@@ -221,6 +221,7 @@ mod tests {
     const NEXTEST_PASS: &str = include_str!("../../fixtures/cargo-nextest-pass.txt");
     const NEXTEST_FAIL: &str = include_str!("../../fixtures/cargo-nextest-fail.txt");
     const CARGO_TEST_PASS: &str = include_str!("../../fixtures/cargo-test-pass.txt");
+    const CARGO_TEST_FAIL: &str = include_str!("../../fixtures/cargo-test-fail.txt");
     const CARGO_DOC_PASS: &str = include_str!("../../fixtures/cargo-test-doc.txt");
 
     fn version(text: &str) -> CommandOutput {
@@ -335,6 +336,18 @@ mod tests {
     }
 
     #[test]
+    fn real_failing_cargo_test_output_is_summed_across_targets() {
+        assert_eq!(
+            parse_cargo_test_counts(CARGO_TEST_FAIL),
+            Some(TestCounts {
+                passed: 5,
+                failed: 3,
+                skipped: 1
+            })
+        );
+    }
+
+    #[test]
     fn ignored_cargo_tests_are_counted_as_skipped() {
         let text = "test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out\n";
         assert_eq!(
@@ -355,6 +368,19 @@ mod tests {
             TestCounts::default(),
         );
         assert_eq!(outcome.label(), "skipped");
+    }
+
+    #[test]
+    fn tests_and_doctests_both_count_towards_having_run_something() {
+        let two = TestCounts {
+            passed: 2,
+            failed: 0,
+            skipped: 0,
+        };
+        assert_eq!(
+            verdict(Harness::Nextest, two, two),
+            GateOutcome::pass("2 test(s) and 2 doctest(s) via cargo nextest")
+        );
     }
 
     #[test]

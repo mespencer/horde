@@ -353,6 +353,36 @@ mod tests {
     }
 
     #[test]
+    fn tested_counts_every_mutant_that_was_built_and_run() {
+        let counts = MutantCounts {
+            missed: 2,
+            caught: 10,
+            unviable: 5,
+            timeout: 3,
+        };
+        assert_eq!(
+            counts.tested(),
+            15,
+            "unviable mutants were never run; everything else was"
+        );
+        assert_eq!(MutantCounts::default().tested(), 0);
+    }
+
+    #[test]
+    fn a_run_whose_mutants_only_timed_out_is_a_pass_not_a_skip() {
+        let counts = MutantCounts {
+            missed: 0,
+            caught: 0,
+            unviable: 0,
+            timeout: 3,
+        };
+        let GateOutcome::Pass { detail } = outcome_of(&Scope::FullTree, counts) else {
+            panic!("a mutant that hung the suite did change behaviour, so it was caught");
+        };
+        assert!(detail.contains("3 timed out"), "{detail}");
+    }
+
+    #[test]
     fn a_run_with_nothing_to_mutate_is_skipped_not_passed() {
         let counts = MutantCounts {
             missed: 0,

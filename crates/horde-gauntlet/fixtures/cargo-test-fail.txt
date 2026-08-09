@@ -1,0 +1,63 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/testprobe-76c87a14b73650e7)
+
+running 7 tests
+test tests::halves_odd ... ok
+test tests::doubles_zero ... ok
+test tests::doubles_negative ... ok
+test tests::halves_negative ... ok
+test tests::slow ... ignored, demonstrates a skipped test in the fixture
+test tests::halves ... FAILED
+test tests::doubles ... FAILED
+
+failures:
+
+---- tests::halves stdout ----
+
+thread 'tests::halves' (37495604) panicked at src/lib.rs:29:19:
+assertion `left == right` failed
+  left: 3
+ right: 4
+
+---- tests::doubles stdout ----
+
+thread 'tests::doubles' (37495601) panicked at src/lib.rs:23:20:
+assertion `left == right` failed
+  left: 6
+ right: 7
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::doubles
+    tests::halves
+
+test result: FAILED. 4 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+     Running tests/integration.rs (target/debug/deps/integration-81f8557550e8d21e)
+
+running 2 tests
+test doubling_then_halving_round_trips ... ok
+test halving_then_doubling_loses_the_odd_bit ... FAILED
+
+failures:
+
+---- halving_then_doubling_loses_the_odd_bit stdout ----
+
+thread 'halving_then_doubling_loses_the_odd_bit' (37495614) panicked at tests/integration.rs:8:5:
+assertion `left == right` failed
+  left: 4
+ right: 5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    halving_then_doubling_loses_the_odd_bit
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test integration`
+error: 2 targets failed:
+    `--lib`
+    `--test integration`
