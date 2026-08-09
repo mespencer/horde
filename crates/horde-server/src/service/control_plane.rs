@@ -35,7 +35,7 @@ use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
-use super::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
+use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::{PendingEvent, StoredEvent};
 use crate::scheduler::Placement;
