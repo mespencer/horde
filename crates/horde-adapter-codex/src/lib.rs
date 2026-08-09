@@ -78,14 +78,11 @@ pub fn capabilities() -> Capabilities {
     Capabilities::none()
         .with(Capability::Resumable)
         .with(Capability::InterruptibleTurn)
-        // SEAM(steer-ruling): spike W2c transcript 15 shows `turn/steer`
-        // amending the ACTIVE turn — same turn id start to finish, with a
-        // second `final_answer` inside it — rather than delivering at the next
-        // boundary. The capability's name is under review by the seam's owner;
-        // when the ruling lands this is a one-line rename and nothing else in
-        // this crate moves. The claim itself is correct either way: Codex does
-        // deliver a message into a running turn without cancelling it.
-        .with(Capability::SteerAtTurnBoundary)
+        // Ruling applied: the capability is `AmendActiveTurn`, named for what
+        // `turn/steer` does to the turn rather than for when the message lands.
+        // Transcript 15 is the evidence — same turn id start to finish, two
+        // final answers inside it.
+        .with(Capability::AmendActiveTurn)
         .with(Capability::SandboxTierAtSpawn)
         .with(Capability::ReportsHeadroom)
         .with(Capability::SystemPromptOverlay)
@@ -141,7 +138,7 @@ mod tests {
         for capability in [
             Capability::Resumable,
             Capability::InterruptibleTurn,
-            Capability::SteerAtTurnBoundary,
+            Capability::AmendActiveTurn,
             Capability::ReportsHeadroom,
             Capability::ModelSelection,
             Capability::AccountIsolation,
