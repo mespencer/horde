@@ -12,6 +12,12 @@
 
 pub mod error;
 pub mod log;
+pub mod scheduler;
+pub mod service;
+pub mod state;
 
 pub use error::ServerError;
 pub use log::EventLog;
+pub use scheduler::{Placement, Scheduler, SingleWorkerScheduler, WorkerRegistry};
+pub use service::ServerCore;
+pub use state::{AgentState, SessionState};
