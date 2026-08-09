@@ -334,7 +334,36 @@ def scenario_resume(args):
         srv.close()
 
 
+def scenario_interrupt(args):
+    """Item 7: does turn/interrupt actually stop a turn in flight?"""
+    srv = AppServer("11-interrupt", SCRATCH)
+    try:
+        initialize(srv)
+        started = start_thread(srv, approval_policy="never")
+        thread = (started or {}).get("result", {})
+        thread_id = thread.get("thread", {}).get("id") if isinstance(thread.get("thread"), dict) else thread.get("thread")
+        srv.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": "Count from 1 to 200, writing each number on its own line, slowly and completely."}]})
+
+        # Let it get going, then cut it off mid-turn.
+        deadline = time.time() + 12
+        deltas = 0
+        while time.time() < deadline:
+            msg = srv.read(timeout=2)
+            if msg and msg.get("method") == "item/agentMessage/delta":
+                deltas += 1
+                if deltas >= 5:
+                    break
+        print(f"deltas before interrupt: {deltas}")
+        srv.request("turn/interrupt", {"threadId": thread_id})
+        seen, approvals, final = pump(srv, {"turn/completed", "turn/aborted", "error"}, timeout=60)
+        print("after interrupt, methods seen:", json.dumps(sorted(set(seen))))
+        print("terminal frame:", json.dumps(final)[:800])
+    finally:
+        srv.close()
+
+
 SCENARIOS = {
+    "interrupt": scenario_interrupt,
     "initialize": scenario_initialize,
     "freeprobes": scenario_freeprobes,
     "turn": scenario_turn,
