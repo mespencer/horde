@@ -12,6 +12,8 @@
 
 pub mod error;
 pub mod log;
+pub mod state;
 
 pub use error::ServerError;
 pub use log::EventLog;
+pub use state::{AgentState, SessionState};
