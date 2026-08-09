@@ -11,6 +11,7 @@ resolver = "3"
 members = [
     "crates/horde-adapter",
     "crates/horde-adapter-claude",
+    "crates/horde-adapter-codex",
     "crates/horde-adapter-fake",
     "crates/horde-proto",
     "crates/horde-testkit",

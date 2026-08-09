@@ -259,6 +259,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-adapter-codex"
+version = "0.1.0"
+dependencies = [
+ "horde-adapter",
+ "horde-testkit",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "horde-adapter-fake"
 version = "0.1.0"
 dependencies = [
