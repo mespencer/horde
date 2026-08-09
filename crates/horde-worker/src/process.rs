@@ -190,7 +190,16 @@ impl SupervisedHarness {
         self.stderr.lock().await.clone()
     }
 
-    /// The OS process id, for diagnostics only.
+    /// The child's OS process id while it is running.
+    ///
+    /// `None` once the child has been reaped by [`Self::wait`] — the id stops
+    /// being meaningful at that point, and returning a stale one invites a
+    /// caller to signal a pid the kernel has since handed to somebody else.
+    /// That is the same class of mistake as killing by pattern, arrived at from
+    /// the other direction.
+    ///
+    /// Diagnostics only. Nothing in this crate signals by pid; killing goes
+    /// through [`Self::kill`], which owns the handle.
     #[must_use]
     pub fn id(&self) -> Option<u32> {
         self.child.id()
