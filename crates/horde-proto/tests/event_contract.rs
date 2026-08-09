@@ -8,17 +8,17 @@ use horde_proto::prost::Message;
 use horde_proto::prost_types::{DescriptorProto, FileDescriptorSet};
 use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
-    AgentSpawned, Assignment, AssignmentId, AssignmentSent, Event, EventEnvelope, Note, NoteSent,
-    Payload, PermissionDecided, PermissionDecision, PermissionRequest, PermissionRequested,
-    Placement, PlacementChanged, PlacementState, Result, ResultReported, ResultStatus, SessionId,
-    SessionLifecycleChanged, SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded,
-    WorkspaceInstanceChanged, WorkspaceInstanceReport, event,
+    AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, Event, EventEnvelope,
+    Note, NoteSent, Payload, PermissionDecided, PermissionDecision, PermissionRequest,
+    PermissionRequested, Placement, PlacementChanged, PlacementState, ResultReported, ResultStatus,
+    SessionId, SessionLifecycleChanged, SessionLifecycleState, TurnInterrupted, UsageRecord,
+    UsageRecorded, WorkspaceInstanceChanged, WorkspaceInstanceReport, event,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:
 ///
 /// * Agent output, spawn ancestry, the Assignment/Note split, and the Result
-///   an Assignment is owed.
+///   an Assignment is owed (`AgentResult` on the wire).
 /// * Permission escalation and its decision — human approval is "an ordinary
 ///   event in the tree", which is what makes phone approval work.
 /// * Usage records, per Agent, attributable across a tree.
@@ -99,7 +99,7 @@ fn every_kind() -> Vec<event::Kind> {
             delivery: 0,
         }),
         event::Kind::ResultReported(ResultReported {
-            result: Some(Result {
+            result: Some(AgentResult {
                 assignment_id: Some(AssignmentId::new("assign-1")),
                 status: ResultStatus::Partial.into(),
                 summary: "two of three tests fixed".to_owned(),

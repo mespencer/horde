@@ -4,11 +4,11 @@
 
 use horde_proto::prost::Message;
 use horde_proto::v1::{
-    AgentId, Attachment, Event, EventBatch, EventEnvelope, GitRef, JournalAck, JournaledEvent,
-    JournaledEventBatch, Payload, PushEventsAccepted, PushEventsRequest, PushEventsResponse,
-    PushEventsStart, Result, ResultStatus, SessionCursor, SessionId, StreamCommandsResponse,
-    SyncCaughtUp, SyncEventsRequest, SyncEventsResponse, WorkerId, event, push_events_request,
-    push_events_response, stream_commands_response, sync_events_response,
+    AgentId, AgentResult, Attachment, Event, EventBatch, EventEnvelope, GitRef, JournalAck,
+    JournaledEvent, JournaledEventBatch, Payload, PushEventsAccepted, PushEventsRequest,
+    PushEventsResponse, PushEventsStart, ResultStatus, SessionCursor, SessionId,
+    StreamCommandsResponse, SyncCaughtUp, SyncEventsRequest, SyncEventsResponse, WorkerId, event,
+    push_events_request, push_events_response, stream_commands_response, sync_events_response,
 };
 
 /// Encodes, decodes, and asserts the value survived unchanged.
@@ -53,7 +53,7 @@ fn journaled_event_and_session_envelope_keep_their_own_sequences() {
         idempotency_key: "worker-1/journal/117".to_owned(),
         kind: Some(event::Kind::ResultReported(
             horde_proto::v1::ResultReported {
-                result: Some(Result {
+                result: Some(AgentResult {
                     assignment_id: None,
                     status: ResultStatus::Blocked.into(),
                     summary: "needs credentials for the private remote".to_owned(),
@@ -178,14 +178,14 @@ fn unknown_enum_values_survive_decoding() {
     // Protobuf enums are open. A newer peer that adds a ResultStatus must not
     // have it silently rewritten to UNSPECIFIED by an older one, so the wire
     // representation has to preserve the integer verbatim.
-    let from_a_newer_peer = Result {
+    let from_a_newer_peer = AgentResult {
         assignment_id: None,
         status: 99,
         summary: "status this build has never heard of".to_owned(),
         payload: None,
     };
 
-    let decoded = Result::decode(from_a_newer_peer.encode_to_vec().as_slice()).ok();
+    let decoded = AgentResult::decode(from_a_newer_peer.encode_to_vec().as_slice()).ok();
 
     assert_eq!(decoded.as_ref().map(|r| r.status), Some(99));
     assert_eq!(decoded.as_ref(), Some(&from_a_newer_peer));

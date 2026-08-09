@@ -54,7 +54,11 @@ enum ResultStatus {
 
 // The single response an Assignment is owed. Reporting a Result does not
 // discard context; archiving does.
-message Result {
+//
+// The domain term is "Result" (CONTEXT.md); the wire name diverges on purpose,
+// because a generated `Result` type shadows `std::result::Result` in every
+// downstream Rust crate that glob-imports this package.
+message AgentResult {
   AssignmentId assignment_id = 1;
 
   ResultStatus status = 2;

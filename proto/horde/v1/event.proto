@@ -87,7 +87,7 @@ message NoteSent {
 // Event.agent_id is the reporting Agent. Reporting does not end the Agent; it
 // goes idle with context retained.
 message ResultReported {
-  Result result = 1;
+  AgentResult result = 1;
 }
 
 message PermissionRequested {
