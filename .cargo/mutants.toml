@@ -5,12 +5,9 @@
 # its mutants survive is how a mutation gate becomes decorative. If a function
 # cannot be mutation-tested, the fix is to move its logic somewhere that can be.
 
-# Almost all of a mutant's cost is rebuilding the crate, which is largely
-# single-threaded, so several mutants at once is close to a linear speed-up.
-# A gate nobody can afford to run is a gate nobody runs; the timeouts below are
-# generous enough that the extra load does not turn into spurious timeouts.
-jobs = 4
-
+# Parallelism is not settable here — cargo-mutants takes `--jobs` on the command
+# line only — so it lives in the gate, like every other flag.
+#
 # Tests here are in-process and finish in milliseconds; the floor exists so a
 # cold or contended machine does not report a spurious timeout.
 minimum_test_timeout = 60

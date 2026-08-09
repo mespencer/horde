@@ -24,6 +24,16 @@ pub const PIN: ToolPin = ToolPin {
 /// Branch the diff is taken against.
 pub const TRUNK: &str = "main";
 
+/// How many mutants to build and test at once.
+///
+/// Almost all of a mutant's cost is rebuilding the crate, which is largely
+/// single-threaded, so running several at once is close to a linear speed-up.
+/// A gate nobody can afford to run is a gate nobody runs. This changes only how
+/// long the measurement takes, never what it measures; the timeouts in
+/// `.cargo/mutants.toml` are generous enough that the extra load does not turn
+/// into spurious ones.
+pub const JOBS: &str = "4";
+
 /// Which mutants a run covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -133,6 +143,8 @@ pub fn spec(ctx: &GateContext, scope: &Scope) -> CommandSpec {
         "--no-shuffle".to_owned(),
         "--colors".to_owned(),
         "never".to_owned(),
+        "--jobs".to_owned(),
+        JOBS.to_owned(),
         "--output".to_owned(),
         ctx.log_dir.display().to_string(),
     ];
@@ -242,7 +254,7 @@ mod tests {
         let spec = spec(&repo_ctx(), &Scope::FullTree);
         assert_eq!(
             spec.display(),
-            "cargo mutants --no-shuffle --colors never --output /repo/target/quality"
+            "cargo mutants --no-shuffle --colors never --jobs 4 --output /repo/target/quality"
         );
     }
 
