@@ -1,0 +1,21 @@
+version: v2
+
+# Non-Rust code generation only.
+#
+# Rust generation deliberately does NOT live here: `crates/horde-proto/build.rs`
+# drives tonic-prost-build so the generator and the prost/tonic runtimes are
+# pinned by one Cargo.lock. A Buf plugin releases on its own schedule and would
+# be a second, independently-drifting pin on the same generated code.
+#
+# What is here is the second-language path — DESIGN.md §11's later GUI/mobile
+# clients. It also keeps the schema honest: anything that only works because of
+# a prost-specific behaviour shows up when a different generator reads the same
+# files.
+#
+# @bufbuild/protobuf v2 generates service descriptors directly, so Connect-ES
+# clients need no second plugin.
+plugins:
+  - remote: buf.build/bufbuild/es:v2.10.1
+    out: gen/ts
+    opt:
+      - target=ts

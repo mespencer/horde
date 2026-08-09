@@ -1,0 +1,20 @@
+# MINIMAL root manifest for the W1b (proto contracts) worktree.
+#
+# W1a owns the real workspace scaffold (full member list, shared dependency
+# table, toolchain pin, gauntlet crate). This file exists so `crates/horde-proto`
+# builds and can be shown to pass the lint policy from docs/TESTING.md §4; the
+# orchestrator resolves this file in favour of W1a's version at merge, keeping
+# only `crates/horde-proto` in `members`.
+[workspace]
+resolver = "3"
+members = ["crates/horde-proto"]
+
+# docs/TESTING.md §4. Reproduced here (not invented here) so the generated code
+# is verified against the real policy rather than assumed compatible with it.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

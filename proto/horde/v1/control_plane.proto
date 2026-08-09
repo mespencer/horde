@@ -1,0 +1,446 @@
+// The client-facing control plane.
+//
+// CLI parity is a hard rule: the TUI is optional, so every operation a Client
+// can perform is an RPC here and nothing is reachable only through a UI.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "horde/v1/agent.proto";
+import "horde/v1/event.proto";
+import "horde/v1/handshake.proto";
+import "horde/v1/id.proto";
+import "horde/v1/permission.proto";
+import "horde/v1/usage.proto";
+import "horde/v1/worker.proto";
+import "horde/v1/workspace.proto";
+
+service ControlPlaneService {
+  // Version and capability handshake. Call first on every connection.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+
+  // -- Sessions -------------------------------------------------------------
+
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc ArchiveSession(ArchiveSessionRequest) returns (ArchiveSessionResponse);
+
+  // The resilience primitive: replay from an offset, then follow. Attach,
+  // scrollback, reconnect, and the multi-session overview are all this call.
+  rpc SyncEvents(SyncEventsRequest) returns (stream SyncEventsResponse);
+
+  // -- Driving Agents -------------------------------------------------------
+
+  // Send an Assignment or a Note. Steering is DeliveryMode on this call, not a
+  // separate verb.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+
+  // Cancel the turn in flight without sending anything.
+  rpc InterruptAgent(InterruptAgentRequest) returns (InterruptAgentResponse);
+
+  // Answer a human-layer permission escalation from any attached Client.
+  rpc AnswerPermission(AnswerPermissionRequest) returns (AnswerPermissionResponse);
+
+  // Spawn an Agent under an existing one. Never blocks: an unmatched spawn
+  // comes back QUEUED with a reason.
+  rpc SpawnAgent(SpawnAgentRequest) returns (SpawnAgentResponse);
+
+  // -- Workspaces -----------------------------------------------------------
+
+  rpc CreateWorkspaceDefinition(CreateWorkspaceDefinitionRequest) returns (CreateWorkspaceDefinitionResponse);
+  rpc GetWorkspaceDefinition(GetWorkspaceDefinitionRequest) returns (GetWorkspaceDefinitionResponse);
+  rpc ListWorkspaceDefinitions(ListWorkspaceDefinitionsRequest) returns (ListWorkspaceDefinitionsResponse);
+  rpc UpdateWorkspaceDefinition(UpdateWorkspaceDefinitionRequest) returns (UpdateWorkspaceDefinitionResponse);
+
+  // Separate from Update because the repo set is fixed at definition time and
+  // widening it is a deliberate act, not a field edit.
+  rpc AddWorkspaceRepo(AddWorkspaceRepoRequest) returns (AddWorkspaceRepoResponse);
+
+  rpc DeleteWorkspaceDefinition(DeleteWorkspaceDefinitionRequest) returns (DeleteWorkspaceDefinitionResponse);
+
+  // Materialize a Workspace Instance on a chosen Worker ahead of need.
+  // Progress streams as Session events, not in this response.
+  rpc PrewarmWorkspace(PrewarmWorkspaceRequest) returns (PrewarmWorkspaceResponse);
+
+  // -- Workers and enrollment ----------------------------------------------
+
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+
+  // Mint a short-lived one-time enrollment code embedding the Server cert
+  // fingerprint. Redeemed against EnrollmentService.Join on the new machine.
+  rpc MintEnrollmentCode(MintEnrollmentCodeRequest) returns (MintEnrollmentCodeResponse);
+
+  // Deny-list an issued certificate by principal.
+  rpc RevokeEnrollment(RevokeEnrollmentRequest) returns (RevokeEnrollmentResponse);
+
+  // -- Usage ----------------------------------------------------------------
+
+  rpc QueryUsage(QueryUsageRequest) returns (QueryUsageResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+// ---------------------------------------------------------------------------
+
+message HelloRequest {
+  Hello hello = 1;
+}
+
+message HelloResponse {
+  ServerHello server = 1;
+
+  ClientId client_id = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+message CreateSessionRequest {
+  string title = 1;
+
+  // Single-repo definitions are auto-registered from cwd by `horde new`; this
+  // is set either way.
+  WorkspaceDefinitionId workspace_definition_id = 2;
+
+  // The top-level Agent. Its initial_assignment is the first prompt.
+  AgentSpec root_agent = 3;
+
+  // Makes retry after a lost response safe.
+  string idempotency_key = 4;
+}
+
+message CreateSessionResponse {
+  SessionSummary session = 1;
+
+  AgentId root_agent_id = 2;
+}
+
+message ListSessionsRequest {
+  bool include_archived = 1;
+
+  uint32 page_size = 2;
+
+  string page_token = 3;
+}
+
+message ListSessionsResponse {
+  repeated SessionSummary sessions = 1;
+
+  // Empty when there are no further pages.
+  string next_page_token = 2;
+}
+
+message GetSessionRequest {
+  SessionId session_id = 1;
+}
+
+message GetSessionResponse {
+  SessionSummary session = 1;
+
+  // The whole Agent tree, including archived Agents whose metadata is retained.
+  repeated AgentSummary agents = 2;
+}
+
+message ArchiveSessionRequest {
+  SessionId session_id = 1;
+
+  string reason = 2;
+}
+
+message ArchiveSessionResponse {
+  SessionSummary session = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Event sync
+// ---------------------------------------------------------------------------
+
+// Where a Client wants one Session's replay to start.
+message SessionCursor {
+  SessionId session_id = 1;
+
+  // First sequence wanted. Zero is normalized to 1 (from the beginning).
+  uint64 from_sequence = 2;
+}
+
+message SyncEventsRequest {
+  // Sessions to replay and their offsets.
+  repeated SessionCursor cursors = 1;
+
+  // Also subscribe to Sessions not listed, including ones created later, from
+  // their current head. This is the multi-session overview and the global
+  // inbox.
+  bool all_sessions = 2;
+
+  // Restrict to this Agent's subtree. Attaching to an Agent scopes the view;
+  // Session-root attachment sees everything.
+  AgentId subtree_root = 3;
+
+  // False replays to head and completes the stream — the scriptable form.
+  bool follow = 4;
+
+  // Server-chosen when zero.
+  uint32 max_batch_events = 5;
+}
+
+message EventBatch {
+  repeated EventEnvelope events = 1;
+}
+
+// Replay finished; everything after this is live. Lets a TUI stop showing a
+// loading state without guessing.
+message SyncCaughtUp {
+  // Per-Session head at the moment of catch-up.
+  repeated SessionCursor heads = 1;
+}
+
+// Keepalive during quiet periods, so a Client can distinguish "nothing is
+// happening" from "the connection died".
+message SyncHeartbeat {
+  google.protobuf.Timestamp server_time = 1;
+}
+
+message SyncEventsResponse {
+  oneof update {
+    EventBatch batch = 1;
+    SyncCaughtUp caught_up = 2;
+    SyncHeartbeat heartbeat = 3;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Driving Agents
+// ---------------------------------------------------------------------------
+
+message SendMessageRequest {
+  AgentId to_agent_id = 1;
+
+  oneof body {
+    Assignment assignment = 2;
+    Note note = 3;
+  }
+
+  DeliveryMode delivery = 4;
+
+  string idempotency_key = 5;
+}
+
+message SendMessageResponse {
+  // Server-assigned; set only for Assignments.
+  AssignmentId assignment_id = 1;
+
+  SessionId session_id = 2;
+
+  // Log position of the resulting event, so a caller can sync from exactly
+  // here instead of racing its own write.
+  uint64 sequence = 3;
+}
+
+message InterruptAgentRequest {
+  AgentId agent_id = 1;
+
+  string reason = 2;
+}
+
+message InterruptAgentResponse {
+  uint64 sequence = 1;
+}
+
+message AnswerPermissionRequest {
+  PermissionRequestId request_id = 1;
+
+  PermissionOutcome outcome = 2;
+
+  string reason = 3;
+
+  bool remember_for_session = 4;
+}
+
+message AnswerPermissionResponse {
+  uint64 sequence = 1;
+}
+
+message SpawnAgentRequest {
+  SessionId session_id = 1;
+
+  // The spawner. Unset means the Session's top-level Agent.
+  AgentId parent_agent_id = 2;
+
+  AgentSpec spec = 3;
+
+  string idempotency_key = 4;
+}
+
+message SpawnAgentResponse {
+  AgentId agent_id = 1;
+
+  // May be QUEUED with a reason. The Agent exists either way.
+  Placement placement = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces
+// ---------------------------------------------------------------------------
+
+message CreateWorkspaceDefinitionRequest {
+  string name = 1;
+
+  repeated WorkspaceRepo repos = 2;
+
+  repeated string unmanaged_paths = 3;
+}
+
+message CreateWorkspaceDefinitionResponse {
+  WorkspaceDefinition definition = 1;
+}
+
+message GetWorkspaceDefinitionRequest {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  // Alternative lookup by name when the id is not known.
+  string name = 2;
+}
+
+message GetWorkspaceDefinitionResponse {
+  WorkspaceDefinition definition = 1;
+
+  // Known Instances across Workers. The Server's cached view.
+  repeated WorkspaceInstanceReport instances = 2;
+}
+
+message ListWorkspaceDefinitionsRequest {
+  uint32 page_size = 1;
+
+  string page_token = 2;
+}
+
+message ListWorkspaceDefinitionsResponse {
+  repeated WorkspaceDefinition definitions = 1;
+
+  string next_page_token = 2;
+}
+
+message UpdateWorkspaceDefinitionRequest {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  // Must match the current definition or the call fails ABORTED.
+  string etag = 2;
+
+  string name = 3;
+
+  repeated string unmanaged_paths = 4;
+
+  // Layout changes only; `repos` here may not add or remove repos.
+  repeated WorkspaceRepo repos = 5;
+}
+
+message UpdateWorkspaceDefinitionResponse {
+  WorkspaceDefinition definition = 1;
+}
+
+message AddWorkspaceRepoRequest {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  WorkspaceRepo repo = 2;
+
+  string etag = 3;
+}
+
+message AddWorkspaceRepoResponse {
+  WorkspaceDefinition definition = 1;
+}
+
+message DeleteWorkspaceDefinitionRequest {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  string etag = 2;
+}
+
+message DeleteWorkspaceDefinitionResponse {}
+
+message PrewarmWorkspaceRequest {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  WorkerId worker_id = 2;
+
+  // Optional: the Session whose log should carry the progress events.
+  SessionId session_id = 3;
+}
+
+message PrewarmWorkspaceResponse {
+  // State at acceptance, normally MATERIALIZING. Completion arrives as events.
+  WorkspaceInstanceReport report = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Workers and enrollment
+// ---------------------------------------------------------------------------
+
+message ListWorkersRequest {
+  bool include_offline = 1;
+}
+
+message ListWorkersResponse {
+  repeated WorkerSummary workers = 1;
+}
+
+message MintEnrollmentCodeRequest {
+  Role role = 1;
+
+  // Name to record for the principal this code will create.
+  string name = 2;
+
+  // Server-clamped. Codes are short-lived by design.
+  google.protobuf.Duration ttl = 3;
+}
+
+message MintEnrollmentCodeResponse {
+  // The one-time code, to be typed on the joining machine.
+  string code = 1;
+
+  // The Server cert fingerprint the code embeds, so the joining machine can
+  // authenticate the Server before sending a CSR.
+  string server_cert_fingerprint = 2;
+
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message RevokeEnrollmentRequest {
+  oneof principal {
+    WorkerId worker_id = 1;
+    ClientId client_id = 2;
+  }
+
+  string reason = 3;
+}
+
+message RevokeEnrollmentResponse {
+  // Certificate serial added to the deny-list.
+  string revoked_serial = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+
+message QueryUsageRequest {
+  // Empty means all Sessions.
+  repeated SessionId session_ids = 1;
+
+  // Restrict to one Agent's subtree; this is tree-level attribution.
+  AgentId subtree_root = 2;
+
+  UsageGroupBy group_by = 3;
+
+  google.protobuf.Timestamp since = 4;
+
+  google.protobuf.Timestamp until = 5;
+}
+
+message QueryUsageResponse {
+  repeated UsageAggregate aggregates = 1;
+}

@@ -1,0 +1,206 @@
+// The event log — the resilience mechanism (ADR-0001).
+//
+// Every Session has an append-only, sequence-numbered log on the Server. All
+// Client and Worker streams are "sync me from offset N", so reconnect, attach,
+// scrollback, crash recovery, and usage attribution are one mechanism rather
+// than five features. Everything that matters is an event; side channels are
+// bugs.
+//
+// Two sequence spaces exist and must not be confused:
+//   * EventEnvelope.sequence     — per Session, assigned by the Server. What
+//                                  Clients resume from.
+//   * JournaledEvent.journal_sequence — per Worker, assigned by the Worker's
+//                                  local journal. What the Server acks so a
+//                                  partitioned Worker knows what to replay.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/timestamp.proto";
+import "horde/v1/agent.proto";
+import "horde/v1/id.proto";
+import "horde/v1/permission.proto";
+import "horde/v1/usage.proto";
+import "horde/v1/workspace.proto";
+
+// ---------------------------------------------------------------------------
+// Event kinds
+// ---------------------------------------------------------------------------
+
+// Which stream of an Agent's turn a chunk belongs to. Clients render these
+// differently; the log keeps them distinguishable rather than pre-flattened.
+enum AgentOutputChannel {
+  AGENT_OUTPUT_CHANNEL_UNSPECIFIED = 0;
+  AGENT_OUTPUT_CHANNEL_ASSISTANT = 1;
+  AGENT_OUTPUT_CHANNEL_REASONING = 2;
+  AGENT_OUTPUT_CHANNEL_TOOL_CALL = 3;
+  AGENT_OUTPUT_CHANNEL_TOOL_RESULT = 4;
+
+  // Harness-level noise: warnings, retries, rate-limit notices.
+  AGENT_OUTPUT_CHANNEL_HARNESS_DIAGNOSTIC = 5;
+}
+
+message AgentOutputChunk {
+  AgentOutputChannel channel = 1;
+
+  string text = 2;
+
+  // Groups chunks and usage records belonging to one turn.
+  string turn_id = 3;
+
+  // Position within the turn and channel. Lets a Client detect a gap without
+  // consulting the Session sequence, which interleaves all Agents.
+  uint64 chunk_index = 4;
+}
+
+// An Agent came into existence. Event.agent_id is the new Agent.
+message AgentSpawned {
+  // Unset for the Session's top-level Agent.
+  AgentId parent_agent_id = 1;
+
+  Actor spawned_by = 2;
+
+  AgentSpec spec = 3;
+
+  // Ancestry display names, root first.
+  repeated string tree_path = 4;
+}
+
+// Event.agent_id is the recipient; `from` is the sender.
+message AssignmentSent {
+  Actor from = 1;
+
+  Assignment assignment = 2;
+
+  DeliveryMode delivery = 3;
+}
+
+// Event.agent_id is the recipient.
+message NoteSent {
+  Actor from = 1;
+
+  Note note = 2;
+
+  DeliveryMode delivery = 3;
+}
+
+// Event.agent_id is the reporting Agent. Reporting does not end the Agent; it
+// goes idle with context retained.
+message ResultReported {
+  AgentResult result = 1;
+}
+
+message PermissionRequested {
+  PermissionRequest request = 1;
+}
+
+message PermissionDecided {
+  PermissionDecision decision = 1;
+}
+
+message UsageRecorded {
+  UsageRecord record = 1;
+}
+
+// A Workspace Instance was created, progressed, or went away. Carries
+// materialization progress so `prewarm` is visible in the Session.
+message WorkspaceInstanceChanged {
+  WorkspaceInstanceReport report = 1;
+
+  // Present while state is MATERIALIZING.
+  MaterializationProgress progress = 2;
+}
+
+message AgentLifecycleChanged {
+  AgentLifecycleState previous_state = 1;
+
+  AgentLifecycleState state = 2;
+
+  // Why, in words: "reaped after 60m idle", "harness exited with status 1".
+  string reason = 3;
+}
+
+message SessionLifecycleChanged {
+  SessionLifecycleState previous_state = 1;
+
+  SessionLifecycleState state = 2;
+
+  string reason = 3;
+}
+
+// Placement was made, refused, or expired. Queued-with-reason is a first-class
+// outcome: spawn never blocks the caller.
+message PlacementChanged {
+  Placement placement = 1;
+}
+
+// A turn in flight was cancelled. Distinct from a queued message, which is a
+// delivery mode on AssignmentSent or NoteSent.
+message TurnInterrupted {
+  Actor requested_by = 1;
+
+  string turn_id = 2;
+
+  string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Envelopes
+// ---------------------------------------------------------------------------
+
+// One thing that happened, without log coordinates. Split from EventEnvelope so
+// a Worker can journal an event before the Server has assigned it a Session
+// sequence.
+message Event {
+  // The Agent this event is about. Unset for Session-scoped events.
+  AgentId agent_id = 1;
+
+  // When the originator observed it. May precede recorded_at by the length of a
+  // partition.
+  google.protobuf.Timestamp occurred_at = 2;
+
+  // Stable across replays of the same event, so a Worker replaying its journal
+  // after reconnect cannot double-append. Worker-assigned and opaque.
+  string idempotency_key = 3;
+
+  oneof kind {
+    AgentOutputChunk agent_output_chunk = 10;
+    AgentSpawned agent_spawned = 11;
+    AssignmentSent assignment_sent = 12;
+    NoteSent note_sent = 13;
+    ResultReported result_reported = 14;
+    PermissionRequested permission_requested = 15;
+    PermissionDecided permission_decided = 16;
+    UsageRecorded usage_recorded = 17;
+    WorkspaceInstanceChanged workspace_instance_changed = 18;
+    AgentLifecycleChanged agent_lifecycle_changed = 19;
+    SessionLifecycleChanged session_lifecycle_changed = 20;
+    PlacementChanged placement_changed = 21;
+    TurnInterrupted turn_interrupted = 22;
+  }
+}
+
+// An Event as it sits in a Session's log.
+message EventEnvelope {
+  SessionId session_id = 1;
+
+  // Per-Session, dense, 1-based, assigned by the Server on append.
+  uint64 sequence = 2;
+
+  // When the Server appended it. Monotonic with sequence.
+  google.protobuf.Timestamp recorded_at = 3;
+
+  Event event = 4;
+}
+
+// An Event in a Worker's local journal, on its way up. Survives partitions: the
+// Worker keeps producing these while disconnected and replays from the last
+// acked sequence on reconnect.
+message JournaledEvent {
+  // Per Worker, dense, 1-based, monotonic across reconnects and restarts.
+  uint64 journal_sequence = 1;
+
+  SessionId session_id = 2;
+
+  Event event = 3;
+}

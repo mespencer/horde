@@ -1,0 +1,6 @@
+# docs/TESTING.md §4: `expect` and `panic` are allowed in tests; `unwrap` is
+# banned everywhere, tests included. Owned by W1a — reproduced here so W1b's
+# evidence is generated under the real policy.
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = false

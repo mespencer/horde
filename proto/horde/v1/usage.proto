@@ -1,0 +1,91 @@
+// Usage accounting: per-Agent records, per-account headroom, tree aggregation.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "horde/v1/agent.proto";
+import "horde/v1/id.proto";
+
+message TokenUsage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cache_read_input_tokens = 3;
+  uint64 cache_write_input_tokens = 4;
+}
+
+// Where a RateWindow's numbers came from. Provider-reported state is truth
+// where the provider exposes it; otherwise Horde meters against a declared
+// quota model. Every token flows through Horde, so it is never blind — but the
+// two sources have different trust, and callers must be able to tell them apart.
+enum HeadroomSource {
+  HEADROOM_SOURCE_UNSPECIFIED = 0;
+  HEADROOM_SOURCE_PROVIDER_REPORTED = 1;
+  HEADROOM_SOURCE_HORDE_METERED = 2;
+}
+
+enum RateWindowUnit {
+  RATE_WINDOW_UNIT_UNSPECIFIED = 0;
+  RATE_WINDOW_UNIT_TOKENS = 1;
+  RATE_WINDOW_UNIT_REQUESTS = 2;
+}
+
+// Rate-limit state for one Provider Account. Drives the `headroom` selection
+// strategy.
+message RateWindow {
+  HeadroomSource source = 1;
+
+  RateWindowUnit unit = 2;
+
+  uint64 used = 3;
+
+  // Zero means unknown, which is distinct from a limit of zero — a Provider
+  // Account with no quota is expressed by exhausting `used` against `limit`.
+  uint64 limit = 4;
+
+  google.protobuf.Duration window_length = 5;
+
+  google.protobuf.Timestamp resets_at = 6;
+}
+
+// One metered turn, attributable to an Agent and a Provider Account.
+message UsageRecord {
+  ModelBinding binding = 1;
+
+  TokenUsage tokens = 2;
+
+  // Account headroom as of this record, when the adapter reports it.
+  RateWindow rate_window = 3;
+
+  // Correlates the record with the turn's output chunks.
+  string turn_id = 4;
+}
+
+enum UsageGroupBy {
+  USAGE_GROUP_BY_UNSPECIFIED = 0;
+  USAGE_GROUP_BY_AGENT = 1;
+  USAGE_GROUP_BY_SESSION = 2;
+  USAGE_GROUP_BY_TREE_PATH = 3;
+  USAGE_GROUP_BY_PROVIDER_ACCOUNT = 4;
+  USAGE_GROUP_BY_MODEL = 5;
+}
+
+// The dimensions of one aggregate row. Only the fields implied by the query's
+// UsageGroupBy are populated.
+message UsageGroupKey {
+  SessionId session_id = 1;
+  AgentId agent_id = 2;
+  repeated string tree_path = 3;
+  string provider = 4;
+  string provider_account = 5;
+  string model = 6;
+}
+
+message UsageAggregate {
+  UsageGroupKey key = 1;
+
+  TokenUsage tokens = 2;
+
+  uint64 agent_count = 3;
+}
