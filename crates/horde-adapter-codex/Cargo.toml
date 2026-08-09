@@ -10,8 +10,7 @@ description = "Codex app-server codec: JSON-RPC wire types, turn assembly, usage
 workspace = true
 
 [dependencies]
-# async-trait returns with ReplaySession's AgentSession impl; declaring it
-# before then reds the machete gate.
+async-trait = { workspace = true }
 horde-adapter = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

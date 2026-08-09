@@ -262,6 +262,7 @@ dependencies = [
 name = "horde-adapter-codex"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "horde-adapter",
  "horde-testkit",
  "serde",

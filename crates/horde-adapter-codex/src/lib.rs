@@ -46,11 +46,13 @@
 
 pub mod codec;
 pub mod identity;
+pub mod replay;
 pub mod turn;
 pub mod wire;
 
 pub use codec::{decode_line, encode_interrupt, encode_steer, encode_turn_start};
 pub use identity::RevivalIdentity;
+pub use replay::ReplaySession;
 pub use turn::TurnAssembler;
 
 use horde_adapter::{Capabilities, Capability};

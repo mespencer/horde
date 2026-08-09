@@ -27,6 +27,14 @@ pub struct TurnAssembler {
     /// assembler that simply added what it saw would bill the prior turn again
     /// on every revival.
     counted_usage: HashSet<(String, String)>,
+    /// An interrupt asked for while no turn was open yet.
+    ///
+    /// A Worker calls `interrupt()` on wall-clock time, not on frame arrival,
+    /// so the request can land before `turn/started` has been read. Latching it
+    /// means the cancellation is not silently lost in that race; the latch is
+    /// consumed by the next turn and cleared when a turn closes, so it can
+    /// never leak into a later, unrelated turn.
+    interrupt_pending: bool,
 }
 
 #[derive(Debug)]
@@ -75,8 +83,9 @@ impl TurnAssembler {
     /// what a thread reports between turns, and Codex emits no distinct
     /// "aborted" frame.
     pub fn note_interrupt_requested(&mut self) {
-        if let Some(turn) = self.turn.as_mut() {
-            turn.interrupt_requested = true;
+        match self.turn.as_mut() {
+            Some(turn) => turn.interrupt_requested = true,
+            None => self.interrupt_pending = true,
         }
     }
 
@@ -115,7 +124,10 @@ impl TurnAssembler {
             }
 
             Notification::TurnStarted(started) => {
-                self.turn = Some(OpenTurn::new(TurnId::new(&started.turn.id)));
+                let mut turn = OpenTurn::new(TurnId::new(&started.turn.id));
+                // Consume any interrupt that arrived before this turn existed.
+                turn.interrupt_requested = std::mem::take(&mut self.interrupt_pending);
+                self.turn = Some(turn);
                 Vec::new()
             }
 
@@ -263,6 +275,8 @@ impl TurnAssembler {
         let Some(turn) = self.turn.take() else {
             return Vec::new();
         };
+        // A closed turn ends the interrupt's reach; the next one starts clean.
+        self.interrupt_pending = false;
 
         vec![AgentEvent::TurnEnded(TurnOutcome {
             turn_id: turn.id,
