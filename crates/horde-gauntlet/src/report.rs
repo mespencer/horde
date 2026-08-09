@@ -197,6 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_table_renders_exactly_like_this() {
+        let table = render_table(&[
+            result("fmt", Some(GateOutcome::pass("clean")), Some(80)),
+            result(
+                "duplication",
+                Some(GateOutcome::fail("2 blocks")),
+                Some(1500),
+            ),
+            result("mutants", None, None),
+        ]);
+        assert_eq!(
+            table,
+            "\
+gate         enforcement  result     time   detail\n\
+-----------  -----------  ---------  -----  --------------------------------------------------------------\n\
+fmt          blocking     pass       0.08s  clean\n\
+duplication  blocking     fail       1.50s  2 blocks\n\
+mutants      blocking     no result  -      the gate never reported — it crashed, or the run stopped first\n\
+2 of 3 gates red: duplication, mutants\n"
+        );
+    }
+
+    #[test]
     fn columns_are_padded_to_the_widest_cell() {
         let table = render_table(&[
             result("fmt", Some(GateOutcome::pass("clean")), Some(100)),

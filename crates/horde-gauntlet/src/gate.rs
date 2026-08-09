@@ -336,6 +336,24 @@ mod tests {
     };
 
     #[test]
+    fn a_registered_gate_debugs_as_its_spec() {
+        struct Nothing;
+        impl Gate for Nothing {
+            fn run(&self, _ctx: &GateContext, _runner: &dyn CommandRunner) -> GateOutcome {
+                GateOutcome::pass("nothing")
+            }
+        }
+        let registered = RegisteredGate {
+            spec: SPEC,
+            gate: Box::new(Nothing),
+        };
+        let rendered = format!("{registered:?}");
+        assert!(rendered.contains("RegisteredGate"), "{rendered}");
+        assert!(rendered.contains("fmt"), "{rendered}");
+        assert!(rendered.contains("Blocking"), "{rendered}");
+    }
+
+    #[test]
     fn a_pending_row_carries_the_gate_identity_but_no_outcome() {
         let result = GateResult::pending(&SPEC);
         assert_eq!(result.name, "fmt");

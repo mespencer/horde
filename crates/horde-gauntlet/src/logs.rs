@@ -172,6 +172,17 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_runner_debugs_as_the_transcript_it_holds() {
+        let inner = ScriptedRunner::new(vec![CommandOutput::new(Some(0), "hello", "")]);
+        let recorder = RecordingRunner::new(&inner);
+        let _ = recorder.run(&spec());
+        let rendered = format!("{recorder:?}");
+        assert!(rendered.contains("RecordingRunner"), "{rendered}");
+        assert!(rendered.contains("cargo fmt --check"), "{rendered}");
+        assert!(rendered.contains("hello"), "{rendered}");
+    }
+
+    #[test]
     fn recording_runner_transcribes_launch_failures_too() {
         let inner = ScriptedRunner::failing("nope");
         let recorder = RecordingRunner::new(&inner);
