@@ -35,16 +35,22 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
     match capability {
         Capability::Resumable => Some(AdapterCapability::Resumable),
         Capability::InterruptibleTurn => Some(AdapterCapability::Interruptible),
-        Capability::Steerable => Some(AdapterCapability::Steerable),
+        Capability::SteerAtTurnBoundary => Some(AdapterCapability::Steerable),
 
         // The domain models the capability; the wire's PERMISSION_PROMPT_TOOL
         // names one provider's mechanism and is deprecated in favour of this.
-        Capability::PermissionPrompt => Some(AdapterCapability::ToolCallGating),
+        Capability::PreAuthorizeToolCalls => Some(AdapterCapability::ToolCallGating),
 
-        // Worker-local facts with no placement consequence yet. Deliberately
-        // not on the wire: advertising a capability nothing matches on invites
+        // Worker-local facts with no placement consequence on the wire yet.
+        // Deliberately not advertised: a capability nothing matches on invites
         // readers to assume it is enforced somewhere.
+        //
+        // `SandboxTierAtSpawn` is the one most likely to graduate — it is what
+        // an ungateable provider offers *instead* of interception, so a
+        // scheduler that learns to place high-trust work will want to see it.
+        // It stays off the wire until something reads it.
         Capability::RewritesToolInput
+        | Capability::SandboxTierAtSpawn
         | Capability::ReportsHeadroom
         | Capability::SystemPromptOverlay
         | Capability::ModelSelection
@@ -71,12 +77,12 @@ pub fn capability_from_wire(value: i32) -> Result<Option<Capability>, UnknownCap
         AdapterCapability::Unspecified => None,
         AdapterCapability::Resumable => Some(Capability::Resumable),
         AdapterCapability::Interruptible => Some(Capability::InterruptibleTurn),
-        AdapterCapability::Steerable => Some(Capability::Steerable),
-        AdapterCapability::ToolCallGating => Some(Capability::PermissionPrompt),
+        AdapterCapability::Steerable => Some(Capability::SteerAtTurnBoundary),
+        AdapterCapability::ToolCallGating => Some(Capability::PreAuthorizeToolCalls),
 
         // Deprecated, but old Workers still send it, and it means the same
         // thing they would now send as TOOL_CALL_GATING.
-        AdapterCapability::PermissionPromptTool => Some(Capability::PermissionPrompt),
+        AdapterCapability::PermissionPromptTool => Some(Capability::PreAuthorizeToolCalls),
     })
 }
 
@@ -94,7 +100,7 @@ mod tests {
         for capability in Capability::ALL {
             let _ = capability_to_wire(capability);
         }
-        assert_eq!(Capability::ALL.len(), 9);
+        assert_eq!(Capability::ALL.len(), 10);
     }
 
     #[test]
@@ -125,7 +131,7 @@ mod tests {
         // downgrade that Worker to ungateable and refuse high-trust work on it.
         assert_eq!(
             capability_from_wire(AdapterCapability::PermissionPromptTool.into()),
-            Ok(Some(Capability::PermissionPrompt))
+            Ok(Some(Capability::PreAuthorizeToolCalls))
         );
     }
 
@@ -140,10 +146,11 @@ mod tests {
         // Codex cannot pre-authorize tool calls (ADR-0005). It expresses that
         // by not advertising the capability — there is no negative flag, and a
         // reader must treat absence as "cannot", not "unknown".
-        let codex: Vec<AdapterCapability> = [Capability::Resumable, Capability::Steerable]
-            .into_iter()
-            .filter_map(capability_to_wire)
-            .collect();
+        let codex: Vec<AdapterCapability> =
+            [Capability::Resumable, Capability::SteerAtTurnBoundary]
+                .into_iter()
+                .filter_map(capability_to_wire)
+                .collect();
 
         assert!(!codex.contains(&AdapterCapability::ToolCallGating));
         assert!(codex.contains(&AdapterCapability::Steerable));

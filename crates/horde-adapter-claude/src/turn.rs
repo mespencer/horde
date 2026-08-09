@@ -10,7 +10,7 @@ use core::time::Duration;
 
 use horde_adapter::{
     AgentEvent, HeadroomSource, OutputChannel, PermissionDenial, ProviderSessionId, RateWindow,
-    TokenUsage, ToolCallId, TurnId, TurnOutcome, TurnStatus, UsageAccumulator,
+    TokenUsage, ToolCallId, TurnId, TurnOutcome, TurnStatus, UsageAccumulator, Utilization,
 };
 use serde_json::Value;
 
@@ -65,18 +65,13 @@ impl TurnAssembler {
                 window: RateWindow {
                     source: HeadroomSource::ProviderReported,
                     window: rate_limit.rate_limit_info.rate_limit_type.clone(),
-                    allowed: rate_limit.rate_limit_info.status == "allowed",
+                    // Claude Code reports only whether it is still serving, with
+                    // no counts or percentage to derive headroom from.
+                    utilization: Utilization::AllowedOnly {
+                        allowed: rate_limit.rate_limit_info.status == "allowed",
+                    },
+                    window_duration: None,
                     resets_at_unix: rate_limit.rate_limit_info.resets_at,
-                    // Claude Code's rate-limit event is qualitative: a window
-                    // name, an allowed/blocked status, and a reset time. It
-                    // carries no consumption figure in either shape, so the
-                    // numeric fields stay absent rather than being invented.
-                    // `headroom_fraction()` is therefore None for Claude, which
-                    // is the honest answer and not "plenty of room".
-                    used: None,
-                    limit: None,
-                    used_fraction: None,
-                    window_length: None,
                 },
             }],
             Event::ControlResponse(_)
@@ -188,9 +183,7 @@ impl TurnAssembler {
                         output_tokens: model.output_tokens,
                         cache_read_input_tokens: model.cache_read_input_tokens,
                         cache_write_input_tokens: model.cache_creation_input_tokens,
-                        // `modelUsage` has no reasoning breakdown; thinking
-                        // tokens arrive on their own envelopes and are already
-                        // inside output_tokens.
+                        // Claude Code does not break reasoning out of output.
                         reasoning_output_tokens: 0,
                     }
             });
@@ -504,7 +497,10 @@ mod tests {
 
         match feed(&mut assembler, &line).as_slice() {
             [AgentEvent::HeadroomReported { window }] => {
-                assert!(window.allowed);
+                assert_eq!(
+                    window.utilization,
+                    horde_adapter::Utilization::AllowedOnly { allowed: true }
+                );
                 assert_eq!(window.window, "five_hour");
                 assert_eq!(window.resets_at_unix, Some(1786317600));
             }

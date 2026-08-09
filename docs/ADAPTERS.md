@@ -38,6 +38,38 @@ binding and the session carries the conversation. Permission answers land on the
 session rather than a callback, because the decision may be made minutes later
 on someone else's phone.
 
+## Capabilities are data, and the permission layer queries them
+
+Providers differ in ways that change what Horde may safely do with them, so
+capability flags are values, not doc comments.
+
+The load-bearing one is `PreAuthorizeToolCalls`: whether Horde sees a proposed
+tool call **before** it runs. Claude Code has it (spike W1c). Codex 0.145.0 does
+**not** — spike W2c found that across six configurations no client-facing
+approval request ever arrived, because the two features that would route them
+are under development and off. Codex adjudicates against its own sandbox tiers
+and tells the client afterwards.
+
+Ask `Capabilities::permission_enforcement()` rather than reading flags yourself:
+
+| Answer | Meaning |
+|---|---|
+| `PerCall` | Every proposed call is offered to Horde first; the full chain of DESIGN.md §10 applies. |
+| `SandboxAtSpawn` | The harness polices itself against a tier Horde chose at spawn and reports afterwards. Constrainable, not adjudicable — a high-trust assignment does not belong here. |
+| `Unenforced` | Tool calls run unobserved; only placement and the workspace limit the blast radius. |
+
+`SteerAtTurnBoundary` is separate from `InterruptibleTurn` because both harnesses
+split them (Codex has `turn/steer` alongside `turn/interrupt`).
+
+## Spawn is not side-effect-free
+
+`Adapter::spawn` makes no purity promise, and one provider actively breaks it:
+Codex's `thread/start` writes the working directory into `~/.codex/config.toml`
+as a trusted project, which changes how that harness behaves for every later
+agent in the same directory. Do not design assumptions that an adapter leaves
+the machine as it found it. Containing those effects — sandbox profiles around
+the whole process (DESIGN.md §10) — is the Worker's job.
+
 ## What an implementation owes its caller
 
 These are enforced by `horde_testkit::conformance`, and they are why a Worker can
@@ -55,15 +87,28 @@ trust an adapter it has never seen:
 5. **Turn ids are unique and carried by every event of their turn**, and chunk
    indices start at zero and advance per channel, so a client can detect a gap.
 
-## Usage: diff, never sum
+## Usage: per-turn at the seam, however the harness reports it
 
-`UsageAccumulator` turns a harness's running totals into per-turn deltas.
+The seam's contract is per-turn usage. The two harnesses reach it from opposite
+directions, and each codec normalizes its own way:
 
-Claude Code reports `total_cost_usd` and `modelUsage` cumulatively for the
-lifetime of one child process. Spike W1c measured `0.0037 → 0.0063 → 0.0078`
-across three turns of one process: a Worker that summed those would over-bill
-quadratically. A counter that moves backwards means the harness restarted, so
-the accumulator reads it whole rather than saturating to zero.
+- **Claude** reports `total_cost_usd` and `modelUsage` cumulatively for the
+  lifetime of one child process. Spike W1c measured `0.0037 → 0.0063 → 0.0078`
+  across three turns: a Worker that summed those would over-bill quadratically.
+  `UsageAccumulator` does that subtraction in one audited place. A counter that
+  moves backwards means the harness restarted, so it reads the value whole
+  rather than saturating to zero.
+- **Codex** reports `thread/tokenUsage/updated` with a `last` field that already
+  *is* the turn, so it never touches the accumulator.
+
+`TokenUsage::reasoning_output_tokens` is separate from `output_tokens` because
+Codex counts it separately and folding it in would lose the distinction
+irreversibly.
+
+Headroom is a `Utilization`, not a pair of integers: Codex reports a percentage
+with no absolute counts, and Claude reports only whether it is still serving.
+Collapsing both into `used`/`limit` would mean inventing numbers. An absolute
+limit of zero reads as *unknown*, never as exhausted.
 
 Two Claude-specific traps the codec already absorbs: `modelUsage` is camelCase
 where its sibling `usage` is snake_case (getting it wrong silently zeroes every
@@ -106,6 +151,17 @@ let records = check_session_with(session.as_mut(), &["go"], &|_| {
 }).await?;
 ```
 
+`Step::Stall` makes an agent go quiet mid-turn; pause the clock with
+`#[tokio::test(start_paused = true)]` so the wait is free. `Step::UseHordeTool`
+models the orchestrator verbs of DESIGN.md §5 — a spawn-child intent reaches the
+adapter as an ordinary tool call.
+
+`Script::misbehaving(..)` makes the fake break the contract on purpose. That is
+how the conformance suite's own checks are tested: five tests assert the suite
+*rejects* an adapter that skips `SessionEstablished`, never ends a turn, ends one
+twice, repeats a chunk index, or renames its session mid-conversation. A check
+that has never been shown to fail is not known to work.
+
 `with_capabilities` narrows what the fake claims, so a test can stand up the
 honestly-terminal, non-resumable provider DESIGN.md §5 has to cope with and check
 the orchestrator respects the limit instead of assuming every provider behaves
@@ -124,6 +180,25 @@ source for a child process's stdout and keeps the rest.
 
 Adding a transcript to that directory automatically enrols it in the conformance
 suite; nothing needs listing by hand.
+
+Recordings can only prove the codec matched the CLI on the day they were taken.
+`tests/live_smoke.rs` drives the **real** binary and is `#[ignore]`d, so it never
+runs in a normal suite:
+
+```sh
+cargo test -p horde-adapter-claude --test live_smoke -- --ignored --nocapture
+```
+
+Run it when bumping the supported CLI version. If it fails, capture a fresh
+transcript rather than loosening the parser to accept both shapes.
+
+## Revival identity
+
+A session id alone cannot revive a Claude agent. Sessions live *inside*
+`CLAUDE_CONFIG_DIR`, so `RevivalIdentity` pairs the id with the account
+directory it was recorded under, and `is_resumable_under` refuses a mismatch
+instead of surfacing an authentication error that looks like an outage. Journal
+both halves together.
 
 ## Not here yet
 

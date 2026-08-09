@@ -26,6 +26,7 @@ fn counts_window() -> RateWindow {
         window_length: None,
         resets_at: None,
         used_fraction: None,
+        allowed: None,
     }
 }
 
@@ -40,13 +41,24 @@ fn fraction_window() -> RateWindow {
         window_length: None,
         resets_at: None,
         used_fraction: Some(0.42),
+        allowed: None,
+    }
+}
+
+/// Claude-shaped: no quantity at all, only "still serving".
+fn allowed_only_window() -> RateWindow {
+    RateWindow {
+        allowed: Some(true),
+        used_fraction: None,
+        ..fraction_window()
     }
 }
 
 #[test]
-fn rate_window_round_trips_both_reporting_shapes() {
+fn rate_window_round_trips_all_three_reporting_shapes() {
     round_trip(&counts_window());
     round_trip(&fraction_window());
+    round_trip(&allowed_only_window());
 }
 
 #[test]
