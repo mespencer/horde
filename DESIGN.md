@@ -101,14 +101,14 @@ The entire agent-facing mental model fits in a paragraph of system prompt: *you 
 
 ### Model selection for spawned agents
 
-Agents request a **tier**, not a brand. Provider-agnostic tiers (working set: `fast` / `standard` / `deep`) map to concrete provider+model pairs in config, resolved through the standard precedence chain:
+Agents request a **tier**, not a brand. Tiers are user-defined config keys (shipped defaults: `fast` / `standard` / `deep`; define as many as you like), each mapping to a set of candidate (provider, model) pairs — multiplied by available accounts into concrete options. The tier itself is resolved through the standard precedence chain:
 
 1. **Spawn args** — explicit tier, or a concrete provider/model (concrete requests are subject to permission policy, so "always use my provider" bias is containable)
 2. **Agent-type definition** (repo `.horde/`: "the reviewer runs `deep`")
 3. **Session defaults** — set at `horde new` ("everything in this session runs on codex")
 4. **Workspace / user-global tier mappings**
 
-Unspecified = inherit the spawner's tier. Within a tier's candidate mappings, the scheduler picks by account rate-limit headroom. Rationale: letting spawners name concrete models invites provider self-bias and couples prompts to today's model names; tiers keep agent definitions portable while explicit override + session pinning preserve full control.
+Unspecified = inherit the spawner's tier. Within a tier, the scheduler picks the concrete option with the most **headroom**: adapter-reported rate-limit state where the provider exposes it (Claude Code does), otherwise Horde's own metering against a per-account declared quota model (window length + budget) — every token flows through Horde, so it is never blind. The binding is made once, at spawn, and held for the agent's life (revival resumes the same provider session); rebalancing happens across new spawns, never by migrating live agents. Rationale: letting spawners name concrete models invites provider self-bias and couples prompts to today's model names; tiers keep agent definitions portable while explicit override + session pinning preserve full control.
 
 ### Agent-facing surface: one MCP endpoint
 
