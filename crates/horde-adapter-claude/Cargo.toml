@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
-description = "placeholder"
+description = "Claude Code stream-json codec: wire types, turn assembly, usage normalization, and the permission-prompt contract."
 
 [lints]
 workspace = true
+
+[dependencies]
+horde-adapter = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
