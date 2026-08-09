@@ -47,6 +47,18 @@ pub fn transcript_dir() -> PathBuf {
 }
 
 /// A recorded harness session.
+///
+/// ```
+/// use horde_testkit::transcripts::Transcript;
+///
+/// let transcript = Transcript::load("02-multi-turn.jsonl")?;
+///
+/// // Three user messages went in, and the capture splits into three turns —
+/// // a turn runs up to and including its `result` envelope.
+/// assert_eq!(transcript.inbound.len(), 3);
+/// assert_eq!(transcript.turns().len(), 3);
+/// # Ok::<(), horde_testkit::TranscriptError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct Transcript {
     pub name: String,

@@ -20,6 +20,22 @@ pub struct ProposedToolCall {
 }
 
 /// Horde's answer to a [`ProposedToolCall`].
+///
+/// ```
+/// use horde_adapter::PermissionDecision;
+/// use serde_json::json;
+///
+/// // Permitting a call as proposed.
+/// let allowed = PermissionDecision::allow();
+/// assert!(allowed.is_allow() && allowed.updated_input().is_none());
+///
+/// // Narrowing it: the harness runs these arguments, not the model's.
+/// let narrowed = PermissionDecision::allow_with(json!({ "path": "/workspace" }));
+/// assert_eq!(narrowed.updated_input(), Some(&json!({ "path": "/workspace" })));
+///
+/// let refused = PermissionDecision::deny("outside the workspace");
+/// assert!(!refused.is_allow());
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionDecision {
     /// Let the call proceed.

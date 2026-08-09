@@ -94,6 +94,20 @@ impl Sub for TokenUsage {
 /// changed since last time. Because a harness restart resets its own counters,
 /// a total that moved backwards is treated as a new accumulation epoch rather
 /// than as negative usage.
+///
+/// ```
+/// use horde_adapter::{TokenUsage, UsageAccumulator};
+///
+/// let tokens = |output| TokenUsage { output_tokens: output, ..TokenUsage::default() };
+/// let mut accumulator = UsageAccumulator::new();
+///
+/// // The harness reports lifetime totals, so each reading includes the last.
+/// assert_eq!(accumulator.observe(tokens(451), 0.0037).tokens.output_tokens, 451);
+/// assert_eq!(accumulator.observe(tokens(654), 0.0063).tokens.output_tokens, 203);
+///
+/// // A replacement process starts its counters over; that is not negative usage.
+/// assert_eq!(accumulator.observe(tokens(41), 0.0011).tokens.output_tokens, 41);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct UsageAccumulator {
     previous_tokens: TokenUsage,

@@ -11,6 +11,23 @@ use crate::wire::{Envelope, Event};
 
 /// Decodes one line of the harness's stdout.
 ///
+/// ```
+/// use horde_adapter_claude::codec::decode_line;
+/// use horde_adapter_claude::wire::Event;
+///
+/// let envelope = decode_line(
+///     r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-haiku-4-5"}"#,
+/// )?;
+/// assert!(matches!(envelope.event, Event::Init(_)));
+///
+/// // An event type from a newer CLI decodes rather than failing the session,
+/// // and keeps its raw form so nothing is lost.
+/// let future = decode_line(r#"{"type":"invented_later","payload":7}"#)?;
+/// assert!(matches!(future.event, Event::Unknown { .. }));
+/// assert_eq!(future.raw["payload"], 7);
+/// # Ok::<(), horde_adapter::AdapterError>(())
+/// ```
+///
 /// An envelope whose `type` this crate does not model decodes to
 /// [`Event::Unknown`] with its raw form intact. Only malformed JSON, or an
 /// envelope whose known shape fails to parse, is an error — the first means the

@@ -81,6 +81,24 @@ impl ScriptedTurn {
 }
 
 /// A whole scripted conversation.
+///
+/// ```
+/// use horde_adapter_fake::{Script, ScriptedTurn, Step};
+/// use serde_json::json;
+///
+/// let script = Script::of(vec![
+///     ScriptedTurn::saying("looking into it").with_step(Step::AskPermission {
+///         tool_call_id: "call-1".to_owned(),
+///         tool_name: "Bash".to_owned(),
+///         input: json!({ "command": "docker rm horde-test" }),
+///     }),
+///     ScriptedTurn::saying("done"),
+/// ]);
+///
+/// // The turn holding the AskPermission blocks until a decision arrives, which
+/// // is what lets a test exercise the permission chain for real.
+/// assert_eq!(script.turns.len(), 2);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Script {
     pub turns: Vec<ScriptedTurn>,

@@ -66,6 +66,18 @@ impl Capability {
 }
 
 /// The set of capabilities one adapter claims.
+///
+/// ```
+/// use horde_adapter::{Capabilities, Capability};
+///
+/// let claimed = Capabilities::none()
+///     .with(Capability::Resumable)
+///     .with(Capability::PermissionPrompt);
+///
+/// assert!(claimed.supports(Capability::Resumable));
+/// // Anything unclaimed must be refused rather than silently no-oped.
+/// assert!(!claimed.supports(Capability::RewritesToolInput));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
     supported: BTreeSet<Capability>,
