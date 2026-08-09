@@ -1,0 +1,15 @@
+[package]
+name = "horde-testkit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Shared test infrastructure: golden transcript loading and the adapter conformance suite."
+
+[lints]
+workspace = true
+
+[dependencies]
+horde-adapter = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

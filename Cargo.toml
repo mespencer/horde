@@ -1,13 +1,32 @@
-# MINIMAL root manifest for the W1b (proto contracts) worktree.
+# MINIMAL root manifest, shared by the W1b (proto contracts) and W2b (adapter
+# core) worktrees.
 #
 # W1a owns the real workspace scaffold (full member list, shared dependency
-# table, toolchain pin, gauntlet crate). This file exists so `crates/horde-proto`
-# builds and can be shown to pass the lint policy from docs/TESTING.md §4; the
+# table, toolchain pin, gauntlet crate). This file exists so the crates below
+# build and can be shown to pass the lint policy from docs/TESTING.md §4; the
 # orchestrator resolves this file in favour of W1a's version at merge, keeping
-# only `crates/horde-proto` in `members`.
+# only the `members` entries each branch added.
 [workspace]
 resolver = "3"
-members = ["crates/horde-proto"]
+members = [
+    "crates/horde-adapter",
+    "crates/horde-adapter-claude",
+    "crates/horde-adapter-fake",
+    "crates/horde-proto",
+    "crates/horde-testkit",
+]
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false }
+
+horde-adapter = { path = "crates/horde-adapter" }
+horde-adapter-claude = { path = "crates/horde-adapter-claude" }
+horde-adapter-fake = { path = "crates/horde-adapter-fake" }
+horde-testkit = { path = "crates/horde-testkit" }
 
 # docs/TESTING.md §4. Reproduced here (not invented here) so the generated code
 # is verified against the real policy rather than assumed compatible with it.
