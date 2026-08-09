@@ -1,0 +1,48 @@
+--- crates/horde-adapter-codex/src/turn.rs
++++ replace TurnAssembler::item_completed -> Vec<AgentEvent> with vec![Default::default()]
+@@ -202,44 +202,17 @@
+                 }
+             }
+ 
+             Notification::ThreadStatusChanged(_) | Notification::Other { .. } => Vec::new(),
+         }
+     }
+ 
+     fn item_completed(&mut self, item: &Item) -> Vec<AgentEvent> {
+-        let Some(turn) = self.turn.as_mut() else {
+-            return Vec::new();
+-        };
+-
+-        if item.is_final_answer() {
+-            // The steer trap: this may be the second final answer of one turn.
+-            // Both are kept; `close_turn` takes the last, because after a steer
+-            // the answer to the steer is the turn's answer.
+-            if let Some(text) = item.text.clone() {
+-                turn.final_answers.push(text);
+-            }
+-            return Vec::new();
+-        }
+-
+-        if item.is_command_execution() {
+-            let turn_id = turn.id.clone();
+-            let is_error = item.exit_code.is_some_and(|code| code != 0)
+-                || item.status.as_deref() == Some("failed");
+-            return vec![AgentEvent::ToolCompleted {
+-                turn_id,
+-                // Codex numbers its own items; there is no separate tool-call
+-                // id, so the item id is the identity.
+-                tool_call_id: horde_adapter::ToolCallId::new(item.id.clone().unwrap_or_default()),
+-                is_error,
+-            }];
+-        }
+-
+-        Vec::new()
++        vec![Default::default()] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Adds a per-turn usage reading, once.
+     ///
+     /// Idempotent per `(turnId, itemId)` — here the reading itself is the item,
+     /// so a replayed reading for a turn already counted is dropped.
+     fn record_usage(&mut self, turn_id: Option<&str>, counts: Option<&TokenCounts>) {
+         let (Some(turn_id), Some(counts)) = (turn_id, counts) else {

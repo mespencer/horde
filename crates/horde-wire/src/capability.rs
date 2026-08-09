@@ -35,7 +35,7 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
     match capability {
         Capability::Resumable => Some(AdapterCapability::Resumable),
         Capability::InterruptibleTurn => Some(AdapterCapability::Interruptible),
-        Capability::SteerAtTurnBoundary => Some(AdapterCapability::Steerable),
+        Capability::AmendActiveTurn => Some(AdapterCapability::Steerable),
 
         // The domain models the capability; the wire's PERMISSION_PROMPT_TOOL
         // names one provider's mechanism and is deprecated in favour of this.
@@ -80,7 +80,7 @@ pub fn capability_from_wire(value: i32) -> Result<Option<Capability>, UnknownCap
         AdapterCapability::Unspecified => None,
         AdapterCapability::Resumable => Some(Capability::Resumable),
         AdapterCapability::Interruptible => Some(Capability::InterruptibleTurn),
-        AdapterCapability::Steerable => Some(Capability::SteerAtTurnBoundary),
+        AdapterCapability::Steerable => Some(Capability::AmendActiveTurn),
         AdapterCapability::ToolCallGating => Some(Capability::PreAuthorizeToolCalls),
         AdapterCapability::ToolInputRewrite => Some(Capability::RewritesToolInput),
 
@@ -197,11 +197,10 @@ mod tests {
         // Codex cannot pre-authorize tool calls (ADR-0005). It expresses that
         // by not advertising the capability — there is no negative flag, and a
         // reader must treat absence as "cannot", not "unknown".
-        let codex: Vec<AdapterCapability> =
-            [Capability::Resumable, Capability::SteerAtTurnBoundary]
-                .into_iter()
-                .filter_map(capability_to_wire)
-                .collect();
+        let codex: Vec<AdapterCapability> = [Capability::Resumable, Capability::AmendActiveTurn]
+            .into_iter()
+            .filter_map(capability_to_wire)
+            .collect();
 
         assert!(!codex.contains(&AdapterCapability::ToolCallGating));
         assert!(codex.contains(&AdapterCapability::Steerable));

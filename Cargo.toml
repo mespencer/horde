@@ -1,5 +1,8 @@
 [workspace]
 resolver = "3"
+# A glob, not a list: every crate under crates/ is a member, so a new crate
+# joins by existing rather than by remembering to edit this line. The gauntlet
+# measures whatever `cargo metadata` reports, so the two cannot drift.
 members = ["crates/*"]
 
 [workspace.package]

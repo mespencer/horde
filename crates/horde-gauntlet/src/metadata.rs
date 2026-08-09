@@ -5,6 +5,8 @@
 //! Parsing the JSON here (rather than depending on a metadata crate) keeps the
 //! whole path testable from a captured fixture.
 
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 /// One workspace member and the targets a structural check applies to.
@@ -16,6 +18,11 @@ pub struct WorkspacePackage {
     pub has_lib: bool,
     /// Names of the package's binary targets.
     pub bins: Vec<String>,
+    /// Directory holding the package's `Cargo.toml`.
+    ///
+    /// Tools that take a directory rather than a package name — cargo-crap's
+    /// `--path`, for one — are narrowed by pointing them here.
+    pub manifest_dir: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +36,7 @@ struct Package {
     id: String,
     name: String,
     targets: Vec<Target>,
+    manifest_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +84,11 @@ fn package_targets(package: &Package) -> WorkspacePackage {
         name: package.name.clone(),
         has_lib,
         bins,
+        manifest_dir: package
+            .manifest_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
     }
 }
 
@@ -94,6 +107,7 @@ mod tests {
                 name: "horde-gauntlet".to_owned(),
                 has_lib: true,
                 bins: vec!["gauntlet".to_owned()],
+                manifest_dir: PathBuf::from("/repo/crates/horde-gauntlet"),
             }]
         );
     }
@@ -102,8 +116,8 @@ mod tests {
     fn non_member_packages_are_excluded() {
         let json = r#"{
             "packages": [
-                {"id": "mine", "name": "mine", "targets": [{"kind": ["lib"], "name": "mine"}]},
-                {"id": "theirs", "name": "theirs", "targets": [{"kind": ["lib"], "name": "theirs"}]}
+                {"id": "mine", "name": "mine", "manifest_path": "/repo/crates/mine/Cargo.toml", "targets": [{"kind": ["lib"], "name": "mine"}]},
+                {"id": "theirs", "name": "theirs", "manifest_path": "/repo/crates/theirs/Cargo.toml", "targets": [{"kind": ["lib"], "name": "theirs"}]}
             ],
             "workspace_members": ["mine"]
         }"#;
@@ -116,8 +130,8 @@ mod tests {
     fn packages_are_sorted_so_gate_output_is_stable() {
         let json = r#"{
             "packages": [
-                {"id": "b", "name": "zulu", "targets": []},
-                {"id": "a", "name": "alpha", "targets": []}
+                {"id": "b", "name": "zulu", "manifest_path": "/repo/crates/zulu/Cargo.toml", "targets": []},
+                {"id": "a", "name": "alpha", "manifest_path": "/repo/crates/alpha/Cargo.toml", "targets": []}
             ],
             "workspace_members": ["a", "b"]
         }"#;
@@ -129,7 +143,7 @@ mod tests {
     #[test]
     fn build_scripts_and_test_targets_are_not_libs_or_bins() {
         let json = r#"{
-            "packages": [{"id": "a", "name": "a", "targets": [
+            "packages": [{"id": "a", "name": "a", "manifest_path": "/repo/crates/a/Cargo.toml", "targets": [
                 {"kind": ["custom-build"], "name": "build-script-build"},
                 {"kind": ["test"], "name": "integration"},
                 {"kind": ["example"], "name": "demo"}
@@ -145,7 +159,7 @@ mod tests {
     fn proc_macro_and_rlib_crates_count_as_libraries() {
         for kind in ["rlib", "proc-macro", "cdylib", "dylib"] {
             let json = format!(
-                r#"{{"packages": [{{"id": "a", "name": "a", "targets": [{{"kind": ["{kind}"], "name": "a"}}]}}], "workspace_members": ["a"]}}"#
+                r#"{{"packages": [{{"id": "a", "name": "a", "manifest_path": "/repo/crates/a/Cargo.toml", "targets": [{{"kind": ["{kind}"], "name": "a"}}]}}], "workspace_members": ["a"]}}"#
             );
             let packages = parse_workspace_packages(&json).expect("valid");
             assert!(packages[0].has_lib, "{kind} should count as a library");
@@ -155,7 +169,7 @@ mod tests {
     #[test]
     fn every_binary_target_is_listed() {
         let json = r#"{
-            "packages": [{"id": "a", "name": "a", "targets": [
+            "packages": [{"id": "a", "name": "a", "manifest_path": "/repo/crates/a/Cargo.toml", "targets": [
                 {"kind": ["bin"], "name": "one"},
                 {"kind": ["bin"], "name": "two"}
             ]}],

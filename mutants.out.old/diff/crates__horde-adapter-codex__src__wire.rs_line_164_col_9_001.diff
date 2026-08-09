@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ replace Item::is_final_answer -> bool with false
+@@ -156,17 +156,17 @@
+     pub status: Option<String>,
+     #[serde(rename = "exitCode", default)]
+     pub exit_code: Option<i64>,
+ }
+ 
+ impl Item {
+     #[must_use]
+     pub fn is_final_answer(&self) -> bool {
+-        self.kind == "agentMessage" && self.phase.as_deref() == Some("final_answer")
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     #[must_use]
+     pub fn is_command_execution(&self) -> bool {
+         self.kind == "commandExecution"
+     }
+ }
+ 

@@ -110,11 +110,15 @@ mod harness {
 }
 ```
 
-That states what the helpers already are and costs nothing. Rewriting helpers to avoid
-`expect` also works but is a workaround for a misdiagnosis. What must **not** happen is
-a `#![allow(clippy::expect_used)]` at the top of the file: the policy is that `expect` is
-fine in tests, and the wrapper expresses exactly that, whereas a blanket allow also
-covers any non-test code that later lands in the file.
+That is the canonical fix. It states what the helpers already are, it runs under the
+unmodified deny-list, and it costs one line. Rewriting helpers to be assertion-based so
+they never need `expect` is an acceptable alternative — it is what W1b did — but it is
+not required, and reaching for it because `expect` seems banned is treating a
+misdiagnosis as a constraint.
+
+What must **not** happen is `#![allow(clippy::expect_used)]` at the top of the file. The
+policy is that `expect` is fine *in tests*; the `cfg(test)` wrapper says exactly that,
+whereas a blanket allow also covers any non-test code that later lands in the file.
 
 **Local.** `gauntlet run clippy`, or
 `cargo clippy --all-targets --all-features -- -D warnings`.
@@ -174,8 +178,22 @@ may exceed cyclomatic complexity 15 even when perfectly covered, and an untested
 may not exceed about three branches. That is exactly the combination agent-written code
 drifts toward — a long function with a plausible happy-path test.
 
-**Local.** `gauntlet run crap` (it runs `coverage` first, because scoring against a stale
-LCOV is not a measurement). Directly:
+**The coverage dependency is load-bearing, not an optimisation.** cargo-crap without
+`--lcov` scores every function as 0% covered — its own help calls that "not a real CRAP
+run" — and the output still looks like a report. Worse, an LCOV that exists but records
+nothing makes cargo-crap exit *zero* while producing exactly the same lie, so nothing
+downstream notices. The gate therefore reads the LCOV itself before scoring and reports
+`error` if it is missing or records no instrumented lines, rather than passing on a
+number that is complexity wearing CRAP's name.
+
+**Narrowing is by directory.** cargo-crap has no `--package`; it analyses `--path`,
+which defaults to its working directory. `gauntlet run crap -p <crate>` therefore runs
+cargo-crap *in* that crate's directory, resolved through `cargo metadata`. Naming two
+packages is refused rather than quietly widened back to the whole workspace — measuring
+more than was asked for is how a narrowed run comes to report other people's findings.
+
+**Local.** `gauntlet run crap` (it runs `coverage` first, because scoring against a
+missing or stale LCOV is not a measurement). Directly:
 `cargo crap --workspace --lcov target/quality/lcov.info --threshold 15`.
 
 **The one exclusion.** `build.rs` is excluded, because a build script runs at compile
@@ -324,10 +342,17 @@ one of those stays green when the code under it is quietly wrong, and every one 
 is exactly what a surviving mutant points at. A mutation that stays green is a finding,
 not a relief.
 
-**Scope.** Diff-scoping keeps the gate fast enough to run on every change; the fallback
-when there is no diff (or no `main`) is the *whole tree*, which is the stricter choice, so
-a missing branch can never quietly shrink the gate to nothing. Timeouts live in
-`.cargo/mutants.toml`.
+**Scope, and why it does not grow with the workspace.** The diff is taken against the
+merge-base with `main`, and merging `main` into a branch *moves* that merge-base to
+`main`'s tip. So the diff is always only the branch's own work, and the mutant count
+tracks what this branch changed rather than how large the workspace has become: nine
+crates and 567 tests still produce ~440 mutants of gauntlet code, because that is what
+this branch touched. Main growing does not slow this gate down; it only costs more the
+day someone edits the grown parts, which is exactly when it should.
+
+The fallback when there is no diff (or no `main`) is the *whole tree*, which is the
+stricter choice, so a missing branch can never quietly shrink the gate to nothing.
+Timeouts live in `.cargo/mutants.toml`; `--jobs` lives in the gate.
 
 **No exclusions.** `.cargo/mutants.toml` has no `exclude_re`. Skipping a function because
 its mutants survive is how a mutation gate becomes decorative. If a function cannot be

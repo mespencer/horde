@@ -61,7 +61,7 @@ impl FakeAdapter {
             capabilities: Capabilities::none()
                 .with(Capability::Resumable)
                 .with(Capability::InterruptibleTurn)
-                .with(Capability::SteerAtTurnBoundary)
+                .with(Capability::AmendActiveTurn)
                 .with(Capability::PreAuthorizeToolCalls)
                 .with(Capability::RewritesToolInput)
                 .with(Capability::SystemPromptOverlay)

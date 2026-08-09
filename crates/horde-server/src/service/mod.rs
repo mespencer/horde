@@ -1,0 +1,67 @@
+//! The gRPC service spines.
+//!
+//! Both services are thin: they validate, translate, and then read or write the
+//! log. No state lives here that is not either derived from the log or
+//! explicitly documented as not yet durable (see [`commands`]).
+
+pub mod commands;
+pub mod control_plane;
+pub mod worker;
+
+pub use commands::CommandQueues;
+pub use control_plane::ControlPlane;
+pub use worker::WorkerFacing;
+
+use std::sync::Arc;
+
+use crate::log::EventLog;
+use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
+
+/// Everything the two services share.
+///
+/// One value, cloned into both, so there is no question of them disagreeing
+/// about which log or which registry they are talking to.
+#[derive(Clone)]
+pub struct ServerCore {
+    pub log: EventLog,
+    pub workers: WorkerRegistry,
+    pub commands: CommandQueues,
+    pub scheduler: Arc<dyn Scheduler>,
+}
+
+impl ServerCore {
+    /// Builds a core around a log, with the bootstrap single-worker scheduler.
+    #[must_use]
+    pub fn new(log: EventLog) -> Self {
+        let workers = WorkerRegistry::new();
+        let scheduler = Arc::new(SingleWorkerScheduler::new(workers.clone()));
+        Self {
+            log,
+            workers,
+            commands: CommandQueues::new(),
+            scheduler,
+        }
+    }
+
+    /// Replaces the scheduler. Wave 4 swaps in the real one here.
+    #[must_use]
+    pub fn with_scheduler(mut self, scheduler: Arc<dyn Scheduler>) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+}
+
+impl std::fmt::Debug for ServerCore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerCore")
+            .field("workers", &self.workers.connected().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// This build's semver, echoed in every handshake.
+pub const SERVER_SEMVER: &str = env!("CARGO_PKG_VERSION");
+
+/// Below this, a peer's role is refused outright (DESIGN.md §2).
+pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";

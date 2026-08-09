@@ -260,6 +260,7 @@ mod tests {
             name: name.to_owned(),
             has_lib,
             bins: bins.iter().map(|bin| (*bin).to_owned()).collect(),
+            manifest_dir: std::path::PathBuf::from("/repo/crates").join(name),
         }
     }
 

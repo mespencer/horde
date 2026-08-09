@@ -1,0 +1,27 @@
+--- crates/horde-adapter-codex/src/turn.rs
++++ replace TurnAssembler::feed -> Vec<AgentEvent> with vec![Default::default()]
+@@ -86,23 +86,17 @@
+         match self.turn.as_mut() {
+             Some(turn) => turn.interrupt_requested = true,
+             None => self.interrupt_pending = true,
+         }
+     }
+ 
+     /// Feeds one frame, returning the events it produced.
+     pub fn feed(&mut self, frame: &Frame) -> Vec<AgentEvent> {
+-        match frame {
+-            Frame::Notification(notification) => self.feed_notification(notification),
+-            // Responses correlate to requests the Worker made and carry nothing
+-            // the event stream needs; server requests are approvals, which
+-            // Codex does not send (ADR-0005).
+-            Frame::Response { .. } | Frame::ServerRequest { .. } => Vec::new(),
+-        }
++        vec![Default::default()] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn feed_notification(&mut self, notification: &Notification) -> Vec<AgentEvent> {
+         match notification {
+             Notification::ThreadStarted(started) => {
+                 let id = started
+                     .thread
+                     .as_ref()

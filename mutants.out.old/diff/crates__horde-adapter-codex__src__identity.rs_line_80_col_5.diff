@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/identity.rs
++++ replace codex_home_for -> Option<PathBuf> with None
+@@ -72,17 +72,17 @@
+ }
+ 
+ /// Resolves an account name to the `CODEX_HOME` it runs under.
+ ///
+ /// A Worker-level resource (DESIGN.md §4): accounts are directories the Worker
+ /// owns and advertises as a capability.
+ #[must_use]
+ pub fn codex_home_for(account: Option<&ProviderAccount>, accounts_root: &Path) -> Option<PathBuf> {
+-    account.map(|account| accounts_root.join(account.as_str()))
++    None /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use std::path::{Path, PathBuf};
+ 
+     use horde_adapter::{ProviderAccount, ProviderSessionId};
+ 
