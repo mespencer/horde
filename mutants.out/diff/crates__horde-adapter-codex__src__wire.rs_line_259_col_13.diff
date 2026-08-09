@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ delete match arm "item/completed" in Notification::classify
+@@ -251,17 +251,17 @@
+         };
+ 
+         match method {
+             "thread/started" => parse(params).map_or_else(other, Self::ThreadStarted),
+             "thread/status/changed" => parse(params).map_or_else(other, Self::ThreadStatusChanged),
+             "turn/started" => parse(params).map_or_else(other, Self::TurnStarted),
+             "turn/completed" => parse(params).map_or_else(other, Self::TurnCompleted),
+             "item/agentMessage/delta" => parse(params).map_or_else(other, Self::AgentMessageDelta),
+-            "item/completed" => parse(params).map_or_else(other, Self::ItemCompleted),
++             /* ~ changed by cargo-mutants ~ */
+             "thread/tokenUsage/updated" => {
+                 parse(params).map_or_else(other, Self::TokenUsageUpdated)
+             }
+             "account/rateLimits/updated" => {
+                 parse(params).map_or_else(other, Self::RateLimitsUpdated)
+             }
+             _ => other(),
+         }

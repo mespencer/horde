@@ -301,3 +301,143 @@ impl TurnAssembler {
         })]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use horde_adapter::{AgentEvent, TurnStatus};
+    use serde_json::json;
+
+    use super::TurnAssembler;
+    use crate::codec::decode_line;
+
+    fn feed(assembler: &mut TurnAssembler, frame: serde_json::Value) -> Vec<AgentEvent> {
+        let decoded = decode_line(&frame.to_string()).expect("test frames are well formed");
+        assembler.feed(&decoded)
+    }
+
+    fn open_turn(assembler: &mut TurnAssembler) {
+        feed(
+            assembler,
+            json!({"method":"thread/started","params":{"thread":{"id":"t1"}}}),
+        );
+        feed(
+            assembler,
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-1"}}}),
+        );
+    }
+
+    fn status(kind: &str) -> serde_json::Value {
+        json!({"method":"thread/status/changed","params":{"status":{"type":kind}}})
+    }
+
+    /// Only `idle` ends an interrupted turn. An `active` status arriving after
+    /// the interrupt must not close it early, or output still in flight is
+    /// attributed to a turn that already ended.
+    #[test]
+    fn a_non_idle_status_does_not_close_an_interrupted_turn() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        assembler.note_interrupt_requested();
+
+        let events = feed(&mut assembler, status("active"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnded(_))),
+            "only idle ends an interrupted turn"
+        );
+
+        let events = feed(&mut assembler, status("idle"));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnded(_))),
+            "idle must end it"
+        );
+    }
+
+    fn command_item(status: &str, exit_code: Option<i64>) -> serde_json::Value {
+        let mut item = json!({
+            "type": "commandExecution",
+            "id": "exec-1",
+            "command": "/bin/zsh -lc 'echo hi'",
+            "status": status,
+        });
+        if let Some(code) = exit_code {
+            item["exitCode"] = json!(code);
+        }
+        json!({"method":"item/completed","params":{"item": item}})
+    }
+
+    fn tool_error(assembler: &mut TurnAssembler, frame: serde_json::Value) -> Option<bool> {
+        feed(assembler, frame)
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolCompleted { is_error, .. } => Some(is_error),
+                _ => None,
+            })
+    }
+
+    /// A command is failed if it exited non-zero **or** the harness said so.
+    /// Both halves are load-bearing: Codex reports `status: "failed"` for a
+    /// sandbox denial that never produced an exit code at all.
+    #[test]
+    fn a_command_fails_on_a_bad_exit_code_or_a_failed_status() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        assert_eq!(
+            tool_error(&mut assembler, command_item("completed", Some(0))),
+            Some(false),
+            "exit 0 and completed is a success"
+        );
+        assert_eq!(
+            tool_error(&mut assembler, command_item("completed", Some(6))),
+            Some(true),
+            "a non-zero exit is a failure even when the status says completed"
+        );
+        assert_eq!(
+            tool_error(&mut assembler, command_item("failed", None)),
+            Some(true),
+            "a failed status is a failure even with no exit code — the sandbox-denial shape"
+        );
+    }
+
+    /// Items that are not command executions produce no tool event.
+    #[test]
+    fn a_non_command_item_is_not_reported_as_a_tool() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"item/completed",
+                   "params":{"item":{"type":"userMessage","id":"u1"}}}),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCompleted { .. })),
+            "a user message is not a tool call"
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_reports_its_recorded_duration() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"turn/completed",
+                   "params":{"turn":{"id":"turn-1","durationMs":6101}}}),
+        );
+        let ended = events.into_iter().find_map(|event| match event {
+            AgentEvent::TurnEnded(outcome) => Some(outcome),
+            _ => None,
+        });
+        let ended = ended.expect("turn/completed closes the turn");
+        assert_eq!(ended.status, TurnStatus::Completed);
+        assert_eq!(ended.duration.as_millis(), 6101);
+    }
+}

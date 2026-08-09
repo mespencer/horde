@@ -168,6 +168,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remaining_turns_counts_down_as_the_recording_drains() {
+        let mut session = ReplaySession::new(one_turn());
+        assert_eq!(session.remaining_turns(), 1);
+
+        session
+            .send(TurnInput::queued("hi"))
+            .await
+            .expect("replays");
+        assert_eq!(session.remaining_turns(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_discards_the_rest_of_the_recording() {
+        let mut session = ReplaySession::new(one_turn());
+        session.shutdown().await.expect("shutdown is infallible");
+
+        assert_eq!(session.remaining_turns(), 0, "the recording is dropped");
+        assert!(
+            session.next_event().await.expect("no error").is_none(),
+            "and so are any events that had not been drained"
+        );
+        // A shut-down session is finished, not merely quiet.
+        assert!(session.send(TurnInput::queued("hi")).await.is_err());
+    }
+
+    #[tokio::test]
     async fn the_thread_id_becomes_available_once_a_turn_has_replayed() {
         let mut session = ReplaySession::new(one_turn());
         assert!(session.provider_session_id().is_none());

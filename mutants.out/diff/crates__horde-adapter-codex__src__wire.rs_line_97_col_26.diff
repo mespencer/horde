@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ replace == with != in ThreadStatus::is_idle
+@@ -89,17 +89,17 @@
+ pub struct StatusBody {
+     #[serde(rename = "type")]
+     pub kind: String,
+ }
+ 
+ impl ThreadStatus {
+     #[must_use]
+     pub fn is_idle(&self) -> bool {
+-        self.status.kind == "idle"
++        self.status.kind != /* ~ changed by cargo-mutants ~ */ "idle"
+     }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Deserialize)]
+ pub struct TurnRef {
+     #[serde(rename = "threadId", default)]
+     pub thread_id: Option<String>,
+     pub turn: TurnBody,

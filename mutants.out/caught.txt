@@ -1,0 +1,61 @@
+crates/horde-adapter-codex/src/lib.rs:78:5: replace capabilities -> Capabilities with Default::default()
+crates/horde-adapter-codex/src/codec.rs:59:5: replace encode_turn_start -> String with String::new()
+crates/horde-adapter-codex/src/codec.rs:59:5: replace encode_turn_start -> String with "xyzzy".into()
+crates/horde-adapter-codex/src/codec.rs:76:5: replace encode_steer -> String with String::new()
+crates/horde-adapter-codex/src/codec.rs:76:5: replace encode_steer -> String with "xyzzy".into()
+crates/horde-adapter-codex/src/codec.rs:92:5: replace encode_interrupt -> String with String::new()
+crates/horde-adapter-codex/src/codec.rs:92:5: replace encode_interrupt -> String with "xyzzy".into()
+crates/horde-adapter-codex/src/codec.rs:96:5: replace request -> String with String::new()
+crates/horde-adapter-codex/src/codec.rs:96:5: replace request -> String with "xyzzy".into()
+crates/horde-adapter-codex/src/identity.rs:60:9: replace RevivalIdentity::is_resumable_under -> bool with true
+crates/horde-adapter-codex/src/identity.rs:60:9: replace RevivalIdentity::is_resumable_under -> bool with false
+crates/horde-adapter-codex/src/identity.rs:60:36: replace == with != in RevivalIdentity::is_resumable_under
+crates/horde-adapter-codex/src/identity.rs:70:9: replace RevivalIdentity::sessions_dir -> Option<PathBuf> with None
+crates/horde-adapter-codex/src/identity.rs:70:9: replace RevivalIdentity::sessions_dir -> Option<PathBuf> with Some(Default::default())
+crates/horde-adapter-codex/src/identity.rs:80:5: replace codex_home_for -> Option<PathBuf> with None
+crates/horde-adapter-codex/src/identity.rs:80:5: replace codex_home_for -> Option<PathBuf> with Some(Default::default())
+crates/horde-adapter-codex/src/replay.rs:53:9: replace ReplaySession::remaining_turns -> usize with 0
+crates/horde-adapter-codex/src/replay.rs:53:9: replace ReplaySession::remaining_turns -> usize with 1
+crates/horde-adapter-codex/src/replay.rs:57:9: replace ReplaySession::drain_turn -> Result<()> with Ok(())
+crates/horde-adapter-codex/src/replay.rs:69:9: replace <impl AgentSession for ReplaySession>::provider_session_id -> Option<&ProviderSessionId> with None
+crates/horde-adapter-codex/src/replay.rs:76:9: replace <impl AgentSession for ReplaySession>::send -> Result<()> with Ok(())
+crates/horde-adapter-codex/src/replay.rs:83:9: replace <impl AgentSession for ReplaySession>::next_event -> Result<Option<AgentEvent>> with Ok(None)
+crates/horde-adapter-codex/src/replay.rs:95:9: replace <impl AgentSession for ReplaySession>::answer_permission -> Result<()> with Ok(())
+crates/horde-adapter-codex/src/replay.rs:105:9: replace <impl AgentSession for ReplaySession>::interrupt -> Result<()> with Ok(())
+crates/horde-adapter-codex/src/replay.rs:110:9: replace <impl AgentSession for ReplaySession>::shutdown -> Result<()> with Ok(())
+crates/horde-adapter-codex/src/turn.rs:76:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with None
+crates/horde-adapter-codex/src/turn.rs:86:9: replace TurnAssembler::note_interrupt_requested with ()
+crates/horde-adapter-codex/src/turn.rs:94:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-codex/src/turn.rs:104:9: replace TurnAssembler::feed_notification -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-codex/src/turn.rs:192:58: replace match guard status.is_idle() with true in TurnAssembler::feed_notification
+crates/horde-adapter-codex/src/turn.rs:192:58: replace match guard status.is_idle() with false in TurnAssembler::feed_notification
+crates/horde-adapter-codex/src/turn.rs:139:34: replace += with -= in TurnAssembler::feed_notification
+crates/horde-adapter-codex/src/turn.rs:139:34: replace += with *= in TurnAssembler::feed_notification
+crates/horde-adapter-codex/src/turn.rs:210:9: replace TurnAssembler::item_completed -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-codex/src/turn.rs:227:17: replace || with && in TurnAssembler::item_completed
+crates/horde-adapter-codex/src/turn.rs:226:67: replace != with == in TurnAssembler::item_completed
+crates/horde-adapter-codex/src/turn.rs:227:43: replace == with != in TurnAssembler::item_completed
+crates/horde-adapter-codex/src/turn.rs:245:9: replace TurnAssembler::record_usage with ()
+crates/horde-adapter-codex/src/turn.rs:252:12: delete ! in TurnAssembler::record_usage
+crates/horde-adapter-codex/src/turn.rs:259:29: replace != with == in TurnAssembler::record_usage
+crates/horde-adapter-codex/src/turn.rs:275:9: replace TurnAssembler::close_turn -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-codex/src/wire.rs:97:9: replace ThreadStatus::is_idle -> bool with true
+crates/horde-adapter-codex/src/wire.rs:97:9: replace ThreadStatus::is_idle -> bool with false
+crates/horde-adapter-codex/src/wire.rs:97:26: replace == with != in ThreadStatus::is_idle
+crates/horde-adapter-codex/src/wire.rs:164:9: replace Item::is_final_answer -> bool with true
+crates/horde-adapter-codex/src/wire.rs:164:9: replace Item::is_final_answer -> bool with false
+crates/horde-adapter-codex/src/wire.rs:164:37: replace && with || in Item::is_final_answer
+crates/horde-adapter-codex/src/wire.rs:164:19: replace == with != in Item::is_final_answer
+crates/horde-adapter-codex/src/wire.rs:164:62: replace == with != in Item::is_final_answer
+crates/horde-adapter-codex/src/wire.rs:169:9: replace Item::is_command_execution -> bool with true
+crates/horde-adapter-codex/src/wire.rs:169:9: replace Item::is_command_execution -> bool with false
+crates/horde-adapter-codex/src/wire.rs:169:19: replace == with != in Item::is_command_execution
+crates/horde-adapter-codex/src/wire.rs:246:13: replace Notification::classify::parse -> Option<T> with None
+crates/horde-adapter-codex/src/wire.rs:254:13: delete match arm "thread/started" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:255:13: delete match arm "thread/status/changed" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:256:13: delete match arm "turn/started" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:257:13: delete match arm "turn/completed" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:258:13: delete match arm "item/agentMessage/delta" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:259:13: delete match arm "item/completed" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:260:13: delete match arm "thread/tokenUsage/updated" in Notification::classify
+crates/horde-adapter-codex/src/wire.rs:263:13: delete match arm "account/rateLimits/updated" in Notification::classify

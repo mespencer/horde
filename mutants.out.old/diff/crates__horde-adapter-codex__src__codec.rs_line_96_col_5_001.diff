@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/codec.rs
++++ replace request -> String with "xyzzy".into()
+@@ -88,17 +88,17 @@
+ ///
+ /// The caller must not then wait for `turn/completed`; see [`crate::turn`].
+ #[must_use]
+ pub fn encode_interrupt(id: u64, thread_id: &str) -> String {
+     request(id, "turn/interrupt", json!({ "threadId": thread_id }))
+ }
+ 
+ fn request(id: u64, method: &str, params: Value) -> String {
+-    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
++    "xyzzy".into() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use serde_json::{Value, json};
+ 
+     use super::{decode_line, encode_interrupt, encode_steer, encode_turn_start};
+     use crate::wire::{Frame, Notification};

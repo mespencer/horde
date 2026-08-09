@@ -1,0 +1,24 @@
+--- crates/horde-adapter-codex/src/turn.rs
++++ replace TurnAssembler::note_interrupt_requested with ()
+@@ -78,20 +78,17 @@
+ 
+     /// Records that an interrupt was sent, so the next `thread/status → idle`
+     /// is read as a cancellation rather than an ordinary quiet moment.
+     ///
+     /// Without this the assembler cannot tell the two apart: `idle` is also
+     /// what a thread reports between turns, and Codex emits no distinct
+     /// "aborted" frame.
+     pub fn note_interrupt_requested(&mut self) {
+-        match self.turn.as_mut() {
+-            Some(turn) => turn.interrupt_requested = true,
+-            None => self.interrupt_pending = true,
+-        }
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Feeds one frame, returning the events it produced.
+     pub fn feed(&mut self, frame: &Frame) -> Vec<AgentEvent> {
+         match frame {
+             Frame::Notification(notification) => self.feed_notification(notification),
+             // Responses correlate to requests the Worker made and carry nothing
+             // the event stream needs; server requests are approvals, which
