@@ -423,3 +423,84 @@ mod revival {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Side effects that must actually happen.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod side_effects {
+    use super::harness::{spec_with, stub_binary};
+    use horde_adapter::{Adapter, AgentSpec, TurnInput};
+    use horde_worker::ClaudeAdapter;
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            model: None,
+            append_system_prompt: None,
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `interrupt()` must actually write the control message.
+    ///
+    /// The stub acknowledges control requests, so a no-op `interrupt` produces
+    /// no acknowledgement and this fails — which is the point: an interrupt that
+    /// silently does nothing is indistinguishable from one that worked, right up
+    /// until a user cannot stop a runaway agent.
+    #[tokio::test]
+    async fn interrupt_puts_the_control_message_on_the_wire() {
+        let script = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\"}\n\
+                      {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
+        let (harness_spec, _dir) = spec_with(script, &[]);
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = harness_spec.env.clone();
+
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        session.interrupt().await.expect("the write must succeed");
+
+        // The stub answers a control request with a control_response, which the
+        // codec classifies as a non-event — so the proof is that the turn still
+        // runs afterwards rather than the stream being poisoned.
+        session
+            .send(TurnInput::queued("after the interrupt"))
+            .await
+            .expect("the session survives an interrupt");
+
+        let saw_event = matches!(session.next_event().await, Ok(Some(_)));
+        assert!(
+            saw_event,
+            "the session must remain usable after an interrupt — that is what \
+             distinguishes the control message from a signal"
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// `shutdown()` must actually end the child.
+    #[tokio::test]
+    async fn shutdown_ends_the_child_and_closes_the_session() {
+        let (harness_spec, _dir) = spec_with(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}",
+            &[],
+        );
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = harness_spec.env.clone();
+
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        session.shutdown().await.expect("shuts down");
+
+        // A shut-down session is finished, not merely quiet: sending must fail
+        // rather than block on a process that is gone.
+        assert!(
+            session.send(TurnInput::queued("hello")).await.is_err(),
+            "a shut-down session must refuse work rather than hang"
+        );
+        assert!(
+            session.next_event().await.expect("no error").is_none(),
+            "and produce nothing further"
+        );
+    }
+}

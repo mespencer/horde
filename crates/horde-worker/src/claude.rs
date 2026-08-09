@@ -261,3 +261,97 @@ impl AgentSession for LiveClaudeSession {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use horde_adapter::{Adapter, AgentSpec, Capability};
+
+    use super::ClaudeAdapter;
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            model: None,
+            append_system_prompt: None,
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The flags W1c established as the minimum for a usable stream.
+    ///
+    /// `--verbose` is the one that bites: without it alongside `-p`, the harness
+    /// collapses the stream to a final message and the turn cannot be watched at
+    /// all. Pinned here because losing it degrades silently — output still
+    /// arrives, just never incrementally.
+    #[test]
+    fn the_base_flags_keep_the_stream_watchable() {
+        let args = ClaudeAdapter::new().base_args(&spec());
+
+        for required in [
+            "-p",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ] {
+            assert!(
+                args.iter().any(|a| a == required),
+                "{required} is required for a usable stream; got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overlay_is_appended_and_the_model_is_named() {
+        let args = ClaudeAdapter::new().base_args(&AgentSpec {
+            model: Some("haiku".to_owned()),
+            append_system_prompt: Some("overlay text".to_owned()),
+            ..spec()
+        });
+
+        // Appended, never replacing: the harness's own prompt is what makes its
+        // tools work, so there is deliberately no --system-prompt path.
+        let joined = args.join(" ");
+        assert!(joined.contains("--append-system-prompt overlay text"));
+        assert!(joined.contains("--model haiku"));
+        assert!(
+            !joined.contains("--system-prompt "),
+            "replacing the harness prompt would break its tools"
+        );
+    }
+
+    /// The permission seam: absent by default, present when configured.
+    #[test]
+    fn the_permission_prompt_tool_is_opt_in() {
+        let plain = ClaudeAdapter::new().base_args(&spec());
+        assert!(
+            !plain.iter().any(|a| a == "--permission-prompt-tool"),
+            "no endpoint means no flag, not an empty one"
+        );
+
+        let mut wired = ClaudeAdapter::new();
+        wired.permission_prompt_tool = Some("mcp__horde__approve".to_owned());
+        let args = wired.base_args(&spec());
+        assert!(args.iter().any(|a| a == "mcp__horde__approve"));
+    }
+
+    #[test]
+    fn the_adapter_reports_the_provider_key_the_wire_contract_uses() {
+        assert_eq!(ClaudeAdapter::new().provider(), "claude");
+    }
+
+    /// The adapter must pass the codec's measured capabilities through
+    /// unchanged — a supervisor that reported its own guess would let callers
+    /// rely on something no spike ever demonstrated.
+    #[test]
+    fn capabilities_come_from_the_codec_not_from_the_supervisor() {
+        let claimed = ClaudeAdapter::new().capabilities();
+
+        assert_eq!(claimed, horde_adapter_claude::capabilities());
+        assert!(claimed.supports(Capability::Resumable));
+        assert!(claimed.supports(Capability::PreAuthorizeToolCalls));
+    }
+}

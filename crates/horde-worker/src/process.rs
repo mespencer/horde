@@ -196,3 +196,44 @@ impl SupervisedHarness {
         self.child.id()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SupervisorError;
+
+    /// The messages an operator reads when a harness will not start.
+    ///
+    /// Worth pinning: a supervisor whose errors all render the same is one an
+    /// operator cannot act on, and `Display` is the only place the distinction
+    /// between "never started" and "died" survives.
+    #[test]
+    fn each_failure_explains_itself_distinctly() {
+        let spawn = SupervisorError::Spawn {
+            program: "claude".to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        }
+        .to_string();
+        assert!(spawn.contains("claude") && spawn.contains("no such file"));
+
+        assert!(
+            SupervisorError::MissingPipe("stdout")
+                .to_string()
+                .contains("stdout")
+        );
+
+        let with_code = SupervisorError::Exited { code: Some(3) }.to_string();
+        assert!(with_code.contains('3'), "the status is the diagnosis");
+
+        let without = SupervisorError::Exited { code: None }.to_string();
+        assert!(
+            without.contains("without a status"),
+            "a signal death has no code and must say so rather than print a fake one"
+        );
+
+        assert!(
+            SupervisorError::Io(std::io::Error::other("pipe broke"))
+                .to_string()
+                .contains("pipe broke")
+        );
+    }
+}
