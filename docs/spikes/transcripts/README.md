@@ -1,31 +1,60 @@
-# W2c transcripts — driving Codex
+# W1c golden transcripts — `claude` stream-json
 
-Raw wire recordings from the W2c spike (`codex-cli 0.145.0`, macOS arm64,
-ChatGPT Pro login). Findings and the verdict live in `../codex-driving.md`.
+Raw captures from spike W1c ([findings](../claude-stream-json.md)). Recorded against
+**Claude Code 2.1.226** on macOS (Darwin 25.3.0) on 2026-08-09, model `haiku`
+(`claude-haiku-4-5-20251001`) except where noted.
 
-Files 01–11 and 14 record the **app-server** protocol via `drive.py` / the Rust
-probe: each line is `{"dir": "in"|"out", "t": <unix seconds>, "msg": <JSON-RPC
-frame>}`, where `out` is client→Codex. Files 12–13 record **`codex exec
---json`**, whose output is plain JSONL with no envelope — a different and much
-thinner schema.
+Nothing has been redacted. A scan for credential-shaped strings found none; the
+transcripts do contain absolute paths under the spike worktree and base64
+`thinking` signatures, both of which are wire-format artifacts worth keeping.
 
-| File | What it shows |
-|---|---|
-| `01-initialize.jsonl` | `initialize` handshake; NDJSON framing confirmed |
-| `02-free-probes.jsonl` | `model/list`, `account/rateLimits/read`, `account/read`, `mcpServerStatus/list`, `permissionProfile/list` — everything answerable without a model turn |
-| `03-basic-turn.jsonl` | One full streamed turn: deltas, `thread/tokenUsage/updated`, `account/rateLimits/updated`, `turn/completed` |
-| `04-approval-echo-untrusted.jsonl` | `echo` under read-only + untrusted → ran, auto-approved, **no approval request** |
-| `05-approval-write-untrusted.jsonl` | in-cwd write, read-only + untrusted → blocked, model looped, no request |
-| `06-approval-write-granular.jsonl` | same with granular policy (all flags true) → no request |
-| `07-approval-network-onrequest.jsonl` | `curl` under workspace-write + on-request → **failed exit 6** (DNS blocked); denied, not escalated |
-| `08-approval-write-onrequest-workspacewrite.jsonl` | in-cwd write → succeeded exit 0 (permitted, so no escape) |
-| `09-approval-outside-workspace.jsonl` | write to `/private/tmp` → succeeded exit 0 (tmp is permitted) |
-| `10-approval-with-experimental-flags.jsonl` | `--enable exec_permission_approvals --enable request_permissions_tool` → still no request |
-| `11-interrupt.jsonl` | `turn/interrupt` mid-turn: 394 deltas still arrived afterwards, and the turn ended via `thread/status/changed → idle` with **no** `turn/completed` |
-| `12-exec-json.jsonl` | `codex exec --json` — only 4 event types, no streaming deltas |
-| `13-exec-resume.jsonl` | `codex exec resume <id>` in a fresh process — context survived, input tokens doubled from history replay |
-| `14-rust-probe.jsonl` | the same turn driven from Rust by `spikes/codex-probe` |
+These files exist to seed the adapter conformance suite: the Claude adapter should
+be replayable against them without a live API.
 
-Redaction: account email, account/installation ids, and the scratch session path
-are replaced; third-party MCP tool schemas are elided to a count. Nothing here
-contains credentials — `auth.json` was never read into a transcript.
+## Format
+
+Most files are JSON Lines where each line wraps one wire message with the direction
+and a capture timestamp:
+
+```json
+{"dir": "in" | "out", "t": 1786...  , "msg": { ...the actual stream-json envelope... }}
+```
+
+`dir: "in"` is a message the driver wrote to the child's **stdin**; `dir: "out"` is a
+line the child wrote to **stdout**. The one exception is `01-basic-turn.out.jsonl`,
+which is unwrapped raw stdout (no envelope) because it was captured with a shell
+pipe rather than the Python driver.
+
+`perm-*.jsonl` are logs from the stand-in permission MCP servers
+(`spikes/harness/permserver.py` for stdio, `permhttp.py` for HTTP), recording the
+JSON-RPC each received and the allow/deny decision it returned.
+
+## Scenarios
+
+| File | Scenario | Key evidence |
+|---|---|---|
+| `01-basic-turn.out.jsonl` | One user message, one result | Baseline event sequence; unwrapped raw stdout |
+| `02-multi-turn.jsonl` | Three user messages on **one** process | Context retained; one `result` per message; stable `session_id`; cumulative `total_cost_usd` |
+| `03-tool-use.jsonl` | Prompt that writes a file | `tool_use` block, matching `tool_result` user message, `tool_use_result` sidecar |
+| `04a-perm-deny.jsonl` | `--permission-prompt-tool` returns `deny` | Write suppressed; `is_error: true` tool_result; `permission_denials` populated in result |
+| `04b-perm-allow.jsonl` | Same, returns `allow` | Tool runs; file created |
+| `04c-perm-mutate.jsonl` | `allow` with rewritten `updatedInput` | Tool executes the **server's** input, not the model's |
+| `04d-perm-slow-180s.jsonl` | Permission server stalls 180 s before allowing | No timeout; turn completes; proves the human-approval leg |
+| `05-resume.jsonl` | `--resume` of the `02` session in a new process | Context survived process death |
+| `06-perm-http-deny.jsonl` | Permission tool served over **HTTP** MCP, returns `deny` | Interception is not stdio-only; Horde's per-agent endpoint can be an HTTP service |
+| `07a-interrupt-control.jsonl` | `control_request`/`interrupt` mid-turn | `control_response` ack, `aborted_streaming` result, **process stays usable** |
+| `07b-resume-after-interrupt.jsonl` | `--resume` of the interrupted session | Partial work retained in context |
+| `07c-interrupt-stdinclose.jsonl` | Closing stdin mid-turn | **Does not interrupt** — turn runs to completion, then exits |
+| `07d-interrupt-sigint.jsonl` | SIGINT mid-turn | Aborts the turn but also ends the process |
+| `08a-append-system-prompt.jsonl` | `--append-system-prompt` | Overlay honored in stream-json mode |
+| `08b-model-sonnet.jsonl` | `--model sonnet` | Model selection honored; note the second billed model in `modelUsage` |
+| `09-config-isolation.jsonl` | Fresh `CLAUDE_CONFIG_DIR` | Hard auth failure — credentials do not leak from the ambient config |
+| `10-partial-messages.jsonl` | `--include-partial-messages` | Token-level `stream_event` deltas for the TUI |
+| `11-probe-run.txt` | Console output of `spikes/claude-probe` | The Rust driver doing all of the above |
+
+## Reproducing
+
+The drivers live in `spikes/harness/`. All runs used
+`--setting-sources '' --strict-mcp-config` to suppress the operator's ambient
+settings, hooks, and MCP servers, so these captures reflect the protocol rather
+than one machine's configuration.

@@ -2,3 +2,5 @@
 /.claude/worktrees/
 **/*.log
 /gen/
+/spikes/*/target/
+/scratch/
