@@ -45,6 +45,16 @@ The server is remote-code-execution-as-a-service by design; the trust boundary i
 - **Revocation:** per-cert denylist by serial (`horde worker revoke <name>`).
 - No non-localhost binding before auth exists — auth is v1, not a follow-up.
 
+### Worker bootstrap over ssh (nice-to-have, post-v1 core)
+
+`horde worker up --ssh myles@host` composes existing primitives — it is client-side orchestration, not new protocol:
+
+1. Client mints a one-time enrollment code from the server.
+2. Client shells out to **system ssh** (so `~/.ssh/config`, keys, agent, and password prompts all behave normally), copies or downloads the right `horde-worker` binary for the target's os/arch, and runs `horde-worker join <server> --code <code>`.
+3. Installs a persistence unit (launchd/systemd user unit) so the worker survives reboots; `--foreground` for throwaway use.
+
+**Harness installation:** adapters carry an install recipe (brew/npm/curl per platform). A worker missing a harness advertises that as an installable capability; `horde worker install <worker> claude` (or `--install claude,codex` at bootstrap) runs the recipe worker-side. Note install ≠ auth: after install, provider login still runs through the interactive-auth relay (§4).
+
 ## 4. Providers and adapters
 
 A per-provider **adapter** trait: `spawn / send / stream / interrupt / resume`, plus capability flags (notably `resumable`).
@@ -88,6 +98,17 @@ Agents never think about transport. A **payload** = committed git ref and/or blo
 Design principle: **prefer the orchestrator observing what happened over agents declaring what happened.** Observed state doesn't drift.
 
 The entire agent-facing mental model fits in a paragraph of system prompt: *you have your own worktree; commit as you go; agents you spawn start from your latest commit; your commits ride your result automatically; attach files when the content isn't code.*
+
+### Model selection for spawned agents
+
+Agents request a **tier**, not a brand. Provider-agnostic tiers (working set: `fast` / `standard` / `deep`) map to concrete provider+model pairs in config, resolved through the standard precedence chain:
+
+1. **Spawn args** — explicit tier, or a concrete provider/model (concrete requests are subject to permission policy, so "always use my provider" bias is containable)
+2. **Agent-type definition** (repo `.horde/`: "the reviewer runs `deep`")
+3. **Session defaults** — set at `horde new` ("everything in this session runs on codex")
+4. **Workspace / user-global tier mappings**
+
+Unspecified = inherit the spawner's tier. Within a tier's candidate mappings, the scheduler picks by account rate-limit headroom. Rationale: letting spawners name concrete models invites provider self-bias and couples prompts to today's model names; tiers keep agent definitions portable while explicit override + session pinning preserve full control.
 
 ### Agent-facing surface: one MCP endpoint
 
@@ -147,7 +168,9 @@ Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), an
 
 **Sandboxing:** v1 relies on the harnesses' own sandboxes (CC/Codex: Seatbelt on macOS, Landlock/seccomp or bubblewrap-style on Linux). Orchestrator-level per-process sandbox profiles (writes confined to workspace, network allowlist), applied by the worker around the whole agent process, are a designed seam for later — that's what protects agents from *each other* on a shared worker.
 
-## 11. Client / TUI
+## 11. Clients (CLI and TUI)
+
+**CLI parity is a hard rule: the TUI is optional.** Every operation is a server RPC; the TUI and plain CLI subcommands are two frontends over the same client library, so anything the TUI can do has a scriptable `horde <verb>` equivalent (`horde sessions`, `horde spawn`, `horde approve <id>`, `horde workspace add`, …). This is also what makes "Claude Code as a client" work — a CC wrapper or MCP shim drives the same verbs. New capability = new RPC + CLI verb first; TUI surface second.
 
 - **Two zoom levels, one binary, same rendering machinery:** top-level multi-session view (`horde`) and per-session attach (`horde attach <session>`; `horde new` creates from cwd, auto-resolving the workspace — the CC-per-tmux-pane flow, nearly verbatim). Detach to overview and back without restarting.
 - **Attached to a session:** you see the top-level agent; prompts from anywhere in the tree bubble up CC-style, stamped with tree path.
@@ -185,7 +208,7 @@ Multi-repo workspaces: each repo's `.horde/` contributes namespaced definitions;
 7. Enrollment/mTLS, remote workers, scheduler with capabilities
 8. MCP hub; blob store; usage reporting; OTLP
 
-Deferred: raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobile clients, multi-user server, credential-less workers (relay-only git), Ollama.
+Deferred: raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobile clients, multi-user server, credential-less workers (relay-only git), Ollama, ssh worker bootstrap + harness install recipes.
 
 ## 15. Open questions
 
