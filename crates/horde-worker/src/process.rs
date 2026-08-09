@@ -76,6 +76,12 @@ pub struct SupervisedHarness {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+    /// The harness's own diagnostics, drained in the background.
+    ///
+    /// Drained rather than left in the pipe because a full stderr pipe blocks
+    /// the child — a harness that logs enough would deadlock against a
+    /// supervisor that never reads it.
+    stderr: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl SupervisedHarness {
@@ -92,9 +98,11 @@ impl SupervisedHarness {
             .args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // The harness's own diagnostics are not protocol and must never be
-            // parsed as such; the Worker surfaces them separately.
-            .stderr(Stdio::null())
+            // Piped, not null: the harness's diagnostics are not protocol and
+            // must never be parsed as such, but they are the only explanation a
+            // dead harness leaves behind. Discarding them turns every startup
+            // failure into "it exited" with no reason attached.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         for (key, value) in &spec.env {
@@ -120,11 +128,25 @@ impl SupervisedHarness {
             .stdout
             .take()
             .ok_or(SupervisorError::MissingPipe("stdout"))?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or(SupervisorError::MissingPipe("stderr"))?;
+
+        let stderr = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&stderr);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr_pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                sink.lock().await.push(line);
+            }
+        });
 
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
+            stderr,
         })
     }
 
@@ -158,6 +180,14 @@ impl SupervisedHarness {
     pub async fn kill(&mut self) -> Result<(), SupervisorError> {
         self.child.kill().await?;
         Ok(())
+    }
+
+    /// What the harness wrote to stderr so far.
+    ///
+    /// The per-agent log the Worker attaches to a failure: without it, a harness
+    /// that refused to start is indistinguishable from one that crashed.
+    pub async fn diagnostics(&self) -> Vec<String> {
+        self.stderr.lock().await.clone()
     }
 
     /// The OS process id, for diagnostics only.

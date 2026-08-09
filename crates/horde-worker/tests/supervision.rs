@@ -28,6 +28,15 @@ mod harness {
         path.join("stub-harness")
     }
 
+    /// A spec whose child gets extra environment, for scripting the stub.
+    pub fn spec_with(transcript: &str, extra: &[(&str, &str)]) -> (HarnessSpec, tempfile::TempDir) {
+        let (mut spec, dir) = spec_for(transcript);
+        for (key, value) in extra {
+            spec.env.push(((*key).to_owned(), (*value).to_owned()));
+        }
+        (spec, dir)
+    }
+
     pub fn spec_for(transcript: &str) -> (HarnessSpec, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("a scratch dir");
         let file = dir.path().join("transcript.jsonl");
@@ -170,19 +179,9 @@ mod live_session {
         let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
         adapter.accounts_root = None;
 
-        // The stub reads its script from the environment of its own process, so
-        // hand the binding through the spec the adapter builds.
-        unsafe {
-            std::env::set_var(
-                "HORDE_STUB_TRANSCRIPT",
-                harness_spec
-                    .env
-                    .iter()
-                    .find(|(k, _)| k == "HORDE_STUB_TRANSCRIPT")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default(),
-            );
-        }
+        // Per-child, never process-wide: setting it on this process would race
+        // every other test's spawn.
+        adapter.extra_env = harness_spec.env.clone();
 
         let spec = AgentSpec {
             model: Some("haiku".to_owned()),
@@ -216,5 +215,101 @@ mod live_session {
         );
 
         session.shutdown().await.expect("shutdown kills by handle");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The failure modes a supervisor must not have.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod failure_modes {
+    use super::harness::spec_with;
+    use horde_worker::SupervisedHarness;
+
+    /// An interrupt the harness never acknowledges must not hang the supervisor.
+    ///
+    /// The real hazard: `interrupt()` writes a control message, and a harness
+    /// that is wedged or dying never answers. A supervisor that waited for the
+    /// ack would hold the agent forever — so it must not wait for one.
+    #[tokio::test]
+    async fn an_unacknowledged_interrupt_does_not_block() {
+        let (spec, _dir) = spec_with(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"ok\"}",
+            &[("HORDE_STUB_IGNORE_INTERRUPT", "1")],
+        );
+
+        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let control =
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}"#;
+
+        // Writing must return regardless of whether anything answers.
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            harness.write_line(control),
+        )
+        .await;
+
+        assert!(
+            written.is_ok(),
+            "writing an interrupt must not wait on an acknowledgement"
+        );
+        harness.kill().await.expect("kill by handle");
+    }
+
+    /// A harness that exits mid-session is reported, not waited on.
+    #[tokio::test]
+    async fn an_exit_mid_session_surfaces_as_eof_and_a_status() {
+        let (spec, _dir) = spec_with(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"ok\"}",
+            &[
+                ("HORDE_STUB_EXIT_AFTER", "1"),
+                ("HORDE_STUB_EXIT_CODE", "3"),
+            ],
+        );
+
+        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        harness
+            .write_line("{\"type\":\"user\"}")
+            .await
+            .expect("writes");
+
+        // Drain to EOF — bounded, because a hang here is the bug under test.
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Ok(Some(_)) = harness.read_line().await {}
+            harness.wait().await
+        })
+        .await;
+
+        let status = drained.expect("a dead harness must not hang the reader");
+        assert_eq!(
+            status.ok().flatten(),
+            Some(3),
+            "the exit status is how the Worker explains the death"
+        );
+    }
+
+    /// stderr is captured, not discarded.
+    #[tokio::test]
+    async fn harness_diagnostics_are_kept_for_the_agent_log() {
+        // The stub writes to stderr when its script is missing, which is
+        // exactly the "refused to start" case an operator has to diagnose.
+        let (mut spec, _dir) = spec_with("{}", &[]);
+        spec.env.retain(|(k, _)| k != "HORDE_STUB_TRANSCRIPT");
+
+        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let _ = harness.read_line().await;
+        let _ = harness.wait().await;
+
+        // Give the drain task a moment to flush the pipe.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let diagnostics = harness.diagnostics().await;
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|l| l.contains("HORDE_STUB_TRANSCRIPT")),
+            "a harness that refused to start must leave its reason behind, got {diagnostics:?}"
+        );
     }
 }

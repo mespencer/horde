@@ -27,6 +27,12 @@ pub struct ClaudeAdapter {
     /// the next increment: the seam exists now so wiring it later is not a
     /// change to spawn logic.
     pub permission_prompt_tool: Option<String>,
+    /// Extra environment for every child this adapter spawns.
+    ///
+    /// Per-child, never process-wide. A supervisor that configured children by
+    /// setting its own variables would race every concurrent spawn — which is
+    /// precisely what happened when the tests tried it.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl ClaudeAdapter {
@@ -37,6 +43,7 @@ impl ClaudeAdapter {
             program: "claude".to_owned(),
             accounts_root: None,
             permission_prompt_tool: None,
+            extra_env: Vec::new(),
         }
     }
 
@@ -88,7 +95,7 @@ impl ClaudeAdapter {
         HarnessSpec {
             program: self.program.clone(),
             args,
-            env: Vec::new(),
+            env: self.extra_env.clone(),
             config_dir: horde_adapter_claude::identity::config_dir_for(
                 spec.account.as_ref(),
                 self.accounts_root
