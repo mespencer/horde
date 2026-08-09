@@ -6,24 +6,32 @@
 //! tested the only honest way, by running the real binary and inspecting what
 //! the operating system got back.
 
-use std::path::Path;
-use std::process::{Command, Output};
+use harness::{gauntlet, workspace};
 
-/// Runs the built binary in `cwd`.
-fn gauntlet(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_gauntlet"))
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("the gauntlet binary is built as a dependency of this test")
-}
+/// The `#[cfg(test)]` wrapper is what tells clippy these helpers are test code,
+/// which is where `expect` is permitted (`clippy.toml`); an integration test's
+/// free functions are not otherwise recognised as such.
+#[cfg(test)]
+mod harness {
+    use std::path::Path;
+    use std::process::{Command, Output};
 
-/// A throwaway directory containing a workspace manifest.
-fn workspace() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("temp dir");
-    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = []\n")
-        .expect("workspace manifest");
-    dir
+    /// Runs the built binary in `cwd`.
+    pub(crate) fn gauntlet(cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_gauntlet"))
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("the gauntlet binary is built as a dependency of this test")
+    }
+
+    /// A throwaway directory containing a workspace manifest.
+    pub(crate) fn workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("workspace manifest");
+        dir
+    }
 }
 
 #[test]
