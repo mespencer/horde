@@ -1,0 +1,355 @@
+//! Permission decisions, both directions.
+//!
+//! This is the conversion most worth owning in one place. A decision may
+//! *narrow* a tool call rather than merely permit it, and spike W1c proved
+//! Claude Code executes whatever arguments the permission tool returns — so a
+//! rewrite that quietly fails to cross the wire means the original, unnarrowed
+//! call runs. The failure mode is a silently widened permission, which is
+//! exactly the kind of thing that must be an error rather than a dropped field.
+//!
+//! The two sides also disagree about what an argument bag is. The domain uses
+//! `serde_json::Value`, which may be any JSON value; `google.protobuf.Struct`
+//! is specifically an object. That asymmetry is surfaced as
+//! [`ConversionError::NotAnObject`] rather than smoothed over.
+
+use horde_adapter::permission::PermissionDecision;
+use horde_proto::prost_types::value::Kind;
+use horde_proto::prost_types::{ListValue, Struct, Value as WireValue};
+use horde_proto::v1::{PermissionDecision as WirePermissionDecision, PermissionOutcome};
+use serde_json::{Map, Number, Value as JsonValue};
+
+/// Why a permission decision could not cross the seam.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversionError {
+    /// `updated_input` was not a JSON object, so it cannot be a `Struct`.
+    ///
+    /// Tool arguments are always a named bag in practice; a bare array or
+    /// scalar means the caller built something the wire cannot carry, and
+    /// truncating it would silently drop the narrowing.
+    NotAnObject,
+    /// A JSON number that has no `f64` representation — protobuf's `Struct`
+    /// has only doubles, so a `u64`/`i64` past 2^53 cannot round-trip exactly.
+    UnrepresentableNumber(String),
+    /// An outcome this build does not recognize, or `UNSPECIFIED`.
+    ///
+    /// Never guessed: defaulting an unknown outcome to allow would be a
+    /// security failure, and defaulting it to deny would silently stall agents
+    /// on a newer Server.
+    UnusableOutcome(i32),
+    /// The wire said ALLOW and carried replacement arguments the Worker's
+    /// adapter cannot apply.
+    ///
+    /// The proto documents reject-don't-drop for exactly this: an adapter
+    /// without the rewrite capability must refuse, so a narrowing that failed
+    /// to apply is never mistaken for one that took effect.
+    RewriteUnsupported,
+}
+
+impl core::fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotAnObject => write!(f, "updated_input must be a JSON object"),
+            Self::UnrepresentableNumber(n) => {
+                write!(f, "number {n} has no exact f64 representation")
+            }
+            Self::UnusableOutcome(v) => write!(f, "unusable PermissionOutcome {v}"),
+            Self::RewriteUnsupported => {
+                write!(f, "decision rewrites tool input but the adapter cannot")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ConversionError {}
+
+/// A double that represents `n` exactly, or an error.
+///
+/// Protobuf `Struct` has only doubles. An integer past 2^53 would come back a
+/// different number, and a permission decision that silently altered an
+/// argument is worse than one that failed loudly.
+fn exact_f64(n: &Number) -> Result<f64, ConversionError> {
+    let as_f64 = n
+        .as_f64()
+        .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;
+
+    if let Some(i) = n.as_i64()
+        && i128::from(i) != as_f64 as i128
+    {
+        return Err(ConversionError::UnrepresentableNumber(n.to_string()));
+    }
+    if let Some(u) = n.as_u64()
+        && u128::from(u) != as_f64 as u128
+    {
+        return Err(ConversionError::UnrepresentableNumber(n.to_string()));
+    }
+    Ok(as_f64)
+}
+
+fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {
+    let kind = match value {
+        JsonValue::Null => Kind::NullValue(0),
+        JsonValue::Bool(b) => Kind::BoolValue(*b),
+        JsonValue::Number(n) => Kind::NumberValue(exact_f64(n)?),
+        JsonValue::String(s) => Kind::StringValue(s.clone()),
+        JsonValue::Array(items) => Kind::ListValue(ListValue {
+            values: items.iter().map(json_to_wire).collect::<Result<_, _>>()?,
+        }),
+        JsonValue::Object(map) => Kind::StructValue(object_to_struct(map)?),
+    };
+    Ok(WireValue { kind: Some(kind) })
+}
+
+fn object_to_struct(map: &Map<String, JsonValue>) -> Result<Struct, ConversionError> {
+    let mut fields = std::collections::BTreeMap::new();
+    for (key, value) in map {
+        fields.insert(key.clone(), json_to_wire(value)?);
+    }
+    Ok(Struct { fields })
+}
+
+fn wire_to_json(value: &WireValue) -> JsonValue {
+    // An unset kind is an empty Value, which ProtoJSON reads as null.
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => JsonValue::Null,
+        Some(Kind::BoolValue(b)) => JsonValue::Bool(*b),
+        Some(Kind::NumberValue(n)) => number_from_wire(*n),
+        Some(Kind::StringValue(s)) => JsonValue::String(s.clone()),
+        Some(Kind::ListValue(list)) => {
+            JsonValue::Array(list.values.iter().map(wire_to_json).collect())
+        }
+        Some(Kind::StructValue(s)) => struct_to_json(s),
+    }
+}
+
+/// Reconstructs a JSON number from protobuf's only numeric type, a double.
+///
+/// `Struct` cannot represent integers, so `{"depth": 3}` arrives as `3.0`.
+/// Integral doubles are turned back into JSON integers because tool arguments
+/// are overwhelmingly integers — a harness handed `{"depth": 3.0}` may render
+/// or type-check it differently than the `{"depth": 3}` the chain intended.
+///
+/// The narrowing this cannot undo: a caller who genuinely meant the float
+/// `3.0` gets the integer `3` back. In JSON those are the same number, so the
+/// value is preserved even though the spelling is not. Magnitudes beyond
+/// 2^53 cannot survive the double at all, which is why the outbound direction
+/// rejects them rather than rounding.
+fn number_from_wire(n: f64) -> JsonValue {
+    const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+    if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {
+        #[allow(clippy::cast_possible_truncation)] // guarded by the check above
+        return JsonValue::Number(Number::from(n as i64));
+    }
+    Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)
+}
+
+fn struct_to_json(value: &Struct) -> JsonValue {
+    JsonValue::Object(
+        value
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), wire_to_json(v)))
+            .collect(),
+    )
+}
+
+/// Domain → wire.
+///
+/// Fills only what the domain owns: the outcome, the denial message, and any
+/// replacement arguments. `request_id`, `decided_by`, `decided_by_actor`, and
+/// `remember_for_session` belong to the Server that ran the permission chain
+/// and are left at their defaults for it to set.
+pub fn permission_decision_to_wire(
+    decision: &PermissionDecision,
+) -> Result<WirePermissionDecision, ConversionError> {
+    let (outcome, reason, updated_input) = match decision {
+        PermissionDecision::Allow { updated_input } => {
+            let rewritten = match updated_input {
+                Some(JsonValue::Object(map)) => Some(object_to_struct(map)?),
+                Some(_) => return Err(ConversionError::NotAnObject),
+                None => None,
+            };
+            (PermissionOutcome::Allow, String::new(), rewritten)
+        }
+        PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),
+    };
+
+    Ok(WirePermissionDecision {
+        outcome: outcome.into(),
+        reason,
+        updated_input,
+        ..WirePermissionDecision::default()
+    })
+}
+
+/// Wire → domain — the direction a Worker actually runs.
+///
+/// `can_rewrite_input` is the adapter's
+/// [`Capability::RewritesToolInput`](horde_adapter::Capability::RewritesToolInput)
+/// claim. When a decision carries replacement arguments and the adapter cannot
+/// apply them, this fails rather than downgrading to a plain allow.
+pub fn permission_decision_from_wire(
+    decision: &WirePermissionDecision,
+    can_rewrite_input: bool,
+) -> Result<PermissionDecision, ConversionError> {
+    let outcome = PermissionOutcome::try_from(decision.outcome)
+        .map_err(|_| ConversionError::UnusableOutcome(decision.outcome))?;
+
+    match outcome {
+        PermissionOutcome::Allow => match &decision.updated_input {
+            Some(rewritten) => {
+                if !can_rewrite_input {
+                    return Err(ConversionError::RewriteUnsupported);
+                }
+                Ok(PermissionDecision::allow_with(struct_to_json(rewritten)))
+            }
+            None => Ok(PermissionDecision::allow()),
+        },
+        PermissionOutcome::Deny => Ok(PermissionDecision::deny(decision.reason.clone())),
+        PermissionOutcome::Unspecified => Err(ConversionError::UnusableOutcome(decision.outcome)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConversionError, permission_decision_from_wire, permission_decision_to_wire};
+    use horde_adapter::permission::PermissionDecision;
+    use horde_proto::prost_types::Struct;
+    use horde_proto::v1::{PermissionDecision as WirePermissionDecision, PermissionOutcome};
+    use serde_json::json;
+
+    #[test]
+    fn a_narrowing_allow_round_trips_its_arguments() {
+        let narrowed = PermissionDecision::allow_with(json!({
+            "path": "/workspace/atlas",
+            "recursive": false,
+            "depth": 3,
+            "tags": ["a", "b"],
+            "nested": { "keep": null },
+        }));
+
+        let wire = permission_decision_to_wire(&narrowed).expect("object input converts");
+        let back = permission_decision_from_wire(&wire, true).expect("adapter can rewrite");
+
+        assert_eq!(back, narrowed, "the narrowing must survive both directions");
+    }
+
+    #[test]
+    fn a_bare_allow_stays_bare() {
+        let wire = permission_decision_to_wire(&PermissionDecision::allow()).expect("converts");
+        assert_eq!(wire.updated_input, None);
+        assert_eq!(
+            permission_decision_from_wire(&wire, false),
+            Ok(PermissionDecision::allow()),
+            "no rewrite means no capability is needed"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_is_refused_rather_than_dropped() {
+        // The whole point of the proto's reject-don't-drop note: silently
+        // discarding the replacement arguments would run the original call.
+        let wire =
+            permission_decision_to_wire(&PermissionDecision::allow_with(json!({"path": "/safe"})))
+                .expect("converts");
+
+        assert_eq!(
+            permission_decision_from_wire(&wire, false),
+            Err(ConversionError::RewriteUnsupported)
+        );
+    }
+
+    #[test]
+    fn a_denial_carries_its_message() {
+        let denial = PermissionDecision::deny("outside the workspace");
+        let wire = permission_decision_to_wire(&denial).expect("converts");
+
+        assert_eq!(wire.outcome, i32::from(PermissionOutcome::Deny));
+        assert_eq!(wire.reason, "outside the workspace");
+        assert_eq!(permission_decision_from_wire(&wire, true), Ok(denial));
+    }
+
+    #[test]
+    fn an_empty_rewrite_is_not_the_same_as_no_rewrite() {
+        // "Allow with no arguments" is a real instruction and must not decay
+        // into "allow as proposed".
+        let emptied = WirePermissionDecision {
+            outcome: PermissionOutcome::Allow.into(),
+            updated_input: Some(Struct::default()),
+            ..WirePermissionDecision::default()
+        };
+        let as_proposed = WirePermissionDecision {
+            outcome: PermissionOutcome::Allow.into(),
+            updated_input: None,
+            ..WirePermissionDecision::default()
+        };
+
+        assert_eq!(
+            permission_decision_from_wire(&emptied, true),
+            Ok(PermissionDecision::allow_with(json!({})))
+        );
+        assert_eq!(
+            permission_decision_from_wire(&as_proposed, true),
+            Ok(PermissionDecision::allow())
+        );
+        assert_ne!(
+            permission_decision_from_wire(&emptied, true),
+            permission_decision_from_wire(&as_proposed, true)
+        );
+    }
+
+    #[test]
+    fn integers_survive_the_double_only_representation() {
+        // protobuf Struct has no integer type. Integral values come back as
+        // integers rather than 3.0, because a harness handed {"depth": 3.0}
+        // may treat it differently from the {"depth": 3} the chain meant.
+        let wire = permission_decision_to_wire(&PermissionDecision::allow_with(
+            json!({ "depth": 3, "ratio": 0.5, "negative": -7 }),
+        ))
+        .expect("converts");
+
+        let back = permission_decision_from_wire(&wire, true).expect("converts back");
+        assert_eq!(
+            back.updated_input(),
+            Some(&json!({ "depth": 3, "ratio": 0.5, "negative": -7 }))
+        );
+    }
+
+    #[test]
+    fn an_integer_too_large_for_a_double_is_refused() {
+        // 2^53 + 1 cannot round-trip through a double. Silently altering an
+        // argument inside a permission decision is worse than failing.
+        let huge = PermissionDecision::allow_with(json!({ "id": 9_007_199_254_740_993_i64 }));
+        assert_eq!(
+            permission_decision_to_wire(&huge),
+            Err(ConversionError::UnrepresentableNumber(
+                "9007199254740993".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_non_object_rewrite_is_an_error_not_a_truncation() {
+        let bad = PermissionDecision::allow_with(json!(["not", "an", "object"]));
+        assert_eq!(
+            permission_decision_to_wire(&bad),
+            Err(ConversionError::NotAnObject)
+        );
+    }
+
+    #[test]
+    fn an_unusable_outcome_is_never_guessed() {
+        // Defaulting to allow would be a security failure; defaulting to deny
+        // would stall agents against a newer Server. Both are refused.
+        for outcome in [0, 9_999] {
+            let wire = WirePermissionDecision {
+                outcome,
+                ..WirePermissionDecision::default()
+            };
+            assert_eq!(
+                permission_decision_from_wire(&wire, true),
+                Err(ConversionError::UnusableOutcome(outcome))
+            );
+        }
+    }
+}

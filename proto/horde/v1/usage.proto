@@ -68,6 +68,17 @@ message RateWindow {
   // RateWindow carries whichever shape its provider actually reports, and may
   // carry both; consumers must handle a window with only one.
   optional double used_fraction = 7;
+
+  // Whether the provider is still serving requests, for providers that report
+  // nothing but that.
+  //
+  // Claude Code's rate-limit event is exactly this shape (spike W1c/W2c): a
+  // window name, a status, and a reset time, with no quantity in either other
+  // shape. Without this field that state has nowhere to land, and the only
+  // encodings available are lies — `used_fraction = 1.0` invents exhaustion,
+  // and absence claims the provider said nothing when it did say "still
+  // serving".
+  optional bool allowed = 8;
 }
 
 // One metered turn, attributable to an Agent and a Provider Account.

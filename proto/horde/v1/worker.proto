@@ -25,9 +25,13 @@ enum AdapterCapability {
   // Messages can be queued to the next turn boundary.
   ADAPTER_CAPABILITY_STEERABLE = 3;
 
-  // Permission decisions can be routed through Horde's MCP endpoint. Names a
-  // mechanism; TOOL_CALL_GATING below is the capability to match on.
-  ADAPTER_CAPABILITY_PERMISSION_PROMPT_TOOL = 4;
+  // Deprecated in favour of TOOL_CALL_GATING. Names one provider's *mechanism*
+  // (Claude's `--permission-prompt-tool` pointed at Horde's MCP endpoint)
+  // rather than the capability, so it cannot describe a harness that gates
+  // tool calls some other way. Kept at 4 and never renumbered; new
+  // advertisements should send TOOL_CALL_GATING instead, and matchers should
+  // read that.
+  ADAPTER_CAPABILITY_PERMISSION_PROMPT_TOOL = 4 [deprecated = true];
 
   // Proposed tool calls are surfaced for an external decision *before* they
   // execute — what the permission chain (DESIGN §10) needs in order to apply
