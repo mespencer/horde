@@ -4,3 +4,5 @@
 /gen/
 /spikes/*/target/
 /scratch/
+/mutants.out/
+**/mutants.out/
