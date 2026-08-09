@@ -10,8 +10,9 @@ description = "The Worker: supervises provider harnesses as child processes and 
 workspace = true
 
 [dependencies]
-# async-trait, horde-adapter and horde-adapter-claude return with the live
-# AgentSession impl; declaring them before then reds the machete gate.
+async-trait = { workspace = true }
+horde-adapter = { workspace = true }
+horde-adapter-claude = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]

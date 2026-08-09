@@ -22,6 +22,8 @@
 //! by pattern is how a supervisor reaches outside its own subtree and takes down
 //! something it did not start.
 
+pub mod claude;
 pub mod process;
 
+pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use process::{SupervisedHarness, SupervisorError};

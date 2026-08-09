@@ -405,6 +405,9 @@ dependencies = [
 name = "horde-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "horde-adapter",
+ "horde-adapter-claude",
  "horde-testkit",
  "serde_json",
  "tempfile",

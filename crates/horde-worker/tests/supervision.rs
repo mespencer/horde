@@ -147,3 +147,74 @@ async fn the_account_directory_reaches_the_child() {
     assert_eq!(spec.config_dir.as_deref(), Some(account.as_path()));
     harness.kill().await.expect("kill by handle");
 }
+
+// ---------------------------------------------------------------------------
+// The live session, driven end to end over a real child process.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod live_session {
+    use super::harness::{spec_for, stub_binary};
+    use horde_adapter::{Adapter, AgentEvent, AgentSpec, TurnInput, TurnStatus};
+    use horde_worker::ClaudeAdapter;
+
+    /// A whole turn, from spawn to `TurnEnded`, against a real child.
+    #[tokio::test]
+    async fn a_turn_streams_and_ends_through_a_real_process() {
+        let (harness_spec, _dir) = spec_for(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-1\",\"model\":\"haiku\"}\n\
+             {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"sess-1\",\"duration_ms\":7,\"result\":\"HORDE_OK\"}",
+        );
+
+        // Point the adapter at the stub: the tests must never touch the real CLI.
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.accounts_root = None;
+
+        // The stub reads its script from the environment of its own process, so
+        // hand the binding through the spec the adapter builds.
+        unsafe {
+            std::env::set_var(
+                "HORDE_STUB_TRANSCRIPT",
+                harness_spec
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == "HORDE_STUB_TRANSCRIPT")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default(),
+            );
+        }
+
+        let spec = AgentSpec {
+            model: Some("haiku".to_owned()),
+            append_system_prompt: Some("you are supervised".to_owned()),
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        let mut session = adapter.spawn(&spec).await.expect("the stub must spawn");
+        session
+            .send(TurnInput::queued("hello"))
+            .await
+            .expect("sends");
+
+        let mut ended = None;
+        while let Ok(Some(event)) = session.next_event().await {
+            if let AgentEvent::TurnEnded(outcome) = event {
+                ended = Some(outcome);
+                break;
+            }
+        }
+
+        let ended = ended.expect("the turn must end");
+        assert_eq!(ended.status, TurnStatus::Completed);
+        assert_eq!(
+            session.provider_session_id().map(ToString::to_string),
+            Some("sess-1".to_owned()),
+            "the revival identifier must reach the caller before anything is lost"
+        );
+
+        session.shutdown().await.expect("shutdown kills by handle");
+    }
+}
