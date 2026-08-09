@@ -44,6 +44,18 @@ enum AdapterCapability {
   // placement consult this flag so a high-trust Assignment can refuse to land
   // on an ungateable provider.
   ADAPTER_CAPABILITY_TOOL_CALL_GATING = 5;
+
+  // A permission decision may replace the tool's arguments, not merely permit
+  // or refuse the call.
+  //
+  // On the wire because the Server must know it *before* it emits a narrowing
+  // decision. A decision carrying `PermissionDecision.updated_input` toward a
+  // Worker that cannot apply one is rejected at the Worker (the field's own
+  // reject-don't-drop rule), so without this advertisement the Server only
+  // learns after the round trip and the Agent stalls on a decision that was
+  // never deliverable. Implies TOOL_CALL_GATING: arguments cannot be rewritten
+  // by a chain that never sees the call.
+  ADAPTER_CAPABILITY_TOOL_INPUT_REWRITE = 6;
 }
 
 // A provider harness on this Worker. Install is not auth: an installed harness
