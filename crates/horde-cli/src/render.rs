@@ -341,7 +341,7 @@ mod tests {
         event::Kind,
     };
 
-    use super::{Format, event, session, sessions};
+    use super::{Format, created, event, hello, sent, sequence, session, sessions, spawned};
 
     fn summary() -> SessionSummary {
         SessionSummary {
@@ -434,6 +434,245 @@ mod tests {
             serde_json::from_str(&event(&unknown, Format::Json)).expect("valid JSON");
         assert_eq!(parsed["kind"], "unknown");
         assert_eq!(parsed["sequence"], 7);
+    }
+
+    /// `kind_name` is a 13-arm match, so a partially covered one scores badly
+    /// however simple each arm is. Naming every kind here also makes an added
+    /// event kind fail this test rather than silently print as `unknown`.
+    #[test]
+    fn every_event_kind_has_a_wire_name() {
+        use horde_proto::v1::{
+            AgentLifecycleChanged, AgentSpawned, AssignmentSent, NoteSent, PermissionDecided,
+            PermissionRequested, ResultReported, SessionLifecycleChanged, TurnInterrupted,
+            UsageRecorded, WorkspaceInstanceChanged,
+        };
+
+        let cases: Vec<(Kind, &str)> = vec![
+            (
+                Kind::AgentOutputChunk(AgentOutputChunk::default()),
+                "agent_output_chunk",
+            ),
+            (Kind::AgentSpawned(AgentSpawned::default()), "agent_spawned"),
+            (
+                Kind::AssignmentSent(AssignmentSent::default()),
+                "assignment_sent",
+            ),
+            (Kind::NoteSent(NoteSent::default()), "note_sent"),
+            (
+                Kind::ResultReported(ResultReported::default()),
+                "result_reported",
+            ),
+            (
+                Kind::PermissionRequested(PermissionRequested::default()),
+                "permission_requested",
+            ),
+            (
+                Kind::PermissionDecided(PermissionDecided::default()),
+                "permission_decided",
+            ),
+            (
+                Kind::UsageRecorded(UsageRecorded::default()),
+                "usage_recorded",
+            ),
+            (
+                Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged::default()),
+                "workspace_instance_changed",
+            ),
+            (
+                Kind::AgentLifecycleChanged(AgentLifecycleChanged::default()),
+                "agent_lifecycle_changed",
+            ),
+            (
+                Kind::SessionLifecycleChanged(SessionLifecycleChanged::default()),
+                "session_lifecycle_changed",
+            ),
+            (
+                Kind::PlacementChanged(PlacementChanged::default()),
+                "placement_changed",
+            ),
+            (
+                Kind::TurnInterrupted(TurnInterrupted::default()),
+                "turn_interrupted",
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let rendered = event(&envelope(Some(kind)), Format::Human);
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} in {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_handshake_names_the_server_version_in_both_formats() {
+        let server = horde_proto::v1::ServerHello {
+            semver: "0.1.0".to_owned(),
+            capability_flags: vec!["payload.attachments".to_owned()],
+            min_supported_semver: "0.1.0".to_owned(),
+            server_time: None,
+            principal: String::new(),
+        };
+
+        let human = hello(&server, Format::Human);
+        assert!(human.contains("0.1.0") && human.contains("payload.attachments"));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&hello(&server, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["semver"], "0.1.0");
+    }
+
+    /// A server advertising nothing must not render an empty field that reads
+    /// like a truncated line.
+    #[test]
+    fn a_server_with_no_capability_flags_says_none() {
+        let server = horde_proto::v1::ServerHello {
+            semver: "0.1.0".to_owned(),
+            min_supported_semver: "0.1.0".to_owned(),
+            ..horde_proto::v1::ServerHello::default()
+        };
+        assert!(hello(&server, Format::Human).contains("none"));
+    }
+
+    #[test]
+    fn a_created_session_carries_the_root_agent_the_next_command_needs() {
+        let root = AgentId::new("root-1");
+
+        let human = created(&summary(), &root, Format::Human);
+        assert!(human.contains("root-1"), "got {human:?}");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&created(&summary(), &root, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["root_agent_id"], "root-1");
+        assert_eq!(parsed["session_id"], "s1", "the session fields survive too");
+    }
+
+    #[test]
+    fn an_assignment_reports_its_id_and_a_note_does_not() {
+        let assignment = horde_proto::v1::SendMessageResponse {
+            assignment_id: Some(horde_proto::v1::AssignmentId::new("a-1")),
+            session_id: Some(SessionId::new("s1")),
+            sequence: 4,
+        };
+        let human = sent(&assignment, Format::Human);
+        assert!(
+            human.contains('4') && human.contains("a-1"),
+            "got {human:?}"
+        );
+
+        // Only assignments owe a result, so only they get an id.
+        let note = horde_proto::v1::SendMessageResponse {
+            assignment_id: None,
+            session_id: Some(SessionId::new("s1")),
+            sequence: 5,
+        };
+        let human = sent(&note, Format::Human);
+        assert!(
+            human.contains('5') && !human.contains("assignment"),
+            "got {human:?}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&sent(&note, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["assignment_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_placed_spawn_names_its_worker() {
+        let response = horde_proto::v1::SpawnAgentResponse {
+            agent_id: Some(AgentId::new("agent-1")),
+            placement: Some(Placement {
+                agent_id: Some(AgentId::new("agent-1")),
+                state: PlacementState::Placed as i32,
+                worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
+                reason: String::new(),
+            }),
+        };
+
+        let human = spawned(&response, Format::Human);
+        assert!(
+            human.contains("agent-1") && human.contains("placed") && human.contains("worker-a")
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&spawned(&response, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["placement"], "placed");
+        assert_eq!(parsed["worker_id"], "worker-a");
+    }
+
+    /// A queued spawn without its reason is not actionable.
+    #[test]
+    fn a_queued_spawn_keeps_its_reason_in_both_formats() {
+        let response = horde_proto::v1::SpawnAgentResponse {
+            agent_id: Some(AgentId::new("agent-1")),
+            placement: Some(Placement {
+                agent_id: Some(AgentId::new("agent-1")),
+                state: PlacementState::Queued as i32,
+                worker_id: None,
+                reason: "no worker is connected".to_owned(),
+            }),
+        };
+
+        let human = spawned(&response, Format::Human);
+        assert!(human.contains("queued") && human.contains("no worker is connected"));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&spawned(&response, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["reason"], "no worker is connected");
+        assert_eq!(parsed["worker_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_spawn_with_no_placement_still_renders() {
+        let response = horde_proto::v1::SpawnAgentResponse {
+            agent_id: None,
+            placement: None,
+        };
+        assert!(spawned(&response, Format::Human).contains("unspecified"));
+    }
+
+    #[test]
+    fn an_acknowledgement_carries_the_position_a_caller_syncs_from() {
+        assert_eq!(
+            sequence("interrupted", 9, Format::Human),
+            "interrupted at 9"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&sequence("denied", 9, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["result"], "denied");
+        assert_eq!(parsed["sequence"], 9);
+    }
+
+    #[test]
+    fn every_placement_and_session_state_has_a_name() {
+        for (state, expected) in [
+            (PlacementState::Placed, "placed"),
+            (PlacementState::Queued, "queued"),
+            (PlacementState::Expired, "expired"),
+            (PlacementState::Cancelled, "cancelled"),
+            (PlacementState::Unspecified, "unspecified"),
+        ] {
+            assert_eq!(super::placement_state(state as i32), expected);
+        }
+        assert_eq!(super::placement_state(9999), "unspecified");
+
+        assert_eq!(
+            super::session_state(SessionLifecycleState::Archived as i32),
+            "archived"
+        );
+        assert_eq!(super::session_state(9999), "unspecified");
+    }
+
+    #[test]
+    fn a_session_with_no_title_does_not_render_a_trailing_gap() {
+        let untitled = SessionSummary {
+            title: String::new(),
+            ..summary()
+        };
+        let human = session(&untitled, Format::Human);
+        assert_eq!(human, human.trim_end(), "got {human:?}");
     }
 
     #[test]

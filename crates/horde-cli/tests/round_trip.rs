@@ -222,6 +222,68 @@ async fn a_reconnecting_client_resumes_without_duplicates_or_gaps() {
 
 /// Answering an escalation that is not outstanding must fail rather than
 /// silently succeed: a decision that went nowhere must never look applied.
+/// The returned sequence is the position a caller syncs from next, so a stub
+/// that returns a constant is worse than useless — mutation testing caught
+/// `Ok(0)` and `Ok(1)` surviving here.
+#[tokio::test]
+async fn interrupt_returns_the_log_position_it_wrote() {
+    let mut client = client().await.expect("a connected client");
+
+    let (summary, root) = client
+        .create_session("interrupt", "key-1")
+        .await
+        .expect("create");
+    let session_id = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .expect("an id");
+
+    let before = replay(&mut client, &session_id, 0).await.expect("replay");
+    let head_before = before.last().copied().unwrap_or(0);
+
+    let sequence = client
+        .interrupt(&root.to_string(), "changed my mind")
+        .await
+        .expect("interrupt");
+
+    assert_eq!(
+        sequence,
+        head_before + 1,
+        "the interrupt must report the position it actually appended at"
+    );
+    let after = replay(&mut client, &session_id, 0).await.expect("replay");
+    assert_eq!(after.last().copied(), Some(sequence));
+}
+
+/// Same contract for send: the sequence is what a caller resumes from.
+#[tokio::test]
+async fn send_returns_the_log_position_it_wrote() {
+    let mut client = client().await.expect("a connected client");
+
+    let (summary, root) = client
+        .create_session("send", "key-1")
+        .await
+        .expect("create");
+    let session_id = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .expect("an id");
+
+    let response = client
+        .send_note(&root.to_string(), "hello", DeliveryMode::TurnBoundary, "")
+        .await
+        .expect("send");
+
+    let seen = replay(&mut client, &session_id, 0).await.expect("replay");
+    assert_eq!(
+        seen.last().copied(),
+        Some(response.sequence),
+        "the reported sequence must be where the event actually landed"
+    );
+}
+
 #[tokio::test]
 async fn approving_an_unknown_request_is_refused() {
     let mut client = client().await.expect("a connected client");
