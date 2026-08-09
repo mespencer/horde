@@ -313,3 +313,113 @@ mod failure_modes {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Revival: a conversation outliving the process that started it.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod revival {
+    use super::harness::{spec_with, stub_binary};
+    use horde_adapter::{Adapter, AgentEvent, AgentSpec, ProviderSessionId, TurnInput};
+    use horde_worker::ClaudeAdapter;
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            model: None,
+            append_system_prompt: None,
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The handoff: a session id learned from one process is what revives the
+    /// conversation in the next.
+    ///
+    /// The stub replays the same script either way, so this does not prove the
+    /// model remembered anything — that is the live smoke's job. What it proves
+    /// is the supervisor's half: the id reaches the caller, `resume` spawns a
+    /// second process carrying it, and the revived session is usable.
+    #[tokio::test]
+    async fn a_session_id_from_one_process_revives_in_the_next() {
+        let script = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-42\",\"model\":\"haiku\"}\n\
+                      {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"sess-42\",\"duration_ms\":3,\"result\":\"first\"}";
+
+        let (harness_spec, _dir) = spec_with(script, &[]);
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = harness_spec.env.clone();
+
+        let mut first = adapter.spawn(&spec()).await.expect("spawns");
+        first.send(TurnInput::queued("hello")).await.expect("sends");
+        while let Ok(Some(event)) = first.next_event().await {
+            if matches!(event, AgentEvent::TurnEnded(_)) {
+                break;
+            }
+        }
+
+        let revival_id = first
+            .provider_session_id()
+            .cloned()
+            .expect("the id must reach the caller before the process can be lost");
+        assert_eq!(revival_id.to_string(), "sess-42");
+        first.shutdown().await.expect("shuts down");
+
+        // A second, independent process, carrying the id.
+        let mut revived = adapter
+            .resume(&spec(), &revival_id)
+            .await
+            .expect("resume spawns a fresh process");
+        revived
+            .send(TurnInput::queued("still there?"))
+            .await
+            .expect("the revived session is usable");
+
+        let mut saw_turn = false;
+        while let Ok(Some(event)) = revived.next_event().await {
+            if matches!(event, AgentEvent::TurnEnded(_)) {
+                saw_turn = true;
+                break;
+            }
+        }
+        assert!(saw_turn, "the revived session must run a turn");
+        revived.shutdown().await.expect("shuts down");
+    }
+
+    /// Resuming an id the harness has never heard of must fail loudly.
+    ///
+    /// Silently starting a fresh conversation is the dangerous alternative: the
+    /// agent looks alive and has lost everything it knew.
+    #[tokio::test]
+    async fn reviving_an_unknown_conversation_does_not_silently_start_a_new_one() {
+        // An empty script means the stub answers nothing and exits — which is
+        // what a harness does when `--resume` names a session it cannot find.
+        let (harness_spec, _dir) = spec_with("", &[]);
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = harness_spec.env.clone();
+
+        let mut revived = adapter
+            .resume(&spec(), &ProviderSessionId::new("sess-does-not-exist"))
+            .await
+            .expect("the process starts; the failure is in what it does next");
+        let _ = revived.send(TurnInput::queued("hello")).await;
+
+        // No events, and the stream ends — never an invented SessionEstablished.
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = revived.next_event().await {
+            events.push(event);
+        }
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SessionEstablished { .. })),
+            "a conversation that was not found must not be reported as established"
+        );
+        assert!(
+            revived.provider_session_id().is_none(),
+            "and no revival identity may be invented for it"
+        );
+    }
+}
