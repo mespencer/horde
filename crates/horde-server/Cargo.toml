@@ -1,0 +1,29 @@
+[package]
+name = "horde-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The Horde control plane: the append-only event log and the service spines built on it."
+
+[lints]
+workspace = true
+
+[dependencies]
+horde-proto = { workspace = true }
+prost = "0.14.4"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1.19"
+tonic = "0.14.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1.9.0"
+tempfile = "3.24.0"
+
+[[bin]]
+name = "horde-server"
+path = "src/bin/horde_server.rs"
