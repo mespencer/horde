@@ -13,37 +13,26 @@ use horde_adapter::usage::Utilization;
 use horde_adapter::{AgentEvent, TurnStatus};
 use horde_adapter_codex::TurnAssembler;
 use horde_adapter_codex::codec::decode_line;
+use horde_testkit::{HarnessOutputKey, Transcript};
 
-/// Where the W2c recordings live.
+/// The W2c recordings, loaded through the shared testkit.
 ///
-/// `horde-testkit::transcripts` resolves to `docs/spikes/transcripts`, which is
-/// spike W1c's flat claude directory; the codex recordings sit in their own
-/// subdirectory. Loading them here rather than widening the testkit keeps this
-/// crate from touching a shared file — see the report's finding on that.
+/// `HarnessOutputKey::In` is required and not a default: the codex driver
+/// recorded `dir` from its own socket's point of view, the opposite of the
+/// claude captures. Guessing wrong swaps harness output with driver input and
+/// every assertion still runs, which is why the testkit makes it an argument.
 fn transcript(name: &str) -> Vec<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("docs/spikes/codex-app-server/transcripts")
-        .join(name);
-
+    let dir =
+        horde_testkit::transcripts::repo_root().join("docs/spikes/codex-app-server/transcripts");
+    let transcript = Transcript::load_from(&dir, name, HarnessOutputKey::In);
     // assert! rather than panic!: this is a helper, not a #[test] fn, and the
     // workspace bans panic! outside test functions.
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
     assert!(
-        !raw.is_empty(),
-        "transcript {} must be readable and non-empty",
-        path.display()
+        transcript.is_ok(),
+        "transcript {name} must load from {}",
+        dir.display()
     );
-
-    // The recordings wrap each frame as {"dir","t","msg"}; only inbound frames
-    // are harness output, and only those are what a live session would decode.
-    raw.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|entry| entry.get("dir").and_then(serde_json::Value::as_str) == Some("in"))
-        .filter_map(|entry| entry.get("msg").map(ToString::to_string))
-        .collect()
+    transcript.map(|t| t.outbound).unwrap_or_default()
 }
 
 /// Feeds a whole recording through a fresh assembler.
