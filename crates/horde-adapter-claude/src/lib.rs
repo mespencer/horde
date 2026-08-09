@@ -15,6 +15,9 @@
 //!   [`horde_adapter::AgentEvent`]s, including usage normalization.
 //! * [`permission`] — the `--permission-prompt-tool` payloads, which arrive on
 //!   the MCP endpoint rather than on stdout.
+//! * [`identity`] — what it takes to find a conversation again. A session id
+//!   alone is not enough: sessions live inside `CLAUDE_CONFIG_DIR`, so the
+//!   account directory is part of an agent's revival identity.
 //!
 //! # What is deliberately not here
 //!
@@ -34,12 +37,14 @@
 //! SIGINT ends the process and closing stdin does not interrupt at all.
 
 pub mod codec;
+pub mod identity;
 pub mod permission;
 pub mod replay;
 pub mod turn;
 pub mod wire;
 
 pub use codec::{decode_line, encode_interrupt, encode_user_message};
+pub use identity::RevivalIdentity;
 pub use replay::ReplaySession;
 pub use turn::TurnAssembler;
 
