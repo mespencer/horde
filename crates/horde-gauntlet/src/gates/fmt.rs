@@ -1,20 +1,14 @@
 //! Formatting: `cargo fmt --check`.
 
-use crate::command::{CommandOutput, CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
-use crate::gates::{invoke, unexpected_exit};
+use crate::gates::prelude::*;
+use crate::gates::unexpected_exit;
 
 /// Checks that every tracked source file is already rustfmt-clean.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FmtGate;
-
-impl Gate for FmtGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        let spec = spec(ctx);
-        match invoke(runner, &spec) {
-            Err(outcome) => outcome,
-            Ok(output) => outcome_of(&spec, &output),
-        }
+pub fn gate() -> CommandGate {
+    CommandGate {
+        pin: None,
+        build: spec,
+        read: Reader::AnyExit(outcome_of),
     }
 }
 
@@ -79,41 +73,47 @@ fn diff_header(line: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{exited, failed, repo_ctx};
 
     const DIRTY: &str = include_str!("../../fixtures/cargo-fmt-check.txt");
 
+    /// The gate wiring itself — that a `CommandGate` checks its pin, runs its
+    /// command and routes the output — is covered once in `gates::tests`.
+    #[test]
+    fn the_gate_is_a_cargo_subcommand_that_reports_through_its_exit_code() {
+        let wiring = gate();
+        assert!(
+            wiring.pin.is_none(),
+            "rustfmt is pinned by rust-toolchain.toml, not by an install command"
+        );
+        assert!(matches!(wiring.read, Reader::AnyExit(_)));
+    }
+
     #[test]
     fn a_whole_workspace_run_uses_all() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        assert_eq!(spec(&ctx).display(), "cargo fmt --all -- --check");
-        assert_eq!(spec(&ctx).cwd, Path::new("/repo"));
+        assert_eq!(spec(&repo_ctx()).display(), "cargo fmt --all -- --check");
+        assert_eq!(spec(&repo_ctx()).cwd, std::path::Path::new("/repo"));
     }
 
     #[test]
     fn a_narrowed_run_names_each_package() {
-        let ctx = GateContext::new(Path::new("/repo"), vec!["a".to_owned(), "b".to_owned()]);
+        let ctx = GateContext::new(
+            std::path::Path::new("/repo"),
+            vec!["a".to_owned(), "b".to_owned()],
+        );
         assert_eq!(spec(&ctx).display(), "cargo fmt -p a -p b -- --check");
     }
 
     #[test]
     fn a_clean_tree_passes() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(0), "", "")]);
-        assert_eq!(
-            FmtGate.run(&ctx, &runner),
-            GateOutcome::pass("every file is rustfmt-clean")
-        );
+        let outcome = outcome_of(&spec(&repo_ctx()), &exited(0, ""));
+        assert_eq!(outcome, GateOutcome::pass("every file is rustfmt-clean"));
     }
 
     #[test]
     fn real_rustfmt_output_is_read_as_a_failure_listing_each_file_once() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(1), DIRTY, "")]);
-        let GateOutcome::Fail { detail } = FmtGate.run(&ctx, &runner) else {
+        let GateOutcome::Fail { detail } = outcome_of(&spec(&repo_ctx()), &exited(1, DIRTY)) else {
             panic!("unformatted code is a verdict about the code, not an instrument error");
         };
         assert!(
@@ -158,25 +158,10 @@ mod tests {
 
     #[test]
     fn a_failure_rustfmt_cannot_explain_is_an_instrument_error() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(
-            Some(1),
-            "",
-            "error: failed to load config file",
-        )]);
-        let GateOutcome::Error { reason } = FmtGate.run(&ctx, &runner) else {
+        let output = failed(1, "error: failed to load config file");
+        let GateOutcome::Error { reason } = outcome_of(&spec(&repo_ctx()), &output) else {
             panic!("rustfmt failing to run is not a verdict about the code");
         };
         assert!(reason.contains("failed to load config file"), "{reason}");
-    }
-
-    #[test]
-    fn a_missing_cargo_is_an_instrument_error() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::failing("could not launch `cargo fmt`");
-        assert_eq!(
-            FmtGate.run(&ctx, &runner),
-            GateOutcome::error("could not launch `cargo fmt`")
-        );
     }
 }

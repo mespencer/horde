@@ -7,8 +7,42 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::path::Path;
 
 use crate::command::{CommandOutput, CommandRunner, CommandSpec};
+use crate::gate::{Gate, GateContext, GateOutcome};
+
+/// A whole-workspace context rooted at a fixed, obviously-fake path.
+///
+/// Gate tests that only build commands never touch the filesystem, so the root
+/// exists to be matched against, not to be read.
+pub(crate) fn repo_ctx() -> GateContext {
+    GateContext::new(Path::new("/repo"), Vec::new())
+}
+
+/// A whole-workspace context rooted at a real directory.
+pub(crate) fn ctx_at(root: &Path) -> GateContext {
+    GateContext::new(root, Vec::new())
+}
+
+/// A command that exited with `code`, printing `stdout` and nothing on stderr.
+pub(crate) fn exited(code: i32, stdout: &str) -> CommandOutput {
+    CommandOutput::new(Some(code), stdout, "")
+}
+
+/// A command that exited with `code`, printing `stderr` and nothing on stdout.
+pub(crate) fn failed(code: i32, stderr: &str) -> CommandOutput {
+    CommandOutput::new(Some(code), "", stderr)
+}
+
+/// Runs a gate, so a test module need not import the [`Gate`] trait itself.
+pub(crate) fn run_gate(
+    gate: &impl Gate,
+    ctx: &GateContext,
+    runner: &ScriptedRunner,
+) -> GateOutcome {
+    gate.run(ctx, runner)
+}
 
 /// Replays a fixed script of command results and records what was asked of it.
 #[derive(Debug)]

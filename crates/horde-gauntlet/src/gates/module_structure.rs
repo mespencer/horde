@@ -9,14 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::command::{CommandRunner, CommandSpec};
+use crate::command::CommandRunner;
 use crate::cycles::{
     Cycle, CycleDiff, diff_cycles, find_cycles, parse_baseline, parse_module_graph,
 };
-use crate::gate::{Gate, GateContext, GateOutcome};
+use crate::gates::prelude::*;
 use crate::gates::{invoke, read_artifact, strip_ansi, unexpected_exit};
 use crate::metadata::{WorkspacePackage, parse_workspace_packages};
-use crate::tool::{ToolPin, check_pin};
 
 /// The cargo-modules version the gate is calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -30,31 +29,31 @@ pub const PIN: ToolPin = ToolPin {
 pub const BASELINE: &str = "baselines/module-cycles.txt";
 
 /// Checks for orphaned source files and ratchets module cycles.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ModuleStructureGate;
-
-impl Gate for ModuleStructureGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        if let Err(reason) = check_pin(runner, &PIN, &ctx.workspace_root) {
-            return GateOutcome::error(reason);
-        }
-        let packages = match packages(ctx, runner) {
-            Ok(packages) => packages,
-            Err(outcome) => return outcome,
-        };
-        if packages.is_empty() {
-            return GateOutcome::skipped("no workspace packages to analyse");
-        }
-        let findings = match survey(ctx, runner, &packages) {
-            Ok(findings) => findings,
-            Err(outcome) => return outcome,
-        };
-        let baseline = match read_artifact(&baseline_path(ctx), "the module-cycle baseline") {
-            Ok(text) => parse_baseline(&text),
-            Err(outcome) => return outcome,
-        };
-        outcome_of(&findings, &baseline)
+pub fn gate() -> PinnedGate {
+    PinnedGate {
+        pin: &PIN,
+        measure: survey_workspace,
     }
+}
+
+/// Surveys every selected package, then ratchets what it found.
+fn survey_workspace(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+    let packages = match packages(ctx, runner) {
+        Ok(packages) => packages,
+        Err(outcome) => return outcome,
+    };
+    if packages.is_empty() {
+        return GateOutcome::skipped("no workspace packages to analyse");
+    }
+    let findings = match survey(ctx, runner, &packages) {
+        Ok(findings) => findings,
+        Err(outcome) => return outcome,
+    };
+    let baseline = match read_artifact(&baseline_path(ctx), "the module-cycle baseline") {
+        Ok(text) => parse_baseline(&text),
+        Err(outcome) => return outcome,
+    };
+    outcome_of(&findings, &baseline)
 }
 
 /// Where the committed cycle baseline lives.
@@ -184,14 +183,19 @@ fn survey(
     Ok(findings)
 }
 
-/// Every target of a package that has a module tree.
+/// The targets whose module trees are checked for orphans.
+///
+/// cargo-modules scans the whole crate directory for whichever target it was
+/// pointed at, so in a package that has both a library and a binary, asking
+/// about the binary reports every one of the library's modules as an orphan —
+/// they are, from `main.rs`'s point of view. The library pass already covers
+/// every file under `src/`, so a package with a library is checked through it
+/// alone, and binaries are checked directly only when there is no library.
 pub fn targets(package: &WorkspacePackage) -> Vec<Target<'_>> {
-    let mut targets = Vec::new();
     if package.has_lib {
-        targets.push(Target::Lib);
+        return vec![Target::Lib];
     }
-    targets.extend(package.bins.iter().map(|name| Target::Bin(name)));
-    targets
+    package.bins.iter().map(|name| Target::Bin(name)).collect()
 }
 
 /// The orphaned files named in a cargo-modules run.
@@ -239,16 +243,12 @@ pub fn describe_cycle_diff(diff: &CycleDiff) -> String {
 mod tests {
     use super::*;
     use crate::command::CommandOutput;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, ctx_at, exited, failed, repo_ctx, run_gate};
 
     const ORPHANS_FOUND: &str = include_str!("../../fixtures/cargo-modules-orphans-found.txt");
     const ORPHANS_CLEAN: &str = include_str!("../../fixtures/cargo-modules-orphans-clean.txt");
     const METADATA: &str = include_str!("../../fixtures/cargo-metadata.json");
     const DOT: &str = include_str!("../../fixtures/cargo-modules-dependencies.dot");
-
-    fn ctx_at(root: &Path) -> GateContext {
-        GateContext::new(root, Vec::new())
-    }
 
     fn cycle(members: &[&str]) -> Cycle {
         members.iter().map(|member| (*member).to_owned()).collect()
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn the_orphan_check_enables_cfg_test_so_test_modules_are_not_orphans() {
-        let spec = orphans_spec(&ctx_at(Path::new("/repo")), "horde-gauntlet", Target::Lib);
+        let spec = orphans_spec(&repo_ctx(), "horde-gauntlet", Target::Lib);
         assert_eq!(
             spec.display(),
             "cargo modules orphans --deny --cfg-test -p horde-gauntlet --lib"
@@ -273,11 +273,7 @@ mod tests {
 
     #[test]
     fn each_binary_is_checked_by_name() {
-        let spec = orphans_spec(
-            &ctx_at(Path::new("/repo")),
-            "horde-gauntlet",
-            Target::Bin("gauntlet"),
-        );
+        let spec = orphans_spec(&repo_ctx(), "horde-gauntlet", Target::Bin("gauntlet"));
         assert!(
             spec.display().ends_with("--bin gauntlet"),
             "{}",
@@ -287,7 +283,7 @@ mod tests {
 
     #[test]
     fn the_graph_command_keeps_items_so_cross_module_edges_survive() {
-        let spec = graph_spec(&ctx_at(Path::new("/repo")), "horde-gauntlet");
+        let spec = graph_spec(&repo_ctx(), "horde-gauntlet");
         assert_eq!(
             spec.display(),
             "cargo modules dependencies --lib --cfg-test --no-externs --no-sysroot -p horde-gauntlet"
@@ -295,19 +291,26 @@ mod tests {
     }
 
     #[test]
-    fn a_package_contributes_its_library_and_every_binary() {
+    fn a_package_with_a_library_is_checked_through_the_library_alone() {
         assert_eq!(
             targets(&package("a", true, &["one", "two"])),
-            vec![Target::Lib, Target::Bin("one"), Target::Bin("two")]
+            vec![Target::Lib],
+            "asking about a binary in a package that also has a library reports every library \
+             module as an orphan"
         );
     }
 
     #[test]
-    fn a_binary_only_package_contributes_no_library_target() {
+    fn a_binary_only_package_is_checked_through_each_binary() {
         assert_eq!(
-            targets(&package("a", false, &["one"])),
-            vec![Target::Bin("one")]
+            targets(&package("a", false, &["one", "two"])),
+            vec![Target::Bin("one"), Target::Bin("two")]
         );
+    }
+
+    #[test]
+    fn a_package_with_neither_target_is_not_checked() {
+        assert_eq!(targets(&package("a", false, &[])), Vec::new());
     }
 
     #[test]
@@ -382,56 +385,48 @@ mod tests {
     }
 
     #[test]
-    fn a_version_mismatch_stops_the_gate_before_it_surveys() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(
-            Some(0),
-            "cargo-modules 0.25.0",
-            "",
-        )]);
-        let GateOutcome::Error { .. } =
-            ModuleStructureGate.run(&ctx_at(Path::new("/repo")), &runner)
-        else {
-            panic!("an unpinned tool moves the calibration");
-        };
-        assert_eq!(runner.calls().len(), 1);
+    fn the_gate_is_pinned_to_the_calibrated_cargo_modules() {
+        assert_eq!(gate().pin, &PIN);
+        assert_eq!(PIN.expected, "0.26.0");
+    }
+
+    /// Runs a clean survey against a throwaway root, optionally with a baseline.
+    fn survey_with(baseline: Option<&str>) -> (GateOutcome, Vec<String>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        if let Some(baseline) = baseline {
+            std::fs::create_dir_all(dir.path().join("baselines")).expect("baselines dir");
+            std::fs::write(dir.path().join(BASELINE), baseline).expect("baseline");
+        }
+        let runner = ScriptedRunner::new(vec![
+            exited(0, "cargo-modules 0.26.0"),
+            exited(0, METADATA),
+            exited(0, ORPHANS_CLEAN),
+            exited(0, DOT),
+        ]);
+        let outcome = run_gate(&gate(), &ctx_at(dir.path()), &runner);
+        (outcome, runner.command_lines())
     }
 
     #[test]
     fn the_gate_surveys_every_target_then_reads_the_baseline() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(dir.path().join("baselines")).expect("baselines dir");
-        std::fs::write(dir.path().join(BASELINE), "# none\n").expect("baseline");
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-modules 0.26.0", ""),
-            CommandOutput::new(Some(0), METADATA, ""),
-            CommandOutput::new(Some(0), ORPHANS_CLEAN, ""),
-            CommandOutput::new(Some(0), ORPHANS_CLEAN, ""),
-            CommandOutput::new(Some(0), DOT, ""),
-        ]);
-        let outcome = ModuleStructureGate.run(&ctx_at(dir.path()), &runner);
+        let (outcome, lines) = survey_with(Some("# none\n"));
         assert_eq!(outcome.label(), "pass", "{outcome:?}");
-        let lines = runner.command_lines();
         assert!(lines[1].starts_with("cargo metadata"), "{lines:?}");
         assert!(lines[2].ends_with("--lib"), "{lines:?}");
-        assert!(lines[3].ends_with("--bin gauntlet"), "{lines:?}");
         assert!(
-            lines[4].starts_with("cargo modules dependencies"),
+            lines[3].starts_with("cargo modules dependencies"),
             "{lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            4,
+            "the binary is covered by the library pass: {lines:?}"
         );
     }
 
     #[test]
     fn a_missing_baseline_file_is_an_instrument_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-modules 0.26.0", ""),
-            CommandOutput::new(Some(0), METADATA, ""),
-            CommandOutput::new(Some(0), ORPHANS_CLEAN, ""),
-            CommandOutput::new(Some(0), ORPHANS_CLEAN, ""),
-            CommandOutput::new(Some(0), DOT, ""),
-        ]);
-        let GateOutcome::Error { reason } = ModuleStructureGate.run(&ctx_at(dir.path()), &runner)
-        else {
+        let GateOutcome::Error { reason } = survey_with(None).0 else {
             panic!("a ratchet with no baseline is not a measurement");
         };
         assert!(reason.contains("module-cycles.txt"), "{reason}");
@@ -440,12 +435,10 @@ mod tests {
     #[test]
     fn unreadable_metadata_is_an_instrument_error() {
         let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-modules 0.26.0", ""),
-            CommandOutput::new(Some(101), "", "error: failed to parse manifest"),
+            exited(0, "cargo-modules 0.26.0"),
+            failed(101, "error: failed to parse manifest"),
         ]);
-        let GateOutcome::Error { reason } =
-            ModuleStructureGate.run(&ctx_at(Path::new("/repo")), &runner)
-        else {
+        let GateOutcome::Error { reason } = run_gate(&gate(), &repo_ctx(), &runner) else {
             panic!("a workspace that cannot be enumerated cannot be surveyed");
         };
         assert!(reason.contains("failed to parse manifest"), "{reason}");
@@ -454,10 +447,10 @@ mod tests {
     #[test]
     fn a_workspace_with_no_packages_is_skipped_not_passed() {
         let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-modules 0.26.0", ""),
+            exited(0, "cargo-modules 0.26.0"),
             CommandOutput::new(Some(0), r#"{"packages": [], "workspace_members": []}"#, ""),
         ]);
-        let outcome = ModuleStructureGate.run(&ctx_at(Path::new("/repo")), &runner);
+        let outcome = run_gate(&gate(), &repo_ctx(), &runner);
         assert_eq!(outcome.label(), "skipped");
     }
 }

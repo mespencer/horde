@@ -7,10 +7,8 @@
 
 use std::path::Path;
 
-use crate::command::{CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
-use crate::gates::{invoke, read_artifact, unexpected_exit};
-use crate::tool::{ToolPin, check_pin};
+use crate::gates::prelude::*;
+use crate::gates::read_artifact;
 
 /// The cargo-llvm-cov version the gate is calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -21,26 +19,19 @@ pub const PIN: ToolPin = ToolPin {
 };
 
 /// Measures line coverage and writes LCOV to `target/quality/lcov.info`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CoverageGate;
+pub fn gate() -> CommandGate {
+    CommandGate {
+        pin: Some(&PIN),
+        build: spec,
+        read: Reader::CleanExitOnly(read_lcov),
+    }
+}
 
-impl Gate for CoverageGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        if let Err(reason) = check_pin(runner, &PIN, &ctx.workspace_root) {
-            return GateOutcome::error(reason);
-        }
-        let spec = spec(ctx);
-        let output = match invoke(runner, &spec) {
-            Ok(output) => output,
-            Err(outcome) => return outcome,
-        };
-        if !output.success() {
-            return unexpected_exit(&spec, &output);
-        }
-        match read_artifact(&ctx.lcov_path(), "cargo llvm-cov") {
-            Err(outcome) => outcome,
-            Ok(lcov) => outcome_of(&lcov, &ctx.lcov_path()),
-        }
+/// Reads the LCOV file the run was supposed to leave behind.
+pub fn read_lcov(ctx: &GateContext, _output: &CommandOutput) -> GateOutcome {
+    match read_artifact(&ctx.lcov_path(), "cargo llvm-cov") {
+        Err(outcome) => outcome,
+        Ok(lcov) => outcome_of(&lcov, &ctx.lcov_path()),
     }
 }
 
@@ -125,17 +116,13 @@ fn record_value(line: &str, prefix: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::command::CommandOutput;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, ctx_at, exited, failed, repo_ctx, run_gate};
 
     const LCOV: &str = include_str!("../../fixtures/lcov.info");
 
-    fn ctx_at(root: &Path) -> GateContext {
-        GateContext::new(root, Vec::new())
-    }
-
     #[test]
     fn the_command_writes_lcov_where_the_crap_gate_looks_for_it() {
-        let ctx = ctx_at(Path::new("/repo"));
+        let ctx = repo_ctx();
         assert_eq!(
             spec(&ctx).display(),
             "cargo llvm-cov --all-features --lcov --output-path /repo/target/quality/lcov.info --workspace"
@@ -196,35 +183,26 @@ mod tests {
     }
 
     #[test]
-    fn a_version_mismatch_stops_the_gate_before_it_measures() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(
-            Some(0),
-            "cargo-llvm-cov 0.6.0",
-            "",
-        )]);
-        let GateOutcome::Error { reason } = CoverageGate.run(&ctx_at(Path::new("/repo")), &runner)
-        else {
-            panic!("an unpinned tool moves the calibration");
-        };
-        assert!(reason.contains("0.6.0"), "{reason}");
-        assert_eq!(
-            runner.calls().len(),
-            1,
-            "the gate must not measure after a bad pin"
-        );
+    fn the_gate_is_pinned_to_the_calibrated_cargo_llvm_cov() {
+        assert_eq!(gate().pin, Some(&PIN));
+        assert_eq!(PIN.expected, "0.8.7");
+    }
+
+    /// Runs the gate against a throwaway root, optionally seeded with LCOV.
+    fn run_against(lcov: Option<&str>, run: CommandOutput) -> GateOutcome {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = ctx_at(dir.path());
+        if let Some(lcov) = lcov {
+            std::fs::create_dir_all(&ctx.log_dir).expect("log dir");
+            std::fs::write(ctx.lcov_path(), lcov).expect("lcov");
+        }
+        let runner = ScriptedRunner::new(vec![exited(0, "cargo-llvm-cov 0.8.7"), run]);
+        run_gate(&gate(), &ctx, &runner)
     }
 
     #[test]
     fn the_gate_reads_the_lcov_the_tool_actually_wrote() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ctx = ctx_at(dir.path());
-        std::fs::create_dir_all(&ctx.log_dir).expect("log dir");
-        std::fs::write(ctx.lcov_path(), LCOV).expect("lcov");
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-llvm-cov 0.8.7", ""),
-            CommandOutput::new(Some(0), "", ""),
-        ]);
-        let GateOutcome::Pass { detail } = CoverageGate.run(&ctx, &runner) else {
+        let GateOutcome::Pass { detail } = run_against(Some(LCOV), exited(0, "")) else {
             panic!("expected a pass");
         };
         assert!(detail.contains("10/13"), "{detail}");
@@ -232,12 +210,7 @@ mod tests {
 
     #[test]
     fn a_missing_lcov_is_an_instrument_error_even_when_the_tool_exited_zero() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-llvm-cov 0.8.7", ""),
-            CommandOutput::new(Some(0), "", ""),
-        ]);
-        let GateOutcome::Error { reason } = CoverageGate.run(&ctx_at(dir.path()), &runner) else {
+        let GateOutcome::Error { reason } = run_against(None, exited(0, "")) else {
             panic!("a tool that claims success but leaves no artifact did not measure");
         };
         assert!(reason.contains("lcov.info"), "{reason}");
@@ -245,12 +218,8 @@ mod tests {
 
     #[test]
     fn a_failing_coverage_run_is_an_instrument_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-llvm-cov 0.8.7", ""),
-            CommandOutput::new(Some(101), "", "error: could not compile"),
-        ]);
-        let GateOutcome::Error { reason } = CoverageGate.run(&ctx_at(dir.path()), &runner) else {
+        let outcome = run_against(Some(LCOV), failed(101, "error: could not compile"));
+        let GateOutcome::Error { reason } = outcome else {
             panic!("coverage that could not run did not pass");
         };
         assert!(reason.contains("could not compile"), "{reason}");

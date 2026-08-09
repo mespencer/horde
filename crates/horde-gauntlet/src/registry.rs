@@ -19,7 +19,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "cargo fmt --check: every file is rustfmt-clean",
             },
-            gate: Box::new(gates::fmt::FmtGate),
+            gate: Box::new(gates::fmt::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -28,7 +28,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "cargo clippy over all targets and features, warnings denied",
             },
-            gate: Box::new(gates::clippy::ClippyGate),
+            gate: Box::new(gates::clippy::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -46,7 +46,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "cargo llvm-cov: records line coverage and writes the LCOV crap reads",
             },
-            gate: Box::new(gates::coverage::CoverageGate),
+            gate: Box::new(gates::coverage::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -55,7 +55,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &["coverage"],
                 summary: "cargo-crap: no function scores above CRAP 15",
             },
-            gate: Box::new(gates::crap::CrapGate),
+            gate: Box::new(gates::crap::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -64,7 +64,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "jscpd: no copy-pasted blocks at the detector's default size",
             },
-            gate: Box::new(gates::duplication::DuplicationGate),
+            gate: Box::new(gates::duplication::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -73,7 +73,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "cargo-machete: no unused dependencies, dev-dependencies included",
             },
-            gate: Box::new(gates::machete::MacheteGate),
+            gate: Box::new(gates::machete::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -82,7 +82,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "cargo-modules: no orphaned files, module cycles ratcheted both ways",
             },
-            gate: Box::new(gates::module_structure::ModuleStructureGate),
+            gate: Box::new(gates::module_structure::gate()),
         },
         RegisteredGate {
             spec: GateSpec {
@@ -91,7 +91,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 depends_on: &[],
                 summary: "cargo-mutants: no mutant survives, diff-scoped against main",
             },
-            gate: Box::new(gates::mutants::MutantsGate),
+            gate: Box::new(gates::mutants::gate()),
         },
     ]
 }

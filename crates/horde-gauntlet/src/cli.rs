@@ -114,16 +114,29 @@ fn declares_workspace(manifest: &Path) -> bool {
 }
 
 /// The binary's entry point.
+///
+/// Everything except reading the process's arguments and working directory
+/// lives in [`run_in`], which tests drive directly.
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut out = io::stdout();
-    let Ok(cwd) = std::env::current_dir() else {
-        return fail("could not read the current directory");
-    };
-    let Some(root) = workspace_root(&cwd) else {
+    match std::env::current_dir() {
+        Ok(cwd) => run_in(&cwd, &cli.command, &ProcessRunner, &mut io::stdout()),
+        Err(error) => fail(&format!("could not read the current directory: {error}")),
+    }
+}
+
+/// Locates the workspace above `cwd`, runs `command`, and turns the verdict
+/// into an exit code.
+pub fn run_in(
+    cwd: &Path,
+    command: &Command,
+    runner: &dyn CommandRunner,
+    out: &mut dyn Write,
+) -> ExitCode {
+    let Some(root) = workspace_root(cwd) else {
         return fail("no Cargo.toml declaring [workspace] at or above the current directory");
     };
-    match dispatch(&cli.command, &root, &ProcessRunner, &mut out) {
+    match dispatch(command, &root, runner, out) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => fail(&error.to_string()),
@@ -264,6 +277,47 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
         assert_eq!(workspace_root(&dir.path().join("does-not-exist")), None);
+    }
+
+    /// Runs `command` under a throwaway root, optionally a real workspace.
+    fn exit_code(command: &Command, with_manifest: bool) -> (ExitCode, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        if with_manifest {
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").expect("root");
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let runner = ScriptedRunner::failing("no tools in this test");
+        let code = run_in(dir.path(), command, &runner, &mut out);
+        (code, out)
+    }
+
+    #[test]
+    fn a_green_run_exits_successfully() {
+        assert_eq!(exit_code(&Command::List, true).0, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn a_red_run_exits_with_a_failure_code() {
+        let command = Command::Run {
+            gates: vec!["fmt".to_owned()],
+            packages: Vec::new(),
+        };
+        assert_eq!(exit_code(&command, true).0, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn running_outside_a_workspace_fails_rather_than_measuring_the_wrong_tree() {
+        let (code, out) = exit_code(&Command::List, false);
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(out.is_empty(), "nothing should have been measured");
+    }
+
+    #[test]
+    fn a_reporting_error_exits_with_a_failure_code() {
+        let command = Command::Report {
+            format: Format::Terminal,
+        };
+        assert_eq!(exit_code(&command, true).0, ExitCode::FAILURE);
     }
 
     #[test]

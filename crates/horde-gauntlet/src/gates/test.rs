@@ -1,10 +1,11 @@
 //! Tests: cargo-nextest when it is installed, `cargo test` otherwise, plus
 //! doctests either way (nextest cannot run them).
 
-use crate::command::{CommandOutput, CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
+use crate::command::CommandRunner;
+use crate::gate::Gate;
+use crate::gates::prelude::*;
 use crate::gates::{invoke, labelled_count, unexpected_exit, with_packages};
-use crate::tool::{ToolPin, extract_version, is_missing_cargo_subcommand};
+use crate::tool::{extract_version, is_missing_cargo_subcommand};
 
 /// The nextest version the gate is calibrated against.
 pub const NEXTEST_PIN: ToolPin = ToolPin {
@@ -213,19 +214,14 @@ pub fn verdict(harness: Harness, unit: TestCounts, doc: TestCounts) -> GateOutco
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use super::*;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, failed, repo_ctx, run_gate};
 
     const NEXTEST_PASS: &str = include_str!("../../fixtures/cargo-nextest-pass.txt");
     const NEXTEST_FAIL: &str = include_str!("../../fixtures/cargo-nextest-fail.txt");
     const CARGO_TEST_PASS: &str = include_str!("../../fixtures/cargo-test-pass.txt");
     const CARGO_DOC_PASS: &str = include_str!("../../fixtures/cargo-test-doc.txt");
-
-    fn ctx() -> GateContext {
-        GateContext::new(Path::new("/repo"), Vec::new())
-    }
 
     fn version(text: &str) -> CommandOutput {
         CommandOutput::new(Some(0), text, "")
@@ -241,7 +237,7 @@ mod tests {
 
     #[test]
     fn an_absent_nextest_falls_back_without_complaint() {
-        let probe = CommandOutput::new(Some(101), "", "error: no such command: `nextest`");
+        let probe = failed(101, "error: no such command: `nextest`");
         assert_eq!(harness_from_probe(&probe), HarnessChoice::Fallback);
     }
 
@@ -257,7 +253,7 @@ mod tests {
 
     #[test]
     fn a_nextest_that_fails_for_another_reason_is_an_instrument_error() {
-        let probe = CommandOutput::new(Some(1), "", "error: could not read config");
+        let probe = failed(1, "error: could not read config");
         let HarnessChoice::Error(reason) = harness_from_probe(&probe) else {
             panic!("a broken nextest is not a silent fallback");
         };
@@ -275,7 +271,7 @@ mod tests {
     #[test]
     fn nextest_runs_every_feature_across_the_selected_packages() {
         assert_eq!(
-            unit_spec(&ctx(), Harness::Nextest).display(),
+            unit_spec(&repo_ctx(), Harness::Nextest).display(),
             "cargo nextest run --all-features --workspace"
         );
     }
@@ -283,7 +279,7 @@ mod tests {
     #[test]
     fn the_fallback_runs_every_target_because_nextest_flags_do_not_apply() {
         assert_eq!(
-            unit_spec(&ctx(), Harness::CargoTest).display(),
+            unit_spec(&repo_ctx(), Harness::CargoTest).display(),
             "cargo test --all-targets --all-features --workspace"
         );
     }
@@ -291,7 +287,7 @@ mod tests {
     #[test]
     fn doctests_always_go_through_cargo_test() {
         assert_eq!(
-            doc_spec(&ctx()).display(),
+            doc_spec(&repo_ctx()).display(),
             "cargo test --doc --all-features --workspace"
         );
     }
@@ -428,7 +424,7 @@ mod tests {
             CommandOutput::new(Some(0), NEXTEST_PASS, ""),
             CommandOutput::new(Some(0), CARGO_DOC_PASS, ""),
         ]);
-        let outcome = TestGate.run(&ctx(), &runner);
+        let outcome = run_gate(&TestGate, &repo_ctx(), &runner);
         assert_eq!(
             outcome,
             GateOutcome::pass("8 test(s) and 2 doctest(s) via cargo nextest (1 skipped)")
@@ -446,11 +442,11 @@ mod tests {
     #[test]
     fn the_gate_falls_back_to_cargo_test_when_nextest_is_absent() {
         let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(101), "", "error: no such command: `nextest`"),
+            failed(101, "error: no such command: `nextest`"),
             CommandOutput::new(Some(0), CARGO_TEST_PASS, ""),
             CommandOutput::new(Some(0), CARGO_DOC_PASS, ""),
         ]);
-        let GateOutcome::Pass { detail } = TestGate.run(&ctx(), &runner) else {
+        let GateOutcome::Pass { detail } = run_gate(&TestGate, &repo_ctx(), &runner) else {
             panic!("the fallback is a supported configuration");
         };
         assert!(detail.contains("nextest not installed"), "{detail}");
@@ -464,9 +460,9 @@ mod tests {
     fn a_build_failure_is_an_instrument_error_not_a_silent_zero() {
         let runner = ScriptedRunner::new(vec![
             version("cargo-nextest 0.9.82"),
-            CommandOutput::new(Some(101), "", "error: could not compile `horde-gauntlet`"),
+            failed(101, "error: could not compile `horde-gauntlet`"),
         ]);
-        let GateOutcome::Error { reason } = TestGate.run(&ctx(), &runner) else {
+        let GateOutcome::Error { reason } = run_gate(&TestGate, &repo_ctx(), &runner) else {
             panic!("tests that never ran did not pass");
         };
         assert!(reason.contains("could not compile"), "{reason}");

@@ -5,24 +5,18 @@
 //! rather than a warning — the deny levels live in the workspace manifest, and
 //! `-D warnings` lives here, in one place.
 
-use crate::command::{CommandOutput, CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
-use crate::gates::{invoke, unexpected_exit, with_packages};
+use crate::gates::prelude::*;
+use crate::gates::{unexpected_exit, with_packages};
 
 /// Exit code cargo uses when compilation (including deny-level lints) fails.
 const COMPILE_FAILURE: i32 = 101;
 
 /// Runs clippy over every target and every feature, warnings denied.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ClippyGate;
-
-impl Gate for ClippyGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        let spec = spec(ctx);
-        match invoke(runner, &spec) {
-            Err(outcome) => outcome,
-            Ok(output) => outcome_of(&spec, &output),
-        }
+pub fn gate() -> CommandGate {
+    CommandGate {
+        pin: None,
+        build: spec,
+        read: Reader::AnyExit(outcome_of),
     }
 }
 
@@ -66,25 +60,37 @@ fn is_cargo_tally(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{exited, failed, repo_ctx};
 
     const DIRTY: &str = include_str!("../../fixtures/cargo-clippy-denied.txt");
 
+    fn read(output: &CommandOutput) -> GateOutcome {
+        outcome_of(&spec(&repo_ctx()), output)
+    }
+
+    /// The gate wiring itself is covered once in `gates::tests`.
+    #[test]
+    fn the_gate_is_a_cargo_subcommand_that_reports_through_its_exit_code() {
+        let wiring = gate();
+        assert!(
+            wiring.pin.is_none(),
+            "clippy is pinned by rust-toolchain.toml, not by an install command"
+        );
+        assert!(matches!(wiring.read, Reader::AnyExit(_)));
+    }
+
     #[test]
     fn the_command_covers_every_target_and_feature_and_denies_warnings() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
         assert_eq!(
-            spec(&ctx).display(),
+            spec(&repo_ctx()).display(),
             "cargo clippy --all-targets --all-features --workspace -- -D warnings"
         );
     }
 
     #[test]
     fn a_narrowed_run_replaces_the_workspace_flag_with_packages() {
-        let ctx = GateContext::new(Path::new("/repo"), vec!["a".to_owned()]);
+        let ctx = GateContext::new(std::path::Path::new("/repo"), vec!["a".to_owned()]);
         assert_eq!(
             spec(&ctx).display(),
             "cargo clippy --all-targets --all-features -p a -- -D warnings"
@@ -93,20 +99,16 @@ mod tests {
 
     #[test]
     fn a_clean_run_passes() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(0), "", "Finished")]);
         assert_eq!(
-            ClippyGate.run(&ctx, &runner),
+            read(&exited(0, "Finished")),
             GateOutcome::pass("no clippy or rustc warnings")
         );
     }
 
     #[test]
     fn real_clippy_output_is_read_as_a_failure_with_a_diagnostic_count() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(101), "", DIRTY)]);
         assert_eq!(
-            ClippyGate.run(&ctx, &runner),
+            read(&failed(COMPILE_FAILURE, DIRTY)),
             GateOutcome::fail("2 clippy/rustc diagnostic(s); see the gate log")
         );
     }
@@ -132,29 +134,15 @@ mod tests {
 
     #[test]
     fn a_crash_with_no_diagnostics_is_an_instrument_error() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(101), "", "")]);
-        let GateOutcome::Error { .. } = ClippyGate.run(&ctx, &runner) else {
+        let GateOutcome::Error { .. } = read(&failed(COMPILE_FAILURE, "")) else {
             panic!("clippy exiting without diagnostics means it did not measure");
         };
     }
 
     #[test]
     fn an_unexpected_exit_code_is_an_instrument_error_even_with_diagnostics() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(1), "", DIRTY)]);
-        let GateOutcome::Error { .. } = ClippyGate.run(&ctx, &runner) else {
+        let GateOutcome::Error { .. } = read(&failed(1, DIRTY)) else {
             panic!("only exit 101 is a lint verdict");
         };
-    }
-
-    #[test]
-    fn a_missing_cargo_is_an_instrument_error() {
-        let ctx = GateContext::new(Path::new("/repo"), Vec::new());
-        let runner = ScriptedRunner::failing("could not launch `cargo clippy`");
-        assert_eq!(
-            ClippyGate.run(&ctx, &runner),
-            GateOutcome::error("could not launch `cargo clippy`")
-        );
     }
 }

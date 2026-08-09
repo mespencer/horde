@@ -18,7 +18,87 @@ pub mod test;
 use std::path::Path;
 
 use crate::command::{CommandOutput, CommandRunner, CommandSpec};
-use crate::gate::{GateContext, GateOutcome};
+use crate::gate::{Gate, GateContext, GateOutcome};
+use crate::tool::{ToolPin, check_pin};
+
+/// How a gate turns one command's output into a verdict.
+#[derive(Debug, Clone, Copy)]
+pub enum Reader {
+    /// The gate interprets the exit code itself, because the tool uses a
+    /// non-zero code to report a finding (rustfmt, clippy, cargo-machete).
+    AnyExit(fn(&CommandSpec, &CommandOutput) -> GateOutcome),
+    /// The gate reads only after a clean exit; any other exit means the tool
+    /// did not measure, which is an instrument error rather than a verdict.
+    CleanExitOnly(fn(&GateContext, &CommandOutput) -> GateOutcome),
+}
+
+/// A gate that checks a tool's version, runs one command, and reads the result.
+///
+/// Six of the nine gates have exactly this shape, so they are values of this
+/// type rather than six near-identical `impl Gate` blocks. Only the multi-step
+/// gates — the ones that enumerate targets or compute a diff first — implement
+/// [`Gate`] themselves.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandGate {
+    /// The tool's pinned version, or `None` for cargo's own subcommands, which
+    /// `rust-toolchain.toml` pins instead.
+    pub pin: Option<&'static ToolPin>,
+    /// Builds the command for this run.
+    pub build: fn(&GateContext) -> CommandSpec,
+    /// Turns the result into a verdict.
+    pub read: Reader,
+}
+
+impl Gate for CommandGate {
+    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+        if let Some(pin) = self.pin
+            && let Err(reason) = check_pin(runner, pin, &ctx.workspace_root)
+        {
+            return GateOutcome::error(reason);
+        }
+        let spec = (self.build)(ctx);
+        let output = match invoke(runner, &spec) {
+            Ok(output) => output,
+            Err(outcome) => return outcome,
+        };
+        match self.read {
+            Reader::AnyExit(read) => read(&spec, &output),
+            Reader::CleanExitOnly(read) if output.success() => read(ctx, &output),
+            Reader::CleanExitOnly(_) => unexpected_exit(&spec, &output),
+        }
+    }
+}
+
+/// A gate that checks a tool's version and then measures in several steps.
+///
+/// The multi-step gates enumerate targets or compute a diff before they can run
+/// the tool that produces their verdict, so they cannot be a [`CommandGate`];
+/// what they do share is the version check, which lives here rather than being
+/// repeated at the top of each one.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedGate {
+    /// The tool's pinned version.
+    pub pin: &'static ToolPin,
+    /// Measures, once the pin has been confirmed.
+    pub measure: fn(&GateContext, &dyn CommandRunner) -> GateOutcome,
+}
+
+impl Gate for PinnedGate {
+    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+        match check_pin(runner, self.pin, &ctx.workspace_root) {
+            Err(reason) => GateOutcome::error(reason),
+            Ok(()) => (self.measure)(ctx, runner),
+        }
+    }
+}
+
+/// What every gate module needs in order to define a gate.
+pub mod prelude {
+    pub use crate::command::{CommandOutput, CommandSpec};
+    pub use crate::gate::{GateContext, GateOutcome};
+    pub use crate::gates::{CommandGate, PinnedGate, Reader};
+    pub use crate::tool::ToolPin;
+}
 
 /// Runs a command, turning "could not launch" into an instrument error.
 pub(crate) fn invoke(
@@ -104,7 +184,87 @@ pub(crate) fn unexpected_exit(spec: &CommandSpec, output: &CommandOutput) -> Gat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, exited, failed, repo_ctx};
+
+    const PIN: crate::tool::ToolPin = crate::tool::ToolPin {
+        program: "cargo",
+        version_args: &["crap", "--version"],
+        expected: "0.3.1",
+        install: "cargo install --locked cargo-crap@0.3.1",
+    };
+
+    fn any_exit(_spec: &CommandSpec, output: &CommandOutput) -> GateOutcome {
+        GateOutcome::fail(format!("read {:?} {}", output.status, output.stdout))
+    }
+
+    fn clean_exit_only(ctx: &GateContext, output: &CommandOutput) -> GateOutcome {
+        GateOutcome::pass(format!(
+            "read {} in {}",
+            output.stdout,
+            ctx.workspace_root.display()
+        ))
+    }
+
+    fn command_gate(pin: Option<&'static crate::tool::ToolPin>, read: Reader) -> CommandGate {
+        CommandGate {
+            pin,
+            build: |ctx| CommandSpec::new("cargo", &["crap"], &ctx.workspace_root),
+            read,
+        }
+    }
+
+    #[test]
+    fn a_pinned_gate_checks_the_version_before_running_the_tool() {
+        let runner = ScriptedRunner::new(vec![exited(0, "cargo-crap 0.2.0")]);
+        let outcome = command_gate(Some(&PIN), Reader::AnyExit(any_exit)).run(&repo_ctx(), &runner);
+        assert_eq!(outcome.label(), "error");
+        assert_eq!(
+            runner.calls().len(),
+            1,
+            "a gate must not measure with the wrong tool version"
+        );
+    }
+
+    #[test]
+    fn an_unpinned_gate_runs_the_tool_straight_away() {
+        let runner = ScriptedRunner::new(vec![exited(7, "output")]);
+        let outcome = command_gate(None, Reader::AnyExit(any_exit)).run(&repo_ctx(), &runner);
+        assert_eq!(outcome, GateOutcome::fail("read Some(7) output"));
+        assert_eq!(runner.command_lines(), vec!["cargo crap"]);
+    }
+
+    #[test]
+    fn an_any_exit_reader_sees_a_nonzero_exit_because_it_models_the_codes_itself() {
+        let runner = ScriptedRunner::new(vec![exited(0, "cargo-crap 0.3.1"), exited(3, "report")]);
+        let outcome = command_gate(Some(&PIN), Reader::AnyExit(any_exit)).run(&repo_ctx(), &runner);
+        assert_eq!(outcome, GateOutcome::fail("read Some(3) report"));
+    }
+
+    #[test]
+    fn a_clean_exit_only_reader_runs_after_a_zero_exit() {
+        let runner = ScriptedRunner::new(vec![exited(0, "report")]);
+        let outcome =
+            command_gate(None, Reader::CleanExitOnly(clean_exit_only)).run(&repo_ctx(), &runner);
+        assert_eq!(outcome, GateOutcome::pass("read report in /repo"));
+    }
+
+    #[test]
+    fn a_clean_exit_only_reader_never_sees_a_failed_run() {
+        let runner = ScriptedRunner::new(vec![exited(2, "boom")]);
+        let outcome =
+            command_gate(None, Reader::CleanExitOnly(clean_exit_only)).run(&repo_ctx(), &runner);
+        let GateOutcome::Error { reason } = outcome else {
+            panic!("a tool that failed did not measure");
+        };
+        assert!(reason.contains("boom"), "{reason}");
+    }
+
+    #[test]
+    fn an_unlaunchable_tool_is_an_instrument_error() {
+        let runner = ScriptedRunner::failing("no such binary");
+        let outcome = command_gate(None, Reader::AnyExit(any_exit)).run(&repo_ctx(), &runner);
+        assert_eq!(outcome, GateOutcome::error("no such binary"));
+    }
 
     #[test]
     fn a_launch_failure_becomes_an_instrument_error() {
@@ -116,7 +276,7 @@ mod tests {
 
     #[test]
     fn a_nonzero_exit_is_not_a_launch_failure() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(7), "", "")]);
+        let runner = ScriptedRunner::new(vec![failed(7, "")]);
         let spec = CommandSpec::new("tool", &[], Path::new("/repo"));
         let output = invoke(&runner, &spec).expect("the process ran");
         assert_eq!(output.status, Some(7));
@@ -202,10 +362,7 @@ mod tests {
 
     #[test]
     fn a_status_is_described_by_code_or_by_signal() {
-        assert_eq!(
-            describe_status(&CommandOutput::new(Some(2), "", "")),
-            "exit 2"
-        );
+        assert_eq!(describe_status(&failed(2, "")), "exit 2");
         assert_eq!(
             describe_status(&CommandOutput::new(None, "", "")),
             "killed by a signal"
@@ -215,7 +372,7 @@ mod tests {
     #[test]
     fn an_uninterpretable_exit_names_the_command_the_status_and_the_output() {
         let spec = CommandSpec::new("cargo", &["crap"], Path::new("/repo"));
-        let outcome = unexpected_exit(&spec, &CommandOutput::new(Some(9), "boom\n", ""));
+        let outcome = unexpected_exit(&spec, &exited(9, "boom\n"));
         let GateOutcome::Error { reason } = outcome else {
             panic!("an uninterpretable exit must be an error");
         };

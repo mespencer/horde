@@ -6,10 +6,8 @@
 //! exists. cargo-machete checks both tables, so the gate needs no extra flag —
 //! only a test proving it stays that way.
 
-use crate::command::{CommandOutput, CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
-use crate::gates::{invoke, unexpected_exit};
-use crate::tool::{ToolPin, check_pin};
+use crate::gates::prelude::*;
+use crate::gates::unexpected_exit;
 
 /// The cargo-machete version the gate is calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -23,19 +21,11 @@ pub const PIN: ToolPin = ToolPin {
 const FOUND_UNUSED: i32 = 1;
 
 /// Finds dependencies no crate in the workspace actually uses.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MacheteGate;
-
-impl Gate for MacheteGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        if let Err(reason) = check_pin(runner, &PIN, &ctx.workspace_root) {
-            return GateOutcome::error(reason);
-        }
-        let spec = spec(ctx);
-        match invoke(runner, &spec) {
-            Err(outcome) => outcome,
-            Ok(output) => outcome_of(&spec, &output),
-        }
+pub fn gate() -> CommandGate {
+    CommandGate {
+        pin: Some(&PIN),
+        build: spec,
+        read: Reader::AnyExit(outcome_of),
     }
 }
 
@@ -109,22 +99,17 @@ fn indented(line: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use super::*;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, exited, failed, repo_ctx, run_gate};
 
     const UNUSED: &str = include_str!("../../fixtures/cargo-machete-unused.txt");
     const CLEAN: &str = include_str!("../../fixtures/cargo-machete-clean.txt");
 
-    fn ctx() -> GateContext {
-        GateContext::new(Path::new("/repo"), Vec::new())
-    }
-
     #[test]
     fn the_command_resolves_renamed_dependencies_and_skips_build_output() {
         assert_eq!(
-            spec(&ctx()).display(),
+            spec(&repo_ctx()).display(),
             "cargo machete --with-metadata --skip-target-dir /repo"
         );
     }
@@ -188,7 +173,7 @@ mod tests {
     #[test]
     fn a_clean_run_passes_and_says_dev_dependencies_were_included() {
         let output = CommandOutput::new(Some(0), CLEAN, "");
-        let GateOutcome::Pass { detail } = outcome_of(&spec(&ctx()), &output) else {
+        let GateOutcome::Pass { detail } = outcome_of(&spec(&repo_ctx()), &output) else {
             panic!("exit zero means no unused dependencies");
         };
         assert!(detail.contains("dev-dependencies"), "{detail}");
@@ -197,7 +182,7 @@ mod tests {
     #[test]
     fn a_dirty_run_fails_and_names_each_dependency() {
         let output = CommandOutput::new(Some(1), UNUSED, "");
-        let GateOutcome::Fail { detail } = outcome_of(&spec(&ctx()), &output) else {
+        let GateOutcome::Fail { detail } = outcome_of(&spec(&repo_ctx()), &output) else {
             panic!("an unused dependency is a verdict about the code");
         };
         assert!(detail.starts_with("2 unused dependenc(ies)"), "{detail}");
@@ -207,8 +192,8 @@ mod tests {
 
     #[test]
     fn cargo_machetes_own_error_exit_is_an_instrument_error() {
-        let output = CommandOutput::new(Some(2), "", "error: could not read Cargo.toml");
-        let GateOutcome::Error { reason } = outcome_of(&spec(&ctx()), &output) else {
+        let output = failed(2, "error: could not read Cargo.toml");
+        let GateOutcome::Error { reason } = outcome_of(&spec(&repo_ctx()), &output) else {
             panic!("exit 2 is cargo-machete failing, not a finding");
         };
         assert!(reason.contains("could not read Cargo.toml"), "{reason}");
@@ -216,28 +201,25 @@ mod tests {
 
     #[test]
     fn a_failure_with_no_parseable_findings_is_an_instrument_error() {
-        let output = CommandOutput::new(Some(1), "", "");
-        let GateOutcome::Error { .. } = outcome_of(&spec(&ctx()), &output) else {
+        let output = failed(1, "");
+        let GateOutcome::Error { .. } = outcome_of(&spec(&repo_ctx()), &output) else {
             panic!("claiming unused dependencies without naming any is not a measurement");
         };
     }
 
     #[test]
-    fn a_version_mismatch_stops_the_gate_before_it_runs() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(0), "0.8.0", "")]);
-        let GateOutcome::Error { .. } = MacheteGate.run(&ctx(), &runner) else {
-            panic!("an unpinned tool moves the calibration");
-        };
-        assert_eq!(runner.calls().len(), 1);
+    fn the_gate_is_pinned_to_the_calibrated_cargo_machete() {
+        assert_eq!(gate().pin, Some(&PIN));
+        assert_eq!(PIN.expected, "0.9.2");
     }
 
     #[test]
     fn the_gate_runs_the_probe_then_the_check() {
         let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "0.9.2", ""),
+            exited(0, "0.9.2"),
             CommandOutput::new(Some(0), CLEAN, ""),
         ]);
-        assert_eq!(MacheteGate.run(&ctx(), &runner).label(), "pass");
+        assert_eq!(run_gate(&gate(), &repo_ctx(), &runner).label(), "pass");
         assert_eq!(
             runner.command_lines(),
             vec![

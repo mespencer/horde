@@ -8,10 +8,8 @@
 
 use serde::Deserialize;
 
-use crate::command::{CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
-use crate::gates::{invoke, read_artifact, unexpected_exit};
-use crate::tool::{ToolPin, check_pin};
+use crate::gates::prelude::*;
+use crate::gates::read_artifact;
 
 /// The jscpd version the gate is calibrated against.
 ///
@@ -28,29 +26,22 @@ pub const PIN: ToolPin = ToolPin {
 const REPORT_DIR: &str = "jscpd";
 
 /// Detects copy-pasted blocks across the workspace's Rust sources.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DuplicationGate;
+pub fn gate() -> CommandGate {
+    CommandGate {
+        pin: Some(&PIN),
+        build: spec,
+        read: Reader::CleanExitOnly(read_jscpd_report),
+    }
+}
 
-impl Gate for DuplicationGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        if let Err(reason) = check_pin(runner, &PIN, &ctx.workspace_root) {
-            return GateOutcome::error(reason);
-        }
-        let spec = spec(ctx);
-        let output = match invoke(runner, &spec) {
-            Ok(output) => output,
-            Err(outcome) => return outcome,
-        };
-        if !output.success() {
-            return unexpected_exit(&spec, &output);
-        }
-        match read_artifact(&report_path(ctx), "jscpd") {
-            Err(outcome) => outcome,
-            Ok(json) => match parse_report(&json) {
-                Err(reason) => GateOutcome::error(reason),
-                Ok(report) => outcome_of(&report),
-            },
-        }
+/// Reads the JSON report jscpd was supposed to leave behind.
+pub fn read_jscpd_report(ctx: &GateContext, _output: &CommandOutput) -> GateOutcome {
+    match read_artifact(&report_path(ctx), "jscpd") {
+        Err(outcome) => outcome,
+        Ok(json) => match parse_report(&json) {
+            Err(reason) => GateOutcome::error(reason),
+            Ok(report) => outcome_of(&report),
+        },
     }
 }
 
@@ -63,6 +54,11 @@ pub fn report_path(ctx: &GateContext) -> std::path::PathBuf {
 ///
 /// Detection settings live in the committed `.jscpd.json`, not here, because
 /// jscpd reads them itself when it walks the tree.
+///
+/// The tree is named as `.` relative to the workspace root rather than by
+/// absolute path: jscpd matches its `ignore` globs against the full path it was
+/// given, so an absolute root would let a directory name *above* the workspace
+/// silently exclude the entire scan.
 pub fn spec(ctx: &GateContext) -> CommandSpec {
     CommandSpec::owned(
         "npx",
@@ -76,7 +72,7 @@ pub fn spec(ctx: &GateContext) -> CommandSpec {
             "--output".to_owned(),
             ctx.log_dir.join(REPORT_DIR).display().to_string(),
             "--silent".to_owned(),
-            ctx.workspace_root.display().to_string(),
+            ".".to_owned(),
         ],
         &ctx.workspace_root,
     )
@@ -184,19 +180,15 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::command::CommandOutput;
-    use crate::testing::ScriptedRunner;
+
+    use crate::testing::{ScriptedRunner, ctx_at, exited, failed, repo_ctx, run_gate};
 
     const CLEAN: &str = include_str!("../../fixtures/jscpd-report.json");
     const DIRTY: &str = include_str!("../../fixtures/jscpd-report-duplicated.json");
 
-    fn ctx() -> GateContext {
-        GateContext::new(Path::new("/repo"), Vec::new())
-    }
-
     #[test]
     fn the_command_pins_the_version_and_points_at_the_committed_config() {
-        let line = spec(&ctx()).display();
+        let line = spec(&repo_ctx()).display();
         assert!(line.contains("jscpd@5.0.14"), "{line}");
         assert!(line.contains("--config /repo/.jscpd.json"), "{line}");
         assert!(
@@ -206,9 +198,21 @@ mod tests {
     }
 
     #[test]
+    fn the_tree_is_named_relative_to_the_workspace_root() {
+        let spec = spec(&repo_ctx());
+        assert!(
+            spec.display().ends_with(" ."),
+            "an absolute root would let a parent directory name match an ignore glob and \
+             silently scan nothing: {}",
+            spec.display()
+        );
+        assert_eq!(spec.cwd, Path::new("/repo"));
+    }
+
+    #[test]
     fn the_report_is_read_from_where_the_command_writes_it() {
         assert_eq!(
-            report_path(&ctx()),
+            report_path(&repo_ctx()),
             Path::new("/repo/target/quality/jscpd/jscpd-report.json")
         );
     }
@@ -263,18 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn a_version_mismatch_stops_the_gate_before_it_scans() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(0), "4.0.0", "")]);
-        let GateOutcome::Error { .. } = DuplicationGate.run(&ctx(), &runner) else {
-            panic!("a different jscpd is a different detector");
-        };
-        assert_eq!(runner.calls().len(), 1);
+    fn the_gate_is_pinned_to_the_calibrated_jscpd() {
+        assert_eq!(gate().pin, Some(&PIN));
+        assert_eq!(PIN.expected, "5.0.14");
     }
 
     #[test]
     fn a_missing_npx_is_an_instrument_error_with_an_install_hint() {
         let runner = ScriptedRunner::failing("could not launch `npx`");
-        let GateOutcome::Error { reason } = DuplicationGate.run(&ctx(), &runner) else {
+        let GateOutcome::Error { reason } = run_gate(&gate(), &repo_ctx(), &runner) else {
             panic!("an absent detector did not measure");
         };
         assert!(reason.contains("Node.js"), "{reason}");
@@ -283,25 +284,19 @@ mod tests {
     #[test]
     fn the_gate_reads_the_report_jscpd_actually_wrote() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let ctx = GateContext::new(dir.path(), Vec::new());
+        let ctx = ctx_at(dir.path());
         std::fs::create_dir_all(ctx.log_dir.join(REPORT_DIR)).expect("report dir");
         std::fs::write(report_path(&ctx), CLEAN).expect("report");
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "5.0.14", ""),
-            CommandOutput::new(Some(0), "", ""),
-        ]);
-        assert_eq!(DuplicationGate.run(&ctx, &runner).label(), "pass");
+        let runner = ScriptedRunner::new(vec![exited(0, "5.0.14"), failed(0, "")]);
+        assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
     }
 
     #[test]
     fn a_missing_report_is_an_instrument_error_even_when_jscpd_exited_zero() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let ctx = GateContext::new(dir.path(), Vec::new());
-        let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "5.0.14", ""),
-            CommandOutput::new(Some(0), "", ""),
-        ]);
-        let GateOutcome::Error { reason } = DuplicationGate.run(&ctx, &runner) else {
+        let ctx = ctx_at(dir.path());
+        let runner = ScriptedRunner::new(vec![exited(0, "5.0.14"), failed(0, "")]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
             panic!("no report means no measurement");
         };
         assert!(reason.contains("jscpd-report.json"), "{reason}");

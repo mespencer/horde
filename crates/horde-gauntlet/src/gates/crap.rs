@@ -9,10 +9,7 @@
 
 use serde::Deserialize;
 
-use crate::command::{CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
-use crate::gates::{invoke, unexpected_exit};
-use crate::tool::{ToolPin, check_pin};
+use crate::gates::prelude::*;
 
 /// The cargo-crap version the threshold was calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -48,26 +45,19 @@ struct Report {
 }
 
 /// Scores every function against the LCOV the coverage gate produced.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CrapGate;
+pub fn gate() -> CommandGate {
+    CommandGate {
+        pin: Some(&PIN),
+        build: spec,
+        read: Reader::CleanExitOnly(read_scores),
+    }
+}
 
-impl Gate for CrapGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        if let Err(reason) = check_pin(runner, &PIN, &ctx.workspace_root) {
-            return GateOutcome::error(reason);
-        }
-        let spec = spec(ctx);
-        let output = match invoke(runner, &spec) {
-            Ok(output) => output,
-            Err(outcome) => return outcome,
-        };
-        if !output.success() {
-            return unexpected_exit(&spec, &output);
-        }
-        match parse_report(&output.stdout) {
-            Err(reason) => GateOutcome::error(reason),
-            Ok(entries) => outcome_of(&entries, THRESHOLD),
-        }
+/// Reads the JSON report cargo-crap printed.
+pub fn read_scores(_ctx: &GateContext, output: &CommandOutput) -> GateOutcome {
+    match parse_report(&output.stdout) {
+        Err(reason) => GateOutcome::error(reason),
+        Ok(entries) => outcome_of(&entries, THRESHOLD),
     }
 }
 
@@ -150,11 +140,10 @@ pub fn outcome_of(entries: &[Entry], threshold: f64) -> GateOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use super::*;
     use crate::command::CommandOutput;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, exited, failed, repo_ctx, run_gate};
 
     const REPORT: &str = include_str!("../../fixtures/cargo-crap.json");
 
@@ -169,14 +158,10 @@ mod tests {
         }
     }
 
-    fn ctx() -> GateContext {
-        GateContext::new(Path::new("/repo"), Vec::new())
-    }
-
     #[test]
     fn the_command_scores_the_workspace_against_the_coverage_gates_lcov() {
         assert_eq!(
-            spec(&ctx()).display(),
+            spec(&repo_ctx()).display(),
             "cargo crap --workspace --lcov /repo/target/quality/lcov.info --threshold 15 --format json"
         );
     }
@@ -261,21 +246,18 @@ mod tests {
     }
 
     #[test]
-    fn a_version_mismatch_stops_the_gate_before_it_scores() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(Some(0), "cargo-crap 0.2.0", "")]);
-        let GateOutcome::Error { .. } = CrapGate.run(&ctx(), &runner) else {
-            panic!("an unpinned tool moves the calibration");
-        };
-        assert_eq!(runner.calls().len(), 1);
+    fn the_gate_is_pinned_to_the_calibrated_cargo_crap() {
+        assert_eq!(gate().pin, Some(&PIN));
+        assert_eq!(PIN.expected, "0.3.1");
     }
 
     #[test]
     fn the_gate_runs_the_probe_then_the_scoring_command() {
         let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-crap 0.3.1", ""),
+            exited(0, "cargo-crap 0.3.1"),
             CommandOutput::new(Some(0), REPORT, ""),
         ]);
-        assert_eq!(CrapGate.run(&ctx(), &runner).label(), "pass");
+        assert_eq!(run_gate(&gate(), &repo_ctx(), &runner).label(), "pass");
         assert_eq!(runner.command_lines()[0], "cargo crap --version");
         assert!(runner.command_lines()[1].contains("--format json"));
     }
@@ -283,10 +265,10 @@ mod tests {
     #[test]
     fn a_failing_scoring_run_is_an_instrument_error() {
         let runner = ScriptedRunner::new(vec![
-            CommandOutput::new(Some(0), "cargo-crap 0.3.1", ""),
-            CommandOutput::new(Some(2), "", "error: no LCOV file"),
+            exited(0, "cargo-crap 0.3.1"),
+            failed(2, "error: no LCOV file"),
         ]);
-        let GateOutcome::Error { reason } = CrapGate.run(&ctx(), &runner) else {
+        let GateOutcome::Error { reason } = run_gate(&gate(), &repo_ctx(), &runner) else {
             panic!("a scoring run that failed did not pass");
         };
         assert!(reason.contains("no LCOV file"), "{reason}");

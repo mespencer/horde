@@ -1,13 +1,10 @@
 {
-  "$comment": "Detection window is jscpd's shipped default (50 tokens / 5 lines). Narrowing it to make an existing duplicate disappear would be gaming the gate; the threshold is enforced in the gate, not here.",
   "minTokens": 50,
   "minLines": 5,
   "format": ["rust"],
   "gitignore": true,
   "ignore": [
     "**/target/**",
-    "**/node_modules/**",
-    "**/.claude/**"
-  ],
-  "absolute": false
+    "**/node_modules/**"
+  ]
 }

@@ -9,10 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::command::{CommandRunner, CommandSpec};
-use crate::gate::{Gate, GateContext, GateOutcome};
+use crate::command::CommandRunner;
+use crate::gates::prelude::*;
 use crate::gates::{invoke, labelled_count, unexpected_exit};
-use crate::tool::{ToolPin, check_pin};
 
 /// The cargo-mutants version the gate is calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -45,27 +44,27 @@ impl Scope {
 }
 
 /// Runs cargo-mutants and requires that nothing survived.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MutantsGate;
+pub fn gate() -> PinnedGate {
+    PinnedGate {
+        pin: &PIN,
+        measure: mutate,
+    }
+}
 
-impl Gate for MutantsGate {
-    fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
-        if let Err(reason) = check_pin(runner, &PIN, &ctx.workspace_root) {
-            return GateOutcome::error(reason);
-        }
-        let scope = match scope(ctx, runner) {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
-        let spec = spec(ctx, &scope);
-        let output = match invoke(runner, &spec) {
-            Ok(output) => output,
-            Err(outcome) => return outcome,
-        };
-        match parse_summary(&output.combined()) {
-            None => unexpected_exit(&spec, &output),
-            Some(counts) => outcome_of(&scope, counts),
-        }
+/// Scopes the run, then mutates.
+fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+    let scope = match scope(ctx, runner) {
+        Ok(scope) => scope,
+        Err(outcome) => return outcome,
+    };
+    let spec = spec(ctx, &scope);
+    let output = match invoke(runner, &spec) {
+        Ok(output) => output,
+        Err(outcome) => return outcome,
+    };
+    match parse_summary(&output.combined()) {
+        None => unexpected_exit(&spec, &output),
+        Some(counts) => outcome_of(&scope, counts),
     }
 }
 
@@ -218,16 +217,12 @@ pub fn outcome_of(scope: &Scope, counts: MutantCounts) -> GateOutcome {
 mod tests {
     use super::*;
     use crate::command::CommandOutput;
-    use crate::testing::ScriptedRunner;
+    use crate::testing::{ScriptedRunner, ctx_at, exited, failed, repo_ctx, run_gate};
 
     const CLEAN: &str = include_str!("../../fixtures/cargo-mutants-clean.txt");
 
-    fn ctx_at(root: &Path) -> GateContext {
-        GateContext::new(root, Vec::new())
-    }
-
     fn version() -> CommandOutput {
-        CommandOutput::new(Some(0), "cargo-mutants 27.1.0", "")
+        exited(0, "cargo-mutants 27.1.0")
     }
 
     #[test]
@@ -244,7 +239,7 @@ mod tests {
 
     #[test]
     fn a_full_tree_run_names_no_diff() {
-        let spec = spec(&ctx_at(Path::new("/repo")), &Scope::FullTree);
+        let spec = spec(&repo_ctx(), &Scope::FullTree);
         assert_eq!(
             spec.display(),
             "cargo mutants --no-shuffle --colors never --output /repo/target/quality"
@@ -254,7 +249,7 @@ mod tests {
     #[test]
     fn a_diff_scoped_run_points_cargo_mutants_at_the_diff() {
         let spec = spec(
-            &ctx_at(Path::new("/repo")),
+            &repo_ctx(),
             &Scope::Diff(PathBuf::from("/repo/target/quality/mutants.diff")),
         );
         assert!(
@@ -365,64 +360,55 @@ mod tests {
         assert_eq!(Scope::Diff(PathBuf::new()).label(), "changed code");
     }
 
+    /// What one scripted run of the gate produced.
+    struct Run {
+        _dir: tempfile::TempDir,
+        ctx: GateContext,
+        outcome: GateOutcome,
+        lines: Vec<String>,
+    }
+
+    /// Runs the gate against a throwaway root, scripting the git probes and
+    /// then a clean cargo-mutants run.
+    fn run_after(git: Vec<CommandOutput>) -> Run {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = ctx_at(dir.path());
+        let mut script = vec![version()];
+        script.extend(git);
+        script.push(exited(0, CLEAN));
+        let runner = ScriptedRunner::new(script);
+        let outcome = run_gate(&gate(), &ctx, &runner);
+        Run {
+            _dir: dir,
+            ctx,
+            outcome,
+            lines: runner.command_lines(),
+        }
+    }
+
     #[test]
     fn an_absent_trunk_branch_falls_back_to_the_whole_tree() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let runner = ScriptedRunner::new(vec![
-            version(),
-            CommandOutput::new(Some(128), "", "fatal: Not a valid object name main"),
-            CommandOutput::new(Some(0), CLEAN, ""),
-        ]);
-        assert_eq!(
-            MutantsGate.run(&ctx_at(dir.path()), &runner).label(),
-            "pass"
-        );
-        assert!(
-            !runner.command_lines()[2].contains("--in-diff"),
-            "{:?}",
-            runner.command_lines()
-        );
+        let run = run_after(vec![failed(128, "fatal: Not a valid object name main")]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert!(!run.lines[2].contains("--in-diff"), "{:?}", run.lines);
     }
 
     #[test]
     fn an_empty_diff_falls_back_to_the_whole_tree() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let runner = ScriptedRunner::new(vec![
-            version(),
-            CommandOutput::new(Some(0), "abc123\n", ""),
-            CommandOutput::new(Some(0), "", ""),
-            CommandOutput::new(Some(0), CLEAN, ""),
-        ]);
-        assert_eq!(
-            MutantsGate.run(&ctx_at(dir.path()), &runner).label(),
-            "pass"
-        );
-        assert!(
-            !runner.command_lines()[3].contains("--in-diff"),
-            "{:?}",
-            runner.command_lines()
-        );
+        let run = run_after(vec![exited(0, "abc123\n"), exited(0, "")]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert!(!run.lines[3].contains("--in-diff"), "{:?}", run.lines);
     }
 
     #[test]
     fn a_real_diff_scopes_the_run_and_is_written_to_disk() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ctx = ctx_at(dir.path());
-        let runner = ScriptedRunner::new(vec![
-            version(),
-            CommandOutput::new(Some(0), "abc123\n", ""),
-            CommandOutput::new(Some(0), "diff --git a/src/lib.rs b/src/lib.rs\n", ""),
-            CommandOutput::new(Some(0), CLEAN, ""),
-        ]);
-        assert_eq!(MutantsGate.run(&ctx, &runner).label(), "pass");
-        assert!(
-            runner.command_lines()[3].contains("--in-diff"),
-            "{:?}",
-            runner.command_lines()
-        );
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n";
+        let run = run_after(vec![exited(0, "abc123\n"), exited(0, diff)]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert!(run.lines[3].contains("--in-diff"), "{:?}", run.lines);
         assert_eq!(
-            std::fs::read_to_string(diff_path(&ctx)).expect("the diff was written"),
-            "diff --git a/src/lib.rs b/src/lib.rs\n"
+            std::fs::read_to_string(diff_path(&run.ctx)).expect("the diff was written"),
+            diff
         );
     }
 
@@ -431,26 +417,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let runner = ScriptedRunner::new(vec![
             version(),
-            CommandOutput::new(Some(128), "", "fatal: no main"),
-            CommandOutput::new(Some(4), "", "error: build failed in an unmutated tree"),
+            failed(128, "fatal: no main"),
+            failed(4, "error: build failed in an unmutated tree"),
         ]);
-        let GateOutcome::Error { reason } = MutantsGate.run(&ctx_at(dir.path()), &runner) else {
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx_at(dir.path()), &runner) else {
             panic!("a mutation run that did not finish did not pass");
         };
         assert!(reason.contains("build failed"), "{reason}");
     }
 
     #[test]
-    fn a_version_mismatch_stops_the_gate_before_it_runs() {
-        let runner = ScriptedRunner::new(vec![CommandOutput::new(
-            Some(0),
-            "cargo-mutants 25.0.0",
-            "",
-        )]);
-        let GateOutcome::Error { .. } = MutantsGate.run(&ctx_at(Path::new("/repo")), &runner)
-        else {
-            panic!("an unpinned tool moves the calibration");
-        };
-        assert_eq!(runner.calls().len(), 1);
+    fn the_gate_is_pinned_to_the_calibrated_cargo_mutants() {
+        assert_eq!(gate().pin, &PIN);
+        assert_eq!(PIN.expected, "27.1.0");
     }
 }
