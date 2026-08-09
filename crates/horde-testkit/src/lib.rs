@@ -19,4 +19,4 @@ pub use conformance::{
     ConformanceFailure, Policy, TurnRecord, check_capability_honesty, check_session,
     check_session_with, run_turn, run_turn_with,
 };
-pub use transcripts::{Transcript, TranscriptError};
+pub use transcripts::{HarnessOutputKey, Transcript, TranscriptError};

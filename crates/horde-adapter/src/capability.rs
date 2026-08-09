@@ -36,14 +36,32 @@ pub enum Capability {
     /// promising the session is still steerable afterwards.
     InterruptibleTurn,
 
-    /// A message can be delivered at the next turn boundary without cancelling
-    /// the turn in flight.
+    /// A message can be delivered **into a turn already running**, and the
+    /// agent acts on it before that turn ends.
     ///
-    /// Distinct from [`Self::InterruptibleTurn`] because the two are separate
-    /// mechanisms in both harnesses Horde drives — Codex exposes `turn/steer`
-    /// alongside `turn/interrupt` — and DESIGN.md §5 treats steering as a
-    /// delivery mode rather than a kind of cancellation.
-    SteerAtTurnBoundary,
+    /// Named for what happens to the turn: an amendment extends it, where
+    /// [`Self::InterruptibleTurn`] aborts it. Codex exposes `turn/steer`
+    /// alongside `turn/interrupt` for exactly this reason.
+    ///
+    /// Spike W2c's transcript `15-steer.jsonl` is the evidence, and it carries
+    /// a trap worth stating plainly: **a `final_answer` is not terminal within
+    /// a turn.** `turn/steer` returns the *same* turn id, the in-flight work
+    /// finishes and emits its own `final_answer`, and the steered instruction
+    /// then emits a second one — two final answers under one turn id. Only
+    /// `turn/completed` ends the turn. An adapter that treats the first final
+    /// answer as the end reports a Result built from work the user just
+    /// redirected away from.
+    ///
+    /// **There is deliberately no boundary-steering capability**, and this
+    /// paragraph exists so nobody re-adds one. Queueing a message to the next
+    /// turn boundary works against *every* provider, because the orchestrator
+    /// simply holds the message and calls
+    /// [`AgentSession::send`](crate::AgentSession::send) when the turn ends.
+    /// That is not a harness capability, so advertising it would be
+    /// meaningless. The absence of `AmendActiveTurn` therefore means precisely
+    /// "the orchestrator holds the message itself" — never "steering is
+    /// unavailable".
+    AmendActiveTurn,
 
     /// **Horde sees a proposed tool call before it runs and decides its fate.**
     ///
@@ -92,7 +110,7 @@ impl Capability {
     pub const ALL: [Self; 10] = [
         Self::Resumable,
         Self::InterruptibleTurn,
-        Self::SteerAtTurnBoundary,
+        Self::AmendActiveTurn,
         Self::PreAuthorizeToolCalls,
         Self::RewritesToolInput,
         Self::SandboxTierAtSpawn,
@@ -279,10 +297,10 @@ mod tests {
     /// Horde drives, so claiming one must not imply the other.
     #[test]
     fn steering_and_interruption_are_independent_claims() {
-        let steer_only = Capabilities::none().with(Capability::SteerAtTurnBoundary);
+        let steer_only = Capabilities::none().with(Capability::AmendActiveTurn);
         assert!(!steer_only.supports(Capability::InterruptibleTurn));
 
         let interrupt_only = Capabilities::none().with(Capability::InterruptibleTurn);
-        assert!(!interrupt_only.supports(Capability::SteerAtTurnBoundary));
+        assert!(!interrupt_only.supports(Capability::AmendActiveTurn));
     }
 }

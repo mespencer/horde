@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ replace == with != in Item::is_command_execution
+@@ -161,17 +161,17 @@
+ impl Item {
+     #[must_use]
+     pub fn is_final_answer(&self) -> bool {
+         self.kind == "agentMessage" && self.phase.as_deref() == Some("final_answer")
+     }
+ 
+     #[must_use]
+     pub fn is_command_execution(&self) -> bool {
+-        self.kind == "commandExecution"
++        self.kind != /* ~ changed by cargo-mutants ~ */ "commandExecution"
+     }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Deserialize)]
+ pub struct TokenUsageUpdated {
+     #[serde(rename = "threadId", default)]
+     pub thread_id: Option<String>,
+     #[serde(rename = "turnId", default)]

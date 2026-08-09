@@ -22,7 +22,13 @@ enum AdapterCapability {
   // A turn in flight can be cancelled.
   ADAPTER_CAPABILITY_INTERRUPTIBLE = 2;
 
-  // Messages can be queued to the next turn boundary.
+  // A message can be delivered into a turn already running, and the agent acts
+  // on it before that turn ends — `AmendActiveTurn` in the domain.
+  //
+  // Not "can be steered": queueing to the next turn boundary works against
+  // every provider, because the Server holds the message and sends it when the
+  // turn ends. Absence of this flag means exactly that — the Server holds it —
+  // and never that steering is unavailable.
   ADAPTER_CAPABILITY_STEERABLE = 3;
 
   // Deprecated in favour of TOOL_CALL_GATING. Names one provider's *mechanism*

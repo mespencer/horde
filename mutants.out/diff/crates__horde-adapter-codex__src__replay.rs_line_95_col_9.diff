@@ -1,0 +1,23 @@
+--- crates/horde-adapter-codex/src/replay.rs
++++ replace <impl AgentSession for ReplaySession>::answer_permission -> Result<()> with Ok(())
+@@ -87,19 +87,17 @@
+         &mut self,
+         tool_call_id: &ToolCallId,
+         _decision: PermissionDecision,
+     ) -> Result<()> {
+         // Codex 0.145.0 routes no approvals to the client at all (ADR-0005), so
+         // there is never an outstanding request to answer — on a recording or
+         // on a live session. Reporting that honestly beats accepting a decision
+         // that would go nowhere.
+-        Err(AdapterError::UnknownPermissionRequest {
+-            tool_call_id: tool_call_id.clone(),
+-        })
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn interrupt(&mut self) -> Result<()> {
+         // Tell the assembler, because it cannot infer this: `thread/status →
+         // idle` is both how an interrupted turn ends and the ordinary state
+         // between turns. Whatever the interrupt did is already in the
+         // recording; what is missing is the knowledge that it was asked for.
+         self.assembler.note_interrupt_requested();

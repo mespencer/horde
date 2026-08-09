@@ -1,0 +1,36 @@
+--- crates/horde-adapter-codex/src/lib.rs
++++ replace capabilities -> Capabilities with Default::default()
+@@ -70,32 +70,17 @@
+ /// tells the client afterwards, which is why
+ /// [`Capability::SandboxTierAtSpawn`] is claimed instead: that is the honest
+ /// description of what containment Codex actually offers (ADR-0005).
+ ///
+ /// Consequently [`Capability::RewritesToolInput`] is absent too — arguments
+ /// cannot be rewritten by a chain that never sees the call.
+ #[must_use]
+ pub fn capabilities() -> Capabilities {
+-    Capabilities::none()
+-        .with(Capability::Resumable)
+-        .with(Capability::InterruptibleTurn)
+-        // SEAM(steer-ruling): spike W2c transcript 15 shows `turn/steer`
+-        // amending the ACTIVE turn — same turn id start to finish, with a
+-        // second `final_answer` inside it — rather than delivering at the next
+-        // boundary. The capability's name is under review by the seam's owner;
+-        // when the ruling lands this is a one-line rename and nothing else in
+-        // this crate moves. The claim itself is correct either way: Codex does
+-        // deliver a message into a running turn without cancelling it.
+-        .with(Capability::SteerAtTurnBoundary)
+-        .with(Capability::SandboxTierAtSpawn)
+-        .with(Capability::ReportsHeadroom)
+-        .with(Capability::SystemPromptOverlay)
+-        .with(Capability::ModelSelection)
+-        .with(Capability::AccountIsolation)
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use horde_adapter::{Capability, PermissionEnforcement};
+ 
+     use super::{PROVIDER, capabilities};
+ 

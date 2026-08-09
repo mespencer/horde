@@ -1,0 +1,23 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ delete match arm "account/rateLimits/updated" in Notification::classify
+@@ -255,19 +255,17 @@
+             "thread/status/changed" => parse(params).map_or_else(other, Self::ThreadStatusChanged),
+             "turn/started" => parse(params).map_or_else(other, Self::TurnStarted),
+             "turn/completed" => parse(params).map_or_else(other, Self::TurnCompleted),
+             "item/agentMessage/delta" => parse(params).map_or_else(other, Self::AgentMessageDelta),
+             "item/completed" => parse(params).map_or_else(other, Self::ItemCompleted),
+             "thread/tokenUsage/updated" => {
+                 parse(params).map_or_else(other, Self::TokenUsageUpdated)
+             }
+-            "account/rateLimits/updated" => {
+-                parse(params).map_or_else(other, Self::RateLimitsUpdated)
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             _ => other(),
+         }
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use serde_json::json;

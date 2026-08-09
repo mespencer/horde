@@ -1,0 +1,23 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ delete match arm "thread/tokenUsage/updated" in Notification::classify
+@@ -252,19 +252,17 @@
+ 
+         match method {
+             "thread/started" => parse(params).map_or_else(other, Self::ThreadStarted),
+             "thread/status/changed" => parse(params).map_or_else(other, Self::ThreadStatusChanged),
+             "turn/started" => parse(params).map_or_else(other, Self::TurnStarted),
+             "turn/completed" => parse(params).map_or_else(other, Self::TurnCompleted),
+             "item/agentMessage/delta" => parse(params).map_or_else(other, Self::AgentMessageDelta),
+             "item/completed" => parse(params).map_or_else(other, Self::ItemCompleted),
+-            "thread/tokenUsage/updated" => {
+-                parse(params).map_or_else(other, Self::TokenUsageUpdated)
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             "account/rateLimits/updated" => {
+                 parse(params).map_or_else(other, Self::RateLimitsUpdated)
+             }
+             _ => other(),
+         }
+     }
+ }
+ 

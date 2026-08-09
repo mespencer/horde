@@ -1,0 +1,22 @@
+--- crates/horde-adapter-codex/src/replay.rs
++++ replace <impl AgentSession for ReplaySession>::interrupt -> Result<()> with Ok(())
+@@ -97,18 +97,17 @@
+         })
+     }
+ 
+     async fn interrupt(&mut self) -> Result<()> {
+         // Tell the assembler, because it cannot infer this: `thread/status →
+         // idle` is both how an interrupted turn ends and the ordinary state
+         // between turns. Whatever the interrupt did is already in the
+         // recording; what is missing is the knowledge that it was asked for.
+-        self.assembler.note_interrupt_requested();
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn shutdown(&mut self) -> Result<()> {
+         self.turns.clear();
+         self.pending.clear();
+         Ok(())
+     }
+ }

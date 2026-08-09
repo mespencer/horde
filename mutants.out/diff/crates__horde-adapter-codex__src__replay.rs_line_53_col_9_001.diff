@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/replay.rs
++++ replace ReplaySession::remaining_turns -> usize with 1
+@@ -45,17 +45,17 @@
+             assembler: TurnAssembler::new(),
+             session_id: None,
+         }
+     }
+ 
+     /// How many recorded turns have not been replayed yet.
+     #[must_use]
+     pub fn remaining_turns(&self) -> usize {
+-        self.turns.len()
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn drain_turn(&mut self, lines: &[String]) -> Result<()> {
+         for line in lines {
+             let frame = decode_line(line)?;
+             self.pending.extend(self.assembler.feed(&frame));
+         }
+         self.session_id = self.assembler.provider_session_id();
