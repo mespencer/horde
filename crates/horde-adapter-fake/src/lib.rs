@@ -27,7 +27,9 @@
 
 pub mod script;
 
-pub use script::{Exhausted, Script, ScriptedTurn, Step};
+pub use script::{Exhausted, Misbehaviour, Script, ScriptedTurn, Step};
+
+use core::time::Duration;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -111,6 +113,8 @@ impl FakeAdapter {
             cumulative_cost: 0.0,
             usage: UsageAccumulator::new(),
             finished: false,
+            misbehaviour: self.script.misbehaviour,
+            stall: None,
         }
     }
 }
@@ -177,10 +181,17 @@ pub struct FakeSession {
     cumulative_cost: f64,
     usage: UsageAccumulator,
     finished: bool,
+    misbehaviour: Option<Misbehaviour>,
+    /// Set by a `Stall` step; awaited by `next_event`, which is the only async
+    /// point in the session.
+    stall: Option<Duration>,
 }
 
 impl FakeSession {
     fn next_chunk_index(&mut self, channel: OutputChannel) -> u64 {
+        if self.misbehaviour == Some(Misbehaviour::RepeatChunkIndex) {
+            return 0;
+        }
         match self
             .chunk_counters
             .iter_mut()
@@ -216,7 +227,7 @@ impl FakeSession {
     /// Plays steps until the queue produces an event, a decision is needed, or
     /// the turn runs out of steps and ends.
     fn advance(&mut self) {
-        while self.pending.is_empty() && self.waiting_on.is_none() {
+        while self.pending.is_empty() && self.waiting_on.is_none() && self.stall.is_none() {
             let Some(step) = self.steps.pop_front() else {
                 self.end_turn();
                 return;
@@ -225,6 +236,21 @@ impl FakeSession {
             match step {
                 Step::Say(text) => self.emit_output(OutputChannel::Assistant, text),
                 Step::Think(text) => self.emit_output(OutputChannel::Reasoning, text),
+                Step::Stall(duration) => self.stall = Some(duration),
+                Step::UseHordeTool {
+                    tool_call_id,
+                    tool_name,
+                    input,
+                } => {
+                    let tool_call_id = ToolCallId::new(tool_call_id);
+                    let turn_id = self.turn_id();
+                    self.emit_output(OutputChannel::ToolCall, format!("{tool_name} {input}"));
+                    self.pending.push_back(AgentEvent::ToolCompleted {
+                        turn_id,
+                        tool_call_id,
+                        is_error: false,
+                    });
+                }
                 Step::AskPermission {
                     tool_call_id,
                     tool_name,
@@ -259,14 +285,22 @@ impl FakeSession {
             .usage
             .observe(self.cumulative_tokens, self.cumulative_cost);
 
-        self.pending.push_back(AgentEvent::TurnEnded(TurnOutcome {
+        if self.misbehaviour == Some(Misbehaviour::NeverEndTurn) {
+            return;
+        }
+
+        let ended = AgentEvent::TurnEnded(TurnOutcome {
             turn_id: current.turn_id,
             status: current.status,
             text: current.text,
             usage,
             denials: std::mem::take(&mut self.denials),
-            duration: core::time::Duration::from_millis(1),
-        }));
+            duration: Duration::from_millis(1),
+        });
+        if self.misbehaviour == Some(Misbehaviour::EndTurnTwice) {
+            self.pending.push_back(ended.clone());
+        }
+        self.pending.push_back(ended);
     }
 }
 
@@ -316,34 +350,64 @@ impl AgentSession for FakeSession {
             cost_usd: turn.cost_usd,
         });
 
-        if !self.announced {
-            self.announced = true;
-            self.pending.push_back(AgentEvent::SessionEstablished {
-                provider_session_id: self.provider_session_id.clone(),
-                model: "fake-model".to_owned(),
-            });
+        match self.misbehaviour {
+            Some(Misbehaviour::SkipSessionEstablished) => {}
+            Some(Misbehaviour::ChangeSessionIdMidConversation) => {
+                // A different name every turn, so revival would target the
+                // wrong conversation.
+                self.announced = true;
+                self.provider_session_id =
+                    ProviderSessionId::new(format!("fake-session-{}", self.turns_taken));
+                self.pending.push_back(AgentEvent::SessionEstablished {
+                    provider_session_id: self.provider_session_id.clone(),
+                    model: "fake-model".to_owned(),
+                });
+            }
+            _ => {
+                if !self.announced {
+                    self.announced = true;
+                    self.pending.push_back(AgentEvent::SessionEstablished {
+                        provider_session_id: self.provider_session_id.clone(),
+                        model: "fake-model".to_owned(),
+                    });
+                }
+            }
         }
 
         Ok(())
     }
 
     async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
-        if self.pending.is_empty()
-            && let Some(tool_call_id) = &self.waiting_on
-        {
-            return Err(AdapterError::AwaitingDecision {
-                tool_call_id: tool_call_id.clone(),
-            });
-        }
+        // `advance` is synchronous and stops when it hits a `Stall`, leaving the
+        // duration behind for this loop to await. Looping — rather than
+        // sleeping once at the top — is what keeps a stall from truncating the
+        // turn: after waking, there is still a turn to play out.
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
 
-        if self.pending.is_empty() {
+            if let Some(tool_call_id) = &self.waiting_on {
+                return Err(AdapterError::AwaitingDecision {
+                    tool_call_id: tool_call_id.clone(),
+                });
+            }
+
+            if let Some(duration) = self.stall.take() {
+                tokio::time::sleep(duration).await;
+                continue;
+            }
+
             if self.current.is_none() {
                 return Ok(None);
             }
             self.advance();
-        }
 
-        Ok(self.pending.pop_front())
+            if self.pending.is_empty() && self.stall.is_none() && self.waiting_on.is_none() {
+                // `advance` ran the turn to its end and produced nothing more.
+                return Ok(None);
+            }
+        }
     }
 
     async fn answer_permission(

@@ -5,11 +5,13 @@
 //! that the Claude codec passes against recorded bytes are run here against the
 //! script-backed backend, so the two cannot drift apart unnoticed.
 
+use core::time::Duration;
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSpec, Capabilities, Capability, OutputChannel,
     PermissionDecision, ProviderSessionId, TokenUsage, TurnInput, TurnStatus,
 };
-use horde_adapter_fake::{FakeAdapter, Script, ScriptedTurn, Step};
+
+use horde_adapter_fake::{FakeAdapter, Misbehaviour, Script, ScriptedTurn, Step};
 use horde_testkit::conformance::{
     check_capability_honesty, check_session, check_session_with, run_turn,
 };
@@ -358,5 +360,129 @@ async fn several_chunks_on_one_channel_are_numbered_in_order() {
         reasoning,
         vec![0],
         "each channel is numbered independently of the others"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Positive controls: the conformance suite must reject a misbehaving adapter.
+//
+// docs/TESTING.md §1 — a check that has never been shown to fail is not known
+// to work. Each of these deliberately breaks one contract clause and asserts
+// the suite catches it, so the checks stay honest as the suite grows.
+// ---------------------------------------------------------------------------
+
+/// Drives a misbehaving agent and returns the violation the suite reported.
+async fn violation_from(misbehaviour: Misbehaviour, messages: &[&str]) -> String {
+    let adapter = FakeAdapter::new(
+        Script::of(vec![
+            ScriptedTurn::saying("one").with_step(Step::Say("two".to_owned())),
+            ScriptedTurn::saying("three"),
+        ])
+        .misbehaving(misbehaviour),
+    );
+    let Ok(mut session) = adapter.spawn(&AgentSpec::default()).await else {
+        return "spawn failed".to_owned();
+    };
+
+    match check_session(session.as_mut(), messages).await {
+        Ok(_) => String::new(),
+        Err(failure) => failure.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn output_before_the_session_is_named_is_rejected() {
+    let reported = violation_from(Misbehaviour::SkipSessionEstablished, &["go"]).await;
+    assert!(
+        reported.contains("before any SessionEstablished"),
+        "the suite must reject unattributable output, got: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_never_ends_is_rejected() {
+    let reported = violation_from(Misbehaviour::NeverEndTurn, &["go"]).await;
+    assert!(
+        reported.contains("without a TurnEnded"),
+        "every message owes exactly one turn ending, got: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_chunk_index_is_rejected() {
+    let reported = violation_from(Misbehaviour::RepeatChunkIndex, &["go"]).await;
+    assert!(
+        reported.contains("chunk index"),
+        "indices exist for gap detection and must advance, got: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn renaming_the_session_mid_conversation_is_rejected() {
+    let reported = violation_from(
+        Misbehaviour::ChangeSessionIdMidConversation,
+        &["go", "again"],
+    )
+    .await;
+    assert!(
+        reported.contains("changed mid-conversation"),
+        "revival would target the wrong conversation, got: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn closing_the_same_turn_twice_is_rejected() {
+    let reported = violation_from(Misbehaviour::EndTurnTwice, &["go", "again"]).await;
+    assert!(
+        !reported.is_empty(),
+        "a doubled turn ending must not pass as two clean turns"
+    );
+}
+
+/// A stalling agent still conforms; the clock is paused so the wait is free.
+#[tokio::test(start_paused = true)]
+async fn a_stalling_turn_still_conforms() {
+    let adapter = FakeAdapter::new(Script::of(vec![
+        ScriptedTurn::saying("thinking").with_step(Step::Stall(Duration::from_secs(300))),
+    ]));
+    let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
+
+    let started = tokio::time::Instant::now();
+    let records = check_session(session.as_mut(), &["go"])
+        .await
+        .expect("a slow agent is still a conforming agent");
+
+    assert_eq!(records.len(), 1);
+    assert!(
+        started.elapsed() >= Duration::from_secs(300),
+        "the stall must actually advance the clock, or timeout tests would be vacuous"
+    );
+}
+
+/// Horde's own verbs reach the adapter as ordinary tool calls, which is how a
+/// script says "here the agent spawns a child".
+#[tokio::test]
+async fn a_horde_verb_is_reported_as_a_tool_call_without_an_approval_round_trip() {
+    let adapter = FakeAdapter::new(Script::of(vec![
+        ScriptedTurn::saying("delegating").with_step(Step::UseHordeTool {
+            tool_call_id: "call-9".to_owned(),
+            tool_name: "spawn_agent".to_owned(),
+            input: json!({ "agent_type": "reviewer", "tier": "deep" }),
+        }),
+    ]));
+    let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
+
+    let records = check_session(session.as_mut(), &["go"])
+        .await
+        .expect("must conform");
+
+    let called = records[0].events.iter().any(|event| {
+        matches!(event, AgentEvent::Output { channel: OutputChannel::ToolCall, text, .. }
+            if text.starts_with("spawn_agent "))
+    });
+    assert!(called, "the spawn intent must reach the event stream");
+    assert!(
+        records[0].outcome.is_clean_success(),
+        "a Horde verb needs no approval and must not register as a denial"
     );
 }
