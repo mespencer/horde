@@ -479,6 +479,44 @@ mod side_effects {
         session.shutdown().await.expect("shuts down");
     }
 
+    /// Answering a permission request that cannot exist must be an error.
+    ///
+    /// Prompts arrive on the MCP endpoint, not on stdout, and that endpoint is
+    /// the next increment. Returning Ok here would let a decision that went
+    /// nowhere look like one that was applied — the failure the permission chain
+    /// cannot tolerate.
+    #[tokio::test]
+    async fn answering_a_permission_request_that_cannot_exist_is_an_error() {
+        let (harness_spec, _dir) = spec_with(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}",
+            &[],
+        );
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = harness_spec.env.clone();
+
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        let refused = session
+            .answer_permission(
+                &horde_adapter::ToolCallId::new("toolu_01"),
+                horde_adapter::PermissionDecision::allow(),
+            )
+            .await;
+
+        assert!(
+            refused.is_err(),
+            "a decision with nowhere to go must be refused"
+        );
+        assert!(
+            refused
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+                .contains("toolu_01"),
+            "and must name the call it could not answer"
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
     /// `shutdown()` must actually end the child.
     #[tokio::test]
     async fn shutdown_ends_the_child_and_closes_the_session() {
