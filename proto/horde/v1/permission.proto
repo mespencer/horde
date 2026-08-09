@@ -1,0 +1,78 @@
+// The permission chain: deterministic deny, deterministic allow, Policy Judge,
+// human approval.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "horde/v1/id.proto";
+
+// The layers, in evaluation order. Used both for "who decided" and for "which
+// layer gave up and escalated".
+enum PermissionLayer {
+  PERMISSION_LAYER_UNSPECIFIED = 0;
+  PERMISSION_LAYER_DETERMINISTIC_DENY = 1;
+  PERMISSION_LAYER_DETERMINISTIC_ALLOW = 2;
+  PERMISSION_LAYER_POLICY_JUDGE = 3;
+  PERMISSION_LAYER_HUMAN = 4;
+}
+
+enum PermissionOutcome {
+  PERMISSION_OUTCOME_UNSPECIFIED = 0;
+  PERMISSION_OUTCOME_ALLOW = 1;
+  PERMISSION_OUTCOME_DENY = 2;
+}
+
+// The tool call being judged, as the harness proposed it.
+message ProposedToolCall {
+  string tool_name = 1;
+
+  // Arguments as the harness supplied them. Structured rather than a JSON
+  // string so deterministic rules and the Policy Judge read the same values.
+  google.protobuf.Struct input = 2;
+
+  // Human-readable rendering for approval UIs, e.g. "docker rm horde-test".
+  string rendered = 3;
+}
+
+// An escalation awaiting a decision. Rides the event log like everything else,
+// which is what makes it answerable from any connected Client.
+message PermissionRequest {
+  PermissionRequestId request_id = 1;
+
+  AgentId agent_id = 2;
+
+  ProposedToolCall tool_call = 3;
+
+  // Ancestry for the approver: ["ci-fix", "reviewer", "test-runner"].
+  repeated string tree_path = 4;
+
+  // The named mode that was in force.
+  string permission_mode = 5;
+
+  // The layer that escalated. HUMAN never appears here.
+  PermissionLayer escalated_from = 6;
+
+  // After this, the request is dead and the Agent is unblocked as a denial.
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+message PermissionDecision {
+  PermissionRequestId request_id = 1;
+
+  PermissionOutcome outcome = 2;
+
+  // Which layer produced this decision.
+  PermissionLayer decided_by = 3;
+
+  // Which principal, when the layer was HUMAN. Multi-attach means several
+  // Clients could have answered.
+  Actor decided_by_actor = 4;
+
+  // Judge rationale or human note.
+  string reason = 5;
+
+  // Widen the deterministic-allow layer for the rest of the Session.
+  bool remember_for_session = 6;
+}

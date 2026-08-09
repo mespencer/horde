@@ -1,0 +1,59 @@
+// The version/capability handshake carried on every connection.
+//
+// Above the Server's minimum supported version per role, features gate on
+// advertised capability flags rather than on semver comparisons. Flags are
+// freeform strings deliberately: adding a feature gate must not require a
+// schema change on both sides first.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_CLIENT = 1;
+  ROLE_WORKER = 2;
+}
+
+// Sent by a Client or Worker when it connects.
+message Hello {
+  // Semantic version of the peer binary, e.g. "0.3.1".
+  string semver = 1;
+
+  // Freeform feature flags this peer implements, e.g. "payload.attachments".
+  repeated string capability_flags = 2;
+
+  Role role = 3;
+
+  // Human-facing name for display and enrollment records.
+  string display_name = 4;
+}
+
+// The Server's half of the handshake.
+message ServerHello {
+  string semver = 1;
+
+  repeated string capability_flags = 2;
+
+  // Below this, the Server refuses the peer's role outright.
+  string min_supported_semver = 3;
+
+  // Server clock, so peers can render and reconcile skew without guessing.
+  google.protobuf.Timestamp server_time = 4;
+
+  // The identity the Server derived from the peer's mTLS certificate. Echoed
+  // back so a peer can tell whom the Server thinks it is talking to.
+  string principal = 5;
+}
+
+// Auto-detected facts about a Worker's machine; matchable at placement time.
+message Platform {
+  // GOOS-style, e.g. "darwin", "linux".
+  string os = 1;
+
+  // GOARCH-style, e.g. "arm64", "amd64".
+  string arch = 2;
+
+  string hostname = 3;
+}

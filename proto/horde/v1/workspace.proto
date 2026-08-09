@@ -1,0 +1,98 @@
+// Workspaces: portable Definitions (Server-owned) and per-Worker Instances
+// (Worker-owned; the Server's view is cache).
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/timestamp.proto";
+import "horde/v1/id.proto";
+
+message WorkspaceRepo {
+  // Stable name used by GitRef and by layout, e.g. "atlas".
+  string name = 1;
+
+  string remote_url = 2;
+
+  string default_branch = 3;
+
+  // Path relative to the Instance root where this repo is checked out.
+  string layout_path = 4;
+}
+
+// The portable description of a Workspace: repos, layout, Unmanaged Paths.
+message WorkspaceDefinition {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  string name = 2;
+
+  // Fixed at definition time. Additions go through AddWorkspaceRepo, which is
+  // deliberate ceremony, not an Update field.
+  repeated WorkspaceRepo repos = 3;
+
+  // Directories git never covers and Payloads never sync: datasets, weights,
+  // build caches. Cross-Worker artifact passing is the Blob Store's job.
+  repeated string unmanaged_paths = 4;
+
+  google.protobuf.Timestamp created_at = 5;
+
+  // Optimistic-concurrency token. Send back on Update; mismatch is ABORTED.
+  string etag = 6;
+}
+
+enum WorkspaceInstanceState {
+  WORKSPACE_INSTANCE_STATE_UNSPECIFIED = 0;
+
+  WORKSPACE_INSTANCE_STATE_MATERIALIZING = 1;
+
+  WORKSPACE_INSTANCE_STATE_READY = 2;
+
+  // Present but not matching the Definition: a repo failed to fetch, a path was
+  // removed out of band.
+  WORKSPACE_INSTANCE_STATE_DEGRADED = 3;
+
+  // The Worker no longer has it. Reported so the Server can drop its cache.
+  WORKSPACE_INSTANCE_STATE_MISSING = 4;
+}
+
+message RepoInstanceReport {
+  string repo_name = 1;
+
+  // Absolute path on the Worker's disk.
+  string path = 2;
+
+  string head_commit_sha = 3;
+
+  bool dirty = 4;
+}
+
+// A Worker's report on one materialized Instance. The Worker-local state file
+// is the truth; this is what the Server caches.
+message WorkspaceInstanceReport {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  WorkerId worker_id = 2;
+
+  WorkspaceInstanceState state = 3;
+
+  string root_path = 4;
+
+  repeated RepoInstanceReport repos = 5;
+
+  // Why, when state is DEGRADED or MISSING.
+  string detail = 6;
+
+  google.protobuf.Timestamp observed_at = 7;
+}
+
+// Streamed while an Instance is being materialized, so `prewarm` is visible
+// rather than a silent wait.
+message MaterializationProgress {
+  // What is happening now, e.g. "cloning atlas".
+  string step = 1;
+
+  uint32 completed_repos = 2;
+
+  uint32 total_repos = 3;
+
+  string detail = 4;
+}

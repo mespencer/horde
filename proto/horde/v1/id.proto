@@ -1,0 +1,58 @@
+// Identifiers and actors.
+//
+// Every identifier is a distinct message rather than a bare `string` so that
+// generated code in every language refuses to pass a SessionId where an AgentId
+// is expected, and so an identifier can gain structure later without a wire
+// break. Cost: identifier fields decode as optional in every language; callers
+// convert to domain types at the transport boundary.
+syntax = "proto3";
+
+package horde.v1;
+
+// A Session: one conversation tree rooted at one top-level Agent.
+message SessionId {
+  string value = 1;
+}
+
+// An Agent: one conversation with one model via one provider harness.
+message AgentId {
+  string value = 1;
+}
+
+// A Worker: a machine-resident supervisor that dials the Server.
+message WorkerId {
+  string value = 1;
+}
+
+// A Client: a user-facing program attached to the Server.
+message ClientId {
+  string value = 1;
+}
+
+// A Workspace Definition: the portable description of a Workspace.
+message WorkspaceDefinitionId {
+  string value = 1;
+}
+
+// An Assignment: the message that is owed exactly one Result.
+message AssignmentId {
+  string value = 1;
+}
+
+// One permission escalation awaiting a decision.
+message PermissionRequestId {
+  string value = 1;
+}
+
+// Whoever caused an event. Multi-attach means several Clients can drive one
+// Session, so "the user did it" is not specific enough to render or audit.
+message Actor {
+  oneof actor {
+    AgentId agent_id = 1;
+    ClientId client_id = 2;
+    ServerActor server = 3;
+  }
+}
+
+// The Server acting on its own behalf: the Reaper, the scheduler, queue expiry.
+message ServerActor {}

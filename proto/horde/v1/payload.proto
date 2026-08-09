@@ -1,0 +1,45 @@
+// Payloads: what rides a spawn, a message, or a Result.
+//
+// Transport is never the Agent's concern. A Payload names committed git refs
+// and/or Attachments; the Server and Workers resolve how those actually move
+// (ref checkout, peer fetch, or push/fetch through the Relay).
+syntax = "proto3";
+
+package horde.v1;
+
+message Payload {
+  // One ref per repo touched. Repeated from day one because a Workspace is
+  // 1..N repos and one Agent can commit in several of them.
+  repeated GitRef git_refs = 1;
+
+  // Non-code files carried through the Blob Store.
+  repeated Attachment attachments = 2;
+}
+
+// A committed point in one repo of the Workspace. The unit of sharing is the
+// commit; dirty working trees are permanently out of scope.
+message GitRef {
+  // Repo name as declared in the Workspace Definition, not a URL: the sender
+  // and receiver may reach the same repo through different remotes.
+  string repo_name = 1;
+
+  // Full 40- or 64-hex commit id. Authoritative.
+  string commit_sha = 2;
+
+  // Advisory branch the commit was observed on; may be absent or stale.
+  string branch = 3;
+}
+
+// A non-code file (screenshot, binary, log) held in the Server's Blob Store.
+message Attachment {
+  // Display name, e.g. "failing-test.log". Not a path and not unique.
+  string name = 1;
+
+  // Content address in the Blob Store, e.g. "sha256:abc...". The identity.
+  string blob_digest = 2;
+
+  uint64 size_bytes = 3;
+
+  // IANA media type when known, e.g. "image/png".
+  string media_type = 4;
+}

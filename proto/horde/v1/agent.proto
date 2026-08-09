@@ -1,0 +1,281 @@
+// The Agent model: messages, Results, model selection, placement, lifecycle.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "horde/v1/id.proto";
+import "horde/v1/payload.proto";
+
+// ---------------------------------------------------------------------------
+// Messaging: two kinds, sender declares intent.
+// ---------------------------------------------------------------------------
+
+// A message that expects exactly one Result. Spawning carries an implicit
+// first Assignment.
+message Assignment {
+  // Server-assigned. Leave unset when sending; the Server fills it in and
+  // returns it, so the Result can be correlated back.
+  AssignmentId assignment_id = 1;
+
+  string text = 2;
+
+  Payload payload = 3;
+}
+
+// A message owing no Result: chat, context, status. Ongoing Agents live on
+// these.
+message Note {
+  string text = 1;
+
+  Payload payload = 2;
+}
+
+// When a message reaches a busy Agent. Steering is a delivery mode, not a third
+// message kind: the same Assignment or Note either waits for the turn boundary
+// or cancels the turn in flight.
+enum DeliveryMode {
+  DELIVERY_MODE_UNSPECIFIED = 0;
+
+  // Queue until the Agent's current turn ends. The default for steering.
+  DELIVERY_MODE_TURN_BOUNDARY = 1;
+
+  // Cancel the current turn and deliver immediately.
+  DELIVERY_MODE_INTERRUPT = 2;
+}
+
+enum ResultStatus {
+  RESULT_STATUS_UNSPECIFIED = 0;
+  RESULT_STATUS_SUCCESS = 1;
+  RESULT_STATUS_PARTIAL = 2;
+  RESULT_STATUS_BLOCKED = 3;
+}
+
+// The single response an Assignment is owed. Reporting a Result does not
+// discard context; archiving does.
+message Result {
+  AssignmentId assignment_id = 1;
+
+  ResultStatus status = 2;
+
+  string summary = 3;
+
+  // Commits are auto-detected by the Worker and stamped here; Attachments are
+  // whatever the Agent chose to attach.
+  Payload payload = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Model selection: Agents request a tier, not a brand.
+// ---------------------------------------------------------------------------
+
+// What a spawn asks for. Leaving the oneof unset means "inherit the spawner's
+// tier" — a distinct state from naming a tier explicitly, which is why this is
+// a oneof and not two strings.
+message ModelSelection {
+  oneof selection {
+    // A user-defined tier key: shipped defaults are "fast", "standard", "deep".
+    string tier = 1;
+
+    // An explicit (provider, model) request. Subject to permission policy,
+    // because letting spawners name brands invites provider self-bias.
+    ConcreteModel concrete = 2;
+  }
+}
+
+message ConcreteModel {
+  // Adapter key, e.g. "claude", "codex".
+  string provider = 1;
+
+  string model = 2;
+
+  // Provider Account name; empty means any account with headroom.
+  string provider_account = 3;
+}
+
+// What the scheduler actually bound at spawn time. Held for the Agent's life —
+// revival resumes the same provider session, and rebalancing happens across new
+// spawns, never by migrating live Agents.
+message ModelBinding {
+  // The tier this binding was resolved from; empty when concretely requested.
+  string tier = 1;
+
+  string provider = 2;
+
+  string model = 3;
+
+  string provider_account = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Spawning
+// ---------------------------------------------------------------------------
+
+// How an Agent occupies a Workspace Instance.
+enum CheckoutPolicy {
+  CHECKOUT_POLICY_UNSPECIFIED = 0;
+
+  // Work directly in the parent's Instance.
+  CHECKOUT_POLICY_SHARED = 1;
+
+  // One git worktree per repo under an Agent-private root. The default for
+  // mutating Agents.
+  CHECKOUT_POLICY_WORKTREE = 2;
+
+  // A full clone; total isolation.
+  CHECKOUT_POLICY_FRESH_CLONE = 3;
+}
+
+// What the scheduler must match a Worker's advertised Capabilities against.
+message PlacementConstraints {
+  // Freeform Worker tags that must all be present, e.g. "gpu", "macos".
+  repeated string required_tags = 1;
+
+  // Skip matching entirely and demand this Worker.
+  WorkerId pinned_worker_id = 2;
+
+  // Provider Account names the Worker must hold.
+  repeated string required_provider_accounts = 3;
+
+  // Git remotes the Worker must be able to reach directly.
+  repeated string required_remotes = 4;
+
+  // How long the spawn may sit queued before it expires. Spawn never blocks the
+  // caller; expiry is an event the spawner hears.
+  google.protobuf.Duration queue_timeout = 5;
+}
+
+// A cap on what a subtree may consume. Activation is sequenced later; the shape
+// is here from day one so accounting is never retrofitted.
+message Budget {
+  // Total tokens across this Agent and its descendants. Zero means unbounded.
+  uint64 total_tokens = 1;
+}
+
+// Everything needed to bring one Agent into existence.
+message AgentSpec {
+  // Agent type name from a repo's `.horde/`, e.g. "reviewer".
+  string agent_type = 1;
+
+  ModelSelection model = 2;
+
+  WorkspaceDefinitionId workspace_definition_id = 3;
+
+  CheckoutPolicy checkout_policy = 4;
+
+  PlacementConstraints placement = 5;
+
+  // Named permission mode, resolved through the config precedence chain.
+  // Capabilities attenuate down the tree; asking for more than the parent holds
+  // is a human-approval event, never silent.
+  string permission_mode = 6;
+
+  Budget budget = 7;
+
+  // The implicit first Assignment carried by the spawn.
+  Assignment initial_assignment = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Placement and lifecycle
+// ---------------------------------------------------------------------------
+
+enum PlacementState {
+  PLACEMENT_STATE_UNSPECIFIED = 0;
+
+  // No matching Worker yet. The spawner holds a handle and may wait, relax,
+  // cancel, or escalate.
+  PLACEMENT_STATE_QUEUED = 1;
+
+  PLACEMENT_STATE_PLACED = 2;
+
+  // The queue timeout elapsed without a match.
+  PLACEMENT_STATE_EXPIRED = 3;
+
+  PLACEMENT_STATE_CANCELLED = 4;
+}
+
+// The scheduler assigning one Agent to one Worker. Sessions span Workers; the
+// Agent, not the Session, is the unit of placement.
+message Placement {
+  AgentId agent_id = 1;
+
+  PlacementState state = 2;
+
+  // Set once state is PLACED.
+  WorkerId worker_id = 3;
+
+  // Why, in words the spawner can act on: "no online worker with tag `gpu`;
+  // `gpu-box` matches but is offline".
+  string reason = 4;
+}
+
+enum AgentLifecycleState {
+  AGENT_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  AGENT_LIFECYCLE_STATE_QUEUED = 1;
+  AGENT_LIFECYCLE_STATE_STARTING = 2;
+  AGENT_LIFECYCLE_STATE_RUNNING = 3;
+  AGENT_LIFECYCLE_STATE_WAITING_ON_CHILD = 4;
+  AGENT_LIFECYCLE_STATE_WAITING_ON_HUMAN = 5;
+
+  // Reported its Result, context retained, revivable by another message.
+  AGENT_LIFECYCLE_STATE_IDLE = 6;
+
+  // Context discarded. This — not the Result — is what ends an Agent.
+  AGENT_LIFECYCLE_STATE_ARCHIVED = 7;
+
+  AGENT_LIFECYCLE_STATE_FAILED = 8;
+}
+
+enum SessionLifecycleState {
+  SESSION_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  SESSION_LIFECYCLE_STATE_ACTIVE = 1;
+  SESSION_LIFECYCLE_STATE_ARCHIVED = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Read models
+// ---------------------------------------------------------------------------
+
+message AgentSummary {
+  AgentId agent_id = 1;
+
+  // Unset for a Session's top-level Agent.
+  AgentId parent_agent_id = 2;
+
+  SessionId session_id = 3;
+
+  AgentLifecycleState state = 4;
+
+  ModelBinding binding = 5;
+
+  WorkerId worker_id = 6;
+
+  // Spawn ancestry as display names, root first: ["ci-fix", "reviewer"]. Used
+  // for permission routing context and usage attribution.
+  repeated string tree_path = 7;
+
+  string agent_type = 8;
+
+  google.protobuf.Timestamp created_at = 9;
+}
+
+message SessionSummary {
+  SessionId session_id = 1;
+
+  string title = 2;
+
+  AgentId root_agent_id = 3;
+
+  WorkspaceDefinitionId workspace_definition_id = 4;
+
+  SessionLifecycleState state = 5;
+
+  google.protobuf.Timestamp created_at = 6;
+
+  // Highest sequence in this Session's event log. A Client resumes from here.
+  uint64 head_sequence = 7;
+
+  uint32 agent_count = 8;
+}

@@ -1,0 +1,248 @@
+// The Worker-facing surface.
+//
+// Workers dial the Server (NAT-friendly); the Server never dials a Worker. So
+// "commands down" is a server-streaming response and "events up" is a client
+// stream, both initiated by the Worker.
+//
+// Commands and events are separate streams rather than one bidirectional
+// stream, deliberately: a burst of Agent output chunks must not head-of-line
+// block a placement command, and the two directions reconnect independently.
+// Each direction carries its own monotonic sequence and is acked by the other
+// side, so a reconnect resumes instead of replaying blindly or losing work.
+syntax = "proto3";
+
+package horde.v1;
+
+import "horde/v1/agent.proto";
+import "horde/v1/event.proto";
+import "horde/v1/handshake.proto";
+import "horde/v1/id.proto";
+import "horde/v1/permission.proto";
+import "horde/v1/worker.proto";
+import "horde/v1/workspace.proto";
+
+service WorkerService {
+  // Handshake plus full Capability advertisement. Call before opening streams.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Commands down. The Worker resumes from the last command it durably
+  // applied.
+  rpc StreamCommands(StreamCommandsRequest) returns (stream StreamCommandsResponse);
+
+  // Journaled events up, acked by offset. Bidirectional because the ack must
+  // ride the same stream that carries the events; a Worker that never learns
+  // its high-water mark cannot truncate its journal.
+  rpc PushEvents(stream PushEventsRequest) returns (stream PushEventsResponse);
+
+  // Capability refresh: headroom moved, an account was added, a harness was
+  // installed. Also serves as the liveness heartbeat.
+  rpc ReportCapabilities(ReportCapabilitiesRequest) returns (ReportCapabilitiesResponse);
+
+  // Workspace Instance state. The Worker-local state file is the truth; this
+  // is how the Server's cache is corrected after a wiped disk or an
+  // out-of-band deletion.
+  rpc ReportWorkspaceInstances(ReportWorkspaceInstancesRequest) returns (ReportWorkspaceInstancesResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+message RegisterWorkerRequest {
+  Hello hello = 1;
+
+  // The Worker's own view of its identity; the Server trusts the mTLS
+  // certificate over this field and may correct it in the response.
+  WorkerId worker_id = 2;
+
+  WorkerCapabilities capabilities = 3;
+}
+
+message RegisterWorkerResponse {
+  // Authoritative, derived from the client certificate.
+  WorkerId worker_id = 1;
+
+  ServerHello server = 2;
+
+  // First journal sequence the Server has not durably stored. The Worker
+  // replays from here.
+  uint64 resume_from_journal_sequence = 3;
+
+  // First command sequence the Server believes the Worker has not applied.
+  uint64 resume_from_command_sequence = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Commands down
+// ---------------------------------------------------------------------------
+
+message StreamCommandsRequest {
+  WorkerId worker_id = 1;
+
+  // Last command the Worker durably applied, plus one. Authoritative: the
+  // Worker's local state, not the Server's guess, decides what is replayed.
+  uint64 resume_from_command_sequence = 2;
+}
+
+message SpawnAgentCommand {
+  SessionId session_id = 1;
+
+  // Server-assigned before the command is sent, so the Agent is addressable
+  // even if the Worker never acks.
+  AgentId agent_id = 2;
+
+  AgentId parent_agent_id = 3;
+
+  AgentSpec spec = 4;
+
+  // Resolved by the scheduler; the Worker does not re-resolve tiers.
+  ModelBinding binding = 5;
+
+  repeated string tree_path = 6;
+
+  // Prompt Overlay text to apply at spawn. Differs for top-level versus
+  // spawned Agents; resolution happens Server-side, application Worker-side.
+  string prompt_overlay = 7;
+}
+
+message DeliverMessageCommand {
+  AgentId agent_id = 1;
+
+  oneof body {
+    Assignment assignment = 2;
+    Note note = 3;
+  }
+
+  DeliveryMode delivery = 4;
+}
+
+message InterruptAgentCommand {
+  AgentId agent_id = 1;
+
+  string reason = 2;
+}
+
+// Discard the Agent's context. This, not the Result, is what ends an Agent.
+message ArchiveAgentCommand {
+  AgentId agent_id = 1;
+
+  string reason = 2;
+}
+
+// Create or repair a Workspace Instance. Instances are never self-initiated by
+// a Worker; they exist because the Server asked.
+message MaterializeWorkspaceCommand {
+  // The full Definition, not just its id: a Worker must be able to materialize
+  // without a round trip, including while its view of the Server is degraded.
+  WorkspaceDefinition definition = 1;
+
+  // Session whose log should carry progress events, when there is one.
+  SessionId session_id = 2;
+}
+
+message DeliverPermissionDecisionCommand {
+  AgentId agent_id = 1;
+
+  PermissionDecision decision = 2;
+}
+
+message CancelPlacementCommand {
+  AgentId agent_id = 1;
+
+  string reason = 2;
+}
+
+message StreamCommandsResponse {
+  // Per Worker, dense, 1-based, monotonic across reconnects.
+  uint64 command_sequence = 1;
+
+  // Stable across redelivery. Commands are at-least-once; the Worker dedupes
+  // on this.
+  string command_id = 2;
+
+  oneof command {
+    SpawnAgentCommand spawn_agent = 10;
+    DeliverMessageCommand deliver_message = 11;
+    InterruptAgentCommand interrupt_agent = 12;
+    ArchiveAgentCommand archive_agent = 13;
+    MaterializeWorkspaceCommand materialize_workspace = 14;
+    DeliverPermissionDecisionCommand deliver_permission_decision = 15;
+    CancelPlacementCommand cancel_placement = 16;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Events up
+// ---------------------------------------------------------------------------
+
+// First message on the stream.
+message PushEventsStart {
+  WorkerId worker_id = 1;
+
+  // Highest sequence in the Worker's local journal. Lets the Server detect a
+  // Worker that lost its journal (reports lower than the Server has seen) and
+  // refuse rather than silently renumber.
+  uint64 last_local_journal_sequence = 2;
+}
+
+message JournaledEventBatch {
+  // Contiguous and ascending by journal_sequence.
+  repeated JournaledEvent events = 1;
+
+  // Piggybacked ack for the command stream: the highest command the Worker has
+  // durably applied. Riding the event stream means acks flow even when no new
+  // commands are arriving.
+  uint64 acked_command_sequence = 2;
+}
+
+message PushEventsRequest {
+  oneof body {
+    PushEventsStart start = 1;
+    JournaledEventBatch batch = 2;
+  }
+}
+
+// The Server's answer to PushEventsStart.
+message PushEventsAccepted {
+  // First journal sequence the Server has not durably stored. The Worker
+  // replays from here and may truncate everything below it.
+  uint64 resume_from_journal_sequence = 1;
+}
+
+message JournalAck {
+  // Highest journal sequence durably appended to the Session logs.
+  uint64 acked_journal_sequence = 1;
+}
+
+message PushEventsResponse {
+  oneof body {
+    PushEventsAccepted accepted = 1;
+    JournalAck ack = 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+message ReportCapabilitiesRequest {
+  WorkerId worker_id = 1;
+
+  // Complete replacement, not a delta: partial capability updates are how a
+  // scheduler ends up matching on facts that stopped being true.
+  WorkerCapabilities capabilities = 2;
+}
+
+message ReportCapabilitiesResponse {}
+
+message ReportWorkspaceInstancesRequest {
+  WorkerId worker_id = 1;
+
+  repeated WorkspaceInstanceReport reports = 2;
+
+  // True when this is the Worker's complete Instance set, so the Server may
+  // drop cached Instances absent from it. False for incremental updates.
+  bool authoritative = 3;
+}
+
+message ReportWorkspaceInstancesResponse {}

@@ -1,0 +1,13 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  # FILE, not WIRE: version skew is a generated-code problem as much as a wire
+  # problem here. Server, Worker, and Client are separate binaries that upgrade
+  # independently, so a change that parses fine but renames a generated type
+  # still breaks a build we care about.
+  use:
+    - FILE

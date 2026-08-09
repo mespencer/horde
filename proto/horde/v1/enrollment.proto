@@ -1,0 +1,46 @@
+// Enrollment: the one-time-code flow by which a new Worker or Client obtains
+// its mTLS identity from the Server's internal CA.
+//
+// The only surface reachable without a client certificate, which is why it is
+// a separate service: it is a distinct trust tier, not an unauthenticated
+// corner of the control plane.
+syntax = "proto3";
+
+package horde.v1;
+
+import "horde/v1/handshake.proto";
+import "horde/v1/id.proto";
+
+service EnrollmentService {
+  // Redeem a one-time code and a CSR for a signed certificate. Private keys
+  // never travel: the joining machine generates its own keypair and sends only
+  // the CSR.
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message JoinRequest {
+  // Short-lived one-time code minted by ControlPlaneService.MintEnrollmentCode.
+  string enrollment_code = 1;
+
+  // PEM-encoded certificate signing request.
+  string csr_pem = 2;
+
+  // The joining peer's version and capabilities, so the Server can refuse an
+  // unsupported version before issuing an identity to it.
+  Hello hello = 3;
+
+  string name = 4;
+}
+
+message JoinResponse {
+  // PEM-encoded certificate signed by the Server's CA.
+  string certificate_pem = 1;
+
+  // PEM bundle the peer should trust for the Server.
+  string ca_bundle_pem = 2;
+
+  oneof principal {
+    WorkerId worker_id = 3;
+    ClientId client_id = 4;
+  }
+}
