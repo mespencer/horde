@@ -9,8 +9,10 @@
 //! implementation, which is the point: they are regression tests for bugs that
 //! were never written, because the spike found them first.
 
+use horde_adapter::AgentSession;
 use horde_adapter::usage::Utilization;
 use horde_adapter::{AgentEvent, TurnStatus};
+use horde_adapter_codex::ReplaySession;
 use horde_adapter_codex::TurnAssembler;
 use horde_adapter_codex::codec::decode_line;
 use horde_testkit::{HarnessOutputKey, Transcript};
@@ -264,4 +266,88 @@ fn no_recording_ever_produced_a_permission_request() {
             "{name}: Codex 0.145.0 routes no approvals to the client (ADR-0005)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trait-level parity: the same seam invariants the FakeAdapter is held to.
+// ---------------------------------------------------------------------------
+
+/// Splits a codex recording into turns.
+///
+/// Codex has no single terminator: a completed turn ends on `turn/completed`,
+/// an interrupted one ends on `thread/status → idle` and emits no terminal
+/// frame at all. The predicate must accept both or an interrupted recording
+/// never closes.
+fn codex_turns(name: &str) -> Vec<Vec<String>> {
+    let lines = transcript(name);
+    let mut turns = Vec::new();
+    let mut current = Vec::new();
+
+    for line in lines {
+        let completed = line.contains("\"turn/completed\"");
+        current.push(line);
+        if completed {
+            turns.push(std::mem::take(&mut current));
+        }
+    }
+
+    // Whatever is left is a turn only if a turn actually opened in it — an
+    // interrupted turn ends on `thread/status → idle` with no terminal frame,
+    // so it lands here. Trailing status chatter after the last completed turn
+    // is not a turn and must not be replayed as one, or the contract check
+    // sees a message answered by no ending.
+    if current.iter().any(|line| line.contains("\"turn/started\"")) {
+        turns.push(current);
+    } else if let Some(last) = turns.last_mut() {
+        last.extend(current);
+    }
+
+    turns
+}
+
+/// The recorded session must satisfy the same contract the FakeAdapter does.
+///
+/// This is the parity that keeps the fake honest: one suite, two backends. A
+/// codec that assembled plausible-looking events but broke an invariant — a
+/// turn id that changes mid-turn, output before the session was announced, a
+/// gap in chunk indices — fails here even though every targeted test above
+/// still passes.
+#[tokio::test]
+async fn a_recorded_session_satisfies_the_adapter_contract() {
+    let turns = codex_turns("03-basic-turn.jsonl");
+    assert!(!turns.is_empty(), "the recording must contain a turn");
+
+    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
+    let mut session = ReplaySession::new(turns);
+
+    let records = horde_testkit::conformance::check_session(&mut session, &messages).await;
+    assert!(
+        records.is_ok(),
+        "the recorded session violated the adapter contract: {:?}",
+        records.err()
+    );
+}
+
+/// The capability claims must match what the adapter can actually do.
+#[tokio::test]
+async fn the_capability_claims_are_honest_about_gating() {
+    // Codex claims no PreAuthorizeToolCalls, so the seam must never surface a
+    // permission request — and answering one that cannot exist must be an
+    // error rather than a silent success.
+    let mut session = ReplaySession::new(codex_turns("04-approval-echo-untrusted.jsonl"));
+    let refused = session
+        .answer_permission(
+            &horde_adapter::ToolCallId::new("exec-1"),
+            horde_adapter::PermissionDecision::allow(),
+        )
+        .await;
+
+    assert!(
+        refused.is_err(),
+        "a decision that went nowhere must not look like one that was applied"
+    );
+    assert!(
+        !horde_adapter_codex::capabilities()
+            .supports(horde_adapter::Capability::PreAuthorizeToolCalls)
+    );
 }
