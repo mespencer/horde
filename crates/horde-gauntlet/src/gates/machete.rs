@@ -82,12 +82,20 @@ pub fn unused_dependencies(text: &str) -> Vec<(String, String)> {
     found
 }
 
+/// A package header: unindented, `name -- path/Cargo.toml:`.
+///
+/// Indentation alone decides header from entry — an *indented* line is a
+/// dependency name whatever else it looks like — so the two conditions are
+/// checked separately rather than as one guard.
 fn package_header(line: &str) -> Option<&str> {
-    if line.starts_with(char::is_whitespace) || !line.ends_with(':') {
+    if line.starts_with(char::is_whitespace) {
         return None;
     }
-    let (name, _) = line.split_once(" -- ")?;
-    (!name.is_empty()).then_some(name)
+    let (name, manifest) = line.split_once(" -- ")?;
+    if name.is_empty() || !manifest.ends_with(':') {
+        return None;
+    }
+    Some(name)
 }
 
 fn indented(line: &str) -> Option<&str> {
@@ -163,6 +171,32 @@ mod tests {
                 ("beta".to_owned(), "clap".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn an_indented_line_is_a_dependency_however_much_it_looks_like_a_header() {
+        let text = "alpha -- ./a/Cargo.toml:\n\tbeta -- ./b/Cargo.toml:\n";
+        assert_eq!(
+            unused_dependencies(text),
+            vec![("alpha".to_owned(), "beta -- ./b/Cargo.toml:".to_owned())],
+            "indentation decides header from entry, not shape"
+        );
+    }
+
+    #[test]
+    fn an_unindented_line_that_is_not_a_manifest_reference_is_not_a_header() {
+        let text = "cargo-machete found the following unused dependencies:\n\tserde\n";
+        assert_eq!(
+            unused_dependencies(text),
+            Vec::new(),
+            "the preamble must not become a package name"
+        );
+    }
+
+    #[test]
+    fn a_header_whose_manifest_lacks_the_trailing_colon_is_not_a_header() {
+        let text = "alpha -- ./a/Cargo.toml\n\tserde\n";
+        assert_eq!(unused_dependencies(text), Vec::new());
     }
 
     #[test]
