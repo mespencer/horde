@@ -213,6 +213,8 @@ pub fn permission_decision_from_wire(
 #[cfg(test)]
 mod tests {
     use super::{ConversionError, permission_decision_from_wire, permission_decision_to_wire};
+    use crate as horde_wire_self;
+    use horde_adapter::Capability;
     use horde_adapter::permission::PermissionDecision;
     use horde_proto::prost_types::Struct;
     use horde_proto::v1::{PermissionDecision as WirePermissionDecision, PermissionOutcome};
@@ -242,6 +244,31 @@ mod tests {
             permission_decision_from_wire(&wire, false),
             Ok(PermissionDecision::allow()),
             "no rewrite means no capability is needed"
+        );
+    }
+
+    #[test]
+    fn a_narrowing_decision_is_undeliverable_to_a_worker_that_cannot_rewrite() {
+        // End to end: the Server reads the Worker's advertisement, and a
+        // decision it would have sent anyway is refused rather than silently
+        // widening the permission.
+        use horde_wire_self::capability::advertises_tool_input_rewrite;
+
+        let codex_advertisement: Vec<i32> = [Capability::Resumable, Capability::SandboxTierAtSpawn]
+            .into_iter()
+            .filter_map(horde_wire_self::capability::capability_to_wire)
+            .map(i32::from)
+            .collect();
+
+        let narrowing =
+            permission_decision_to_wire(&PermissionDecision::allow_with(json!({"path": "/safe"})))
+                .expect("converts");
+
+        let can_rewrite = advertises_tool_input_rewrite(&codex_advertisement);
+        assert!(!can_rewrite);
+        assert_eq!(
+            permission_decision_from_wire(&narrowing, can_rewrite),
+            Err(ConversionError::RewriteUnsupported)
         );
     }
 

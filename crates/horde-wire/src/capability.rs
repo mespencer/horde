@@ -41,6 +41,10 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
         // names one provider's mechanism and is deprecated in favour of this.
         Capability::PreAuthorizeToolCalls => Some(AdapterCapability::ToolCallGating),
 
+        // On the wire because the Server needs it before it composes a
+        // narrowing decision, not after the Worker bounces one.
+        Capability::RewritesToolInput => Some(AdapterCapability::ToolInputRewrite),
+
         // Worker-local facts with no placement consequence on the wire yet.
         // Deliberately not advertised: a capability nothing matches on invites
         // readers to assume it is enforced somewhere.
@@ -49,8 +53,7 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
         // an ungateable provider offers *instead* of interception, so a
         // scheduler that learns to place high-trust work will want to see it.
         // It stays off the wire until something reads it.
-        Capability::RewritesToolInput
-        | Capability::SandboxTierAtSpawn
+        Capability::SandboxTierAtSpawn
         | Capability::ReportsHeadroom
         | Capability::SystemPromptOverlay
         | Capability::ModelSelection
@@ -79,6 +82,7 @@ pub fn capability_from_wire(value: i32) -> Result<Option<Capability>, UnknownCap
         AdapterCapability::Interruptible => Some(Capability::InterruptibleTurn),
         AdapterCapability::Steerable => Some(Capability::SteerAtTurnBoundary),
         AdapterCapability::ToolCallGating => Some(Capability::PreAuthorizeToolCalls),
+        AdapterCapability::ToolInputRewrite => Some(Capability::RewritesToolInput),
 
         // Deprecated, but old Workers still send it, and it means the same
         // thing they would now send as TOOL_CALL_GATING.
@@ -86,9 +90,30 @@ pub fn capability_from_wire(value: i32) -> Result<Option<Capability>, UnknownCap
     })
 }
 
+/// Whether a Worker advertising `advertised` can apply replacement tool
+/// arguments.
+///
+/// The Server asks this *before* composing a narrowing decision. Sending one to
+/// a Worker without the capability produces a decision the Worker must reject
+/// rather than silently widen, which strands the Agent on an answer that was
+/// never deliverable.
+///
+/// Unknown values are ignored rather than refused: a peer from the future
+/// advertising capabilities this build cannot name says nothing about whether
+/// it rewrites.
+#[must_use]
+pub fn advertises_tool_input_rewrite(advertised: &[i32]) -> bool {
+    advertised
+        .iter()
+        .filter_map(|value| capability_from_wire(*value).ok().flatten())
+        .any(|capability| capability == Capability::RewritesToolInput)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UnknownCapability, capability_from_wire, capability_to_wire};
+    use super::{
+        UnknownCapability, advertises_tool_input_rewrite, capability_from_wire, capability_to_wire,
+    };
     use horde_adapter::Capability;
     use horde_proto::v1::AdapterCapability;
 
@@ -139,6 +164,32 @@ mod tests {
     fn unset_is_not_an_error_but_an_unknown_number_is() {
         assert_eq!(capability_from_wire(0), Ok(None));
         assert_eq!(capability_from_wire(9_999), Err(UnknownCapability(9_999)));
+    }
+
+    #[test]
+    fn a_rewrite_is_only_offered_to_a_worker_that_advertised_it() {
+        // The Server asks this before composing a narrowing decision. Without
+        // the advertisement it would only learn after the Worker rejected one.
+        let claude: Vec<i32> = [
+            Capability::PreAuthorizeToolCalls,
+            Capability::RewritesToolInput,
+        ]
+        .into_iter()
+        .filter_map(capability_to_wire)
+        .map(i32::from)
+        .collect();
+
+        let codex: Vec<i32> = [Capability::Resumable, Capability::SandboxTierAtSpawn]
+            .into_iter()
+            .filter_map(capability_to_wire)
+            .map(i32::from)
+            .collect();
+
+        assert!(advertises_tool_input_rewrite(&claude));
+        assert!(!advertises_tool_input_rewrite(&codex));
+
+        // A peer from the future says nothing about rewriting by being unknown.
+        assert!(!advertises_tool_input_rewrite(&[9_999]));
     }
 
     #[test]

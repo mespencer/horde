@@ -150,4 +150,5 @@ fn tool_call_gating_did_not_disturb_existing_capability_numbers() {
     assert_eq!(i32::from(AdapterCapability::Steerable), 3);
     assert_eq!(i32::from(AdapterCapability::PermissionPromptTool), 4);
     assert_eq!(i32::from(AdapterCapability::ToolCallGating), 5);
+    assert_eq!(i32::from(AdapterCapability::ToolInputRewrite), 6);
 }
