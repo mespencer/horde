@@ -57,7 +57,8 @@ pub fn capabilities() -> Capabilities {
     Capabilities::none()
         .with(Capability::Resumable)
         .with(Capability::InterruptibleTurn)
-        .with(Capability::PermissionPrompt)
+        .with(Capability::SteerAtTurnBoundary)
+        .with(Capability::PreAuthorizeToolCalls)
         .with(Capability::RewritesToolInput)
         .with(Capability::ReportsHeadroom)
         .with(Capability::SystemPromptOverlay)
@@ -86,7 +87,8 @@ mod tests {
         for capability in [
             Capability::Resumable,
             Capability::InterruptibleTurn,
-            Capability::PermissionPrompt,
+            Capability::SteerAtTurnBoundary,
+            Capability::PreAuthorizeToolCalls,
             Capability::RewritesToolInput,
             Capability::ReportsHeadroom,
             Capability::SystemPromptOverlay,

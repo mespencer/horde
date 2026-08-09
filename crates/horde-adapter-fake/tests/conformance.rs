@@ -121,7 +121,7 @@ async fn a_denied_call_lands_in_the_turn_outcome_as_an_audit_record() {
 async fn a_narrowing_decision_is_refused_by_an_adapter_that_cannot_rewrite() {
     let adapter = FakeAdapter::new(asking_permission()).with_capabilities(
         Capabilities::none()
-            .with(Capability::PermissionPrompt)
+            .with(Capability::PreAuthorizeToolCalls)
             .with(Capability::InterruptibleTurn),
     );
     let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
@@ -189,7 +189,7 @@ async fn an_interrupt_ends_the_turn_and_leaves_the_session_usable() {
 #[tokio::test]
 async fn an_adapter_without_interruptible_turns_refuses_to_interrupt() {
     let adapter = FakeAdapter::default()
-        .with_capabilities(Capabilities::none().with(Capability::PermissionPrompt));
+        .with_capabilities(Capabilities::none().with(Capability::PreAuthorizeToolCalls));
     let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
 
     let error = session
