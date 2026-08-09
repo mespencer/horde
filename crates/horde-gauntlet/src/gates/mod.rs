@@ -110,6 +110,37 @@ pub mod prelude {
     pub use crate::tool::ToolPin;
 }
 
+/// Runs a command and hands its output to `read`.
+///
+/// A launch failure short-circuits to an instrument error, so the reader only
+/// ever sees a process that actually ran.
+pub(crate) fn read_output(
+    runner: &dyn CommandRunner,
+    spec: &CommandSpec,
+    read: impl FnOnce(&CommandOutput) -> GateOutcome,
+) -> GateOutcome {
+    match invoke(runner, spec) {
+        Err(outcome) => outcome,
+        Ok(output) => read(&output),
+    }
+}
+
+/// Reads a command's result only when the command succeeded.
+///
+/// A tool that exited non-zero for a reason its gate does not model did not
+/// measure, so its silence must not be read as a clean sheet.
+pub(crate) fn require_success(
+    spec: &CommandSpec,
+    output: &CommandOutput,
+    read: impl FnOnce() -> GateOutcome,
+) -> GateOutcome {
+    if output.success() {
+        read()
+    } else {
+        unexpected_exit(spec, output)
+    }
+}
+
 /// Runs a command, turning "could not launch" into an instrument error.
 pub(crate) fn invoke(
     runner: &dyn CommandRunner,
@@ -203,6 +234,10 @@ mod tests {
         install: "cargo install --locked cargo-crap@0.3.1",
     };
 
+    fn tool_spec() -> CommandSpec {
+        CommandSpec::new("cargo", &["crap"], Path::new("/repo"))
+    }
+
     fn any_exit(_spec: &CommandSpec, output: &CommandOutput) -> GateOutcome {
         GateOutcome::fail(format!("read {:?} {}", output.status, output.stdout))
     }
@@ -274,6 +309,41 @@ mod tests {
         let runner = ScriptedRunner::failing("no such binary");
         let outcome = command_gate(None, Reader::AnyExit(any_exit)).run(&repo_ctx(), &runner);
         assert_eq!(outcome, GateOutcome::error("no such binary"));
+    }
+
+    #[test]
+    fn reading_output_hands_the_reader_a_process_that_actually_ran() {
+        let runner = ScriptedRunner::new(vec![exited(3, "out")]);
+        let outcome = read_output(&runner, &tool_spec(), |output| {
+            GateOutcome::pass(format!("{:?} {}", output.status, output.stdout))
+        });
+        assert_eq!(outcome, GateOutcome::pass("Some(3) out"));
+    }
+
+    #[test]
+    fn reading_output_short_circuits_a_launch_failure() {
+        let runner = ScriptedRunner::failing("no such binary");
+        let outcome = read_output(&runner, &tool_spec(), |_| {
+            GateOutcome::pass("should not be reached")
+        });
+        assert_eq!(outcome, GateOutcome::error("no such binary"));
+    }
+
+    #[test]
+    fn requiring_success_reads_only_after_a_clean_exit() {
+        let outcome = require_success(&tool_spec(), &exited(0, ""), || GateOutcome::pass("read"));
+        assert_eq!(outcome, GateOutcome::pass("read"));
+    }
+
+    #[test]
+    fn requiring_success_turns_any_other_exit_into_an_instrument_error() {
+        let outcome = require_success(&tool_spec(), &exited(2, "boom"), || {
+            GateOutcome::pass("should not be reached")
+        });
+        let GateOutcome::Error { reason } = outcome else {
+            panic!("a tool that failed did not measure");
+        };
+        assert!(reason.contains("boom"), "{reason}");
     }
 
     #[test]

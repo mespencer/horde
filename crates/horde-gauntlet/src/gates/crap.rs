@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::command::CommandRunner;
 use crate::gates::coverage::line_totals;
 use crate::gates::prelude::*;
-use crate::gates::{invoke, read_artifact, unexpected_exit};
+use crate::gates::{invoke, read_artifact, read_output, require_success, unexpected_exit};
 use crate::metadata::{WorkspacePackage, parse_workspace_packages};
 
 /// The cargo-crap version the threshold was calibrated against.
@@ -97,17 +97,12 @@ fn score(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
         Err(outcome) => return outcome,
     };
     let spec = spec(ctx, &scope);
-    let output = match invoke(runner, &spec) {
-        Ok(output) => output,
-        Err(outcome) => return outcome,
-    };
-    if !output.success() {
-        return unexpected_exit(&spec, &output);
-    }
-    match parse_report(&output.stdout) {
-        Err(reason) => GateOutcome::error(reason),
-        Ok(entries) => outcome_of(&entries, THRESHOLD, &scope),
-    }
+    read_output(runner, &spec, |output| {
+        require_success(&spec, output, || match parse_report(&output.stdout) {
+            Err(reason) => GateOutcome::error(reason),
+            Ok(entries) => outcome_of(&entries, THRESHOLD, &scope),
+        })
+    })
 }
 
 /// Why the LCOV cannot be scored against, if it cannot.
@@ -478,6 +473,28 @@ mod tests {
         };
         assert!(detail.contains("horde-gauntlet"), "{detail}");
         assert!(!detail.contains("whole workspace"), "{detail}");
+    }
+
+    #[test]
+    fn a_function_with_no_coverage_data_says_so_rather_than_showing_zero() {
+        assert_eq!(describe_coverage(Some(0.0)), "0.0%");
+        assert_eq!(describe_coverage(Some(87.25)), "87.2%");
+        assert_eq!(
+            describe_coverage(None),
+            "not measured",
+            "0% and unmeasured are different facts about a function"
+        );
+    }
+
+    #[test]
+    fn an_offender_with_no_coverage_data_is_labelled_as_unmeasured() {
+        let mut unmeasured = entry("mystery", 40.0);
+        unmeasured.coverage = None;
+        let GateOutcome::Fail { detail } = outcome_of(&[unmeasured], THRESHOLD, &Scope::Workspace)
+        else {
+            panic!("40 is over the threshold");
+        };
+        assert!(detail.contains("coverage not measured"), "{detail}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::command::CommandRunner;
 use crate::gates::prelude::*;
-use crate::gates::{invoke, labelled_count, unexpected_exit};
+use crate::gates::{invoke, labelled_count, read_output, unexpected_exit};
 
 /// The cargo-mutants version the gate is calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -69,14 +69,12 @@ fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
         Err(outcome) => return outcome,
     };
     let spec = spec(ctx, &scope);
-    let output = match invoke(runner, &spec) {
-        Ok(output) => output,
-        Err(outcome) => return outcome,
-    };
-    match parse_summary(&output.combined()) {
-        None => unexpected_exit(&spec, &output),
-        Some(counts) => outcome_of(&scope, counts),
-    }
+    read_output(runner, &spec, |output| {
+        match parse_summary(&output.combined()) {
+            None => unexpected_exit(&spec, output),
+            Some(counts) => outcome_of(&scope, counts),
+        }
+    })
 }
 
 /// The command that finds where this branch left `main`.
