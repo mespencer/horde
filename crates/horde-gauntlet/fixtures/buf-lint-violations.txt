@@ -1,0 +1,2 @@
+proto/x/v1/bad.proto:3:9:Message name "thing" should be PascalCase, such as "Thing".
+proto/x/v1/bad.proto:3:24:Field name "Field_One" should be lower_snake_case, such as "field_one".

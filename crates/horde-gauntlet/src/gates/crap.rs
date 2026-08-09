@@ -61,6 +61,17 @@ pub fn read_scores(_ctx: &GateContext, output: &CommandOutput) -> GateOutcome {
     }
 }
 
+/// Build scripts, which the coverage instrument structurally cannot see.
+///
+/// A build script runs at compile time, not under the test harness, so
+/// llvm-cov never produces coverage data for it and cargo-crap scores it as if
+/// it were 0% covered. That is the instrument measuring its own blind spot, not
+/// a fact about the code — a `build.rs` cannot be made to score better by
+/// testing it harder. This is the only exclusion the gate carries, and it is
+/// narrow on purpose: "the instrument cannot see it" is a very different claim
+/// from "nobody has tested it", and only the first one earns an exclusion.
+pub const UNMEASURABLE: &str = "**/build.rs";
+
 /// The command this gate runs.
 ///
 /// cargo-crap has no package filter, so this gate always scores the whole
@@ -75,6 +86,8 @@ pub fn spec(ctx: &GateContext) -> CommandSpec {
             ctx.lcov_path().display().to_string(),
             "--threshold".to_owned(),
             THRESHOLD.to_string(),
+            "--exclude".to_owned(),
+            UNMEASURABLE.to_owned(),
             "--format".to_owned(),
             "json".to_owned(),
         ],
@@ -162,7 +175,19 @@ mod tests {
     fn the_command_scores_the_workspace_against_the_coverage_gates_lcov() {
         assert_eq!(
             spec(&repo_ctx()).display(),
-            "cargo crap --workspace --lcov /repo/target/quality/lcov.info --threshold 15 --format json"
+            "cargo crap --workspace --lcov /repo/target/quality/lcov.info --threshold 15 \
+             --exclude **/build.rs --format json"
+        );
+    }
+
+    #[test]
+    fn build_scripts_are_the_only_thing_excluded_from_scoring() {
+        assert_eq!(UNMEASURABLE, "**/build.rs");
+        let args = spec(&repo_ctx()).args;
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--exclude").count(),
+            1,
+            "an exclusion list that grows is a threshold that quietly falls: {args:?}"
         );
     }
 

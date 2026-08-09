@@ -1,0 +1,15 @@
+[package]
+name = "codex-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "W2c spike: drive `codex app-server` over JSON-RPC and record the wire."
+
+# Standalone on purpose. This is spike code, not a workspace member: it must not
+# ride the gauntlet or the workspace dependency table, and deleting the
+# directory must leave the workspace untouched.
+[workspace]
+
+[dependencies]
+# serde_json only; the probe never derives, it walks Values.
+serde_json = "1"

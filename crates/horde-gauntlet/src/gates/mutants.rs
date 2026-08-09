@@ -57,6 +57,7 @@ impl Scope {
 pub fn gate() -> PinnedGate {
     PinnedGate {
         pin: &PIN,
+        nothing_to_measure: None,
         measure: mutate,
     }
 }

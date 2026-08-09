@@ -13,6 +13,7 @@ pub mod fmt;
 pub mod machete;
 pub mod module_structure;
 pub mod mutants;
+pub mod proto_contract;
 pub mod test;
 
 use std::path::Path;
@@ -34,7 +35,7 @@ pub enum Reader {
 
 /// A gate that checks a tool's version, runs one command, and reads the result.
 ///
-/// Six of the nine gates have exactly this shape, so they are values of this
+/// Six of the ten gates have exactly this shape, so they are values of this
 /// type rather than six near-identical `impl Gate` blocks. Only the multi-step
 /// gates — the ones that enumerate targets or compute a diff first — implement
 /// [`Gate`] themselves.
@@ -79,12 +80,21 @@ impl Gate for CommandGate {
 pub struct PinnedGate {
     /// The tool's pinned version.
     pub pin: &'static ToolPin,
+    /// Asked before the version probe. `Some(reason)` means there is nothing in
+    /// this workspace for the tool to look at, so the gate skips *without*
+    /// requiring the tool to be installed — demanding an instrument for a
+    /// measurement that does not exist would make an absent tool look like a
+    /// broken one.
+    pub nothing_to_measure: Option<fn(&GateContext) -> Option<String>>,
     /// Measures, once the pin has been confirmed.
     pub measure: fn(&GateContext, &dyn CommandRunner) -> GateOutcome,
 }
 
 impl Gate for PinnedGate {
     fn run(&self, ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+        if let Some(reason) = self.nothing_to_measure.and_then(|ask| ask(ctx)) {
+            return GateOutcome::skipped(reason);
+        }
         match check_pin(runner, self.pin, &ctx.workspace_root) {
             Err(reason) => GateOutcome::error(reason),
             Ok(()) => (self.measure)(ctx, runner),

@@ -86,6 +86,15 @@ pub fn registry() -> Vec<RegisteredGate> {
         },
         RegisteredGate {
             spec: GateSpec {
+                name: "proto-contract",
+                enforcement: Enforcement::Blocking,
+                depends_on: &[],
+                summary: "buf lint + buf breaking: the schema is idiomatic and stays compatible",
+            },
+            gate: Box::new(gates::proto_contract::gate()),
+        },
+        RegisteredGate {
+            spec: GateSpec {
                 name: "mutants",
                 enforcement: Enforcement::Blocking,
                 depends_on: &[],
@@ -126,7 +135,7 @@ mod tests {
     use super::*;
 
     /// The gate list, verbatim. Changing this line is the point.
-    const EXPECTED: [&str; 9] = [
+    const EXPECTED: [&str; 10] = [
         "fmt",
         "clippy",
         "test",
@@ -135,6 +144,7 @@ mod tests {
         "duplication",
         "machete",
         "module-structure",
+        "proto-contract",
         "mutants",
     ];
 

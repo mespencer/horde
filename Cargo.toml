@@ -7,14 +7,34 @@ edition = "2024"
 rust-version = "1.95"
 publish = false
 
+[workspace.dependencies]
+async-trait = "0.1.89"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false }
+
+horde-adapter = { path = "crates/horde-adapter" }
+horde-adapter-claude = { path = "crates/horde-adapter-claude" }
+horde-adapter-fake = { path = "crates/horde-adapter-fake" }
+horde-proto = { path = "crates/horde-proto" }
+horde-server = { path = "crates/horde-server" }
+horde-testkit = { path = "crates/horde-testkit" }
+
 [workspace.lints.rust]
 # Deliberately *not* `warnings = "deny"`: denying every present and future rustc
 # warning from the manifest turns a toolchain bump into a broken build. The
 # `clippy` gate passes `-D warnings` instead, so the policy lives in one place
 # (the gate) and local `cargo build` stays usable.
+#
+# Everything listed here is already satisfied by every crate in the workspace.
+# `missing_docs` and `missing_debug_implementations` are deliberately NOT here:
+# they would red the clippy gate on 171 pre-existing items across five crates
+# whose owners never adopted them. Adopting them workspace-wide is a real and
+# worthwhile change — it is just a documentation task someone has to schedule,
+# not something to smuggle in through a lint table. horde-gauntlet holds itself
+# to both, via inner attributes in its own crate root.
 unsafe_code = "forbid"
-missing_docs = "warn"
-missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 

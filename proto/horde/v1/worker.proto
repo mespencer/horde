@@ -1,0 +1,143 @@
+// Worker Capabilities: the facts placement matches on.
+syntax = "proto3";
+
+package horde.v1;
+
+import "google/protobuf/timestamp.proto";
+import "horde/v1/handshake.proto";
+import "horde/v1/id.proto";
+import "horde/v1/usage.proto";
+import "horde/v1/workspace.proto";
+
+// Adapter capability flags. An enum rather than bools so a new capability is an
+// additive value that old peers see as unknown and ignore, and so the set can
+// be matched on generically at placement time.
+enum AdapterCapability {
+  ADAPTER_CAPABILITY_UNSPECIFIED = 0;
+
+  // Idle Agents can be revived with their context. Providers without this get
+  // honestly-terminal Agents.
+  ADAPTER_CAPABILITY_RESUMABLE = 1;
+
+  // A turn in flight can be cancelled.
+  ADAPTER_CAPABILITY_INTERRUPTIBLE = 2;
+
+  // Messages can be queued to the next turn boundary.
+  ADAPTER_CAPABILITY_STEERABLE = 3;
+
+  // Deprecated in favour of TOOL_CALL_GATING. Names one provider's *mechanism*
+  // (Claude's `--permission-prompt-tool` pointed at Horde's MCP endpoint)
+  // rather than the capability, so it cannot describe a harness that gates
+  // tool calls some other way. Kept at 4 and never renumbered; new
+  // advertisements should send TOOL_CALL_GATING instead, and matchers should
+  // read that.
+  ADAPTER_CAPABILITY_PERMISSION_PROMPT_TOOL = 4 [deprecated = true];
+
+  // Proposed tool calls are surfaced for an external decision *before* they
+  // execute — what the permission chain (DESIGN §10) needs in order to apply
+  // deterministic rules, the Policy Judge, or human approval at all.
+  //
+  // Absence is a real state, not a gap in the advertisement: a provider that
+  // adjudicates internally and reports afterwards cannot be gated by Horde.
+  // Codex is that case today (ADR-0005) — its sandbox tier and project trust,
+  // chosen at thread start, are the only controls. Permission modes and
+  // placement consult this flag so a high-trust Assignment can refuse to land
+  // on an ungateable provider.
+  ADAPTER_CAPABILITY_TOOL_CALL_GATING = 5;
+
+  // A permission decision may replace the tool's arguments, not merely permit
+  // or refuse the call.
+  //
+  // On the wire because the Server must know it *before* it emits a narrowing
+  // decision. A decision carrying `PermissionDecision.updated_input` toward a
+  // Worker that cannot apply one is rejected at the Worker (the field's own
+  // reject-don't-drop rule), so without this advertisement the Server only
+  // learns after the round trip and the Agent stalls on a decision that was
+  // never deliverable. Implies TOOL_CALL_GATING: arguments cannot be rewritten
+  // by a chain that never sees the call.
+  ADAPTER_CAPABILITY_TOOL_INPUT_REWRITE = 6;
+}
+
+// A provider harness on this Worker. Install is not auth: an installed harness
+// still needs a Provider Account before it can place anything.
+message HarnessCapability {
+  // Adapter key, e.g. "claude", "codex".
+  string provider = 1;
+
+  bool installed = 2;
+
+  // Harness version, when installed.
+  string version = 3;
+
+  // The adapter carries an install recipe that would work on this platform.
+  bool installable = 4;
+
+  repeated AdapterCapability capabilities = 5;
+}
+
+// One authenticated subscription login, isolated in its own config dir. A
+// Worker-level resource.
+message ProviderAccountCapability {
+  string provider = 1;
+
+  // Account name, unique per provider on this Worker.
+  string account = 2;
+
+  repeated string models = 3;
+
+  // Current rate-limit state; drives the `headroom` selection strategy.
+  RateWindow headroom = 4;
+}
+
+// Everything a Worker advertises. The scheduler matches PlacementConstraints
+// against exactly this message.
+message WorkerCapabilities {
+  // Freeform, user-assigned: "gpu", "macos", "office-lan".
+  repeated string tags = 1;
+
+  // Auto-detected.
+  Platform platform = 2;
+
+  repeated ProviderAccountCapability provider_accounts = 3;
+
+  // Git remotes this Worker can reach directly, bypassing the Relay. Bootstrap
+  // phase only: the end state is Relay-only Workers.
+  repeated string reachable_remotes = 4;
+
+  // Workspace Instances already on disk. Warmth is a placement preference, not
+  // a requirement.
+  repeated WorkspaceInstanceReport warm_instances = 5;
+
+  repeated HarnessCapability harnesses = 6;
+
+  // Zero means the Worker declares no limit.
+  uint32 max_concurrent_agents = 7;
+}
+
+enum WorkerConnectionState {
+  WORKER_CONNECTION_STATE_UNSPECIFIED = 0;
+  WORKER_CONNECTION_STATE_ONLINE = 1;
+
+  // Enrolled but not currently connected. Placement can still explain itself in
+  // terms of an offline Worker that would have matched.
+  WORKER_CONNECTION_STATE_OFFLINE = 2;
+
+  // Connected, finishing its Agents, accepting no new placements.
+  WORKER_CONNECTION_STATE_DRAINING = 3;
+}
+
+message WorkerSummary {
+  WorkerId worker_id = 1;
+
+  string name = 2;
+
+  WorkerConnectionState state = 3;
+
+  string semver = 4;
+
+  WorkerCapabilities capabilities = 5;
+
+  google.protobuf.Timestamp last_seen_at = 6;
+
+  uint32 running_agents = 7;
+}

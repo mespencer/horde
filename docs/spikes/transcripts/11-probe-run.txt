@@ -1,0 +1,55 @@
+   Compiling claude-probe v0.1.0 (/Users/myles/Code/horde/.claude/worktrees/spike-stream-json/spikes/claude-probe)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running `target/debug/claude-probe`
+
+=== 1. spawn + single turn ===
+  result       : "I'll save that number to memory for you.\n\nOK"
+  status       : subtype=success is_error=false terminal_reason=completed
+  session_id   : 07cbae96-d467-4b0c-ae92-c9f2c1a38e50
+  tokens       : in=10 out=212 cache_read=6547 cache_write=0
+  cost/timing  : $0.001725 over 3324 ms (3269 ms api), 1 turn(s)
+  billed model : claude-haiku-4-5-20251001 -> in=10 out=212 cost=$0.001725
+  events       : 15
+
+=== 2. second turn on the SAME process (context retained) ===
+  result       : "8613"
+  status       : subtype=success is_error=false terminal_reason=completed
+  session_id   : 07cbae96-d467-4b0c-ae92-c9f2c1a38e50
+  tokens       : in=10 out=170 cache_read=6547 cache_write=237
+  cost/timing  : $0.004311 over 2706 ms (10578 ms api), 1 turn(s)
+  billed model : claude-haiku-4-5-20251001 -> in=548 out=396 cost=$0.004311
+  events       : 15
+
+=== 3. interrupt mid-turn, then keep using the process ===
+  result       : "<none>"
+  status       : subtype=error_during_execution is_error=true terminal_reason=aborted_streaming
+  session_id   : 07cbae96-d467-4b0c-ae92-c9f2c1a38e50
+  tokens       : in=0 out=0 cache_read=0 cache_write=0
+  cost/timing  : $0.004311 over 5003 ms (10578 ms api), 2 turn(s)
+  billed model : claude-haiku-4-5-20251001 -> in=548 out=396 cost=$0.004311
+  events       : 10
+  result       : "STILL_ALIVE"
+  status       : subtype=success is_error=false terminal_reason=completed
+  session_id   : 07cbae96-d467-4b0c-ae92-c9f2c1a38e50
+  tokens       : in=10 out=42 cache_read=6983 cache_write=634
+  cost/timing  : $0.006498 over 1670 ms (12244 ms api), 1 turn(s)
+  billed model : claude-haiku-4-5-20251001 -> in=558 out=438 cost=$0.006498
+  events       : 11
+
+child exited with code Some(0)
+
+=== 4. resume the dead session in a NEW process ===
+  result       : "8613"
+  status       : subtype=success is_error=false terminal_reason=completed
+  session_id   : 07cbae96-d467-4b0c-ae92-c9f2c1a38e50
+  tokens       : in=10 out=41 cache_read=7617 cache_write=67
+  cost/timing  : $0.001111 over 1404 ms (1348 ms api), 1 turn(s)
+  billed model : claude-haiku-4-5-20251001 -> in=10 out=41 cost=$0.001111
+  events       : 11
+
+child exited with code Some(0)
+
+=== verdict ===
+  same session id across processes : true
+  context survived process death   : true
+  interrupt kept process usable    : true

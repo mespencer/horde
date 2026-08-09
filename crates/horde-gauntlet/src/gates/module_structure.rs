@@ -32,6 +32,7 @@ pub const BASELINE: &str = "baselines/module-cycles.txt";
 pub fn gate() -> PinnedGate {
     PinnedGate {
         pin: &PIN,
+        nothing_to_measure: None,
         measure: survey_workspace,
     }
 }

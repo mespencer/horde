@@ -61,6 +61,7 @@ mismatch. `cargo fmt`, `cargo clippy` and `cargo test` are pinned by
 | cargo-modules | 0.26.0 | `cargo install --locked cargo-modules@0.26.0` |
 | cargo-mutants | 27.1.0 | `cargo install --locked cargo-mutants@27.1.0` |
 | jscpd | 5.0.14 | Node.js 18+; `npx` fetches `jscpd@5.0.14` itself |
+| buf | 1.69.0 | `brew install bufbuild/buf/buf`, or https://buf.build/docs/installation |
 
 ---
 
@@ -92,6 +93,28 @@ banned **everywhere, tests included**.
 diff becomes a crash under an input nobody tried. Denying it in the manifest and
 `-D warnings` here means the policy lives in exactly one place each: level in the
 manifest, severity in this gate.
+
+**`expect` in integration tests — the friction, and the fix that is not a weakening.**
+`allow-expect-in-tests` exempts anything under `#[cfg(test)]`. It is not restricted to
+functions carrying `#[test]`, which is the natural guess and is wrong in a way that
+matters: helper functions in `tests/*.rs` trip `expect_used` not because they lack a
+`#[test]` attribute but because an integration test file's free functions sit outside any
+`cfg(test)` module. The fix is to put the helpers in one:
+
+```rust
+#[cfg(test)]
+mod harness {
+    pub(crate) fn thing() -> Thing {
+        Thing::new().expect("...")
+    }
+}
+```
+
+That states what the helpers already are and costs nothing. Rewriting helpers to avoid
+`expect` also works but is a workaround for a misdiagnosis. What must **not** happen is
+a `#![allow(clippy::expect_used)]` at the top of the file: the policy is that `expect` is
+fine in tests, and the wrapper expresses exactly that, whereas a blanket allow also
+covers any non-test code that later lands in the file.
 
 **Local.** `gauntlet run clippy`, or
 `cargo clippy --all-targets --all-features -- -D warnings`.
@@ -155,6 +178,14 @@ drifts toward — a long function with a plausible happy-path test.
 LCOV is not a measurement). Directly:
 `cargo crap --workspace --lcov target/quality/lcov.info --threshold 15`.
 
+**The one exclusion.** `build.rs` is excluded, because a build script runs at compile
+time rather than under the test harness, so llvm-cov never emits coverage data for it
+and cargo-crap scores it as if it were 0% covered. That is the instrument measuring its
+own blind spot: no amount of testing can move a build script's score. "The instrument
+cannot see it" is the only argument that earns an exclusion here — "nobody has tested
+it yet" is precisely what the gate exists to report, and a test asserts that the
+exclusion list stays at exactly one entry.
+
 **How to read.** A `pass` reports the worst score and where it is, so the headroom is
 visible before it is gone. A `fail` lists every function over the line with its score,
 cyclomatic complexity and coverage — which tells you whether the fix is more tests or a
@@ -175,6 +206,14 @@ to land.
 Narrowing it, or adding an `ignore` entry, to make an existing duplicate disappear is
 gaming the gate; the fix is to factor the shape the duplicate is pointing at. The only
 `ignore` entries are `target/` and `node_modules/`, neither of which contains source.
+
+**Excluded from scanning.** `spikes/**` and `docs/spikes/**`. Spike code is
+throwaway-tier by design — it exists to answer one question and then stop — and holding
+it to workspace standards would either corrupt the spike or corrupt the standard. The
+workspace-scoped gates (clippy, test, machete, module-structure, mutants) skip spikes
+automatically because the spike crates carry their own `[workspace]` table and are not
+members; only the gates that walk the filesystem need to be told. `crap` needs no
+exclusion for the same structural reason: it enumerates workspace members.
 
 **Local.** `gauntlet run duplication`.
 
@@ -233,6 +272,32 @@ directory for whichever target it is pointed at, so asking about a binary in a p
 that also has a library reports every library module as an orphan. Packages with a
 library are therefore checked through the library target alone (which covers everything
 under `src/`), and binaries are checked directly only in packages that have no library.
+
+## proto-contract
+
+**What.** `buf lint` over the schema, and `buf breaking` against the merge-base with
+`main`. Zero violations of either.
+
+**Why.** The `.proto` files are the one artefact the server, workers and clients all
+agree on, and they upgrade independently — so this gate *is* the version-skew guarantee
+from DESIGN §2. A renamed field is not a compile error anywhere; it is a runtime
+mismatch between two binaries built a week apart.
+
+**The baseline needs no special case.** It is always the merge-base with `main`. On a
+branch that is the branch point, so the gate asks "does my work break what I branched
+from". On `main` itself the merge-base *is* `main`'s tip, so the same rule asks "does my
+working tree break what is committed" — the no-uncommitted-breakage check. `HEAD~` would
+be wrong on both. When there is no `main` at all, lint still runs and the row says
+compatibility was **unchecked**, so a green row can never be misread as "compatible"
+when it only means "not compared".
+
+**Local.** `gauntlet run proto-contract`, or `buf lint` and
+`buf breaking --against ".git#ref=$(git merge-base HEAD main)"`.
+
+**How to read.** A `fail` counts lint violations and breaking changes separately and
+lists each with its file, line and column. A workspace with no `proto/` directory is
+`skipped` — and it skips *before* the version probe, so an absent buf on a machine with
+no schema is not reported as a broken instrument.
 
 ## mutants
 

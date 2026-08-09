@@ -5,6 +5,8 @@
   "gitignore": true,
   "ignore": [
     "**/target/**",
-    "**/node_modules/**"
+    "**/node_modules/**",
+    "spikes/**",
+    "docs/spikes/**"
   ]
 }

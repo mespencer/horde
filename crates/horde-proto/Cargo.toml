@@ -1,0 +1,27 @@
+[package]
+name = "horde-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Wire contracts for Horde: generated types and gRPC stubs for package horde.v1."
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = "0.14.4"
+prost-types = "0.14.4"
+tonic = "0.14.6"
+# Referenced by the generated service stubs (ProstCodec), not by handwritten
+# code, so it is a direct dependency without a direct `use`.
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
+
+[package.metadata.cargo-machete]
+# Used only from code generated into OUT_DIR, which machete does not scan.
+ignored = ["tonic-prost"]

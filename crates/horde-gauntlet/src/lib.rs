@@ -28,6 +28,11 @@
 //! assert!(!GateOutcome::fail("two functions over CRAP 15").reds_run(Enforcement::Observe));
 //! ```
 
+// Held here rather than in the workspace lint table: the rest of the workspace
+// has not adopted them yet, and a gate that reds on other people's undocumented
+// items is a gate that gets turned off. See the root Cargo.toml.
+#![warn(missing_docs, missing_debug_implementations)]
+
 pub mod cli;
 pub mod command;
 pub mod cycles;
