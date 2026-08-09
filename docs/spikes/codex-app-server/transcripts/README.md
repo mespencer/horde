@@ -4,7 +4,7 @@ Raw wire recordings from spike W2c ([findings](../../codex-app-server.md)).
 Recorded against **codex-cli 0.145.0** on macOS 26.3.1 arm64 on 2026-08-09,
 under a ChatGPT Pro subscription login.
 
-Files 01–11 and 14 record the **app-server** protocol: each line is
+Files 01–11 and 14–16 record the **app-server** protocol: each line is
 `{"dir": "in"|"out", "t": <unix seconds>, "msg": <JSON-RPC frame>}`, where `out`
 is client→Codex. Files 12–13 record `codex exec --json`, whose output is plain
 JSONL with no envelope — a different and much thinner schema.
@@ -25,6 +25,8 @@ JSONL with no envelope — a different and much thinner schema.
 | `12-exec-json.jsonl` | `codex exec --json` — only 4 event types, no streaming deltas |
 | `13-exec-resume.jsonl` | `codex exec resume <id>` in a fresh process — context survived, input tokens doubled from history replay |
 | `14-rust-probe.jsonl` | the same turn driven from Rust by `spikes/codex-probe` |
+| `15-steer.jsonl` | `turn/steer` mid-turn: same turn id returned, and **two** `final_answer` items in one turn |
+| `16-thread-resume.jsonl` | app-server `thread/resume` across processes — recalled `HORDE_OK`, and replayed the prior turn's usage event |
 
 Redaction: account email, account/installation ids, and the scratch session path
 are replaced; third-party MCP tool schemas are elided to a count. No credentials
