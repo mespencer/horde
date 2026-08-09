@@ -37,8 +37,16 @@ tiers and project-trust model and notifies the client afterwards via
 - The adapter must advertise this honestly. `AdapterCapability` needs a value
   meaning "cannot pre-authorize tool calls" so placement and permission modes
   can refuse to put a high-trust assignment on a Codex agent.
-- `thread/start` mutates `~/.codex/config.toml`, recording the cwd as a trusted
-  project. Workers must expect Codex to write to its own config outside Horde's
-  control, and must not assume an unmodified config between spawns.
+- Codex may write to `~/.codex/config.toml` outside Horde's control, recording a
+  cwd as a trusted project — and a trusted cwd disables approvals for it. The
+  spike observed this for two directories but could not reproduce it on later
+  `thread/start` calls against the same paths, so the trigger is not isolated.
+  Workers must not assume an unmodified Codex config between spawns.
+- Interrupt is not a clean stop: `turn/interrupt` ends the turn via
+  `thread/status/changed → idle` and emits no `turn/completed`, while already-
+  generated deltas keep arriving. An adapter awaiting a turn terminal event
+  after interrupting will hang.
+- `CODEX_HOME` is the Provider Account boundary — it locates credentials as well
+  as config, so one account is one `CODEX_HOME`, mirroring `CLAUDE_CONFIG_DIR`.
 - Re-check the two feature flags on each Codex upgrade; when they stabilize,
   this ADR should be revisited rather than worked around.

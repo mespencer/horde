@@ -334,7 +334,96 @@ def scenario_resume(args):
         srv.close()
 
 
+def scenario_interrupt(args):
+    """Item 7: does turn/interrupt actually stop a turn in flight?"""
+    srv = AppServer("11-interrupt", SCRATCH)
+    try:
+        initialize(srv)
+        started = start_thread(srv, approval_policy="never")
+        thread = (started or {}).get("result", {})
+        thread_id = thread.get("thread", {}).get("id") if isinstance(thread.get("thread"), dict) else thread.get("thread")
+        srv.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": "Count from 1 to 200, writing each number on its own line, slowly and completely."}]})
+
+        # Let it get going, then cut it off mid-turn.
+        deadline = time.time() + 12
+        deltas = 0
+        while time.time() < deadline:
+            msg = srv.read(timeout=2)
+            if msg and msg.get("method") == "item/agentMessage/delta":
+                deltas += 1
+                if deltas >= 5:
+                    break
+        print(f"deltas before interrupt: {deltas}")
+        srv.request("turn/interrupt", {"threadId": thread_id})
+        seen, approvals, final = pump(srv, {"turn/completed", "turn/aborted", "error"}, timeout=60)
+        print("after interrupt, methods seen:", json.dumps(sorted(set(seen))))
+        print("terminal frame:", json.dumps(final)[:800])
+    finally:
+        srv.close()
+
+
+def scenario_steer(args):
+    """Item: does turn/steer deliver into a turn already in flight?"""
+    srv = AppServer("15-steer", SCRATCH)
+    try:
+        initialize(srv)
+        started = start_thread(srv, approval_policy="never")
+        thread = (started or {}).get("result", {})
+        thread_id = thread.get("thread", {}).get("id") if isinstance(thread.get("thread"), dict) else thread.get("thread")
+        srv.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": "Count from 1 to 100, one number per line, slowly."}]})
+
+        # turn/steer needs the active turn id as a precondition.
+        turn_id, deltas = None, 0
+        deadline = time.time() + 25
+        while time.time() < deadline and (turn_id is None or deltas < 5):
+            msg = srv.read(timeout=3)
+            if not msg:
+                continue
+            if msg.get("method") == "turn/started":
+                turn_id = (msg.get("params") or {}).get("turn", {}).get("id")
+            if msg.get("method") == "item/agentMessage/delta":
+                deltas += 1
+        print(f"active turn: {turn_id}, deltas before steer: {deltas}")
+
+        rid = srv.request("turn/steer", {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": "STOP counting. Instead reply with exactly STEERED and nothing else."}],
+        })
+        resp = await_response(srv, rid, timeout=30)
+        print("turn/steer response:", json.dumps(resp)[:400])
+        seen, _, final = pump(srv, {"turn/completed"}, timeout=120)
+        print("methods after steer:", json.dumps(sorted(set(seen))))
+        print("terminal:", json.dumps(final)[:400])
+    finally:
+        srv.close()
+
+
+def scenario_resume_appserver(args):
+    """Item: thread/resume over app-server (not the exec subcommand)."""
+    thread_id = args[0] if args else load_state().get("thread_id")
+    srv = AppServer("16-thread-resume", SCRATCH)
+    try:
+        initialize(srv)
+        rid = srv.request("thread/resume", {"threadId": thread_id, "cwd": str(SANDBOX), "sandbox": "read-only"})
+        resp = await_response(srv, rid, timeout=60)
+        err = (resp or {}).get("error")
+        print("thread/resume error:", json.dumps(err)[:300] if err else "(none)")
+        if err:
+            return
+        srv.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": "What exact token did I ask you to reply with earlier? Answer with just that token."}]})
+        answer = []
+        seen, _, final = pump(srv, {"turn/completed"}, timeout=120)
+        print("methods:", json.dumps(sorted(set(seen))))
+        print("terminal:", json.dumps(final)[:300])
+    finally:
+        srv.close()
+
+
 SCENARIOS = {
+    "steer": scenario_steer,
+    "resume2": scenario_resume_appserver,
+    "interrupt": scenario_interrupt,
     "initialize": scenario_initialize,
     "freeprobes": scenario_freeprobes,
     "turn": scenario_turn,

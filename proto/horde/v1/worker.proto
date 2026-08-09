@@ -25,8 +25,21 @@ enum AdapterCapability {
   // Messages can be queued to the next turn boundary.
   ADAPTER_CAPABILITY_STEERABLE = 3;
 
-  // Permission decisions can be routed through Horde's MCP endpoint.
+  // Permission decisions can be routed through Horde's MCP endpoint. Names a
+  // mechanism; TOOL_CALL_GATING below is the capability to match on.
   ADAPTER_CAPABILITY_PERMISSION_PROMPT_TOOL = 4;
+
+  // Proposed tool calls are surfaced for an external decision *before* they
+  // execute — what the permission chain (DESIGN §10) needs in order to apply
+  // deterministic rules, the Policy Judge, or human approval at all.
+  //
+  // Absence is a real state, not a gap in the advertisement: a provider that
+  // adjudicates internally and reports afterwards cannot be gated by Horde.
+  // Codex is that case today (ADR-0005) — its sandbox tier and project trust,
+  // chosen at thread start, are the only controls. Permission modes and
+  // placement consult this flag so a high-trust Assignment can refuse to land
+  // on an ungateable provider.
+  ADAPTER_CAPABILITY_TOOL_CALL_GATING = 5;
 }
 
 // A provider harness on this Worker. Install is not auth: an installed harness

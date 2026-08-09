@@ -13,6 +13,12 @@ message TokenUsage {
   uint64 output_tokens = 2;
   uint64 cache_read_input_tokens = 3;
   uint64 cache_write_input_tokens = 4;
+
+  // Reasoning tokens, where the provider bills and reports them separately.
+  // Included in `output_tokens` or not depending on the provider, so this is a
+  // breakdown for attribution, never an addend — summing the two double-counts
+  // on providers that already fold reasoning into output.
+  uint64 reasoning_output_tokens = 5;
 }
 
 // Where a RateWindow's numbers came from. Provider-reported state is truth
@@ -36,17 +42,32 @@ enum RateWindowUnit {
 message RateWindow {
   HeadroomSource source = 1;
 
+  // Meaningful only alongside absolute counts; leave UNSPECIFIED when a
+  // provider reports percentage only.
   RateWindowUnit unit = 2;
 
-  uint64 used = 3;
+  // Absolute consumption, when the provider reports counts. Optional because
+  // some providers report only a percentage — Codex reports `usedPercent` with
+  // no counts at all (ADR-0005). Absent is not zero.
+  optional uint64 used = 3;
 
-  // Zero means unknown, which is distinct from a limit of zero — a Provider
-  // Account with no quota is expressed by exhausting `used` against `limit`.
-  uint64 limit = 4;
+  // Absent means the provider does not publish a ceiling, which is distinct
+  // from a ceiling of zero.
+  optional uint64 limit = 4;
 
   google.protobuf.Duration window_length = 5;
 
   google.protobuf.Timestamp resets_at = 6;
+
+  // Fraction of the window consumed, 0.0–1.0, for providers that report a
+  // percentage instead of counts.
+  //
+  // Both shapes are modelled rather than normalising to one, because either
+  // conversion is lossy: percent → counts needs a ceiling the provider never
+  // sent, and counts → percent discards the ceiling the provider did send. A
+  // RateWindow carries whichever shape its provider actually reports, and may
+  // carry both; consumers must handle a window with only one.
+  optional double used_fraction = 7;
 }
 
 // One metered turn, attributable to an Agent and a Provider Account.

@@ -75,4 +75,20 @@ message PermissionDecision {
 
   // Widen the deterministic-allow layer for the rest of the Session.
   bool remember_for_session = 6;
+
+  // Replacement arguments, when the chain narrowed the call rather than merely
+  // permitting it — clamping a path, dropping a flag.
+  //
+  // Meaningful only with outcome ALLOW. Spike W1c proved this is real rather
+  // than theoretical: Claude Code executes the arguments the permission tool
+  // returns, not the ones the model proposed. Without it on the wire, a
+  // narrowing decision dies between Server and Worker and the original call
+  // runs unmodified.
+  //
+  // Absent and empty are different states and both matter: absent means "allow
+  // as proposed", an empty Struct means "allow with no arguments at all". A
+  // Worker whose adapter cannot rewrite arguments must reject a decision
+  // carrying this field rather than drop it, so a narrowing that failed to
+  // apply is never mistaken for one that took effect.
+  google.protobuf.Struct updated_input = 7;
 }

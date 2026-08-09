@@ -1,0 +1,4 @@
+{"type": "thread.started", "thread_id": "019fe87a-349e-7412-93c7-9555dee8211f"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "HORDE_EXEC_OK"}}
+{"type": "turn.completed", "usage": {"input_tokens": 17072, "cached_input_tokens": 11008, "cache_write_input_tokens": 0, "output_tokens": 8, "reasoning_output_tokens": 0}}
