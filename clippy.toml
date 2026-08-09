@@ -1,0 +1,6 @@
+# Policy (docs/TESTING.md §4): `expect` and `panic` are allowed in tests, `unwrap`
+# is banned everywhere including tests. These three keys are the only place that
+# distinction lives; the deny levels themselves are in the workspace lint table.
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = false

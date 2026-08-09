@@ -1,0 +1,25 @@
+{
+  "packages": [
+    {
+      "id": "path+file:///Users/myles/Code/horde/.claude/worktrees/scaffold-gauntlet/crates/horde-gauntlet#0.1.0",
+      "name": "horde-gauntlet",
+      "targets": [
+        {
+          "kind": [
+            "lib"
+          ],
+          "name": "horde_gauntlet"
+        },
+        {
+          "kind": [
+            "bin"
+          ],
+          "name": "gauntlet"
+        }
+      ]
+    }
+  ],
+  "workspace_members": [
+    "path+file:///Users/myles/Code/horde/.claude/worktrees/scaffold-gauntlet/crates/horde-gauntlet#0.1.0"
+  ]
+}

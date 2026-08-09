@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.lints.rust]
+# Deliberately *not* `warnings = "deny"`: denying every present and future rustc
+# warning from the manifest turns a toolchain bump into a broken build. The
+# `clippy` gate passes `-D warnings` instead, so the policy lives in one place
+# (the gate) and local `cargo build` stays usable.
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# docs/TESTING.md §4. `unwrap` is additionally banned in tests via clippy.toml.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+debug = "line-tables-only"

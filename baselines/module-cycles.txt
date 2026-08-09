@@ -1,0 +1,4 @@
+# Module cycles this workspace currently licenses, one cycle per line,
+# members comma-separated. Bidirectional ratchet: a new cycle fails the gate,
+# and so does a line here that no longer describes a real cycle.
+# Update by hand-copying the gate's output; there is no --update flag.

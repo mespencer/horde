@@ -1,0 +1,25 @@
+    Checking fmtprobe v0.1.0 (/repo)
+error: used `unwrap()` on an `Option` value
+ --> src/lib.rs:4:5
+  |
+4 |     v.unwrap()
+  |     ^^^^^^^^^^
+  |
+  = note: if this value is `None`, it will panic
+  = help: consider using `expect()` to provide a better panic message
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#unwrap_used
+  = note: requested on the command line with `-D clippy::unwrap-used`
+
+error: used `unwrap()` on an `Option` value
+ --> src/lib.rs:8:5
+  |
+8 |     v.unwrap()
+  |     ^^^^^^^^^^
+  |
+  = note: if this value is `None`, it will panic
+  = help: consider using `expect()` to provide a better panic message
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#unwrap_used
+
+error: could not compile `fmtprobe` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `fmtprobe` (lib test) due to 2 previous errors

@@ -1,0 +1,13 @@
+Diff in /repo/src/lib.rs:1:
+ pub mod report;
+[31m-pub fn a() ->i32{ 1 }
+[m[32m+pub fn a() -> i32 {
+[m[32m+    1
+[m[32m+}
+[m 
+Diff in /repo/src/report.rs:1:
+[31m-pub fn d() ->i32{ 4 }
+[m[32m+pub fn d() -> i32 {
+[m[32m+    4
+[m[32m+}
+[m 

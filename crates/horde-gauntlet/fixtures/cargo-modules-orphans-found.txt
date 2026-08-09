@@ -1,0 +1,14 @@
+
+1 orphans found:
+
+[1;38;2;219;77;89merror[0m: orphaned module `ghost` at src/ghost.rs
+  [1;38;2;84;142;200m-->[0m src/lib.rs
+   [1;38;2;84;142;200m|[0m  [1;38;2;219;77;89m^^^^^^^^^^[0m [1;38;2;219;77;89morphan module not loaded from file[0m
+   [1;38;2;84;142;200m|[0m
+ [1;38;2;105;190;210mhelp[0m: consider loading `ghost` from module `orph`
+   [1;38;2;84;142;200m|[0m
+   [1;38;2;84;142;200m|[0m  [1;38;2;129;193;105mmod ghost;[0m
+   [1;38;2;84;142;200m|[0m  [1;38;2;129;193;105m++++++++++[0m
+   [1;38;2;84;142;200m|[0m
+
+Error: Found 1 orphans in crate 'orph'
