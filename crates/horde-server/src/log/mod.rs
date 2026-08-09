@@ -21,18 +21,25 @@
 //!
 //! # Why a tail cannot miss an event
 //!
-//! The ordering in [`EventLog::tail`] is the whole trick, and it is the
-//! property the proptests exist to pin:
+//! [`EventLog::tail`] uses two independent mechanisms, because the first one
+//! alone is correct but not verifiable:
 //!
-//! 1. **Subscribe first.** From this moment every append is announced to us.
-//! 2. **Then replay** from the requested offset up to the current head.
-//! 3. **Then drain** the notifications, discarding any whose sequence the
-//!    replay already covered.
+//! 1. **Subscribe before replaying.** From that moment every append is
+//!    announced, so an event written during the replay is either in the replay
+//!    or in the channel.
+//! 2. **Sweep after subscribing.** The head is read again and any events the
+//!    replay missed are folded into the history before it is returned.
 //!
-//! An event appended during step 2 is either included in the replay or waiting
-//! in the channel from step 1 — never neither. Doing it the other way round
-//! (read, then subscribe) leaves exactly that window open, and the bug it
-//! creates is invisible until something is actually writing during a reconnect.
+//! Mechanism 2 is what actually makes the guarantee testable. The subscribe
+//! window is only observable when the *final* append of a session lands inside
+//! it — [`Tail::next_batch`] re-reads from `delivered + 1` on any notification,
+//! so an earlier loss is self-healing, and the last one leaves the follower
+//! waiting for a notification that already fired. That window is real but too
+//! narrow to lose reliably in a test, which makes it exactly the kind of
+//! ordering that rots: a refactor could swap the two lines and nothing would go
+//! red. The sweep removes the dependence on the ordering altogether, and its
+//! postcondition — the returned history reaches the head — is a fact a test can
+//! assert directly.
 
 pub mod schema;
 pub mod store;
@@ -212,12 +219,25 @@ impl EventLog {
         let notifications = self.subscribe();
 
         // Step 2: replay history.
-        let history = self.read_all_from(session_id, from_sequence).await?;
-        let delivered = history
+        let mut history = self.read_all_from(session_id, from_sequence).await?;
+        let mut delivered = history
             .last()
             .map_or(from_sequence.max(1).saturating_sub(1), |event| {
                 event.sequence
             });
+
+        // Step 3: sweep. Anything appended while step 2 ran is picked up here
+        // rather than being left to the notification that may have raced us.
+        // Bounded by the head read at entry, so a continuously written session
+        // cannot keep this loop alive indefinitely.
+        let head_after_replay = self.head(session_id).await?;
+        if head_after_replay > delivered {
+            let missed = self.read_all_from(session_id, delivered + 1).await?;
+            if let Some(last) = missed.last() {
+                delivered = last.sequence;
+                history.extend(missed);
+            }
+        }
 
         Ok((
             history,
@@ -406,9 +426,17 @@ mod tests {
         let (history, mut tail) = log.tail("s1", 1).await.expect("tail");
         writing.await.expect("the writer task must finish");
 
+        // Bounded: a defect that stalls the tail must red this test rather than
+        // hang it. An unbounded wait converts a clear failure into a suite that
+        // never reports, which is strictly worse.
         let mut seen: Vec<u64> = history.iter().map(|event| event.sequence).collect();
         while seen.last().copied().unwrap_or(0) < 25 {
-            let batch = tail.next_batch().await.expect("live").expect("read");
+            let batch =
+                tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
+                    .await
+                    .expect("the tail must not stall below the known head")
+                    .expect("live")
+                    .expect("read");
             seen.extend(batch.iter().map(|event| event.sequence));
         }
 
