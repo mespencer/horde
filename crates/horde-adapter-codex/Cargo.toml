@@ -1,0 +1,20 @@
+[package]
+name = "horde-adapter-codex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Codex app-server codec: JSON-RPC wire types, turn assembly, usage idempotence, and the capability claims ADR-0005 established."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+horde-adapter = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+horde-testkit = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread"] }

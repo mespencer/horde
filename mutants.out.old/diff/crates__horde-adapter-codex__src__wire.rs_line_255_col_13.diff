@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/wire.rs
++++ delete match arm "thread/status/changed" in Notification::classify
+@@ -247,17 +247,17 @@
+         }
+ 
+         let other = || Self::Other {
+             method: method.to_owned(),
+         };
+ 
+         match method {
+             "thread/started" => parse(params).map_or_else(other, Self::ThreadStarted),
+-            "thread/status/changed" => parse(params).map_or_else(other, Self::ThreadStatusChanged),
++             /* ~ changed by cargo-mutants ~ */
+             "turn/started" => parse(params).map_or_else(other, Self::TurnStarted),
+             "turn/completed" => parse(params).map_or_else(other, Self::TurnCompleted),
+             "item/agentMessage/delta" => parse(params).map_or_else(other, Self::AgentMessageDelta),
+             "item/completed" => parse(params).map_or_else(other, Self::ItemCompleted),
+             "thread/tokenUsage/updated" => {
+                 parse(params).map_or_else(other, Self::TokenUsageUpdated)
+             }
+             "account/rateLimits/updated" => {

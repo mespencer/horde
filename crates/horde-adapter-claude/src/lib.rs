@@ -57,12 +57,19 @@ pub const PROVIDER: &str = "claude";
 ///
 /// Every entry here was demonstrated against a real binary (2.1.226); see
 /// `docs/spikes/claude-stream-json.md` for the evidence behind each one.
+///
+/// `AmendActiveTurn` is **not** claimed. W1c found no way to deliver into a
+/// running Claude turn — its only steering-adjacent finding is the control
+/// message's abort-and-keep-steering, which is `InterruptibleTurn`. Per that
+/// capability's contract, the absence means the orchestrator queues the message
+/// to the turn boundary itself, which works here as it does everywhere. Dropped
+/// when the capability was renamed from `SteerAtTurnBoundary`, whose old name
+/// this adapter did satisfy.
 #[must_use]
 pub fn capabilities() -> Capabilities {
     Capabilities::none()
         .with(Capability::Resumable)
         .with(Capability::InterruptibleTurn)
-        .with(Capability::SteerAtTurnBoundary)
         .with(Capability::PreAuthorizeToolCalls)
         .with(Capability::RewritesToolInput)
         .with(Capability::ReportsHeadroom)
@@ -92,7 +99,6 @@ mod tests {
         for capability in [
             Capability::Resumable,
             Capability::InterruptibleTurn,
-            Capability::SteerAtTurnBoundary,
             Capability::PreAuthorizeToolCalls,
             Capability::RewritesToolInput,
             Capability::ReportsHeadroom,

@@ -40,10 +40,39 @@ pub fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The directory holding the golden transcripts.
+/// The directory holding spike W1c's golden transcripts.
+///
+/// Kept pointing at the flat claude directory it has always meant. A second
+/// spike records into its own subdirectory, which is what
+/// [`Transcript::load_from`] is for.
 #[must_use]
 pub fn transcript_dir() -> PathBuf {
     repo_root().join("docs/spikes/transcripts")
+}
+
+/// Which `dir` value in a wrapped capture marks *harness output*.
+///
+/// The two spikes chose opposite conventions for the same key, and the mistake
+/// is invisible — a loader that guesses wrong silently swaps what the harness
+/// said with what the driver sent, and every assertion still runs.
+///
+/// * [`Self::Out`] — W1c's claude captures, where `dir` describes the harness's
+///   stdout: `"out"` is what came *out of* the harness.
+/// * [`Self::In`] — W2c's codex captures, where `dir` describes the driver's
+///   socket: `"in"` is what came *in to* the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessOutputKey {
+    Out,
+    In,
+}
+
+impl HarnessOutputKey {
+    fn marks_output(self, dir: &str) -> bool {
+        match self {
+            Self::Out => dir == "out",
+            Self::In => dir == "in",
+        }
+    }
 }
 
 /// A recorded harness session.
@@ -75,7 +104,22 @@ impl Transcript {
     /// `{"dir":…,"t":…,"msg":…}` envelopes, and the one file that is unwrapped
     /// raw stdout because it was captured with a shell pipe.
     pub fn load(name: &str) -> Result<Self, TranscriptError> {
-        let path = transcript_dir().join(name);
+        Self::load_from(&transcript_dir(), name, HarnessOutputKey::Out)
+    }
+
+    /// Loads a transcript from an explicit directory, naming which `dir` value
+    /// marks harness output.
+    ///
+    /// Additive counterpart to [`Self::load`], for spikes that record into
+    /// their own subdirectory or with the opposite direction convention. See
+    /// [`HarnessOutputKey`] — getting it wrong is silent, so it is a required
+    /// argument rather than a guess.
+    pub fn load_from(
+        dir: &Path,
+        name: &str,
+        output_key: HarnessOutputKey,
+    ) -> Result<Self, TranscriptError> {
+        let path = dir.join(name);
         let contents = std::fs::read_to_string(&path).map_err(|source| TranscriptError::Read {
             path: path.clone(),
             source,
@@ -97,8 +141,10 @@ impl Transcript {
                 })?;
 
             match (value.get("dir").and_then(Value::as_str), value.get("msg")) {
-                (Some("out"), Some(msg)) => outbound.push(msg.to_string()),
-                (Some("in"), Some(msg)) => inbound.push(msg.to_string()),
+                (Some(dir), Some(msg)) if output_key.marks_output(dir) => {
+                    outbound.push(msg.to_string());
+                }
+                (Some(_), Some(msg)) => inbound.push(msg.to_string()),
                 // Unwrapped capture: the line is the harness event itself.
                 _ => outbound.push(line.to_owned()),
             }
@@ -117,11 +163,8 @@ impl Transcript {
     /// thing that closes a turn in this protocol.
     #[must_use]
     pub fn turns(&self) -> Vec<Vec<String>> {
-        let mut turns = Vec::new();
-        let mut current = Vec::new();
-
-        for line in &self.outbound {
-            let is_result = serde_json::from_str::<Value>(line)
+        self.turns_where(|line| {
+            serde_json::from_str::<Value>(line)
                 .ok()
                 .and_then(|value| {
                     value
@@ -129,10 +172,25 @@ impl Transcript {
                         .and_then(Value::as_str)
                         .map(|kind| kind == "result")
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+        })
+    }
 
+    /// Splits the outbound lines into turns using a caller-supplied terminator.
+    ///
+    /// Additive counterpart to [`Self::turns`], whose `result` envelope is
+    /// specific to claude's protocol. Codex, for one, has no single terminator
+    /// at all: an interrupted turn ends on a status change and never emits a
+    /// terminal frame, so its predicate has to accept both.
+    #[must_use]
+    pub fn turns_where(&self, is_turn_end: impl Fn(&str) -> bool) -> Vec<Vec<String>> {
+        let mut turns = Vec::new();
+        let mut current = Vec::new();
+
+        for line in &self.outbound {
+            let ends_turn = is_turn_end(line);
             current.push(line.clone());
-            if is_result {
+            if ends_turn {
                 turns.push(std::mem::take(&mut current));
             }
         }

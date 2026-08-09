@@ -1,0 +1,21 @@
+--- crates/horde-adapter-codex/src/turn.rs
++++ replace != with == in TurnAssembler::record_usage
+@@ -251,17 +251,17 @@
+         let key = (turn_id.to_owned(), "tokenUsage".to_owned());
+         if !self.counted_usage.insert(key) {
+             return;
+         }
+ 
+         let Some(turn) = self.turn.as_mut() else {
+             return;
+         };
+-        if turn.id.as_str() != turn_id {
++        if turn.id.as_str() == /* ~ changed by cargo-mutants ~ */ turn_id {
+             // A reading for a turn that is not the open one — exactly what
+             // resume replays. Recorded as counted above, applied to nothing.
+             return;
+         }
+ 
+         turn.usage = TokenUsage {
+             input_tokens: counts.input_tokens,
+             output_tokens: counts.output_tokens,
