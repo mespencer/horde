@@ -1,28 +1,42 @@
 //! Token accounting across the adapter seam.
 //!
-//! The seam's contract is **per-turn deltas**. Harnesses disagree about this:
-//! Claude Code reports `total_cost_usd` and `modelUsage` as running totals for
-//! the lifetime of one child process, so a Worker that summed the numbers it
-//! was handed would over-bill quadratically (spike W1c measured 0.0037 →
-//! 0.0063 → 0.0078 across three turns of one process). Normalizing to deltas
-//! *inside* each adapter means the Worker never has to know which harness
-//! accumulates and which does not.
+//! The seam's contract is **per-turn usage**, and the two harnesses Horde
+//! drives arrive at it from opposite directions:
 //!
-//! [`UsageAccumulator`] exists so adapters that receive running totals can do
-//! that subtraction in one audited place instead of reinventing it.
+//! * Claude Code reports `total_cost_usd` and `modelUsage` as running totals
+//!   for the lifetime of one child process, so a Worker that summed the numbers
+//!   it was handed would over-bill quadratically (spike W1c measured 0.0037 →
+//!   0.0063 → 0.0078 across three turns of one process).
+//! * Codex reports `thread/tokenUsage/updated` with a `last` field that is
+//!   already the turn (spike W2c), so there is nothing to difference.
+//!
+//! Normalizing *inside* each adapter means the Worker never has to know which
+//! harness accumulates. [`UsageAccumulator`] exists for the first kind, so that
+//! subtraction happens in one audited place; the second kind simply does not
+//! use it.
 
 use core::ops::{Add, AddAssign, Sub};
+use core::time::Duration;
 
 /// Token counts for one turn.
 ///
-/// Mirrors `horde.v1.TokenUsage`; the conversion happens in the Worker, at the
-/// transport boundary.
+/// Mirrors `horde.v1.TokenUsage`, with one addition: reasoning output is
+/// counted separately because Codex reports it as its own counter and folding
+/// it into `output_tokens` would lose the distinction irreversibly. The wire
+/// conversion happens in the Worker, at the transport boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_write_input_tokens: u64,
+    /// Tokens spent thinking, where the provider counts them separately.
+    ///
+    /// Zero means "none reported", which for a harness that does not break
+    /// reasoning out is indistinguishable from "none spent" — the honest
+    /// reading is that this counter is only meaningful for providers that
+    /// populate it.
+    pub reasoning_output_tokens: u64,
 }
 
 impl TokenUsage {
@@ -33,6 +47,7 @@ impl TokenUsage {
             .saturating_add(self.output_tokens)
             .saturating_add(self.cache_read_input_tokens)
             .saturating_add(self.cache_write_input_tokens)
+            .saturating_add(self.reasoning_output_tokens)
     }
 
     /// True when nothing was billed — an interrupted turn, typically.
@@ -55,6 +70,9 @@ impl Add for TokenUsage {
             cache_write_input_tokens: self
                 .cache_write_input_tokens
                 .saturating_add(rhs.cache_write_input_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_add(rhs.reasoning_output_tokens),
         }
     }
 }
@@ -84,6 +102,9 @@ impl Sub for TokenUsage {
             cache_write_input_tokens: self
                 .cache_write_input_tokens
                 .saturating_sub(rhs.cache_write_input_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_sub(rhs.reasoning_output_tokens),
         }
     }
 }
@@ -153,6 +174,7 @@ impl UsageAccumulator {
             || next.output_tokens < previous.output_tokens
             || next.cache_read_input_tokens < previous.cache_read_input_tokens
             || next.cache_write_input_tokens < previous.cache_write_input_tokens
+            || next.reasoning_output_tokens < previous.reasoning_output_tokens
     }
 }
 
@@ -177,23 +199,72 @@ pub enum HeadroomSource {
     HordeMetered,
 }
 
+/// How much of a rate-limit window has been consumed.
+///
+/// Providers disagree about the unit and neither form converts to the other:
+/// Claude Code reports only whether requests are still allowed, and Codex
+/// reports a percentage with no absolute counts (spike W2c). Collapsing both
+/// into `used`/`limit` integers would mean inventing numbers, so the variants
+/// stay distinct and callers handle what they were actually told.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Utilization {
+    /// A fraction of the window consumed, in `0.0..=1.0`.
+    Fraction(f64),
+    /// Absolute counts in the window's own unit.
+    Absolute { used: u64, limit: u64 },
+    /// The provider says only whether it is still serving requests.
+    AllowedOnly { allowed: bool },
+}
+
+impl Utilization {
+    /// Remaining headroom as a fraction, where that can be known.
+    ///
+    /// `None` when the provider reported only a yes/no, or an absolute limit of
+    /// zero — a limit of zero is unknown rather than exhausted, and guessing
+    /// either way would mislead the scheduler.
+    #[must_use]
+    pub fn remaining_fraction(&self) -> Option<f64> {
+        match *self {
+            Self::Fraction(used) => Some((1.0 - used).clamp(0.0, 1.0)),
+            Self::Absolute { limit: 0, .. } => None,
+            Self::Absolute { used, limit } => {
+                let ratio = used as f64 / limit as f64;
+                Some((1.0 - ratio).clamp(0.0, 1.0))
+            }
+            Self::AllowedOnly { .. } => None,
+        }
+    }
+
+    /// Whether the provider will currently serve a request.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        match *self {
+            Self::AllowedOnly { allowed } => !allowed,
+            _ => self.remaining_fraction().is_some_and(|left| left <= 0.0),
+        }
+    }
+}
+
 /// Rate-limit state for one provider account, as the harness reported it.
 ///
 /// Drives the `headroom` selection strategy in DESIGN.md §5.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RateWindow {
     pub source: HeadroomSource,
-    /// Harness's own name for the window, e.g. `"five_hour"`. Opaque to Horde.
+    /// Harness's own name for the window, e.g. `"five_hour"` or a Codex
+    /// `limitId`. Opaque to Horde; two windows with different names are
+    /// different windows.
     pub window: String,
-    /// Whether the provider is currently letting requests through.
-    pub allowed: bool,
+    pub utilization: Utilization,
+    /// How long the window spans, where the provider says.
+    pub window_duration: Option<Duration>,
     /// Unix seconds at which the window resets; `None` when unreported.
     pub resets_at_unix: Option<i64>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenUsage, UsageAccumulator};
+    use super::{TokenUsage, UsageAccumulator, Utilization};
 
     fn usage(input: u64, output: u64) -> TokenUsage {
         TokenUsage {
@@ -266,13 +337,95 @@ mod tests {
     }
 
     #[test]
+    fn a_percentage_window_reports_the_remaining_fraction() {
+        // Codex reports usedPercent with no absolute counts.
+        let window = Utilization::Fraction(0.25);
+        assert_eq!(window.remaining_fraction(), Some(0.75));
+        assert!(!window.is_exhausted());
+    }
+
+    #[test]
+    fn an_absolute_window_reports_the_remaining_fraction() {
+        let window = Utilization::Absolute {
+            used: 750,
+            limit: 1000,
+        };
+        assert_eq!(window.remaining_fraction(), Some(0.25));
+        assert!(!window.is_exhausted());
+    }
+
+    #[test]
+    fn a_fully_consumed_window_is_exhausted() {
+        assert!(Utilization::Fraction(1.0).is_exhausted());
+        assert!(
+            Utilization::Absolute {
+                used: 10,
+                limit: 10
+            }
+            .is_exhausted()
+        );
+    }
+
+    /// A limit of zero means the provider did not say, which is not the same as
+    /// a provider that has nothing left. Guessing either way misleads the
+    /// scheduler's headroom strategy.
+    #[test]
+    fn an_absolute_limit_of_zero_is_unknown_rather_than_exhausted() {
+        let window = Utilization::Absolute { used: 0, limit: 0 };
+        assert_eq!(window.remaining_fraction(), None);
+        assert!(!window.is_exhausted());
+    }
+
+    #[test]
+    fn a_yes_no_window_yields_no_fraction_but_still_reports_exhaustion() {
+        let serving = Utilization::AllowedOnly { allowed: true };
+        assert_eq!(serving.remaining_fraction(), None);
+        assert!(!serving.is_exhausted());
+
+        let refusing = Utilization::AllowedOnly { allowed: false };
+        assert_eq!(refusing.remaining_fraction(), None);
+        assert!(refusing.is_exhausted());
+    }
+
+    #[test]
+    fn an_over_consumed_window_clamps_instead_of_going_negative() {
+        assert_eq!(Utilization::Fraction(1.5).remaining_fraction(), Some(0.0));
+        assert_eq!(
+            Utilization::Absolute {
+                used: 30,
+                limit: 10
+            }
+            .remaining_fraction(),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn reasoning_tokens_survive_differencing_as_their_own_counter() {
+        let with_reasoning = |reasoning| TokenUsage {
+            output_tokens: 100,
+            reasoning_output_tokens: reasoning,
+            ..TokenUsage::default()
+        };
+        let mut acc = UsageAccumulator::new();
+        acc.observe(with_reasoning(40), 0.0);
+        let delta = acc.observe(with_reasoning(65), 0.0);
+        assert_eq!(delta.tokens.reasoning_output_tokens, 25);
+        assert_eq!(
+            delta.tokens.output_tokens, 0,
+            "reasoning must not be folded into output"
+        );
+    }
+
+    #[test]
     fn total_counts_cache_traffic() {
         let usage = TokenUsage {
             input_tokens: 1,
             output_tokens: 2,
             cache_read_input_tokens: 4,
             cache_write_input_tokens: 8,
+            reasoning_output_tokens: 16,
         };
-        assert_eq!(usage.total(), 15);
+        assert_eq!(usage.total(), 31);
     }
 }

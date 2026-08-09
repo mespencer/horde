@@ -47,7 +47,10 @@
 //! 3. **Usage is reported as a per-turn delta**, never as a running total. See
 //!    [`usage`] for why this is the adapter's job and not the Worker's.
 //! 4. **Capabilities are honest.** Asking for something unclaimed returns
-//!    [`AdapterError::Unsupported`]; it never silently no-ops.
+//!    [`AdapterError::Unsupported`]; it never silently no-ops. This matters
+//!    most for [`Capability::PreAuthorizeToolCalls`]: a provider that cannot
+//!    offer a tool call to Horde before it runs must say so, because the
+//!    permission chain would otherwise appear to gate calls it never saw.
 //! 5. **A claimed [`Capability::InterruptibleTurn`] means the session survives
 //!    the interrupt** and accepts the next message.
 //!
@@ -61,13 +64,15 @@ pub mod permission;
 pub mod spec;
 pub mod usage;
 
-pub use capability::{Capabilities, Capability};
+pub use capability::{Capabilities, Capability, PermissionEnforcement};
 pub use error::AdapterError;
 pub use event::{AgentEvent, OutputChannel, TurnOutcome, TurnStatus};
 pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId};
 pub use permission::{PermissionDecision, PermissionDenial, ProposedToolCall};
 pub use spec::{AgentSpec, Delivery, McpEndpoint, TurnInput};
-pub use usage::{HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta};
+pub use usage::{
+    HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
+};
 
 use async_trait::async_trait;
 
@@ -85,6 +90,16 @@ pub trait Adapter: Send + Sync {
     fn capabilities(&self) -> Capabilities;
 
     /// Starts a new conversation.
+    ///
+    /// **Not guaranteed to be side-effect-free.** A harness may write to
+    /// ambient machine state as part of starting up: Codex's `thread/start`
+    /// records the working directory as a trusted project in
+    /// `~/.codex/config.toml` (spike W2c), which then changes how that harness
+    /// behaves for every later agent in the same directory. Adapters do not
+    /// promise purity here, and callers must not assume an unmodified
+    /// environment between spawns. Containing those effects — sandbox profiles
+    /// around the whole process (DESIGN.md §10) — is the Worker's job, not the
+    /// adapter's.
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>>;
 
     /// Revives a conversation from a previous process.
