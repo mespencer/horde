@@ -16,6 +16,11 @@
 //! * `HORDE_STUB_EXIT_CODE` — the code to exit with (default 0).
 //! * `HORDE_STUB_IGNORE_INTERRUPT` — swallow control requests, to prove the
 //!   supervisor does not hang waiting for an ack that never comes.
+//! * `HORDE_STUB_CONTROL_LOG` — append each control request to this file.
+//!   The acknowledgement the harness sends back is classified as a non-event by
+//!   the codec, so a test watching only the event stream cannot tell an
+//!   interrupt that was sent from one that was never written. This file is the
+//!   observation point that closes that gap.
 
 use std::io::{BufRead, Write};
 
@@ -55,6 +60,14 @@ fn main() -> std::process::ExitCode {
         // A control request is not a turn; the real harness answers it out of
         // band and keeps going.
         if line.contains("\"control_request\"") {
+            if let Ok(log) = std::env::var("HORDE_STUB_CONTROL_LOG")
+                && let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+            {
+                let _ = writeln!(file, "{line}");
+            }
             if !ignore_interrupt {
                 let ack = r#"{"type":"control_response","response":{"subtype":"success"}}"#;
                 if writeln!(stdout, "{ack}").is_err() || stdout.flush().is_err() {

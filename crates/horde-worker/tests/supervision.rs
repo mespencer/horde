@@ -445,36 +445,58 @@ mod side_effects {
         }
     }
 
-    /// `interrupt()` must actually write the control message.
+    /// `interrupt()` must actually put the control message on the wire.
     ///
-    /// The stub acknowledges control requests, so a no-op `interrupt` produces
-    /// no acknowledgement and this fails — which is the point: an interrupt that
+    /// Observed at the child, not in the event stream: the harness answers a
+    /// control request with a `control_response`, which the codec classifies as
+    /// a non-event, so a test watching events alone cannot tell an interrupt
+    /// that was sent from one that was never written. A no-op `interrupt` used
+    /// to pass here — that mutant is what this file now catches.
+    ///
+    /// The stakes are why it is worth the extra machinery: an interrupt that
     /// silently does nothing is indistinguishable from one that worked, right up
     /// until a user cannot stop a runaway agent.
     #[tokio::test]
     async fn interrupt_puts_the_control_message_on_the_wire() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+
         let script = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\"}\n\
                       {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
-        let (harness_spec, _dir) = spec_with(script, &[]);
+        let (harness_spec, _dir) = spec_with(
+            script,
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        );
         let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
         adapter.extra_env = harness_spec.env.clone();
 
         let mut session = adapter.spawn(&spec()).await.expect("spawns");
         session.interrupt().await.expect("the write must succeed");
 
-        // The stub answers a control request with a control_response, which the
-        // codec classifies as a non-event — so the proof is that the turn still
-        // runs afterwards rather than the stream being poisoned.
+        // The child records what it received; poll briefly for the pipe to land.
+        let mut recorded = String::new();
+        for _ in 0..50 {
+            recorded = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if !recorded.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            recorded.contains("control_request") && recorded.contains("interrupt"),
+            "the child must actually receive the interrupt, got {recorded:?}"
+        );
+
+        // And the session must remain usable — what separates the control
+        // message from a signal, which would have ended the process.
         session
             .send(TurnInput::queued("after the interrupt"))
             .await
             .expect("the session survives an interrupt");
-
-        let saw_event = matches!(session.next_event().await, Ok(Some(_)));
         assert!(
-            saw_event,
-            "the session must remain usable after an interrupt — that is what \
-             distinguishes the control message from a signal"
+            matches!(session.next_event().await, Ok(Some(_))),
+            "a control-message interrupt leaves the session steerable"
         );
         session.shutdown().await.expect("shuts down");
     }
