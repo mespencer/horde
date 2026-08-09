@@ -35,10 +35,12 @@
 
 pub mod codec;
 pub mod permission;
+pub mod replay;
 pub mod turn;
 pub mod wire;
 
 pub use codec::{decode_line, encode_interrupt, encode_user_message};
+pub use replay::ReplaySession;
 pub use turn::TurnAssembler;
 
 use horde_adapter::{Capabilities, Capability};

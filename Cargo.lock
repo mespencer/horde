@@ -250,9 +250,12 @@ dependencies = [
 name = "horde-adapter-claude"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "horde-adapter",
+ "horde-testkit",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
