@@ -675,6 +675,62 @@ mod tests {
         assert_eq!(human, human.trim_end(), "got {human:?}");
     }
 
+    /// Every arm of `detail` must be pinned by an assertion on the text it
+    /// extracts. Mutation testing deletes arms one at a time, and a fall-through
+    /// to the empty default is invisible unless the text itself is checked —
+    /// the AssignmentSent and NoteSent arms survived until this existed.
+    #[test]
+    fn detail_extracts_the_text_of_every_kind_that_carries_one() {
+        use horde_proto::v1::{Assignment, AssignmentSent, Note, NoteSent, TurnInterrupted};
+
+        let assignment = envelope(Some(Kind::AssignmentSent(AssignmentSent {
+            from: None,
+            assignment: Some(Assignment {
+                assignment_id: None,
+                text: "fix the build".to_owned(),
+                payload: None,
+            }),
+            delivery: 0,
+        })));
+        assert!(
+            event(&assignment, Format::Human).contains("fix the build"),
+            "an assignment's text is the only part a reader cares about"
+        );
+
+        let note = envelope(Some(Kind::NoteSent(NoteSent {
+            from: None,
+            note: Some(Note {
+                text: "just so you know".to_owned(),
+                payload: None,
+            }),
+            delivery: 0,
+        })));
+        assert!(event(&note, Format::Human).contains("just so you know"));
+
+        let interrupted = envelope(Some(Kind::TurnInterrupted(TurnInterrupted {
+            reason: "changed my mind".to_owned(),
+            ..TurnInterrupted::default()
+        })));
+        assert!(event(&interrupted, Format::Human).contains("changed my mind"));
+    }
+
+    /// A message whose body failed to arrive must render as empty rather than
+    /// panicking or inventing text.
+    #[test]
+    fn detail_tolerates_a_message_with_no_body() {
+        use horde_proto::v1::{AssignmentSent, NoteSent};
+
+        for kind in [
+            Kind::AssignmentSent(AssignmentSent::default()),
+            Kind::NoteSent(NoteSent::default()),
+        ] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&event(&envelope(Some(kind)), Format::Json))
+                    .expect("valid JSON");
+            assert_eq!(parsed["detail"], "");
+        }
+    }
+
     #[test]
     fn a_queued_placement_shows_the_reason_the_spawner_needs() {
         let queued = envelope(Some(Kind::PlacementChanged(PlacementChanged {
