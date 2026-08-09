@@ -416,6 +416,24 @@ mod tests {
     }
 
     #[test]
+    fn skipped_doctests_are_surfaced_alongside_skipped_tests() {
+        let unit = TestCounts {
+            passed: 1,
+            failed: 0,
+            skipped: 2,
+        };
+        let doc = TestCounts {
+            passed: 1,
+            failed: 0,
+            skipped: 3,
+        };
+        let GateOutcome::Pass { detail } = verdict(Harness::Nextest, unit, doc) else {
+            panic!("skipped tests do not fail the gate");
+        };
+        assert!(detail.contains("5 skipped"), "{detail}");
+    }
+
+    #[test]
     fn failures_from_either_run_fail_the_gate() {
         let doc = TestCounts {
             passed: 0,
