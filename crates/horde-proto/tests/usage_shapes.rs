@@ -126,6 +126,9 @@ fn tool_call_gating_is_advertised_per_adapter() {
 }
 
 #[test]
+// PermissionPromptTool is deprecated but must keep its number forever; pinning
+// it is exactly why this test reads a deprecated variant.
+#[allow(deprecated)]
 fn tool_call_gating_did_not_disturb_existing_capability_numbers() {
     // Renumbering a shipped capability would silently re-label every worker's
     // advertisement, so pin the assignment.

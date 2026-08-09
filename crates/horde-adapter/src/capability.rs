@@ -49,11 +49,24 @@ pub enum Capability {
     /// Credentials and session state can be isolated per provider account, so
     /// one Worker can hold several accounts for the same provider.
     AccountIsolation,
+
+    /// A message can be delivered into a turn that is already running, and the
+    /// agent acts on it before that turn ends.
+    ///
+    /// Deliberately narrower than "messages can be sent". Queueing a message to
+    /// the next turn boundary is the universal fallback every harness supports;
+    /// this capability is specifically mid-turn steering. Spike W2c verified it
+    /// for Codex (`turn/steer`, which amends the active turn and returns the
+    /// same turn id); Claude Code has no equivalent and must not claim it.
+    ///
+    /// A harness claiming this promises the steered instruction reaches the
+    /// current turn — not that it will be obeyed, which is the model's business.
+    Steerable,
 }
 
 impl Capability {
     /// Every capability, for exhaustiveness checks in tests and reports.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Resumable,
         Self::InterruptibleTurn,
         Self::PermissionPrompt,
@@ -62,6 +75,7 @@ impl Capability {
         Self::SystemPromptOverlay,
         Self::ModelSelection,
         Self::AccountIsolation,
+        Self::Steerable,
     ];
 }
 

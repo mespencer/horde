@@ -1,0 +1,17 @@
+[package]
+name = "horde-wire"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The single owner of the domain↔wire correspondence between horde-adapter and horde.v1."
+
+[lints]
+workspace = true
+
+# Depends on both sides precisely so neither has to depend on the other:
+# horde-adapter stays free of protobuf, and horde-proto stays free of domain
+# semantics. The Worker consumes this crate; nothing consumes the Worker.
+[dependencies]
+horde-adapter = { path = "../horde-adapter" }
+horde-proto = { path = "../horde-proto" }

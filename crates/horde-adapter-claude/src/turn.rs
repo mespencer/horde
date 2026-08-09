@@ -67,6 +67,16 @@ impl TurnAssembler {
                     window: rate_limit.rate_limit_info.rate_limit_type.clone(),
                     allowed: rate_limit.rate_limit_info.status == "allowed",
                     resets_at_unix: rate_limit.rate_limit_info.resets_at,
+                    // Claude Code's rate-limit event is qualitative: a window
+                    // name, an allowed/blocked status, and a reset time. It
+                    // carries no consumption figure in either shape, so the
+                    // numeric fields stay absent rather than being invented.
+                    // `headroom_fraction()` is therefore None for Claude, which
+                    // is the honest answer and not "plenty of room".
+                    used: None,
+                    limit: None,
+                    used_fraction: None,
+                    window_length: None,
                 },
             }],
             Event::ControlResponse(_)
@@ -178,6 +188,10 @@ impl TurnAssembler {
                         output_tokens: model.output_tokens,
                         cache_read_input_tokens: model.cache_read_input_tokens,
                         cache_write_input_tokens: model.cache_creation_input_tokens,
+                        // `modelUsage` has no reasoning breakdown; thinking
+                        // tokens arrive on their own envelopes and are already
+                        // inside output_tokens.
+                        reasoning_output_tokens: 0,
                     }
             });
 

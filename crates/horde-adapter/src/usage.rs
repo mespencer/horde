@@ -12,6 +12,7 @@
 //! that subtraction in one audited place instead of reinventing it.
 
 use core::ops::{Add, AddAssign, Sub};
+use core::time::Duration;
 
 /// Token counts for one turn.
 ///
@@ -23,10 +24,21 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_write_input_tokens: u64,
+    /// Reasoning tokens, where the provider bills and reports them separately.
+    ///
+    /// A **breakdown, never an addend**. Providers disagree about whether
+    /// reasoning already sits inside `output_tokens` — Codex reports both and
+    /// folds reasoning into output (spike W2c) — so [`TokenUsage::total`]
+    /// deliberately excludes this field. Adding it would double-count every
+    /// reasoning token on such a provider.
+    pub reasoning_output_tokens: u64,
 }
 
 impl TokenUsage {
     /// Total tokens that touched the model, cache included.
+    ///
+    /// Excludes `reasoning_output_tokens` on purpose: it is a breakdown of
+    /// output, not a fifth bucket. See that field's documentation.
     #[must_use]
     pub fn total(&self) -> u64 {
         self.input_tokens
@@ -55,6 +67,9 @@ impl Add for TokenUsage {
             cache_write_input_tokens: self
                 .cache_write_input_tokens
                 .saturating_add(rhs.cache_write_input_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_add(rhs.reasoning_output_tokens),
         }
     }
 }
@@ -84,6 +99,9 @@ impl Sub for TokenUsage {
             cache_write_input_tokens: self
                 .cache_write_input_tokens
                 .saturating_sub(rhs.cache_write_input_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_sub(rhs.reasoning_output_tokens),
         }
     }
 }
@@ -153,6 +171,7 @@ impl UsageAccumulator {
             || next.output_tokens < previous.output_tokens
             || next.cache_read_input_tokens < previous.cache_read_input_tokens
             || next.cache_write_input_tokens < previous.cache_write_input_tokens
+            || next.reasoning_output_tokens < previous.reasoning_output_tokens
     }
 }
 
@@ -180,7 +199,10 @@ pub enum HeadroomSource {
 /// Rate-limit state for one provider account, as the harness reported it.
 ///
 /// Drives the `headroom` selection strategy in DESIGN.md §5.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: `used_fraction` is a float, and float equality is not an
+/// equivalence relation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RateWindow {
     pub source: HeadroomSource,
     /// Harness's own name for the window, e.g. `"five_hour"`. Opaque to Horde.
@@ -189,11 +211,55 @@ pub struct RateWindow {
     pub allowed: bool,
     /// Unix seconds at which the window resets; `None` when unreported.
     pub resets_at_unix: Option<i64>,
+    /// Consumption so far, when the provider reports counts. Claude does.
+    ///
+    /// `None` is "not reported", which is emphatically not zero — reading an
+    /// unreported window as an empty one tells the scheduler it has full
+    /// headroom on an account that may be exhausted.
+    pub used: Option<u64>,
+    /// Ceiling for the window, when the provider publishes one. `None` means
+    /// no published ceiling, distinct from a ceiling of zero.
+    pub limit: Option<u64>,
+    /// Fraction of the window consumed, `0.0..=1.0`, for providers that report
+    /// a percentage instead of counts. Codex does (spike W2c).
+    ///
+    /// Both shapes exist because normalising either way is lossy: a fraction
+    /// cannot be turned into counts without a ceiling the provider never sent,
+    /// and counts cannot be turned into a fraction without discarding the
+    /// ceiling it did send.
+    pub used_fraction: Option<f64>,
+    /// Length of the window, when reported. Codex sends 10080 minutes.
+    pub window_length: Option<Duration>,
+}
+
+impl RateWindow {
+    /// How much of the window remains, `0.0..=1.0`, from whichever shape the
+    /// provider reported — the number the `headroom` selection strategy sorts
+    /// on (DESIGN.md §5).
+    ///
+    /// `None` when the provider reported neither shape, so callers must decide
+    /// what an unmeasured account is worth rather than being handed a
+    /// misleading `1.0`.
+    #[must_use]
+    pub fn headroom_fraction(&self) -> Option<f64> {
+        if let Some(fraction) = self.used_fraction {
+            return Some((1.0 - fraction).clamp(0.0, 1.0));
+        }
+        match (self.used, self.limit) {
+            // A zero ceiling has no room by definition; dividing would be NaN.
+            (Some(_), Some(0)) => Some(0.0),
+            (Some(used), Some(limit)) => {
+                let remaining = limit.saturating_sub(used);
+                Some((remaining as f64 / limit as f64).clamp(0.0, 1.0))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenUsage, UsageAccumulator};
+    use super::{HeadroomSource, RateWindow, TokenUsage, UsageAccumulator};
 
     fn usage(input: u64, output: u64) -> TokenUsage {
         TokenUsage {
@@ -272,7 +338,98 @@ mod tests {
             output_tokens: 2,
             cache_read_input_tokens: 4,
             cache_write_input_tokens: 8,
+            reasoning_output_tokens: 0,
         };
         assert_eq!(usage.total(), 15);
+    }
+
+    #[test]
+    fn total_never_double_counts_reasoning_folded_into_output() {
+        // Codex reports 64 reasoning tokens that are already inside its 200
+        // output tokens (spike W2c). A total that added the breakdown would
+        // bill 264 output tokens for 200 tokens of work.
+        let folded = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 64,
+        };
+        let without_breakdown = TokenUsage {
+            reasoning_output_tokens: 0,
+            ..folded
+        };
+
+        assert_eq!(folded.total(), 300);
+        assert_eq!(
+            folded.total(),
+            without_breakdown.total(),
+            "reporting the reasoning breakdown must not change what is billed"
+        );
+    }
+
+    #[test]
+    fn reasoning_breakdown_still_deltas_across_turns() {
+        // It is excluded from total(), not ignored: a Worker attributing
+        // reasoning per turn needs the difference, not the running total.
+        let mut acc = UsageAccumulator::new();
+        let cumulative = |reasoning| TokenUsage {
+            output_tokens: reasoning,
+            reasoning_output_tokens: reasoning,
+            ..TokenUsage::default()
+        };
+
+        assert_eq!(
+            acc.observe(cumulative(64), 0.0)
+                .tokens
+                .reasoning_output_tokens,
+            64
+        );
+        assert_eq!(
+            acc.observe(cumulative(100), 0.0)
+                .tokens
+                .reasoning_output_tokens,
+            36
+        );
+    }
+
+    #[test]
+    fn headroom_comes_from_whichever_shape_the_provider_reported() {
+        let base = RateWindow {
+            source: HeadroomSource::ProviderReported,
+            window: "weekly".to_owned(),
+            allowed: true,
+            resets_at_unix: None,
+            used: None,
+            limit: None,
+            used_fraction: None,
+            window_length: None,
+        };
+
+        // Codex-shaped: a fraction and nothing else.
+        let codex = RateWindow {
+            used_fraction: Some(0.25),
+            ..base.clone()
+        };
+        assert_eq!(codex.headroom_fraction(), Some(0.75));
+
+        // Counts-shaped.
+        let counts = RateWindow {
+            used: Some(2_500),
+            limit: Some(10_000),
+            ..base.clone()
+        };
+        assert_eq!(counts.headroom_fraction(), Some(0.75));
+
+        // A zero ceiling has no room, and must not divide by zero.
+        let zero_ceiling = RateWindow {
+            used: Some(0),
+            limit: Some(0),
+            ..base.clone()
+        };
+        assert_eq!(zero_ceiling.headroom_fraction(), Some(0.0));
+
+        // Unreported is None, not full headroom — the whole point of Option.
+        assert_eq!(base.headroom_fraction(), None);
     }
 }
