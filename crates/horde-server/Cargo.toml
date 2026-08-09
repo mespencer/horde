@@ -16,13 +16,15 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1.19"
-tonic = "0.14.6"
+tonic = { version = "0.14.6", features = ["server", "channel"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [dev-dependencies]
+hyper-util = { version = "0.1", features = ["tokio"] }
 proptest = "1.9.0"
 tempfile = "3.24.0"
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "horde-server"
