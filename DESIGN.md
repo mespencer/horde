@@ -4,6 +4,8 @@ A multi-provider agent orchestrator. One control plane through which *all* agent
 
 Status: design settled 2026-08-09 after initial brainstorm + grill session. No code yet.
 
+**This document defines the end state.** Nothing in it is a "v1 feature" versus a "someday feature" — the shape of every mechanism is designed in from the start, and only *activation* is sequenced (§14). When a section says "bootstrap phase," that is a stepping stone inside the designed shape, not a scope cut to be revisited.
+
 ---
 
 ## 1. Goals and constraints
@@ -43,9 +45,9 @@ The server is remote-code-execution-as-a-service by design; the trust boundary i
 - **mTLS for every principal** (workers *and* clients), certs issued by the server's internal CA.
 - **Enrollment:** `horde worker enroll` on a trusted client prints a short-lived one-time code embedding the server cert fingerprint. On the new machine, `horde-worker join <server> --code <code>` verifies the server against the fingerprint, generates a keypair locally, submits a CSR, and the server signs it. Private keys never travel. Clients enroll identically.
 - **Revocation:** per-cert denylist by serial (`horde worker revoke <name>`).
-- No non-localhost binding before auth exists — auth is v1, not a follow-up.
+- No non-localhost binding before auth exists — auth ships with the first networked build, not as a follow-up.
 
-### Worker bootstrap over ssh (nice-to-have, post-v1 core)
+### Worker bootstrap over ssh (sequenced later)
 
 `horde worker up --ssh myles@host` composes existing primitives — it is client-side orchestration, not new protocol:
 
@@ -61,7 +63,7 @@ A per-provider **adapter** trait: `spawn / send / stream / interrupt / resume`, 
 
 - **Claude (first-class):** the worker drives `claude --input-format stream-json --output-format stream-json` directly as a child process — no Node sidecar. Session revival via `--resume`. Permission decisions route through `--permission-prompt-tool` pointed at the horde MCP endpoint. If stream-json proves too lossy, fallback is a thin Agent SDK shim per agent (contained, not preferred). See ADR-0003. **This is the de-risking spike to run first.**
 - **Other harnesses:** ACP where supported (Codex, etc.), each behind the same trait.
-- **Raw/self-hosted models (Ollama etc.): deferred post-v1.** A bare endpoint brings no tool loop; v1 supports harness-backed providers only. The adapter trait is the seam where a built-in or OSS mini-harness slots in later.
+- **Raw/self-hosted models (Ollama etc.):** part of the end state, sequenced late. A bare endpoint brings no tool loop, so raw endpoints require a harness Horde supplies (built-in minimal loop vs. wrapped OSS harness is an open question); the adapter trait is the seam either slots into. Until then, harness-backed providers only.
 
 ### Provider accounts
 
@@ -108,7 +110,7 @@ Agents request a **tier**, not a brand. Tiers are user-defined config keys (ship
 3. **Session defaults** — set at `horde new` ("everything in this session runs on codex")
 4. **Workspace / user-global tier mappings**
 
-Unspecified = inherit the spawner's tier. Within a tier, the scheduler picks the concrete option with the most **headroom**: adapter-reported rate-limit state where the provider exposes it (Claude Code does), otherwise Horde's own metering against a per-account declared quota model (window length + budget) — every token flows through Horde, so it is never blind. The binding is made once, at spawn, and held for the agent's life (revival resumes the same provider session); rebalancing happens across new spawns, never by migrating live agents. Rationale: letting spawners name concrete models invites provider self-bias and couples prompts to today's model names; tiers keep agent definitions portable while explicit override + session pinning preserve full control.
+Unspecified = inherit the spawner's tier. Within a tier, a per-tier **selection strategy** picks the concrete option: `headroom` (default — most quota headroom), `ordered` (first listed candidate with headroom above a floor), or `weighted` (preference weights combined with headroom). Headroom itself is adapter-reported rate-limit state where the provider exposes it (Claude Code does), otherwise Horde's own metering against a per-account declared quota model (window length + budget) — every token flows through Horde, so it is never blind. The binding is made once, at spawn, and held for the agent's life (revival resumes the same provider session); rebalancing happens across new spawns, never by migrating live agents. Rationale: letting spawners name concrete models invites provider self-bias and couples prompts to today's model names; tiers keep agent definitions portable while explicit override + session pinning preserve full control.
 
 ### Agent-facing surface: one MCP endpoint
 
@@ -143,10 +145,10 @@ Split: **definition** (portable) vs **instance** (per-worker materialization). S
 
 Committed to git deliberately (ADR-0002). The unit of sharing is the commit; syncing dirty working trees across workers is permanently out of scope ("commit, then share" — the tool errors helpfully on uncommitted changes).
 
-**Server git relay (v1):** bare mirrors per registered repo (lazy — mirrored on first fetch), served over git smart-HTTP (`git http-backend`) behind the existing mTLS channel.
+**Server git relay:** bare mirrors per registered repo (lazy — mirrored on first fetch), served over git smart-HTTP (`git http-backend`) behind the existing mTLS channel.
 
 - Transport resolution per sharing pair, invisible to agents: same clone/worktrees → ref checkout only; same worker → fetch from peer path; cross-worker → push/fetch through the relay.
-- Relay doubles as clone cache and **credential chokepoint**. End state: only the server holds external git credentials; workers' only remote is the relay. V1 bootstrap: workers use ambient machine credentials (ssh-agent, `gh auth`) and advertise reachable remotes as capabilities.
+- Relay doubles as clone cache and **credential chokepoint**. End state: only the server holds external git credentials; workers' only remote is the relay. Bootstrap phase: workers use ambient machine credentials (ssh-agent, `gh auth`) and advertise reachable remotes as capabilities.
 - Git bundles were considered and dropped entirely (ADR-0002).
 
 **Blob store (server):** content-addressed, for non-code payload attachments (screenshots, binaries, logs, checkpoints). Worker uploads on send, receiver downloads lazily. Lifetime tied to session; GC'd at session deletion; server-configurable size cap.
@@ -166,7 +168,7 @@ Layered, evaluated in order:
 
 Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), and layered under manual-approve / allowlist styles. Escalation requests carry tree path + context ("session ci-fix → reviewer → test-runner wants `docker rm`").
 
-**Sandboxing:** v1 relies on the harnesses' own sandboxes (CC/Codex: Seatbelt on macOS, Landlock/seccomp or bubblewrap-style on Linux). Orchestrator-level per-process sandbox profiles (writes confined to workspace, network allowlist), applied by the worker around the whole agent process, are a designed seam for later — that's what protects agents from *each other* on a shared worker.
+**Sandboxing:** the end state is orchestrator-level per-process sandbox profiles (writes confined to workspace, network allowlist), applied by the worker around the whole agent process — that's what protects agents from *each other* on a shared worker. Always optional per spawn/policy, never required. Bootstrap phase: rely on the harnesses' own sandboxes (CC/Codex: Seatbelt on macOS, Landlock/seccomp or bubblewrap-style on Linux).
 
 ## 11. Clients (CLI and TUI)
 
@@ -182,7 +184,8 @@ Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), an
 ## 12. Usage and observability
 
 - Usage events per agent (tokens, rate-window state where providers expose it), aggregated by tree path and by provider account.
-- **V1 is report + soft alerts:** TUI surfaces per-agent/per-tree usage; threshold alerts fire as events (phone-visible later). No enforcement machinery; the accounting schema is the seam hard budgets plug into later.
+- **Reporting + soft alerts:** clients surface per-agent/per-tree usage; threshold alerts fire as ordinary events (phone-visible). This lands first.
+- **Hard budgets (end state, sequenced later):** a spawn may carry a budget; at the cap the subtree pauses pending human approval (an ordinary permission-style event). The accounting schema is designed for this from day one.
 - **OTLP tracing:** the agent tree maps onto the span tree (agents = spans, tool calls = events). Flame-graph views of an orchestration for free.
 
 ## 13. Configuration layering
@@ -197,7 +200,9 @@ Precedence: **spawn args > repo > workspace > user-global.**
 
 Multi-repo workspaces: each repo's `.horde/` contributes namespaced definitions; cross-repo name collisions are surfaced warnings, pinnable at the workspace layer. Top-level agents and subagents get different prompt overlays (a stated requirement) — user-global config, applied by the worker at spawn.
 
-## 14. V1 scope and build order
+## 14. Build sequencing
+
+Ordering of activation, not scope. Everything in this document is end state; this is the order it comes alive in. The quality gauntlet (§16 / docs/TESTING.md) lands alongside the first crate, not after.
 
 1. Proto contracts + event log (server + storage)
 2. **Claude adapter via stream-json — the de-risking spike** (full turn + permission prompt through `--permission-prompt-tool`)
@@ -208,7 +213,7 @@ Multi-repo workspaces: each repo's `.horde/` contributes namespaced definitions;
 7. Enrollment/mTLS, remote workers, scheduler with capabilities
 8. MCP hub; blob store; usage reporting; OTLP
 
-Deferred: raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobile clients, multi-user server, credential-less workers (relay-only git), Ollama, ssh worker bootstrap + harness install recipes.
+Sequenced later (still end state): raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobile clients, multi-user server, credential-less workers (relay-only git), ssh worker bootstrap + harness install recipes.
 
 ## 15. Open questions
 
@@ -216,3 +221,8 @@ Deferred: raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobil
 - MCP hub multiplexing details for stateful upstreams.
 - Multi-user / shared-server model (explicitly deferred).
 - Whether workspace repo-set additions need more ceremony than the permission-event.
+- Raw-endpoint harness mechanism: built-in minimal loop vs. wrapped OSS harness (§4).
+
+## 16. Development quality
+
+Horde's own development runs under a full test and metrics suite — the point is that agent-written code is trusted through the gates it passes, not by line-by-line reading. The complete specification lives in **[docs/TESTING.md](./docs/TESTING.md)**: test pyramid (unit, integration, multi-process e2e, property, mutation, Gherkin behavioral, TUI snapshot, proto contract), the FakeAdapter harness, the gauntlet-style gate runner, metrics (coverage, CRAP, duplication, mutants, unused deps, module structure), and the observe → ratchet → hard-gate rollout ladder. It lands with the first crate.
