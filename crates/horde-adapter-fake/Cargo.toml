@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
-description = "placeholder"
+description = "A scripted provider harness: a real alternate adapter backend for orchestration tests."
 
 [lints]
 workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+horde-adapter = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+horde-testkit = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

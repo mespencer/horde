@@ -53,6 +53,15 @@ pub enum AdapterError {
     #[error("no permission request is outstanding for tool call {tool_call_id}")]
     UnknownPermissionRequest { tool_call_id: ToolCallId },
 
+    /// The session cannot advance until an outstanding decision is answered.
+    ///
+    /// Only sessions that can detect the deadlock report it. A harness driven
+    /// over a pipe simply blocks, which is correct but useless to a test; an
+    /// in-process session can see that its caller asked for the next event
+    /// while owing it an answer, and saying so beats hanging.
+    #[error("the session is waiting for a decision on tool call {tool_call_id}")]
+    AwaitingDecision { tool_call_id: ToolCallId },
+
     /// Talking to the harness failed at the transport level.
     #[error("i/o error talking to the harness: {0}")]
     Io(#[from] std::io::Error),
@@ -71,7 +80,8 @@ impl AdapterError {
             Self::Spawn { .. }
             | Self::Unauthenticated { .. }
             | Self::Unsupported { .. }
-            | Self::UnknownPermissionRequest { .. } => false,
+            | Self::UnknownPermissionRequest { .. }
+            | Self::AwaitingDecision { .. } => false,
         }
     }
 }

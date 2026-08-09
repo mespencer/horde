@@ -17,7 +17,7 @@
 
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, Capability, OutputChannel,
-    ProviderSessionId, TurnInput, TurnOutcome,
+    PermissionDecision, ProposedToolCall, ProviderSessionId, TurnInput, TurnOutcome,
 };
 
 /// A conformance violation, or the adapter error that prevented checking.
@@ -70,14 +70,41 @@ impl TurnRecord {
     }
 }
 
+/// How the suite answers permission requests while driving a session.
+///
+/// A turn that asks for permission does not advance until it is answered, so
+/// anything driving a session has to bring a policy. Tests supply one that
+/// exercises the case they care about — denying, narrowing, or stalling.
+pub type Policy<'a> = &'a (dyn Fn(&ProposedToolCall) -> PermissionDecision + Sync);
+
+/// A policy that permits every call unchanged.
+///
+/// The right default for tests about orchestration rather than about
+/// permissions: it keeps turns moving without silently making a permission
+/// decision look like it was considered.
+#[must_use]
+pub fn allow_all() -> PermissionDecision {
+    PermissionDecision::allow()
+}
+
+/// Sends one message and drains events until the turn ends, permitting every
+/// tool call. See [`run_turn_with`] to supply a policy.
+pub async fn run_turn(
+    session: &mut dyn AgentSession,
+    input: TurnInput,
+) -> Result<TurnRecord, ConformanceFailure> {
+    run_turn_with(session, input, &|_| allow_all()).await
+}
+
 /// Sends one message and drains events until the turn ends.
 ///
 /// Enforces the invariant that a turn is closed by exactly one
 /// [`AgentEvent::TurnEnded`]: a stream that ends without one, or that keeps
 /// going after one, fails here rather than somewhere downstream.
-pub async fn run_turn(
+pub async fn run_turn_with(
     session: &mut dyn AgentSession,
     input: TurnInput,
+    policy: Policy<'_>,
 ) -> Result<TurnRecord, ConformanceFailure> {
     let sent = input.text.clone();
     session
@@ -101,6 +128,17 @@ pub async fn run_turn(
             )));
         };
 
+        if let AgentEvent::PermissionRequested { request, .. } = &event {
+            let decision = policy(request);
+            let tool_call_id = request.tool_call_id.clone();
+            session
+                .answer_permission(&tool_call_id, decision)
+                .await
+                .map_err(ConformanceFailure::during(format!(
+                    "answering the permission request for {tool_call_id}"
+                )))?;
+        }
+
         let ended = matches!(event, AgentEvent::TurnEnded(_));
         events.push(event);
 
@@ -123,9 +161,18 @@ pub async fn check_session(
     session: &mut dyn AgentSession,
     messages: &[&str],
 ) -> Result<Vec<TurnRecord>, ConformanceFailure> {
+    check_session_with(session, messages, &|_| allow_all()).await
+}
+
+/// Drives a session through `messages` under an explicit permission policy.
+pub async fn check_session_with(
+    session: &mut dyn AgentSession,
+    messages: &[&str],
+    policy: Policy<'_>,
+) -> Result<Vec<TurnRecord>, ConformanceFailure> {
     let mut records = Vec::new();
     for message in messages {
-        records.push(run_turn(session, TurnInput::queued(*message)).await?);
+        records.push(run_turn_with(session, TurnInput::queued(*message), policy).await?);
     }
 
     check_session_announced_before_output(&records)?;

@@ -261,6 +261,13 @@ dependencies = [
 [[package]]
 name = "horde-adapter-fake"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "horde-adapter",
+ "horde-testkit",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "horde-proto"

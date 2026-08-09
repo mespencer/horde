@@ -15,5 +15,8 @@
 pub mod conformance;
 pub mod transcripts;
 
-pub use conformance::{ConformanceFailure, TurnRecord, check_session, run_turn};
+pub use conformance::{
+    ConformanceFailure, Policy, TurnRecord, check_capability_honesty, check_session,
+    check_session_with, run_turn, run_turn_with,
+};
 pub use transcripts::{Transcript, TranscriptError};

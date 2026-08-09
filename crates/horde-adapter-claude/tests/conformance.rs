@@ -12,20 +12,24 @@ use horde_adapter_claude::wire::Event;
 use horde_testkit::conformance::{TurnRecord, check_session};
 use horde_testkit::transcripts::{Transcript, all_transcript_names};
 
-fn load(name: &str) -> Transcript {
-    Transcript::load(name).unwrap_or_else(|error| panic!("transcript {name}: {error}"))
+/// Loads a transcript, reporting the file name alongside any failure.
+///
+/// Returns rather than panics: these helpers are not `#[test]` functions, so
+/// they are held to the production lint policy that bans `panic!`. Call sites
+/// inside tests turn the error into a failure.
+fn load(name: &str) -> Result<Transcript, String> {
+    Transcript::load(name).map_err(|error| format!("transcript {name}: {error}"))
 }
 
 /// Replays a whole transcript and returns one record per recorded turn.
-async fn replay(name: &str) -> Vec<TurnRecord> {
-    let transcript = load(name);
-    let turns = transcript.turns();
+async fn replay(name: &str) -> Result<Vec<TurnRecord>, String> {
+    let turns = load(name)?.turns();
     let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
     let mut session = ReplaySession::new(turns);
 
     check_session(&mut session, &messages)
         .await
-        .unwrap_or_else(|error| panic!("transcript {name} violated the adapter contract: {error}"))
+        .map_err(|error| format!("transcript {name} violated the adapter contract: {error}"))
 }
 
 #[test]
@@ -37,7 +41,7 @@ fn every_recorded_line_decodes() {
     );
 
     for name in &names {
-        let transcript = load(name);
+        let transcript = load(name).expect("fixture must load");
         for (index, line) in transcript.outbound.iter().enumerate() {
             if let Err(error) = decode_line(line) {
                 panic!("{name} line {}: {error}", index + 1);
@@ -55,7 +59,7 @@ fn no_unmodelled_event_types_remain_in_the_captures() {
     let mut unknown = Vec::new();
 
     for name in &names {
-        for line in &load(name).outbound {
+        for line in &load(name).expect("fixture must load").outbound {
             if let Ok(envelope) = decode_line(line)
                 && let Event::Unknown { event_type } = &envelope.event
                 && !unknown.contains(event_type)
@@ -74,7 +78,7 @@ fn no_unmodelled_event_types_remain_in_the_captures() {
 #[tokio::test]
 async fn every_transcript_satisfies_the_adapter_contract() {
     for name in all_transcript_names().expect("listable") {
-        let records = replay(&name).await;
+        let records = replay(&name).await.expect("must conform");
         assert!(
             !records.is_empty(),
             "{name} produced no turns; a transcript with no result envelope is not a session"
@@ -84,7 +88,9 @@ async fn every_transcript_satisfies_the_adapter_contract() {
 
 #[tokio::test]
 async fn multi_turn_keeps_context_and_one_session_across_turns() {
-    let records = replay("02-multi-turn.jsonl").await;
+    let records = replay("02-multi-turn.jsonl")
+        .await
+        .expect("transcript must conform");
     assert_eq!(records.len(), 3);
 
     let answers: Vec<String> = records
@@ -106,7 +112,9 @@ async fn multi_turn_keeps_context_and_one_session_across_turns() {
 /// adapter must hand back per-turn deltas.
 #[tokio::test]
 async fn usage_is_reported_as_per_turn_deltas() {
-    let records = replay("02-multi-turn.jsonl").await;
+    let records = replay("02-multi-turn.jsonl")
+        .await
+        .expect("transcript must conform");
 
     let outputs: Vec<u64> = records
         .iter()
@@ -130,7 +138,9 @@ async fn usage_is_reported_as_per_turn_deltas() {
 
 #[tokio::test]
 async fn a_denied_tool_call_is_surfaced_and_the_turn_is_not_a_clean_success() {
-    let records = replay("04a-perm-deny.jsonl").await;
+    let records = replay("04a-perm-deny.jsonl")
+        .await
+        .expect("transcript must conform");
     let outcome = &records[0].outcome;
 
     assert_eq!(outcome.denials.len(), 1, "the Write was refused");
@@ -148,14 +158,18 @@ async fn a_denied_tool_call_is_surfaced_and_the_turn_is_not_a_clean_success() {
 
 #[tokio::test]
 async fn an_allowed_tool_call_leaves_no_denials() {
-    let records = replay("04b-perm-allow.jsonl").await;
+    let records = replay("04b-perm-allow.jsonl")
+        .await
+        .expect("transcript must conform");
     assert!(records[0].outcome.denials.is_empty());
     assert!(records[0].outcome.is_clean_success());
 }
 
 #[tokio::test]
 async fn an_interrupted_turn_is_classified_as_interrupted_and_the_session_survives() {
-    let records = replay("07a-interrupt-control.jsonl").await;
+    let records = replay("07a-interrupt-control.jsonl")
+        .await
+        .expect("transcript must conform");
 
     let interrupted = records
         .iter()
@@ -173,7 +187,9 @@ async fn an_interrupted_turn_is_classified_as_interrupted_and_the_session_surviv
 /// this ever reads as `Interrupted`, the classifier has started guessing.
 #[tokio::test]
 async fn closing_stdin_did_not_abort_the_recorded_turn() {
-    let records = replay("07c-interrupt-stdinclose.jsonl").await;
+    let records = replay("07c-interrupt-stdinclose.jsonl")
+        .await
+        .expect("transcript must conform");
     assert!(
         records
             .iter()
@@ -184,7 +200,9 @@ async fn closing_stdin_did_not_abort_the_recorded_turn() {
 
 #[tokio::test]
 async fn an_unauthenticated_session_is_a_failure_despite_claiming_success() {
-    let records = replay("09-config-isolation.jsonl").await;
+    let records = replay("09-config-isolation.jsonl")
+        .await
+        .expect("transcript must conform");
 
     match &records[0].outcome.status {
         TurnStatus::Failed { message } => assert!(
@@ -199,7 +217,9 @@ async fn an_unauthenticated_session_is_a_failure_despite_claiming_success() {
 
 #[tokio::test]
 async fn a_tool_using_turn_reports_the_call_and_its_completion() {
-    let records = replay("03-tool-use.jsonl").await;
+    let records = replay("03-tool-use.jsonl")
+        .await
+        .expect("transcript must conform");
     let events = &records[0].events;
 
     let call = events.iter().find_map(|event| match event {
@@ -229,7 +249,9 @@ async fn a_tool_using_turn_reports_the_call_and_its_completion() {
 
 #[tokio::test]
 async fn the_bound_model_is_reported_from_the_harness_not_from_the_request() {
-    let records = replay("08b-model-sonnet.jsonl").await;
+    let records = replay("08b-model-sonnet.jsonl")
+        .await
+        .expect("transcript must conform");
 
     let model = records[0].events.iter().find_map(|event| match event {
         AgentEvent::SessionEstablished { model, .. } => Some(model.clone()),
@@ -240,7 +262,9 @@ async fn the_bound_model_is_reported_from_the_harness_not_from_the_request() {
 
 #[tokio::test]
 async fn headroom_is_reported_when_the_harness_volunteers_it() {
-    let records = replay("02-multi-turn.jsonl").await;
+    let records = replay("02-multi-turn.jsonl")
+        .await
+        .expect("transcript must conform");
 
     let reported = records.iter().flat_map(|record| &record.events).any(|event| {
         matches!(event, AgentEvent::HeadroomReported { window } if window.window == "five_hour")
@@ -254,7 +278,7 @@ async fn headroom_is_reported_when_the_harness_volunteers_it() {
 /// Draining past the recorded turns must not invent events.
 #[tokio::test]
 async fn a_replayed_session_ends_cleanly() {
-    let transcript = load("01-basic-turn.out.jsonl");
+    let transcript = load("01-basic-turn.out.jsonl").expect("fixture must load");
     let mut session = ReplaySession::new(transcript.turns());
 
     session
