@@ -222,6 +222,7 @@ Sequenced later (still end state): raw-model harness, hard budgets, orchestrator
 - Multi-user / shared-server model (explicitly deferred).
 - Whether workspace repo-set additions need more ceremony than the permission-event.
 - Raw-endpoint harness mechanism: built-in minimal loop vs. wrapped OSS harness (§4).
+- Budget unit for hard budgets (§12): raw tokens aren't comparable across models — per-tier budgets or a normalized cost unit, decide before activation.
 
 ## 16. Development quality
 
