@@ -406,6 +406,36 @@ mod tests {
     }
 
     #[test]
+    fn real_lint_violations_reach_the_verdict_through_the_gate() {
+        let (_dir, ctx) = with_protos();
+        let runner = ScriptedRunner::new(vec![
+            exited(0, "buf 1.69.0"),
+            exited(100, LINT_VIOLATIONS),
+            exited(0, "abc123\n"),
+            exited(0, ""),
+        ]);
+        let GateOutcome::Fail { detail } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("buf's violation exit code carries findings, not a failure to run");
+        };
+        assert!(detail.starts_with("2 lint violation(s)"), "{detail}");
+    }
+
+    #[test]
+    fn real_breaking_changes_reach_the_verdict_through_the_gate() {
+        let (_dir, ctx) = with_protos();
+        let runner = ScriptedRunner::new(vec![
+            exited(0, "buf 1.69.0"),
+            exited(0, ""),
+            exited(0, "abc123\n"),
+            exited(100, BREAKING_VIOLATIONS),
+        ]);
+        let GateOutcome::Fail { detail } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("a broken contract is a verdict about the schema");
+        };
+        assert!(detail.contains("2 breaking change(s)"), "{detail}");
+    }
+
+    #[test]
     fn a_buf_failure_that_is_not_a_violation_is_an_instrument_error() {
         let (_dir, ctx) = with_protos();
         let runner = ScriptedRunner::new(vec![

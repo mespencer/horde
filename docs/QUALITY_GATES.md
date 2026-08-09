@@ -235,6 +235,19 @@ still does.
 
 **Local.** `gauntlet run machete`, or `cargo machete --with-metadata`.
 
+**Build scripts are a blind spot.** cargo-machete scans `src/` and does not read
+`build.rs`, so a `[build-dependencies]` entry used only by the build script reads as
+unused. This is the same shape as the `crap` gate's `build.rs` exclusion — the
+instrument cannot see the file — but the escape hatch lives in the crate's own manifest
+rather than in the gate, which is better: the annotation sits next to the dependency it
+excuses and is reviewed with it.
+
+```toml
+[package.metadata.cargo-machete]
+# Used by build.rs, which machete does not scan.
+ignored = ["prost-build"]
+```
+
 **How to read.** A `fail` names each package and dependency. Genuine false positives (a
 crate used only through a macro, say) go in `[package.metadata.cargo-machete] ignored`
 in the crate's own manifest, where the exemption is visible in review — not in the gate.
