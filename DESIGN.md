@@ -168,6 +168,8 @@ Layered, evaluated in order:
 
 Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), and layered under manual-approve / allowlist styles. Escalation requests carry tree path + context ("session ci-fix → reviewer → test-runner wants `docker rm`").
 
+**Per-provider gating capability varies.** Adapters advertise whether tool calls can be pre-authorized externally: Claude can (permission interception incl. input rewrite, ADR-0003); Codex cannot in current releases — its sandbox tier + project-trust chosen at thread start are the real controls (ADR-0005). Permission modes and placement must consult this flag: a high-trust assignment can refuse placement on an agent whose provider can't be gated.
+
 **Sandboxing:** the end state is orchestrator-level per-process sandbox profiles (writes confined to workspace, network allowlist), applied by the worker around the whole agent process — that's what protects agents from *each other* on a shared worker. Always optional per spawn/policy, never required. Bootstrap phase: rely on the harnesses' own sandboxes (CC/Codex: Seatbelt on macOS, Landlock/seccomp or bubblewrap-style on Linux).
 
 ## 11. Clients (CLI and TUI)
