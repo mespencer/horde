@@ -76,11 +76,27 @@ fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
     };
     let spec = spec(ctx, &scope);
     read_output(runner, &spec, |output| {
-        match parse_summary(&output.combined()) {
+        let text = output.combined();
+        if let Some(reason) = nothing_to_mutate(&text, &scope) {
+            return GateOutcome::skipped(reason);
+        }
+        match parse_summary(&text) {
             None => unexpected_exit(&spec, output),
             Some(counts) => outcome_of(&scope, counts),
         }
     })
+}
+
+/// Why there was nothing to mutate, if there was nothing.
+///
+/// A change that touches no Rust — documentation, a proto file, a config —
+/// generates no mutants and cargo-mutants prints no tally. That is `skipped`,
+/// not `error`: nothing was measured because there was nothing to measure,
+/// which is a different fact from an instrument that broke, and the row has to
+/// say which.
+pub fn nothing_to_mutate(text: &str, scope: &Scope) -> Option<String> {
+    text.contains("changes no Rust source files")
+        .then(|| format!("no Rust changed in {}", scope.label()))
 }
 
 /// Confirms the configured exclusions are real and took effect.
@@ -861,6 +877,41 @@ mod tests {
     }
 
     #[test]
+    fn a_change_touching_no_rust_is_skipped_rather_than_erroring() {
+        // cargo-mutants exits 0 and prints no tally, which is indistinguishable
+        // from a crash unless the gate reads the reason.
+        assert_eq!(
+            nothing_to_mutate(
+                " INFO Diff changes no Rust source files\n",
+                &Scope::FullTree
+            ),
+            Some("no Rust changed in the whole tree".to_owned())
+        );
+        assert_eq!(
+            nothing_to_mutate("858 mutants tested: 0 missed", &Scope::FullTree),
+            None
+        );
+    }
+
+    #[test]
+    fn a_docs_only_change_reports_skipped_through_the_whole_gate() {
+        let run = run_after_with(
+            vec![
+                exited(0, "branchpoint\n"),
+                exited(0, "tip\n"),
+                exited(0, "diff --git a/README.md b/README.md\n"),
+            ],
+            failed(0, " INFO Diff changes no Rust source files\n"),
+        );
+        assert_eq!(run.outcome.label(), "skipped", "{:?}", run.outcome);
+        assert!(
+            run.outcome.detail().contains("no Rust changed"),
+            "{}",
+            run.outcome.detail()
+        );
+    }
+
+    #[test]
     fn a_run_with_nothing_to_mutate_is_skipped_not_passed() {
         let counts = MutantCounts {
             missed: 0,
@@ -898,11 +949,16 @@ mod tests {
     /// Runs the gate against a throwaway root, scripting the git probes and
     /// then a clean cargo-mutants run.
     fn run_after(git: Vec<CommandOutput>) -> Run {
+        run_after_with(git, exited(0, CLEAN))
+    }
+
+    /// As [`run_after`], with the cargo-mutants result chosen by the caller.
+    fn run_after_with(git: Vec<CommandOutput>, result: CommandOutput) -> Run {
         let dir = tempfile::tempdir().expect("temp dir");
         let ctx = ctx_at(dir.path());
         let mut script = vec![version()];
         script.extend(git);
-        script.push(exited(0, CLEAN));
+        script.push(result);
         let runner = ScriptedRunner::new(script);
         let outcome = run_gate(&gate(), &ctx, &runner);
         Run {
