@@ -527,41 +527,38 @@ mod tests {
 
     #[test]
     fn a_first_chunk_that_does_not_start_at_zero_is_rejected() {
-        let turn_id = TurnId::new("t1");
-        let records = vec![TurnRecord {
-            events: vec![output(&turn_id, OutputChannel::Assistant, 1)],
-            outcome: outcome(&turn_id),
-        }];
+        rejects(
+            check_chunk_indices(&turn_with_chunk_indices(&[1])),
+            "expected 0",
+        );
+    }
 
-        rejects(check_chunk_indices(&records), "expected 0");
+    /// One turn whose assistant chunks carry the given indices.
+    fn turn_with_chunk_indices(indices: &[u64]) -> Vec<TurnRecord> {
+        let turn_id = TurnId::new("t1");
+        vec![TurnRecord {
+            events: indices
+                .iter()
+                .map(|index| output(&turn_id, OutputChannel::Assistant, *index))
+                .collect(),
+            outcome: outcome(&turn_id),
+        }]
     }
 
     #[test]
     fn a_gap_in_chunk_indices_is_rejected() {
-        let turn_id = TurnId::new("t1");
-        let records = vec![TurnRecord {
-            events: vec![
-                output(&turn_id, OutputChannel::Assistant, 0),
-                output(&turn_id, OutputChannel::Assistant, 2),
-            ],
-            outcome: outcome(&turn_id),
-        }];
-
-        rejects(check_chunk_indices(&records), "jumped to 2");
+        rejects(
+            check_chunk_indices(&turn_with_chunk_indices(&[0, 2])),
+            "jumped to 2",
+        );
     }
 
     #[test]
     fn a_repeated_chunk_index_is_rejected() {
-        let turn_id = TurnId::new("t1");
-        let records = vec![TurnRecord {
-            events: vec![
-                output(&turn_id, OutputChannel::Assistant, 0),
-                output(&turn_id, OutputChannel::Assistant, 0),
-            ],
-            outcome: outcome(&turn_id),
-        }];
-
-        rejects(check_chunk_indices(&records), "jumped to 0");
+        rejects(
+            check_chunk_indices(&turn_with_chunk_indices(&[0, 0])),
+            "jumped to 0",
+        );
     }
 
     /// Channels are numbered independently, so a second channel starting at

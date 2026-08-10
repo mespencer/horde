@@ -6,101 +6,40 @@
 //! a call *returned* something, never that the something was true.
 
 use horde_proto::v1::{
-    AddWorkspaceRepoRequest, AgentId, AgentSpec, ArchiveSessionRequest, Assignment,
-    CreateSessionRequest, CreateWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionRequest,
+    AddWorkspaceRepoRequest, AgentId, ArchiveSessionRequest, Assignment,
+    CreateWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionRequest,
     GetWorkspaceDefinitionRequest, HelloRequest, ListSessionsRequest, ListWorkersRequest,
     ListWorkspaceDefinitionsRequest, MintEnrollmentCodeRequest, PrewarmWorkspaceRequest,
     QueryUsageRequest, RegisterWorkerRequest, ReportCapabilitiesRequest,
     ReportWorkspaceInstancesRequest, RevokeEnrollmentRequest, SendMessageRequest, SessionCursor,
     SessionId, SyncEventsRequest, UpdateWorkspaceDefinitionRequest, WorkerCapabilities, WorkerId,
-    control_plane_service_client::ControlPlaneServiceClient,
-    control_plane_service_server::ControlPlaneServiceServer, send_message_request,
-    sync_events_response, worker_service_client::WorkerServiceClient,
-    worker_service_server::WorkerServiceServer,
+    send_message_request, sync_events_response,
 };
-use horde_server::EventLog;
-use horde_server::service::{ControlPlane, ServerCore, WorkerFacing};
 use tokio_stream::StreamExt;
 use tonic::Code;
-use tonic::transport::{Endpoint, Server, Uri};
 
-type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+mod common;
 
-struct Harness {
-    control: ControlPlaneServiceClient<tonic::transport::Channel>,
-    worker: WorkerServiceClient<tonic::transport::Channel>,
-}
-
-async fn connect() -> Setup<Harness> {
-    let core = ServerCore::new(EventLog::in_memory()?);
-    Ok(Harness {
-        control: ControlPlaneServiceClient::new(channel_to(core.clone(), true).await?),
-        worker: WorkerServiceClient::new(channel_to(core, false).await?),
-    })
-}
-
-async fn channel_to(core: ServerCore, control_plane: bool) -> Setup<tonic::transport::Channel> {
-    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-
-    tokio::spawn(async move {
-        let mut builder = Server::builder();
-        let serve = async move {
-            if control_plane {
-                builder
-                    .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
-                    .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-                    .await
-            } else {
-                builder
-                    .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
-                    .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-                    .await
-            }
-        };
-        let _ = serve.await;
-    });
-
-    let mut client_side = Some(client_side);
-    let channel = Endpoint::try_from("http://[::]:50051")?
-        .connect_with_connector(tower::service_fn(move |_: Uri| {
-            let stream = client_side.take();
-            async move {
-                stream
-                    .map(hyper_util::rt::TokioIo::new)
-                    .ok_or_else(|| std::io::Error::other("the duplex was already taken"))
-            }
-        }))
-        .await?;
-    Ok(channel)
-}
-
-/// Creates a session, returning its id and root agent id.
-async fn seed(harness: &mut Harness, title: &str, key: &str) -> Setup<(String, String)> {
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: title.to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: key.to_owned(),
-        })
-        .await?
-        .into_inner();
-
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .ok_or("a created session must have an id")?;
-    let root = created
-        .root_agent_id
-        .map(|id| id.to_string())
-        .ok_or("a created session must have a root agent")?;
-    Ok((session_id, root))
-}
+use common::{Harness, Setup, connect, seed};
 
 /// Every sequence in a session, read back through SyncEvents.
 async fn sequences(harness: &mut Harness, session_id: &str) -> Setup<Vec<u64>> {
+    drain_sync(harness, session_id, |batch, out| {
+        out.extend(batch.events.iter().map(|event| event.sequence));
+    })
+    .await
+}
+
+/// Replays a session to its caught-up marker, keeping whatever `collect` takes.
+///
+/// One cursor-and-drain loop rather than one per thing a test wants out of the
+/// stream: the duplication gate caught the second copy, and a second copy of a
+/// stream loop is also a second chance to get the terminator wrong.
+async fn drain_sync<T>(
+    harness: &mut Harness,
+    session_id: &str,
+    mut collect: impl FnMut(&horde_proto::v1::EventBatch, &mut Vec<T>),
+) -> Setup<Vec<T>> {
     let mut stream = harness
         .control
         .sync_events(SyncEventsRequest {
@@ -116,17 +55,70 @@ async fn sequences(harness: &mut Harness, session_id: &str) -> Setup<Vec<u64>> {
         .await?
         .into_inner();
 
-    let mut seen = Vec::new();
+    let mut out = Vec::new();
     while let Some(message) = stream.next().await {
         match message?.update {
-            Some(sync_events_response::Update::Batch(batch)) => {
-                seen.extend(batch.events.iter().map(|event| event.sequence));
-            }
+            Some(sync_events_response::Update::Batch(batch)) => collect(&batch, &mut out),
             Some(sync_events_response::Update::CaughtUp(_)) => break,
             _ => {}
         }
     }
-    Ok(seen)
+    Ok(out)
+}
+
+/// Registers a worker with the given tags.
+///
+/// Three tests need a registered worker before they can assert anything about
+/// listings or capability refreshes.
+async fn register(h: &mut Harness, worker: &str, tags: &[&str]) -> Setup<()> {
+    h.worker
+        .register_worker(RegisterWorkerRequest {
+            hello: None,
+            worker_id: Some(WorkerId::new(worker)),
+            capabilities: Some(WorkerCapabilities {
+                tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                ..WorkerCapabilities::default()
+            }),
+        })
+        .await?;
+    Ok(())
+}
+
+/// The tags the listing reports for a worker.
+async fn listed_tags(h: &mut Harness, worker: &str) -> Setup<Vec<String>> {
+    let workers = h
+        .control
+        .list_workers(ListWorkersRequest::default())
+        .await?
+        .into_inner()
+        .workers;
+    Ok(workers
+        .into_iter()
+        .find(|listed| {
+            listed
+                .worker_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                == Some(worker)
+        })
+        .and_then(|listed| listed.capabilities)
+        .map(|capabilities| capabilities.tags)
+        .unwrap_or_default())
+}
+
+/// The `recorded_at` stamps a session's events carry.
+///
+/// Shares the cursor-and-drain shape with [`sequences`]; both walk one sync
+/// stream to its caught-up marker and differ only in what they keep.
+async fn recorded_stamps(
+    harness: &mut Harness,
+    session_id: &str,
+) -> Setup<Vec<prost_types::Timestamp>> {
+    drain_sync(harness, session_id, |batch, out| {
+        out.extend(batch.events.iter().filter_map(|event| event.recorded_at));
+    })
+    .await
 }
 
 // -- Honest refusals ---------------------------------------------------------
@@ -285,15 +277,7 @@ async fn a_registered_worker_appears_in_the_listing_with_its_capabilities() {
         "nothing has registered yet"
     );
 
-    h.worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities {
-                tags: vec!["gpu".to_owned()],
-                ..WorkerCapabilities::default()
-            }),
-        })
+    register(&mut h, "worker-a", &["gpu"])
         .await
         .expect("registration");
 
@@ -311,11 +295,8 @@ async fn a_registered_worker_appears_in_the_listing_with_its_capabilities() {
         Some("worker-a".to_owned())
     );
     assert_eq!(
-        workers[0]
-            .capabilities
-            .as_ref()
-            .map(|capabilities| capabilities.tags.clone()),
-        Some(vec!["gpu".to_owned()])
+        listed_tags(&mut h, "worker-a").await.expect("tags"),
+        vec!["gpu".to_owned()]
     );
 }
 
@@ -325,15 +306,7 @@ async fn a_registered_worker_appears_in_the_listing_with_its_capabilities() {
 async fn refreshing_capabilities_replaces_what_the_listing_reports() {
     let mut h = connect().await.expect("a harness");
 
-    h.worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities {
-                tags: vec!["gpu".to_owned()],
-                ..WorkerCapabilities::default()
-            }),
-        })
+    register(&mut h, "worker-a", &["gpu"])
         .await
         .expect("registration");
 
@@ -348,20 +321,9 @@ async fn refreshing_capabilities_replaces_what_the_listing_reports() {
         .await
         .expect("a capability refresh must succeed");
 
-    let workers = h
-        .control
-        .list_workers(ListWorkersRequest::default())
-        .await
-        .expect("list")
-        .into_inner()
-        .workers;
-
     assert_eq!(
-        workers[0]
-            .capabilities
-            .as_ref()
-            .map(|capabilities| capabilities.tags.clone()),
-        Some(vec!["macos".to_owned()]),
+        listed_tags(&mut h, "worker-a").await.expect("tags"),
+        vec!["macos".to_owned()],
         "a refresh replaces rather than merges, and must actually take effect"
     );
 }
@@ -517,32 +479,9 @@ async fn events_are_stamped_with_a_plausible_server_clock() {
     let mut h = connect().await.expect("a harness");
     let (session_id, _) = seed(&mut h, "clock", "key-1").await.expect("seed");
 
-    let mut stream = h
-        .control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow: false,
-            max_batch_events: 0,
-        })
+    let stamps = recorded_stamps(&mut h, &session_id)
         .await
-        .expect("sync")
-        .into_inner();
-
-    let mut stamps = Vec::new();
-    while let Some(message) = stream.next().await {
-        match message.expect("sync must not error").update {
-            Some(sync_events_response::Update::Batch(batch)) => {
-                stamps.extend(batch.events.iter().filter_map(|event| event.recorded_at));
-            }
-            Some(sync_events_response::Update::CaughtUp(_)) => break,
-            _ => {}
-        }
-    }
+        .expect("sync must succeed");
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
