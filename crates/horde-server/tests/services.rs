@@ -32,9 +32,13 @@ struct Harness {
     worker: WorkerServiceClient<tonic::transport::Channel>,
 }
 
-/// Helpers return `Result` rather than unwrapping: clippy's in-test allowance
-/// for `expect` does not reach free functions in an integration test file, and
-/// exempting the lint would be worse than threading the error to a `#[test]`.
+/// Helpers return `Result` rather than unwrapping.
+///
+/// `allow-expect-in-tests` exempts anything under `#[cfg(test)]`, which an
+/// integration test file's free functions are not — so `expect` here would trip
+/// the deny-list. Wrapping the helpers in `#[cfg(test)] mod` would also fix it
+/// (see docs/QUALITY_GATES.md); threading the error to a `#[test]` is kept
+/// because it also reports *which* setup step failed.
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn connect(core: ServerCore) -> Setup<Harness> {
@@ -87,6 +91,114 @@ fn core() -> Setup<ServerCore> {
     Ok(ServerCore::new(EventLog::in_memory()?))
 }
 
+/// Creates a session and returns its id.
+///
+/// Four tests need a session before they can test anything else; this is that
+/// preamble, once.
+async fn create_session(harness: &mut Harness, title: &str, key: &str) -> Setup<String> {
+    let created = harness
+        .control
+        .create_session(CreateSessionRequest {
+            title: title.to_owned(),
+            workspace_definition_id: None,
+            root_agent: Some(AgentSpec::default()),
+            idempotency_key: key.to_owned(),
+        })
+        .await?
+        .into_inner();
+    created
+        .session
+        .and_then(|summary| summary.session_id)
+        .map(|id| id.to_string())
+        .ok_or_else(|| "a created session must carry an id".into())
+}
+
+/// Opens a journal stream and announces the worker's journal position.
+///
+/// Returns the sender and the ack stream; the caller decides what to make of
+/// the first ack, which is the part each test actually cares about.
+async fn open_journal(
+    harness: &mut Harness,
+    worker_id: &str,
+    last_local_journal_sequence: u64,
+) -> Setup<(
+    tokio::sync::mpsc::Sender<PushEventsRequest>,
+    tonic::Streaming<horde_proto::v1::PushEventsResponse>,
+)> {
+    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
+    let acks = harness
+        .worker
+        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+        .await?
+        .into_inner();
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Start(PushEventsStart {
+                worker_id: Some(WorkerId::new(worker_id)),
+                last_local_journal_sequence,
+            })),
+        })
+        .await?;
+    Ok((to_server, acks))
+}
+
+/// Registers a worker so the scheduler has somewhere to place agents.
+async fn register_worker(harness: &mut Harness, worker_id: &str) -> Setup<u64> {
+    Ok(harness
+        .worker
+        .register_worker(RegisterWorkerRequest {
+            hello: None,
+            worker_id: Some(WorkerId::new(worker_id)),
+            capabilities: Some(WorkerCapabilities::default()),
+        })
+        .await?
+        .into_inner()
+        .resume_from_journal_sequence)
+}
+
+/// Spawns a root agent under `session_id` and returns its id and placement.
+async fn spawn_agent(
+    harness: &mut Harness,
+    session_id: &str,
+) -> Setup<(String, horde_proto::v1::Placement)> {
+    let spawned = harness
+        .control
+        .spawn_agent(SpawnAgentRequest {
+            session_id: Some(SessionId::new(session_id)),
+            parent_agent_id: None,
+            spec: Some(AgentSpec::default()),
+            idempotency_key: String::new(),
+        })
+        .await?
+        .into_inner();
+    let placement = spawned
+        .placement
+        .ok_or("a spawn always reports placement")?;
+    let agent_id = spawned
+        .agent_id
+        .map(|id| id.to_string())
+        .ok_or("a spawned agent has an id")?;
+    Ok((agent_id, placement))
+}
+
+/// Answers a pending permission, returning whatever the server made of it.
+async fn answer_permission(
+    harness: &mut Harness,
+    request_id: &str,
+    reason: &str,
+) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
+    harness
+        .control
+        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            reason: reason.to_owned(),
+            remember_for_session: false,
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
 fn output_event(agent: &str, text: &str, index: u64) -> Event {
     Event {
         agent_id: Some(AgentId::new(agent)),
@@ -112,63 +224,28 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         .expect("the harness must connect");
 
     // 1. The worker registers and is told where to resume from.
-    let registered = harness
-        .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+    let resume_from = register_worker(&mut harness, "worker-a")
         .await
-        .expect("registration must succeed")
-        .into_inner();
+        .expect("registration must succeed");
     assert_eq!(
-        registered.resume_from_journal_sequence, 1,
+        resume_from, 1,
         "a fresh worker starts at the first journal position"
     );
 
     // 2. A client creates a session and spawns an agent under it.
-    let session = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "ci-fix".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "ci-fix", "key-1")
         .await
-        .expect("create must succeed")
-        .into_inner();
-    let session_id = session
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("a created session has an id");
+        .expect("a session must be creatable");
 
-    let spawned = harness
-        .control
-        .spawn_agent(SpawnAgentRequest {
-            session_id: Some(SessionId::new(session_id.clone())),
-            parent_agent_id: None,
-            spec: Some(AgentSpec::default()),
-            idempotency_key: String::new(),
-        })
+    let (agent_id, placement) = spawn_agent(&mut harness, &session_id)
         .await
-        .expect("spawn must succeed")
-        .into_inner();
-
-    let placement = spawned.placement.expect("a spawn always reports placement");
+        .expect("spawn must succeed");
     assert_eq!(
         placement.state,
         horde_proto::v1::PlacementState::Placed as i32,
         "with one worker registered the agent is placed: {}",
         placement.reason
     );
-    let agent_id = spawned
-        .agent_id
-        .map(|id| id.to_string())
-        .expect("a spawned agent has an id");
-
     // 3. The worker receives the spawn command.
     let mut commands = harness
         .worker
@@ -197,23 +274,9 @@ async fn a_worker_and_a_client_meet_through_the_log() {
     }
 
     // 4. The worker journals events back and is acked.
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let mut acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
         .await
-        .expect("the event stream must open")
-        .into_inner();
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new("worker-a")),
-                last_local_journal_sequence: 0,
-            })),
-        })
-        .await
-        .expect("start must send");
+        .expect("the event stream must open");
 
     match acks
         .next()
@@ -285,20 +348,7 @@ async fn sync_to_head(
     session_id: &str,
     from_sequence: u64,
 ) -> Setup<Vec<u64>> {
-    let mut stream = control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            // Not following: replay to head and complete, the scriptable form.
-            follow: false,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(control, session_id, from_sequence, false).await?;
 
     let mut sequences = Vec::new();
     while let Some(message) = stream.next().await {
@@ -331,22 +381,9 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         "a fresh server has no sessions because the log has no events"
     );
 
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "first".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "first", "key-1")
         .await
-        .expect("create must succeed")
-        .into_inner();
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("an id");
+        .expect("a session must be creatable");
 
     let listed = harness
         .control
@@ -415,36 +452,13 @@ async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
     let core = core().expect("an in-memory core");
     let mut harness = connect(core).await.expect("the harness must connect");
 
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "lonely".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "lonely", "key-1")
         .await
-        .expect("create")
-        .into_inner();
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("an id");
+        .expect("a session must be creatable");
 
-    let spawned = harness
-        .control
-        .spawn_agent(SpawnAgentRequest {
-            session_id: Some(SessionId::new(session_id)),
-            parent_agent_id: None,
-            spec: Some(AgentSpec::default()),
-            idempotency_key: String::new(),
-        })
+    let (agent_id, placement) = spawn_agent(&mut harness, &session_id)
         .await
-        .expect("spawn must not fail just because nothing can run it")
-        .into_inner();
-
-    let placement = spawned.placement.expect("a placement");
+        .expect("spawn must not fail just because nothing can run it");
     assert_eq!(
         placement.state,
         horde_proto::v1::PlacementState::Queued as i32
@@ -455,7 +469,7 @@ async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
         placement.reason
     );
     assert!(
-        spawned.agent_id.is_some(),
+        !agent_id.is_empty(),
         "the agent exists whether or not it is placed"
     );
 }
@@ -482,52 +496,19 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
         .await
         .expect("the harness must connect");
 
-    harness
-        .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+    register_worker(&mut harness, "worker-a")
         .await
         .expect("registration");
 
     // Store some journal history directly, then have the worker claim it has
     // less than the server does.
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "s".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "s", "key-1")
         .await
-        .expect("create")
-        .into_inner();
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("an id");
+        .expect("a session must be creatable");
 
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let mut acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
         .await
-        .expect("stream opens")
-        .into_inner();
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new("worker-a")),
-                last_local_journal_sequence: 0,
-            })),
-        })
-        .await
-        .expect("start sends");
+        .expect("stream opens");
     acks.next().await.expect("accepted").expect("accepted");
 
     to_server
@@ -548,23 +529,9 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
     drop(to_server);
 
     // Reconnect claiming a journal head below what the server stored.
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let mut acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+    let (_to_server, mut acks) = open_journal(&mut harness, "worker-a", 2)
         .await
-        .expect("stream reopens")
-        .into_inner();
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new("worker-a")),
-                last_local_journal_sequence: 2,
-            })),
-        })
-        .await
-        .expect("start sends");
+        .expect("stream reopens");
 
     let status = acks
         .next()
@@ -573,6 +540,272 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
         .expect_err("a regressed journal must be refused, not silently renumbered");
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert!(status.message().contains("refusing to renumber"));
+}
+
+/// A permission request, journaled by the worker the way a real one arrives.
+fn permission_requested(agent: &str, request_id: &str) -> Event {
+    Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: String::new(),
+        kind: Some(Kind::PermissionRequested(
+            horde_proto::v1::PermissionRequested {
+                request: Some(horde_proto::v1::PermissionRequest {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+                    agent_id: Some(AgentId::new(agent)),
+                    ..horde_proto::v1::PermissionRequest::default()
+                }),
+            },
+        )),
+    }
+}
+
+#[tokio::test]
+async fn a_permission_is_answered_by_request_id_alone() {
+    // The client answering a permission knows the request id and nothing else —
+    // not the session, not the worker. Finding the rest is the server's job,
+    // which is what makes a permission answerable from any attached client.
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    let session_id = create_session(&mut harness, "perms", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("the event stream must open");
+    acks.next().await.expect("a reply").expect("accepted");
+
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events: vec![JournaledEvent {
+                    journal_sequence: 1,
+                    session_id: Some(SessionId::new(session_id.clone())),
+                    event: Some(permission_requested("agent-1", "req-1")),
+                }],
+                acked_command_sequence: 0,
+            })),
+        })
+        .await
+        .expect("the request must journal");
+    acks.next().await.expect("a reply").expect("accepted");
+
+    let answered = answer_permission(&mut harness, "req-1", "looks fine")
+        .await
+        .expect("a pending permission must be answerable");
+    assert!(
+        answered.sequence > 0,
+        "the decision is an event like any other, so it has a sequence"
+    );
+
+    // Answering it again fails: the projection dropped it when the decision
+    // landed, so there is nothing left awaiting an answer.
+    let twice = answer_permission(&mut harness, "req-1", "")
+        .await
+        .expect_err("an answered permission is no longer pending");
+    assert_eq!(twice.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn answering_a_permission_nobody_asked_for_is_refused() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    create_session(&mut harness, "perms", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let status = answer_permission(&mut harness, "never-asked", "")
+        .await
+        .expect_err("inventing a decision for an unknown request would be worse");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.message().contains("never-asked"));
+}
+
+#[tokio::test]
+async fn an_agent_is_found_by_id_without_being_told_its_session() {
+    // interrupt_agent takes an agent id and no session id, so the server has to
+    // find the session itself. The failure case matters as much: an unknown
+    // agent must be refused rather than interrupting something else.
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    register_worker(&mut harness, "worker-a")
+        .await
+        .expect("the worker must register");
+    let session_id = create_session(&mut harness, "findable", "key-1")
+        .await
+        .expect("a session must be creatable");
+    let interrupted_session = session_id.clone();
+    let (agent_id, _placement) = spawn_agent(&mut harness, &session_id)
+        .await
+        .expect("spawn must succeed");
+
+    let interrupted = harness
+        .control
+        .interrupt_agent(horde_proto::v1::InterruptAgentRequest {
+            agent_id: Some(AgentId::new(agent_id)),
+            reason: "changed my mind".to_owned(),
+        })
+        .await
+        .expect("a known agent must be interruptible")
+        .into_inner();
+    assert!(interrupted.sequence > 0);
+
+    // The reason has to reach the log — it is what an attached client shows to
+    // explain why a turn stopped.
+    let reasons = interrupt_reasons(&mut harness.control, &interrupted_session)
+        .await
+        .expect("the session must be readable");
+    assert_eq!(reasons, vec!["changed my mind".to_owned()]);
+
+    let status = harness
+        .control
+        .interrupt_agent(horde_proto::v1::InterruptAgentRequest {
+            agent_id: Some(AgentId::new("no-such-agent")),
+            reason: String::new(),
+        })
+        .await
+        .expect_err("an unknown agent must not resolve to some other session");
+    assert_eq!(status.code(), Code::NotFound);
+}
+
+/// Opens a sync stream over one session from its beginning.
+async fn open_sync(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+    from_sequence: u64,
+    follow: bool,
+) -> Setup<tonic::Streaming<horde_proto::v1::SyncEventsResponse>> {
+    Ok(control
+        .sync_events(SyncEventsRequest {
+            cursors: vec![SessionCursor {
+                session_id: Some(SessionId::new(session_id)),
+                from_sequence,
+            }],
+            all_sessions: false,
+            subtree_root: None,
+            follow,
+            max_batch_events: 0,
+        })
+        .await?
+        .into_inner())
+}
+
+/// The reason on every `TurnInterrupted` recorded for a session.
+async fn interrupt_reasons(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+) -> Setup<Vec<String>> {
+    let mut stream = open_sync(control, session_id, 0, false).await?;
+
+    let mut reasons = Vec::new();
+    while let Some(message) = stream.next().await {
+        if let Some(sync_events_response::Update::Batch(batch)) = message?.update {
+            for envelope in batch.events {
+                if let Some(Kind::TurnInterrupted(interrupted)) =
+                    envelope.event.and_then(|event| event.kind)
+                {
+                    reasons.push(interrupted.reason);
+                }
+            }
+        }
+    }
+    Ok(reasons)
+}
+
+/// Everything a sync stream delivered, in order, without stopping early.
+async fn sync_everything(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+    follow: bool,
+) -> Setup<Vec<String>> {
+    let mut stream = open_sync(control, session_id, 0, follow).await?;
+
+    let mut updates = Vec::new();
+    while let Some(message) = stream.next().await {
+        match message?.update {
+            Some(sync_events_response::Update::Batch(batch)) => {
+                updates.push(format!("batch:{}", batch.events.len()));
+            }
+            Some(sync_events_response::Update::CaughtUp(_)) => updates.push("caught-up".to_owned()),
+            _ => {}
+        }
+    }
+    Ok(updates)
+}
+
+#[tokio::test]
+async fn a_sync_that_is_not_following_ends_at_the_caught_up_marker() {
+    // Read the stream to its end rather than stopping at caught-up: a client
+    // that is not following needs the stream to actually close, or it waits
+    // forever for a completion that never comes.
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    let session_id = create_session(&mut harness, "syncing", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let updates = sync_everything(&mut harness.control, &session_id, false)
+        .await
+        .expect("a non-following sync must complete on its own");
+
+    assert_eq!(
+        updates,
+        vec!["batch:1".to_owned(), "caught-up".to_owned()],
+        "history arrives before the marker, and nothing arrives after it"
+    );
+}
+
+#[tokio::test]
+async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    let session_id = create_session(&mut harness, "following", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let mut stream = open_sync(&mut harness.control, &session_id, 0, true)
+        .await
+        .expect("the sync stream must open");
+
+    // History, then the marker.
+    assert!(matches!(
+        stream.next().await.expect("history").expect("ok").update,
+        Some(sync_events_response::Update::Batch(_))
+    ));
+    assert!(matches!(
+        stream.next().await.expect("marker").expect("ok").update,
+        Some(sync_events_response::Update::CaughtUp(_))
+    ));
+
+    // Now append something and watch it arrive on the same stream.
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("the event stream must open");
+    acks.next().await.expect("a reply").expect("accepted");
+    for round in 1..=2u64 {
+        to_server
+            .send(PushEventsRequest {
+                body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                    events: vec![JournaledEvent {
+                        journal_sequence: round,
+                        session_id: Some(SessionId::new(session_id.clone())),
+                        event: Some(output_event("agent-1", "later", round)),
+                    }],
+                    acked_command_sequence: 0,
+                })),
+            })
+            .await
+            .expect("the event must journal");
+
+        let followed = stream.next().await.expect("a followed batch").expect("ok");
+        match followed.update {
+            Some(sync_events_response::Update::Batch(batch)) => {
+                assert_eq!(batch.events.len(), 1, "round {round}");
+            }
+            other => panic!("expected a batch after catching up, got {other:?}"),
+        }
+    }
 }
 
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.

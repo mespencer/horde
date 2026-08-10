@@ -1,0 +1,44 @@
+{
+  "duplicates": [],
+  "statistics": {
+    "detectionDate": "2026-08-09T21:06:16.851Z",
+    "formats": {
+      "d": {
+        "clones": 0,
+        "duplicatedLines": 0,
+        "duplicatedTokens": 0,
+        "lines": 5,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 0.0,
+        "percentageTokens": 0.0,
+        "sources": 1,
+        "tokens": 118
+      },
+      "rust": {
+        "clones": 0,
+        "duplicatedLines": 0,
+        "duplicatedTokens": 0,
+        "lines": 10,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 0.0,
+        "percentageTokens": 0.0,
+        "sources": 1,
+        "tokens": 117
+      }
+    },
+    "total": {
+      "clones": 0,
+      "duplicatedLines": 0,
+      "duplicatedTokens": 0,
+      "lines": 15,
+      "newClones": 0,
+      "newDuplicatedLines": 0,
+      "percentage": 0.0,
+      "percentageTokens": 0.0,
+      "sources": 2,
+      "tokens": 235
+    }
+  }
+}

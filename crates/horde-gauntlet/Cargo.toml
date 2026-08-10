@@ -1,0 +1,26 @@
+[package]
+name = "horde-gauntlet"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Horde's quality gate runner: one binary that CI and laptops both run."
+
+[lib]
+name = "horde_gauntlet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gauntlet"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[lints]
+workspace = true

@@ -7,7 +7,7 @@
 
 use horde_adapter::{AgentEvent, AgentSession, OutputChannel, TurnInput, TurnStatus};
 use horde_adapter_claude::codec::decode_line;
-use horde_adapter_claude::replay::ReplaySession;
+use horde_adapter_claude::replay::replay as replay_session;
 use horde_adapter_claude::wire::Event;
 use horde_testkit::conformance::{TurnRecord, check_session};
 use horde_testkit::transcripts::{Transcript, all_transcript_names};
@@ -25,7 +25,7 @@ fn load(name: &str) -> Result<Transcript, String> {
 async fn replay(name: &str) -> Result<Vec<TurnRecord>, String> {
     let turns = load(name)?.turns();
     let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
-    let mut session = ReplaySession::new(turns);
+    let mut session = replay_session(turns);
 
     check_session(&mut session, &messages)
         .await
@@ -279,7 +279,7 @@ async fn headroom_is_reported_when_the_harness_volunteers_it() {
 #[tokio::test]
 async fn a_replayed_session_ends_cleanly() {
     let transcript = load("01-basic-turn.out.jsonl").expect("fixture must load");
-    let mut session = ReplaySession::new(transcript.turns());
+    let mut session = replay_session(transcript.turns());
 
     session
         .send(TurnInput::queued("replayed"))

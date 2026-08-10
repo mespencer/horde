@@ -13,9 +13,37 @@ use horde_adapter::{
 
 use horde_adapter_fake::{FakeAdapter, Misbehaviour, Script, ScriptedTurn, Step};
 use horde_testkit::conformance::{
-    check_capability_honesty, check_session, check_session_with, run_turn,
+    TurnRecord, check_capability_honesty, check_session, check_session_with, run_turn,
 };
 use serde_json::json;
+
+/// The `#[cfg(test)]` wrapper is what tells clippy this is test code, which is
+/// where `expect` is permitted (`clippy.toml`); an integration test's free
+/// functions are not otherwise recognised as such. See docs/QUALITY_GATES.md.
+#[cfg(test)]
+mod harness {
+    use horde_adapter::{Adapter, AgentSpec};
+
+    use super::{FakeAdapter, Script, ScriptedTurn, TurnRecord, check_session};
+
+    /// Runs one message through a scripted adapter and returns the turn records.
+    ///
+    /// Several tests need exactly this — script, spawn, drive the conformance
+    /// suite with one message — and differ only in the script and in what they
+    /// assert.
+    pub(crate) async fn conforming_records(turns: Vec<ScriptedTurn>) -> Vec<TurnRecord> {
+        let adapter = FakeAdapter::new(Script::of(turns));
+        let mut session = adapter
+            .spawn(&AgentSpec::default())
+            .await
+            .expect("the fake always spawns");
+        check_session(session.as_mut(), &["go"])
+            .await
+            .expect("a scripted turn must satisfy the adapter contract")
+    }
+}
+
+use harness::conforming_records;
 
 fn asking_permission() -> Script {
     Script::of(vec![ScriptedTurn::saying("working on it").with_step(
@@ -314,17 +342,13 @@ async fn an_exhausted_script_can_end_the_harness() {
 /// the conformance suite's index check something to bite on.
 #[tokio::test]
 async fn several_chunks_on_one_channel_are_numbered_in_order() {
-    let adapter = FakeAdapter::new(Script::of(vec![
+    let records = conforming_records(vec![
         ScriptedTurn::saying("one")
             .with_step(Step::Think("pondering".to_owned()))
             .with_step(Step::Say("two".to_owned()))
             .with_step(Step::Say("three".to_owned())),
-    ]));
-    let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
-
-    let records = check_session(session.as_mut(), &["go"])
-        .await
-        .expect("multi-chunk turns must conform");
+    ])
+    .await;
 
     let assistant: Vec<u64> = records[0]
         .events
@@ -463,18 +487,14 @@ async fn a_stalling_turn_still_conforms() {
 /// script says "here the agent spawns a child".
 #[tokio::test]
 async fn a_horde_verb_is_reported_as_a_tool_call_without_an_approval_round_trip() {
-    let adapter = FakeAdapter::new(Script::of(vec![
-        ScriptedTurn::saying("delegating").with_step(Step::UseHordeTool {
+    let records = conforming_records(vec![ScriptedTurn::saying("delegating").with_step(
+        Step::UseHordeTool {
             tool_call_id: "call-9".to_owned(),
             tool_name: "spawn_agent".to_owned(),
             input: json!({ "agent_type": "reviewer", "tier": "deep" }),
-        }),
-    ]));
-    let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
-
-    let records = check_session(session.as_mut(), &["go"])
-        .await
-        .expect("must conform");
+        },
+    )])
+    .await;
 
     let called = records[0].events.iter().any(|event| {
         matches!(event, AgentEvent::Output { channel: OutputChannel::ToolCall, text, .. }

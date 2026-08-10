@@ -1,0 +1,20 @@
+# cargo-mutants configuration. Read by the `mutants` gate, which passes only
+# scope flags on the command line.
+#
+# There are deliberately no `exclude_re` entries: skipping a function because
+# its mutants survive is how a mutation gate becomes decorative. If a function
+# cannot be mutation-tested, the fix is to move its logic somewhere that can be.
+
+# Parallelism is not settable here — cargo-mutants takes `--jobs` on the command
+# line only — so it lives in the gate, like every other flag.
+#
+# Tests here are in-process and finish in milliseconds; the floor exists so a
+# cold or contended machine does not report a spurious timeout.
+minimum_test_timeout = 60
+
+# A mutant that hangs usually hangs badly. Five times the clean-tree test time
+# is generous enough to avoid false timeouts without stalling a run.
+timeout_multiplier = 5.0
+
+# Mutants often produce code that takes longer to compile than the original.
+build_timeout_multiplier = 5.0

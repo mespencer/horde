@@ -23,5 +23,12 @@ protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"
 
 [package.metadata.cargo-machete]
-# Used only from code generated into OUT_DIR, which machete does not scan.
-ignored = ["tonic-prost"]
+# `tonic-prost` is used only from code generated into OUT_DIR, which machete
+# does not scan. The three build-dependencies are used by build.rs, which
+# machete does not scan either — see docs/QUALITY_GATES.md, machete section.
+ignored = [
+    "tonic-prost",
+    "prost-build",
+    "protoc-bin-vendored",
+    "tonic-prost-build",
+]

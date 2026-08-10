@@ -23,7 +23,7 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::instrument;
 
-use super::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
+use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::PendingEvent;
 
@@ -304,7 +304,8 @@ mod tests {
         AgentId, Event, JournaledEvent, SessionId, TurnInterrupted, event::Kind,
     };
 
-    use super::{ServerCore, handle_start, ingest_batch};
+    use super::super::shared::ServerCore;
+    use super::{handle_start, ingest_batch};
     use crate::EventLog;
     use crate::error::ServerError;
 

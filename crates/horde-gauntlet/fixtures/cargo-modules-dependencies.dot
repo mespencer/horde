@@ -1,0 +1,45 @@
+digraph {
+
+    graph [
+        label="probe",
+        labelloc=t,
+
+        pad=0.4,
+
+        // Consider rendering the graph using a different layout algorithm, such as:
+        // [dot, neato, twopi, circo, fdp, sfdp]
+        layout=neato,
+        overlap=false,
+        splines="line",
+        rankdir=LR,
+
+        fontname="Helvetica", 
+        fontsize="36",
+    ];
+
+    node [
+        fontname="monospace",
+        fontsize="10",
+        shape="record",
+        style="filled",
+    ];
+
+    edge [
+        fontname="monospace",
+        fontsize="10",
+    ];
+
+    "probe" [label="crate|probe", fillcolor="#5397c8"]; // "crate" node
+    "probe::classify" [label="pub fn|classify", fillcolor="#81c169"]; // "fn" node
+    "probe::tests" [label="pub(crate) mod|tests", fillcolor="#f8c04c"]; // "mod" node
+    "probe::tests::t" [label="pub(self) fn|tests::t", fillcolor="#db5367"]; // "fn" node
+    "probe::untested" [label="pub fn|untested", fillcolor="#81c169"]; // "fn" node
+
+    "probe" -> "probe::classify" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "probe" -> "probe::tests" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "probe" -> "probe::untested" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "probe::tests" -> "probe::classify" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "probe::tests" -> "probe::tests::t" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "probe::tests" -> "probe::untested" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+
+}

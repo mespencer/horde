@@ -10,11 +10,9 @@ use horde_proto::v1::{
     TokenUsage, UsageRecord,
 };
 
-#[track_caller]
-fn round_trip<M: Message + Default + PartialEq + std::fmt::Debug>(message: &M) {
-    let decoded = M::decode(message.encode_to_vec().as_slice()).ok();
-    assert_eq!(decoded.as_ref(), Some(message));
-}
+mod common;
+
+use common::round_trip;
 
 /// Claude-shaped: absolute counts, no percentage.
 fn counts_window() -> RateWindow {

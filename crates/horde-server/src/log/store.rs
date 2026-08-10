@@ -285,20 +285,37 @@ fn now_unix_ms() -> i64 {
         })
 }
 
+/// A minimal event for one session, for tests across this module's tree.
+///
+/// Lives here rather than in each test module because both `log` and
+/// `log::store` need it, and `log` already depends on `log::store` — putting it
+/// the other way round would close a module cycle.
+#[cfg(test)]
+pub(crate) fn pending(session: &str, payload: &[u8]) -> PendingEvent {
+    PendingEvent {
+        session_id: session.to_owned(),
+        payload: payload.to_vec(),
+        ..PendingEvent::default()
+    }
+}
+
+/// An event as a worker journals it: attributed to that worker, at that
+/// position in the worker's own sequence space.
+#[cfg(test)]
+pub(crate) fn journaled(worker: &str, journal_sequence: u64) -> PendingEvent {
+    PendingEvent {
+        origin_worker_id: worker.to_owned(),
+        journal_sequence: Some(journal_sequence),
+        ..pending("s1", b"x")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingEvent, append, head, open_in_memory, read_from, session_ids,
+        PendingEvent, append, head, journaled, open_in_memory, pending, read_from, session_ids,
         worker_journal_watermark,
     };
-
-    fn pending(session: &str, payload: &[u8]) -> PendingEvent {
-        PendingEvent {
-            session_id: session.to_owned(),
-            payload: payload.to_vec(),
-            ..PendingEvent::default()
-        }
-    }
 
     #[test]
     fn sequences_are_dense_and_one_based_per_session() {
@@ -333,13 +350,7 @@ mod tests {
     #[test]
     fn a_replayed_journal_event_is_deduplicated_to_its_original_position() {
         let mut connection = open_in_memory().expect("in-memory database");
-        let event = PendingEvent {
-            session_id: "s1".to_owned(),
-            origin_worker_id: "worker-a".to_owned(),
-            journal_sequence: Some(7),
-            payload: b"x".to_vec(),
-            ..PendingEvent::default()
-        };
+        let event = journaled("worker-a", 7);
 
         let first = append(&mut connection, &event).expect("append");
         let again = append(&mut connection, &event).expect("re-append");
@@ -358,13 +369,7 @@ mod tests {
     #[test]
     fn the_same_journal_sequence_from_two_workers_is_two_events() {
         let mut connection = open_in_memory().expect("in-memory database");
-        let mut event = PendingEvent {
-            session_id: "s1".to_owned(),
-            origin_worker_id: "worker-a".to_owned(),
-            journal_sequence: Some(1),
-            payload: b"x".to_vec(),
-            ..PendingEvent::default()
-        };
+        let mut event = journaled("worker-a", 1);
         append(&mut connection, &event).expect("append");
 
         event.origin_worker_id = "worker-b".to_owned();
