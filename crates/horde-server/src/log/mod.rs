@@ -232,7 +232,9 @@ impl EventLog {
         // cannot keep this loop alive indefinitely.
         let head_after_replay = self.head(session_id).await?;
         if needs_sweep(head_after_replay, delivered) {
-            let missed = self.read_all_from(session_id, delivered + 1).await?;
+            let missed = self
+                .read_all_from(session_id, sweep_from(delivered))
+                .await?;
             if let Some(last) = missed.last() {
                 delivered = last.sequence;
                 history.extend(missed);
@@ -291,6 +293,18 @@ impl EventLog {
 /// ordinary truth table, so the boundary is pinned instead of hoped for.
 fn needs_sweep(head_after_replay: u64, delivered: u64) -> bool {
     head_after_replay > delivered
+}
+
+/// The first sequence a sweep must ask for.
+///
+/// One past what was delivered: asking for `delivered` again would re-deliver
+/// the last event, and asking beyond it would skip one. Extracted for the third
+/// time in this module for the same reason — the sweep's own dedup and the
+/// tail's re-read heal a wrong window, so nothing downstream observes the
+/// offset and `delivered - 1` or `delivered * 1` survived every end-to-end
+/// test. As a function it is one line with three cases.
+fn sweep_from(delivered: u64) -> u64 {
+    delivered.saturating_add(1)
 }
 
 /// Whether a notification tells this tail nothing new.
@@ -553,6 +567,40 @@ mod tests {
         assert!(super::is_stale(&notification("other", 3), "s1", 4));
     }
 
+    /// The sweep's read window. A wrong offset is invisible end-to-end — the
+    /// re-read and the tail's own dedup heal it — so it is asserted here
+    /// instead.
+    #[test]
+    fn a_sweep_asks_for_the_sequence_after_what_was_delivered() {
+        assert_eq!(super::sweep_from(0), 1, "an empty session starts at 1");
+        assert_eq!(super::sweep_from(4), 5);
+        assert_eq!(
+            super::sweep_from(1),
+            2,
+            "asking for 1 again would re-deliver the event already handed over"
+        );
+        assert_eq!(
+            super::sweep_from(u64::MAX),
+            u64::MAX,
+            "saturating, so an absurd head cannot wrap the window back to zero"
+        );
+    }
+
+    /// Waits for the next batch, bounded.
+    ///
+    /// An unbounded `next_batch().await` turns a defect into a hang: a mutation
+    /// that makes reads come back empty leaves the tail waiting for an event
+    /// the log will never hand it, and cargo-mutants records a timeout rather
+    /// than a kill. A timeout is a mutant that was not evaluated, so every wait
+    /// here has a ceiling.
+    async fn next_batch_within(tail: &mut super::Tail) -> Vec<super::StoredEvent> {
+        tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
+            .await
+            .expect("the tail must produce a batch rather than hang")
+            .expect("the log outlives the tail")
+            .expect("read")
+    }
+
     #[tokio::test]
     async fn appends_are_visible_to_a_later_read() {
         let log = log_with_two_events().await;
@@ -572,11 +620,7 @@ mod tests {
         assert_eq!(tail.delivered(), 2);
 
         log.append(pending("s1", b"c")).await.expect("append");
-        let batch = tail
-            .next_batch()
-            .await
-            .expect("the tail is live")
-            .expect("read");
+        let batch = next_batch_within(&mut tail).await;
         let sequences: Vec<u64> = batch.iter().map(|event| event.sequence).collect();
         assert_eq!(sequences, vec![3]);
     }
@@ -589,7 +633,7 @@ mod tests {
         log.append(pending("other", b"x")).await.expect("append");
         log.append(pending("s1", b"mine")).await.expect("append");
 
-        let batch = tail.next_batch().await.expect("live").expect("read");
+        let batch = next_batch_within(&mut tail).await;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].session_id, "s1");
     }
@@ -602,7 +646,7 @@ mod tests {
         assert_eq!(tail.delivered(), 0);
 
         log.append(pending("s1", b"a")).await.expect("append");
-        let batch = tail.next_batch().await.expect("live").expect("read");
+        let batch = next_batch_within(&mut tail).await;
         assert_eq!(batch[0].sequence, 1, "no event is skipped");
     }
 
