@@ -155,6 +155,8 @@ Committed to git deliberately (ADR-0002). The unit of sharing is the commit; syn
 
 ## 9. MCP hub
 
+**Transport/spec policy.** Horde-as-MCP-server (the per-agent endpoint, permission prompting, hub-proxied tools) targets the current MCP spec over Streamable HTTP in stateless style — agent identity lives in the per-agent URL/token, not MCP session state, so hub restarts and fan-out are cheap; protocol-version negotiation at initialize covers revision skew, and a per-agent stdio shim forwarding to the same endpoint is the universal fallback for any harness client that can't speak HTTP. Horde-as-MCP-client (the hub consuming user servers) is deliberately transport-omnivorous — stdio, streamable HTTP, and legacy HTTP+SSE — because the integration long tail lives there and new-spec-only would exclude deployed servers. Verify the concrete harness-client and SDK support matrix when the hub is built, not from memory.
+
 Single-auth for user MCP servers (Linear, Grafana, …): the **server** runs/owns them and proxies their tools onto every agent's horde MCP endpoint. Auth happens once, at the hub. Config can mark a server **`local`** (machine-bound, e.g. browser automation), which runs worker-side instead. Per-agent-type allowlists scope who sees what. The multiplexing (many agents, one upstream) is the main implementation risk; `local` is the pressure valve for stateful/misbehaving servers. See ADR-0004.
 
 ## 10. Permissions
