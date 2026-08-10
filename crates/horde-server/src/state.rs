@@ -81,74 +81,100 @@ impl SessionState {
         };
 
         match kind {
-            EventKind::AgentSpawned(spawned) => {
-                let Some(agent_id) = agent_id else {
-                    // An agent event with no agent is malformed, but one bad
-                    // event must not sink the projection of everything else.
-                    return Ok(());
-                };
-                let parent = spawned.parent_agent_id.as_ref().map(ToString::to_string);
-                if parent.is_none() {
-                    self.root_agent_id.get_or_insert_with(|| agent_id.clone());
-                }
-                self.agents.insert(
-                    agent_id.clone(),
-                    AgentState {
-                        agent_id,
-                        parent_agent_id: parent,
-                        lifecycle: AgentLifecycleState::Queued,
-                        tree_path: spawned.tree_path,
-                        agent_type: spawned.spec.map(|spec| spec.agent_type).unwrap_or_default(),
-                        worker_id: None,
-                    },
-                );
-            }
+            EventKind::AgentSpawned(spawned) => self.agent_spawned(agent_id, spawned),
             EventKind::AgentLifecycleChanged(changed) => {
-                if let Some(agent_id) = agent_id
-                    && let Some(agent) = self.agents.get_mut(&agent_id)
-                    && let Ok(next) = AgentLifecycleState::try_from(changed.state)
-                {
-                    agent.lifecycle = next;
-                }
+                self.agent_lifecycle_changed(agent_id, &changed);
             }
-            EventKind::PlacementChanged(changed) => {
-                if let Some(placement) = changed.placement
-                    && let Some(id) = placement.agent_id.as_ref().map(ToString::to_string)
-                    && let Some(agent) = self.agents.get_mut(&id)
-                {
-                    agent.worker_id = placement.worker_id.as_ref().map(ToString::to_string);
-                }
-            }
+            EventKind::PlacementChanged(changed) => self.placement_changed(changed),
             EventKind::SessionLifecycleChanged(changed) => {
-                if let Ok(next) = SessionLifecycleState::try_from(changed.state) {
-                    self.lifecycle = next;
-                }
+                self.session_lifecycle_changed(&changed);
             }
-            EventKind::PermissionRequested(requested) => {
-                if let Some(request) = requested.request
-                    && let Some(id) = request.request_id.as_ref().map(ToString::to_string)
-                {
-                    let agent = request
-                        .agent_id
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default();
-                    self.pending_permissions.insert(id, agent);
-                }
-            }
-            EventKind::PermissionDecided(decided) => {
-                if let Some(decision) = decided.decision
-                    && let Some(id) = decision.request_id.as_ref().map(ToString::to_string)
-                {
-                    self.pending_permissions.remove(&id);
-                }
-            }
+            EventKind::PermissionRequested(requested) => self.permission_requested(requested),
+            EventKind::PermissionDecided(decided) => self.permission_decided(decided),
             // Output chunks, messages, results, usage, and workspace progress
             // are journal content rather than tree structure. They are replayed
             // to clients verbatim and do not change the projection.
             _ => {}
         }
         Ok(())
+    }
+
+    /// Adds a spawned agent, and adopts the first parentless one as the root.
+    fn agent_spawned(&mut self, agent_id: Option<String>, spawned: horde_proto::v1::AgentSpawned) {
+        let Some(agent_id) = agent_id else {
+            // An agent event with no agent is malformed, but one bad event must
+            // not sink the projection of everything else.
+            return;
+        };
+        let parent = spawned.parent_agent_id.as_ref().map(ToString::to_string);
+        if parent.is_none() {
+            self.root_agent_id.get_or_insert_with(|| agent_id.clone());
+        }
+        self.agents.insert(
+            agent_id.clone(),
+            AgentState {
+                agent_id,
+                parent_agent_id: parent,
+                lifecycle: AgentLifecycleState::Queued,
+                tree_path: spawned.tree_path,
+                agent_type: spawned.spec.map(|spec| spec.agent_type).unwrap_or_default(),
+                worker_id: None,
+            },
+        );
+    }
+
+    /// Moves a known agent to a lifecycle state this build understands.
+    fn agent_lifecycle_changed(
+        &mut self,
+        agent_id: Option<String>,
+        changed: &horde_proto::v1::AgentLifecycleChanged,
+    ) {
+        if let Some(agent_id) = agent_id
+            && let Some(agent) = self.agents.get_mut(&agent_id)
+            && let Ok(next) = AgentLifecycleState::try_from(changed.state)
+        {
+            agent.lifecycle = next;
+        }
+    }
+
+    /// Records which worker an agent landed on.
+    fn placement_changed(&mut self, changed: horde_proto::v1::PlacementChanged) {
+        if let Some(placement) = changed.placement
+            && let Some(id) = placement.agent_id.as_ref().map(ToString::to_string)
+            && let Some(agent) = self.agents.get_mut(&id)
+        {
+            agent.worker_id = placement.worker_id.as_ref().map(ToString::to_string);
+        }
+    }
+
+    /// Moves the session to a lifecycle state this build understands.
+    fn session_lifecycle_changed(&mut self, changed: &horde_proto::v1::SessionLifecycleChanged) {
+        if let Ok(next) = SessionLifecycleState::try_from(changed.state) {
+            self.lifecycle = next;
+        }
+    }
+
+    /// Remembers which agent is waiting on a permission decision.
+    fn permission_requested(&mut self, requested: horde_proto::v1::PermissionRequested) {
+        if let Some(request) = requested.request
+            && let Some(id) = request.request_id.as_ref().map(ToString::to_string)
+        {
+            let agent = request
+                .agent_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            self.pending_permissions.insert(id, agent);
+        }
+    }
+
+    /// Forgets a permission once its decision has landed.
+    fn permission_decided(&mut self, decided: horde_proto::v1::PermissionDecided) {
+        if let Some(decision) = decided.decision
+            && let Some(id) = decision.request_id.as_ref().map(ToString::to_string)
+        {
+            self.pending_permissions.remove(&id);
+        }
     }
 
     /// Agents whose parent is `parent`, or the roots when `None`.

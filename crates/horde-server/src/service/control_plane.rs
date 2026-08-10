@@ -31,13 +31,14 @@ use horde_proto::v1::{
     sync_events_response,
 };
 use prost::Message;
+use tokio::sync::mpsc::Sender;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
-use crate::log::{PendingEvent, StoredEvent};
+use crate::log::{PendingEvent, StoredEvent, Tail};
 use crate::scheduler::Placement;
 use crate::state::SessionState;
 
@@ -133,6 +134,77 @@ fn envelope(event: &StoredEvent) -> Result<horde_proto::v1::EventEnvelope, Serve
         recorded_at: None,
         event: Some(Event::decode(event.payload.as_slice())?),
     })
+}
+
+/// One sync stream: history, a caught-up marker, then the live tail.
+///
+/// Split out of `sync_events` so the RPC is only about resolving the cursor,
+/// and so history and tail deliver through one code path rather than two
+/// copies of the same envelope-and-send loop.
+async fn stream_session(
+    sender: Sender<Result<SyncEventsResponse, Status>>,
+    session_id: String,
+    history: Vec<StoredEvent>,
+    mut tail: Tail,
+    follow: bool,
+) {
+    if !send_batch(&sender, &history).await {
+        return;
+    }
+
+    // Caught up. A TUI stops showing a loading state here rather than guessing
+    // when history ended.
+    let caught_up = SyncEventsResponse {
+        update: Some(sync_events_response::Update::CaughtUp(
+            horde_proto::v1::SyncCaughtUp {
+                heads: vec![horde_proto::v1::SessionCursor {
+                    session_id: Some(SessionId::new(session_id)),
+                    from_sequence: tail.delivered(),
+                }],
+            },
+        )),
+    };
+    if sender.send(Ok(caught_up)).await.is_err() || !follow {
+        return;
+    }
+
+    while let Some(next) = tail.next_batch().await {
+        let events = match next {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = sender.send(Err(Status::from(error))).await;
+                return;
+            }
+        };
+        if !send_batch(&sender, &events).await {
+            return;
+        }
+    }
+}
+
+/// Envelopes and sends one batch. `false` means the stream is finished — the
+/// receiver hung up, or an event would not decode and the error has been sent.
+async fn send_batch(
+    sender: &Sender<Result<SyncEventsResponse, Status>>,
+    events: &[StoredEvent],
+) -> bool {
+    let batch: Result<Vec<_>, _> = events.iter().map(envelope).collect();
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(error) => {
+            let _ = sender.send(Err(Status::from(error))).await;
+            return false;
+        }
+    };
+    if batch.is_empty() {
+        return true;
+    }
+    let response = SyncEventsResponse {
+        update: Some(sync_events_response::Update::Batch(EventBatch {
+            events: batch,
+        })),
+    };
+    sender.send(Ok(response)).await.is_ok()
 }
 
 #[tonic::async_trait]
@@ -294,7 +366,7 @@ impl ControlPlaneService for ControlPlane {
             .map(ToString::to_string)
             .unwrap_or_default();
 
-        let (history, mut tail) = self
+        let (history, tail) = self
             .core
             .log
             .tail(&session_id, cursor.from_sequence)
@@ -304,72 +376,7 @@ impl ControlPlaneService for ControlPlane {
         let follow = request.follow;
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
 
-        tokio::spawn(async move {
-            let mut batch = Vec::new();
-            for event in &history {
-                match envelope(event) {
-                    Ok(envelope) => batch.push(envelope),
-                    Err(error) => {
-                        let _ = sender.send(Err(Status::from(error))).await;
-                        return;
-                    }
-                }
-            }
-            if !batch.is_empty() {
-                let response = SyncEventsResponse {
-                    update: Some(sync_events_response::Update::Batch(EventBatch {
-                        events: batch,
-                    })),
-                };
-                if sender.send(Ok(response)).await.is_err() {
-                    return;
-                }
-            }
-
-            // Caught up. A TUI stops showing a loading state here rather than
-            // guessing when history ended.
-            let caught_up = SyncEventsResponse {
-                update: Some(sync_events_response::Update::CaughtUp(
-                    horde_proto::v1::SyncCaughtUp {
-                        heads: vec![horde_proto::v1::SessionCursor {
-                            session_id: Some(SessionId::new(session_id.clone())),
-                            from_sequence: tail.delivered(),
-                        }],
-                    },
-                )),
-            };
-            if sender.send(Ok(caught_up)).await.is_err() || !follow {
-                return;
-            }
-
-            while let Some(next) = tail.next_batch().await {
-                let events = match next {
-                    Ok(events) => events,
-                    Err(error) => {
-                        let _ = sender.send(Err(Status::from(error))).await;
-                        return;
-                    }
-                };
-                let mut batch = Vec::new();
-                for event in &events {
-                    match envelope(event) {
-                        Ok(envelope) => batch.push(envelope),
-                        Err(error) => {
-                            let _ = sender.send(Err(Status::from(error))).await;
-                            return;
-                        }
-                    }
-                }
-                let response = SyncEventsResponse {
-                    update: Some(sync_events_response::Update::Batch(EventBatch {
-                        events: batch,
-                    })),
-                };
-                if sender.send(Ok(response)).await.is_err() {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(stream_session(sender, session_id, history, tail, follow));
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
