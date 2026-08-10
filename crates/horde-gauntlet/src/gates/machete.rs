@@ -10,9 +10,21 @@ use crate::gates::prelude::*;
 use crate::gates::unexpected_exit;
 
 /// The cargo-machete version the gate is calibrated against.
+///
+/// Invoked as `cargo-machete`, not `cargo machete`. cargo-machete decides
+/// whether its first argument is the subcommand name or a path to scan by
+/// looking at the `CARGO` environment variable, which cargo sets when it
+/// dispatches a subcommand. Run it any other way and `cargo machete --version`
+/// becomes "scan the directories `machete` and `--version`" — which is exactly
+/// what happened on main, where the gate reported `error` because the tool
+/// exited 2 with output no version parser could read.
+///
+/// Calling the binary directly removes the whole chain. A version probe should
+/// not depend on an environment variable set three processes away deciding how
+/// its own arguments are parsed.
 pub const PIN: ToolPin = ToolPin {
-    program: "cargo",
-    version_args: &["machete", "--version"],
+    program: "cargo-machete",
+    version_args: &["--version"],
     expected: "0.9.2",
     install: "cargo install --locked cargo-machete@0.9.2",
 };
@@ -35,9 +47,8 @@ pub fn gate() -> CommandGate {
 /// `.gitignore`, so `-p` narrowing does not apply.
 pub fn spec(ctx: &GateContext) -> CommandSpec {
     CommandSpec::owned(
-        "cargo",
+        PIN.program,
         vec![
-            "machete".to_owned(),
             "--with-metadata".to_owned(),
             "--skip-target-dir".to_owned(),
             ctx.workspace_root.display().to_string(),
@@ -118,7 +129,7 @@ mod tests {
     fn the_command_resolves_renamed_dependencies_and_skips_build_output() {
         assert_eq!(
             spec(&repo_ctx()).display(),
-            "cargo machete --with-metadata --skip-target-dir /repo"
+            "cargo-machete --with-metadata --skip-target-dir /repo"
         );
     }
 
@@ -242,6 +253,24 @@ mod tests {
     }
 
     #[test]
+    fn the_tool_is_invoked_directly_rather_than_through_cargo() {
+        // cargo-machete reads its own argv differently depending on whether
+        // `CARGO` is set, so going through `cargo machete` makes the version
+        // probe depend on an environment variable set three processes away.
+        // Observed on main: it scanned directories named `machete` and
+        // `--version` and exited 2.
+        assert_eq!(PIN.program, "cargo-machete");
+        assert_eq!(PIN.version_args, &["--version"]);
+        let spec = spec(&repo_ctx());
+        assert_eq!(spec.program, "cargo-machete");
+        assert!(
+            !spec.args.iter().any(|arg| arg == "machete"),
+            "a bare `machete` argument is a path to scan, not a subcommand: {:?}",
+            spec.args
+        );
+    }
+
+    #[test]
     fn the_gate_is_pinned_to_the_calibrated_cargo_machete() {
         assert_eq!(gate().pin, Some(&PIN));
         assert_eq!(PIN.expected, "0.9.2");
@@ -257,8 +286,8 @@ mod tests {
         assert_eq!(
             runner.command_lines(),
             vec![
-                "cargo machete --version",
-                "cargo machete --with-metadata --skip-target-dir /repo",
+                "cargo-machete --version",
+                "cargo-machete --with-metadata --skip-target-dir /repo",
             ]
         );
     }

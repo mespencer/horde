@@ -31,6 +31,13 @@ pub enum Command {
         /// Narrow to these packages (repeatable).
         #[arg(short = 'p', long = "package")]
         packages: Vec<String>,
+        /// Measure the whole tree, not just the change under test.
+        ///
+        /// Only `mutants` scopes by change; everything else already measures
+        /// everything. Use this for the periodic sweep that catches behaviour
+        /// no recent diff has touched.
+        #[arg(long)]
+        full: bool,
     },
     /// List the registered gates and their enforcement levels.
     List,
@@ -74,9 +81,10 @@ pub fn dispatch(
         Command::Run {
             gates: names,
             packages,
+            full,
         } => {
             let selected = resolve(&gates, names).map_err(io::Error::other)?;
-            let ctx = GateContext::new(root, packages.clone());
+            let ctx = GateContext::new(root, packages.clone()).measuring_everything(*full);
             let results = run(&selected, &ctx, runner)?;
             write!(out, "{}", render_table(&results))?;
             Ok(results.iter().all(|result| !result.reds_run()))
@@ -186,6 +194,7 @@ mod tests {
         let command = Command::Run {
             gates: vec!["nope".to_owned()],
             packages: Vec::new(),
+            full: false,
         };
         let error = dispatch(&command, Path::new("/repo"), &runner, &mut out)
             .expect_err("the gate does not exist");
@@ -198,6 +207,7 @@ mod tests {
         let command = Command::Run {
             gates: vec!["fmt".to_owned()],
             packages: Vec::new(),
+            full: false,
         };
         let (green, table) = render(&command, dir.path());
         assert!(!green, "{table}");
@@ -301,6 +311,7 @@ mod tests {
         let command = Command::Run {
             gates: vec!["fmt".to_owned()],
             packages: Vec::new(),
+            full: false,
         };
         assert_eq!(exit_code(&command, true).0, ExitCode::FAILURE);
     }
@@ -324,11 +335,17 @@ mod tests {
     fn the_cli_parses_a_run_with_gates_and_packages() {
         let cli = Cli::try_parse_from(["gauntlet", "run", "crap", "-p", "horde-gauntlet"])
             .expect("valid arguments");
-        let Command::Run { gates, packages } = cli.command else {
+        let Command::Run {
+            gates,
+            packages,
+            full,
+        } = cli.command
+        else {
             panic!("expected a run");
         };
         assert_eq!(gates, vec!["crap".to_owned()]);
         assert_eq!(packages, vec!["horde-gauntlet".to_owned()]);
+        assert!(!full, "the change under test is the default scope");
     }
 
     #[test]
