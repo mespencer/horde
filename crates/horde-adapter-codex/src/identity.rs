@@ -7,38 +7,9 @@
 //! "auth still uses `CODEX_HOME`" — and threads persist as rollout JSONL under
 //! `$CODEX_HOME/sessions/`. One Provider Account is one `CODEX_HOME`.
 
-use std::path::{Path, PathBuf};
-
-use horde_adapter::ProviderAccount;
-
 pub use horde_adapter::RevivalIdentity;
-
 /// Resolves an account name to the `CODEX_HOME` it runs under.
-#[must_use]
-pub fn codex_home_for(account: Option<&ProviderAccount>, accounts_root: &Path) -> Option<PathBuf> {
-    horde_adapter::account_dir(account, accounts_root)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use horde_adapter::ProviderAccount;
-
-    use super::codex_home_for;
-
-    #[test]
-    fn an_account_names_a_directory_under_the_accounts_root() {
-        let account = ProviderAccount::new("work");
-        assert_eq!(
-            codex_home_for(Some(&account), Path::new("/accounts")),
-            Some(Path::new("/accounts/work").to_path_buf()),
-            "one account is one CODEX_HOME"
-        );
-    }
-
-    #[test]
-    fn no_account_means_the_inherited_directory() {
-        assert_eq!(codex_home_for(None, Path::new("/accounts")), None);
-    }
-}
+///
+/// The resolution is provider-independent — see [`horde_adapter::account_dir`];
+/// only the name of the directory is ours.
+pub use horde_adapter::account_dir as codex_home_for;

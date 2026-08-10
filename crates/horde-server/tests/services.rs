@@ -348,20 +348,7 @@ async fn sync_to_head(
     session_id: &str,
     from_sequence: u64,
 ) -> Setup<Vec<u64>> {
-    let mut stream = control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            // Not following: replay to head and complete, the scriptable form.
-            follow: false,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(control, session_id, from_sequence, false).await?;
 
     let mut sequences = Vec::new();
     while let Some(message) = stream.next().await {
@@ -682,24 +669,34 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
     assert_eq!(status.code(), Code::NotFound);
 }
 
+/// Opens a sync stream over one session from its beginning.
+async fn open_sync(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+    from_sequence: u64,
+    follow: bool,
+) -> Setup<tonic::Streaming<horde_proto::v1::SyncEventsResponse>> {
+    Ok(control
+        .sync_events(SyncEventsRequest {
+            cursors: vec![SessionCursor {
+                session_id: Some(SessionId::new(session_id)),
+                from_sequence,
+            }],
+            all_sessions: false,
+            subtree_root: None,
+            follow,
+            max_batch_events: 0,
+        })
+        .await?
+        .into_inner())
+}
+
 /// The reason on every `TurnInterrupted` recorded for a session.
 async fn interrupt_reasons(
     control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
     session_id: &str,
 ) -> Setup<Vec<String>> {
-    let mut stream = control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow: false,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(control, session_id, 0, false).await?;
 
     let mut reasons = Vec::new();
     while let Some(message) = stream.next().await {
@@ -722,19 +719,7 @@ async fn sync_everything(
     session_id: &str,
     follow: bool,
 ) -> Setup<Vec<String>> {
-    let mut stream = control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(control, session_id, 0, follow).await?;
 
     let mut updates = Vec::new();
     while let Some(message) = stream.next().await {
@@ -779,21 +764,9 @@ async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
         .await
         .expect("a session must be creatable");
 
-    let mut stream = harness
-        .control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id.clone())),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow: true,
-            max_batch_events: 0,
-        })
+    let mut stream = open_sync(&mut harness.control, &session_id, 0, true)
         .await
-        .expect("the sync stream must open")
-        .into_inner();
+        .expect("the sync stream must open");
 
     // History, then the marker.
     assert!(matches!(
@@ -810,24 +783,28 @@ async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
         .await
         .expect("the event stream must open");
     acks.next().await.expect("a reply").expect("accepted");
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
-                events: vec![JournaledEvent {
-                    journal_sequence: 1,
-                    session_id: Some(SessionId::new(session_id)),
-                    event: Some(output_event("agent-1", "later", 1)),
-                }],
-                acked_command_sequence: 0,
-            })),
-        })
-        .await
-        .expect("the event must journal");
+    for round in 1..=2u64 {
+        to_server
+            .send(PushEventsRequest {
+                body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                    events: vec![JournaledEvent {
+                        journal_sequence: round,
+                        session_id: Some(SessionId::new(session_id.clone())),
+                        event: Some(output_event("agent-1", "later", round)),
+                    }],
+                    acked_command_sequence: 0,
+                })),
+            })
+            .await
+            .expect("the event must journal");
 
-    let followed = stream.next().await.expect("a followed batch").expect("ok");
-    match followed.update {
-        Some(sync_events_response::Update::Batch(batch)) => assert_eq!(batch.events.len(), 1),
-        other => panic!("expected a batch after catching up, got {other:?}"),
+        let followed = stream.next().await.expect("a followed batch").expect("ok");
+        match followed.update {
+            Some(sync_events_response::Update::Batch(batch)) => {
+                assert_eq!(batch.events.len(), 1, "round {round}");
+            }
+            other => panic!("expected a batch after catching up, got {other:?}"),
+        }
     }
 }
 
