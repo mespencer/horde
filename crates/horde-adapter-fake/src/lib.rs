@@ -850,7 +850,7 @@ mod permission_path_tests {
 mod stall_tests {
     use std::time::Duration;
 
-    use horde_adapter::{Adapter, AgentSpec, TurnInput};
+    use horde_adapter::{Adapter, AgentEvent, AgentSpec, TurnInput};
 
     use super::FakeAdapter;
     use crate::{Script, ScriptedTurn, Step};
@@ -866,26 +866,40 @@ mod stall_tests {
         }
     }
 
-    /// A stalled turn must stop producing, even with steps left to play.
+    /// Long enough that reaching it means the stall was not honoured.
+    const FOREVER: Duration = Duration::from_secs(3600);
+
+    /// A stall must stop the turn where it stands, with steps still to play.
     ///
-    /// This is the case the `advance` guard exists for and the one my earlier
-    /// tests kept missing. The loop runs while nothing is pending, nothing is
-    /// awaited **and** nothing stalls; the `&&`-to-`||` mutant reassociates that
-    /// into "nothing pending **or** (nothing awaited and nothing stalling)", so
-    /// an empty queue alone is enough to keep playing — straight through the
-    /// stall.
+    /// `advance` loops while nothing is pending, nothing is awaited **and**
+    /// nothing stalls. The `&&`-to-`||` mutant reassociates that into "nothing
+    /// pending **or** (nothing awaited and nothing stalling)", so an empty queue
+    /// alone keeps it playing — straight through the stall and into the steps
+    /// behind it.
     ///
-    /// Real agents stall on a long tool call or a slow model. A fake that
-    /// played on regardless would make every timeout and backpressure test
-    /// measured against it meaningless, because the condition they are written
-    /// to exercise would never occur.
+    /// The stall has to be the turn's *first* step for that to be visible.
+    /// `advance` is only ever entered with an empty queue, and under the mutant
+    /// the queue stops being empty the moment any step emits something: a
+    /// `Stall` reached after a `Say` finds the queue full, and the mutant leaves
+    /// the loop exactly as the original does. Both then sleep, both hold the
+    /// caller, and a test that only asks whether the drain completed cannot tell
+    /// them apart. Reaching the stall on an empty queue is what separates them,
+    /// and then the difference is not *whether* the caller is held but *what it
+    /// was handed first*.
+    ///
+    /// Real agents stall on a long tool call or a slow model. A fake that played
+    /// on regardless would make every timeout and backpressure test measured
+    /// against it meaningless, because the condition they exist to exercise
+    /// would never occur.
     #[tokio::test]
-    async fn a_stalled_turn_produces_nothing_while_it_stalls() {
-        let script = Script::of(vec![
-            ScriptedTurn::saying("before the stall")
-                .with_step(Step::Stall(Duration::from_secs(3600)))
-                .with_step(Step::Say("after the stall".to_owned())),
-        ]);
+    async fn a_turn_that_stalls_first_plays_nothing_behind_the_stall() {
+        let script = Script::of(vec![ScriptedTurn {
+            steps: vec![
+                Step::Stall(FOREVER),
+                Step::Say("played on regardless".to_owned()),
+            ],
+            ..ScriptedTurn::saying("done")
+        }]);
 
         let mut session = FakeAdapter::new(script)
             .spawn(&spec())
@@ -893,26 +907,31 @@ mod stall_tests {
             .expect("spawns");
         session.send(TurnInput::queued("go")).await.expect("sends");
 
-        // Drain what the turn produced before the stall, bounded — the stall
-        // is real time, so an unbounded drain would wait it out.
-        let drain = tokio::time::timeout(Duration::from_millis(300), async {
-            let mut seen = 0_usize;
-            while let Ok(Some(_)) = session.next_event().await {
-                seen += 1;
-                if seen > 16 {
+        // Bounded, because the stall is real time and an unbounded drain would
+        // wait it out. Whatever arrives before the bound is what the session was
+        // willing to hand over while stalled.
+        let mut seen: Vec<AgentEvent> = Vec::new();
+        let held = tokio::time::timeout(Duration::from_millis(300), async {
+            while let Ok(Some(event)) = session.next_event().await {
+                seen.push(event);
+                if seen.len() > 16 {
                     break;
                 }
             }
-            seen
         })
         .await;
 
-        // Timing out IS the assertion: a stalled turn holds the caller rather
-        // than racing ahead. The mutant would have played "after the stall" and
-        // ended the turn, so the drain would have completed instead.
         assert!(
-            drain.is_err(),
-            "a stalled turn must hold rather than play on; the drain returned {drain:?}"
+            held.is_err(),
+            "a stalled turn must hold the caller rather than run to its end: {seen:?}"
         );
+        assert!(
+            !seen.iter().any(is_the_step_behind_the_stall),
+            "the step behind the stall was played before the stall elapsed: {seen:?}"
+        );
+    }
+
+    fn is_the_step_behind_the_stall(event: &AgentEvent) -> bool {
+        matches!(event, AgentEvent::Output { text, .. } if text == "played on regardless")
     }
 }
