@@ -71,6 +71,20 @@ string_id! {
     ToolCallId
 }
 
+/// Resolves an account name to the per-account directory it runs under.
+///
+/// A Worker-level resource (DESIGN.md §4): accounts are directories the Worker
+/// owns and advertises as a capability. Each provider names its own environment
+/// variable for this — `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — but the layout under
+/// the root is the same, so the resolution is.
+#[must_use]
+pub fn account_dir(
+    account: Option<&ProviderAccount>,
+    accounts_root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    account.map(|account| accounts_root.join(account.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProviderSessionId, ToolCallId, TurnId};

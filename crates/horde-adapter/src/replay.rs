@@ -194,8 +194,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_replays_its_events_in_order() {
+    async fn a_turn_replays_its_events_in_order_and_publishes_the_session_id() {
         let mut session = ReplaySession::new(Spelled::default(), one_turn());
+        assert!(
+            session.provider_session_id().is_none(),
+            "nothing is known until a turn has replayed"
+        );
         session
             .send(TurnInput::queued("hi"))
             .await
@@ -212,6 +216,10 @@ mod tests {
         assert!(
             session.next_event().await.expect("no error").is_none(),
             "the turn is drained"
+        );
+        assert_eq!(
+            session.provider_session_id().map(ToString::to_string),
+            Some("s1".to_owned())
         );
     }
 
@@ -240,20 +248,6 @@ mod tests {
             .await
             .expect_err("a recording that stopped decoding means the protocol moved");
         assert!(error.to_string().contains("moved"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn the_session_id_becomes_available_once_a_turn_has_replayed() {
-        let mut session = ReplaySession::new(Spelled::default(), one_turn());
-        assert!(session.provider_session_id().is_none());
-        session
-            .send(TurnInput::queued("hi"))
-            .await
-            .expect("must replay");
-        assert_eq!(
-            session.provider_session_id().map(ToString::to_string),
-            Some("s1".to_owned())
-        );
     }
 
     #[tokio::test]

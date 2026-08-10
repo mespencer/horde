@@ -59,6 +59,7 @@
 pub mod capability;
 pub mod error;
 pub mod event;
+pub mod identity;
 pub mod ids;
 pub mod permission;
 pub mod replay;
@@ -68,7 +69,8 @@ pub mod usage;
 pub use capability::{Capabilities, Capability, PermissionEnforcement};
 pub use error::AdapterError;
 pub use event::{AgentEvent, OutputChannel, TurnOutcome, TurnStatus};
-pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId};
+pub use identity::RevivalIdentity;
+pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId, account_dir};
 pub use permission::{PermissionDecision, PermissionDenial, ProposedToolCall};
 pub use replay::{LineDecoder, ReplaySession};
 pub use spec::{AgentSpec, Delivery, McpEndpoint, TurnInput};
