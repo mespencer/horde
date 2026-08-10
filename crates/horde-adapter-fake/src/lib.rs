@@ -635,6 +635,77 @@ mod guard_tests {
         );
     }
 
+    /// A pending decision must stop the script from advancing.
+    ///
+    /// `advance` loops while there is nothing pending, nothing awaited, and no
+    /// stall. The `&&`-to-`||` mutant survived, which would have kept playing
+    /// steps straight past an outstanding permission request — the fake would
+    /// run tool calls nobody approved, and every conformance run measured
+    /// against it would believe the permission chain had been honoured.
+    #[tokio::test]
+    async fn a_pending_permission_request_halts_the_script() {
+        use crate::{Script, ScriptedTurn, Step};
+
+        let script = Script::of(vec![
+            ScriptedTurn::saying("looking into it").with_step(Step::AskPermission {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                input: json!({ "command": "docker rm horde-test" }),
+            }),
+            ScriptedTurn::saying("done"),
+        ]);
+
+        let mut session = FakeAdapter::new(script)
+            .with_capabilities(
+                Capabilities::none()
+                    .with(Capability::PreAuthorizeToolCalls)
+                    .with(Capability::RewritesToolInput),
+            )
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        // Drain until the request surfaces, then confirm the turn has NOT
+        // ended: a turn that finished while a decision was outstanding is the
+        // bug this guard prevents.
+        let mut asked = false;
+        let mut ended_early = false;
+        for _ in 0..32 {
+            match session.next_event().await {
+                Ok(Some(horde_adapter::AgentEvent::PermissionRequested { .. })) => {
+                    asked = true;
+                    break;
+                }
+                Ok(Some(horde_adapter::AgentEvent::TurnEnded(_))) => {
+                    ended_early = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert!(asked, "the scripted permission request must surface");
+        assert!(
+            !ended_early,
+            "the turn must not end while a decision is outstanding"
+        );
+        // Stronger than yielding nothing: the session names what it is waiting
+        // for, so a caller that forgot to answer gets told which call is stuck
+        // rather than an empty stream it might read as a finished turn.
+        let stalled = session.next_event().await;
+        assert!(
+            stalled
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+                .contains("call-1"),
+            "the session must name the outstanding decision, got {stalled:?}"
+        );
+    }
+
     /// `shutdown()` must actually finish the session.
     ///
     /// The `Ok(())` mutant survived: a shutdown that returned success without

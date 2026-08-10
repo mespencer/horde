@@ -594,6 +594,26 @@ mod arithmetic_tests {
         assert_eq!(delta.cost_usd, 0.0);
     }
 
+    /// A decrease of exactly one epsilon is noise, not a restart.
+    ///
+    /// `observe` compares `cost + EPSILON < previous`, and the `<`-to-`<=`
+    /// mutant differs only at that exact boundary. Pinning it documents the
+    /// deliberate choice: the epsilon exists to absorb float noise, so a drop
+    /// no larger than the noise floor is not treated as a replaced process.
+    #[test]
+    fn a_cost_drop_within_the_noise_floor_is_not_a_restart() {
+        let mut accumulator = UsageAccumulator::new();
+        accumulator.observe(usage(10, 10), f64::EPSILON);
+
+        // Same counters, cost lower by exactly one epsilon.
+        let delta = accumulator.observe(usage(10, 10), 0.0);
+        assert!(
+            delta.tokens.is_zero(),
+            "a drop at the noise floor bills nothing rather than re-billing \
+             the whole reading as a fresh process"
+        );
+    }
+
     /// `remaining_fraction` on a window carrying nothing measurable.
     #[test]
     fn an_allowed_only_window_reports_no_fraction() {

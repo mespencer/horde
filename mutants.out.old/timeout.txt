@@ -1,5 +1,0 @@
-crates/horde-adapter-fake/src/lib.rs:82:9: replace FakeAdapter::with_capabilities -> Self with Default::default()
-crates/horde-adapter-fake/src/lib.rs:230:9: replace FakeSession::advance with ()
-crates/horde-adapter-fake/src/lib.rs:314:9: replace <impl AgentSession for FakeSession>::send -> Result<()> with Ok(())
-crates/horde-adapter-fake/src/lib.rs:385:9: replace <impl AgentSession for FakeSession>::next_event -> Result<Option<AgentEvent>> with Ok(None)
-crates/horde-adapter-fake/src/script.rs:176:9: replace Script::of -> Self with Default::default()
