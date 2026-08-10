@@ -142,6 +142,63 @@ async fn open_journal(
     Ok((to_server, acks))
 }
 
+/// Registers a worker so the scheduler has somewhere to place agents.
+async fn register_worker(harness: &mut Harness, worker_id: &str) -> Setup<u64> {
+    Ok(harness
+        .worker
+        .register_worker(RegisterWorkerRequest {
+            hello: None,
+            worker_id: Some(WorkerId::new(worker_id)),
+            capabilities: Some(WorkerCapabilities::default()),
+        })
+        .await?
+        .into_inner()
+        .resume_from_journal_sequence)
+}
+
+/// Spawns a root agent under `session_id` and returns its id and placement.
+async fn spawn_agent(
+    harness: &mut Harness,
+    session_id: &str,
+) -> Setup<(String, horde_proto::v1::Placement)> {
+    let spawned = harness
+        .control
+        .spawn_agent(SpawnAgentRequest {
+            session_id: Some(SessionId::new(session_id)),
+            parent_agent_id: None,
+            spec: Some(AgentSpec::default()),
+            idempotency_key: String::new(),
+        })
+        .await?
+        .into_inner();
+    let placement = spawned
+        .placement
+        .ok_or("a spawn always reports placement")?;
+    let agent_id = spawned
+        .agent_id
+        .map(|id| id.to_string())
+        .ok_or("a spawned agent has an id")?;
+    Ok((agent_id, placement))
+}
+
+/// Answers a pending permission, returning whatever the server made of it.
+async fn answer_permission(
+    harness: &mut Harness,
+    request_id: &str,
+    reason: &str,
+) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
+    harness
+        .control
+        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            reason: reason.to_owned(),
+            remember_for_session: false,
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
 fn output_event(agent: &str, text: &str, index: u64) -> Event {
     Event {
         agent_id: Some(AgentId::new(agent)),
@@ -167,18 +224,11 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         .expect("the harness must connect");
 
     // 1. The worker registers and is told where to resume from.
-    let registered = harness
-        .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+    let resume_from = register_worker(&mut harness, "worker-a")
         .await
-        .expect("registration must succeed")
-        .into_inner();
+        .expect("registration must succeed");
     assert_eq!(
-        registered.resume_from_journal_sequence, 1,
+        resume_from, 1,
         "a fresh worker starts at the first journal position"
     );
 
@@ -187,30 +237,15 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         .await
         .expect("a session must be creatable");
 
-    let spawned = harness
-        .control
-        .spawn_agent(SpawnAgentRequest {
-            session_id: Some(SessionId::new(session_id.clone())),
-            parent_agent_id: None,
-            spec: Some(AgentSpec::default()),
-            idempotency_key: String::new(),
-        })
+    let (agent_id, placement) = spawn_agent(&mut harness, &session_id)
         .await
-        .expect("spawn must succeed")
-        .into_inner();
-
-    let placement = spawned.placement.expect("a spawn always reports placement");
+        .expect("spawn must succeed");
     assert_eq!(
         placement.state,
         horde_proto::v1::PlacementState::Placed as i32,
         "with one worker registered the agent is placed: {}",
         placement.reason
     );
-    let agent_id = spawned
-        .agent_id
-        .map(|id| id.to_string())
-        .expect("a spawned agent has an id");
-
     // 3. The worker receives the spawn command.
     let mut commands = harness
         .worker
@@ -434,19 +469,9 @@ async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
         .await
         .expect("a session must be creatable");
 
-    let spawned = harness
-        .control
-        .spawn_agent(SpawnAgentRequest {
-            session_id: Some(SessionId::new(session_id)),
-            parent_agent_id: None,
-            spec: Some(AgentSpec::default()),
-            idempotency_key: String::new(),
-        })
+    let (agent_id, placement) = spawn_agent(&mut harness, &session_id)
         .await
-        .expect("spawn must not fail just because nothing can run it")
-        .into_inner();
-
-    let placement = spawned.placement.expect("a placement");
+        .expect("spawn must not fail just because nothing can run it");
     assert_eq!(
         placement.state,
         horde_proto::v1::PlacementState::Queued as i32
@@ -457,7 +482,7 @@ async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
         placement.reason
     );
     assert!(
-        spawned.agent_id.is_some(),
+        !agent_id.is_empty(),
         "the agent exists whether or not it is placed"
     );
 }
@@ -484,13 +509,7 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
         .await
         .expect("the harness must connect");
 
-    harness
-        .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+    register_worker(&mut harness, "worker-a")
         .await
         .expect("registration");
 
@@ -585,17 +604,9 @@ async fn a_permission_is_answered_by_request_id_alone() {
         .expect("the request must journal");
     acks.next().await.expect("a reply").expect("accepted");
 
-    let answered = harness
-        .control
-        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
-            request_id: Some(horde_proto::v1::PermissionRequestId::new("req-1")),
-            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
-            reason: "looks fine".to_owned(),
-            remember_for_session: false,
-        })
+    let answered = answer_permission(&mut harness, "req-1", "looks fine")
         .await
-        .expect("a pending permission must be answerable")
-        .into_inner();
+        .expect("a pending permission must be answerable");
     assert!(
         answered.sequence > 0,
         "the decision is an event like any other, so it has a sequence"
@@ -603,14 +614,7 @@ async fn a_permission_is_answered_by_request_id_alone() {
 
     // Answering it again fails: the projection dropped it when the decision
     // landed, so there is nothing left awaiting an answer.
-    let twice = harness
-        .control
-        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
-            request_id: Some(horde_proto::v1::PermissionRequestId::new("req-1")),
-            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
-            reason: String::new(),
-            remember_for_session: false,
-        })
+    let twice = answer_permission(&mut harness, "req-1", "")
         .await
         .expect_err("an answered permission is no longer pending");
     assert_eq!(twice.code(), Code::InvalidArgument);
@@ -624,14 +628,7 @@ async fn answering_a_permission_nobody_asked_for_is_refused() {
         .await
         .expect("a session must be creatable");
 
-    let status = harness
-        .control
-        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
-            request_id: Some(horde_proto::v1::PermissionRequestId::new("never-asked")),
-            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
-            reason: String::new(),
-            remember_for_session: false,
-        })
+    let status = answer_permission(&mut harness, "never-asked", "")
         .await
         .expect_err("inventing a decision for an unknown request would be worse");
     assert_eq!(status.code(), Code::InvalidArgument);
@@ -645,32 +642,15 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
     // agent must be refused rather than interrupting something else.
     let core = core().expect("an in-memory core");
     let mut harness = connect(core).await.expect("the harness must connect");
-    harness
-        .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+    register_worker(&mut harness, "worker-a")
         .await
         .expect("the worker must register");
     let session_id = create_session(&mut harness, "findable", "key-1")
         .await
         .expect("a session must be creatable");
-    let agent_id = harness
-        .control
-        .spawn_agent(SpawnAgentRequest {
-            session_id: Some(SessionId::new(session_id)),
-            parent_agent_id: None,
-            spec: Some(AgentSpec::default()),
-            idempotency_key: String::new(),
-        })
+    let (agent_id, _placement) = spawn_agent(&mut harness, &session_id)
         .await
-        .expect("spawn must succeed")
-        .into_inner()
-        .agent_id
-        .map(|id| id.to_string())
-        .expect("a spawned agent has an id");
+        .expect("spawn must succeed");
 
     let interrupted = harness
         .control

@@ -55,6 +55,27 @@ impl ControlPlane {
     }
 
     /// Appends a server-originated event to a session.
+    /// Appends an event that belongs to one agent and carries no idempotency
+    /// key — the shape every client-initiated agent action has.
+    async fn append_agent_event(
+        &self,
+        session_id: &str,
+        agent_id: String,
+        kind: Kind,
+    ) -> Result<u64, ServerError> {
+        self.append(
+            session_id,
+            "",
+            Event {
+                agent_id: Some(AgentId::new(agent_id)),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(kind),
+            },
+        )
+        .await
+    }
+
     async fn append(
         &self,
         session_id: &str,
@@ -463,18 +484,13 @@ impl ControlPlaneService for ControlPlane {
             .map_err(Status::from)?;
 
         let sequence = self
-            .append(
+            .append_agent_event(
                 &session_id,
-                "",
-                Event {
-                    agent_id: Some(AgentId::new(agent_id)),
-                    occurred_at: None,
-                    idempotency_key: String::new(),
-                    kind: Some(Kind::TurnInterrupted(horde_proto::v1::TurnInterrupted {
-                        reason: request.reason,
-                        ..horde_proto::v1::TurnInterrupted::default()
-                    })),
-                },
+                agent_id,
+                Kind::TurnInterrupted(horde_proto::v1::TurnInterrupted {
+                    reason: request.reason,
+                    ..horde_proto::v1::TurnInterrupted::default()
+                }),
             )
             .await
             .map_err(Status::from)?;
@@ -511,29 +527,20 @@ impl ControlPlaneService for ControlPlane {
         })?;
 
         let sequence = self
-            .append(
+            .append_agent_event(
                 &session_id,
-                "",
-                Event {
-                    agent_id: Some(AgentId::new(agent_id)),
-                    occurred_at: None,
-                    idempotency_key: String::new(),
-                    kind: Some(Kind::PermissionDecided(
-                        horde_proto::v1::PermissionDecided {
-                            decision: Some(horde_proto::v1::PermissionDecision {
-                                request_id: Some(horde_proto::v1::PermissionRequestId::new(
-                                    request_id,
-                                )),
-                                outcome: request.outcome,
-                                decided_by: horde_proto::v1::PermissionLayer::Human as i32,
-                                decided_by_actor: None,
-                                reason: request.reason,
-                                remember_for_session: request.remember_for_session,
-                                updated_input: None,
-                            }),
-                        },
-                    )),
-                },
+                agent_id,
+                Kind::PermissionDecided(horde_proto::v1::PermissionDecided {
+                    decision: Some(horde_proto::v1::PermissionDecision {
+                        request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+                        outcome: request.outcome,
+                        decided_by: horde_proto::v1::PermissionLayer::Human as i32,
+                        decided_by_actor: None,
+                        reason: request.reason,
+                        remember_for_session: request.remember_for_session,
+                        updated_input: None,
+                    }),
+                }),
             )
             .await
             .map_err(Status::from)?;
