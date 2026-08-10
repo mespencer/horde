@@ -227,12 +227,12 @@ fn exclusion_value(config: &str) -> Option<String> {
 }
 
 fn is_exclusion_key(line: &str) -> bool {
-    !line.starts_with('#')
-        && line.starts_with("exclude_re")
-        && line
-            .trim_start_matches("exclude_re")
-            .trim_start()
-            .starts_with('=')
+    // A commented-out key does not start with the key, so `#` needs no test of
+    // its own; the caller trims first.
+    let Some(rest) = line.strip_prefix("exclude_re") else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
 }
 
 /// The TOML strings in an array body, in either quoting style.
