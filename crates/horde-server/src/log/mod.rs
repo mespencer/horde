@@ -293,6 +293,17 @@ fn needs_sweep(head_after_replay: u64, delivered: u64) -> bool {
     head_after_replay > delivered
 }
 
+/// Whether a notification tells this tail nothing new.
+///
+/// Extracted for the same reason as [`needs_sweep`]: inline, the two halves of
+/// this condition are not separately reachable. A tail only ever sees
+/// notifications it already delivered *or* notifications for other sessions in
+/// the same run, so an `&&` still behaves correctly often enough to pass —
+/// as a predicate the truth table is four cases and all four are asserted.
+fn is_stale(notification: &Notification, session_id: &str, delivered: u64) -> bool {
+    notification.session_id != session_id || notification.sequence <= delivered
+}
+
 /// A live follow of one session, already positioned after its replay.
 pub struct Tail {
     log: EventLog,
@@ -322,9 +333,7 @@ impl Tail {
         loop {
             match self.notifications.recv().await {
                 Ok(notification) => {
-                    if notification.session_id != self.session_id
-                        || notification.sequence <= self.delivered
-                    {
+                    if is_stale(&notification, &self.session_id, self.delivered) {
                         continue;
                     }
                 }
@@ -516,6 +525,32 @@ mod tests {
         let tail = log.read_all_from("s1", 100).await.expect("paging");
         let sequences: Vec<u64> = tail.iter().map(|event| event.sequence).collect();
         assert_eq!(sequences, (100..=600).collect::<Vec<u64>>());
+    }
+
+    /// All four corners of the skip condition. Inline these are not separately
+    /// reachable, which is why an `&&` survived: a tail that skipped only when
+    /// a notification was *both* for another session *and* already delivered
+    /// still behaves correctly in the common case.
+    #[test]
+    fn a_notification_is_stale_when_it_is_for_another_session_or_already_delivered() {
+        let notification = |session: &str, sequence: u64| super::Notification {
+            session_id: session.to_owned(),
+            sequence,
+        };
+
+        // Neither: this is the one notification that must wake the tail.
+        assert!(!super::is_stale(&notification("s1", 5), "s1", 4));
+
+        // Wrong session only.
+        assert!(super::is_stale(&notification("other", 5), "s1", 4));
+
+        // Already delivered only — both the equal and the below-head cases,
+        // since `<=` and `<` disagree exactly at the boundary.
+        assert!(super::is_stale(&notification("s1", 4), "s1", 4));
+        assert!(super::is_stale(&notification("s1", 3), "s1", 4));
+
+        // Both.
+        assert!(super::is_stale(&notification("other", 3), "s1", 4));
     }
 
     #[tokio::test]

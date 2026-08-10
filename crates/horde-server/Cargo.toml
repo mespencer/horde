@@ -15,7 +15,7 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "process"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["server", "channel"] }
 tracing = "0.1.44"
