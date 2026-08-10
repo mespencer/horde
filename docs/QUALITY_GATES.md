@@ -375,12 +375,32 @@ large the workspace has become. On `main` the merge-base is `HEAD` itself, which
 leave nothing to compare against — so the baseline is the first parent, which for a merge
 commit is precisely the trunk it landed on. Same question, asked of the merge.
 
-**What this scope cannot see, and what to do about it.** A gate that only ever looks at
-diffs never re-examines code no recent diff has touched. That is not a hypothetical: the
-first whole-tree run on this workspace found **92 surviving mutants** in crates that had
-only ever been measured through someone's diff. `--full` is how you ask the other
-question, and somebody has to actually ask it — periodically, not never. Treat a green
-diff-scoped row as "this change is covered", never as "the workspace is covered".
+**What this scope cannot see.** A gate that only ever looks at diffs never re-examines
+code no recent diff has touched. Not hypothetical: the first whole-tree run on this
+workspace found **92 surviving mutants** in crates that had only ever been measured
+through somebody's diff. Treat a green diff-scoped row as "this change is covered", never
+as "the workspace is covered" — the row says which it is, in words, for that reason.
+
+**When the whole-tree sweep runs: at every wave boundary.** `--full` is the answer to the
+other question, and the thing that failed before was not that the sweep was skipped but
+that nobody had ever run it at all. A calendar reminder would be the same promise in a
+new costume, so the sweep is pinned to an event this project already has:
+IMPLEMENTATION.md's waves. Before a wave is declared finished, whoever is running it does:
+
+```
+gauntlet run --full        # ~24 minutes at 1100 mutants; expect to schedule around it
+```
+
+and the next wave does not start on a red one. Wave boundaries are the right moment
+because that is exactly when the next tranche of work is about to be built on whatever
+the last one left behind, and they arrive often enough that a sweep is never archaeology.
+Once there is a release process, tagging joins the list.
+
+This is deliberately *not* enforced by a timer inside the gate. A gate that reds because
+of the calendar rather than the code teaches people to ignore it, and the gate has no
+honest way to know when the last sweep happened — nothing in git records it. Making the
+sweep an owned step in an existing ritual is weaker than a machine check and stronger
+than a good intention, and it is the strongest thing available here.
 
 Falling back to the whole tree when there is no baseline is deliberate: an absent branch
 or a root commit must never quietly shrink the gate to nothing. Timeouts live in
