@@ -343,11 +343,17 @@ mod tests {
     use super::store::pending;
     use super::{EventLog, PendingEvent};
 
-    #[tokio::test]
-    async fn appends_are_visible_to_a_later_read() {
+    /// A log with two events already in session `s1`.
+    async fn log_with_two_events() -> EventLog {
         let log = EventLog::in_memory().expect("in-memory log");
         log.append(pending("s1", b"a")).await.expect("append");
         log.append(pending("s1", b"b")).await.expect("append");
+        log
+    }
+
+    #[tokio::test]
+    async fn appends_are_visible_to_a_later_read() {
+        let log = log_with_two_events().await;
 
         let all = log.read_all("s1").await.expect("read");
         assert_eq!(all.len(), 2);
@@ -357,9 +363,7 @@ mod tests {
     /// The property the whole module exists for, in its simplest form.
     #[tokio::test]
     async fn a_tail_started_mid_stream_sees_everything_appended_afterwards() {
-        let log = EventLog::in_memory().expect("in-memory log");
-        log.append(pending("s1", b"a")).await.expect("append");
-        log.append(pending("s1", b"b")).await.expect("append");
+        let log = log_with_two_events().await;
 
         let (history, mut tail) = log.tail("s1", 2).await.expect("tail");
         assert_eq!(history.len(), 1, "replay starts at the requested offset");
