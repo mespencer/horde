@@ -161,6 +161,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct Spelled {
         session_id: Option<ProviderSessionId>,
+        interrupts: usize,
     }
 
     impl LineDecoder for Spelled {
@@ -190,6 +191,10 @@ mod tests {
 
         fn provider_session_id(&self) -> Option<ProviderSessionId> {
             self.session_id.clone()
+        }
+
+        fn note_interrupt_requested(&mut self) {
+            self.interrupts += 1;
         }
     }
 
@@ -268,9 +273,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupting_a_recording_is_a_no_op_and_shutdown_empties_it() {
+    async fn an_interrupt_reaches_the_decoder_even_though_it_cancels_nothing() {
         let mut session = ReplaySession::new(Spelled::default(), one_turn());
         session.interrupt().await.expect("nothing left to cancel");
+        assert_eq!(
+            session.decoder.interrupts, 1,
+            "a decoder may need to know an interrupt was asked for, even though \
+             the recording already contains whatever it did"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_empties_the_recording() {
+        let mut session = ReplaySession::new(Spelled::default(), one_turn());
+        assert_eq!(session.remaining_turns(), 1);
         session.shutdown().await.expect("shutdown");
         assert_eq!(session.remaining_turns(), 0);
     }

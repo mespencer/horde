@@ -18,3 +18,27 @@ pub use horde_adapter::RevivalIdentity;
 pub fn codex_home_for(account: Option<&ProviderAccount>, accounts_root: &Path) -> Option<PathBuf> {
     horde_adapter::account_dir(account, accounts_root)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use horde_adapter::ProviderAccount;
+
+    use super::codex_home_for;
+
+    #[test]
+    fn an_account_names_a_directory_under_the_accounts_root() {
+        let account = ProviderAccount::new("work");
+        assert_eq!(
+            codex_home_for(Some(&account), Path::new("/accounts")),
+            Some(Path::new("/accounts/work").to_path_buf()),
+            "one account is one CODEX_HOME"
+        );
+    }
+
+    #[test]
+    fn no_account_means_the_inherited_directory() {
+        assert_eq!(codex_home_for(None, Path::new("/accounts")), None);
+    }
+}

@@ -648,6 +648,7 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
     let session_id = create_session(&mut harness, "findable", "key-1")
         .await
         .expect("a session must be creatable");
+    let interrupted_session = session_id.clone();
     let (agent_id, _placement) = spawn_agent(&mut harness, &session_id)
         .await
         .expect("spawn must succeed");
@@ -663,6 +664,13 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
         .into_inner();
     assert!(interrupted.sequence > 0);
 
+    // The reason has to reach the log — it is what an attached client shows to
+    // explain why a turn stopped.
+    let reasons = interrupt_reasons(&mut harness.control, &interrupted_session)
+        .await
+        .expect("the session must be readable");
+    assert_eq!(reasons, vec!["changed my mind".to_owned()]);
+
     let status = harness
         .control
         .interrupt_agent(horde_proto::v1::InterruptAgentRequest {
@@ -672,6 +680,155 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
         .await
         .expect_err("an unknown agent must not resolve to some other session");
     assert_eq!(status.code(), Code::NotFound);
+}
+
+/// The reason on every `TurnInterrupted` recorded for a session.
+async fn interrupt_reasons(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+) -> Setup<Vec<String>> {
+    let mut stream = control
+        .sync_events(SyncEventsRequest {
+            cursors: vec![SessionCursor {
+                session_id: Some(SessionId::new(session_id)),
+                from_sequence: 0,
+            }],
+            all_sessions: false,
+            subtree_root: None,
+            follow: false,
+            max_batch_events: 0,
+        })
+        .await?
+        .into_inner();
+
+    let mut reasons = Vec::new();
+    while let Some(message) = stream.next().await {
+        if let Some(sync_events_response::Update::Batch(batch)) = message?.update {
+            for envelope in batch.events {
+                if let Some(Kind::TurnInterrupted(interrupted)) =
+                    envelope.event.and_then(|event| event.kind)
+                {
+                    reasons.push(interrupted.reason);
+                }
+            }
+        }
+    }
+    Ok(reasons)
+}
+
+/// Everything a sync stream delivered, in order, without stopping early.
+async fn sync_everything(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+    follow: bool,
+) -> Setup<Vec<String>> {
+    let mut stream = control
+        .sync_events(SyncEventsRequest {
+            cursors: vec![SessionCursor {
+                session_id: Some(SessionId::new(session_id)),
+                from_sequence: 0,
+            }],
+            all_sessions: false,
+            subtree_root: None,
+            follow,
+            max_batch_events: 0,
+        })
+        .await?
+        .into_inner();
+
+    let mut updates = Vec::new();
+    while let Some(message) = stream.next().await {
+        match message?.update {
+            Some(sync_events_response::Update::Batch(batch)) => {
+                updates.push(format!("batch:{}", batch.events.len()));
+            }
+            Some(sync_events_response::Update::CaughtUp(_)) => updates.push("caught-up".to_owned()),
+            _ => {}
+        }
+    }
+    Ok(updates)
+}
+
+#[tokio::test]
+async fn a_sync_that_is_not_following_ends_at_the_caught_up_marker() {
+    // Read the stream to its end rather than stopping at caught-up: a client
+    // that is not following needs the stream to actually close, or it waits
+    // forever for a completion that never comes.
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    let session_id = create_session(&mut harness, "syncing", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let updates = sync_everything(&mut harness.control, &session_id, false)
+        .await
+        .expect("a non-following sync must complete on its own");
+
+    assert_eq!(
+        updates,
+        vec!["batch:1".to_owned(), "caught-up".to_owned()],
+        "history arrives before the marker, and nothing arrives after it"
+    );
+}
+
+#[tokio::test]
+async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    let session_id = create_session(&mut harness, "following", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let mut stream = harness
+        .control
+        .sync_events(SyncEventsRequest {
+            cursors: vec![SessionCursor {
+                session_id: Some(SessionId::new(session_id.clone())),
+                from_sequence: 0,
+            }],
+            all_sessions: false,
+            subtree_root: None,
+            follow: true,
+            max_batch_events: 0,
+        })
+        .await
+        .expect("the sync stream must open")
+        .into_inner();
+
+    // History, then the marker.
+    assert!(matches!(
+        stream.next().await.expect("history").expect("ok").update,
+        Some(sync_events_response::Update::Batch(_))
+    ));
+    assert!(matches!(
+        stream.next().await.expect("marker").expect("ok").update,
+        Some(sync_events_response::Update::CaughtUp(_))
+    ));
+
+    // Now append something and watch it arrive on the same stream.
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("the event stream must open");
+    acks.next().await.expect("a reply").expect("accepted");
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events: vec![JournaledEvent {
+                    journal_sequence: 1,
+                    session_id: Some(SessionId::new(session_id)),
+                    event: Some(output_event("agent-1", "later", 1)),
+                }],
+                acked_command_sequence: 0,
+            })),
+        })
+        .await
+        .expect("the event must journal");
+
+    let followed = stream.next().await.expect("a followed batch").expect("ok");
+    match followed.update {
+        Some(sync_events_response::Update::Batch(batch)) => assert_eq!(batch.events.len(), 1),
+        other => panic!("expected a batch after catching up, got {other:?}"),
+    }
 }
 
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.

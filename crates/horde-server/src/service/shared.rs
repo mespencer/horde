@@ -58,3 +58,20 @@ pub const SERVER_SEMVER: &str = env!("CARGO_PKG_VERSION");
 
 /// Below this, a peer's role is refused outright (DESIGN.md §2).
 pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";
+
+#[cfg(test)]
+mod tests {
+    use super::ServerCore;
+    use crate::log::EventLog;
+
+    #[test]
+    fn a_core_debugs_as_how_many_workers_it_can_see() {
+        let core = ServerCore::new(EventLog::in_memory().expect("in-memory log"));
+        let rendered = format!("{core:?}");
+        assert!(rendered.contains("ServerCore"), "{rendered}");
+        assert!(
+            rendered.contains('0'),
+            "a fresh core has no connected workers: {rendered}"
+        );
+    }
+}
