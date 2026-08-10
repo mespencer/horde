@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace == with != in FakeSession::end_turn
+@@ -292,17 +292,17 @@
+         let ended = AgentEvent::TurnEnded(TurnOutcome {
+             turn_id: current.turn_id,
+             status: current.status,
+             text: current.text,
+             usage,
+             denials: std::mem::take(&mut self.denials),
+             duration: Duration::from_millis(1),
+         });
+-        if self.misbehaviour == Some(Misbehaviour::EndTurnTwice) {
++        if self.misbehaviour != /* ~ changed by cargo-mutants ~ */ Some(Misbehaviour::EndTurnTwice) {
+             self.pending.push_back(ended.clone());
+         }
+         self.pending.push_back(ended);
+     }
+ }
+ 
+ #[async_trait]
+ impl AgentSession for FakeSession {

@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace && with || in <impl AgentSession for FakeSession>::send
+@@ -307,17 +307,17 @@
+ #[async_trait]
+ impl AgentSession for FakeSession {
+     fn provider_session_id(&self) -> Option<&ProviderSessionId> {
+         self.announced.then_some(&self.provider_session_id)
+     }
+ 
+     async fn send(&mut self, input: TurnInput) -> Result<()> {
+         if input.delivery == horde_adapter::Delivery::Interrupt
+-            && !self.capabilities.supports(Capability::InterruptibleTurn)
++            || /* ~ changed by cargo-mutants ~ */ !self.capabilities.supports(Capability::InterruptibleTurn)
+         {
+             return Err(AdapterError::Unsupported {
+                 provider: self.provider.clone(),
+                 capability: Capability::InterruptibleTurn,
+             });
+         }
+         if self.finished {
+             return Err(AdapterError::HarnessExited { exit_code: Some(0) });

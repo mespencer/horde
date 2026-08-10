@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace <impl Adapter for FakeAdapter>::provider -> &str with "xyzzy"
+@@ -123,17 +123,17 @@
+     fn default() -> Self {
+         Self::new(Script::echoing())
+     }
+ }
+ 
+ #[async_trait]
+ impl Adapter for FakeAdapter {
+     fn provider(&self) -> &str {
+-        &self.provider
++        "xyzzy" /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn capabilities(&self) -> Capabilities {
+         self.capabilities.clone()
+     }
+ 
+     async fn spawn(&self, _spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
+         Ok(Box::new(self.session(self.mint_session_id())))

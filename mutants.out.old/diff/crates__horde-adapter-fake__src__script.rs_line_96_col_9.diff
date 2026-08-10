@@ -1,0 +1,23 @@
+--- crates/horde-adapter-fake/src/script.rs
++++ replace ScriptedTurn::with_usage -> Self with Default::default()
+@@ -88,19 +88,17 @@
+     #[must_use]
+     pub fn with_status(mut self, status: TurnStatus) -> Self {
+         self.status = status;
+         self
+     }
+ 
+     #[must_use]
+     pub fn with_usage(mut self, usage: TokenUsage, cost_usd: f64) -> Self {
+-        self.usage = usage;
+-        self.cost_usd = cost_usd;
+-        self
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// A whole scripted conversation.
+ ///
+ /// ```
+ /// use horde_adapter_fake::{Script, ScriptedTurn, Step};
+ /// use serde_json::json;

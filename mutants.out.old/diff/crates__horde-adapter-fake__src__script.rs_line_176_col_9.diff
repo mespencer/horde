@@ -1,0 +1,25 @@
+--- crates/horde-adapter-fake/src/script.rs
++++ replace Script::of -> Self with Default::default()
+@@ -168,21 +168,17 @@
+     #[must_use]
+     pub fn echoing() -> Self {
+         Self::default()
+     }
+ 
+     /// A script that plays these turns, then echoes.
+     #[must_use]
+     pub fn of(turns: Vec<ScriptedTurn>) -> Self {
+-        Self {
+-            turns,
+-            exhausted: Exhausted::Echo,
+-            misbehaviour: None,
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Makes this agent break the adapter contract in a specific way.
+     ///
+     /// Only for testing the conformance suite itself.
+     #[must_use]
+     pub fn misbehaving(mut self, misbehaviour: Misbehaviour) -> Self {
+         self.misbehaviour = Some(misbehaviour);

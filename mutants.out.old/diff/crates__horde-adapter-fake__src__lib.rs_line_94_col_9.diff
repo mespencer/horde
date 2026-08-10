@@ -1,0 +1,22 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace FakeAdapter::mint_session_id -> ProviderSessionId with Default::default()
+@@ -86,18 +86,17 @@
+     /// Overrides the advertised provider key, for tests that route by provider.
+     #[must_use]
+     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+         self.provider = provider.into();
+         self
+     }
+ 
+     fn mint_session_id(&self) -> ProviderSessionId {
+-        let ordinal = self.next_session.fetch_add(1, Ordering::Relaxed);
+-        ProviderSessionId::new(format!("fake-session-{ordinal}"))
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn session(&self, provider_session_id: ProviderSessionId) -> FakeSession {
+         FakeSession {
+             script: self.script.clone(),
+             capabilities: self.capabilities.clone(),
+             provider: self.provider.clone(),
+             provider_session_id,

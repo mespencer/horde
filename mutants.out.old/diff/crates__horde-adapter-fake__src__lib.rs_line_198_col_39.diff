@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace == with != in FakeSession::next_chunk_index
+@@ -190,17 +190,17 @@
+ impl FakeSession {
+     fn next_chunk_index(&mut self, channel: OutputChannel) -> u64 {
+         if self.misbehaviour == Some(Misbehaviour::RepeatChunkIndex) {
+             return 0;
+         }
+         match self
+             .chunk_counters
+             .iter_mut()
+-            .find(|(known, _)| *known == channel)
++            .find(|(known, _)| *known != /* ~ changed by cargo-mutants ~ */ channel)
+         {
+             Some((_, next)) => {
+                 let index = *next;
+                 *next = next.saturating_add(1);
+                 index
+             }
+             None => {
+                 self.chunk_counters.push((channel, 1));

@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/script.rs
++++ replace Script::echoing -> Self with Default::default()
+@@ -162,17 +162,17 @@
+     Exit,
+ }
+ 
+ impl Script {
+     /// A script that echoes every message. The default agent for tests that do
+     /// not care what the agent says.
+     #[must_use]
+     pub fn echoing() -> Self {
+-        Self::default()
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// A script that plays these turns, then echoes.
+     #[must_use]
+     pub fn of(turns: Vec<ScriptedTurn>) -> Self {
+         Self {
+             turns,
+             exhausted: Exhausted::Echo,

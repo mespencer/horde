@@ -1,0 +1,22 @@
+--- crates/horde-adapter-fake/src/script.rs
++++ replace ScriptedTurn::with_step -> Self with Default::default()
+@@ -76,18 +76,17 @@
+                 ..TokenUsage::default()
+             },
+             cost_usd: 0.001,
+         }
+     }
+ 
+     #[must_use]
+     pub fn with_step(mut self, step: Step) -> Self {
+-        self.steps.push(step);
+-        self
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     #[must_use]
+     pub fn with_status(mut self, status: TurnStatus) -> Self {
+         self.status = status;
+         self
+     }
+ 

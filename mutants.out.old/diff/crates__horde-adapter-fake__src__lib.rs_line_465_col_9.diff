@@ -1,0 +1,36 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace <impl AgentSession for FakeSession>::interrupt -> Result<()> with Ok(())
+@@ -457,32 +457,17 @@
+                     is_error: true,
+                 });
+             }
+         }
+         Ok(())
+     }
+ 
+     async fn interrupt(&mut self) -> Result<()> {
+-        if !self.capabilities.supports(Capability::InterruptibleTurn) {
+-            return Err(AdapterError::Unsupported {
+-                provider: self.provider.clone(),
+-                capability: Capability::InterruptibleTurn,
+-            });
+-        }
+-
+-        // Drop the rest of the turn, but still close it — an interrupt is a way
+-        // for a turn to end, not a way to skip ending it.
+-        self.steps.clear();
+-        self.waiting_on = None;
+-        if let Some(current) = self.current.as_mut() {
+-            current.status = TurnStatus::Interrupted;
+-            current.text = None;
+-        }
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn shutdown(&mut self) -> Result<()> {
+         self.finished = true;
+         self.steps.clear();
+         self.pending.clear();
+         self.current = None;
+         Ok(())

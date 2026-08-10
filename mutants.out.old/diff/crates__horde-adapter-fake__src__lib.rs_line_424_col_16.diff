@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ delete ! in <impl AgentSession for FakeSession>::answer_permission
+@@ -416,17 +416,17 @@
+         decision: PermissionDecision,
+     ) -> Result<()> {
+         if self.waiting_on.as_ref() != Some(tool_call_id) {
+             return Err(AdapterError::UnknownPermissionRequest {
+                 tool_call_id: tool_call_id.clone(),
+             });
+         }
+         if decision.updated_input().is_some()
+-            && !self.capabilities.supports(Capability::RewritesToolInput)
++            &&  /* ~ changed by cargo-mutants ~ */self.capabilities.supports(Capability::RewritesToolInput)
+         {
+             return Err(AdapterError::Unsupported {
+                 provider: self.provider.clone(),
+                 capability: Capability::RewritesToolInput,
+             });
+         }
+ 
+         self.waiting_on = None;

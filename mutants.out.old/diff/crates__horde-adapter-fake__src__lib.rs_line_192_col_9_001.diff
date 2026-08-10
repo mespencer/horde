@@ -1,0 +1,38 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace FakeSession::next_chunk_index -> u64 with 1
+@@ -184,34 +184,17 @@
+     misbehaviour: Option<Misbehaviour>,
+     /// Set by a `Stall` step; awaited by `next_event`, which is the only async
+     /// point in the session.
+     stall: Option<Duration>,
+ }
+ 
+ impl FakeSession {
+     fn next_chunk_index(&mut self, channel: OutputChannel) -> u64 {
+-        if self.misbehaviour == Some(Misbehaviour::RepeatChunkIndex) {
+-            return 0;
+-        }
+-        match self
+-            .chunk_counters
+-            .iter_mut()
+-            .find(|(known, _)| *known == channel)
+-        {
+-            Some((_, next)) => {
+-                let index = *next;
+-                *next = next.saturating_add(1);
+-                index
+-            }
+-            None => {
+-                self.chunk_counters.push((channel, 1));
+-                0
+-            }
+-        }
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn emit_output(&mut self, channel: OutputChannel, text: String) {
+         let chunk_index = self.next_chunk_index(channel);
+         let turn_id = self.turn_id();
+         self.pending.push_back(AgentEvent::Output {
+             turn_id,
+             channel,

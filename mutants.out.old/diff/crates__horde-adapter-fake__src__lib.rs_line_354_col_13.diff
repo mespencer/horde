@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ delete match arm Some(Misbehaviour::SkipSessionEstablished) in <impl AgentSession for FakeSession>::send
+@@ -346,17 +346,17 @@
+             turn_id: self.turn_id(),
+             text: turn.text,
+             status: turn.status,
+             tokens: turn.usage,
+             cost_usd: turn.cost_usd,
+         });
+ 
+         match self.misbehaviour {
+-            Some(Misbehaviour::SkipSessionEstablished) => {}
++             /* ~ changed by cargo-mutants ~ */
+             Some(Misbehaviour::ChangeSessionIdMidConversation) => {
+                 // A different name every turn, so revival would target the
+                 // wrong conversation.
+                 self.announced = true;
+                 self.provider_session_id =
+                     ProviderSessionId::new(format!("fake-session-{}", self.turns_taken));
+                 self.pending.push_back(AgentEvent::SessionEstablished {
+                     provider_session_id: self.provider_session_id.clone(),

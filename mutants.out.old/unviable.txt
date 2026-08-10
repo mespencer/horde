@@ -1,19 +1,13 @@
-crates/horde-adapter-claude/src/codec.rs:37:5: replace decode_line -> Result<Envelope, AdapterError> with Ok(Default::default())
-crates/horde-adapter-claude/src/codec.rs:62:5: replace classify -> Result<Event, AdapterError> with Ok(Default::default())
-crates/horde-adapter-claude/src/codec.rs:80:5: replace system_event -> Result<Event, AdapterError> with Ok(Default::default())
-crates/horde-adapter-claude/src/codec.rs:95:5: replace typed -> Result<T, AdapterError> with Ok(Default::default())
-crates/horde-adapter-claude/src/permission.rs:44:9: replace PromptRequest::to_proposed_call -> ProposedToolCall with Default::default()
-crates/horde-adapter-claude/src/replay.rs:27:9: replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![Default::default()])
-crates/horde-adapter-claude/src/replay.rs:32:9: replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())
-crates/horde-adapter-claude/src/replay.rs:38:9: replace <impl LineDecoder for StreamJsonLines>::no_permission_channel -> AdapterError with Default::default()
-crates/horde-adapter-claude/src/replay.rs:50:5: replace replay -> ReplaySession with Default::default()
-crates/horde-adapter-claude/src/turn.rs:51:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())
-crates/horde-adapter-claude/src/turn.rs:59:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-claude/src/turn.rs:87:9: replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-claude/src/turn.rs:119:9: replace TurnAssembler::output -> AgentEvent with Default::default()
-crates/horde-adapter-claude/src/turn.rs:111:9: replace TurnAssembler::turn_id -> TurnId with Default::default()
-crates/horde-adapter-claude/src/turn.rs:131:9: replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-claude/src/turn.rs:176:9: replace TurnAssembler::end_turn -> AgentEvent with Default::default()
-crates/horde-adapter-claude/src/turn.rs:152:9: replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-claude/src/turn.rs:181:21: replace + with * in TurnAssembler::end_turn
-crates/horde-adapter-claude/src/turn.rs:218:5: replace turn_status -> TurnStatus with Default::default()
+crates/horde-adapter-fake/src/lib.rs:94:9: replace FakeAdapter::mint_session_id -> ProviderSessionId with Default::default()
+crates/horde-adapter-fake/src/lib.rs:99:9: replace FakeAdapter::session -> FakeSession with Default::default()
+crates/horde-adapter-fake/src/lib.rs:139:9: replace <impl Adapter for FakeAdapter>::spawn -> Result<Box<dyn AgentSession>> with Ok(Box::new(Default::default()))
+crates/horde-adapter-fake/src/lib.rs:147:9: replace <impl Adapter for FakeAdapter>::resume -> Result<Box<dyn AgentSession>> with Ok(Box::new(Default::default()))
+crates/horde-adapter-fake/src/lib.rs:224:9: replace FakeSession::turn_id -> TurnId with Default::default()
+crates/horde-adapter-fake/src/lib.rs:282:32: replace += with -= in FakeSession::end_turn
+crates/horde-adapter-fake/src/lib.rs:282:32: replace += with *= in FakeSession::end_turn
+crates/horde-adapter-fake/src/lib.rs:310:9: replace <impl AgentSession for FakeSession>::provider_session_id -> Option<&ProviderSessionId> with Some(Box::leak(Box::new(Default::default())))
+crates/horde-adapter-fake/src/lib.rs:385:9: replace <impl AgentSession for FakeSession>::next_event -> Result<Option<AgentEvent>> with Ok(Some(Default::default()))
+crates/horde-adapter-fake/src/script.rs:68:9: replace ScriptedTurn::saying -> Self with Default::default()
+crates/horde-adapter-fake/src/script.rs:84:9: replace ScriptedTurn::with_step -> Self with Default::default()
+crates/horde-adapter-fake/src/script.rs:90:9: replace ScriptedTurn::with_status -> Self with Default::default()
+crates/horde-adapter-fake/src/script.rs:96:9: replace ScriptedTurn::with_usage -> Self with Default::default()

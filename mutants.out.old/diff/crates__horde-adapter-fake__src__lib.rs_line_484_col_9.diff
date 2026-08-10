@@ -1,0 +1,19 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace <impl AgentSession for FakeSession>::shutdown -> Result<()> with Ok(())
+@@ -476,15 +476,11 @@
+         if let Some(current) = self.current.as_mut() {
+             current.status = TurnStatus::Interrupted;
+             current.text = None;
+         }
+         Ok(())
+     }
+ 
+     async fn shutdown(&mut self) -> Result<()> {
+-        self.finished = true;
+-        self.steps.clear();
+-        self.pending.clear();
+-        self.current = None;
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ }

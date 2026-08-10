@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace && with || in FakeSession::advance
+@@ -222,17 +222,17 @@
+ 
+     fn turn_id(&self) -> TurnId {
+         TurnId::new(format!("{}#{}", self.provider_session_id, self.turns_taken))
+     }
+ 
+     /// Plays steps until the queue produces an event, a decision is needed, or
+     /// the turn runs out of steps and ends.
+     fn advance(&mut self) {
+-        while self.pending.is_empty() && self.waiting_on.is_none() && self.stall.is_none() {
++        while self.pending.is_empty() && self.waiting_on.is_none() || /* ~ changed by cargo-mutants ~ */ self.stall.is_none() {
+             let Some(step) = self.steps.pop_front() else {
+                 self.end_turn();
+                 return;
+             };
+ 
+             match step {
+                 Step::Say(text) => self.emit_output(OutputChannel::Assistant, text),
+                 Step::Think(text) => self.emit_output(OutputChannel::Reasoning, text),

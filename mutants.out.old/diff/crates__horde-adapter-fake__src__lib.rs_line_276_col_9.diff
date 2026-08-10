@@ -1,0 +1,48 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace FakeSession::end_turn with ()
+@@ -268,44 +268,17 @@
+                         },
+                     });
+                 }
+             }
+         }
+     }
+ 
+     fn end_turn(&mut self) {
+-        let Some(current) = self.current.take() else {
+-            return;
+-        };
+-
+-        // A real harness reports lifetime totals and leaves the adapter to
+-        // difference them; the fake does the same so the same code runs.
+-        self.cumulative_tokens += current.tokens;
+-        self.cumulative_cost += current.cost_usd;
+-        let usage = self
+-            .usage
+-            .observe(self.cumulative_tokens, self.cumulative_cost);
+-
+-        if self.misbehaviour == Some(Misbehaviour::NeverEndTurn) {
+-            return;
+-        }
+-
+-        let ended = AgentEvent::TurnEnded(TurnOutcome {
+-            turn_id: current.turn_id,
+-            status: current.status,
+-            text: current.text,
+-            usage,
+-            denials: std::mem::take(&mut self.denials),
+-            duration: Duration::from_millis(1),
+-        });
+-        if self.misbehaviour == Some(Misbehaviour::EndTurnTwice) {
+-            self.pending.push_back(ended.clone());
+-        }
+-        self.pending.push_back(ended);
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[async_trait]
+ impl AgentSession for FakeSession {
+     fn provider_session_id(&self) -> Option<&ProviderSessionId> {
+         self.announced.then_some(&self.provider_session_id)
+     }

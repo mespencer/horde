@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace += with *= in FakeSession::end_turn
+@@ -275,17 +275,17 @@
+     fn end_turn(&mut self) {
+         let Some(current) = self.current.take() else {
+             return;
+         };
+ 
+         // A real harness reports lifetime totals and leaves the adapter to
+         // difference them; the fake does the same so the same code runs.
+         self.cumulative_tokens += current.tokens;
+-        self.cumulative_cost += current.cost_usd;
++        self.cumulative_cost *= /* ~ changed by cargo-mutants ~ */ current.cost_usd;
+         let usage = self
+             .usage
+             .observe(self.cumulative_tokens, self.cumulative_cost);
+ 
+         if self.misbehaviour == Some(Misbehaviour::NeverEndTurn) {
+             return;
+         }
+ 

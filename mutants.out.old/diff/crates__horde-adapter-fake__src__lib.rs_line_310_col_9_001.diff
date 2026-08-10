@@ -1,0 +1,21 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace <impl AgentSession for FakeSession>::provider_session_id -> Option<&ProviderSessionId> with Some(Box::leak(Box::new(Default::default())))
+@@ -302,17 +302,17 @@
+         }
+         self.pending.push_back(ended);
+     }
+ }
+ 
+ #[async_trait]
+ impl AgentSession for FakeSession {
+     fn provider_session_id(&self) -> Option<&ProviderSessionId> {
+-        self.announced.then_some(&self.provider_session_id)
++        Some(Box::leak(Box::new(Default::default()))) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn send(&mut self, input: TurnInput) -> Result<()> {
+         if input.delivery == horde_adapter::Delivery::Interrupt
+             && !self.capabilities.supports(Capability::InterruptibleTurn)
+         {
+             return Err(AdapterError::Unsupported {
+                 provider: self.provider.clone(),

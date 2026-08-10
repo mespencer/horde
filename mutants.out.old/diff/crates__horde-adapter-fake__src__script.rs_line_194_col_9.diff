@@ -1,0 +1,22 @@
+--- crates/horde-adapter-fake/src/script.rs
++++ replace Script::ending_after_the_script -> Self with Default::default()
+@@ -186,18 +186,17 @@
+     #[must_use]
+     pub fn misbehaving(mut self, misbehaviour: Misbehaviour) -> Self {
+         self.misbehaviour = Some(misbehaviour);
+         self
+     }
+ 
+     #[must_use]
+     pub fn ending_after_the_script(mut self) -> Self {
+-        self.exhausted = Exhausted::Exit;
+-        self
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use horde_adapter::TurnStatus;
+ 
+     use super::{Exhausted, Misbehaviour, Script, ScriptedTurn, Step};

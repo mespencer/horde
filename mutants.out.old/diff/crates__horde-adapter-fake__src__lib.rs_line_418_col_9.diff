@@ -1,0 +1,64 @@
+--- crates/horde-adapter-fake/src/lib.rs
++++ replace <impl AgentSession for FakeSession>::answer_permission -> Result<()> with Ok(())
+@@ -410,60 +410,17 @@
+         }
+     }
+ 
+     async fn answer_permission(
+         &mut self,
+         tool_call_id: &ToolCallId,
+         decision: PermissionDecision,
+     ) -> Result<()> {
+-        if self.waiting_on.as_ref() != Some(tool_call_id) {
+-            return Err(AdapterError::UnknownPermissionRequest {
+-                tool_call_id: tool_call_id.clone(),
+-            });
+-        }
+-        if decision.updated_input().is_some()
+-            && !self.capabilities.supports(Capability::RewritesToolInput)
+-        {
+-            return Err(AdapterError::Unsupported {
+-                provider: self.provider.clone(),
+-                capability: Capability::RewritesToolInput,
+-            });
+-        }
+-
+-        self.waiting_on = None;
+-        let turn_id = self.turn_id();
+-
+-        match decision {
+-            PermissionDecision::Allow { updated_input } => {
+-                let rendered = updated_input
+-                    .map_or_else(|| "allowed".to_owned(), |input| format!("allowed {input}"));
+-                self.emit_output(OutputChannel::ToolResult, rendered);
+-                self.pending.push_back(AgentEvent::ToolCompleted {
+-                    turn_id,
+-                    tool_call_id: tool_call_id.clone(),
+-                    is_error: false,
+-                });
+-            }
+-            PermissionDecision::Deny { message } => {
+-                self.denials.push(PermissionDenial {
+-                    tool_call_id: tool_call_id.clone(),
+-                    tool_name: "scripted".to_owned(),
+-                    attempted_input: serde_json::Value::Null,
+-                });
+-                self.emit_output(OutputChannel::ToolResult, message);
+-                self.pending.push_back(AgentEvent::ToolCompleted {
+-                    turn_id,
+-                    tool_call_id: tool_call_id.clone(),
+-                    // A refusal is a tool failure from the agent's point of view.
+-                    is_error: true,
+-                });
+-            }
+-        }
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     async fn interrupt(&mut self) -> Result<()> {
+         if !self.capabilities.supports(Capability::InterruptibleTurn) {
+             return Err(AdapterError::Unsupported {
+                 provider: self.provider.clone(),
+                 capability: Capability::InterruptibleTurn,
+             });
