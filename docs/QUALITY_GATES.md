@@ -271,6 +271,13 @@ crate used only through a macro, say) go in `[package.metadata.cargo-machete] ig
 in the crate's own manifest, where the exemption is visible in review — not in the gate.
 Exit code 2 is cargo-machete failing, and is reported as `error`.
 
+**This gate is stricter than a casual local check.** Running `cargo machete` by hand in a
+crate directory, or at the root without `--with-metadata`, answers a narrower question
+than the gate does — the gate walks the whole workspace and counts dev-dependencies. A
+"it's clean on my machine" that disagrees with the gate is usually the shallow check, not
+a gate bug: reproduce with the exact command in the gate's log before concluding
+otherwise. That log is the point of `target/quality/machete.log`.
+
 ## module-structure
 
 **What.** Two structural checks, one gate:
@@ -376,14 +383,31 @@ suite tests is not. `horde-cli`'s `bin/horde.rs` is a product the suite tests, s
 in scope — which is why the exclusion names one path rather than `src/bin/**`, a glob that
 would take the product out with the fixture.
 
-**Exclusions rot, and nothing here catches that yet.** An `exclude_re` that no longer
-matches anything is indistinguishable from one still doing its job, exactly like a
-`baselines/module-cycles.txt` entry for a cycle that has been fixed — and that file is
-ratcheted in both directions for precisely this reason. The mutation gate has no
-equivalent check. Doing it properly means asking cargo-mutants what its exclusions
-actually removed, because `exclude_re` is a regex over mutant descriptions rather than a
-path glob, and a cheaper approximation would be a check that lies. Until that exists, an
-exclusion added here is a promise someone has to keep by hand.
+**Every exclusion is checked, both ways.** Before a mutation run, the gate reads
+`exclude_re` and refuses two kinds of lie:
+
+* *It names nothing.* An exclusion for a path no longer in the tree is
+  indistinguishable from one still doing its job, so it silently misstates what is being
+  measured — the same reason `baselines/module-cycles.txt` ratchets in both directions.
+* *It was configured but did not apply.* `exclude_re` is a regex over each mutant's
+  description, not a path glob, so an anchoring mistake makes an exclusion quietly do
+  nothing and the mutants it named get tested anyway. This is not hypothetical: a
+  `--exclude 'src/bin/**'` was accepted without complaint and the stub binary's mutants
+  were tested regardless. The gate runs `cargo mutants --list` and fails if anything the
+  exclusion claims to remove is still listed. Configured is not applied.
+
+The price is that an exclusion must name **one plain path**, with `\.` for a dot, in a
+TOML literal string:
+
+```toml
+exclude_re = ['horde-worker/src/bin/stub_harness\.rs']
+```
+
+That restriction is what makes the check answerable by looking, instead of by
+reimplementing a regex engine and hoping the imitation agrees with cargo-mutants' own. A
+pattern with any other regex syntax is refused outright rather than accepted and left
+unverified. The listing run costs nothing when there are no exclusions, which is the
+usual case.
 
 **Local.** `gauntlet run mutants`, or `cargo mutants` directly. Survivors are listed in
 `target/quality/mutants.out/missed.txt`.

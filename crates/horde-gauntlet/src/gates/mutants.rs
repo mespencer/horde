@@ -34,6 +34,9 @@ pub const TRUNK: &str = "main";
 /// into spurious ones.
 pub const JOBS: &str = "4";
 
+/// Where cargo-mutants' configuration, and so its exclusions, live.
+pub const CONFIG: &str = ".cargo/mutants.toml";
+
 /// Which mutants a run covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -64,6 +67,9 @@ pub fn gate() -> PinnedGate {
 
 /// Scopes the run, then mutates.
 fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+    if let Err(reason) = check_exclusions(ctx, runner) {
+        return GateOutcome::error(reason);
+    }
     let scope = match scope(ctx, runner) {
         Ok(scope) => scope,
         Err(outcome) => return outcome,
@@ -75,6 +81,33 @@ fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
             Some(counts) => outcome_of(&scope, counts),
         }
     })
+}
+
+/// Confirms the configured exclusions are real and took effect.
+///
+/// Costs nothing when there are none, which is the usual case: the listing run
+/// only happens once something is excluded.
+fn check_exclusions(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<(), String> {
+    let config = ctx.workspace_root.join(CONFIG);
+    let Ok(text) = std::fs::read_to_string(&config) else {
+        return Ok(());
+    };
+    let patterns = configured_exclusions(&text)?;
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let spec = list_spec(ctx);
+    let output = runner.run(&spec).map_err(|error| error.to_string())?;
+    if !output.success() {
+        return Err(format!(
+            "`{}` failed, so the exclusions could not be checked: {}",
+            spec.display(),
+            output.combined().trim()
+        ));
+    }
+    let listed: Vec<String> = output.stdout.lines().map(str::to_owned).collect();
+    let root = ctx.workspace_root.clone();
+    verify_exclusions(&patterns, &listed, |path| root.join(path).exists())
 }
 
 /// The command that finds where this branch left `main`.
@@ -158,6 +191,170 @@ pub fn spec(ctx: &GateContext, scope: &Scope) -> CommandSpec {
     CommandSpec::owned("cargo", args, &ctx.workspace_root)
 }
 
+/// The `exclude_re` patterns configured for cargo-mutants.
+///
+/// # Errors
+///
+/// Returns a message when the key is present but unreadable. A configuration
+/// this gate cannot read is an instrument it cannot vouch for, so it refuses
+/// rather than assuming there are no exclusions.
+pub fn configured_exclusions(config: &str) -> Result<Vec<String>, String> {
+    let Some(rest) = exclusion_value(config) else {
+        return Ok(Vec::new());
+    };
+    let (list, closed) = match rest.split_once(']') {
+        Some((list, _)) => (list, true),
+        None => (rest.as_str(), false),
+    };
+    if !closed {
+        return Err(format!("{CONFIG}: `exclude_re` is missing its closing `]`"));
+    }
+    Ok(toml_strings(list))
+}
+
+/// The body of the `exclude_re` array, from just after its opening bracket.
+fn exclusion_value(config: &str) -> Option<String> {
+    let start = config
+        .lines()
+        .position(|line| is_exclusion_key(line.trim()))?;
+    let tail: String = config
+        .lines()
+        .skip(start)
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tail.split_once('[').map(|(_, rest)| rest.to_owned())
+}
+
+fn is_exclusion_key(line: &str) -> bool {
+    !line.starts_with('#')
+        && line.starts_with("exclude_re")
+        && line
+            .trim_start_matches("exclude_re")
+            .trim_start()
+            .starts_with('=')
+}
+
+/// The TOML strings in an array body, in either quoting style.
+///
+/// A regex in TOML wants a literal string — `'stub\\.rs'` — because a basic
+/// string would need the backslash doubled. Both are read, and a basic string's
+/// `\\\\` is folded back to one backslash so the pattern is what cargo-mutants
+/// will see rather than what TOML spelled.
+fn toml_strings(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some((quote, open)) = next_quote(rest) {
+        let Some(after) = rest.get(open + 1..) else {
+            break;
+        };
+        let Some(close) = after.find(quote) else {
+            break;
+        };
+        if let Some(value) = after.get(..close) {
+            found.push(if quote == '"' {
+                value.replace("\\\\", "\\")
+            } else {
+                value.to_owned()
+            });
+        }
+        rest = after.get(close + 1..).unwrap_or("");
+    }
+    found
+}
+
+fn next_quote(text: &str) -> Option<(char, usize)> {
+    let basic = text.find('"');
+    let literal = text.find('\'');
+    match (basic, literal) {
+        (Some(basic), Some(literal)) if literal < basic => Some(('\'', literal)),
+        (Some(basic), _) => Some(('"', basic)),
+        (None, Some(literal)) => Some(('\'', literal)),
+        (None, None) => None,
+    }
+}
+
+/// The literal path an exclusion names.
+///
+/// Exclusions here must be plain paths, with `\.` for a dot. That is a real
+/// restriction on what may be excluded, and it buys the only thing that makes
+/// an exclusion trustworthy: "did this actually exclude anything?" can be
+/// answered by looking, instead of by reimplementing a regex engine and hoping
+/// the imitation agrees with cargo-mutants' own.
+///
+/// # Errors
+///
+/// Returns a message when the pattern is not a plain path.
+pub fn literal_path(pattern: &str) -> Result<String, String> {
+    let mut literal = String::with_capacity(pattern.len());
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.next() == Some('.') => literal.push('.'),
+            '\\' => return Err(escape_refusal(pattern)),
+            '*' | '?' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                return Err(escape_refusal(pattern));
+            }
+            other => literal.push(other),
+        }
+    }
+    Ok(literal)
+}
+
+fn escape_refusal(pattern: &str) -> String {
+    format!(
+        "{CONFIG}: `{pattern}` is not a plain path. Exclusions must name one path, \
+         with `\\.` for a dot, so the gate can check the exclusion actually took"
+    )
+}
+
+/// Confirms every exclusion both names something and removed it.
+///
+/// Two ways an exclusion lies, and both are checked:
+///
+/// * It names a path that no longer exists. A dead exclusion is
+///   indistinguishable from a live one, so it silently misstates what is being
+///   measured — the same reason the module-cycle baseline ratchets both ways.
+/// * It is configured but had no effect. cargo-mutants matches `exclude_re`
+///   against a mutant's description, and an anchoring mistake makes an
+///   exclusion quietly do nothing; the mutants it was meant to skip are tested
+///   anyway. Configured is not the same as applied, so this checks applied.
+///
+/// # Errors
+///
+/// Returns a message naming the exclusion and which of the two it is.
+pub fn verify_exclusions(
+    patterns: &[String],
+    listed: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    for pattern in patterns {
+        let literal = literal_path(pattern)?;
+        if !exists(&literal) {
+            return Err(format!(
+                "{CONFIG}: `{pattern}` excludes {literal}, which is not in the tree — \
+                 an exclusion that names nothing misstates what is measured"
+            ));
+        }
+        if let Some(mutant) = listed.iter().find(|mutant| mutant.contains(&literal)) {
+            return Err(format!(
+                "{CONFIG}: `{pattern}` did not take — cargo-mutants still lists `{mutant}`. \
+                 Configured is not applied"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The command that lists the mutants a run would test, without testing them.
+pub fn list_spec(ctx: &GateContext) -> CommandSpec {
+    CommandSpec::owned(
+        "cargo",
+        vec!["mutants".to_owned(), "--list".to_owned()],
+        &ctx.workspace_root,
+    )
+}
+
 /// What a cargo-mutants run concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MutantCounts {
@@ -234,6 +431,109 @@ mod tests {
 
     fn version() -> CommandOutput {
         exited(0, "cargo-mutants 27.1.0")
+    }
+
+    #[test]
+    fn a_config_without_exclusions_has_none() {
+        let config = "# a comment\nminimum_test_timeout = 60\n";
+        assert_eq!(configured_exclusions(config), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_empty_exclusion_list_is_no_exclusions() {
+        assert_eq!(configured_exclusions("exclude_re = []\n"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn exclusions_are_read_inline_or_across_lines() {
+        assert_eq!(
+            configured_exclusions("exclude_re = [\"a\", \"b\"]\n"),
+            Ok(vec!["a".to_owned(), "b".to_owned()])
+        );
+        assert_eq!(
+            configured_exclusions("exclude_re = [\n    \"a\",\n    \"b\",\n]\ntimeout = 1\n"),
+            Ok(vec!["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_commented_out_exclusion_is_not_an_exclusion() {
+        let config = "# exclude_re = [\"ghost\"]\nminimum_test_timeout = 60\n";
+        assert_eq!(configured_exclusions(config), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_unterminated_exclusion_list_is_refused_rather_than_read_as_empty() {
+        let message = configured_exclusions("exclude_re = [\"a\",\n")
+            .expect_err("a config the gate cannot read is one it cannot vouch for");
+        assert!(message.contains("closing"), "{message}");
+    }
+
+    #[test]
+    fn a_regex_reads_the_same_in_either_toml_quoting_style() {
+        // A literal string is the idiom for a regex; a basic string has to
+        // double the backslash. Both must reach cargo-mutants as `\\.`.
+        let literal = configured_exclusions("exclude_re = ['stub\\.rs']\n").expect("valid");
+        let basic = configured_exclusions("exclude_re = [\"stub\\\\.rs\"]\n").expect("valid");
+        assert_eq!(literal, basic);
+        assert_eq!(literal, vec!["stub\\.rs".to_owned()]);
+    }
+
+    #[test]
+    fn a_plain_path_exclusion_yields_the_path_it_names() {
+        assert_eq!(
+            literal_path("horde-worker/src/bin/stub_harness\\.rs"),
+            Ok("horde-worker/src/bin/stub_harness.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_is_not_a_plain_path_is_refused() {
+        for pattern in ["src/bin/.*", "src/bin/**", "a(b)c", "a|b", "^a$", "a\\d"] {
+            let message = literal_path(pattern)
+                .expect_err("the gate can only vouch for exclusions it can check");
+            assert!(message.contains("plain path"), "{pattern}: {message}");
+        }
+    }
+
+    #[test]
+    fn an_exclusion_that_took_is_accepted() {
+        let patterns = ["crates/w/src/bin/stub\\.rs".to_owned()];
+        let listed = ["crates/other/src/lib.rs:1:1: replace f with ()".to_owned()];
+        assert_eq!(verify_exclusions(&patterns, &listed, |_| true), Ok(()));
+    }
+
+    #[test]
+    fn an_exclusion_naming_nothing_is_refused() {
+        // A dead exclusion looks exactly like a live one, so it silently
+        // misstates the measured scope — the module-cycle baseline is
+        // bidirectional for the same reason.
+        let patterns = ["crates/gone/src/bin/stub\\.rs".to_owned()];
+        let message = verify_exclusions(&patterns, &[], |_| false)
+            .expect_err("the path it excludes is not in the tree");
+        assert!(message.contains("not in the tree"), "{message}");
+    }
+
+    #[test]
+    fn an_exclusion_that_was_configured_but_did_not_take_is_refused() {
+        // Observed for real: `--exclude 'src/bin/**'` was accepted and the stub
+        // binary's mutants were tested anyway, because exclude_re matches a
+        // mutant's description rather than a path glob. Configured is not
+        // applied, so the gate checks applied.
+        let patterns = ["crates/w/src/bin/stub\\.rs".to_owned()];
+        let listed = ["crates/w/src/bin/stub.rs:9:5: replace main with ()".to_owned()];
+        let message = verify_exclusions(&patterns, &listed, |_| true)
+            .expect_err("cargo-mutants still lists what the exclusion claims to remove");
+        assert!(message.contains("did not take"), "{message}");
+    }
+
+    #[test]
+    fn the_listing_command_does_not_test_anything() {
+        assert_eq!(
+            list_spec(&repo_ctx()).display(),
+            "cargo mutants --list",
+            "checking exclusions must not cost a mutation run"
+        );
     }
 
     #[test]
