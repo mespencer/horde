@@ -139,6 +139,9 @@ pub struct GateContext {
     pub packages: Vec<String>,
     /// Directory for artifacts and per-gate logs (`target/quality`).
     pub log_dir: PathBuf,
+    /// Whether the caller asked to measure the whole tree rather than the
+    /// change under test. Only the `mutants` gate scopes by change today.
+    pub full: bool,
 }
 
 impl GateContext {
@@ -148,7 +151,15 @@ impl GateContext {
             workspace_root: workspace_root.to_path_buf(),
             log_dir: workspace_root.join("target").join("quality"),
             packages,
+            full: false,
         }
+    }
+
+    /// Asks for the whole tree rather than the change under test.
+    #[must_use]
+    pub fn measuring_everything(mut self, full: bool) -> Self {
+        self.full = full;
+        self
     }
 
     /// Cargo's package selection flags for this run.
@@ -395,6 +406,16 @@ mod tests {
         assert_eq!(
             ctx.package_args(),
             vec!["-p", "horde-gauntlet", "-p", "horde-proto"]
+        );
+    }
+
+    #[test]
+    fn a_context_measures_the_change_under_test_unless_asked_otherwise() {
+        assert!(!GateContext::new(Path::new("/repo"), Vec::new()).full);
+        assert!(
+            GateContext::new(Path::new("/repo"), Vec::new())
+                .measuring_everything(true)
+                .full
         );
     }
 

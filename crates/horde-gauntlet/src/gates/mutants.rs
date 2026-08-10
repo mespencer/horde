@@ -124,6 +124,19 @@ pub fn diff_spec(root: &Path, base: &str) -> CommandSpec {
     )
 }
 
+/// The command that names the current commit.
+pub fn head_spec(root: &Path) -> CommandSpec {
+    CommandSpec::new("git", &["rev-parse", "HEAD"], root)
+}
+
+/// The command that names the commit this one was built on.
+///
+/// For a merge commit that is the trunk it landed on, so the diff against it is
+/// what the merge brought in.
+pub fn first_parent_spec(root: &Path) -> CommandSpec {
+    CommandSpec::new("git", &["rev-parse", "HEAD^1"], root)
+}
+
 /// Where the diff is written for cargo-mutants to read.
 pub fn diff_path(ctx: &GateContext) -> PathBuf {
     ctx.log_dir.join("mutants.diff")
@@ -134,14 +147,12 @@ pub fn diff_path(ctx: &GateContext) -> PathBuf {
 /// Falling back to the whole tree is the *stricter* choice, so an absent `main`
 /// or an empty diff can never quietly shrink the gate to nothing.
 fn scope(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<Scope, GateOutcome> {
-    let base_output = invoke(runner, &merge_base_spec(&ctx.workspace_root))?;
-    if !base_output.success() {
+    if ctx.full {
         return Ok(Scope::FullTree);
     }
-    let base = base_output.stdout.trim().to_owned();
-    if base.is_empty() {
+    let Some(base) = baseline(ctx, runner)? else {
         return Ok(Scope::FullTree);
-    }
+    };
     let spec = diff_spec(&ctx.workspace_root, &base);
     let diff_output = invoke(runner, &spec)?;
     if !diff_output.success() {
@@ -153,6 +164,47 @@ fn scope(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<Scope, GateOut
     let path = diff_path(ctx);
     write_diff(&path, &diff_output.stdout)?;
     Ok(Scope::Diff(path))
+}
+
+/// What the change under test is measured against.
+///
+/// On a branch that is the merge-base with `main`, so the scope is the branch's
+/// own work. On `main` the merge-base *is* `HEAD`, which would leave nothing to
+/// compare against, so the baseline becomes `HEAD`'s first parent — for a merge
+/// commit that is precisely what the merge brought in, and for a plain commit
+/// it is that commit. Either way the question is the same one the branch
+/// answered: does *this change* leave behaviour no test checks?
+///
+/// The whole tree remains available, but by asking (`--full`) rather than by
+/// accident. That distinction matters: a scope that only ever looks at diffs
+/// never re-examines old code, which is exactly how 92 surviving mutants sat
+/// unnoticed in crates that had never been measured.
+fn baseline(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<Option<String>, GateOutcome> {
+    let merge_base = single_revision(ctx, runner, &merge_base_spec(&ctx.workspace_root))?;
+    let head = single_revision(ctx, runner, &head_spec(&ctx.workspace_root))?;
+    match (merge_base, head) {
+        // Not on trunk: the branch point.
+        (Some(merge_base), Some(head)) if merge_base != head => Ok(Some(merge_base)),
+        // On trunk: what the tip commit introduced.
+        (Some(_), Some(_)) => single_revision(ctx, runner, &first_parent_spec(&ctx.workspace_root)),
+        // No `main`, or no commits at all.
+        _ => Ok(None),
+    }
+}
+
+/// Resolves one revision, or `None` when git cannot name it.
+fn single_revision(
+    ctx: &GateContext,
+    runner: &dyn CommandRunner,
+    spec: &CommandSpec,
+) -> Result<Option<String>, GateOutcome> {
+    let _ = ctx;
+    let output = invoke(runner, spec)?;
+    if !output.success() {
+        return Ok(None);
+    }
+    let revision = output.stdout.trim().to_owned();
+    Ok((!revision.is_empty()).then_some(revision))
 }
 
 fn write_diff(path: &Path, diff: &str) -> Result<(), GateOutcome> {
@@ -569,6 +621,7 @@ mod tests {
         let runner = ScriptedRunner::new(vec![
             version(),
             failed(128, "fatal: no main"),
+            exited(0, "tip\n"),
             exited(0, CLEAN),
         ]);
         assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
@@ -588,6 +641,7 @@ mod tests {
         let runner = ScriptedRunner::new(vec![
             version(),
             failed(128, "fatal: no main"),
+            exited(0, "tip\n"),
             exited(0, CLEAN),
         ]);
         assert_eq!(
@@ -603,6 +657,7 @@ mod tests {
             version(),
             exited(0, "crates/other/src/lib.rs:1:1: replace f with ()"),
             failed(128, "fatal: no main"),
+            exited(0, "tip\n"),
             exited(0, CLEAN),
         ]);
         assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
@@ -833,6 +888,13 @@ mod tests {
         lines: Vec<String>,
     }
 
+    impl Run {
+        /// The cargo-mutants invocation, which is always the last command.
+        fn mutation_command(&self) -> &str {
+            self.lines.last().map_or("", String::as_str)
+        }
+    }
+
     /// Runs the gate against a throwaway root, scripting the git probes and
     /// then a clean cargo-mutants run.
     fn run_after(git: Vec<CommandOutput>) -> Run {
@@ -852,25 +914,127 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_trunk_branch_falls_back_to_the_whole_tree() {
-        let run = run_after(vec![failed(128, "fatal: Not a valid object name main")]);
+    fn on_a_branch_the_scope_is_everything_since_the_branch_point() {
+        let run = run_after(vec![
+            exited(0, "branchpoint\n"),        // merge-base
+            exited(0, "tip\n"),                // HEAD
+            exited(0, "diff --git a/x b/x\n"), // the branch's work
+        ]);
         assert_eq!(run.outcome.label(), "pass");
-        assert!(!run.lines[2].contains("--in-diff"), "{:?}", run.lines);
+        assert!(
+            run.mutation_command().contains("--in-diff"),
+            "{:?}",
+            run.lines
+        );
+        assert_eq!(run.lines[1], "git merge-base HEAD main");
+    }
+
+    #[test]
+    fn on_trunk_the_scope_is_what_the_tip_commit_brought_in() {
+        // The merge-base is HEAD, so there is nothing behind it to diff
+        // against; the first parent is the trunk the merge landed on, which
+        // makes the diff exactly what the merge introduced.
+        let run = run_after(vec![
+            exited(0, "tip\n"),      // merge-base == HEAD
+            exited(0, "tip\n"),      // HEAD
+            exited(0, "previous\n"), // HEAD^1
+            exited(0, "diff --git a/x b/x\n"),
+        ]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert_eq!(run.lines[3], "git rev-parse HEAD^1");
+        assert!(
+            run.mutation_command().contains("--in-diff"),
+            "{:?}",
+            run.lines
+        );
+        assert!(
+            run.outcome.detail().contains("changed code"),
+            "{}",
+            run.outcome.detail()
+        );
+    }
+
+    #[test]
+    fn a_root_commit_on_trunk_falls_back_to_the_whole_tree() {
+        let run = run_after(vec![
+            exited(0, "tip\n"),
+            exited(0, "tip\n"),
+            failed(128, "fatal: ambiguous argument 'HEAD^1'"),
+        ]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert!(
+            run.outcome.detail().contains("whole tree"),
+            "nothing to compare against means measure everything: {}",
+            run.outcome.detail()
+        );
+    }
+
+    #[test]
+    fn asking_for_everything_skips_the_scoping_entirely() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = ctx_at(dir.path()).measuring_everything(true);
+        let runner = ScriptedRunner::new(vec![version(), exited(0, CLEAN)]);
+        let outcome = run_gate(&gate(), &ctx, &runner);
+
+        assert_eq!(outcome.label(), "pass");
+        assert!(
+            outcome.detail().contains("whole tree"),
+            "{}",
+            outcome.detail()
+        );
+        assert!(
+            !runner
+                .command_lines()
+                .iter()
+                .any(|line| line.starts_with("git")),
+            "an explicit --full needs no git at all: {:?}",
+            runner.command_lines()
+        );
+    }
+
+    #[test]
+    fn an_absent_trunk_branch_falls_back_to_the_whole_tree() {
+        let run = run_after(vec![
+            failed(128, "fatal: Not a valid object name main"),
+            exited(0, "tip\n"),
+        ]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert!(
+            !run.mutation_command().contains("--in-diff"),
+            "{:?}",
+            run.lines
+        );
     }
 
     #[test]
     fn an_empty_diff_falls_back_to_the_whole_tree() {
-        let run = run_after(vec![exited(0, "abc123\n"), exited(0, "")]);
+        let run = run_after(vec![
+            exited(0, "branchpoint\n"),
+            exited(0, "tip\n"),
+            exited(0, ""),
+        ]);
         assert_eq!(run.outcome.label(), "pass");
-        assert!(!run.lines[3].contains("--in-diff"), "{:?}", run.lines);
+        assert!(
+            !run.mutation_command().contains("--in-diff"),
+            "{:?}",
+            run.lines
+        );
     }
 
     #[test]
     fn a_real_diff_scopes_the_run_and_is_written_to_disk() {
         let diff = "diff --git a/src/lib.rs b/src/lib.rs\n";
-        let run = run_after(vec![exited(0, "abc123\n"), exited(0, diff)]);
+        let run = run_after(vec![
+            exited(0, "branchpoint\n"),
+            exited(0, "tip\n"),
+            exited(0, diff),
+        ]);
         assert_eq!(run.outcome.label(), "pass");
-        assert!(run.lines[3].contains("--in-diff"), "{:?}", run.lines);
+        assert!(
+            run.mutation_command().contains("--in-diff"),
+            "{:?}",
+            run.lines
+        );
         assert_eq!(
             std::fs::read_to_string(diff_path(&run.ctx)).expect("the diff was written"),
             diff
@@ -883,6 +1047,7 @@ mod tests {
         let runner = ScriptedRunner::new(vec![
             version(),
             failed(128, "fatal: no main"),
+            exited(0, "tip\n"),
             failed(4, "error: build failed in an unmutated tree"),
         ]);
         let GateOutcome::Error { reason } = run_gate(&gate(), &ctx_at(dir.path()), &runner) else {
