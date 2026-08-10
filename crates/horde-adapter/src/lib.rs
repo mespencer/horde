@@ -61,6 +61,7 @@ pub mod error;
 pub mod event;
 pub mod ids;
 pub mod permission;
+pub mod replay;
 pub mod spec;
 pub mod usage;
 
@@ -69,6 +70,7 @@ pub use error::AdapterError;
 pub use event::{AgentEvent, OutputChannel, TurnOutcome, TurnStatus};
 pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId};
 pub use permission::{PermissionDecision, PermissionDenial, ProposedToolCall};
+pub use replay::{LineDecoder, ReplaySession};
 pub use spec::{AgentSpec, Delivery, McpEndpoint, TurnInput};
 pub use usage::{
     HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
