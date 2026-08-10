@@ -615,15 +615,23 @@ mod tests {
         (dir, ctx)
     }
 
-    #[test]
-    fn no_exclusions_means_no_listing_run_at_all() {
-        let (_dir, ctx) = root_configured("minimum_test_timeout = 60\n");
-        let runner = ScriptedRunner::new(vec![
-            version(),
+    /// A run with no trunk to compare against: the version probe, any extra
+    /// responses the test needs first, then the git probes and a clean result.
+    fn whole_tree_run(after_version: Vec<CommandOutput>) -> Vec<CommandOutput> {
+        let mut script = vec![version()];
+        script.extend(after_version);
+        script.extend([
             failed(128, "fatal: no main"),
             exited(0, "tip\n"),
             exited(0, CLEAN),
         ]);
+        script
+    }
+
+    #[test]
+    fn no_exclusions_means_no_listing_run_at_all() {
+        let (_dir, ctx) = root_configured("minimum_test_timeout = 60\n");
+        let runner = ScriptedRunner::new(whole_tree_run(Vec::new()));
         assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
         assert!(
             !runner
@@ -638,12 +646,7 @@ mod tests {
     #[test]
     fn an_absent_config_is_not_an_error() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let runner = ScriptedRunner::new(vec![
-            version(),
-            failed(128, "fatal: no main"),
-            exited(0, "tip\n"),
-            exited(0, CLEAN),
-        ]);
+        let runner = ScriptedRunner::new(whole_tree_run(Vec::new()));
         assert_eq!(
             run_gate(&gate(), &ctx_at(dir.path()), &runner).label(),
             "pass"
@@ -653,13 +656,10 @@ mod tests {
     #[test]
     fn a_live_exclusion_that_took_lets_the_run_proceed() {
         let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
-        let runner = ScriptedRunner::new(vec![
-            version(),
-            exited(0, "crates/other/src/lib.rs:1:1: replace f with ()"),
-            failed(128, "fatal: no main"),
-            exited(0, "tip\n"),
-            exited(0, CLEAN),
-        ]);
+        let runner = ScriptedRunner::new(whole_tree_run(vec![exited(
+            0,
+            "crates/other/src/lib.rs:1:1: replace f with ()",
+        )]));
         assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
         assert!(
             runner.command_lines()[1].contains("--list"),
