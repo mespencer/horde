@@ -479,6 +479,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rusqlite",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

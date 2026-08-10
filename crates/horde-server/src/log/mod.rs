@@ -231,7 +231,7 @@ impl EventLog {
         // Bounded by the head read at entry, so a continuously written session
         // cannot keep this loop alive indefinitely.
         let head_after_replay = self.head(session_id).await?;
-        if head_after_replay > delivered {
+        if needs_sweep(head_after_replay, delivered) {
             let missed = self.read_all_from(session_id, delivered + 1).await?;
             if let Some(last) = missed.last() {
                 delivered = last.sequence;
@@ -252,6 +252,15 @@ impl EventLog {
 
     /// Reads every event from an offset, paging so one enormous session cannot
     /// be pulled into memory by a single unbounded query.
+    /// Terminates on an empty page rather than on a short one.
+    ///
+    /// A short-page early exit saves exactly one indexed query per replay, and
+    /// costs a branch whose failure mode is silent truncation. Mutation testing
+    /// made the trade concrete: `page.len() > PAGE` is indistinguishable from
+    /// the correct `<` — a page can never exceed the limit it was read with, so
+    /// the branch simply never fires and the empty-page exit does the work
+    /// anyway. A condition that cannot be wrong in one direction is not
+    /// carrying its weight.
     async fn read_all_from(
         &self,
         session_id: &str,
@@ -267,14 +276,21 @@ impl EventLog {
                 break;
             };
             next = last.sequence.saturating_add(1);
-            let short = page.len() < PAGE as usize;
             all.extend(page);
-            if short {
-                break;
-            }
         }
         Ok(all)
     }
+}
+
+/// Whether the head moved past what the replay delivered.
+///
+/// Extracted from [`EventLog::tail`] because an inline comparison there is not
+/// reachable by a test: the sweep only differs from a no-op when an append
+/// lands between the replay and this check, and that race cannot be forced
+/// deterministically. As a predicate it is an ordinary function with an
+/// ordinary truth table, so the boundary is pinned instead of hoped for.
+fn needs_sweep(head_after_replay: u64, delivered: u64) -> bool {
+    head_after_replay > delivered
 }
 
 /// A live follow of one session, already positioned after its replay.
@@ -447,6 +463,59 @@ mod tests {
             vec![2],
             "only the new s1 event, and never a redelivery of event 1"
         );
+    }
+
+    /// The sweep must fire only when the head genuinely moved. Firing when
+    /// equal costs a pointless read; never firing reopens the window the sweep
+    /// exists to close.
+    #[test]
+    fn the_sweep_fires_only_when_the_head_moved_past_what_was_delivered() {
+        assert!(
+            super::needs_sweep(4, 3),
+            "an event landed during the replay"
+        );
+        assert!(!super::needs_sweep(3, 3), "nothing moved");
+        assert!(
+            !super::needs_sweep(2, 3),
+            "a head below what was delivered is not a reason to re-read"
+        );
+        assert!(!super::needs_sweep(0, 0), "an empty session sweeps nothing");
+    }
+
+    /// Paging is tested directly rather than through `tail`, because the sweep
+    /// compensates for a paging error — every mutation of the page-boundary
+    /// comparison survived a 513-event replay taken through `tail`, since the
+    /// sweep silently fetched whatever the paging loop dropped. Two mechanisms
+    /// covering for each other is exactly how a bug in one stays invisible.
+    #[tokio::test]
+    async fn paging_returns_every_event_across_a_page_boundary() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..513 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let all = log
+            .read_all_from("s1", 1)
+            .await
+            .expect("paging must not fail");
+        let sequences: Vec<u64> = all.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            (1..=513).collect::<Vec<u64>>(),
+            "a page boundary must not truncate, duplicate, or reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_from_an_offset_returns_the_suffix_across_a_boundary() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..600 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let tail = log.read_all_from("s1", 100).await.expect("paging");
+        let sequences: Vec<u64> = tail.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, (100..=600).collect::<Vec<u64>>());
     }
 
     #[tokio::test]

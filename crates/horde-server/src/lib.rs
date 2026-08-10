@@ -14,6 +14,7 @@ pub mod error;
 pub mod log;
 pub mod scheduler;
 pub mod service;
+pub mod startup;
 pub mod state;
 
 pub use error::ServerError;
