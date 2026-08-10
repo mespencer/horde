@@ -17,6 +17,7 @@ already has history.
 $ gauntlet run                       # every gate
 $ gauntlet run crap                  # one gate, plus whatever it depends on
 $ gauntlet run clippy -p horde-proto # narrow to a package
+$ gauntlet run --full                # mutants measures the whole tree, not just the change
 $ gauntlet list                      # the registry, with enforcement levels
 $ gauntlet report --format markdown  # re-render the last run
 ```
@@ -251,7 +252,16 @@ to anyone auditing the manifest, as a property-testing suite that no longer exis
 cargo-machete checks both tables by default, and a test in the gate asserts that it
 still does.
 
-**Local.** `gauntlet run machete`, or `cargo machete --with-metadata`.
+**Invoked as `cargo-machete`, not `cargo machete`.** cargo-machete decides whether its
+first argument is a subcommand name or a directory to scan by looking at the `CARGO`
+environment variable, which cargo sets when it dispatches a subcommand. Reached any other
+way, `cargo machete --version` means "scan the directories `machete` and `--version`",
+exits 2, and prints no version at all. That happened on `main`: the gate correctly
+reported `error` rather than a finding, and the fix was to call the binary directly. A
+version probe should not depend on an environment variable set three processes away
+deciding how its own arguments are parsed.
+
+**Local.** `gauntlet run machete`, or `cargo-machete --with-metadata`.
 
 **Build scripts are a blind spot.** cargo-machete scans `src/` and does not read
 `build.rs`, so a `[build-dependencies]` entry used only by the build script reads as
@@ -349,17 +359,32 @@ one of those stays green when the code under it is quietly wrong, and every one 
 is exactly what a surviving mutant points at. A mutation that stays green is a finding,
 not a relief.
 
-**Scope, and why it does not grow with the workspace.** The diff is taken against the
-merge-base with `main`, and merging `main` into a branch *moves* that merge-base to
-`main`'s tip. So the diff is always only the branch's own work, and the mutant count
-tracks what this branch changed rather than how large the workspace has become: nine
-crates and 567 tests still produce ~440 mutants of gauntlet code, because that is what
-this branch touched. Main growing does not slow this gate down; it only costs more the
-day someone edits the grown parts, which is exactly when it should.
+**Scope: the change under test.** This is the only gate that does not measure
+everything, and what it measures is always "what did this change introduce":
 
-The fallback when there is no diff (or no `main`) is the *whole tree*, which is the
-stricter choice, so a missing branch can never quietly shrink the gate to nothing.
-Timeouts live in `.cargo/mutants.toml`; `--jobs` lives in the gate.
+| where | baseline | scope |
+|---|---|---|
+| on a branch | merge-base with `main` | the branch's own work |
+| on `main` | `HEAD`'s first parent | what the tip commit (usually a merge) brought in |
+| no `main`, or a root commit | — | the whole tree |
+| `gauntlet run --full` | — | the whole tree |
+
+On a branch, merging `main` in *moves* the merge-base to `main`'s tip, so the diff stays
+the branch's own work and the mutant count tracks what the branch changed rather than how
+large the workspace has become. On `main` the merge-base is `HEAD` itself, which would
+leave nothing to compare against — so the baseline is the first parent, which for a merge
+commit is precisely the trunk it landed on. Same question, asked of the merge.
+
+**What this scope cannot see, and what to do about it.** A gate that only ever looks at
+diffs never re-examines code no recent diff has touched. That is not a hypothetical: the
+first whole-tree run on this workspace found **92 surviving mutants** in crates that had
+only ever been measured through someone's diff. `--full` is how you ask the other
+question, and somebody has to actually ask it — periodically, not never. Treat a green
+diff-scoped row as "this change is covered", never as "the workspace is covered".
+
+Falling back to the whole tree when there is no baseline is deliberate: an absent branch
+or a root commit must never quietly shrink the gate to nothing. Timeouts live in
+`.cargo/mutants.toml`; `--jobs` and `--full` live in the gate.
 
 **No exclusions, today.** `.cargo/mutants.toml` has no `exclude_re`. Skipping a function
 because its mutants survive is how a mutation gate becomes decorative. If a function
