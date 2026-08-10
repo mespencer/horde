@@ -491,10 +491,7 @@ impl AgentSession for FakeSession {
 
 #[cfg(test)]
 mod guard_tests {
-    use horde_adapter::{
-        Adapter, AgentSpec, Capabilities, Capability, Delivery, PermissionDecision, ToolCallId,
-        TurnInput,
-    };
+    use horde_adapter::{Adapter, AgentSpec, Capabilities, Capability, Delivery, TurnInput};
     use serde_json::json;
 
     use super::FakeAdapter;
@@ -606,35 +603,6 @@ mod guard_tests {
         );
     }
 
-    /// A rewriting decision against an adapter that cannot rewrite is refused.
-    ///
-    /// The `&&` mutant survived, which would have refused *every* decision or
-    /// none. Both are wrong in opposite directions, and the fake is where the
-    /// suite learns which behaviour to expect.
-    #[tokio::test]
-    async fn a_rewrite_is_refused_only_when_the_adapter_cannot_rewrite() {
-        // Not waiting on anything: the unknown-request guard fires first, which
-        // is itself the contract — a decision with no matching request is an
-        // error rather than a silent success.
-        let mut session = FakeAdapter::new(crate::Script::echoing())
-            .with_capabilities(Capabilities::none())
-            .spawn(&spec())
-            .await
-            .expect("spawns");
-
-        let error = session
-            .answer_permission(
-                &ToolCallId::new("never-asked"),
-                PermissionDecision::allow_with(json!({"path": "/safe"})),
-            )
-            .await
-            .expect_err("a decision nobody asked for must be refused");
-        assert!(
-            error.to_string().contains("never-asked"),
-            "and must name the call it could not answer, got {error}"
-        );
-    }
-
     /// A pending decision must stop the script from advancing.
     ///
     /// `advance` loops while there is nothing pending, nothing awaited, and no
@@ -706,21 +674,174 @@ mod guard_tests {
         );
     }
 
-    /// `shutdown()` must actually finish the session.
+    /// `shutdown()` must discard work that was still queued.
     ///
-    /// The `Ok(())` mutant survived: a shutdown that returned success without
-    /// finishing anything leaves a conformance run believing it cleaned up.
+    /// The earlier version of this test asserted `next_event` is `None` after
+    /// shutdown — which a fresh session does anyway, so it never depended on
+    /// shutdown doing anything and the `Ok(())` mutant survived it. This one
+    /// leaves events *pending* first: a no-op shutdown hands them out, a real
+    /// one drops them.
     #[tokio::test]
-    async fn shutdown_finishes_the_session() {
-        let mut session = FakeAdapter::new(crate::Script::echoing())
+    async fn shutdown_discards_events_that_were_still_queued() {
+        use crate::{Script, ScriptedTurn};
+
+        let script = Script::of(vec![
+            ScriptedTurn::saying("one"),
+            ScriptedTurn::saying("two"),
+        ]);
+        let mut session = FakeAdapter::new(script)
             .spawn(&spec())
             .await
             .expect("spawns");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        // Take a single event, deliberately leaving the rest queued.
+        let first = session.next_event().await.expect("no error");
+        assert!(first.is_some(), "the turn must have produced something");
+
         session.shutdown().await.expect("shuts down");
 
         assert!(
             session.next_event().await.expect("no error").is_none(),
-            "a shut-down session produces nothing further"
+            "queued events must be discarded — a shutdown that returned success \
+             while handing out the rest of the turn would let a Worker believe \
+             it had torn the agent down"
+        );
+    }
+}
+
+#[cfg(test)]
+mod permission_path_tests {
+    use horde_adapter::{
+        Adapter, AgentEvent, AgentSession, AgentSpec, Capabilities, Capability, OutputChannel,
+        PermissionDecision, ToolCallId, TurnInput,
+    };
+    use serde_json::json;
+
+    use super::FakeAdapter;
+    use crate::{Script, ScriptedTurn, Step};
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            model: None,
+            append_system_prompt: None,
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn asking_script() -> Script {
+        Script::of(vec![
+            ScriptedTurn::saying("looking into it").with_step(Step::AskPermission {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                input: json!({ "command": "docker rm horde-test" }),
+            }),
+            ScriptedTurn::saying("second turn"),
+        ])
+    }
+
+    /// Drives a session to the point where it is genuinely waiting on `call-1`.
+    async fn waiting_session(capabilities: Capabilities) -> Box<dyn AgentSession> {
+        let mut session = FakeAdapter::new(asking_script())
+            .with_capabilities(capabilities)
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        for _ in 0..32 {
+            match session.next_event().await {
+                Ok(Some(AgentEvent::PermissionRequested { .. })) => return session,
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        panic!("the scripted permission request must surface");
+    }
+
+    /// A plain allow must succeed even on an adapter that cannot rewrite input.
+    ///
+    /// This is the case the earlier test missed entirely: it only exercised the
+    /// unknown-request early return, so control never reached the guard. The
+    /// `&&`-to-`||` mutant lives here — with `||`, an adapter lacking
+    /// `RewritesToolInput` would refuse *every* decision, including ones
+    /// carrying no rewrite at all, and the permission chain would jam on
+    /// providers that are perfectly able to answer yes or no.
+    #[tokio::test]
+    async fn a_plain_allow_is_accepted_by_an_adapter_that_cannot_rewrite() {
+        let mut session =
+            waiting_session(Capabilities::none().with(Capability::PreAuthorizeToolCalls)).await;
+
+        session
+            .answer_permission(&ToolCallId::new("call-1"), PermissionDecision::allow())
+            .await
+            .expect("a decision carrying no rewrite needs no rewrite capability");
+    }
+
+    /// A rewriting allow must be refused by an adapter that cannot rewrite.
+    ///
+    /// The other side of the same guard: reject-don't-drop, so a narrowing that
+    /// could not be applied is never mistaken for one that was.
+    #[tokio::test]
+    async fn a_rewriting_allow_is_refused_by_an_adapter_that_cannot_rewrite() {
+        let mut session =
+            waiting_session(Capabilities::none().with(Capability::PreAuthorizeToolCalls)).await;
+
+        let refused = session
+            .answer_permission(
+                &ToolCallId::new("call-1"),
+                PermissionDecision::allow_with(json!({ "command": "echo safe" })),
+            )
+            .await;
+
+        assert!(
+            refused.is_err(),
+            "a rewrite an adapter cannot apply must be refused, not dropped"
+        );
+    }
+
+    /// Answering must release exactly the decision's own events, not run ahead.
+    ///
+    /// `advance` loops while nothing is pending, nothing is awaited and nothing
+    /// stalls. Once a decision lands, `waiting_on` clears and the tool result is
+    /// queued — so the `&&`-to-`||` mutant makes the loop run anyway and play
+    /// the *next* scripted step before those queued events are consumed. The
+    /// agent would appear to have moved on from a tool call whose result nobody
+    /// had seen yet.
+    #[tokio::test]
+    async fn answering_releases_the_tool_result_before_anything_else() {
+        let mut session = waiting_session(
+            Capabilities::none()
+                .with(Capability::PreAuthorizeToolCalls)
+                .with(Capability::RewritesToolInput),
+        )
+        .await;
+
+        session
+            .answer_permission(&ToolCallId::new("call-1"), PermissionDecision::allow())
+            .await
+            .expect("answers");
+
+        // The very next event must be the tool's own result.
+        let next = session.next_event().await.expect("no error");
+        assert!(
+            matches!(
+                next,
+                Some(AgentEvent::Output {
+                    channel: OutputChannel::ToolResult,
+                    ..
+                })
+            ),
+            "the answered call's result must come first, got {next:?}"
+        );
+
+        let after = session.next_event().await.expect("no error");
+        assert!(
+            matches!(after, Some(AgentEvent::ToolCompleted { .. })),
+            "then the call completes, got {after:?}"
         );
     }
 }
