@@ -845,3 +845,74 @@ mod permission_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stall_tests {
+    use std::time::Duration;
+
+    use horde_adapter::{Adapter, AgentSpec, TurnInput};
+
+    use super::FakeAdapter;
+    use crate::{Script, ScriptedTurn, Step};
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            model: None,
+            append_system_prompt: None,
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A stalled turn must stop producing, even with steps left to play.
+    ///
+    /// This is the case the `advance` guard exists for and the one my earlier
+    /// tests kept missing. The loop runs while nothing is pending, nothing is
+    /// awaited **and** nothing stalls; the `&&`-to-`||` mutant reassociates that
+    /// into "nothing pending **or** (nothing awaited and nothing stalling)", so
+    /// an empty queue alone is enough to keep playing — straight through the
+    /// stall.
+    ///
+    /// Real agents stall on a long tool call or a slow model. A fake that
+    /// played on regardless would make every timeout and backpressure test
+    /// measured against it meaningless, because the condition they are written
+    /// to exercise would never occur.
+    #[tokio::test]
+    async fn a_stalled_turn_produces_nothing_while_it_stalls() {
+        let script = Script::of(vec![
+            ScriptedTurn::saying("before the stall")
+                .with_step(Step::Stall(Duration::from_secs(3600)))
+                .with_step(Step::Say("after the stall".to_owned())),
+        ]);
+
+        let mut session = FakeAdapter::new(script)
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        // Drain what the turn produced before the stall, bounded — the stall
+        // is real time, so an unbounded drain would wait it out.
+        let drain = tokio::time::timeout(Duration::from_millis(300), async {
+            let mut seen = 0_usize;
+            while let Ok(Some(_)) = session.next_event().await {
+                seen += 1;
+                if seen > 16 {
+                    break;
+                }
+            }
+            seen
+        })
+        .await;
+
+        // Timing out IS the assertion: a stalled turn holds the caller rather
+        // than racing ahead. The mutant would have played "after the stall" and
+        // ended the turn, so the drain would have completed instead.
+        assert!(
+            drain.is_err(),
+            "a stalled turn must hold rather than play on; the drain returned {drain:?}"
+        );
+    }
+}
