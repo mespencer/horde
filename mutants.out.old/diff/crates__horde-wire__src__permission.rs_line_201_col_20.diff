@@ -1,0 +1,21 @@
+--- crates/horde-wire/src/permission.rs
++++ delete ! in permission_decision_from_wire
+@@ -193,17 +193,17 @@
+     can_rewrite_input: bool,
+ ) -> Result<PermissionDecision, ConversionError> {
+     let outcome = PermissionOutcome::try_from(decision.outcome)
+         .map_err(|_| ConversionError::UnusableOutcome(decision.outcome))?;
+ 
+     match outcome {
+         PermissionOutcome::Allow => match &decision.updated_input {
+             Some(rewritten) => {
+-                if !can_rewrite_input {
++                if  /* ~ changed by cargo-mutants ~ */can_rewrite_input {
+                     return Err(ConversionError::RewriteUnsupported);
+                 }
+                 Ok(PermissionDecision::allow_with(struct_to_json(rewritten)))
+             }
+             None => Ok(PermissionDecision::allow()),
+         },
+         PermissionOutcome::Deny => Ok(PermissionDecision::deny(decision.reason.clone())),
+         PermissionOutcome::Unspecified => Err(ConversionError::UnusableOutcome(decision.outcome)),

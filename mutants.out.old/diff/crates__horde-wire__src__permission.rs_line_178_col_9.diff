@@ -1,0 +1,21 @@
+--- crates/horde-wire/src/permission.rs
++++ delete field outcome from struct WirePermissionDecision expression in permission_decision_to_wire
+@@ -170,17 +170,17 @@
+                 None => None,
+             };
+             (PermissionOutcome::Allow, String::new(), rewritten)
+         }
+         PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),
+     };
+ 
+     Ok(WirePermissionDecision {
+-        outcome: outcome.into(),
++         /* ~ changed by cargo-mutants ~ */
+         reason,
+         updated_input,
+         ..WirePermissionDecision::default()
+     })
+ }
+ 
+ /// Wire → domain — the direction a Worker actually runs.
+ ///

@@ -1,0 +1,30 @@
+--- crates/horde-wire/src/permission.rs
++++ replace <impl core::fmt::Display for ConversionError>::fmt -> core::fmt::Result with Ok(Default::default())
+@@ -42,26 +42,17 @@
+     /// The proto documents reject-don't-drop for exactly this: an adapter
+     /// without the rewrite capability must refuse, so a narrowing that failed
+     /// to apply is never mistaken for one that took effect.
+     RewriteUnsupported,
+ }
+ 
+ impl core::fmt::Display for ConversionError {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        match self {
+-            Self::NotAnObject => write!(f, "updated_input must be a JSON object"),
+-            Self::UnrepresentableNumber(n) => {
+-                write!(f, "number {n} has no exact f64 representation")
+-            }
+-            Self::UnusableOutcome(v) => write!(f, "unusable PermissionOutcome {v}"),
+-            Self::RewriteUnsupported => {
+-                write!(f, "decision rewrites tool input but the adapter cannot")
+-            }
+-        }
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl core::error::Error for ConversionError {}
+ 
+ /// A double that represents `n` exactly, or an error.
+ ///
+ /// Protobuf `Struct` has only doubles. An integer past 2^53 would come back a

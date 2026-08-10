@@ -1,0 +1,47 @@
+--- crates/horde-wire/src/capability.rs
++++ replace capability_to_wire -> Option<AdapterCapability> with Some(Default::default())
+@@ -27,43 +27,17 @@
+ impl core::error::Error for UnknownCapability {}
+ 
+ /// Domain → wire.
+ ///
+ /// Exhaustive: a new [`Capability`] must decide whether it is something
+ /// placement can match on before this compiles.
+ #[must_use]
+ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
+-    match capability {
+-        Capability::Resumable => Some(AdapterCapability::Resumable),
+-        Capability::InterruptibleTurn => Some(AdapterCapability::Interruptible),
+-        Capability::AmendActiveTurn => Some(AdapterCapability::Steerable),
+-
+-        // The domain models the capability; the wire's PERMISSION_PROMPT_TOOL
+-        // names one provider's mechanism and is deprecated in favour of this.
+-        Capability::PreAuthorizeToolCalls => Some(AdapterCapability::ToolCallGating),
+-
+-        // On the wire because the Server needs it before it composes a
+-        // narrowing decision, not after the Worker bounces one.
+-        Capability::RewritesToolInput => Some(AdapterCapability::ToolInputRewrite),
+-
+-        // Worker-local facts with no placement consequence on the wire yet.
+-        // Deliberately not advertised: a capability nothing matches on invites
+-        // readers to assume it is enforced somewhere.
+-        //
+-        // `SandboxTierAtSpawn` is the one most likely to graduate — it is what
+-        // an ungateable provider offers *instead* of interception, so a
+-        // scheduler that learns to place high-trust work will want to see it.
+-        // It stays off the wire until something reads it.
+-        Capability::SandboxTierAtSpawn
+-        | Capability::ReportsHeadroom
+-        | Capability::SystemPromptOverlay
+-        | Capability::ModelSelection
+-        | Capability::AccountIsolation => None,
+-    }
++    Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Wire → domain.
+ ///
+ /// Exhaustive over the wire enum. `UNSPECIFIED` maps to `Ok(None)` rather than
+ /// an error: an unset field is a peer that said nothing, which is normal, while
+ /// an unrecognized number is a peer from the future, which the caller may want
+ /// to log.

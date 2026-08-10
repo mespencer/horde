@@ -245,3 +245,75 @@ pub struct RateLimitInfo {
     #[serde(default, rename = "resetsAt")]
     pub resets_at: Option<i64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Envelope, TurnResult};
+
+    /// The conversation id is read from wherever the harness put it.
+    ///
+    /// Untested until now, and the mutants showed why that mattered: returning
+    /// `None`, `Some("")`, or a constant all passed. That id is what makes an
+    /// agent revivable, so a wrong one is not a display bug — it is a
+    /// conversation that cannot be found again.
+    #[test]
+    fn the_session_id_comes_from_the_envelope_not_from_a_default() {
+        // Decoded the way a live session decodes it, so the test exercises the
+        // real path rather than a hand-built struct.
+        let envelope = crate::codec::decode_line(
+            &json!({"type": "system", "subtype": "init", "session_id": "sess-7", "model": "m"})
+                .to_string(),
+        )
+        .expect("the recorded shape must decode");
+        assert_eq!(envelope.session_id(), Some("sess-7"));
+
+        let anonymous = crate::codec::decode_line(&json!({"type": "stream_event"}).to_string())
+            .expect("decodes");
+        assert_eq!(
+            anonymous.session_id(),
+            None,
+            "an envelope without an id must report none rather than an empty one"
+        );
+    }
+
+    fn result_with(is_error: bool, terminal_reason: Option<&str>) -> TurnResult {
+        let mut value = json!({
+            "subtype": "error",
+            "is_error": is_error,
+            "session_id": "s1",
+            "duration_ms": 1,
+        });
+        if let Some(reason) = terminal_reason {
+            value["terminal_reason"] = json!(reason);
+        }
+        serde_json::from_value(value).expect("the recorded shape must parse")
+    }
+
+    /// An unauthenticated session arrives as an ordinary-looking result, so
+    /// **both** halves of the check carry weight.
+    ///
+    /// A failure that is not an auth failure must not be reported as one — the
+    /// scheduler's response differs: a bad credential needs a different
+    /// account, an ordinary error can be retried where it stands.
+    #[test]
+    fn only_an_api_error_failure_reads_as_unauthenticated() {
+        assert!(
+            result_with(true, Some("api_error")).is_unauthenticated(),
+            "an errored result with api_error is the unauthenticated shape"
+        );
+        assert!(
+            !result_with(false, Some("api_error")).is_unauthenticated(),
+            "a successful turn is never unauthenticated, whatever its reason"
+        );
+        assert!(
+            !result_with(true, Some("max_turns")).is_unauthenticated(),
+            "an ordinary failure must not be mistaken for a credential problem"
+        );
+        assert!(
+            !result_with(true, None).is_unauthenticated(),
+            "and neither must a failure with no reason at all"
+        );
+    }
+}

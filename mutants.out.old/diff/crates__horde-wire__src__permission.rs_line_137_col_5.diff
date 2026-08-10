@@ -1,0 +1,27 @@
+--- crates/horde-wire/src/permission.rs
++++ replace number_from_wire -> JsonValue with Default::default()
+@@ -129,23 +129,17 @@
+ /// or type-check it differently than the `{"depth": 3}` the chain intended.
+ ///
+ /// The narrowing this cannot undo: a caller who genuinely meant the float
+ /// `3.0` gets the integer `3` back. In JSON those are the same number, so the
+ /// value is preserved even though the spelling is not. Magnitudes beyond
+ /// 2^53 cannot survive the double at all, which is why the outbound direction
+ /// rejects them rather than rounding.
+ fn number_from_wire(n: f64) -> JsonValue {
+-    const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+-
+-    if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {
+-        #[allow(clippy::cast_possible_truncation)] // guarded by the check above
+-        return JsonValue::Number(Number::from(n as i64));
+-    }
+-    Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn struct_to_json(value: &Struct) -> JsonValue {
+     JsonValue::Object(
+         value
+             .fields
+             .iter()
+             .map(|(k, v)| (k.clone(), wire_to_json(v)))

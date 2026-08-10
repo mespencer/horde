@@ -1,0 +1,30 @@
+--- crates/horde-wire/src/permission.rs
++++ replace wire_to_json -> JsonValue with Default::default()
+@@ -104,26 +104,17 @@
+     for (key, value) in map {
+         fields.insert(key.clone(), json_to_wire(value)?);
+     }
+     Ok(Struct { fields })
+ }
+ 
+ fn wire_to_json(value: &WireValue) -> JsonValue {
+     // An unset kind is an empty Value, which ProtoJSON reads as null.
+-    match &value.kind {
+-        None | Some(Kind::NullValue(_)) => JsonValue::Null,
+-        Some(Kind::BoolValue(b)) => JsonValue::Bool(*b),
+-        Some(Kind::NumberValue(n)) => number_from_wire(*n),
+-        Some(Kind::StringValue(s)) => JsonValue::String(s.clone()),
+-        Some(Kind::ListValue(list)) => {
+-            JsonValue::Array(list.values.iter().map(wire_to_json).collect())
+-        }
+-        Some(Kind::StructValue(s)) => struct_to_json(s),
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Reconstructs a JSON number from protobuf's only numeric type, a double.
+ ///
+ /// `Struct` cannot represent integers, so `{"depth": 3}` arrives as `3.0`.
+ /// Integral doubles are turned back into JSON integers because tool arguments
+ /// are overwhelmingly integers — a harness handed `{"depth": 3.0}` may render
+ /// or type-check it differently than the `{"depth": 3}` the chain intended.

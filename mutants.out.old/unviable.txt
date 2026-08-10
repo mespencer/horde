@@ -1,11 +1,6 @@
-crates/horde-adapter-codex/src/codec.rs:21:5: replace decode_line -> Result<Frame> with Ok(Default::default())
-crates/horde-adapter-codex/src/identity.rs:47:9: replace RevivalIdentity::ambient -> Self with Default::default()
-crates/horde-adapter-codex/src/replay.rs:69:9: replace <impl AgentSession for ReplaySession>::provider_session_id -> Option<&ProviderSessionId> with Some(Box::leak(Box::new(Default::default())))
-crates/horde-adapter-codex/src/replay.rs:83:9: replace <impl AgentSession for ReplaySession>::next_event -> Result<Option<AgentEvent>> with Ok(Some(Default::default()))
-crates/horde-adapter-codex/src/turn.rs:76:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())
-crates/horde-adapter-codex/src/turn.rs:94:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-codex/src/turn.rs:104:9: replace TurnAssembler::feed_notification -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-codex/src/turn.rs:210:9: replace TurnAssembler::item_completed -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-codex/src/turn.rs:275:9: replace TurnAssembler::close_turn -> Vec<AgentEvent> with vec![Default::default()]
-crates/horde-adapter-codex/src/wire.rs:245:9: replace Notification::classify -> Self with Default::default()
-crates/horde-adapter-codex/src/wire.rs:246:13: replace Notification::classify::parse -> Option<T> with Some(Default::default())
+crates/horde-wire/src/capability.rs:75:5: replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(Some(Default::default()))
+crates/horde-wire/src/permission.rs:76:9: replace && with || in exact_f64
+crates/horde-wire/src/permission.rs:81:9: replace && with || in exact_f64
+crates/horde-wire/src/permission.rs:195:5: replace permission_decision_from_wire -> Result<PermissionDecision, ConversionError> with Ok(Default::default())
+crates/horde-wire/src/usage.rs:74:5: replace source_from_wire -> HeadroomSource with Default::default()
+crates/horde-wire/src/usage.rs:129:5: replace rate_window_from_wire -> Result<RateWindow, UnreadableUtilization> with Ok(Default::default())

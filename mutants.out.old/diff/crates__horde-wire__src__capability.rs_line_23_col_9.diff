@@ -1,0 +1,21 @@
+--- crates/horde-wire/src/capability.rs
++++ replace <impl core::fmt::Display for UnknownCapability>::fmt -> core::fmt::Result with Ok(Default::default())
+@@ -15,17 +15,17 @@
+ /// older Server has never heard of. That is not corruption — it is the version
+ /// skew the design expects (DESIGN.md §2) — so it is an ordinary error to
+ /// handle, and never a panic.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct UnknownCapability(pub i32);
+ 
+ impl core::fmt::Display for UnknownCapability {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        write!(f, "unrecognized AdapterCapability value {}", self.0)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl core::error::Error for UnknownCapability {}
+ 
+ /// Domain → wire.
+ ///
+ /// Exhaustive: a new [`Capability`] must decide whether it is something

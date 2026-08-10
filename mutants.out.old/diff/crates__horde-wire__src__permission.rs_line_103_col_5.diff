@@ -1,0 +1,25 @@
+--- crates/horde-wire/src/permission.rs
++++ replace object_to_struct -> Result<Struct, ConversionError> with Ok(Default::default())
+@@ -95,21 +95,17 @@
+             values: items.iter().map(json_to_wire).collect::<Result<_, _>>()?,
+         }),
+         JsonValue::Object(map) => Kind::StructValue(object_to_struct(map)?),
+     };
+     Ok(WireValue { kind: Some(kind) })
+ }
+ 
+ fn object_to_struct(map: &Map<String, JsonValue>) -> Result<Struct, ConversionError> {
+-    let mut fields = std::collections::BTreeMap::new();
+-    for (key, value) in map {
+-        fields.insert(key.clone(), json_to_wire(value)?);
+-    }
+-    Ok(Struct { fields })
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn wire_to_json(value: &WireValue) -> JsonValue {
+     // An unset kind is an empty Value, which ProtoJSON reads as null.
+     match &value.kind {
+         None | Some(Kind::NullValue(_)) => JsonValue::Null,
+         Some(Kind::BoolValue(b)) => JsonValue::Bool(*b),
+         Some(Kind::NumberValue(n)) => number_from_wire(*n),

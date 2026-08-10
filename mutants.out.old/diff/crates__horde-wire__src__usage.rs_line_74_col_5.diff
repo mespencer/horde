@@ -1,0 +1,26 @@
+--- crates/horde-wire/src/usage.rs
++++ replace source_from_wire -> HeadroomSource with Default::default()
+@@ -66,22 +66,17 @@
+         HeadroomSource::HordeMetered => WireHeadroomSource::HordeMetered,
+     }
+ }
+ 
+ fn source_from_wire(value: i32) -> HeadroomSource {
+     // Horde's own metering is the safe reading of an unknown source: it is the
+     // weaker claim, so treating a future PROVIDER_REPORTED variant as metered
+     // understates trust rather than overstating it.
+-    match WireHeadroomSource::try_from(value) {
+-        Ok(WireHeadroomSource::ProviderReported) => HeadroomSource::ProviderReported,
+-        Ok(WireHeadroomSource::HordeMetered | WireHeadroomSource::Unspecified) | Err(_) => {
+-            HeadroomSource::HordeMetered
+-        }
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Domain → wire.
+ ///
+ /// Exhaustive over [`Utilization`]: a new arm must decide how it crosses before
+ /// this compiles. Each arm sets exactly one shape, which is what lets
+ /// [`rate_window_from_wire`] tell them apart again.
+ ///

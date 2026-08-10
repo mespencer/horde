@@ -1,0 +1,48 @@
+--- crates/horde-wire/src/usage.rs
++++ replace rate_window_to_wire -> WireRateWindow with Default::default()
+@@ -86,44 +86,17 @@
+ /// [`rate_window_from_wire`] tell them apart again.
+ ///
+ /// The one thing that does not survive: `RateWindow::window`, the harness's own
+ /// label for the window (`"five_hour"`, `"weekly"`). The wire has no field for
+ /// it because nothing downstream matches on it — it is local diagnostic colour,
+ /// and a round trip through the wire returns an empty label.
+ #[must_use]
+ pub fn rate_window_to_wire(window: &RateWindow) -> WireRateWindow {
+-    let mut wire = WireRateWindow {
+-        source: source_to_wire(window.source).into(),
+-        unit: RateWindowUnit::Unspecified.into(),
+-        used: None,
+-        limit: None,
+-        used_fraction: None,
+-        allowed: None,
+-        window_length: window.window_duration.map(|d| WireDuration {
+-            seconds: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+-            nanos: i32::try_from(d.subsec_nanos()).unwrap_or(0),
+-        }),
+-        resets_at: window
+-            .resets_at_unix
+-            .map(|seconds| Timestamp { seconds, nanos: 0 }),
+-    };
+-
+-    match window.utilization {
+-        Utilization::Fraction(used) => wire.used_fraction = Some(used),
+-        Utilization::Absolute { used, limit } => {
+-            wire.used = Some(used);
+-            wire.limit = Some(limit);
+-            // A unit only means something alongside counts.
+-            wire.unit = RateWindowUnit::Tokens.into();
+-        }
+-        Utilization::AllowedOnly { allowed } => wire.allowed = Some(allowed),
+-    }
+-
+-    wire
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Wire → domain.
+ ///
+ /// Shapes are checked in the order of how much they say, so a peer that sent
+ /// more than one is read at its most informative rather than its least.
+ pub fn rate_window_from_wire(wire: &WireRateWindow) -> Result<RateWindow, UnreadableUtilization> {
+     let utilization = match (wire.used_fraction, wire.used, wire.limit, wire.allowed) {

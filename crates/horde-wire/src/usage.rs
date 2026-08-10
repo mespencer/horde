@@ -232,6 +232,21 @@ mod tests {
         assert_eq!(wire.limit, None);
     }
 
+    /// The message an unreadable window produces.
+    ///
+    /// This error means the scheduler was handed headroom it cannot interpret,
+    /// which is a decision-affecting condition rather than noise — so it has to
+    /// say what it was reading, not merely that something went wrong.
+    #[test]
+    fn an_unreadable_window_explains_what_it_could_not_read() {
+        let rendered = UnreadableUtilization.to_string();
+        assert!(rendered.contains("RateWindow"), "got {rendered}");
+        assert!(
+            rendered.contains("utilization"),
+            "and must name the missing shape, got {rendered}"
+        );
+    }
+
     #[test]
     fn a_shapeless_window_is_refused_rather_than_guessed() {
         // An empty message must not read as full headroom.

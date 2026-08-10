@@ -1,0 +1,21 @@
+--- crates/horde-wire/src/permission.rs
++++ delete field reason from struct WirePermissionDecision expression in permission_decision_to_wire
+@@ -171,17 +171,17 @@
+             };
+             (PermissionOutcome::Allow, String::new(), rewritten)
+         }
+         PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),
+     };
+ 
+     Ok(WirePermissionDecision {
+         outcome: outcome.into(),
+-        reason,
++         /* ~ changed by cargo-mutants ~ */
+         updated_input,
+         ..WirePermissionDecision::default()
+     })
+ }
+ 
+ /// Wire → domain — the direction a Worker actually runs.
+ ///
+ /// `can_rewrite_input` is the adapter's

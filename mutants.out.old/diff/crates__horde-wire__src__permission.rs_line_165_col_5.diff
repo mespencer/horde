@@ -1,0 +1,38 @@
+--- crates/horde-wire/src/permission.rs
++++ replace permission_decision_to_wire -> Result<WirePermissionDecision, ConversionError> with Ok(Default::default())
+@@ -157,34 +157,17 @@
+ ///
+ /// Fills only what the domain owns: the outcome, the denial message, and any
+ /// replacement arguments. `request_id`, `decided_by`, `decided_by_actor`, and
+ /// `remember_for_session` belong to the Server that ran the permission chain
+ /// and are left at their defaults for it to set.
+ pub fn permission_decision_to_wire(
+     decision: &PermissionDecision,
+ ) -> Result<WirePermissionDecision, ConversionError> {
+-    let (outcome, reason, updated_input) = match decision {
+-        PermissionDecision::Allow { updated_input } => {
+-            let rewritten = match updated_input {
+-                Some(JsonValue::Object(map)) => Some(object_to_struct(map)?),
+-                Some(_) => return Err(ConversionError::NotAnObject),
+-                None => None,
+-            };
+-            (PermissionOutcome::Allow, String::new(), rewritten)
+-        }
+-        PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),
+-    };
+-
+-    Ok(WirePermissionDecision {
+-        outcome: outcome.into(),
+-        reason,
+-        updated_input,
+-        ..WirePermissionDecision::default()
+-    })
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Wire → domain — the direction a Worker actually runs.
+ ///
+ /// `can_rewrite_input` is the adapter's
+ /// [`Capability::RewritesToolInput`](horde_adapter::Capability::RewritesToolInput)
+ /// claim. When a decision carries replacement arguments and the adapter cannot
+ /// apply them, this fails rather than downgrading to a plain allow.
