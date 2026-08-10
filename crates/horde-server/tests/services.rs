@@ -536,5 +536,163 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
     assert!(status.message().contains("refusing to renumber"));
 }
 
+/// A permission request, journaled by the worker the way a real one arrives.
+fn permission_requested(agent: &str, request_id: &str) -> Event {
+    Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: String::new(),
+        kind: Some(Kind::PermissionRequested(
+            horde_proto::v1::PermissionRequested {
+                request: Some(horde_proto::v1::PermissionRequest {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+                    agent_id: Some(AgentId::new(agent)),
+                    ..horde_proto::v1::PermissionRequest::default()
+                }),
+            },
+        )),
+    }
+}
+
+#[tokio::test]
+async fn a_permission_is_answered_by_request_id_alone() {
+    // The client answering a permission knows the request id and nothing else —
+    // not the session, not the worker. Finding the rest is the server's job,
+    // which is what makes a permission answerable from any attached client.
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    let session_id = create_session(&mut harness, "perms", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("the event stream must open");
+    acks.next().await.expect("a reply").expect("accepted");
+
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events: vec![JournaledEvent {
+                    journal_sequence: 1,
+                    session_id: Some(SessionId::new(session_id.clone())),
+                    event: Some(permission_requested("agent-1", "req-1")),
+                }],
+                acked_command_sequence: 0,
+            })),
+        })
+        .await
+        .expect("the request must journal");
+    acks.next().await.expect("a reply").expect("accepted");
+
+    let answered = harness
+        .control
+        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new("req-1")),
+            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            reason: "looks fine".to_owned(),
+            remember_for_session: false,
+        })
+        .await
+        .expect("a pending permission must be answerable")
+        .into_inner();
+    assert!(
+        answered.sequence > 0,
+        "the decision is an event like any other, so it has a sequence"
+    );
+
+    // Answering it again fails: the projection dropped it when the decision
+    // landed, so there is nothing left awaiting an answer.
+    let twice = harness
+        .control
+        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new("req-1")),
+            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            reason: String::new(),
+            remember_for_session: false,
+        })
+        .await
+        .expect_err("an answered permission is no longer pending");
+    assert_eq!(twice.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn answering_a_permission_nobody_asked_for_is_refused() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    create_session(&mut harness, "perms", "key-1")
+        .await
+        .expect("a session must be creatable");
+
+    let status = harness
+        .control
+        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new("never-asked")),
+            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            reason: String::new(),
+            remember_for_session: false,
+        })
+        .await
+        .expect_err("inventing a decision for an unknown request would be worse");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.message().contains("never-asked"));
+}
+
+#[tokio::test]
+async fn an_agent_is_found_by_id_without_being_told_its_session() {
+    // interrupt_agent takes an agent id and no session id, so the server has to
+    // find the session itself. The failure case matters as much: an unknown
+    // agent must be refused rather than interrupting something else.
+    let core = core().expect("an in-memory core");
+    let mut harness = connect(core).await.expect("the harness must connect");
+    harness
+        .worker
+        .register_worker(RegisterWorkerRequest {
+            hello: None,
+            worker_id: Some(WorkerId::new("worker-a")),
+            capabilities: Some(WorkerCapabilities::default()),
+        })
+        .await
+        .expect("the worker must register");
+    let session_id = create_session(&mut harness, "findable", "key-1")
+        .await
+        .expect("a session must be creatable");
+    let agent_id = harness
+        .control
+        .spawn_agent(SpawnAgentRequest {
+            session_id: Some(SessionId::new(session_id)),
+            parent_agent_id: None,
+            spec: Some(AgentSpec::default()),
+            idempotency_key: String::new(),
+        })
+        .await
+        .expect("spawn must succeed")
+        .into_inner()
+        .agent_id
+        .map(|id| id.to_string())
+        .expect("a spawned agent has an id");
+
+    let interrupted = harness
+        .control
+        .interrupt_agent(horde_proto::v1::InterruptAgentRequest {
+            agent_id: Some(AgentId::new(agent_id)),
+            reason: "changed my mind".to_owned(),
+        })
+        .await
+        .expect("a known agent must be interruptible")
+        .into_inner();
+    assert!(interrupted.sequence > 0);
+
+    let status = harness
+        .control
+        .interrupt_agent(horde_proto::v1::InterruptAgentRequest {
+            agent_id: Some(AgentId::new("no-such-agent")),
+            reason: String::new(),
+        })
+        .await
+        .expect_err("an unknown agent must not resolve to some other session");
+    assert_eq!(status.code(), Code::NotFound);
+}
+
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.
 const _: fn(DuplexStream) = |_stream| {};
