@@ -32,9 +32,13 @@ struct Harness {
     worker: WorkerServiceClient<tonic::transport::Channel>,
 }
 
-/// Helpers return `Result` rather than unwrapping: clippy's in-test allowance
-/// for `expect` does not reach free functions in an integration test file, and
-/// exempting the lint would be worse than threading the error to a `#[test]`.
+/// Helpers return `Result` rather than unwrapping.
+///
+/// `allow-expect-in-tests` exempts anything under `#[cfg(test)]`, which an
+/// integration test file's free functions are not — so `expect` here would trip
+/// the deny-list. Wrapping the helpers in `#[cfg(test)] mod` would also fix it
+/// (see docs/QUALITY_GATES.md); threading the error to a `#[test]` is kept
+/// because it also reports *which* setup step failed.
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn connect(core: ServerCore) -> Setup<Harness> {
@@ -87,6 +91,57 @@ fn core() -> Setup<ServerCore> {
     Ok(ServerCore::new(EventLog::in_memory()?))
 }
 
+/// Creates a session and returns its id.
+///
+/// Four tests need a session before they can test anything else; this is that
+/// preamble, once.
+async fn create_session(harness: &mut Harness, title: &str, key: &str) -> Setup<String> {
+    let created = harness
+        .control
+        .create_session(CreateSessionRequest {
+            title: title.to_owned(),
+            workspace_definition_id: None,
+            root_agent: Some(AgentSpec::default()),
+            idempotency_key: key.to_owned(),
+        })
+        .await?
+        .into_inner();
+    created
+        .session
+        .and_then(|summary| summary.session_id)
+        .map(|id| id.to_string())
+        .ok_or_else(|| "a created session must carry an id".into())
+}
+
+/// Opens a journal stream and announces the worker's journal position.
+///
+/// Returns the sender and the ack stream; the caller decides what to make of
+/// the first ack, which is the part each test actually cares about.
+async fn open_journal(
+    harness: &mut Harness,
+    worker_id: &str,
+    last_local_journal_sequence: u64,
+) -> Setup<(
+    tokio::sync::mpsc::Sender<PushEventsRequest>,
+    tonic::Streaming<horde_proto::v1::PushEventsResponse>,
+)> {
+    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
+    let acks = harness
+        .worker
+        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+        .await?
+        .into_inner();
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Start(PushEventsStart {
+                worker_id: Some(WorkerId::new(worker_id)),
+                last_local_journal_sequence,
+            })),
+        })
+        .await?;
+    Ok((to_server, acks))
+}
+
 fn output_event(agent: &str, text: &str, index: u64) -> Event {
     Event {
         agent_id: Some(AgentId::new(agent)),
@@ -128,22 +183,9 @@ async fn a_worker_and_a_client_meet_through_the_log() {
     );
 
     // 2. A client creates a session and spawns an agent under it.
-    let session = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "ci-fix".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "ci-fix", "key-1")
         .await
-        .expect("create must succeed")
-        .into_inner();
-    let session_id = session
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("a created session has an id");
+        .expect("a session must be creatable");
 
     let spawned = harness
         .control
@@ -197,23 +239,9 @@ async fn a_worker_and_a_client_meet_through_the_log() {
     }
 
     // 4. The worker journals events back and is acked.
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let mut acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
         .await
-        .expect("the event stream must open")
-        .into_inner();
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new("worker-a")),
-                last_local_journal_sequence: 0,
-            })),
-        })
-        .await
-        .expect("start must send");
+        .expect("the event stream must open");
 
     match acks
         .next()
@@ -331,22 +359,9 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         "a fresh server has no sessions because the log has no events"
     );
 
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "first".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "first", "key-1")
         .await
-        .expect("create must succeed")
-        .into_inner();
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("an id");
+        .expect("a session must be creatable");
 
     let listed = harness
         .control
@@ -415,22 +430,9 @@ async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
     let core = core().expect("an in-memory core");
     let mut harness = connect(core).await.expect("the harness must connect");
 
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "lonely".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "lonely", "key-1")
         .await
-        .expect("create")
-        .into_inner();
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("an id");
+        .expect("a session must be creatable");
 
     let spawned = harness
         .control
@@ -494,40 +496,13 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
 
     // Store some journal history directly, then have the worker claim it has
     // less than the server does.
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: "s".to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: "key-1".to_owned(),
-        })
+    let session_id = create_session(&mut harness, "s", "key-1")
         .await
-        .expect("create")
-        .into_inner();
-    let session_id = created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("an id");
+        .expect("a session must be creatable");
 
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let mut acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
         .await
-        .expect("stream opens")
-        .into_inner();
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new("worker-a")),
-                last_local_journal_sequence: 0,
-            })),
-        })
-        .await
-        .expect("start sends");
+        .expect("stream opens");
     acks.next().await.expect("accepted").expect("accepted");
 
     to_server
@@ -548,23 +523,9 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
     drop(to_server);
 
     // Reconnect claiming a journal head below what the server stored.
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let mut acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+    let (_to_server, mut acks) = open_journal(&mut harness, "worker-a", 2)
         .await
-        .expect("stream reopens")
-        .into_inner();
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new("worker-a")),
-                last_local_journal_sequence: 2,
-            })),
-        })
-        .await
-        .expect("start sends");
+        .expect("stream reopens");
 
     let status = acks
         .next()
