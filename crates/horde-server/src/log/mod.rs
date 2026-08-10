@@ -351,6 +351,104 @@ mod tests {
         log
     }
 
+    /// `Debug` on the log is what an operator sees in a span; an empty struct
+    /// tells them nothing about whether anyone is attached.
+    #[tokio::test]
+    async fn the_debug_view_reports_how_many_tails_are_attached() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        assert!(format!("{log:?}").contains("EventLog"));
+        assert!(
+            format!("{log:?}").contains("subscribers: 0"),
+            "got {:?}",
+            format!("{log:?}")
+        );
+
+        let _subscriber = log.subscribe();
+        assert!(
+            format!("{log:?}").contains("subscribers: 1"),
+            "an attached tail must be visible: {:?}",
+            format!("{log:?}")
+        );
+    }
+
+    /// The sweep exists to fold in whatever landed during the replay. It must
+    /// fire when the head moved and stay quiet when it did not — a comparison
+    /// that always fires would re-read on every tail, and one that never fires
+    /// reopens the window the sweep closes.
+    #[tokio::test]
+    async fn the_sweep_folds_in_events_that_landed_during_the_replay() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..3 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        // Nothing moved between the read and the sweep: history is exactly the
+        // three events, and `delivered` sits on the last of them.
+        let (history, tail) = log.tail("s1", 1).await.expect("tail");
+        assert_eq!(history.len(), 3);
+        assert_eq!(tail.delivered(), 3);
+
+        // A tail taken at the head must return nothing and still be positioned
+        // correctly, which is the boundary case `>` versus `>=` disagrees on.
+        let (empty, tail) = log.tail("s1", 4).await.expect("tail");
+        assert!(
+            empty.is_empty(),
+            "there is no event 4 yet, so the sweep must find nothing"
+        );
+        assert_eq!(tail.delivered(), 3);
+    }
+
+    /// Paging stops on a short page. Getting the comparison wrong either stops
+    /// after the first full page or never stops at all.
+    #[tokio::test]
+    async fn replaying_a_session_longer_than_one_page_returns_every_event() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        // One more than the 512-event page, so the loop must go round twice.
+        for _ in 0..513 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let (history, _tail) = log.tail("s1", 1).await.expect("tail");
+        let sequences: Vec<u64> = history.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            (1..=513).collect::<Vec<u64>>(),
+            "a page boundary must not truncate or duplicate the replay"
+        );
+    }
+
+    /// `next_batch` skips a notification when it is for another session OR for
+    /// something already delivered. With `&&` it would skip only when both were
+    /// true, so a duplicate for this session would be re-read forever.
+    #[tokio::test]
+    async fn a_tail_ignores_notifications_it_has_already_delivered() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"a")).await.expect("append");
+
+        // Replay everything, so the next notification for s1 is one the tail
+        // has already seen.
+        let (history, mut tail) = log.tail("s1", 1).await.expect("tail");
+        assert_eq!(history.len(), 1);
+
+        // A notification for another session must not wake this tail into
+        // returning anything.
+        log.append(pending("other", b"x")).await.expect("append");
+        log.append(pending("s1", b"b")).await.expect("append");
+
+        let batch = tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
+            .await
+            .expect("the tail must not stall")
+            .expect("the log outlives the tail")
+            .expect("read");
+
+        let sequences: Vec<u64> = batch.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            vec![2],
+            "only the new s1 event, and never a redelivery of event 1"
+        );
+    }
+
     #[tokio::test]
     async fn appends_are_visible_to_a_later_read() {
         let log = log_with_two_events().await;

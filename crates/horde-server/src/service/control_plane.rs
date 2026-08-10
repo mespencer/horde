@@ -152,9 +152,24 @@ fn envelope(event: &StoredEvent) -> Result<horde_proto::v1::EventEnvelope, Serve
     Ok(horde_proto::v1::EventEnvelope {
         session_id: Some(SessionId::new(event.session_id.clone())),
         sequence: event.sequence,
-        recorded_at: None,
+        recorded_at: Some(recorded_at(event.recorded_at_unix_ms)),
         event: Some(Event::decode(event.payload.as_slice())?),
     })
+}
+
+/// Converts the log's stored milliseconds into a wire timestamp.
+///
+/// The log has always recorded this; it was never put on the wire, so a client
+/// could not render when anything happened or reconcile clock skew against the
+/// server (DESIGN.md §2). Mutation testing found it: the stored value had no
+/// reader, so replacing the clock with a constant changed nothing observable.
+fn recorded_at(unix_ms: i64) -> prost_types::Timestamp {
+    // Floor division, so a pre-epoch reading yields a negative second and a
+    // non-negative nanosecond rather than a timestamp that reads as later than
+    // it was.
+    let seconds = unix_ms.div_euclid(1_000);
+    let nanos = i32::try_from(unix_ms.rem_euclid(1_000)).unwrap_or(0) * 1_000_000;
+    prost_types::Timestamp { seconds, nanos }
 }
 
 /// One sync stream: history, a caught-up marker, then the live tail.
@@ -701,11 +716,29 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
-        // Deliberately not stubbed away: the registry is real, so this can
-        // answer truthfully even though enrollment is not built.
-        Ok(Response::new(ListWorkersResponse {
-            workers: Vec::new(),
-        }))
+        // Answered from the registry rather than stubbed: the registry is real
+        // even though enrollment is not, and returning an empty list would make
+        // a connected worker indistinguishable from none.
+        let workers = self
+            .core
+            .workers
+            .connected()
+            .into_iter()
+            .map(|worker| horde_proto::v1::WorkerSummary {
+                worker_id: Some(horde_proto::v1::WorkerId::new(worker.worker_id.clone())),
+                name: worker.worker_id,
+                // Connection state is what the registry knows: a worker is in
+                // it because it registered and has not been dropped.
+                state: horde_proto::v1::WorkerConnectionState::Online as i32,
+                // Filled in with the handshake once enrollment carries it.
+                semver: String::new(),
+                capabilities: Some(worker.capabilities),
+                last_seen_at: None,
+                running_agents: 0,
+            })
+            .collect();
+
+        Ok(Response::new(ListWorkersResponse { workers }))
     }
 
     async fn mint_enrollment_code(

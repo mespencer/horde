@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 horde-proto = { workspace = true }
 prost = "0.14.4"
+prost-types = "0.14.4"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
