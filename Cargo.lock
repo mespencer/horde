@@ -477,7 +477,9 @@ dependencies = [
  "hyper-util",
  "proptest",
  "prost",
+ "prost-types",
  "rusqlite",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -491,9 +493,12 @@ dependencies = [
 name = "horde-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "horde-adapter",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

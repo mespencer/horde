@@ -231,7 +231,63 @@ pub fn all_transcript_names() -> Result<Vec<String>, TranscriptError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Transcript, all_transcript_names, transcript_dir};
+    use super::{
+        HarnessOutputKey, Transcript, TranscriptError, all_transcript_names, transcript_dir,
+    };
+
+    /// The two spikes chose opposite conventions for `dir`, and guessing wrong
+    /// silently swaps what the harness said with what the driver sent — every
+    /// assertion still runs, against the wrong half of the conversation.
+    #[test]
+    fn each_convention_marks_only_its_own_direction_as_harness_output() {
+        assert!(HarnessOutputKey::Out.marks_output("out"));
+        assert!(!HarnessOutputKey::Out.marks_output("in"));
+
+        assert!(HarnessOutputKey::In.marks_output("in"));
+        assert!(!HarnessOutputKey::In.marks_output("out"));
+    }
+
+    #[test]
+    fn an_unrelated_direction_is_not_harness_output_under_either_convention() {
+        for key in [HarnessOutputKey::Out, HarnessOutputKey::In] {
+            assert!(!key.marks_output("sideways"));
+            assert!(!key.marks_output(""));
+        }
+    }
+
+    /// A malformed line must be reported at its own 1-based position: an
+    /// off-by-one sends whoever is debugging a transcript to the wrong line.
+    #[test]
+    fn a_malformed_line_is_reported_at_its_one_based_position() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            directory.path().join("broken.jsonl"),
+            "{\"a\":1}\n{\"b\":2}\nnot json at all\n",
+        )
+        .expect("write the fixture");
+
+        let error = Transcript::load_from(directory.path(), "broken.jsonl", HarnessOutputKey::Out)
+            .expect_err("a malformed line must be rejected");
+
+        match error {
+            TranscriptError::Malformed { line_number, .. } => assert_eq!(
+                line_number, 3,
+                "the third line is malformed; 1-based counting is what a reader expects"
+            ),
+            other => panic!("expected Malformed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_first_line_is_reported_as_line_one() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(directory.path().join("broken.jsonl"), "nope\n").expect("write the fixture");
+
+        match Transcript::load_from(directory.path(), "broken.jsonl", HarnessOutputKey::Out) {
+            Err(TranscriptError::Malformed { line_number, .. }) => assert_eq!(line_number, 1),
+            other => panic!("expected Malformed at line 1, got {other:?}"),
+        }
+    }
 
     #[test]
     fn the_golden_transcripts_are_where_we_think_they_are() {
