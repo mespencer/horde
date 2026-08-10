@@ -1,0 +1,21 @@
+--- crates/horde-adapter-claude/src/replay.rs
++++ replace replay -> ReplaySession with Default::default()
+@@ -42,17 +42,17 @@
+ }
+ 
+ /// Replays recorded `claude` output, one turn per message sent.
+ pub type ReplaySession = horde_adapter::ReplaySession<StreamJsonLines>;
+ 
+ /// Builds a session from stdout lines already grouped into turns.
+ #[must_use]
+ pub fn replay(turns: Vec<Vec<String>>) -> ReplaySession {
+-    ReplaySession::new(StreamJsonLines::default(), turns)
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use horde_adapter::{AgentSession, ToolCallId, TurnInput};
+     use serde_json::json;
+ 
+     use super::replay;

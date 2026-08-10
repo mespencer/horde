@@ -1,298 +1,330 @@
 [
   {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace <impl core::fmt::Display for UnknownCapability>::fmt -> core::fmt::Result with Ok(Default::default())\n@@ -15,17 +15,17 @@\n /// older Server has never heard of. That is not corruption — it is the version\n /// skew the design expects (DESIGN.md §2) — so it is an ordinary error to\n /// handle, and never a panic.\n #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n pub struct UnknownCapability(pub i32);\n \n impl core::fmt::Display for UnknownCapability {\n     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n-        write!(f, \"unrecognized AdapterCapability value {}\", self.0)\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl core::error::Error for UnknownCapability {}\n \n /// Domain → wire.\n ///\n /// Exhaustive: a new [`Capability`] must decide whether it is something\n",
-    "file": "crates/horde-wire/src/capability.rs",
+    "diff": "--- crates/horde-adapter-claude/src/lib.rs\n+++ replace capabilities -> Capabilities with Default::default()\n@@ -62,25 +62,17 @@\n /// running Claude turn — its only steering-adjacent finding is the control\n /// message's abort-and-keep-steering, which is `InterruptibleTurn`. Per that\n /// capability's contract, the absence means the orchestrator queues the message\n /// to the turn boundary itself, which works here as it does everywhere. Dropped\n /// when the capability was renamed from `SteerAtTurnBoundary`, whose old name\n /// this adapter did satisfy.\n #[must_use]\n pub fn capabilities() -> Capabilities {\n-    Capabilities::none()\n-        .with(Capability::Resumable)\n-        .with(Capability::InterruptibleTurn)\n-        .with(Capability::PreAuthorizeToolCalls)\n-        .with(Capability::RewritesToolInput)\n-        .with(Capability::ReportsHeadroom)\n-        .with(Capability::SystemPromptOverlay)\n-        .with(Capability::ModelSelection)\n-        .with(Capability::AccountIsolation)\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use horde_adapter::Capability;\n \n     use super::{PROVIDER, capabilities};\n \n",
+    "file": "crates/horde-adapter-claude/src/lib.rs",
     "function": {
-      "function_name": "<impl core::fmt::Display for UnknownCapability>::fmt",
-      "return_type": "-> core::fmt::Result",
+      "function_name": "capabilities",
+      "return_type": "-> Capabilities",
       "span": {
         "end": {
-          "column": 6,
-          "line": 24
+          "column": 2,
+          "line": 79
         },
         "start": {
-          "column": 5,
-          "line": 22
+          "column": 1,
+          "line": 56
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:23:9: replace <impl core::fmt::Display for UnknownCapability>::fmt -> core::fmt::Result with Ok(Default::default())",
-    "package": "horde-wire",
+    "name": "crates/horde-adapter-claude/src/lib.rs:70:5: replace capabilities -> Capabilities with Default::default()",
+    "package": "horde-adapter-claude",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 44,
+        "line": 78
+      },
+      "start": {
+        "column": 5,
+        "line": 70
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace decode_line -> Result<Envelope, AdapterError> with Ok(Default::default())\n@@ -29,33 +29,17 @@\n /// ```\n ///\n /// An envelope whose `type` this crate does not model decodes to\n /// [`Event::Unknown`] with its raw form intact. Only malformed JSON, or an\n /// envelope whose known shape fails to parse, is an error — the first means the\n /// stream is corrupt, the second means the protocol moved under us, and both\n /// need the raw line to diagnose.\n pub fn decode_line(line: &str) -> Result<Envelope, AdapterError> {\n-    let raw: Value = serde_json::from_str(line).map_err(|source| AdapterError::Protocol {\n-        message: format!(\"line is not valid JSON: {source}\"),\n-        raw: line.to_owned(),\n-    })?;\n-\n-    let event_type = raw\n-        .get(\"type\")\n-        .and_then(Value::as_str)\n-        .ok_or_else(|| AdapterError::Protocol {\n-            message: \"envelope has no `type` field\".to_owned(),\n-            raw: line.to_owned(),\n-        })?\n-        .to_owned();\n-\n-    let event = classify(&raw, event_type, line)?;\n-\n-    Ok(Envelope { raw, event })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Maps an envelope's `type` to the event this crate models.\n ///\n /// Split out of [`decode_line`] so that reading the line and interpreting it\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "decode_line",
+      "return_type": "-> Result<Envelope, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 54
+        },
+        "start": {
+          "column": 1,
+          "line": 12
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/codec.rs:37:5: replace decode_line -> Result<Envelope, AdapterError> with Ok(Default::default())",
+    "package": "horde-adapter-claude",
     "replacement": "Ok(Default::default())",
     "span": {
       "end": {
-        "column": 69,
-        "line": 23
-      },
-      "start": {
-        "column": 9,
-        "line": 23
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace capability_to_wire -> Option<AdapterCapability> with None\n@@ -27,43 +27,17 @@\n impl core::error::Error for UnknownCapability {}\n \n /// Domain → wire.\n ///\n /// Exhaustive: a new [`Capability`] must decide whether it is something\n /// placement can match on before this compiles.\n #[must_use]\n pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {\n-    match capability {\n-        Capability::Resumable => Some(AdapterCapability::Resumable),\n-        Capability::InterruptibleTurn => Some(AdapterCapability::Interruptible),\n-        Capability::AmendActiveTurn => Some(AdapterCapability::Steerable),\n-\n-        // The domain models the capability; the wire's PERMISSION_PROMPT_TOOL\n-        // names one provider's mechanism and is deprecated in favour of this.\n-        Capability::PreAuthorizeToolCalls => Some(AdapterCapability::ToolCallGating),\n-\n-        // On the wire because the Server needs it before it composes a\n-        // narrowing decision, not after the Worker bounces one.\n-        Capability::RewritesToolInput => Some(AdapterCapability::ToolInputRewrite),\n-\n-        // Worker-local facts with no placement consequence on the wire yet.\n-        // Deliberately not advertised: a capability nothing matches on invites\n-        // readers to assume it is enforced somewhere.\n-        //\n-        // `SandboxTierAtSpawn` is the one most likely to graduate — it is what\n-        // an ungateable provider offers *instead* of interception, so a\n-        // scheduler that learns to place high-trust work will want to see it.\n-        // It stays off the wire until something reads it.\n-        Capability::SandboxTierAtSpawn\n-        | Capability::ReportsHeadroom\n-        | Capability::SystemPromptOverlay\n-        | Capability::ModelSelection\n-        | Capability::AccountIsolation => None,\n-    }\n+    None /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wire → domain.\n ///\n /// Exhaustive over the wire enum. `UNSPECIFIED` maps to `Ok(None)` rather than\n /// an error: an unset field is a peer that said nothing, which is normal, while\n /// an unrecognized number is a peer from the future, which the caller may want\n /// to log.\n",
-    "file": "crates/horde-wire/src/capability.rs",
-    "function": {
-      "function_name": "capability_to_wire",
-      "return_type": "-> Option<AdapterCapability>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 62
-        },
-        "start": {
-          "column": 1,
-          "line": 29
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:35:5: replace capability_to_wire -> Option<AdapterCapability> with None",
-    "package": "horde-wire",
-    "replacement": "None",
-    "span": {
-      "end": {
-        "column": 6,
-        "line": 61
+        "column": 32,
+        "line": 53
       },
       "start": {
         "column": 5,
-        "line": 35
+        "line": 37
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace capability_to_wire -> Option<AdapterCapability> with Some(Default::default())\n@@ -27,43 +27,17 @@\n impl core::error::Error for UnknownCapability {}\n \n /// Domain → wire.\n ///\n /// Exhaustive: a new [`Capability`] must decide whether it is something\n /// placement can match on before this compiles.\n #[must_use]\n pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {\n-    match capability {\n-        Capability::Resumable => Some(AdapterCapability::Resumable),\n-        Capability::InterruptibleTurn => Some(AdapterCapability::Interruptible),\n-        Capability::AmendActiveTurn => Some(AdapterCapability::Steerable),\n-\n-        // The domain models the capability; the wire's PERMISSION_PROMPT_TOOL\n-        // names one provider's mechanism and is deprecated in favour of this.\n-        Capability::PreAuthorizeToolCalls => Some(AdapterCapability::ToolCallGating),\n-\n-        // On the wire because the Server needs it before it composes a\n-        // narrowing decision, not after the Worker bounces one.\n-        Capability::RewritesToolInput => Some(AdapterCapability::ToolInputRewrite),\n-\n-        // Worker-local facts with no placement consequence on the wire yet.\n-        // Deliberately not advertised: a capability nothing matches on invites\n-        // readers to assume it is enforced somewhere.\n-        //\n-        // `SandboxTierAtSpawn` is the one most likely to graduate — it is what\n-        // an ungateable provider offers *instead* of interception, so a\n-        // scheduler that learns to place high-trust work will want to see it.\n-        // It stays off the wire until something reads it.\n-        Capability::SandboxTierAtSpawn\n-        | Capability::ReportsHeadroom\n-        | Capability::SystemPromptOverlay\n-        | Capability::ModelSelection\n-        | Capability::AccountIsolation => None,\n-    }\n+    Some(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wire → domain.\n ///\n /// Exhaustive over the wire enum. `UNSPECIFIED` maps to `Ok(None)` rather than\n /// an error: an unset field is a peer that said nothing, which is normal, while\n /// an unrecognized number is a peer from the future, which the caller may want\n /// to log.\n",
-    "file": "crates/horde-wire/src/capability.rs",
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace classify -> Result<Event, AdapterError> with Ok(Default::default())\n@@ -54,26 +54,17 @@\n }\n \n /// Maps an envelope's `type` to the event this crate models.\n ///\n /// Split out of [`decode_line`] so that reading the line and interpreting it\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n-    Ok(match event_type.as_str() {\n-        \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n-        \"user\" => Event::User(typed(raw, &event_type, line)?),\n-        \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n-        \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n-        \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n-        \"stream_event\" => Event::StreamEvent,\n-        \"system\" => system_event(raw, &event_type, line)?,\n-        _ => Event::Unknown { event_type },\n-    })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Splits a `system` envelope on its subtype.\n ///\n /// `init` is the one that carries session identity and model; the others are\n /// kept as their subtype so a report can say which arrived without this crate\n /// having to model each one.\n fn system_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, AdapterError> {\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
     "function": {
-      "function_name": "capability_to_wire",
-      "return_type": "-> Option<AdapterCapability>",
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
       "span": {
         "end": {
           "column": 2,
-          "line": 62
+          "line": 72
         },
         "start": {
           "column": 1,
-          "line": 29
+          "line": 56
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:35:5: replace capability_to_wire -> Option<AdapterCapability> with Some(Default::default())",
-    "package": "horde-wire",
-    "replacement": "Some(Default::default())",
-    "span": {
-      "end": {
-        "column": 6,
-        "line": 61
-      },
-      "start": {
-        "column": 5,
-        "line": 35
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(None)\n@@ -67,32 +67,17 @@\n /// an error: an unset field is a peer that said nothing, which is normal, while\n /// an unrecognized number is a peer from the future, which the caller may want\n /// to log.\n // Reading the deprecated variant is the entire point of this direction:\n // Workers built before TOOL_CALL_GATING still advertise it, and refusing to\n // decode it would silently downgrade them to ungateable.\n #[allow(deprecated)]\n pub fn capability_from_wire(value: i32) -> Result<Option<Capability>, UnknownCapability> {\n-    let Ok(capability) = AdapterCapability::try_from(value) else {\n-        return Err(UnknownCapability(value));\n-    };\n-\n-    Ok(match capability {\n-        AdapterCapability::Unspecified => None,\n-        AdapterCapability::Resumable => Some(Capability::Resumable),\n-        AdapterCapability::Interruptible => Some(Capability::InterruptibleTurn),\n-        AdapterCapability::Steerable => Some(Capability::AmendActiveTurn),\n-        AdapterCapability::ToolCallGating => Some(Capability::PreAuthorizeToolCalls),\n-        AdapterCapability::ToolInputRewrite => Some(Capability::RewritesToolInput),\n-\n-        // Deprecated, but old Workers still send it, and it means the same\n-        // thing they would now send as TOOL_CALL_GATING.\n-        AdapterCapability::PermissionPromptTool => Some(Capability::PreAuthorizeToolCalls),\n-    })\n+    Ok(None) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Whether a Worker advertising `advertised` can apply replacement tool\n /// arguments.\n ///\n /// The Server asks this *before* composing a narrowing decision. Sending one to\n /// a Worker without the capability produces a decision the Worker must reject\n /// rather than silently widen, which strands the Agent on an answer that was\n",
-    "file": "crates/horde-wire/src/capability.rs",
-    "function": {
-      "function_name": "capability_from_wire",
-      "return_type": "-> Result<Option<Capability>, UnknownCapability>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 91
-        },
-        "start": {
-          "column": 1,
-          "line": 64
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:75:5: replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(None)",
-    "package": "horde-wire",
-    "replacement": "Ok(None)",
-    "span": {
-      "end": {
-        "column": 7,
-        "line": 90
-      },
-      "start": {
-        "column": 5,
-        "line": 75
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(Some(Default::default()))\n@@ -67,32 +67,17 @@\n /// an error: an unset field is a peer that said nothing, which is normal, while\n /// an unrecognized number is a peer from the future, which the caller may want\n /// to log.\n // Reading the deprecated variant is the entire point of this direction:\n // Workers built before TOOL_CALL_GATING still advertise it, and refusing to\n // decode it would silently downgrade them to ungateable.\n #[allow(deprecated)]\n pub fn capability_from_wire(value: i32) -> Result<Option<Capability>, UnknownCapability> {\n-    let Ok(capability) = AdapterCapability::try_from(value) else {\n-        return Err(UnknownCapability(value));\n-    };\n-\n-    Ok(match capability {\n-        AdapterCapability::Unspecified => None,\n-        AdapterCapability::Resumable => Some(Capability::Resumable),\n-        AdapterCapability::Interruptible => Some(Capability::InterruptibleTurn),\n-        AdapterCapability::Steerable => Some(Capability::AmendActiveTurn),\n-        AdapterCapability::ToolCallGating => Some(Capability::PreAuthorizeToolCalls),\n-        AdapterCapability::ToolInputRewrite => Some(Capability::RewritesToolInput),\n-\n-        // Deprecated, but old Workers still send it, and it means the same\n-        // thing they would now send as TOOL_CALL_GATING.\n-        AdapterCapability::PermissionPromptTool => Some(Capability::PreAuthorizeToolCalls),\n-    })\n+    Ok(Some(Default::default())) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Whether a Worker advertising `advertised` can apply replacement tool\n /// arguments.\n ///\n /// The Server asks this *before* composing a narrowing decision. Sending one to\n /// a Worker without the capability produces a decision the Worker must reject\n /// rather than silently widen, which strands the Agent on an answer that was\n",
-    "file": "crates/horde-wire/src/capability.rs",
-    "function": {
-      "function_name": "capability_from_wire",
-      "return_type": "-> Result<Option<Capability>, UnknownCapability>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 91
-        },
-        "start": {
-          "column": 1,
-          "line": 64
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:75:5: replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(Some(Default::default()))",
-    "package": "horde-wire",
-    "replacement": "Ok(Some(Default::default()))",
-    "span": {
-      "end": {
-        "column": 7,
-        "line": 90
-      },
-      "start": {
-        "column": 5,
-        "line": 75
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace advertises_tool_input_rewrite -> bool with true\n@@ -98,20 +98,17 @@\n /// rather than silently widen, which strands the Agent on an answer that was\n /// never deliverable.\n ///\n /// Unknown values are ignored rather than refused: a peer from the future\n /// advertising capabilities this build cannot name says nothing about whether\n /// it rewrites.\n #[must_use]\n pub fn advertises_tool_input_rewrite(advertised: &[i32]) -> bool {\n-    advertised\n-        .iter()\n-        .filter_map(|value| capability_from_wire(*value).ok().flatten())\n-        .any(|capability| capability == Capability::RewritesToolInput)\n+    true /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{\n         UnknownCapability, advertises_tool_input_rewrite, capability_from_wire, capability_to_wire,\n     };\n     use horde_adapter::Capability;\n",
-    "file": "crates/horde-wire/src/capability.rs",
-    "function": {
-      "function_name": "advertises_tool_input_rewrite",
-      "return_type": "-> bool",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 110
-        },
-        "start": {
-          "column": 1,
-          "line": 93
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:106:5: replace advertises_tool_input_rewrite -> bool with true",
-    "package": "horde-wire",
-    "replacement": "true",
-    "span": {
-      "end": {
-        "column": 71,
-        "line": 109
-      },
-      "start": {
-        "column": 5,
-        "line": 106
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace advertises_tool_input_rewrite -> bool with false\n@@ -98,20 +98,17 @@\n /// rather than silently widen, which strands the Agent on an answer that was\n /// never deliverable.\n ///\n /// Unknown values are ignored rather than refused: a peer from the future\n /// advertising capabilities this build cannot name says nothing about whether\n /// it rewrites.\n #[must_use]\n pub fn advertises_tool_input_rewrite(advertised: &[i32]) -> bool {\n-    advertised\n-        .iter()\n-        .filter_map(|value| capability_from_wire(*value).ok().flatten())\n-        .any(|capability| capability == Capability::RewritesToolInput)\n+    false /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{\n         UnknownCapability, advertises_tool_input_rewrite, capability_from_wire, capability_to_wire,\n     };\n     use horde_adapter::Capability;\n",
-    "file": "crates/horde-wire/src/capability.rs",
-    "function": {
-      "function_name": "advertises_tool_input_rewrite",
-      "return_type": "-> bool",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 110
-        },
-        "start": {
-          "column": 1,
-          "line": 93
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/capability.rs:106:5: replace advertises_tool_input_rewrite -> bool with false",
-    "package": "horde-wire",
-    "replacement": "false",
-    "span": {
-      "end": {
-        "column": 71,
-        "line": 109
-      },
-      "start": {
-        "column": 5,
-        "line": 106
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/capability.rs\n+++ replace == with != in advertises_tool_input_rewrite\n@@ -101,17 +101,17 @@\n /// Unknown values are ignored rather than refused: a peer from the future\n /// advertising capabilities this build cannot name says nothing about whether\n /// it rewrites.\n #[must_use]\n pub fn advertises_tool_input_rewrite(advertised: &[i32]) -> bool {\n     advertised\n         .iter()\n         .filter_map(|value| capability_from_wire(*value).ok().flatten())\n-        .any(|capability| capability == Capability::RewritesToolInput)\n+        .any(|capability| capability != /* ~ changed by cargo-mutants ~ */ Capability::RewritesToolInput)\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{\n         UnknownCapability, advertises_tool_input_rewrite, capability_from_wire, capability_to_wire,\n     };\n     use horde_adapter::Capability;\n",
-    "file": "crates/horde-wire/src/capability.rs",
-    "function": {
-      "function_name": "advertises_tool_input_rewrite",
-      "return_type": "-> bool",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 110
-        },
-        "start": {
-          "column": 1,
-          "line": 93
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/capability.rs:109:38: replace == with != in advertises_tool_input_rewrite",
-    "package": "horde-wire",
-    "replacement": "!=",
-    "span": {
-      "end": {
-        "column": 40,
-        "line": 109
-      },
-      "start": {
-        "column": 38,
-        "line": 109
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace <impl core::fmt::Display for ConversionError>::fmt -> core::fmt::Result with Ok(Default::default())\n@@ -42,26 +42,17 @@\n     /// The proto documents reject-don't-drop for exactly this: an adapter\n     /// without the rewrite capability must refuse, so a narrowing that failed\n     /// to apply is never mistaken for one that took effect.\n     RewriteUnsupported,\n }\n \n impl core::fmt::Display for ConversionError {\n     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n-        match self {\n-            Self::NotAnObject => write!(f, \"updated_input must be a JSON object\"),\n-            Self::UnrepresentableNumber(n) => {\n-                write!(f, \"number {n} has no exact f64 representation\")\n-            }\n-            Self::UnusableOutcome(v) => write!(f, \"unusable PermissionOutcome {v}\"),\n-            Self::RewriteUnsupported => {\n-                write!(f, \"decision rewrites tool input but the adapter cannot\")\n-            }\n-        }\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl core::error::Error for ConversionError {}\n \n /// A double that represents `n` exactly, or an error.\n ///\n /// Protobuf `Struct` has only doubles. An integer past 2^53 would come back a\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "<impl core::fmt::Display for ConversionError>::fmt",
-      "return_type": "-> core::fmt::Result",
-      "span": {
-        "end": {
-          "column": 6,
-          "line": 60
-        },
-        "start": {
-          "column": 5,
-          "line": 49
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:50:9: replace <impl core::fmt::Display for ConversionError>::fmt -> core::fmt::Result with Ok(Default::default())",
-    "package": "horde-wire",
+    "name": "crates/horde-adapter-claude/src/codec.rs:62:5: replace classify -> Result<Event, AdapterError> with Ok(Default::default())",
+    "package": "horde-adapter-claude",
     "replacement": "Ok(Default::default())",
     "span": {
       "end": {
-        "column": 10,
-        "line": 59
+        "column": 7,
+        "line": 71
       },
       "start": {
-        "column": 9,
-        "line": 50
+        "column": 5,
+        "line": 62
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace exact_f64 -> Result<f64, ConversionError> with Ok(0.0)\n@@ -63,31 +63,17 @@\n impl core::error::Error for ConversionError {}\n \n /// A double that represents `n` exactly, or an error.\n ///\n /// Protobuf `Struct` has only doubles. An integer past 2^53 would come back a\n /// different number, and a permission decision that silently altered an\n /// argument is worse than one that failed loudly.\n fn exact_f64(n: &Number) -> Result<f64, ConversionError> {\n-    let as_f64 = n\n-        .as_f64()\n-        .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n-\n-    if let Some(i) = n.as_i64()\n-        && i128::from(i) != as_f64 as i128\n-    {\n-        return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n-    }\n-    if let Some(u) = n.as_u64()\n-        && u128::from(u) != as_f64 as u128\n-    {\n-        return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n-    }\n-    Ok(as_f64)\n+    Ok(0.0) /* ~ changed by cargo-mutants ~ */\n }\n \n fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {\n     let kind = match value {\n         JsonValue::Null => Kind::NullValue(0),\n         JsonValue::Bool(b) => Kind::BoolValue(*b),\n         JsonValue::Number(n) => Kind::NumberValue(exact_f64(n)?),\n         JsonValue::String(s) => Kind::StringValue(s.clone()),\n",
-    "file": "crates/horde-wire/src/permission.rs",
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"assistant\" in classify\n@@ -55,17 +55,17 @@\n \n /// Maps an envelope's `type` to the event this crate models.\n ///\n /// Split out of [`decode_line`] so that reading the line and interpreting it\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n-        \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n+         /* ~ changed by cargo-mutants ~ */\n         \"user\" => Event::User(typed(raw, &event_type, line)?),\n         \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n         \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n         \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n         \"stream_event\" => Event::StreamEvent,\n         \"system\" => system_event(raw, &event_type, line)?,\n         _ => Event::Unknown { event_type },\n     })\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
     "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:63:9: delete match arm \"assistant\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 73,
+        "line": 63
+      },
+      "start": {
+        "column": 9,
+        "line": 63
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"user\" in classify\n@@ -56,17 +56,17 @@\n /// Maps an envelope's `type` to the event this crate models.\n ///\n /// Split out of [`decode_line`] so that reading the line and interpreting it\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n         \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n-        \"user\" => Event::User(typed(raw, &event_type, line)?),\n+         /* ~ changed by cargo-mutants ~ */\n         \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n         \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n         \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n         \"stream_event\" => Event::StreamEvent,\n         \"system\" => system_event(raw, &event_type, line)?,\n         _ => Event::Unknown { event_type },\n     })\n }\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:64:9: delete match arm \"user\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 63,
+        "line": 64
+      },
+      "start": {
+        "column": 9,
+        "line": 64
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"result\" in classify\n@@ -57,17 +57,17 @@\n ///\n /// Split out of [`decode_line`] so that reading the line and interpreting it\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n         \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n         \"user\" => Event::User(typed(raw, &event_type, line)?),\n-        \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n+         /* ~ changed by cargo-mutants ~ */\n         \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n         \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n         \"stream_event\" => Event::StreamEvent,\n         \"system\" => system_event(raw, &event_type, line)?,\n         _ => Event::Unknown { event_type },\n     })\n }\n \n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:65:9: delete match arm \"result\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 77,
+        "line": 65
+      },
+      "start": {
+        "column": 9,
+        "line": 65
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"control_response\" in classify\n@@ -58,17 +58,17 @@\n /// Split out of [`decode_line`] so that reading the line and interpreting it\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n         \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n         \"user\" => Event::User(typed(raw, &event_type, line)?),\n         \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n-        \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n+         /* ~ changed by cargo-mutants ~ */\n         \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n         \"stream_event\" => Event::StreamEvent,\n         \"system\" => system_event(raw, &event_type, line)?,\n         _ => Event::Unknown { event_type },\n     })\n }\n \n /// Splits a `system` envelope on its subtype.\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:66:9: delete match arm \"control_response\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 86,
+        "line": 66
+      },
+      "start": {
+        "column": 9,
+        "line": 66
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"rate_limit_event\" in classify\n@@ -59,17 +59,17 @@\n /// are separately legible: everything above is about the bytes, everything here\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n         \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n         \"user\" => Event::User(typed(raw, &event_type, line)?),\n         \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n         \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n-        \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n+         /* ~ changed by cargo-mutants ~ */\n         \"stream_event\" => Event::StreamEvent,\n         \"system\" => system_event(raw, &event_type, line)?,\n         _ => Event::Unknown { event_type },\n     })\n }\n \n /// Splits a `system` envelope on its subtype.\n ///\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:67:9: delete match arm \"rate_limit_event\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 80,
+        "line": 67
+      },
+      "start": {
+        "column": 9,
+        "line": 67
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"stream_event\" in classify\n@@ -60,17 +60,17 @@\n /// is about the protocol.\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n         \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n         \"user\" => Event::User(typed(raw, &event_type, line)?),\n         \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n         \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n         \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n-        \"stream_event\" => Event::StreamEvent,\n+         /* ~ changed by cargo-mutants ~ */\n         \"system\" => system_event(raw, &event_type, line)?,\n         _ => Event::Unknown { event_type },\n     })\n }\n \n /// Splits a `system` envelope on its subtype.\n ///\n /// `init` is the one that carries session identity and model; the others are\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:68:9: delete match arm \"stream_event\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 46,
+        "line": 68
+      },
+      "start": {
+        "column": 9,
+        "line": 68
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ delete match arm \"system\" in classify\n@@ -61,17 +61,17 @@\n fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {\n     Ok(match event_type.as_str() {\n         \"assistant\" => Event::Assistant(typed(raw, &event_type, line)?),\n         \"user\" => Event::User(typed(raw, &event_type, line)?),\n         \"result\" => Event::Result(Box::new(typed(raw, &event_type, line)?)),\n         \"control_response\" => Event::ControlResponse(typed(raw, &event_type, line)?),\n         \"rate_limit_event\" => Event::RateLimit(typed(raw, &event_type, line)?),\n         \"stream_event\" => Event::StreamEvent,\n-        \"system\" => system_event(raw, &event_type, line)?,\n+         /* ~ changed by cargo-mutants ~ */\n         _ => Event::Unknown { event_type },\n     })\n }\n \n /// Splits a `system` envelope on its subtype.\n ///\n /// `init` is the one that carries session identity and model; the others are\n /// kept as their subtype so a report can say which arrived without this crate\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "classify",
+      "return_type": "-> Result<Event, AdapterError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 72
+        },
+        "start": {
+          "column": 1,
+          "line": 56
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/horde-adapter-claude/src/codec.rs:69:9: delete match arm \"system\" in classify",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 69
+      },
+      "start": {
+        "column": 9,
+        "line": 69
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace system_event -> Result<Event, AdapterError> with Ok(Default::default())\n@@ -72,22 +72,17 @@\n }\n \n /// Splits a `system` envelope on its subtype.\n ///\n /// `init` is the one that carries session identity and model; the others are\n /// kept as their subtype so a report can say which arrived without this crate\n /// having to model each one.\n fn system_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, AdapterError> {\n-    Ok(match raw.get(\"subtype\").and_then(Value::as_str) {\n-        Some(\"init\") => Event::Init(Box::new(typed(raw, event_type, line)?)),\n-        other => Event::System {\n-            subtype: other.unwrap_or_default().to_owned(),\n-        },\n-    })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Deserializes a known envelope shape, keeping the raw line in the error so a\n /// protocol change is diagnosable from the report alone.\n fn typed<T: serde::de::DeserializeOwned>(\n     raw: &Value,\n     event_type: &str,\n     line: &str,\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "system_event",
+      "return_type": "-> Result<Event, AdapterError>",
       "span": {
         "end": {
           "column": 2,
@@ -300,227 +332,35 @@
         },
         "start": {
           "column": 1,
-          "line": 65
+          "line": 74
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(0.0)",
-    "package": "horde-wire",
-    "replacement": "Ok(0.0)",
+    "name": "crates/horde-adapter-claude/src/codec.rs:80:5: replace system_event -> Result<Event, AdapterError> with Ok(Default::default())",
+    "package": "horde-adapter-claude",
+    "replacement": "Ok(Default::default())",
     "span": {
       "end": {
-        "column": 15,
+        "column": 7,
         "line": 85
       },
       "start": {
         "column": 5,
-        "line": 71
+        "line": 80
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace exact_f64 -> Result<f64, ConversionError> with Ok(1.0)\n@@ -63,31 +63,17 @@\n impl core::error::Error for ConversionError {}\n \n /// A double that represents `n` exactly, or an error.\n ///\n /// Protobuf `Struct` has only doubles. An integer past 2^53 would come back a\n /// different number, and a permission decision that silently altered an\n /// argument is worse than one that failed loudly.\n fn exact_f64(n: &Number) -> Result<f64, ConversionError> {\n-    let as_f64 = n\n-        .as_f64()\n-        .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n-\n-    if let Some(i) = n.as_i64()\n-        && i128::from(i) != as_f64 as i128\n-    {\n-        return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n-    }\n-    if let Some(u) = n.as_u64()\n-        && u128::from(u) != as_f64 as u128\n-    {\n-        return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n-    }\n-    Ok(as_f64)\n+    Ok(1.0) /* ~ changed by cargo-mutants ~ */\n }\n \n fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {\n     let kind = match value {\n         JsonValue::Null => Kind::NullValue(0),\n         JsonValue::Bool(b) => Kind::BoolValue(*b),\n         JsonValue::Number(n) => Kind::NumberValue(exact_f64(n)?),\n         JsonValue::String(s) => Kind::StringValue(s.clone()),\n",
-    "file": "crates/horde-wire/src/permission.rs",
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace typed -> Result<T, AdapterError> with Ok(Default::default())\n@@ -87,20 +87,17 @@\n \n /// Deserializes a known envelope shape, keeping the raw line in the error so a\n /// protocol change is diagnosable from the report alone.\n fn typed<T: serde::de::DeserializeOwned>(\n     raw: &Value,\n     event_type: &str,\n     line: &str,\n ) -> Result<T, AdapterError> {\n-    serde_json::from_value(raw.clone()).map_err(|source| AdapterError::Protocol {\n-        message: format!(\"malformed `{event_type}` envelope: {source}\"),\n-        raw: line.to_owned(),\n-    })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Encodes a user message for the harness's stdin.\n #[must_use]\n pub fn encode_user_message(text: &str) -> String {\n     json!({\n         \"type\": \"user\",\n         \"message\": { \"role\": \"user\", \"content\": [{ \"type\": \"text\", \"text\": text }] }\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
     "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
+      "function_name": "typed",
+      "return_type": "-> Result<T, AdapterError>",
       "span": {
         "end": {
           "column": 2,
-          "line": 86
-        },
-        "start": {
-          "column": 1,
-          "line": 65
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(1.0)",
-    "package": "horde-wire",
-    "replacement": "Ok(1.0)",
-    "span": {
-      "end": {
-        "column": 15,
-        "line": 85
-      },
-      "start": {
-        "column": 5,
-        "line": 71
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace exact_f64 -> Result<f64, ConversionError> with Ok(-1.0)\n@@ -63,31 +63,17 @@\n impl core::error::Error for ConversionError {}\n \n /// A double that represents `n` exactly, or an error.\n ///\n /// Protobuf `Struct` has only doubles. An integer past 2^53 would come back a\n /// different number, and a permission decision that silently altered an\n /// argument is worse than one that failed loudly.\n fn exact_f64(n: &Number) -> Result<f64, ConversionError> {\n-    let as_f64 = n\n-        .as_f64()\n-        .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n-\n-    if let Some(i) = n.as_i64()\n-        && i128::from(i) != as_f64 as i128\n-    {\n-        return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n-    }\n-    if let Some(u) = n.as_u64()\n-        && u128::from(u) != as_f64 as u128\n-    {\n-        return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n-    }\n-    Ok(as_f64)\n+    Ok(-1.0) /* ~ changed by cargo-mutants ~ */\n }\n \n fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {\n     let kind = match value {\n         JsonValue::Null => Kind::NullValue(0),\n         JsonValue::Bool(b) => Kind::BoolValue(*b),\n         JsonValue::Number(n) => Kind::NumberValue(exact_f64(n)?),\n         JsonValue::String(s) => Kind::StringValue(s.clone()),\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 86
-        },
-        "start": {
-          "column": 1,
-          "line": 65
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(-1.0)",
-    "package": "horde-wire",
-    "replacement": "Ok(-1.0)",
-    "span": {
-      "end": {
-        "column": 15,
-        "line": 85
-      },
-      "start": {
-        "column": 5,
-        "line": 71
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace && with || in exact_f64\n@@ -68,17 +68,17 @@\n /// different number, and a permission decision that silently altered an\n /// argument is worse than one that failed loudly.\n fn exact_f64(n: &Number) -> Result<f64, ConversionError> {\n     let as_f64 = n\n         .as_f64()\n         .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n \n     if let Some(i) = n.as_i64()\n-        && i128::from(i) != as_f64 as i128\n+        || /* ~ changed by cargo-mutants ~ */ i128::from(i) != as_f64 as i128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     if let Some(u) = n.as_u64()\n         && u128::from(u) != as_f64 as u128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 86
-        },
-        "start": {
-          "column": 1,
-          "line": 65
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:76:9: replace && with || in exact_f64",
-    "package": "horde-wire",
-    "replacement": "||",
-    "span": {
-      "end": {
-        "column": 11,
-        "line": 76
-      },
-      "start": {
-        "column": 9,
-        "line": 76
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace != with == in exact_f64\n@@ -68,17 +68,17 @@\n /// different number, and a permission decision that silently altered an\n /// argument is worse than one that failed loudly.\n fn exact_f64(n: &Number) -> Result<f64, ConversionError> {\n     let as_f64 = n\n         .as_f64()\n         .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n \n     if let Some(i) = n.as_i64()\n-        && i128::from(i) != as_f64 as i128\n+        && i128::from(i) == /* ~ changed by cargo-mutants ~ */ as_f64 as i128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     if let Some(u) = n.as_u64()\n         && u128::from(u) != as_f64 as u128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 86
-        },
-        "start": {
-          "column": 1,
-          "line": 65
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:76:26: replace != with == in exact_f64",
-    "package": "horde-wire",
-    "replacement": "==",
-    "span": {
-      "end": {
-        "column": 28,
-        "line": 76
-      },
-      "start": {
-        "column": 26,
-        "line": 76
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace && with || in exact_f64\n@@ -73,17 +73,17 @@\n         .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n \n     if let Some(i) = n.as_i64()\n         && i128::from(i) != as_f64 as i128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     if let Some(u) = n.as_u64()\n-        && u128::from(u) != as_f64 as u128\n+        || /* ~ changed by cargo-mutants ~ */ u128::from(u) != as_f64 as u128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     Ok(as_f64)\n }\n \n fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {\n     let kind = match value {\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 86
-        },
-        "start": {
-          "column": 1,
-          "line": 65
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:81:9: replace && with || in exact_f64",
-    "package": "horde-wire",
-    "replacement": "||",
-    "span": {
-      "end": {
-        "column": 11,
-        "line": 81
-      },
-      "start": {
-        "column": 9,
-        "line": 81
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace != with == in exact_f64\n@@ -73,17 +73,17 @@\n         .ok_or_else(|| ConversionError::UnrepresentableNumber(n.to_string()))?;\n \n     if let Some(i) = n.as_i64()\n         && i128::from(i) != as_f64 as i128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     if let Some(u) = n.as_u64()\n-        && u128::from(u) != as_f64 as u128\n+        && u128::from(u) == /* ~ changed by cargo-mutants ~ */ as_f64 as u128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     Ok(as_f64)\n }\n \n fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {\n     let kind = match value {\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "exact_f64",
-      "return_type": "-> Result<f64, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 86
-        },
-        "start": {
-          "column": 1,
-          "line": 65
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:81:26: replace != with == in exact_f64",
-    "package": "horde-wire",
-    "replacement": "==",
-    "span": {
-      "end": {
-        "column": 28,
-        "line": 81
-      },
-      "start": {
-        "column": 26,
-        "line": 81
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace json_to_wire -> Result<WireValue, ConversionError> with Ok(Default::default())\n@@ -81,27 +81,17 @@\n         && u128::from(u) != as_f64 as u128\n     {\n         return Err(ConversionError::UnrepresentableNumber(n.to_string()));\n     }\n     Ok(as_f64)\n }\n \n fn json_to_wire(value: &JsonValue) -> Result<WireValue, ConversionError> {\n-    let kind = match value {\n-        JsonValue::Null => Kind::NullValue(0),\n-        JsonValue::Bool(b) => Kind::BoolValue(*b),\n-        JsonValue::Number(n) => Kind::NumberValue(exact_f64(n)?),\n-        JsonValue::String(s) => Kind::StringValue(s.clone()),\n-        JsonValue::Array(items) => Kind::ListValue(ListValue {\n-            values: items.iter().map(json_to_wire).collect::<Result<_, _>>()?,\n-        }),\n-        JsonValue::Object(map) => Kind::StructValue(object_to_struct(map)?),\n-    };\n-    Ok(WireValue { kind: Some(kind) })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n fn object_to_struct(map: &Map<String, JsonValue>) -> Result<Struct, ConversionError> {\n     let mut fields = std::collections::BTreeMap::new();\n     for (key, value) in map {\n         fields.insert(key.clone(), json_to_wire(value)?);\n     }\n     Ok(Struct { fields })\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "json_to_wire",
-      "return_type": "-> Result<WireValue, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 100
+          "line": 99
         },
         "start": {
           "column": 1,
@@ -529,570 +369,250 @@
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:89:5: replace json_to_wire -> Result<WireValue, ConversionError> with Ok(Default::default())",
-    "package": "horde-wire",
-    "replacement": "Ok(Default::default())",
-    "span": {
-      "end": {
-        "column": 39,
-        "line": 99
-      },
-      "start": {
-        "column": 5,
-        "line": 89
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace object_to_struct -> Result<Struct, ConversionError> with Ok(Default::default())\n@@ -95,21 +95,17 @@\n             values: items.iter().map(json_to_wire).collect::<Result<_, _>>()?,\n         }),\n         JsonValue::Object(map) => Kind::StructValue(object_to_struct(map)?),\n     };\n     Ok(WireValue { kind: Some(kind) })\n }\n \n fn object_to_struct(map: &Map<String, JsonValue>) -> Result<Struct, ConversionError> {\n-    let mut fields = std::collections::BTreeMap::new();\n-    for (key, value) in map {\n-        fields.insert(key.clone(), json_to_wire(value)?);\n-    }\n-    Ok(Struct { fields })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n fn wire_to_json(value: &WireValue) -> JsonValue {\n     // An unset kind is an empty Value, which ProtoJSON reads as null.\n     match &value.kind {\n         None | Some(Kind::NullValue(_)) => JsonValue::Null,\n         Some(Kind::BoolValue(b)) => JsonValue::Bool(*b),\n         Some(Kind::NumberValue(n)) => number_from_wire(*n),\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "object_to_struct",
-      "return_type": "-> Result<Struct, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 108
-        },
-        "start": {
-          "column": 1,
-          "line": 102
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:103:5: replace object_to_struct -> Result<Struct, ConversionError> with Ok(Default::default())",
-    "package": "horde-wire",
-    "replacement": "Ok(Default::default())",
-    "span": {
-      "end": {
-        "column": 26,
-        "line": 107
-      },
-      "start": {
-        "column": 5,
-        "line": 103
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace wire_to_json -> JsonValue with Default::default()\n@@ -104,26 +104,17 @@\n     for (key, value) in map {\n         fields.insert(key.clone(), json_to_wire(value)?);\n     }\n     Ok(Struct { fields })\n }\n \n fn wire_to_json(value: &WireValue) -> JsonValue {\n     // An unset kind is an empty Value, which ProtoJSON reads as null.\n-    match &value.kind {\n-        None | Some(Kind::NullValue(_)) => JsonValue::Null,\n-        Some(Kind::BoolValue(b)) => JsonValue::Bool(*b),\n-        Some(Kind::NumberValue(n)) => number_from_wire(*n),\n-        Some(Kind::StringValue(s)) => JsonValue::String(s.clone()),\n-        Some(Kind::ListValue(list)) => {\n-            JsonValue::Array(list.values.iter().map(wire_to_json).collect())\n-        }\n-        Some(Kind::StructValue(s)) => struct_to_json(s),\n-    }\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Reconstructs a JSON number from protobuf's only numeric type, a double.\n ///\n /// `Struct` cannot represent integers, so `{\"depth\": 3}` arrives as `3.0`.\n /// Integral doubles are turned back into JSON integers because tool arguments\n /// are overwhelmingly integers — a harness handed `{\"depth\": 3.0}` may render\n /// or type-check it differently than the `{\"depth\": 3}` the chain intended.\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "wire_to_json",
-      "return_type": "-> JsonValue",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 122
-        },
-        "start": {
-          "column": 1,
-          "line": 110
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:112:5: replace wire_to_json -> JsonValue with Default::default()",
-    "package": "horde-wire",
-    "replacement": "Default::default()",
-    "span": {
-      "end": {
-        "column": 6,
-        "line": 121
-      },
-      "start": {
-        "column": 5,
-        "line": 112
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace number_from_wire -> JsonValue with Default::default()\n@@ -129,23 +129,17 @@\n /// or type-check it differently than the `{\"depth\": 3}` the chain intended.\n ///\n /// The narrowing this cannot undo: a caller who genuinely meant the float\n /// `3.0` gets the integer `3` back. In JSON those are the same number, so the\n /// value is preserved even though the spelling is not. Magnitudes beyond\n /// 2^53 cannot survive the double at all, which is why the outbound direction\n /// rejects them rather than rounding.\n fn number_from_wire(n: f64) -> JsonValue {\n-    const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53\n-\n-    if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {\n-        #[allow(clippy::cast_possible_truncation)] // guarded by the check above\n-        return JsonValue::Number(Number::from(n as i64));\n-    }\n-    Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n fn struct_to_json(value: &Struct) -> JsonValue {\n     JsonValue::Object(\n         value\n             .fields\n             .iter()\n             .map(|(k, v)| (k.clone(), wire_to_json(v)))\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "number_from_wire",
-      "return_type": "-> JsonValue",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 144
-        },
-        "start": {
-          "column": 1,
-          "line": 124
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:137:5: replace number_from_wire -> JsonValue with Default::default()",
-    "package": "horde-wire",
-    "replacement": "Default::default()",
-    "span": {
-      "end": {
-        "column": 67,
-        "line": 143
-      },
-      "start": {
-        "column": 5,
-        "line": 137
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace && with || in number_from_wire\n@@ -131,17 +131,17 @@\n /// The narrowing this cannot undo: a caller who genuinely meant the float\n /// `3.0` gets the integer `3` back. In JSON those are the same number, so the\n /// value is preserved even though the spelling is not. Magnitudes beyond\n /// 2^53 cannot survive the double at all, which is why the outbound direction\n /// rejects them rather than rounding.\n fn number_from_wire(n: f64) -> JsonValue {\n     const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53\n \n-    if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {\n+    if n.fract() == 0.0 || /* ~ changed by cargo-mutants ~ */ n.abs() <= EXACT_INTEGER_LIMIT {\n         #[allow(clippy::cast_possible_truncation)] // guarded by the check above\n         return JsonValue::Number(Number::from(n as i64));\n     }\n     Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)\n }\n \n fn struct_to_json(value: &Struct) -> JsonValue {\n     JsonValue::Object(\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "number_from_wire",
-      "return_type": "-> JsonValue",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 144
-        },
-        "start": {
-          "column": 1,
-          "line": 124
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:139:25: replace && with || in number_from_wire",
-    "package": "horde-wire",
-    "replacement": "||",
-    "span": {
-      "end": {
-        "column": 27,
-        "line": 139
-      },
-      "start": {
-        "column": 25,
-        "line": 139
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace == with != in number_from_wire\n@@ -131,17 +131,17 @@\n /// The narrowing this cannot undo: a caller who genuinely meant the float\n /// `3.0` gets the integer `3` back. In JSON those are the same number, so the\n /// value is preserved even though the spelling is not. Magnitudes beyond\n /// 2^53 cannot survive the double at all, which is why the outbound direction\n /// rejects them rather than rounding.\n fn number_from_wire(n: f64) -> JsonValue {\n     const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53\n \n-    if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {\n+    if n.fract() != /* ~ changed by cargo-mutants ~ */ 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {\n         #[allow(clippy::cast_possible_truncation)] // guarded by the check above\n         return JsonValue::Number(Number::from(n as i64));\n     }\n     Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)\n }\n \n fn struct_to_json(value: &Struct) -> JsonValue {\n     JsonValue::Object(\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "number_from_wire",
-      "return_type": "-> JsonValue",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 144
-        },
-        "start": {
-          "column": 1,
-          "line": 124
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:139:18: replace == with != in number_from_wire",
-    "package": "horde-wire",
-    "replacement": "!=",
-    "span": {
-      "end": {
-        "column": 20,
-        "line": 139
-      },
-      "start": {
-        "column": 18,
-        "line": 139
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace <= with > in number_from_wire\n@@ -131,17 +131,17 @@\n /// The narrowing this cannot undo: a caller who genuinely meant the float\n /// `3.0` gets the integer `3` back. In JSON those are the same number, so the\n /// value is preserved even though the spelling is not. Magnitudes beyond\n /// 2^53 cannot survive the double at all, which is why the outbound direction\n /// rejects them rather than rounding.\n fn number_from_wire(n: f64) -> JsonValue {\n     const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53\n \n-    if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {\n+    if n.fract() == 0.0 && n.abs() > /* ~ changed by cargo-mutants ~ */ EXACT_INTEGER_LIMIT {\n         #[allow(clippy::cast_possible_truncation)] // guarded by the check above\n         return JsonValue::Number(Number::from(n as i64));\n     }\n     Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)\n }\n \n fn struct_to_json(value: &Struct) -> JsonValue {\n     JsonValue::Object(\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "number_from_wire",
-      "return_type": "-> JsonValue",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 144
-        },
-        "start": {
-          "column": 1,
-          "line": 124
-        }
-      }
-    },
-    "genre": "BinaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:139:36: replace <= with > in number_from_wire",
-    "package": "horde-wire",
-    "replacement": ">",
-    "span": {
-      "end": {
-        "column": 38,
-        "line": 139
-      },
-      "start": {
-        "column": 36,
-        "line": 139
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace struct_to_json -> JsonValue with Default::default()\n@@ -139,23 +139,17 @@\n     if n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {\n         #[allow(clippy::cast_possible_truncation)] // guarded by the check above\n         return JsonValue::Number(Number::from(n as i64));\n     }\n     Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)\n }\n \n fn struct_to_json(value: &Struct) -> JsonValue {\n-    JsonValue::Object(\n-        value\n-            .fields\n-            .iter()\n-            .map(|(k, v)| (k.clone(), wire_to_json(v)))\n-            .collect(),\n-    )\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Domain → wire.\n ///\n /// Fills only what the domain owns: the outcome, the denial message, and any\n /// replacement arguments. `request_id`, `decided_by`, `decided_by_actor`, and\n /// `remember_for_session` belong to the Server that ran the permission chain\n /// and are left at their defaults for it to set.\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "struct_to_json",
-      "return_type": "-> JsonValue",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 154
-        },
-        "start": {
-          "column": 1,
-          "line": 146
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:147:5: replace struct_to_json -> JsonValue with Default::default()",
-    "package": "horde-wire",
-    "replacement": "Default::default()",
-    "span": {
-      "end": {
-        "column": 6,
-        "line": 153
-      },
-      "start": {
-        "column": 5,
-        "line": 147
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace permission_decision_to_wire -> Result<WirePermissionDecision, ConversionError> with Ok(Default::default())\n@@ -157,34 +157,17 @@\n ///\n /// Fills only what the domain owns: the outcome, the denial message, and any\n /// replacement arguments. `request_id`, `decided_by`, `decided_by_actor`, and\n /// `remember_for_session` belong to the Server that ran the permission chain\n /// and are left at their defaults for it to set.\n pub fn permission_decision_to_wire(\n     decision: &PermissionDecision,\n ) -> Result<WirePermissionDecision, ConversionError> {\n-    let (outcome, reason, updated_input) = match decision {\n-        PermissionDecision::Allow { updated_input } => {\n-            let rewritten = match updated_input {\n-                Some(JsonValue::Object(map)) => Some(object_to_struct(map)?),\n-                Some(_) => return Err(ConversionError::NotAnObject),\n-                None => None,\n-            };\n-            (PermissionOutcome::Allow, String::new(), rewritten)\n-        }\n-        PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),\n-    };\n-\n-    Ok(WirePermissionDecision {\n-        outcome: outcome.into(),\n-        reason,\n-        updated_input,\n-        ..WirePermissionDecision::default()\n-    })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wire → domain — the direction a Worker actually runs.\n ///\n /// `can_rewrite_input` is the adapter's\n /// [`Capability::RewritesToolInput`](horde_adapter::Capability::RewritesToolInput)\n /// claim. When a decision carries replacement arguments and the adapter cannot\n /// apply them, this fails rather than downgrading to a plain allow.\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "permission_decision_to_wire",
-      "return_type": "-> Result<WirePermissionDecision, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 183
-        },
-        "start": {
-          "column": 1,
-          "line": 156
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:165:5: replace permission_decision_to_wire -> Result<WirePermissionDecision, ConversionError> with Ok(Default::default())",
-    "package": "horde-wire",
+    "name": "crates/horde-adapter-claude/src/codec.rs:95:5: replace typed -> Result<T, AdapterError> with Ok(Default::default())",
+    "package": "horde-adapter-claude",
     "replacement": "Ok(Default::default())",
     "span": {
       "end": {
         "column": 7,
-        "line": 182
+        "line": 98
       },
       "start": {
         "column": 5,
-        "line": 165
+        "line": 95
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ delete field outcome from struct WirePermissionDecision expression in permission_decision_to_wire\n@@ -170,17 +170,17 @@\n                 None => None,\n             };\n             (PermissionOutcome::Allow, String::new(), rewritten)\n         }\n         PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),\n     };\n \n     Ok(WirePermissionDecision {\n-        outcome: outcome.into(),\n+         /* ~ changed by cargo-mutants ~ */\n         reason,\n         updated_input,\n         ..WirePermissionDecision::default()\n     })\n }\n \n /// Wire → domain — the direction a Worker actually runs.\n ///\n",
-    "file": "crates/horde-wire/src/permission.rs",
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace encode_user_message -> String with String::new()\n@@ -96,21 +96,17 @@\n         message: format!(\"malformed `{event_type}` envelope: {source}\"),\n         raw: line.to_owned(),\n     })\n }\n \n /// Encodes a user message for the harness's stdin.\n #[must_use]\n pub fn encode_user_message(text: &str) -> String {\n-    json!({\n-        \"type\": \"user\",\n-        \"message\": { \"role\": \"user\", \"content\": [{ \"type\": \"text\", \"text\": text }] }\n-    })\n-    .to_string()\n+    String::new() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Encodes an interrupt.\n ///\n /// This is the only mechanism that aborts a turn while leaving the process\n /// usable. The spike measured the alternatives: SIGINT aborts the turn but ends\n /// the process, and closing stdin does not abort at all — it lets the turn run\n /// to completion and only then exits. Both would silently break steering.\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
     "function": {
-      "function_name": "permission_decision_to_wire",
-      "return_type": "-> Result<WirePermissionDecision, ConversionError>",
+      "function_name": "encode_user_message",
+      "return_type": "-> String",
       "span": {
         "end": {
           "column": 2,
-          "line": 183
+          "line": 109
         },
         "start": {
           "column": 1,
-          "line": 156
-        }
-      }
-    },
-    "genre": "StructField",
-    "name": "crates/horde-wire/src/permission.rs:178:9: delete field outcome from struct WirePermissionDecision expression in permission_decision_to_wire",
-    "package": "horde-wire",
-    "replacement": "",
-    "span": {
-      "end": {
-        "column": 33,
-        "line": 178
-      },
-      "start": {
-        "column": 9,
-        "line": 178
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ delete field reason from struct WirePermissionDecision expression in permission_decision_to_wire\n@@ -171,17 +171,17 @@\n             };\n             (PermissionOutcome::Allow, String::new(), rewritten)\n         }\n         PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),\n     };\n \n     Ok(WirePermissionDecision {\n         outcome: outcome.into(),\n-        reason,\n+         /* ~ changed by cargo-mutants ~ */\n         updated_input,\n         ..WirePermissionDecision::default()\n     })\n }\n \n /// Wire → domain — the direction a Worker actually runs.\n ///\n /// `can_rewrite_input` is the adapter's\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "permission_decision_to_wire",
-      "return_type": "-> Result<WirePermissionDecision, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 183
-        },
-        "start": {
-          "column": 1,
-          "line": 156
-        }
-      }
-    },
-    "genre": "StructField",
-    "name": "crates/horde-wire/src/permission.rs:179:9: delete field reason from struct WirePermissionDecision expression in permission_decision_to_wire",
-    "package": "horde-wire",
-    "replacement": "",
-    "span": {
-      "end": {
-        "column": 16,
-        "line": 179
-      },
-      "start": {
-        "column": 9,
-        "line": 179
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ delete field updated_input from struct WirePermissionDecision expression in permission_decision_to_wire\n@@ -172,17 +172,17 @@\n             (PermissionOutcome::Allow, String::new(), rewritten)\n         }\n         PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),\n     };\n \n     Ok(WirePermissionDecision {\n         outcome: outcome.into(),\n         reason,\n-        updated_input,\n+         /* ~ changed by cargo-mutants ~ */\n         ..WirePermissionDecision::default()\n     })\n }\n \n /// Wire → domain — the direction a Worker actually runs.\n ///\n /// `can_rewrite_input` is the adapter's\n /// [`Capability::RewritesToolInput`](horde_adapter::Capability::RewritesToolInput)\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "permission_decision_to_wire",
-      "return_type": "-> Result<WirePermissionDecision, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 183
-        },
-        "start": {
-          "column": 1,
-          "line": 156
-        }
-      }
-    },
-    "genre": "StructField",
-    "name": "crates/horde-wire/src/permission.rs:180:9: delete field updated_input from struct WirePermissionDecision expression in permission_decision_to_wire",
-    "package": "horde-wire",
-    "replacement": "",
-    "span": {
-      "end": {
-        "column": 23,
-        "line": 180
-      },
-      "start": {
-        "column": 9,
-        "line": 180
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ replace permission_decision_from_wire -> Result<PermissionDecision, ConversionError> with Ok(Default::default())\n@@ -187,32 +187,17 @@\n /// `can_rewrite_input` is the adapter's\n /// [`Capability::RewritesToolInput`](horde_adapter::Capability::RewritesToolInput)\n /// claim. When a decision carries replacement arguments and the adapter cannot\n /// apply them, this fails rather than downgrading to a plain allow.\n pub fn permission_decision_from_wire(\n     decision: &WirePermissionDecision,\n     can_rewrite_input: bool,\n ) -> Result<PermissionDecision, ConversionError> {\n-    let outcome = PermissionOutcome::try_from(decision.outcome)\n-        .map_err(|_| ConversionError::UnusableOutcome(decision.outcome))?;\n-\n-    match outcome {\n-        PermissionOutcome::Allow => match &decision.updated_input {\n-            Some(rewritten) => {\n-                if !can_rewrite_input {\n-                    return Err(ConversionError::RewriteUnsupported);\n-                }\n-                Ok(PermissionDecision::allow_with(struct_to_json(rewritten)))\n-            }\n-            None => Ok(PermissionDecision::allow()),\n-        },\n-        PermissionOutcome::Deny => Ok(PermissionDecision::deny(decision.reason.clone())),\n-        PermissionOutcome::Unspecified => Err(ConversionError::UnusableOutcome(decision.outcome)),\n-    }\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{ConversionError, permission_decision_from_wire, permission_decision_to_wire};\n     use crate as horde_wire_self;\n     use horde_adapter::Capability;\n     use horde_adapter::permission::PermissionDecision;\n",
-    "file": "crates/horde-wire/src/permission.rs",
-    "function": {
-      "function_name": "permission_decision_from_wire",
-      "return_type": "-> Result<PermissionDecision, ConversionError>",
-      "span": {
-        "end": {
-          "column": 2,
-          "line": 211
-        },
-        "start": {
-          "column": 1,
-          "line": 185
+          "line": 101
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/permission.rs:195:5: replace permission_decision_from_wire -> Result<PermissionDecision, ConversionError> with Ok(Default::default())",
-    "package": "horde-wire",
-    "replacement": "Ok(Default::default())",
+    "name": "crates/horde-adapter-claude/src/codec.rs:104:5: replace encode_user_message -> String with String::new()",
+    "package": "horde-adapter-claude",
+    "replacement": "String::new()",
     "span": {
       "end": {
-        "column": 6,
-        "line": 210
+        "column": 17,
+        "line": 108
       },
       "start": {
         "column": 5,
-        "line": 195
+        "line": 104
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/permission.rs\n+++ delete ! in permission_decision_from_wire\n@@ -193,17 +193,17 @@\n     can_rewrite_input: bool,\n ) -> Result<PermissionDecision, ConversionError> {\n     let outcome = PermissionOutcome::try_from(decision.outcome)\n         .map_err(|_| ConversionError::UnusableOutcome(decision.outcome))?;\n \n     match outcome {\n         PermissionOutcome::Allow => match &decision.updated_input {\n             Some(rewritten) => {\n-                if !can_rewrite_input {\n+                if  /* ~ changed by cargo-mutants ~ */can_rewrite_input {\n                     return Err(ConversionError::RewriteUnsupported);\n                 }\n                 Ok(PermissionDecision::allow_with(struct_to_json(rewritten)))\n             }\n             None => Ok(PermissionDecision::allow()),\n         },\n         PermissionOutcome::Deny => Ok(PermissionDecision::deny(decision.reason.clone())),\n         PermissionOutcome::Unspecified => Err(ConversionError::UnusableOutcome(decision.outcome)),\n",
-    "file": "crates/horde-wire/src/permission.rs",
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace encode_user_message -> String with \"xyzzy\".into()\n@@ -96,21 +96,17 @@\n         message: format!(\"malformed `{event_type}` envelope: {source}\"),\n         raw: line.to_owned(),\n     })\n }\n \n /// Encodes a user message for the harness's stdin.\n #[must_use]\n pub fn encode_user_message(text: &str) -> String {\n-    json!({\n-        \"type\": \"user\",\n-        \"message\": { \"role\": \"user\", \"content\": [{ \"type\": \"text\", \"text\": text }] }\n-    })\n-    .to_string()\n+    \"xyzzy\".into() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Encodes an interrupt.\n ///\n /// This is the only mechanism that aborts a turn while leaving the process\n /// usable. The spike measured the alternatives: SIGINT aborts the turn but ends\n /// the process, and closing stdin does not abort at all — it lets the turn run\n /// to completion and only then exits. Both would silently break steering.\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
     "function": {
-      "function_name": "permission_decision_from_wire",
-      "return_type": "-> Result<PermissionDecision, ConversionError>",
+      "function_name": "encode_user_message",
+      "return_type": "-> String",
       "span": {
         "end": {
           "column": 2,
-          "line": 211
+          "line": 109
         },
         "start": {
           "column": 1,
-          "line": 185
+          "line": 101
         }
       }
     },
-    "genre": "UnaryOperator",
-    "name": "crates/horde-wire/src/permission.rs:201:20: delete ! in permission_decision_from_wire",
-    "package": "horde-wire",
-    "replacement": "",
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/codec.rs:104:5: replace encode_user_message -> String with \"xyzzy\".into()",
+    "package": "horde-adapter-claude",
+    "replacement": "\"xyzzy\".into()",
     "span": {
       "end": {
-        "column": 21,
-        "line": 201
+        "column": 17,
+        "line": 108
       },
       "start": {
-        "column": 20,
-        "line": 201
+        "column": 5,
+        "line": 104
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace <impl core::fmt::Display for UnreadableUtilization>::fmt -> core::fmt::Result with Ok(Default::default())\n@@ -25,17 +25,17 @@\n /// Every [`Utilization`] arm sets exactly one shape, so a window carrying none\n /// of them came from a peer that sent an empty message or a shape this build\n /// does not know. Guessing would hand the scheduler a headroom nobody reported.\n #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n pub struct UnreadableUtilization;\n \n impl core::fmt::Display for UnreadableUtilization {\n     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n-        f.write_str(\"RateWindow carries no recognizable utilization shape\")\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl core::error::Error for UnreadableUtilization {}\n \n /// Domain → wire.\n #[must_use]\n pub fn token_usage_to_wire(usage: TokenUsage) -> WireTokenUsage {\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace encode_interrupt -> String with String::new()\n@@ -111,22 +111,17 @@\n /// Encodes an interrupt.\n ///\n /// This is the only mechanism that aborts a turn while leaving the process\n /// usable. The spike measured the alternatives: SIGINT aborts the turn but ends\n /// the process, and closing stdin does not abort at all — it lets the turn run\n /// to completion and only then exits. Both would silently break steering.\n #[must_use]\n pub fn encode_interrupt(request_id: &str) -> String {\n-    json!({\n-        \"type\": \"control_request\",\n-        \"request_id\": request_id,\n-        \"request\": { \"subtype\": \"interrupt\" }\n-    })\n-    .to_string()\n+    String::new() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{decode_line, encode_interrupt, encode_user_message};\n     use crate::wire::{ContentBlock, Event};\n \n     #[test]\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
     "function": {
-      "function_name": "<impl core::fmt::Display for UnreadableUtilization>::fmt",
-      "return_type": "-> core::fmt::Result",
+      "function_name": "encode_interrupt",
+      "return_type": "-> String",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 125
+        },
+        "start": {
+          "column": 1,
+          "line": 111
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/codec.rs:119:5: replace encode_interrupt -> String with String::new()",
+    "package": "horde-adapter-claude",
+    "replacement": "String::new()",
+    "span": {
+      "end": {
+        "column": 17,
+        "line": 124
+      },
+      "start": {
+        "column": 5,
+        "line": 119
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/codec.rs\n+++ replace encode_interrupt -> String with \"xyzzy\".into()\n@@ -111,22 +111,17 @@\n /// Encodes an interrupt.\n ///\n /// This is the only mechanism that aborts a turn while leaving the process\n /// usable. The spike measured the alternatives: SIGINT aborts the turn but ends\n /// the process, and closing stdin does not abort at all — it lets the turn run\n /// to completion and only then exits. Both would silently break steering.\n #[must_use]\n pub fn encode_interrupt(request_id: &str) -> String {\n-    json!({\n-        \"type\": \"control_request\",\n-        \"request_id\": request_id,\n-        \"request\": { \"subtype\": \"interrupt\" }\n-    })\n-    .to_string()\n+    \"xyzzy\".into() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{decode_line, encode_interrupt, encode_user_message};\n     use crate::wire::{ContentBlock, Event};\n \n     #[test]\n",
+    "file": "crates/horde-adapter-claude/src/codec.rs",
+    "function": {
+      "function_name": "encode_interrupt",
+      "return_type": "-> String",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 125
+        },
+        "start": {
+          "column": 1,
+          "line": 111
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/codec.rs:119:5: replace encode_interrupt -> String with \"xyzzy\".into()",
+    "package": "horde-adapter-claude",
+    "replacement": "\"xyzzy\".into()",
+    "span": {
+      "end": {
+        "column": 17,
+        "line": 124
+      },
+      "start": {
+        "column": 5,
+        "line": 119
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/permission.rs\n+++ replace PromptRequest::to_proposed_call -> ProposedToolCall with Default::default()\n@@ -36,21 +36,17 @@\n     #[serde(default)]\n     pub tool_use_id: String,\n }\n \n impl PromptRequest {\n     /// Lifts the harness's request into the provider-neutral domain type.\n     #[must_use]\n     pub fn to_proposed_call(&self) -> ProposedToolCall {\n-        ProposedToolCall {\n-            tool_call_id: ToolCallId::new(self.tool_use_id.clone()),\n-            tool_name: self.tool_name.clone(),\n-            input: self.input.clone(),\n-        }\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// Renders a decision as the JSON string the harness expects.\n ///\n /// The harness wants this *stringified inside a text content block*, not as a\n /// nested object; [`encode_tool_response`] wraps it accordingly.\n #[must_use]\n",
+    "file": "crates/horde-adapter-claude/src/permission.rs",
+    "function": {
+      "function_name": "PromptRequest::to_proposed_call",
+      "return_type": "-> ProposedToolCall",
       "span": {
         "end": {
           "column": 6,
-          "line": 34
-        },
-        "start": {
-          "column": 5,
-          "line": 32
-        }
-      }
-    },
-    "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:33:9: replace <impl core::fmt::Display for UnreadableUtilization>::fmt -> core::fmt::Result with Ok(Default::default())",
-    "package": "horde-wire",
-    "replacement": "Ok(Default::default())",
-    "span": {
-      "end": {
-        "column": 76,
-        "line": 33
-      },
-      "start": {
-        "column": 9,
-        "line": 33
-      }
-    }
-  },
-  {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace token_usage_to_wire -> WireTokenUsage with Default::default()\n@@ -34,23 +34,17 @@\n     }\n }\n \n impl core::error::Error for UnreadableUtilization {}\n \n /// Domain → wire.\n #[must_use]\n pub fn token_usage_to_wire(usage: TokenUsage) -> WireTokenUsage {\n-    WireTokenUsage {\n-        input_tokens: usage.input_tokens,\n-        output_tokens: usage.output_tokens,\n-        cache_read_input_tokens: usage.cache_read_input_tokens,\n-        cache_write_input_tokens: usage.cache_write_input_tokens,\n-        reasoning_output_tokens: usage.reasoning_output_tokens,\n-    }\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wire → domain.\n #[must_use]\n pub fn token_usage_from_wire(usage: &WireTokenUsage) -> TokenUsage {\n     TokenUsage {\n         input_tokens: usage.input_tokens,\n         output_tokens: usage.output_tokens,\n",
-    "file": "crates/horde-wire/src/usage.rs",
-    "function": {
-      "function_name": "token_usage_to_wire",
-      "return_type": "-> WireTokenUsage",
-      "span": {
-        "end": {
-          "column": 2,
           "line": 49
         },
         "start": {
-          "column": 1,
-          "line": 39
+          "column": 5,
+          "line": 41
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:42:5: replace token_usage_to_wire -> WireTokenUsage with Default::default()",
-    "package": "horde-wire",
+    "name": "crates/horde-adapter-claude/src/permission.rs:44:9: replace PromptRequest::to_proposed_call -> ProposedToolCall with Default::default()",
+    "package": "horde-adapter-claude",
     "replacement": "Default::default()",
     "span": {
       "end": {
-        "column": 6,
+        "column": 10,
         "line": 48
       },
       "start": {
-        "column": 5,
-        "line": 42
+        "column": 9,
+        "line": 44
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace token_usage_from_wire -> TokenUsage with Default::default()\n@@ -46,23 +46,17 @@\n         cache_write_input_tokens: usage.cache_write_input_tokens,\n         reasoning_output_tokens: usage.reasoning_output_tokens,\n     }\n }\n \n /// Wire → domain.\n #[must_use]\n pub fn token_usage_from_wire(usage: &WireTokenUsage) -> TokenUsage {\n-    TokenUsage {\n-        input_tokens: usage.input_tokens,\n-        output_tokens: usage.output_tokens,\n-        cache_read_input_tokens: usage.cache_read_input_tokens,\n-        cache_write_input_tokens: usage.cache_write_input_tokens,\n-        reasoning_output_tokens: usage.reasoning_output_tokens,\n-    }\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n fn source_to_wire(source: HeadroomSource) -> WireHeadroomSource {\n     match source {\n         HeadroomSource::ProviderReported => WireHeadroomSource::ProviderReported,\n         HeadroomSource::HordeMetered => WireHeadroomSource::HordeMetered,\n     }\n }\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/permission.rs\n+++ replace encode_decision -> String with String::new()\n@@ -50,29 +50,17 @@\n }\n \n /// Renders a decision as the JSON string the harness expects.\n ///\n /// The harness wants this *stringified inside a text content block*, not as a\n /// nested object; [`encode_tool_response`] wraps it accordingly.\n #[must_use]\n pub fn encode_decision(decision: &PermissionDecision, proposed_input: &Value) -> String {\n-    let body = match decision {\n-        PermissionDecision::Allow { updated_input } => json!({\n-            \"behavior\": \"allow\",\n-            // The harness runs whatever is in `updatedInput`, so an unmodified\n-            // allow must echo the proposal back rather than omit the field.\n-            \"updatedInput\": updated_input.as_ref().unwrap_or(proposed_input),\n-        }),\n-        PermissionDecision::Deny { message } => json!({\n-            \"behavior\": \"deny\",\n-            \"message\": message,\n-        }),\n-    };\n-    body.to_string()\n+    String::new() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wraps a decision as a complete MCP `tools/call` result.\n #[must_use]\n pub fn encode_tool_response(decision: &PermissionDecision, proposed_input: &Value) -> Value {\n     json!({\n         \"content\": [{ \"type\": \"text\", \"text\": encode_decision(decision, proposed_input) }],\n         \"isError\": false,\n",
+    "file": "crates/horde-adapter-claude/src/permission.rs",
     "function": {
-      "function_name": "token_usage_from_wire",
-      "return_type": "-> TokenUsage",
+      "function_name": "encode_decision",
+      "return_type": "-> String",
       "span": {
         "end": {
           "column": 2,
-          "line": 61
+          "line": 71
         },
         "start": {
           "column": 1,
-          "line": 51
+          "line": 52
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:54:5: replace token_usage_from_wire -> TokenUsage with Default::default()",
-    "package": "horde-wire",
-    "replacement": "Default::default()",
+    "name": "crates/horde-adapter-claude/src/permission.rs:58:5: replace encode_decision -> String with String::new()",
+    "package": "horde-adapter-claude",
+    "replacement": "String::new()",
     "span": {
       "end": {
-        "column": 6,
-        "line": 60
+        "column": 21,
+        "line": 70
       },
       "start": {
         "column": 5,
-        "line": 54
+        "line": 58
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace source_to_wire -> WireHeadroomSource with Default::default()\n@@ -56,20 +56,17 @@\n         output_tokens: usage.output_tokens,\n         cache_read_input_tokens: usage.cache_read_input_tokens,\n         cache_write_input_tokens: usage.cache_write_input_tokens,\n         reasoning_output_tokens: usage.reasoning_output_tokens,\n     }\n }\n \n fn source_to_wire(source: HeadroomSource) -> WireHeadroomSource {\n-    match source {\n-        HeadroomSource::ProviderReported => WireHeadroomSource::ProviderReported,\n-        HeadroomSource::HordeMetered => WireHeadroomSource::HordeMetered,\n-    }\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n fn source_from_wire(value: i32) -> HeadroomSource {\n     // Horde's own metering is the safe reading of an unknown source: it is the\n     // weaker claim, so treating a future PROVIDER_REPORTED variant as metered\n     // understates trust rather than overstating it.\n     match WireHeadroomSource::try_from(value) {\n         Ok(WireHeadroomSource::ProviderReported) => HeadroomSource::ProviderReported,\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/permission.rs\n+++ replace encode_decision -> String with \"xyzzy\".into()\n@@ -50,29 +50,17 @@\n }\n \n /// Renders a decision as the JSON string the harness expects.\n ///\n /// The harness wants this *stringified inside a text content block*, not as a\n /// nested object; [`encode_tool_response`] wraps it accordingly.\n #[must_use]\n pub fn encode_decision(decision: &PermissionDecision, proposed_input: &Value) -> String {\n-    let body = match decision {\n-        PermissionDecision::Allow { updated_input } => json!({\n-            \"behavior\": \"allow\",\n-            // The harness runs whatever is in `updatedInput`, so an unmodified\n-            // allow must echo the proposal back rather than omit the field.\n-            \"updatedInput\": updated_input.as_ref().unwrap_or(proposed_input),\n-        }),\n-        PermissionDecision::Deny { message } => json!({\n-            \"behavior\": \"deny\",\n-            \"message\": message,\n-        }),\n-    };\n-    body.to_string()\n+    \"xyzzy\".into() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wraps a decision as a complete MCP `tools/call` result.\n #[must_use]\n pub fn encode_tool_response(decision: &PermissionDecision, proposed_input: &Value) -> Value {\n     json!({\n         \"content\": [{ \"type\": \"text\", \"text\": encode_decision(decision, proposed_input) }],\n         \"isError\": false,\n",
+    "file": "crates/horde-adapter-claude/src/permission.rs",
     "function": {
-      "function_name": "source_to_wire",
-      "return_type": "-> WireHeadroomSource",
+      "function_name": "encode_decision",
+      "return_type": "-> String",
       "span": {
         "end": {
           "column": 2,
-          "line": 68
+          "line": 71
         },
         "start": {
           "column": 1,
-          "line": 63
+          "line": 52
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:64:5: replace source_to_wire -> WireHeadroomSource with Default::default()",
-    "package": "horde-wire",
-    "replacement": "Default::default()",
+    "name": "crates/horde-adapter-claude/src/permission.rs:58:5: replace encode_decision -> String with \"xyzzy\".into()",
+    "package": "horde-adapter-claude",
+    "replacement": "\"xyzzy\".into()",
     "span": {
       "end": {
-        "column": 6,
-        "line": 67
+        "column": 21,
+        "line": 70
       },
       "start": {
         "column": 5,
-        "line": 64
+        "line": 58
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace source_from_wire -> HeadroomSource with Default::default()\n@@ -66,22 +66,17 @@\n         HeadroomSource::HordeMetered => WireHeadroomSource::HordeMetered,\n     }\n }\n \n fn source_from_wire(value: i32) -> HeadroomSource {\n     // Horde's own metering is the safe reading of an unknown source: it is the\n     // weaker claim, so treating a future PROVIDER_REPORTED variant as metered\n     // understates trust rather than overstating it.\n-    match WireHeadroomSource::try_from(value) {\n-        Ok(WireHeadroomSource::ProviderReported) => HeadroomSource::ProviderReported,\n-        Ok(WireHeadroomSource::HordeMetered | WireHeadroomSource::Unspecified) | Err(_) => {\n-            HeadroomSource::HordeMetered\n-        }\n-    }\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Domain → wire.\n ///\n /// Exhaustive over [`Utilization`]: a new arm must decide how it crosses before\n /// this compiles. Each arm sets exactly one shape, which is what lets\n /// [`rate_window_from_wire`] tell them apart again.\n ///\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/permission.rs\n+++ replace encode_tool_response -> Value with Default::default()\n@@ -68,20 +68,17 @@\n         }),\n     };\n     body.to_string()\n }\n \n /// Wraps a decision as a complete MCP `tools/call` result.\n #[must_use]\n pub fn encode_tool_response(decision: &PermissionDecision, proposed_input: &Value) -> Value {\n-    json!({\n-        \"content\": [{ \"type\": \"text\", \"text\": encode_decision(decision, proposed_input) }],\n-        \"isError\": false,\n-    })\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use horde_adapter::PermissionDecision;\n     use serde_json::json;\n \n     use super::{PromptRequest, encode_decision, encode_tool_response};\n",
+    "file": "crates/horde-adapter-claude/src/permission.rs",
     "function": {
-      "function_name": "source_from_wire",
-      "return_type": "-> HeadroomSource",
+      "function_name": "encode_tool_response",
+      "return_type": "-> Value",
       "span": {
         "end": {
           "column": 2,
@@ -1100,146 +620,626 @@
         },
         "start": {
           "column": 1,
-          "line": 70
+          "line": 73
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:74:5: replace source_from_wire -> HeadroomSource with Default::default()",
-    "package": "horde-wire",
+    "name": "crates/horde-adapter-claude/src/permission.rs:76:5: replace encode_tool_response -> Value with Default::default()",
+    "package": "horde-adapter-claude",
     "replacement": "Default::default()",
     "span": {
       "end": {
-        "column": 6,
+        "column": 7,
         "line": 79
       },
       "start": {
         "column": 5,
-        "line": 74
+        "line": 76
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace rate_window_to_wire -> WireRateWindow with Default::default()\n@@ -86,44 +86,17 @@\n /// [`rate_window_from_wire`] tell them apart again.\n ///\n /// The one thing that does not survive: `RateWindow::window`, the harness's own\n /// label for the window (`\"five_hour\"`, `\"weekly\"`). The wire has no field for\n /// it because nothing downstream matches on it — it is local diagnostic colour,\n /// and a round trip through the wire returns an empty label.\n #[must_use]\n pub fn rate_window_to_wire(window: &RateWindow) -> WireRateWindow {\n-    let mut wire = WireRateWindow {\n-        source: source_to_wire(window.source).into(),\n-        unit: RateWindowUnit::Unspecified.into(),\n-        used: None,\n-        limit: None,\n-        used_fraction: None,\n-        allowed: None,\n-        window_length: window.window_duration.map(|d| WireDuration {\n-            seconds: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),\n-            nanos: i32::try_from(d.subsec_nanos()).unwrap_or(0),\n-        }),\n-        resets_at: window\n-            .resets_at_unix\n-            .map(|seconds| Timestamp { seconds, nanos: 0 }),\n-    };\n-\n-    match window.utilization {\n-        Utilization::Fraction(used) => wire.used_fraction = Some(used),\n-        Utilization::Absolute { used, limit } => {\n-            wire.used = Some(used);\n-            wire.limit = Some(limit);\n-            // A unit only means something alongside counts.\n-            wire.unit = RateWindowUnit::Tokens.into();\n-        }\n-        Utilization::AllowedOnly { allowed } => wire.allowed = Some(allowed),\n-    }\n-\n-    wire\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Wire → domain.\n ///\n /// Shapes are checked in the order of how much they say, so a peer that sent\n /// more than one is read at its most informative rather than its least.\n pub fn rate_window_from_wire(wire: &WireRateWindow) -> Result<RateWindow, UnreadableUtilization> {\n     let utilization = match (wire.used_fraction, wire.used, wire.limit, wire.allowed) {\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/replay.rs\n+++ replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![])\n@@ -19,18 +19,17 @@\n /// Reads one line of `claude` stream-json into events.\n #[derive(Debug, Default)]\n pub struct StreamJsonLines {\n     assembler: TurnAssembler,\n }\n \n impl LineDecoder for StreamJsonLines {\n     fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {\n-        let envelope = decode_line(line)?;\n-        Ok(self.assembler.feed(&envelope))\n+        Ok(vec![]) /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn provider_session_id(&self) -> Option<ProviderSessionId> {\n         self.assembler.provider_session_id()\n     }\n \n     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {\n         // Permission prompts reach a live session over the MCP endpoint, not\n",
+    "file": "crates/horde-adapter-claude/src/replay.rs",
     "function": {
-      "function_name": "rate_window_to_wire",
-      "return_type": "-> WireRateWindow",
+      "function_name": "<impl LineDecoder for StreamJsonLines>::decode",
+      "return_type": "-> Result<Vec<AgentEvent>>",
       "span": {
         "end": {
-          "column": 2,
-          "line": 122
+          "column": 6,
+          "line": 29
         },
         "start": {
-          "column": 1,
-          "line": 82
+          "column": 5,
+          "line": 26
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:94:5: replace rate_window_to_wire -> WireRateWindow with Default::default()",
-    "package": "horde-wire",
+    "name": "crates/horde-adapter-claude/src/replay.rs:27:9: replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![])",
+    "package": "horde-adapter-claude",
+    "replacement": "Ok(vec![])",
+    "span": {
+      "end": {
+        "column": 43,
+        "line": 28
+      },
+      "start": {
+        "column": 9,
+        "line": 27
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/replay.rs\n+++ replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![Default::default()])\n@@ -19,18 +19,17 @@\n /// Reads one line of `claude` stream-json into events.\n #[derive(Debug, Default)]\n pub struct StreamJsonLines {\n     assembler: TurnAssembler,\n }\n \n impl LineDecoder for StreamJsonLines {\n     fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {\n-        let envelope = decode_line(line)?;\n-        Ok(self.assembler.feed(&envelope))\n+        Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn provider_session_id(&self) -> Option<ProviderSessionId> {\n         self.assembler.provider_session_id()\n     }\n \n     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {\n         // Permission prompts reach a live session over the MCP endpoint, not\n",
+    "file": "crates/horde-adapter-claude/src/replay.rs",
+    "function": {
+      "function_name": "<impl LineDecoder for StreamJsonLines>::decode",
+      "return_type": "-> Result<Vec<AgentEvent>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 29
+        },
+        "start": {
+          "column": 5,
+          "line": 26
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/replay.rs:27:9: replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![Default::default()])",
+    "package": "horde-adapter-claude",
+    "replacement": "Ok(vec![Default::default()])",
+    "span": {
+      "end": {
+        "column": 43,
+        "line": 28
+      },
+      "start": {
+        "column": 9,
+        "line": 27
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/replay.rs\n+++ replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with None\n@@ -24,17 +24,17 @@\n \n impl LineDecoder for StreamJsonLines {\n     fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {\n         let envelope = decode_line(line)?;\n         Ok(self.assembler.feed(&envelope))\n     }\n \n     fn provider_session_id(&self) -> Option<ProviderSessionId> {\n-        self.assembler.provider_session_id()\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {\n         // Permission prompts reach a live session over the MCP endpoint, not\n         // over stdout, so a recording of stdout has nothing to answer.\n         AdapterError::UnknownPermissionRequest {\n             tool_call_id: tool_call_id.clone(),\n         }\n",
+    "file": "crates/horde-adapter-claude/src/replay.rs",
+    "function": {
+      "function_name": "<impl LineDecoder for StreamJsonLines>::provider_session_id",
+      "return_type": "-> Option<ProviderSessionId>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 33
+        },
+        "start": {
+          "column": 5,
+          "line": 31
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/replay.rs:32:9: replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with None",
+    "package": "horde-adapter-claude",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 45,
+        "line": 32
+      },
+      "start": {
+        "column": 9,
+        "line": 32
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/replay.rs\n+++ replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())\n@@ -24,17 +24,17 @@\n \n impl LineDecoder for StreamJsonLines {\n     fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {\n         let envelope = decode_line(line)?;\n         Ok(self.assembler.feed(&envelope))\n     }\n \n     fn provider_session_id(&self) -> Option<ProviderSessionId> {\n-        self.assembler.provider_session_id()\n+        Some(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {\n         // Permission prompts reach a live session over the MCP endpoint, not\n         // over stdout, so a recording of stdout has nothing to answer.\n         AdapterError::UnknownPermissionRequest {\n             tool_call_id: tool_call_id.clone(),\n         }\n",
+    "file": "crates/horde-adapter-claude/src/replay.rs",
+    "function": {
+      "function_name": "<impl LineDecoder for StreamJsonLines>::provider_session_id",
+      "return_type": "-> Option<ProviderSessionId>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 33
+        },
+        "start": {
+          "column": 5,
+          "line": 31
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/replay.rs:32:9: replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())",
+    "package": "horde-adapter-claude",
+    "replacement": "Some(Default::default())",
+    "span": {
+      "end": {
+        "column": 45,
+        "line": 32
+      },
+      "start": {
+        "column": 9,
+        "line": 32
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/replay.rs\n+++ replace <impl LineDecoder for StreamJsonLines>::no_permission_channel -> AdapterError with Default::default()\n@@ -30,19 +30,17 @@\n \n     fn provider_session_id(&self) -> Option<ProviderSessionId> {\n         self.assembler.provider_session_id()\n     }\n \n     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {\n         // Permission prompts reach a live session over the MCP endpoint, not\n         // over stdout, so a recording of stdout has nothing to answer.\n-        AdapterError::UnknownPermissionRequest {\n-            tool_call_id: tool_call_id.clone(),\n-        }\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// Replays recorded `claude` output, one turn per message sent.\n pub type ReplaySession = horde_adapter::ReplaySession<StreamJsonLines>;\n \n /// Builds a session from stdout lines already grouped into turns.\n #[must_use]\n",
+    "file": "crates/horde-adapter-claude/src/replay.rs",
+    "function": {
+      "function_name": "<impl LineDecoder for StreamJsonLines>::no_permission_channel",
+      "return_type": "-> AdapterError",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 41
+        },
+        "start": {
+          "column": 5,
+          "line": 35
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/replay.rs:38:9: replace <impl LineDecoder for StreamJsonLines>::no_permission_channel -> AdapterError with Default::default()",
+    "package": "horde-adapter-claude",
     "replacement": "Default::default()",
     "span": {
       "end": {
-        "column": 9,
-        "line": 121
+        "column": 10,
+        "line": 40
       },
       "start": {
-        "column": 5,
-        "line": 94
+        "column": 9,
+        "line": 38
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ replace rate_window_from_wire -> Result<RateWindow, UnreadableUtilization> with Ok(Default::default())\n@@ -121,33 +121,17 @@\n     wire\n }\n \n /// Wire → domain.\n ///\n /// Shapes are checked in the order of how much they say, so a peer that sent\n /// more than one is read at its most informative rather than its least.\n pub fn rate_window_from_wire(wire: &WireRateWindow) -> Result<RateWindow, UnreadableUtilization> {\n-    let utilization = match (wire.used_fraction, wire.used, wire.limit, wire.allowed) {\n-        (Some(fraction), ..) => Utilization::Fraction(fraction),\n-        (None, Some(used), Some(limit), _) => Utilization::Absolute { used, limit },\n-        (None, None, None, Some(allowed)) => Utilization::AllowedOnly { allowed },\n-        _ => return Err(UnreadableUtilization),\n-    };\n-\n-    Ok(RateWindow {\n-        source: source_from_wire(wire.source),\n-        // No wire field; see `rate_window_to_wire`.\n-        window: String::new(),\n-        utilization,\n-        window_duration: wire\n-            .window_length\n-            .map(|d| core::time::Duration::new(d.seconds.max(0) as u64, d.nanos.max(0) as u32)),\n-        resets_at_unix: wire.resets_at.map(|t| t.seconds),\n-    })\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{\n         UnreadableUtilization, rate_window_from_wire, rate_window_to_wire, token_usage_from_wire,\n         token_usage_to_wire,\n     };\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/replay.rs\n+++ replace replay -> ReplaySession with Default::default()\n@@ -42,17 +42,17 @@\n }\n \n /// Replays recorded `claude` output, one turn per message sent.\n pub type ReplaySession = horde_adapter::ReplaySession<StreamJsonLines>;\n \n /// Builds a session from stdout lines already grouped into turns.\n #[must_use]\n pub fn replay(turns: Vec<Vec<String>>) -> ReplaySession {\n-    ReplaySession::new(StreamJsonLines::default(), turns)\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use horde_adapter::{AgentSession, ToolCallId, TurnInput};\n     use serde_json::json;\n \n     use super::replay;\n",
+    "file": "crates/horde-adapter-claude/src/replay.rs",
     "function": {
-      "function_name": "rate_window_from_wire",
-      "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+      "function_name": "replay",
+      "return_type": "-> ReplaySession",
       "span": {
         "end": {
           "column": 2,
-          "line": 146
+          "line": 51
         },
         "start": {
           "column": 1,
-          "line": 124
+          "line": 47
         }
       }
     },
     "genre": "FnValue",
-    "name": "crates/horde-wire/src/usage.rs:129:5: replace rate_window_from_wire -> Result<RateWindow, UnreadableUtilization> with Ok(Default::default())",
-    "package": "horde-wire",
-    "replacement": "Ok(Default::default())",
+    "name": "crates/horde-adapter-claude/src/replay.rs:50:5: replace replay -> ReplaySession with Default::default()",
+    "package": "horde-adapter-claude",
+    "replacement": "Default::default()",
     "span": {
       "end": {
-        "column": 7,
-        "line": 145
+        "column": 58,
+        "line": 50
       },
       "start": {
         "column": 5,
-        "line": 129
+        "line": 50
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ delete match arm (Some(fraction), ..) in rate_window_from_wire\n@@ -122,17 +122,17 @@\n }\n \n /// Wire → domain.\n ///\n /// Shapes are checked in the order of how much they say, so a peer that sent\n /// more than one is read at its most informative rather than its least.\n pub fn rate_window_from_wire(wire: &WireRateWindow) -> Result<RateWindow, UnreadableUtilization> {\n     let utilization = match (wire.used_fraction, wire.used, wire.limit, wire.allowed) {\n-        (Some(fraction), ..) => Utilization::Fraction(fraction),\n+         /* ~ changed by cargo-mutants ~ */\n         (None, Some(used), Some(limit), _) => Utilization::Absolute { used, limit },\n         (None, None, None, Some(allowed)) => Utilization::AllowedOnly { allowed },\n         _ => return Err(UnreadableUtilization),\n     };\n \n     Ok(RateWindow {\n         source: source_from_wire(wire.source),\n         // No wire field; see `rate_window_to_wire`.\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace channel_index -> usize with 0\n@@ -15,23 +15,17 @@\n use serde_json::Value;\n \n use crate::wire::{ContentBlock, Envelope, Event, Message, TurnResult};\n \n /// Number of variants in [`OutputChannel`], for the per-channel chunk counters.\n const CHANNEL_COUNT: usize = 5;\n \n const fn channel_index(channel: OutputChannel) -> usize {\n-    match channel {\n-        OutputChannel::Assistant => 0,\n-        OutputChannel::Reasoning => 1,\n-        OutputChannel::ToolCall => 2,\n-        OutputChannel::ToolResult => 3,\n-        OutputChannel::HarnessDiagnostic => 4,\n-    }\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n /// Turns a stream of [`Envelope`]s into a stream of [`AgentEvent`]s.\n #[derive(Debug, Default)]\n pub struct TurnAssembler {\n     session_id: Option<String>,\n     announced_session: bool,\n     turn_ordinal: u64,\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
     "function": {
-      "function_name": "rate_window_from_wire",
-      "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+      "function_name": "channel_index",
+      "return_type": "-> usize",
       "span": {
         "end": {
           "column": 2,
-          "line": 146
+          "line": 30
         },
         "start": {
           "column": 1,
-          "line": 124
+          "line": 22
         }
       }
     },
-    "genre": "MatchArm",
-    "name": "crates/horde-wire/src/usage.rs:130:9: delete match arm (Some(fraction), ..) in rate_window_from_wire",
-    "package": "horde-wire",
-    "replacement": "",
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:23:5: replace channel_index -> usize with 0",
+    "package": "horde-adapter-claude",
+    "replacement": "0",
     "span": {
       "end": {
-        "column": 65,
-        "line": 130
+        "column": 6,
+        "line": 29
+      },
+      "start": {
+        "column": 5,
+        "line": 23
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace channel_index -> usize with 1\n@@ -15,23 +15,17 @@\n use serde_json::Value;\n \n use crate::wire::{ContentBlock, Envelope, Event, Message, TurnResult};\n \n /// Number of variants in [`OutputChannel`], for the per-channel chunk counters.\n const CHANNEL_COUNT: usize = 5;\n \n const fn channel_index(channel: OutputChannel) -> usize {\n-    match channel {\n-        OutputChannel::Assistant => 0,\n-        OutputChannel::Reasoning => 1,\n-        OutputChannel::ToolCall => 2,\n-        OutputChannel::ToolResult => 3,\n-        OutputChannel::HarnessDiagnostic => 4,\n-    }\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n /// Turns a stream of [`Envelope`]s into a stream of [`AgentEvent`]s.\n #[derive(Debug, Default)]\n pub struct TurnAssembler {\n     session_id: Option<String>,\n     announced_session: bool,\n     turn_ordinal: u64,\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "channel_index",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 30
+        },
+        "start": {
+          "column": 1,
+          "line": 22
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:23:5: replace channel_index -> usize with 1",
+    "package": "horde-adapter-claude",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 29
+      },
+      "start": {
+        "column": 5,
+        "line": 23
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with None\n@@ -43,17 +43,17 @@\n     #[must_use]\n     pub fn new() -> Self {\n         Self::default()\n     }\n \n     /// The harness conversation id seen so far.\n     #[must_use]\n     pub fn provider_session_id(&self) -> Option<ProviderSessionId> {\n-        self.session_id.as_deref().map(ProviderSessionId::new)\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Feeds one envelope, returning the domain events it produced.\n     ///\n     /// Most envelopes produce none: thinking-token tallies, hook lifecycle, and\n     /// partial-message deltas carry nothing the assembled messages do not.\n     pub fn feed(&mut self, envelope: &Envelope) -> Vec<AgentEvent> {\n         match &envelope.event {\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::provider_session_id",
+      "return_type": "-> Option<ProviderSessionId>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 52
+        },
+        "start": {
+          "column": 5,
+          "line": 48
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:51:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with None",
+    "package": "horde-adapter-claude",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 63,
+        "line": 51
       },
       "start": {
         "column": 9,
-        "line": 130
+        "line": 51
       }
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ delete match arm (None, Some(used), Some(limit), _) in rate_window_from_wire\n@@ -123,17 +123,17 @@\n \n /// Wire → domain.\n ///\n /// Shapes are checked in the order of how much they say, so a peer that sent\n /// more than one is read at its most informative rather than its least.\n pub fn rate_window_from_wire(wire: &WireRateWindow) -> Result<RateWindow, UnreadableUtilization> {\n     let utilization = match (wire.used_fraction, wire.used, wire.limit, wire.allowed) {\n         (Some(fraction), ..) => Utilization::Fraction(fraction),\n-        (None, Some(used), Some(limit), _) => Utilization::Absolute { used, limit },\n+         /* ~ changed by cargo-mutants ~ */\n         (None, None, None, Some(allowed)) => Utilization::AllowedOnly { allowed },\n         _ => return Err(UnreadableUtilization),\n     };\n \n     Ok(RateWindow {\n         source: source_from_wire(wire.source),\n         // No wire field; see `rate_window_to_wire`.\n         window: String::new(),\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())\n@@ -43,17 +43,17 @@\n     #[must_use]\n     pub fn new() -> Self {\n         Self::default()\n     }\n \n     /// The harness conversation id seen so far.\n     #[must_use]\n     pub fn provider_session_id(&self) -> Option<ProviderSessionId> {\n-        self.session_id.as_deref().map(ProviderSessionId::new)\n+        Some(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Feeds one envelope, returning the domain events it produced.\n     ///\n     /// Most envelopes produce none: thinking-token tallies, hook lifecycle, and\n     /// partial-message deltas carry nothing the assembled messages do not.\n     pub fn feed(&mut self, envelope: &Envelope) -> Vec<AgentEvent> {\n         match &envelope.event {\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
     "function": {
-      "function_name": "rate_window_from_wire",
-      "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+      "function_name": "TurnAssembler::provider_session_id",
+      "return_type": "-> Option<ProviderSessionId>",
       "span": {
         "end": {
-          "column": 2,
-          "line": 146
+          "column": 6,
+          "line": 52
         },
         "start": {
-          "column": 1,
-          "line": 124
+          "column": 5,
+          "line": 48
         }
       }
     },
-    "genre": "MatchArm",
-    "name": "crates/horde-wire/src/usage.rs:131:9: delete match arm (None, Some(used), Some(limit), _) in rate_window_from_wire",
-    "package": "horde-wire",
-    "replacement": "",
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:51:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())",
+    "package": "horde-adapter-claude",
+    "replacement": "Some(Default::default())",
     "span": {
       "end": {
-        "column": 85,
+        "column": 63,
+        "line": 51
+      },
+      "start": {
+        "column": 9,
+        "line": 51
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::feed -> Vec<AgentEvent> with vec![]\n@@ -51,39 +51,17 @@\n         self.session_id.as_deref().map(ProviderSessionId::new)\n     }\n \n     /// Feeds one envelope, returning the domain events it produced.\n     ///\n     /// Most envelopes produce none: thinking-token tallies, hook lifecycle, and\n     /// partial-message deltas carry nothing the assembled messages do not.\n     pub fn feed(&mut self, envelope: &Envelope) -> Vec<AgentEvent> {\n-        match &envelope.event {\n-            Event::Init(init) => self.begin_turn(&init.session_id, &init.model),\n-            Event::Assistant(message) => self.assistant_events(message),\n-            Event::User(message) => self.tool_result_events(message),\n-            Event::Result(result) => vec![self.end_turn(result)],\n-            Event::RateLimit(rate_limit) => vec![AgentEvent::HeadroomReported {\n-                window: RateWindow {\n-                    source: HeadroomSource::ProviderReported,\n-                    window: rate_limit.rate_limit_info.rate_limit_type.clone(),\n-                    // Claude Code reports only whether it is still serving, with\n-                    // no counts or percentage to derive headroom from.\n-                    utilization: Utilization::AllowedOnly {\n-                        allowed: rate_limit.rate_limit_info.status == \"allowed\",\n-                    },\n-                    window_duration: None,\n-                    resets_at_unix: rate_limit.rate_limit_info.resets_at,\n-                },\n-            }],\n-            Event::ControlResponse(_)\n-            | Event::StreamEvent\n-            | Event::System { .. }\n-            | Event::Unknown { .. } => Vec::new(),\n-        }\n+        vec![] /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// `system`/`init` opens each turn — it is a turn header, not a process\n     /// handshake, and arrives once per user message.\n     fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {\n         let is_new_session = self.session_id.as_deref() != Some(session_id);\n         if is_new_session {\n             self.session_id = Some(session_id.to_owned());\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::feed",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 82
+        },
+        "start": {
+          "column": 5,
+          "line": 54
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:59:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 81
+      },
+      "start": {
+        "column": 9,
+        "line": 59
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::feed -> Vec<AgentEvent> with vec![Default::default()]\n@@ -51,39 +51,17 @@\n         self.session_id.as_deref().map(ProviderSessionId::new)\n     }\n \n     /// Feeds one envelope, returning the domain events it produced.\n     ///\n     /// Most envelopes produce none: thinking-token tallies, hook lifecycle, and\n     /// partial-message deltas carry nothing the assembled messages do not.\n     pub fn feed(&mut self, envelope: &Envelope) -> Vec<AgentEvent> {\n-        match &envelope.event {\n-            Event::Init(init) => self.begin_turn(&init.session_id, &init.model),\n-            Event::Assistant(message) => self.assistant_events(message),\n-            Event::User(message) => self.tool_result_events(message),\n-            Event::Result(result) => vec![self.end_turn(result)],\n-            Event::RateLimit(rate_limit) => vec![AgentEvent::HeadroomReported {\n-                window: RateWindow {\n-                    source: HeadroomSource::ProviderReported,\n-                    window: rate_limit.rate_limit_info.rate_limit_type.clone(),\n-                    // Claude Code reports only whether it is still serving, with\n-                    // no counts or percentage to derive headroom from.\n-                    utilization: Utilization::AllowedOnly {\n-                        allowed: rate_limit.rate_limit_info.status == \"allowed\",\n-                    },\n-                    window_duration: None,\n-                    resets_at_unix: rate_limit.rate_limit_info.resets_at,\n-                },\n-            }],\n-            Event::ControlResponse(_)\n-            | Event::StreamEvent\n-            | Event::System { .. }\n-            | Event::Unknown { .. } => Vec::new(),\n-        }\n+        vec![Default::default()] /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// `system`/`init` opens each turn — it is a turn header, not a process\n     /// handshake, and arrives once per user message.\n     fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {\n         let is_new_session = self.session_id.as_deref() != Some(session_id);\n         if is_new_session {\n             self.session_id = Some(session_id.to_owned());\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::feed",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 82
+        },
+        "start": {
+          "column": 5,
+          "line": 54
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:59:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![Default::default()]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![Default::default()]",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 81
+      },
+      "start": {
+        "column": 9,
+        "line": 59
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![]\n@@ -79,33 +79,17 @@\n             | Event::System { .. }\n             | Event::Unknown { .. } => Vec::new(),\n         }\n     }\n \n     /// `system`/`init` opens each turn — it is a turn header, not a process\n     /// handshake, and arrives once per user message.\n     fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {\n-        let is_new_session = self.session_id.as_deref() != Some(session_id);\n-        if is_new_session {\n-            self.session_id = Some(session_id.to_owned());\n-            self.announced_session = false;\n-        }\n-\n-        self.turn_ordinal = self.turn_ordinal.saturating_add(1);\n-        self.chunk_counters = [0; CHANNEL_COUNT];\n-\n-        if self.announced_session {\n-            return Vec::new();\n-        }\n-        self.announced_session = true;\n-        vec![AgentEvent::SessionEstablished {\n-            provider_session_id: ProviderSessionId::new(session_id),\n-            model: model.to_owned(),\n-        }]\n+        vec![] /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// A stable, replay-deterministic turn identifier.\n     ///\n     /// Derived rather than random because a golden transcript must produce the\n     /// same events every time it is replayed.\n     fn turn_id(&self) -> TurnId {\n         TurnId::new(format!(\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::begin_turn",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 104
+        },
+        "start": {
+          "column": 5,
+          "line": 84
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:87:9: replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 103
+      },
+      "start": {
+        "column": 9,
+        "line": 87
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![Default::default()]\n@@ -79,33 +79,17 @@\n             | Event::System { .. }\n             | Event::Unknown { .. } => Vec::new(),\n         }\n     }\n \n     /// `system`/`init` opens each turn — it is a turn header, not a process\n     /// handshake, and arrives once per user message.\n     fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {\n-        let is_new_session = self.session_id.as_deref() != Some(session_id);\n-        if is_new_session {\n-            self.session_id = Some(session_id.to_owned());\n-            self.announced_session = false;\n-        }\n-\n-        self.turn_ordinal = self.turn_ordinal.saturating_add(1);\n-        self.chunk_counters = [0; CHANNEL_COUNT];\n-\n-        if self.announced_session {\n-            return Vec::new();\n-        }\n-        self.announced_session = true;\n-        vec![AgentEvent::SessionEstablished {\n-            provider_session_id: ProviderSessionId::new(session_id),\n-            model: model.to_owned(),\n-        }]\n+        vec![Default::default()] /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// A stable, replay-deterministic turn identifier.\n     ///\n     /// Derived rather than random because a golden transcript must produce the\n     /// same events every time it is replayed.\n     fn turn_id(&self) -> TurnId {\n         TurnId::new(format!(\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::begin_turn",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 104
+        },
+        "start": {
+          "column": 5,
+          "line": 84
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:87:9: replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![Default::default()]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![Default::default()]",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 103
+      },
+      "start": {
+        "column": 9,
+        "line": 87
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace != with == in TurnAssembler::begin_turn\n@@ -79,17 +79,17 @@\n             | Event::System { .. }\n             | Event::Unknown { .. } => Vec::new(),\n         }\n     }\n \n     /// `system`/`init` opens each turn — it is a turn header, not a process\n     /// handshake, and arrives once per user message.\n     fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {\n-        let is_new_session = self.session_id.as_deref() != Some(session_id);\n+        let is_new_session = self.session_id.as_deref() == /* ~ changed by cargo-mutants ~ */ Some(session_id);\n         if is_new_session {\n             self.session_id = Some(session_id.to_owned());\n             self.announced_session = false;\n         }\n \n         self.turn_ordinal = self.turn_ordinal.saturating_add(1);\n         self.chunk_counters = [0; CHANNEL_COUNT];\n \n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::begin_turn",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 104
+        },
+        "start": {
+          "column": 5,
+          "line": 84
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/turn.rs:87:57: replace != with == in TurnAssembler::begin_turn",
+    "package": "horde-adapter-claude",
+    "replacement": "==",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 87
+      },
+      "start": {
+        "column": 57,
+        "line": 87
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::turn_id -> TurnId with Default::default()\n@@ -103,21 +103,17 @@\n         }]\n     }\n \n     /// A stable, replay-deterministic turn identifier.\n     ///\n     /// Derived rather than random because a golden transcript must produce the\n     /// same events every time it is replayed.\n     fn turn_id(&self) -> TurnId {\n-        TurnId::new(format!(\n-            \"{}#{}\",\n-            self.session_id.as_deref().unwrap_or(\"unknown\"),\n-            self.turn_ordinal\n-        ))\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn output(&mut self, channel: OutputChannel, text: String) -> AgentEvent {\n         let slot = &mut self.chunk_counters[channel_index(channel)];\n         let chunk_index = *slot;\n         *slot = slot.saturating_add(1);\n         AgentEvent::Output {\n             turn_id: self.turn_id(),\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::turn_id",
+      "return_type": "-> TurnId",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 116
+        },
+        "start": {
+          "column": 5,
+          "line": 106
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:111:9: replace TurnAssembler::turn_id -> TurnId with Default::default()",
+    "package": "horde-adapter-claude",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 115
+      },
+      "start": {
+        "column": 9,
+        "line": 111
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::output -> AgentEvent with Default::default()\n@@ -111,25 +111,17 @@\n         TurnId::new(format!(\n             \"{}#{}\",\n             self.session_id.as_deref().unwrap_or(\"unknown\"),\n             self.turn_ordinal\n         ))\n     }\n \n     fn output(&mut self, channel: OutputChannel, text: String) -> AgentEvent {\n-        let slot = &mut self.chunk_counters[channel_index(channel)];\n-        let chunk_index = *slot;\n-        *slot = slot.saturating_add(1);\n-        AgentEvent::Output {\n-            turn_id: self.turn_id(),\n-            channel,\n-            text,\n-            chunk_index,\n-        }\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn assistant_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n         let mut events = Vec::new();\n         for block in &message.message.content {\n             match block {\n                 ContentBlock::Text { text } => {\n                     events.push(self.output(OutputChannel::Assistant, text.clone()));\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::output",
+      "return_type": "-> AgentEvent",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 128
+        },
+        "start": {
+          "column": 5,
+          "line": 118
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:119:9: replace TurnAssembler::output -> AgentEvent with Default::default()",
+    "package": "horde-adapter-claude",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 127
+      },
+      "start": {
+        "column": 9,
+        "line": 119
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![]\n@@ -123,33 +123,17 @@\n             turn_id: self.turn_id(),\n             channel,\n             text,\n             chunk_index,\n         }\n     }\n \n     fn assistant_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n-        let mut events = Vec::new();\n-        for block in &message.message.content {\n-            match block {\n-                ContentBlock::Text { text } => {\n-                    events.push(self.output(OutputChannel::Assistant, text.clone()));\n-                }\n-                ContentBlock::Thinking { thinking } => {\n-                    events.push(self.output(OutputChannel::Reasoning, thinking.clone()));\n-                }\n-                ContentBlock::ToolUse { name, input, .. } => {\n-                    let rendered = format!(\"{name} {input}\");\n-                    events.push(self.output(OutputChannel::ToolCall, rendered));\n-                }\n-                ContentBlock::ToolResult { .. } | ContentBlock::Other => {}\n-            }\n-        }\n-        events\n+        vec![] /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Tool results arrive echoed back through the user role.\n     fn tool_result_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n         let mut events = Vec::new();\n         for block in &message.message.content {\n             if let ContentBlock::ToolResult {\n                 tool_use_id,\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::assistant_events",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 148
+        },
+        "start": {
+          "column": 5,
+          "line": 130
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:131:9: replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 147
+      },
+      "start": {
+        "column": 9,
         "line": 131
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![Default::default()]\n@@ -123,33 +123,17 @@\n             turn_id: self.turn_id(),\n             channel,\n             text,\n             chunk_index,\n         }\n     }\n \n     fn assistant_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n-        let mut events = Vec::new();\n-        for block in &message.message.content {\n-            match block {\n-                ContentBlock::Text { text } => {\n-                    events.push(self.output(OutputChannel::Assistant, text.clone()));\n-                }\n-                ContentBlock::Thinking { thinking } => {\n-                    events.push(self.output(OutputChannel::Reasoning, thinking.clone()));\n-                }\n-                ContentBlock::ToolUse { name, input, .. } => {\n-                    let rendered = format!(\"{name} {input}\");\n-                    events.push(self.output(OutputChannel::ToolCall, rendered));\n-                }\n-                ContentBlock::ToolResult { .. } | ContentBlock::Other => {}\n-            }\n-        }\n-        events\n+        vec![Default::default()] /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Tool results arrive echoed back through the user role.\n     fn tool_result_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n         let mut events = Vec::new();\n         for block in &message.message.content {\n             if let ContentBlock::ToolResult {\n                 tool_use_id,\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::assistant_events",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 148
+        },
+        "start": {
+          "column": 5,
+          "line": 130
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:131:9: replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![Default::default()]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![Default::default()]",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 147
       },
       "start": {
         "column": 9,
@@ -1248,34 +1248,674 @@
     }
   },
   {
-    "diff": "--- crates/horde-wire/src/usage.rs\n+++ delete match arm (None, None, None, Some(allowed)) in rate_window_from_wire\n@@ -124,17 +124,17 @@\n /// Wire → domain.\n ///\n /// Shapes are checked in the order of how much they say, so a peer that sent\n /// more than one is read at its most informative rather than its least.\n pub fn rate_window_from_wire(wire: &WireRateWindow) -> Result<RateWindow, UnreadableUtilization> {\n     let utilization = match (wire.used_fraction, wire.used, wire.limit, wire.allowed) {\n         (Some(fraction), ..) => Utilization::Fraction(fraction),\n         (None, Some(used), Some(limit), _) => Utilization::Absolute { used, limit },\n-        (None, None, None, Some(allowed)) => Utilization::AllowedOnly { allowed },\n+         /* ~ changed by cargo-mutants ~ */\n         _ => return Err(UnreadableUtilization),\n     };\n \n     Ok(RateWindow {\n         source: source_from_wire(wire.source),\n         // No wire field; see `rate_window_to_wire`.\n         window: String::new(),\n         utilization,\n",
-    "file": "crates/horde-wire/src/usage.rs",
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![]\n@@ -144,33 +144,17 @@\n                 ContentBlock::ToolResult { .. } | ContentBlock::Other => {}\n             }\n         }\n         events\n     }\n \n     /// Tool results arrive echoed back through the user role.\n     fn tool_result_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n-        let mut events = Vec::new();\n-        for block in &message.message.content {\n-            if let ContentBlock::ToolResult {\n-                tool_use_id,\n-                is_error,\n-                content,\n-            } = block\n-            {\n-                events.push(self.output(OutputChannel::ToolResult, render_content(content)));\n-                events.push(AgentEvent::ToolCompleted {\n-                    turn_id: self.turn_id(),\n-                    tool_call_id: ToolCallId::new(tool_use_id.clone()),\n-                    is_error: *is_error,\n-                });\n-            }\n-        }\n-        events\n+        vec![] /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {\n         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but\n         // counts only the requested model, while a turn can bill auxiliary\n         // models too (a `--model sonnet` run billed haiku alongside it). The\n         // former is a running total, which is what the accumulator is for.\n         let cumulative = result\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
     "function": {
-      "function_name": "rate_window_from_wire",
-      "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+      "function_name": "TurnAssembler::tool_result_events",
+      "return_type": "-> Vec<AgentEvent>",
       "span": {
         "end": {
-          "column": 2,
-          "line": 146
+          "column": 6,
+          "line": 169
         },
         "start": {
-          "column": 1,
-          "line": 124
+          "column": 5,
+          "line": 150
         }
       }
     },
-    "genre": "MatchArm",
-    "name": "crates/horde-wire/src/usage.rs:132:9: delete match arm (None, None, None, Some(allowed)) in rate_window_from_wire",
-    "package": "horde-wire",
-    "replacement": "",
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:152:9: replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![]",
     "span": {
       "end": {
-        "column": 83,
-        "line": 132
+        "column": 15,
+        "line": 168
       },
       "start": {
         "column": 9,
-        "line": 132
+        "line": 152
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![Default::default()]\n@@ -144,33 +144,17 @@\n                 ContentBlock::ToolResult { .. } | ContentBlock::Other => {}\n             }\n         }\n         events\n     }\n \n     /// Tool results arrive echoed back through the user role.\n     fn tool_result_events(&mut self, message: &Message) -> Vec<AgentEvent> {\n-        let mut events = Vec::new();\n-        for block in &message.message.content {\n-            if let ContentBlock::ToolResult {\n-                tool_use_id,\n-                is_error,\n-                content,\n-            } = block\n-            {\n-                events.push(self.output(OutputChannel::ToolResult, render_content(content)));\n-                events.push(AgentEvent::ToolCompleted {\n-                    turn_id: self.turn_id(),\n-                    tool_call_id: ToolCallId::new(tool_use_id.clone()),\n-                    is_error: *is_error,\n-                });\n-            }\n-        }\n-        events\n+        vec![Default::default()] /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {\n         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but\n         // counts only the requested model, while a turn can bill auxiliary\n         // models too (a `--model sonnet` run billed haiku alongside it). The\n         // former is a running total, which is what the accumulator is for.\n         let cumulative = result\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::tool_result_events",
+      "return_type": "-> Vec<AgentEvent>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 169
+        },
+        "start": {
+          "column": 5,
+          "line": 150
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:152:9: replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![Default::default()]",
+    "package": "horde-adapter-claude",
+    "replacement": "vec![Default::default()]",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 168
+      },
+      "start": {
+        "column": 9,
+        "line": 152
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace TurnAssembler::end_turn -> AgentEvent with Default::default()\n@@ -168,49 +168,17 @@\n         events\n     }\n \n     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {\n         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but\n         // counts only the requested model, while a turn can bill auxiliary\n         // models too (a `--model sonnet` run billed haiku alongside it). The\n         // former is a running total, which is what the accumulator is for.\n-        let cumulative = result\n-            .model_usage\n-            .values()\n-            .fold(TokenUsage::default(), |total, model| {\n-                total\n-                    + TokenUsage {\n-                        input_tokens: model.input_tokens,\n-                        output_tokens: model.output_tokens,\n-                        cache_read_input_tokens: model.cache_read_input_tokens,\n-                        cache_write_input_tokens: model.cache_creation_input_tokens,\n-                        // Claude Code does not break reasoning out of output.\n-                        reasoning_output_tokens: 0,\n-                    }\n-            });\n-\n-        let usage = self.usage.observe(cumulative, result.total_cost_usd);\n-\n-        AgentEvent::TurnEnded(TurnOutcome {\n-            turn_id: self.turn_id(),\n-            status: turn_status(result),\n-            text: result.result.clone(),\n-            usage,\n-            denials: result\n-                .permission_denials\n-                .iter()\n-                .map(|denial| PermissionDenial {\n-                    tool_call_id: ToolCallId::new(denial.tool_use_id.clone()),\n-                    tool_name: denial.tool_name.clone(),\n-                    attempted_input: denial.tool_input.clone(),\n-                })\n-                .collect(),\n-            duration: Duration::from_millis(result.duration_ms),\n-        })\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// Classifies a result envelope.\n ///\n /// Order matters. An interrupted turn is flagged `is_error` and would otherwise\n /// be reported as a failure, when in fact it is a turn that ended the way Horde\n /// asked it to and left the session usable.\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::end_turn",
+      "return_type": "-> AgentEvent",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 209
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:176:9: replace TurnAssembler::end_turn -> AgentEvent with Default::default()",
+    "package": "horde-adapter-claude",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 208
+      },
+      "start": {
+        "column": 9,
+        "line": 176
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace + with - in TurnAssembler::end_turn\n@@ -173,17 +173,17 @@\n         // counts only the requested model, while a turn can bill auxiliary\n         // models too (a `--model sonnet` run billed haiku alongside it). The\n         // former is a running total, which is what the accumulator is for.\n         let cumulative = result\n             .model_usage\n             .values()\n             .fold(TokenUsage::default(), |total, model| {\n                 total\n-                    + TokenUsage {\n+                    - /* ~ changed by cargo-mutants ~ */ TokenUsage {\n                         input_tokens: model.input_tokens,\n                         output_tokens: model.output_tokens,\n                         cache_read_input_tokens: model.cache_read_input_tokens,\n                         cache_write_input_tokens: model.cache_creation_input_tokens,\n                         // Claude Code does not break reasoning out of output.\n                         reasoning_output_tokens: 0,\n                     }\n             });\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::end_turn",
+      "return_type": "-> AgentEvent",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 209
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/turn.rs:181:21: replace + with - in TurnAssembler::end_turn",
+    "package": "horde-adapter-claude",
+    "replacement": "-",
+    "span": {
+      "end": {
+        "column": 22,
+        "line": 181
+      },
+      "start": {
+        "column": 21,
+        "line": 181
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace + with * in TurnAssembler::end_turn\n@@ -173,17 +173,17 @@\n         // counts only the requested model, while a turn can bill auxiliary\n         // models too (a `--model sonnet` run billed haiku alongside it). The\n         // former is a running total, which is what the accumulator is for.\n         let cumulative = result\n             .model_usage\n             .values()\n             .fold(TokenUsage::default(), |total, model| {\n                 total\n-                    + TokenUsage {\n+                    * /* ~ changed by cargo-mutants ~ */ TokenUsage {\n                         input_tokens: model.input_tokens,\n                         output_tokens: model.output_tokens,\n                         cache_read_input_tokens: model.cache_read_input_tokens,\n                         cache_write_input_tokens: model.cache_creation_input_tokens,\n                         // Claude Code does not break reasoning out of output.\n                         reasoning_output_tokens: 0,\n                     }\n             });\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "TurnAssembler::end_turn",
+      "return_type": "-> AgentEvent",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 209
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/turn.rs:181:21: replace + with * in TurnAssembler::end_turn",
+    "package": "horde-adapter-claude",
+    "replacement": "*",
+    "span": {
+      "end": {
+        "column": 22,
+        "line": 181
+      },
+      "start": {
+        "column": 21,
+        "line": 181
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace turn_status -> TurnStatus with Default::default()\n@@ -210,28 +210,17 @@\n }\n \n /// Classifies a result envelope.\n ///\n /// Order matters. An interrupted turn is flagged `is_error` and would otherwise\n /// be reported as a failure, when in fact it is a turn that ended the way Horde\n /// asked it to and left the session usable.\n fn turn_status(result: &TurnResult) -> TurnStatus {\n-    if result.terminal_reason.as_deref() == Some(\"aborted_streaming\") {\n-        return TurnStatus::Interrupted;\n-    }\n-    if result.succeeded() {\n-        return TurnStatus::Completed;\n-    }\n-    TurnStatus::Failed {\n-        message: result\n-            .result\n-            .clone()\n-            .unwrap_or_else(|| result.subtype.clone()),\n-    }\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Renders a tool result's free-form content for display.\n fn render_content(content: &Value) -> String {\n     match content {\n         Value::Null => String::new(),\n         Value::String(text) => text.clone(),\n         other => other.to_string(),\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "turn_status",
+      "return_type": "-> TurnStatus",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 230
+        },
+        "start": {
+          "column": 1,
+          "line": 212
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:218:5: replace turn_status -> TurnStatus with Default::default()",
+    "package": "horde-adapter-claude",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 229
+      },
+      "start": {
+        "column": 5,
+        "line": 218
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace == with != in turn_status\n@@ -210,17 +210,17 @@\n }\n \n /// Classifies a result envelope.\n ///\n /// Order matters. An interrupted turn is flagged `is_error` and would otherwise\n /// be reported as a failure, when in fact it is a turn that ended the way Horde\n /// asked it to and left the session usable.\n fn turn_status(result: &TurnResult) -> TurnStatus {\n-    if result.terminal_reason.as_deref() == Some(\"aborted_streaming\") {\n+    if result.terminal_reason.as_deref() != /* ~ changed by cargo-mutants ~ */ Some(\"aborted_streaming\") {\n         return TurnStatus::Interrupted;\n     }\n     if result.succeeded() {\n         return TurnStatus::Completed;\n     }\n     TurnStatus::Failed {\n         message: result\n             .result\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "turn_status",
+      "return_type": "-> TurnStatus",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 230
+        },
+        "start": {
+          "column": 1,
+          "line": 212
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/turn.rs:218:42: replace == with != in turn_status",
+    "package": "horde-adapter-claude",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 44,
+        "line": 218
+      },
+      "start": {
+        "column": 42,
+        "line": 218
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace render_content -> String with String::new()\n@@ -226,21 +226,17 @@\n             .result\n             .clone()\n             .unwrap_or_else(|| result.subtype.clone()),\n     }\n }\n \n /// Renders a tool result's free-form content for display.\n fn render_content(content: &Value) -> String {\n-    match content {\n-        Value::Null => String::new(),\n-        Value::String(text) => text.clone(),\n-        other => other.to_string(),\n-    }\n+    String::new() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use horde_adapter::{AgentEvent, OutputChannel, TurnStatus};\n     use serde_json::json;\n \n     use super::TurnAssembler;\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "render_content",
+      "return_type": "-> String",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 239
+        },
+        "start": {
+          "column": 1,
+          "line": 232
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:234:5: replace render_content -> String with String::new()",
+    "package": "horde-adapter-claude",
+    "replacement": "String::new()",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 238
+      },
+      "start": {
+        "column": 5,
+        "line": 234
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/turn.rs\n+++ replace render_content -> String with \"xyzzy\".into()\n@@ -226,21 +226,17 @@\n             .result\n             .clone()\n             .unwrap_or_else(|| result.subtype.clone()),\n     }\n }\n \n /// Renders a tool result's free-form content for display.\n fn render_content(content: &Value) -> String {\n-    match content {\n-        Value::Null => String::new(),\n-        Value::String(text) => text.clone(),\n-        other => other.to_string(),\n-    }\n+    \"xyzzy\".into() /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use horde_adapter::{AgentEvent, OutputChannel, TurnStatus};\n     use serde_json::json;\n \n     use super::TurnAssembler;\n",
+    "file": "crates/horde-adapter-claude/src/turn.rs",
+    "function": {
+      "function_name": "render_content",
+      "return_type": "-> String",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 239
+        },
+        "start": {
+          "column": 1,
+          "line": 232
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/turn.rs:234:5: replace render_content -> String with \"xyzzy\".into()",
+    "package": "horde-adapter-claude",
+    "replacement": "\"xyzzy\".into()",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 238
+      },
+      "start": {
+        "column": 5,
+        "line": 234
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace Envelope::session_id -> Option<&str> with None\n@@ -23,17 +23,17 @@\n     pub raw: Value,\n     pub event: Event,\n }\n \n impl Envelope {\n     /// The harness conversation id carried by nearly every envelope.\n     #[must_use]\n     pub fn session_id(&self) -> Option<&str> {\n-        self.raw.get(\"session_id\").and_then(Value::as_str)\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// The typed view of an envelope.\n ///\n /// [`Event::Result`] is boxed because it is an order of magnitude larger than\n /// every other variant and would otherwise set the size of all of them.\n #[derive(Debug, Clone, PartialEq)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "Envelope::session_id",
+      "return_type": "-> Option<&str>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 32
+        },
+        "start": {
+          "column": 5,
+          "line": 28
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with None",
+    "package": "horde-adapter-claude",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 31
+      },
+      "start": {
+        "column": 9,
+        "line": 31
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace Envelope::session_id -> Option<&str> with Some(\"\")\n@@ -23,17 +23,17 @@\n     pub raw: Value,\n     pub event: Event,\n }\n \n impl Envelope {\n     /// The harness conversation id carried by nearly every envelope.\n     #[must_use]\n     pub fn session_id(&self) -> Option<&str> {\n-        self.raw.get(\"session_id\").and_then(Value::as_str)\n+        Some(\"\") /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// The typed view of an envelope.\n ///\n /// [`Event::Result`] is boxed because it is an order of magnitude larger than\n /// every other variant and would otherwise set the size of all of them.\n #[derive(Debug, Clone, PartialEq)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "Envelope::session_id",
+      "return_type": "-> Option<&str>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 32
+        },
+        "start": {
+          "column": 5,
+          "line": 28
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with Some(\"\")",
+    "package": "horde-adapter-claude",
+    "replacement": "Some(\"\")",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 31
+      },
+      "start": {
+        "column": 9,
+        "line": 31
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace Envelope::session_id -> Option<&str> with Some(\"xyzzy\")\n@@ -23,17 +23,17 @@\n     pub raw: Value,\n     pub event: Event,\n }\n \n impl Envelope {\n     /// The harness conversation id carried by nearly every envelope.\n     #[must_use]\n     pub fn session_id(&self) -> Option<&str> {\n-        self.raw.get(\"session_id\").and_then(Value::as_str)\n+        Some(\"xyzzy\") /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// The typed view of an envelope.\n ///\n /// [`Event::Result`] is boxed because it is an order of magnitude larger than\n /// every other variant and would otherwise set the size of all of them.\n #[derive(Debug, Clone, PartialEq)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "Envelope::session_id",
+      "return_type": "-> Option<&str>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 32
+        },
+        "start": {
+          "column": 5,
+          "line": 28
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with Some(\"xyzzy\")",
+    "package": "horde-adapter-claude",
+    "replacement": "Some(\"xyzzy\")",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 31
+      },
+      "start": {
+        "column": 9,
+        "line": 31
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace TurnResult::succeeded -> bool with true\n@@ -160,17 +160,17 @@\n     #[serde(default)]\n     pub permission_denials: Vec<WireDenial>,\n }\n \n impl TurnResult {\n     /// True only when the turn completed *and* carried no error flag.\n     #[must_use]\n     pub fn succeeded(&self) -> bool {\n-        !self.is_error && self.subtype == \"success\"\n+        true /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::succeeded",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 169
+        },
+        "start": {
+          "column": 5,
+          "line": 165
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:168:9: replace TurnResult::succeeded -> bool with true",
+    "package": "horde-adapter-claude",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 168
+      },
+      "start": {
+        "column": 9,
+        "line": 168
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace TurnResult::succeeded -> bool with false\n@@ -160,17 +160,17 @@\n     #[serde(default)]\n     pub permission_denials: Vec<WireDenial>,\n }\n \n impl TurnResult {\n     /// True only when the turn completed *and* carried no error flag.\n     #[must_use]\n     pub fn succeeded(&self) -> bool {\n-        !self.is_error && self.subtype == \"success\"\n+        false /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::succeeded",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 169
+        },
+        "start": {
+          "column": 5,
+          "line": 165
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:168:9: replace TurnResult::succeeded -> bool with false",
+    "package": "horde-adapter-claude",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 168
+      },
+      "start": {
+        "column": 9,
+        "line": 168
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace && with || in TurnResult::succeeded\n@@ -160,17 +160,17 @@\n     #[serde(default)]\n     pub permission_denials: Vec<WireDenial>,\n }\n \n impl TurnResult {\n     /// True only when the turn completed *and* carried no error flag.\n     #[must_use]\n     pub fn succeeded(&self) -> bool {\n-        !self.is_error && self.subtype == \"success\"\n+        !self.is_error || /* ~ changed by cargo-mutants ~ */ self.subtype == \"success\"\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::succeeded",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 169
+        },
+        "start": {
+          "column": 5,
+          "line": 165
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/wire.rs:168:24: replace && with || in TurnResult::succeeded",
+    "package": "horde-adapter-claude",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 26,
+        "line": 168
+      },
+      "start": {
+        "column": 24,
+        "line": 168
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ delete ! in TurnResult::succeeded\n@@ -160,17 +160,17 @@\n     #[serde(default)]\n     pub permission_denials: Vec<WireDenial>,\n }\n \n impl TurnResult {\n     /// True only when the turn completed *and* carried no error flag.\n     #[must_use]\n     pub fn succeeded(&self) -> bool {\n-        !self.is_error && self.subtype == \"success\"\n+         /* ~ changed by cargo-mutants ~ */self.is_error && self.subtype == \"success\"\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::succeeded",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 169
+        },
+        "start": {
+          "column": 5,
+          "line": 165
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/horde-adapter-claude/src/wire.rs:168:9: delete ! in TurnResult::succeeded",
+    "package": "horde-adapter-claude",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 168
+      },
+      "start": {
+        "column": 9,
+        "line": 168
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace == with != in TurnResult::succeeded\n@@ -160,17 +160,17 @@\n     #[serde(default)]\n     pub permission_denials: Vec<WireDenial>,\n }\n \n impl TurnResult {\n     /// True only when the turn completed *and* carried no error flag.\n     #[must_use]\n     pub fn succeeded(&self) -> bool {\n-        !self.is_error && self.subtype == \"success\"\n+        !self.is_error && self.subtype != /* ~ changed by cargo-mutants ~ */ \"success\"\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::succeeded",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 169
+        },
+        "start": {
+          "column": 5,
+          "line": 165
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/wire.rs:168:40: replace == with != in TurnResult::succeeded",
+    "package": "horde-adapter-claude",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 42,
+        "line": 168
+      },
+      "start": {
+        "column": 40,
+        "line": 168
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace TurnResult::is_unauthenticated -> bool with true\n@@ -169,17 +169,17 @@\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n-        self.is_error && self.terminal_reason.as_deref() == Some(\"api_error\")\n+        true /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]\n pub struct ResultUsage {\n     #[serde(default)]\n     pub input_tokens: u64,\n     #[serde(default)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::is_unauthenticated",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 178
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:177:9: replace TurnResult::is_unauthenticated -> bool with true",
+    "package": "horde-adapter-claude",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 78,
+        "line": 177
+      },
+      "start": {
+        "column": 9,
+        "line": 177
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace TurnResult::is_unauthenticated -> bool with false\n@@ -169,17 +169,17 @@\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n-        self.is_error && self.terminal_reason.as_deref() == Some(\"api_error\")\n+        false /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]\n pub struct ResultUsage {\n     #[serde(default)]\n     pub input_tokens: u64,\n     #[serde(default)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::is_unauthenticated",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 178
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/horde-adapter-claude/src/wire.rs:177:9: replace TurnResult::is_unauthenticated -> bool with false",
+    "package": "horde-adapter-claude",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 78,
+        "line": 177
+      },
+      "start": {
+        "column": 9,
+        "line": 177
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace && with || in TurnResult::is_unauthenticated\n@@ -169,17 +169,17 @@\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n-        self.is_error && self.terminal_reason.as_deref() == Some(\"api_error\")\n+        self.is_error || /* ~ changed by cargo-mutants ~ */ self.terminal_reason.as_deref() == Some(\"api_error\")\n     }\n }\n \n #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]\n pub struct ResultUsage {\n     #[serde(default)]\n     pub input_tokens: u64,\n     #[serde(default)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::is_unauthenticated",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 178
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/wire.rs:177:23: replace && with || in TurnResult::is_unauthenticated",
+    "package": "horde-adapter-claude",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 25,
+        "line": 177
+      },
+      "start": {
+        "column": 23,
+        "line": 177
+      }
+    }
+  },
+  {
+    "diff": "--- crates/horde-adapter-claude/src/wire.rs\n+++ replace == with != in TurnResult::is_unauthenticated\n@@ -169,17 +169,17 @@\n     }\n \n     /// Whether this result reports the session as unauthenticated.\n     ///\n     /// The harness signals this as an ordinary-looking result envelope, so it\n     /// has to be recognized rather than waited for as a spawn failure.\n     #[must_use]\n     pub fn is_unauthenticated(&self) -> bool {\n-        self.is_error && self.terminal_reason.as_deref() == Some(\"api_error\")\n+        self.is_error && self.terminal_reason.as_deref() != /* ~ changed by cargo-mutants ~ */ Some(\"api_error\")\n     }\n }\n \n #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]\n pub struct ResultUsage {\n     #[serde(default)]\n     pub input_tokens: u64,\n     #[serde(default)]\n",
+    "file": "crates/horde-adapter-claude/src/wire.rs",
+    "function": {
+      "function_name": "TurnResult::is_unauthenticated",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 178
+        },
+        "start": {
+          "column": 5,
+          "line": 171
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/horde-adapter-claude/src/wire.rs:177:58: replace == with != in TurnResult::is_unauthenticated",
+    "package": "horde-adapter-claude",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 60,
+        "line": 177
+      },
+      "start": {
+        "column": 58,
+        "line": 177
       }
     }
   }

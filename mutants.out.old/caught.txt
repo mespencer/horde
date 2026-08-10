@@ -1,32 +1,34 @@
-crates/horde-wire/src/capability.rs:106:5: replace advertises_tool_input_rewrite -> bool with true
-crates/horde-wire/src/capability.rs:106:5: replace advertises_tool_input_rewrite -> bool with false
-crates/horde-wire/src/capability.rs:109:38: replace == with != in advertises_tool_input_rewrite
-crates/horde-wire/src/permission.rs:50:9: replace <impl core::fmt::Display for ConversionError>::fmt -> core::fmt::Result with Ok(Default::default())
-crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(0.0)
-crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(1.0)
-crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(-1.0)
-crates/horde-wire/src/permission.rs:76:26: replace != with == in exact_f64
-crates/horde-wire/src/permission.rs:81:26: replace != with == in exact_f64
-crates/horde-wire/src/permission.rs:89:5: replace json_to_wire -> Result<WireValue, ConversionError> with Ok(Default::default())
-crates/horde-wire/src/permission.rs:103:5: replace object_to_struct -> Result<Struct, ConversionError> with Ok(Default::default())
-crates/horde-wire/src/permission.rs:112:5: replace wire_to_json -> JsonValue with Default::default()
-crates/horde-wire/src/capability.rs:35:5: replace capability_to_wire -> Option<AdapterCapability> with Some(Default::default())
-crates/horde-wire/src/permission.rs:137:5: replace number_from_wire -> JsonValue with Default::default()
-crates/horde-wire/src/permission.rs:139:25: replace && with || in number_from_wire
-crates/horde-wire/src/permission.rs:139:18: replace == with != in number_from_wire
-crates/horde-wire/src/capability.rs:75:5: replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(None)
-crates/horde-wire/src/permission.rs:139:36: replace <= with > in number_from_wire
-crates/horde-wire/src/capability.rs:35:5: replace capability_to_wire -> Option<AdapterCapability> with None
-crates/horde-wire/src/permission.rs:147:5: replace struct_to_json -> JsonValue with Default::default()
-crates/horde-wire/src/permission.rs:165:5: replace permission_decision_to_wire -> Result<WirePermissionDecision, ConversionError> with Ok(Default::default())
-crates/horde-wire/src/permission.rs:178:9: delete field outcome from struct WirePermissionDecision expression in permission_decision_to_wire
-crates/horde-wire/src/permission.rs:179:9: delete field reason from struct WirePermissionDecision expression in permission_decision_to_wire
-crates/horde-wire/src/permission.rs:180:9: delete field updated_input from struct WirePermissionDecision expression in permission_decision_to_wire
-crates/horde-wire/src/permission.rs:201:20: delete ! in permission_decision_from_wire
-crates/horde-wire/src/usage.rs:42:5: replace token_usage_to_wire -> WireTokenUsage with Default::default()
-crates/horde-wire/src/usage.rs:54:5: replace token_usage_from_wire -> TokenUsage with Default::default()
-crates/horde-wire/src/usage.rs:64:5: replace source_to_wire -> WireHeadroomSource with Default::default()
-crates/horde-wire/src/usage.rs:94:5: replace rate_window_to_wire -> WireRateWindow with Default::default()
-crates/horde-wire/src/usage.rs:130:9: delete match arm (Some(fraction), ..) in rate_window_from_wire
-crates/horde-wire/src/usage.rs:131:9: delete match arm (None, Some(used), Some(limit), _) in rate_window_from_wire
-crates/horde-wire/src/usage.rs:132:9: delete match arm (None, None, None, Some(allowed)) in rate_window_from_wire
+crates/horde-adapter-claude/src/lib.rs:70:5: replace capabilities -> Capabilities with Default::default()
+crates/horde-adapter-claude/src/codec.rs:64:9: delete match arm "user" in classify
+crates/horde-adapter-claude/src/codec.rs:65:9: delete match arm "result" in classify
+crates/horde-adapter-claude/src/codec.rs:66:9: delete match arm "control_response" in classify
+crates/horde-adapter-claude/src/codec.rs:67:9: delete match arm "rate_limit_event" in classify
+crates/horde-adapter-claude/src/codec.rs:69:9: delete match arm "system" in classify
+crates/horde-adapter-claude/src/codec.rs:63:9: delete match arm "assistant" in classify
+crates/horde-adapter-claude/src/codec.rs:68:9: delete match arm "stream_event" in classify
+crates/horde-adapter-claude/src/codec.rs:104:5: replace encode_user_message -> String with String::new()
+crates/horde-adapter-claude/src/codec.rs:119:5: replace encode_interrupt -> String with String::new()
+crates/horde-adapter-claude/src/codec.rs:104:5: replace encode_user_message -> String with "xyzzy".into()
+crates/horde-adapter-claude/src/codec.rs:119:5: replace encode_interrupt -> String with "xyzzy".into()
+crates/horde-adapter-claude/src/permission.rs:58:5: replace encode_decision -> String with String::new()
+crates/horde-adapter-claude/src/permission.rs:76:5: replace encode_tool_response -> Value with Default::default()
+crates/horde-adapter-claude/src/permission.rs:58:5: replace encode_decision -> String with "xyzzy".into()
+crates/horde-adapter-claude/src/replay.rs:27:9: replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![])
+crates/horde-adapter-claude/src/replay.rs:32:9: replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with None
+crates/horde-adapter-claude/src/turn.rs:23:5: replace channel_index -> usize with 0
+crates/horde-adapter-claude/src/turn.rs:23:5: replace channel_index -> usize with 1
+crates/horde-adapter-claude/src/turn.rs:51:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with None
+crates/horde-adapter-claude/src/turn.rs:59:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-claude/src/turn.rs:87:9: replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-claude/src/turn.rs:87:57: replace != with == in TurnAssembler::begin_turn
+crates/horde-adapter-claude/src/turn.rs:152:9: replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-claude/src/turn.rs:131:9: replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![]
+crates/horde-adapter-claude/src/turn.rs:181:21: replace + with - in TurnAssembler::end_turn
+crates/horde-adapter-claude/src/turn.rs:218:42: replace == with != in turn_status
+crates/horde-adapter-claude/src/turn.rs:234:5: replace render_content -> String with String::new()
+crates/horde-adapter-claude/src/turn.rs:234:5: replace render_content -> String with "xyzzy".into()
+crates/horde-adapter-claude/src/wire.rs:168:9: replace TurnResult::succeeded -> bool with true
+crates/horde-adapter-claude/src/wire.rs:168:24: replace && with || in TurnResult::succeeded
+crates/horde-adapter-claude/src/wire.rs:168:9: replace TurnResult::succeeded -> bool with false
+crates/horde-adapter-claude/src/wire.rs:168:9: delete ! in TurnResult::succeeded
+crates/horde-adapter-claude/src/wire.rs:168:40: replace == with != in TurnResult::succeeded

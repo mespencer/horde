@@ -1,0 +1,21 @@
+--- crates/horde-adapter-claude/src/wire.rs
++++ replace TurnResult::is_unauthenticated -> bool with false
+@@ -169,17 +169,17 @@
+     }
+ 
+     /// Whether this result reports the session as unauthenticated.
+     ///
+     /// The harness signals this as an ordinary-looking result envelope, so it
+     /// has to be recognized rather than waited for as a spawn failure.
+     #[must_use]
+     pub fn is_unauthenticated(&self) -> bool {
+-        self.is_error && self.terminal_reason.as_deref() == Some("api_error")
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+ pub struct ResultUsage {
+     #[serde(default)]
+     pub input_tokens: u64,
+     #[serde(default)]

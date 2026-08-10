@@ -1,0 +1,21 @@
+--- crates/horde-adapter-claude/src/turn.rs
++++ replace == with != in turn_status
+@@ -210,17 +210,17 @@
+ }
+ 
+ /// Classifies a result envelope.
+ ///
+ /// Order matters. An interrupted turn is flagged `is_error` and would otherwise
+ /// be reported as a failure, when in fact it is a turn that ended the way Horde
+ /// asked it to and left the session usable.
+ fn turn_status(result: &TurnResult) -> TurnStatus {
+-    if result.terminal_reason.as_deref() == Some("aborted_streaming") {
++    if result.terminal_reason.as_deref() != /* ~ changed by cargo-mutants ~ */ Some("aborted_streaming") {
+         return TurnStatus::Interrupted;
+     }
+     if result.succeeded() {
+         return TurnStatus::Completed;
+     }
+     TurnStatus::Failed {
+         message: result
+             .result

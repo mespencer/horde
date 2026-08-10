@@ -1,0 +1,24 @@
+--- crates/horde-adapter-claude/src/codec.rs
++++ replace typed -> Result<T, AdapterError> with Ok(Default::default())
+@@ -87,20 +87,17 @@
+ 
+ /// Deserializes a known envelope shape, keeping the raw line in the error so a
+ /// protocol change is diagnosable from the report alone.
+ fn typed<T: serde::de::DeserializeOwned>(
+     raw: &Value,
+     event_type: &str,
+     line: &str,
+ ) -> Result<T, AdapterError> {
+-    serde_json::from_value(raw.clone()).map_err(|source| AdapterError::Protocol {
+-        message: format!("malformed `{event_type}` envelope: {source}"),
+-        raw: line.to_owned(),
+-    })
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Encodes a user message for the harness's stdin.
+ #[must_use]
+ pub fn encode_user_message(text: &str) -> String {
+     json!({
+         "type": "user",
+         "message": { "role": "user", "content": [{ "type": "text", "text": text }] }

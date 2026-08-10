@@ -1,0 +1,29 @@
+--- crates/horde-adapter-claude/src/lib.rs
++++ replace capabilities -> Capabilities with Default::default()
+@@ -62,25 +62,17 @@
+ /// running Claude turn — its only steering-adjacent finding is the control
+ /// message's abort-and-keep-steering, which is `InterruptibleTurn`. Per that
+ /// capability's contract, the absence means the orchestrator queues the message
+ /// to the turn boundary itself, which works here as it does everywhere. Dropped
+ /// when the capability was renamed from `SteerAtTurnBoundary`, whose old name
+ /// this adapter did satisfy.
+ #[must_use]
+ pub fn capabilities() -> Capabilities {
+-    Capabilities::none()
+-        .with(Capability::Resumable)
+-        .with(Capability::InterruptibleTurn)
+-        .with(Capability::PreAuthorizeToolCalls)
+-        .with(Capability::RewritesToolInput)
+-        .with(Capability::ReportsHeadroom)
+-        .with(Capability::SystemPromptOverlay)
+-        .with(Capability::ModelSelection)
+-        .with(Capability::AccountIsolation)
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use horde_adapter::Capability;
+ 
+     use super::{PROVIDER, capabilities};
+ 

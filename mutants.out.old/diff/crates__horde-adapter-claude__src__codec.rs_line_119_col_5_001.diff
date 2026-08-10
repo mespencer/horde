@@ -1,0 +1,26 @@
+--- crates/horde-adapter-claude/src/codec.rs
++++ replace encode_interrupt -> String with "xyzzy".into()
+@@ -111,22 +111,17 @@
+ /// Encodes an interrupt.
+ ///
+ /// This is the only mechanism that aborts a turn while leaving the process
+ /// usable. The spike measured the alternatives: SIGINT aborts the turn but ends
+ /// the process, and closing stdin does not abort at all — it lets the turn run
+ /// to completion and only then exits. Both would silently break steering.
+ #[must_use]
+ pub fn encode_interrupt(request_id: &str) -> String {
+-    json!({
+-        "type": "control_request",
+-        "request_id": request_id,
+-        "request": { "subtype": "interrupt" }
+-    })
+-    .to_string()
++    "xyzzy".into() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::{decode_line, encode_interrupt, encode_user_message};
+     use crate::wire::{ContentBlock, Event};
+ 
+     #[test]

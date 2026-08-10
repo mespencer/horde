@@ -1,0 +1,25 @@
+--- crates/horde-adapter-claude/src/turn.rs
++++ replace render_content -> String with String::new()
+@@ -226,21 +226,17 @@
+             .result
+             .clone()
+             .unwrap_or_else(|| result.subtype.clone()),
+     }
+ }
+ 
+ /// Renders a tool result's free-form content for display.
+ fn render_content(content: &Value) -> String {
+-    match content {
+-        Value::Null => String::new(),
+-        Value::String(text) => text.clone(),
+-        other => other.to_string(),
+-    }
++    String::new() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use horde_adapter::{AgentEvent, OutputChannel, TurnStatus};
+     use serde_json::json;
+ 
+     use super::TurnAssembler;

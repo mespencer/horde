@@ -8,25 +8,25 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 9.774640917,
+          "duration": 4.909704833,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         },
         {
           "phase": "Test",
-          "duration": 0.331364084,
+          "duration": 1.137047291,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -34,107 +34,293 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:23:9: replace <impl core::fmt::Display for UnknownCapability>::fmt -> core::fmt::Result with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
+          "name": "crates/horde-adapter-claude/src/lib.rs:70:5: replace capabilities -> Capabilities with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/lib.rs",
           "function": {
-            "function_name": "<impl core::fmt::Display for UnknownCapability>::fmt",
-            "return_type": "-> core::fmt::Result",
+            "function_name": "capabilities",
+            "return_type": "-> Capabilities",
             "span": {
               "start": {
-                "line": 22,
-                "column": 5
-              },
-              "end": {
-                "line": 24,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 23,
-              "column": 9
-            },
-            "end": {
-              "line": 23,
-              "column": 69
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_23_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_23_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.434910958,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 1.147157,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:75:5: replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(Some(Default::default()))",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
-          "function": {
-            "function_name": "capability_from_wire",
-            "return_type": "-> Result<Option<Capability>, UnknownCapability>",
-            "span": {
-              "start": {
-                "line": 64,
+                "line": 56,
                 "column": 1
               },
               "end": {
-                "line": 91,
+                "line": 79,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 75,
+              "line": 70,
               "column": 5
             },
             "end": {
-              "line": 90,
+              "line": 78,
+              "column": 44
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__lib.rs_line_70_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__lib.rs_line_70_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.902359208,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.736257333,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:64:9: delete match arm \"user\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
+            "span": {
+              "start": {
+                "line": 56,
+                "column": 1
+              },
+              "end": {
+                "line": 72,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 64,
+              "column": 9
+            },
+            "end": {
+              "line": 64,
+              "column": 63
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_64_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_64_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.98266575,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.378908125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:65:9: delete match arm \"result\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
+            "span": {
+              "start": {
+                "line": 56,
+                "column": 1
+              },
+              "end": {
+                "line": 72,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 65,
+              "column": 9
+            },
+            "end": {
+              "line": 65,
+              "column": 77
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_65_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_65_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.283288084,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.600374583,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:37:5: replace decode_line -> Result<Envelope, AdapterError> with Ok(Default::default())",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "decode_line",
+            "return_type": "-> Result<Envelope, AdapterError>",
+            "span": {
+              "start": {
+                "line": 12,
+                "column": 1
+              },
+              "end": {
+                "line": 54,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 37,
+              "column": 5
+            },
+            "end": {
+              "line": 53,
+              "column": 32
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_37_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_37_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.316150125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:62:5: replace classify -> Result<Event, AdapterError> with Ok(Default::default())",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
+            "span": {
+              "start": {
+                "line": 56,
+                "column": 1
+              },
+              "end": {
+                "line": 72,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 62,
+              "column": 5
+            },
+            "end": {
+              "line": 71,
               "column": 7
             }
           },
-          "replacement": "Ok(Some(Default::default()))",
+          "replacement": "Ok(Default::default())",
           "genre": "FnValue"
         }
       },
       "summary": "Unviable",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_75_col_5_001.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_75_col_5_001.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_62_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_62_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.267082375,
+          "duration": 7.005764666,
           "process_status": {
             "Failure": 101
           },
@@ -143,7 +329,7 @@
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -151,259 +337,183 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:106:5: replace advertises_tool_input_rewrite -> bool with true",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:66:9: delete match arm \"control_response\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "advertises_tool_input_rewrite",
-            "return_type": "-> bool",
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
             "span": {
               "start": {
-                "line": 93,
+                "line": 56,
                 "column": 1
               },
               "end": {
-                "line": 110,
+                "line": 72,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 106,
-              "column": 5
-            },
-            "end": {
-              "line": 109,
-              "column": 71
-            }
-          },
-          "replacement": "true",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_106_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_106_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.967409542,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.428376709,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:106:5: replace advertises_tool_input_rewrite -> bool with false",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
-          "function": {
-            "function_name": "advertises_tool_input_rewrite",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 93,
-                "column": 1
-              },
-              "end": {
-                "line": 110,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 106,
-              "column": 5
-            },
-            "end": {
-              "line": 109,
-              "column": 71
-            }
-          },
-          "replacement": "false",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_106_col_5_001.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_106_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.803233583,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.327214708,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:109:38: replace == with != in advertises_tool_input_rewrite",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
-          "function": {
-            "function_name": "advertises_tool_input_rewrite",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 93,
-                "column": 1
-              },
-              "end": {
-                "line": 110,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 109,
-              "column": 38
-            },
-            "end": {
-              "line": 109,
-              "column": 40
-            }
-          },
-          "replacement": "!=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_109_col_38.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_109_col_38.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.863691708,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.327676042,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:50:9: replace <impl core::fmt::Display for ConversionError>::fmt -> core::fmt::Result with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "<impl core::fmt::Display for ConversionError>::fmt",
-            "return_type": "-> core::fmt::Result",
-            "span": {
-              "start": {
-                "line": 49,
-                "column": 5
-              },
-              "end": {
-                "line": 60,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 50,
+              "line": 66,
               "column": 9
             },
             "end": {
-              "line": 59,
-              "column": 10
+              "line": 66,
+              "column": 86
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_66_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_66_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.032657917,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.547641583,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:67:9: delete match arm \"rate_limit_event\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
+            "span": {
+              "start": {
+                "line": 56,
+                "column": 1
+              },
+              "end": {
+                "line": 72,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 67,
+              "column": 9
+            },
+            "end": {
+              "line": 67,
+              "column": 80
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_67_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_67_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.571171375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.321122625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:80:5: replace system_event -> Result<Event, AdapterError> with Ok(Default::default())",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "system_event",
+            "return_type": "-> Result<Event, AdapterError>",
+            "span": {
+              "start": {
+                "line": 74,
+                "column": 1
+              },
+              "end": {
+                "line": 86,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 80,
+              "column": 5
+            },
+            "end": {
+              "line": 85,
+              "column": 7
             }
           },
           "replacement": "Ok(Default::default())",
           "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_50_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_50_col_9.diff",
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_80_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_80_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.19131525,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.389646958,
+          "duration": 0.382590875,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
+            "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -411,305 +521,56 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(0.0)",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:69:9: delete match arm \"system\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
             "span": {
               "start": {
-                "line": 65,
+                "line": 56,
                 "column": 1
               },
               "end": {
-                "line": 86,
+                "line": 72,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 71,
-              "column": 5
-            },
-            "end": {
-              "line": 85,
-              "column": 15
-            }
-          },
-          "replacement": "Ok(0.0)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_71_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_71_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.974463084,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 1.025043541,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(1.0)",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
-            "span": {
-              "start": {
-                "line": 65,
-                "column": 1
-              },
-              "end": {
-                "line": 86,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 71,
-              "column": 5
-            },
-            "end": {
-              "line": 85,
-              "column": 15
-            }
-          },
-          "replacement": "Ok(1.0)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_71_col_5_001.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_71_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.98258,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.453339708,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:71:5: replace exact_f64 -> Result<f64, ConversionError> with Ok(-1.0)",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
-            "span": {
-              "start": {
-                "line": 65,
-                "column": 1
-              },
-              "end": {
-                "line": 86,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 71,
-              "column": 5
-            },
-            "end": {
-              "line": 85,
-              "column": 15
-            }
-          },
-          "replacement": "Ok(-1.0)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_71_col_5_002.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_71_col_5_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.85559,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.420512166,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:76:9: replace && with || in exact_f64",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
-            "span": {
-              "start": {
-                "line": 65,
-                "column": 1
-              },
-              "end": {
-                "line": 86,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 76,
+              "line": 69,
               "column": 9
             },
             "end": {
-              "line": 76,
-              "column": 11
+              "line": 69,
+              "column": 59
             }
           },
-          "replacement": "||",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_76_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_76_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.26571575,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:76:26: replace != with == in exact_f64",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
-            "span": {
-              "start": {
-                "line": 65,
-                "column": 1
-              },
-              "end": {
-                "line": 86,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 76,
-              "column": 26
-            },
-            "end": {
-              "line": 76,
-              "column": 28
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
+          "replacement": "",
+          "genre": "MatchArm"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_76_col_26.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_76_col_26.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_69_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_69_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.96120525,
+          "duration": 1.08778125,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         },
         {
           "phase": "Test",
-          "duration": 0.326320333,
+          "duration": 0.319834791,
           "process_status": {
             "Failure": 101
           },
@@ -717,7 +578,7 @@
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -725,995 +586,31 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:81:9: replace && with || in exact_f64",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:95:5: replace typed -> Result<T, AdapterError> with Ok(Default::default())",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
-            "span": {
-              "start": {
-                "line": 65,
-                "column": 1
-              },
-              "end": {
-                "line": 86,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 81,
-              "column": 9
-            },
-            "end": {
-              "line": 81,
-              "column": 11
-            }
-          },
-          "replacement": "||",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_81_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_81_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.268326916,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:81:26: replace != with == in exact_f64",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "exact_f64",
-            "return_type": "-> Result<f64, ConversionError>",
-            "span": {
-              "start": {
-                "line": 65,
-                "column": 1
-              },
-              "end": {
-                "line": 86,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 81,
-              "column": 26
-            },
-            "end": {
-              "line": 81,
-              "column": 28
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_81_col_26.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_81_col_26.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.922057417,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.376983917,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:89:5: replace json_to_wire -> Result<WireValue, ConversionError> with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "json_to_wire",
-            "return_type": "-> Result<WireValue, ConversionError>",
+            "function_name": "typed",
+            "return_type": "-> Result<T, AdapterError>",
             "span": {
               "start": {
                 "line": 88,
                 "column": 1
               },
               "end": {
-                "line": 100,
+                "line": 99,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 89,
+              "line": 95,
               "column": 5
             },
             "end": {
-              "line": 99,
-              "column": 39
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_89_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_89_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.2909987090000001,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.709137875,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:103:5: replace object_to_struct -> Result<Struct, ConversionError> with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "object_to_struct",
-            "return_type": "-> Result<Struct, ConversionError>",
-            "span": {
-              "start": {
-                "line": 102,
-                "column": 1
-              },
-              "end": {
-                "line": 108,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 103,
-              "column": 5
-            },
-            "end": {
-              "line": 107,
-              "column": 26
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_103_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_103_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.433033459,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.326431292,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:112:5: replace wire_to_json -> JsonValue with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "wire_to_json",
-            "return_type": "-> JsonValue",
-            "span": {
-              "start": {
-                "line": 110,
-                "column": 1
-              },
-              "end": {
-                "line": 122,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 112,
-              "column": 5
-            },
-            "end": {
-              "line": 121,
-              "column": 6
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_112_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_112_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.600785791,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.460777542,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:35:5: replace capability_to_wire -> Option<AdapterCapability> with Some(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
-          "function": {
-            "function_name": "capability_to_wire",
-            "return_type": "-> Option<AdapterCapability>",
-            "span": {
-              "start": {
-                "line": 29,
-                "column": 1
-              },
-              "end": {
-                "line": 62,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 35,
-              "column": 5
-            },
-            "end": {
-              "line": 61,
-              "column": 6
-            }
-          },
-          "replacement": "Some(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_35_col_5_001.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_35_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 18.420647167,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.58592825,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:137:5: replace number_from_wire -> JsonValue with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "number_from_wire",
-            "return_type": "-> JsonValue",
-            "span": {
-              "start": {
-                "line": 124,
-                "column": 1
-              },
-              "end": {
-                "line": 144,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 137,
-              "column": 5
-            },
-            "end": {
-              "line": 143,
-              "column": 67
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_137_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_137_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.431751541,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.320996292,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:139:25: replace && with || in number_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "number_from_wire",
-            "return_type": "-> JsonValue",
-            "span": {
-              "start": {
-                "line": 124,
-                "column": 1
-              },
-              "end": {
-                "line": 144,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 139,
-              "column": 25
-            },
-            "end": {
-              "line": 139,
-              "column": 27
-            }
-          },
-          "replacement": "||",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_139_col_25.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_139_col_25.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.430500041,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.265363916,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:139:18: replace == with != in number_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "number_from_wire",
-            "return_type": "-> JsonValue",
-            "span": {
-              "start": {
-                "line": 124,
-                "column": 1
-              },
-              "end": {
-                "line": 144,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 139,
-              "column": 18
-            },
-            "end": {
-              "line": 139,
-              "column": 20
-            }
-          },
-          "replacement": "!=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_139_col_18.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_139_col_18.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.487975667,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.331014292,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:75:5: replace capability_from_wire -> Result<Option<Capability>, UnknownCapability> with Ok(None)",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
-          "function": {
-            "function_name": "capability_from_wire",
-            "return_type": "-> Result<Option<Capability>, UnknownCapability>",
-            "span": {
-              "start": {
-                "line": 64,
-                "column": 1
-              },
-              "end": {
-                "line": 91,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 75,
-              "column": 5
-            },
-            "end": {
-              "line": 90,
+              "line": 98,
               "column": 7
-            }
-          },
-          "replacement": "Ok(None)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_75_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_75_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 20.039339625,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.488207875,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:139:36: replace <= with > in number_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "number_from_wire",
-            "return_type": "-> JsonValue",
-            "span": {
-              "start": {
-                "line": 124,
-                "column": 1
-              },
-              "end": {
-                "line": 144,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 139,
-              "column": 36
-            },
-            "end": {
-              "line": 139,
-              "column": 38
-            }
-          },
-          "replacement": ">",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_139_col_36.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_139_col_36.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.487129292,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.529516208,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/capability.rs:35:5: replace capability_to_wire -> Option<AdapterCapability> with None",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/capability.rs",
-          "function": {
-            "function_name": "capability_to_wire",
-            "return_type": "-> Option<AdapterCapability>",
-            "span": {
-              "start": {
-                "line": 29,
-                "column": 1
-              },
-              "end": {
-                "line": 62,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 35,
-              "column": 5
-            },
-            "end": {
-              "line": 61,
-              "column": 6
-            }
-          },
-          "replacement": "None",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__capability.rs_line_35_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__capability.rs_line_35_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 20.226197209,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.652323792,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:147:5: replace struct_to_json -> JsonValue with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "struct_to_json",
-            "return_type": "-> JsonValue",
-            "span": {
-              "start": {
-                "line": 146,
-                "column": 1
-              },
-              "end": {
-                "line": 154,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 147,
-              "column": 5
-            },
-            "end": {
-              "line": 153,
-              "column": 6
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_147_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_147_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.441045083,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.271477125,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:165:5: replace permission_decision_to_wire -> Result<WirePermissionDecision, ConversionError> with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "permission_decision_to_wire",
-            "return_type": "-> Result<WirePermissionDecision, ConversionError>",
-            "span": {
-              "start": {
-                "line": 156,
-                "column": 1
-              },
-              "end": {
-                "line": 183,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 165,
-              "column": 5
-            },
-            "end": {
-              "line": 182,
-              "column": 7
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_165_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_165_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.479769834,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.268327875,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:178:9: delete field outcome from struct WirePermissionDecision expression in permission_decision_to_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "permission_decision_to_wire",
-            "return_type": "-> Result<WirePermissionDecision, ConversionError>",
-            "span": {
-              "start": {
-                "line": 156,
-                "column": 1
-              },
-              "end": {
-                "line": 183,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 178,
-              "column": 9
-            },
-            "end": {
-              "line": 178,
-              "column": 33
-            }
-          },
-          "replacement": "",
-          "genre": "StructField"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_178_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_178_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.430896875,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.330033166,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:195:5: replace permission_decision_from_wire -> Result<PermissionDecision, ConversionError> with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
-          "function": {
-            "function_name": "permission_decision_from_wire",
-            "return_type": "-> Result<PermissionDecision, ConversionError>",
-            "span": {
-              "start": {
-                "line": 185,
-                "column": 1
-              },
-              "end": {
-                "line": 211,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 195,
-              "column": 5
-            },
-            "end": {
-              "line": 210,
-              "column": 6
             }
           },
           "replacement": "Ok(Default::default())",
@@ -1721,12 +618,12 @@
         }
       },
       "summary": "Unviable",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_195_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_195_col_5.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_95_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_95_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.381785125,
+          "duration": 0.268805708,
           "process_status": {
             "Failure": 101
           },
@@ -1735,7 +632,7 @@
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -1743,56 +640,56 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:179:9: delete field reason from struct WirePermissionDecision expression in permission_decision_to_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:63:9: delete match arm \"assistant\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "permission_decision_to_wire",
-            "return_type": "-> Result<WirePermissionDecision, ConversionError>",
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
             "span": {
               "start": {
-                "line": 156,
+                "line": 56,
                 "column": 1
               },
               "end": {
-                "line": 183,
+                "line": 72,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 179,
+              "line": 63,
               "column": 9
             },
             "end": {
-              "line": 179,
-              "column": 16
+              "line": 63,
+              "column": 73
             }
           },
           "replacement": "",
-          "genre": "StructField"
+          "genre": "MatchArm"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_179_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_179_col_9.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_63_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_63_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.435470583,
+          "duration": 8.523631917,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         },
         {
           "phase": "Test",
-          "duration": 0.355037375,
+          "duration": 0.489130333,
           "process_status": {
             "Failure": 101
           },
@@ -1800,7 +697,7 @@
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -1808,56 +705,56 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:180:9: delete field updated_input from struct WirePermissionDecision expression in permission_decision_to_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:68:9: delete match arm \"stream_event\" in classify",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "permission_decision_to_wire",
-            "return_type": "-> Result<WirePermissionDecision, ConversionError>",
+            "function_name": "classify",
+            "return_type": "-> Result<Event, AdapterError>",
             "span": {
               "start": {
-                "line": 156,
+                "line": 56,
                 "column": 1
               },
               "end": {
-                "line": 183,
+                "line": 72,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 180,
+              "line": 68,
               "column": 9
             },
             "end": {
-              "line": 180,
-              "column": 23
+              "line": 68,
+              "column": 46
             }
           },
           "replacement": "",
-          "genre": "StructField"
+          "genre": "MatchArm"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_180_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_180_col_9.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_68_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_68_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.647324542,
+          "duration": 1.603410542,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         },
         {
           "phase": "Test",
-          "duration": 0.378800375,
+          "duration": 0.816511792,
           "process_status": {
             "Failure": 101
           },
@@ -1865,7 +762,7 @@
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -1873,121 +770,56 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/permission.rs:201:20: delete ! in permission_decision_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/permission.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:104:5: replace encode_user_message -> String with String::new()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "permission_decision_from_wire",
-            "return_type": "-> Result<PermissionDecision, ConversionError>",
+            "function_name": "encode_user_message",
+            "return_type": "-> String",
             "span": {
               "start": {
-                "line": 185,
+                "line": 101,
                 "column": 1
               },
               "end": {
-                "line": 211,
+                "line": 109,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 201,
-              "column": 20
-            },
-            "end": {
-              "line": 201,
-              "column": 21
-            }
-          },
-          "replacement": "",
-          "genre": "UnaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__permission.rs_line_201_col_20.log",
-      "diff_path": "diff/crates__horde-wire__src__permission.rs_line_201_col_20.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.432253917,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.323971959,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:42:5: replace token_usage_to_wire -> WireTokenUsage with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
-          "function": {
-            "function_name": "token_usage_to_wire",
-            "return_type": "-> WireTokenUsage",
-            "span": {
-              "start": {
-                "line": 39,
-                "column": 1
-              },
-              "end": {
-                "line": 49,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 42,
+              "line": 104,
               "column": 5
             },
             "end": {
-              "line": 48,
-              "column": 6
+              "line": 108,
+              "column": 17
             }
           },
-          "replacement": "Default::default()",
+          "replacement": "String::new()",
           "genre": "FnValue"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_42_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_42_col_5.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_104_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_104_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.524854542,
+          "duration": 1.086569,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         },
         {
           "phase": "Test",
-          "duration": 0.271254375,
+          "duration": 0.316543208,
           "process_status": {
             "Failure": 101
           },
@@ -1995,7 +827,7 @@
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -2003,62 +835,118 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:33:9: replace <impl core::fmt::Display for UnreadableUtilization>::fmt -> core::fmt::Result with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:119:5: replace encode_interrupt -> String with String::new()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "<impl core::fmt::Display for UnreadableUtilization>::fmt",
-            "return_type": "-> core::fmt::Result",
+            "function_name": "encode_interrupt",
+            "return_type": "-> String",
             "span": {
               "start": {
-                "line": 32,
+                "line": 111,
+                "column": 1
+              },
+              "end": {
+                "line": 125,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 119,
+              "column": 5
+            },
+            "end": {
+              "line": 124,
+              "column": 17
+            }
+          },
+          "replacement": "String::new()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_119_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_119_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.914307333,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.489789417,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/permission.rs:44:9: replace PromptRequest::to_proposed_call -> ProposedToolCall with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/permission.rs",
+          "function": {
+            "function_name": "PromptRequest::to_proposed_call",
+            "return_type": "-> ProposedToolCall",
+            "span": {
+              "start": {
+                "line": 41,
                 "column": 5
               },
               "end": {
-                "line": 34,
+                "line": 49,
                 "column": 6
               }
             }
           },
           "span": {
             "start": {
-              "line": 33,
+              "line": 44,
               "column": 9
             },
             "end": {
-              "line": 33,
-              "column": 76
+              "line": 48,
+              "column": 10
             }
           },
-          "replacement": "Ok(Default::default())",
+          "replacement": "Default::default()",
           "genre": "FnValue"
         }
       },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_33_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_33_col_9.diff",
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__permission.rs_line_44_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__permission.rs_line_44_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.586764959,
-          "process_status": "Success",
+          "duration": 0.272244667,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.430007208,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -2066,15 +954,210 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:74:5: replace source_from_wire -> HeadroomSource with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
+          "name": "crates/horde-adapter-claude/src/codec.rs:104:5: replace encode_user_message -> String with \"xyzzy\".into()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
           "function": {
-            "function_name": "source_from_wire",
-            "return_type": "-> HeadroomSource",
+            "function_name": "encode_user_message",
+            "return_type": "-> String",
             "span": {
               "start": {
-                "line": 70,
+                "line": 101,
+                "column": 1
+              },
+              "end": {
+                "line": 109,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 104,
+              "column": 5
+            },
+            "end": {
+              "line": 108,
+              "column": 17
+            }
+          },
+          "replacement": "\"xyzzy\".into()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_104_col_5_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_104_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.086469125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.650283792,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/codec.rs:119:5: replace encode_interrupt -> String with \"xyzzy\".into()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/codec.rs",
+          "function": {
+            "function_name": "encode_interrupt",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 111,
+                "column": 1
+              },
+              "end": {
+                "line": 125,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 119,
+              "column": 5
+            },
+            "end": {
+              "line": 124,
+              "column": 17
+            }
+          },
+          "replacement": "\"xyzzy\".into()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__codec.rs_line_119_col_5_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__codec.rs_line_119_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.754359875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.589563625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/permission.rs:58:5: replace encode_decision -> String with String::new()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/permission.rs",
+          "function": {
+            "function_name": "encode_decision",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 52,
+                "column": 1
+              },
+              "end": {
+                "line": 71,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 58,
+              "column": 5
+            },
+            "end": {
+              "line": 70,
+              "column": 21
+            }
+          },
+          "replacement": "String::new()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__permission.rs_line_58_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__permission.rs_line_58_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.871393875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.326550083,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/permission.rs:76:5: replace encode_tool_response -> Value with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/permission.rs",
+          "function": {
+            "function_name": "encode_tool_response",
+            "return_type": "-> Value",
+            "span": {
+              "start": {
+                "line": 73,
                 "column": 1
               },
               "end": {
@@ -2085,209 +1168,90 @@
           },
           "span": {
             "start": {
-              "line": 74,
+              "line": 76,
               "column": 5
             },
             "end": {
               "line": 79,
-              "column": 6
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_74_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_74_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.32457175,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:54:5: replace token_usage_from_wire -> TokenUsage with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
-          "function": {
-            "function_name": "token_usage_from_wire",
-            "return_type": "-> TokenUsage",
-            "span": {
-              "start": {
-                "line": 51,
-                "column": 1
-              },
-              "end": {
-                "line": 61,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 54,
-              "column": 5
-            },
-            "end": {
-              "line": 60,
-              "column": 6
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_54_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_54_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.427828458,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.327024333,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:64:5: replace source_to_wire -> WireHeadroomSource with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
-          "function": {
-            "function_name": "source_to_wire",
-            "return_type": "-> WireHeadroomSource",
-            "span": {
-              "start": {
-                "line": 63,
-                "column": 1
-              },
-              "end": {
-                "line": 68,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 64,
-              "column": 5
-            },
-            "end": {
-              "line": 67,
-              "column": 6
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_64_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_64_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.484657041,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.264743042,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:129:5: replace rate_window_from_wire -> Result<RateWindow, UnreadableUtilization> with Ok(Default::default())",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
-          "function": {
-            "function_name": "rate_window_from_wire",
-            "return_type": "-> Result<RateWindow, UnreadableUtilization>",
-            "span": {
-              "start": {
-                "line": 124,
-                "column": 1
-              },
-              "end": {
-                "line": 146,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 129,
-              "column": 5
-            },
-            "end": {
-              "line": 145,
               "column": 7
             }
           },
-          "replacement": "Ok(Default::default())",
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__permission.rs_line_76_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__permission.rs_line_76_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.862443084,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.32575375,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/replay.rs:27:9: replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![Default::default()])",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/replay.rs",
+          "function": {
+            "function_name": "<impl LineDecoder for StreamJsonLines>::decode",
+            "return_type": "-> Result<Vec<AgentEvent>>",
+            "span": {
+              "start": {
+                "line": 26,
+                "column": 5
+              },
+              "end": {
+                "line": 29,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 27,
+              "column": 9
+            },
+            "end": {
+              "line": 28,
+              "column": 43
+            }
+          },
+          "replacement": "Ok(vec![Default::default()])",
           "genre": "FnValue"
         }
       },
       "summary": "Unviable",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_129_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_129_col_5.diff",
+      "log_path": "log/crates__horde-adapter-claude__src__replay.rs_line_27_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__replay.rs_line_27_col_9_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.325955375,
+          "duration": 0.281317417,
           "process_status": {
             "Failure": 101
           },
@@ -2296,7 +1260,7 @@
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -2304,64 +1268,237 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:94:5: replace rate_window_to_wire -> WireRateWindow with Default::default()",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
+          "name": "crates/horde-adapter-claude/src/permission.rs:58:5: replace encode_decision -> String with \"xyzzy\".into()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/permission.rs",
           "function": {
-            "function_name": "rate_window_to_wire",
-            "return_type": "-> WireRateWindow",
+            "function_name": "encode_decision",
+            "return_type": "-> String",
             "span": {
               "start": {
-                "line": 82,
+                "line": 52,
                 "column": 1
               },
               "end": {
-                "line": 122,
+                "line": 71,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 94,
+              "line": 58,
               "column": 5
             },
             "end": {
-              "line": 121,
+              "line": 70,
+              "column": 21
+            }
+          },
+          "replacement": "\"xyzzy\".into()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__permission.rs_line_58_col_5_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__permission.rs_line_58_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.981833792,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.475839833,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/replay.rs:27:9: replace <impl LineDecoder for StreamJsonLines>::decode -> Result<Vec<AgentEvent>> with Ok(vec![])",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/replay.rs",
+          "function": {
+            "function_name": "<impl LineDecoder for StreamJsonLines>::decode",
+            "return_type": "-> Result<Vec<AgentEvent>>",
+            "span": {
+              "start": {
+                "line": 26,
+                "column": 5
+              },
+              "end": {
+                "line": 29,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 27,
               "column": 9
+            },
+            "end": {
+              "line": 28,
+              "column": 43
+            }
+          },
+          "replacement": "Ok(vec![])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__replay.rs_line_27_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__replay.rs_line_27_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.993194041,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.416007708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/replay.rs:32:9: replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/replay.rs",
+          "function": {
+            "function_name": "<impl LineDecoder for StreamJsonLines>::provider_session_id",
+            "return_type": "-> Option<ProviderSessionId>",
+            "span": {
+              "start": {
+                "line": 31,
+                "column": 5
+              },
+              "end": {
+                "line": 33,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 32,
+              "column": 9
+            },
+            "end": {
+              "line": 32,
+              "column": 45
+            }
+          },
+          "replacement": "Some(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__replay.rs_line_32_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__replay.rs_line_32_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.323350583,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/replay.rs:38:9: replace <impl LineDecoder for StreamJsonLines>::no_permission_channel -> AdapterError with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/replay.rs",
+          "function": {
+            "function_name": "<impl LineDecoder for StreamJsonLines>::no_permission_channel",
+            "return_type": "-> AdapterError",
+            "span": {
+              "start": {
+                "line": 35,
+                "column": 5
+              },
+              "end": {
+                "line": 41,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 38,
+              "column": 9
+            },
+            "end": {
+              "line": 40,
+              "column": 10
             }
           },
           "replacement": "Default::default()",
           "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_94_col_5.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_94_col_5.diff",
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__replay.rs_line_38_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__replay.rs_line_38_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.428057666,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.326045583,
+          "duration": 0.436882625,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
+            "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -2369,64 +1506,53 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:130:9: delete match arm (Some(fraction), ..) in rate_window_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
+          "name": "crates/horde-adapter-claude/src/replay.rs:50:5: replace replay -> ReplaySession with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/replay.rs",
           "function": {
-            "function_name": "rate_window_from_wire",
-            "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+            "function_name": "replay",
+            "return_type": "-> ReplaySession",
             "span": {
               "start": {
-                "line": 124,
+                "line": 47,
                 "column": 1
               },
               "end": {
-                "line": 146,
+                "line": 51,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 130,
-              "column": 9
+              "line": 50,
+              "column": 5
             },
             "end": {
-              "line": 130,
-              "column": 65
+              "line": 50,
+              "column": 58
             }
           },
-          "replacement": "",
-          "genre": "MatchArm"
+          "replacement": "Default::default()",
+          "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_130_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_130_col_9.diff",
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__replay.rs_line_50_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__replay.rs_line_50_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.482621,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.314622709,
+          "duration": 0.323932042,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
+            "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -2434,20 +1560,745 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:131:9: delete match arm (None, Some(used), Some(limit), _) in rate_window_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
+          "name": "crates/horde-adapter-claude/src/replay.rs:32:9: replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with None",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/replay.rs",
           "function": {
-            "function_name": "rate_window_from_wire",
-            "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+            "function_name": "<impl LineDecoder for StreamJsonLines>::provider_session_id",
+            "return_type": "-> Option<ProviderSessionId>",
             "span": {
               "start": {
-                "line": 124,
+                "line": 31,
+                "column": 5
+              },
+              "end": {
+                "line": 33,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 32,
+              "column": 9
+            },
+            "end": {
+              "line": 32,
+              "column": 45
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__replay.rs_line_32_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__replay.rs_line_32_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.589699041,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.323387708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:51:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with Some(Default::default())",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::provider_session_id",
+            "return_type": "-> Option<ProviderSessionId>",
+            "span": {
+              "start": {
+                "line": 48,
+                "column": 5
+              },
+              "end": {
+                "line": 52,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 51,
+              "column": 9
+            },
+            "end": {
+              "line": 51,
+              "column": 63
+            }
+          },
+          "replacement": "Some(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_51_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_51_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.483984541,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:23:5: replace channel_index -> usize with 0",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "channel_index",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 22,
                 "column": 1
               },
               "end": {
-                "line": 146,
+                "line": 30,
                 "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 23,
+              "column": 5
+            },
+            "end": {
+              "line": 29,
+              "column": 6
+            }
+          },
+          "replacement": "0",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_23_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_23_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.985438042,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.328701791,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:23:5: replace channel_index -> usize with 1",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "channel_index",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 22,
+                "column": 1
+              },
+              "end": {
+                "line": 30,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 23,
+              "column": 5
+            },
+            "end": {
+              "line": 29,
+              "column": 6
+            }
+          },
+          "replacement": "1",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_23_col_5_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_23_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.969017,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.383362416,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:51:9: replace TurnAssembler::provider_session_id -> Option<ProviderSessionId> with None",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::provider_session_id",
+            "return_type": "-> Option<ProviderSessionId>",
+            "span": {
+              "start": {
+                "line": 48,
+                "column": 5
+              },
+              "end": {
+                "line": 52,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 51,
+              "column": 9
+            },
+            "end": {
+              "line": 51,
+              "column": 63
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_51_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_51_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.964864583,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.430973333,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:59:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![Default::default()]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::feed",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 54,
+                "column": 5
+              },
+              "end": {
+                "line": 82,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 59,
+              "column": 9
+            },
+            "end": {
+              "line": 81,
+              "column": 10
+            }
+          },
+          "replacement": "vec![Default::default()]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_59_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_59_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.429286042,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:87:9: replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![Default::default()]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::begin_turn",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 84,
+                "column": 5
+              },
+              "end": {
+                "line": 104,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 87,
+              "column": 9
+            },
+            "end": {
+              "line": 103,
+              "column": 11
+            }
+          },
+          "replacement": "vec![Default::default()]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_87_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_87_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.377004375,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:59:9: replace TurnAssembler::feed -> Vec<AgentEvent> with vec![]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::feed",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 54,
+                "column": 5
+              },
+              "end": {
+                "line": 82,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 59,
+              "column": 9
+            },
+            "end": {
+              "line": 81,
+              "column": 10
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_59_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_59_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.804416625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.32121725,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:119:9: replace TurnAssembler::output -> AgentEvent with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::output",
+            "return_type": "-> AgentEvent",
+            "span": {
+              "start": {
+                "line": 118,
+                "column": 5
+              },
+              "end": {
+                "line": 128,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 119,
+              "column": 9
+            },
+            "end": {
+              "line": 127,
+              "column": 10
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_119_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_119_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.445150209,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:111:9: replace TurnAssembler::turn_id -> TurnId with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::turn_id",
+            "return_type": "-> TurnId",
+            "span": {
+              "start": {
+                "line": 106,
+                "column": 5
+              },
+              "end": {
+                "line": 116,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 111,
+              "column": 9
+            },
+            "end": {
+              "line": 115,
+              "column": 11
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_111_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_111_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.487975875,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:87:9: replace TurnAssembler::begin_turn -> Vec<AgentEvent> with vec![]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::begin_turn",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 84,
+                "column": 5
+              },
+              "end": {
+                "line": 104,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 87,
+              "column": 9
+            },
+            "end": {
+              "line": 103,
+              "column": 11
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_87_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_87_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.74874975,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.316542792,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:87:57: replace != with == in TurnAssembler::begin_turn",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::begin_turn",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 84,
+                "column": 5
+              },
+              "end": {
+                "line": 104,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 87,
+              "column": 57
+            },
+            "end": {
+              "line": 87,
+              "column": 59
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_87_col_57.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_87_col_57.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.754448,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.325744083,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:131:9: replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![Default::default()]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::assistant_events",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 130,
+                "column": 5
+              },
+              "end": {
+                "line": 148,
+                "column": 6
               }
             }
           },
@@ -2457,41 +2308,30 @@
               "column": 9
             },
             "end": {
-              "line": 131,
-              "column": 85
+              "line": 147,
+              "column": 15
             }
           },
-          "replacement": "",
-          "genre": "MatchArm"
+          "replacement": "vec![Default::default()]",
+          "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_131_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_131_col_9.diff",
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_131_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_131_col_9_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.489535291,
-          "process_status": "Success",
-          "argv": [
-            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=horde-wire@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.328274583,
+          "duration": 0.375643292,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
+            "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
@@ -2499,56 +2339,218 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/horde-wire/src/usage.rs:132:9: delete match arm (None, None, None, Some(allowed)) in rate_window_from_wire",
-          "package": "horde-wire",
-          "file": "crates/horde-wire/src/usage.rs",
+          "name": "crates/horde-adapter-claude/src/turn.rs:176:9: replace TurnAssembler::end_turn -> AgentEvent with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
           "function": {
-            "function_name": "rate_window_from_wire",
-            "return_type": "-> Result<RateWindow, UnreadableUtilization>",
+            "function_name": "TurnAssembler::end_turn",
+            "return_type": "-> AgentEvent",
             "span": {
               "start": {
-                "line": 124,
-                "column": 1
+                "line": 171,
+                "column": 5
               },
               "end": {
-                "line": 146,
-                "column": 2
+                "line": 209,
+                "column": 6
               }
             }
           },
           "span": {
             "start": {
-              "line": 132,
+              "line": 176,
               "column": 9
             },
             "end": {
-              "line": 132,
-              "column": 83
+              "line": 208,
+              "column": 11
             }
           },
-          "replacement": "",
-          "genre": "MatchArm"
+          "replacement": "Default::default()",
+          "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__horde-wire__src__usage.rs_line_132_col_9.log",
-      "diff_path": "diff/crates__horde-wire__src__usage.rs_line_132_col_9.diff",
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_176_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_176_col_9.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.484792375,
+          "duration": 0.493941417,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:152:9: replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![Default::default()]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::tool_result_events",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 150,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 152,
+              "column": 9
+            },
+            "end": {
+              "line": 168,
+              "column": 15
+            }
+          },
+          "replacement": "vec![Default::default()]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_152_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_152_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.597185875,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:181:21: replace + with * in TurnAssembler::end_turn",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::end_turn",
+            "return_type": "-> AgentEvent",
+            "span": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 209,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 181,
+              "column": 21
+            },
+            "end": {
+              "line": 181,
+              "column": 22
+            }
+          },
+          "replacement": "*",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_181_col_21_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_181_col_21_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.27055675,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:152:9: replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::tool_result_events",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 150,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 152,
+              "column": 9
+            },
+            "end": {
+              "line": 168,
+              "column": 15
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_152_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_152_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.849964416,
           "process_status": "Success",
           "argv": [
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
           ]
         },
         {
           "phase": "Test",
-          "duration": 0.32389275,
+          "duration": 0.321131792,
           "process_status": {
             "Failure": 101
           },
@@ -2556,19 +2558,1164 @@
             "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
             "test",
             "--verbose",
-            "--package=horde-wire@0.1.0"
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:131:9: replace TurnAssembler::assistant_events -> Vec<AgentEvent> with vec![]",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::assistant_events",
+            "return_type": "-> Vec<AgentEvent>",
+            "span": {
+              "start": {
+                "line": 130,
+                "column": 5
+              },
+              "end": {
+                "line": 148,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 131,
+              "column": 9
+            },
+            "end": {
+              "line": 147,
+              "column": 15
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_131_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_131_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.976574125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.430592209,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:218:5: replace turn_status -> TurnStatus with Default::default()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "turn_status",
+            "return_type": "-> TurnStatus",
+            "span": {
+              "start": {
+                "line": 212,
+                "column": 1
+              },
+              "end": {
+                "line": 230,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 218,
+              "column": 5
+            },
+            "end": {
+              "line": 229,
+              "column": 6
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_218_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_218_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.374897208,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:181:21: replace + with - in TurnAssembler::end_turn",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "TurnAssembler::end_turn",
+            "return_type": "-> AgentEvent",
+            "span": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 209,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 181,
+              "column": 21
+            },
+            "end": {
+              "line": 181,
+              "column": 22
+            }
+          },
+          "replacement": "-",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_181_col_21.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_181_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.638296708,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.275223625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:218:42: replace == with != in turn_status",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "turn_status",
+            "return_type": "-> TurnStatus",
+            "span": {
+              "start": {
+                "line": 212,
+                "column": 1
+              },
+              "end": {
+                "line": 230,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 218,
+              "column": 42
+            },
+            "end": {
+              "line": 218,
+              "column": 44
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_218_col_42.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_218_col_42.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.97443,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.390438416,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:234:5: replace render_content -> String with String::new()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "render_content",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 232,
+                "column": 1
+              },
+              "end": {
+                "line": 239,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 234,
+              "column": 5
+            },
+            "end": {
+              "line": 238,
+              "column": 6
+            }
+          },
+          "replacement": "String::new()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_234_col_5.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_234_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.915448875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.48552525,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/turn.rs:234:5: replace render_content -> String with \"xyzzy\".into()",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/turn.rs",
+          "function": {
+            "function_name": "render_content",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 232,
+                "column": 1
+              },
+              "end": {
+                "line": 239,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 234,
+              "column": 5
+            },
+            "end": {
+              "line": 238,
+              "column": 6
+            }
+          },
+          "replacement": "\"xyzzy\".into()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__turn.rs_line_234_col_5_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__turn.rs_line_234_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.031738583,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.434976041,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:168:9: replace TurnResult::succeeded -> bool with true",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::succeeded",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 9
+            },
+            "end": {
+              "line": 168,
+              "column": 52
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_168_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_168_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.701992833,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.4883995,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with None",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "Envelope::session_id",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 28,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 31,
+              "column": 9
+            },
+            "end": {
+              "line": 31,
+              "column": 59
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_31_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_31_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.86792725,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.8933035,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with Some(\"\")",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "Envelope::session_id",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 28,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 31,
+              "column": 9
+            },
+            "end": {
+              "line": 31,
+              "column": 59
+            }
+          },
+          "replacement": "Some(\"\")",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_31_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_31_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.705457375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.113486584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:168:24: replace && with || in TurnResult::succeeded",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::succeeded",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 24
+            },
+            "end": {
+              "line": 168,
+              "column": 26
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_168_col_24.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_168_col_24.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.598104125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.48830975,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:168:9: replace TurnResult::succeeded -> bool with false",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::succeeded",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 9
+            },
+            "end": {
+              "line": 168,
+              "column": 52
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_168_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_168_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.588283167,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.082020083,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with Some(\"xyzzy\")",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "Envelope::session_id",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 28,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 31,
+              "column": 9
+            },
+            "end": {
+              "line": 31,
+              "column": 59
+            }
+          },
+          "replacement": "Some(\"xyzzy\")",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_31_col_9_002.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_31_col_9_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.788220541,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.4180105,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:168:9: delete ! in TurnResult::succeeded",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::succeeded",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 9
+            },
+            "end": {
+              "line": 168,
+              "column": 10
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_168_col_9_002.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_168_col_9_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.6981825,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.370101334,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:168:40: replace == with != in TurnResult::succeeded",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::succeeded",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 40
+            },
+            "end": {
+              "line": 168,
+              "column": 42
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_168_col_40.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_168_col_40.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.75900025,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.542637459,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:177:9: replace TurnResult::is_unauthenticated -> bool with true",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::is_unauthenticated",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 178,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 177,
+              "column": 9
+            },
+            "end": {
+              "line": 177,
+              "column": 78
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_177_col_9.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_177_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.90453325,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.208900459,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:177:9: replace TurnResult::is_unauthenticated -> bool with false",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::is_unauthenticated",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 178,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 177,
+              "column": 9
+            },
+            "end": {
+              "line": 177,
+              "column": 78
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_177_col_9_001.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_177_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.821726625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.695346958,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:177:23: replace && with || in TurnResult::is_unauthenticated",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::is_unauthenticated",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 178,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 177,
+              "column": 23
+            },
+            "end": {
+              "line": 177,
+              "column": 25
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_177_col_23.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_177_col_23.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.692091084,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.469751666,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/horde-adapter-claude/src/wire.rs:177:58: replace == with != in TurnResult::is_unauthenticated",
+          "package": "horde-adapter-claude",
+          "file": "crates/horde-adapter-claude/src/wire.rs",
+          "function": {
+            "function_name": "TurnResult::is_unauthenticated",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 178,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 177,
+              "column": 58
+            },
+            "end": {
+              "line": 177,
+              "column": 60
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__horde-adapter-claude__src__wire.rs_line_177_col_58.log",
+      "diff_path": "diff/crates__horde-adapter-claude__src__wire.rs_line_177_col_58.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.596701834,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.3030667080000002,
+          "process_status": "Success",
+          "argv": [
+            "/Users/myles/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=horde-adapter-claude@0.1.0"
           ]
         }
       ]
     }
   ],
-  "total_mutants": 40,
-  "missed": 2,
-  "caught": 32,
+  "total_mutants": 60,
+  "missed": 7,
+  "caught": 34,
   "timeout": 0,
-  "unviable": 6,
+  "unviable": 19,
   "success": 0,
-  "start_time": "2026-08-10T03:00:22.339615Z",
-  "end_time": "2026-08-10T03:00:56.922614Z",
+  "start_time": "2026-08-10T03:01:56.941764Z",
+  "end_time": "2026-08-10T03:02:28.342865Z",
   "cargo_mutants_version": "27.1.0"
 }

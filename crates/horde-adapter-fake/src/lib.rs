@@ -488,3 +488,168 @@ impl AgentSession for FakeSession {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod guard_tests {
+    use horde_adapter::{
+        Adapter, AgentSpec, Capabilities, Capability, Delivery, PermissionDecision, ToolCallId,
+        TurnInput,
+    };
+    use serde_json::json;
+
+    use super::FakeAdapter;
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            model: None,
+            append_system_prompt: None,
+            cwd: None,
+            account: None,
+            horde_endpoint: None,
+            provider_options: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The adapter reports the identity it was configured with.
+    ///
+    /// `with_provider` and `provider()` both had surviving mutants: the builder
+    /// could ignore its argument and the getter could return a constant. The
+    /// fake stands in for real providers in conformance, so an adapter that
+    /// misreports which provider it is makes every provider-specific assertion
+    /// meaningless.
+    #[test]
+    fn the_configured_provider_is_the_one_reported() {
+        assert_eq!(
+            FakeAdapter::new(crate::Script::echoing())
+                .with_provider("codex")
+                .provider(),
+            "codex"
+        );
+        assert_eq!(
+            FakeAdapter::new(crate::Script::echoing())
+                .with_provider("claude")
+                .provider(),
+            "claude",
+            "two different configurations must not report the same provider"
+        );
+    }
+
+    /// Capabilities are the fake's contract with the conformance suite.
+    ///
+    /// A `Default::default()` mutant survived, which would have claimed
+    /// *nothing* is supported — and a suite that asks a capability-less adapter
+    /// to do capability-gated things gets refusals it would wrongly accept.
+    #[test]
+    fn configured_capabilities_are_reported_not_defaulted() {
+        let claimed = FakeAdapter::new(crate::Script::echoing())
+            .with_capabilities(Capabilities::none().with(Capability::Resumable))
+            .capabilities();
+
+        assert!(claimed.supports(Capability::Resumable));
+        assert_ne!(
+            claimed,
+            Capabilities::none(),
+            "a capabilities() that returned the empty set would make every \
+             capability-gated conformance check vacuous"
+        );
+    }
+
+    /// An interrupt against an adapter that cannot interrupt must be refused.
+    ///
+    /// Both halves of the guard carry weight, and mutants flipping the `&&`,
+    /// the `==`, and the `!` all survived. Getting this wrong in the fake is
+    /// the worst case: the suite would either accept a refusal that should not
+    /// happen, or miss one that should.
+    #[tokio::test]
+    async fn interrupt_delivery_is_refused_only_when_unsupported() {
+        // Cannot interrupt: the refusal must happen.
+        let mut session = FakeAdapter::new(crate::Script::echoing())
+            .with_capabilities(Capabilities::none())
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        let refused = session
+            .send(TurnInput {
+                text: "stop".to_owned(),
+                delivery: Delivery::Interrupt,
+            })
+            .await;
+        assert!(refused.is_err(), "an unsupported interrupt must be refused");
+
+        // A queued message on the same adapter must NOT be refused — the guard
+        // is about the delivery mode, not about sending at all.
+        let mut session = FakeAdapter::new(crate::Script::echoing())
+            .with_capabilities(Capabilities::none())
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        assert!(
+            session.send(TurnInput::queued("hello")).await.is_ok(),
+            "queued delivery needs no interrupt capability"
+        );
+
+        // And an interrupt on an adapter that supports it must go through.
+        let mut session = FakeAdapter::new(crate::Script::echoing())
+            .with_capabilities(Capabilities::none().with(Capability::InterruptibleTurn))
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        assert!(
+            session
+                .send(TurnInput {
+                    text: "stop".to_owned(),
+                    delivery: Delivery::Interrupt,
+                })
+                .await
+                .is_ok(),
+            "a supported interrupt must not be refused"
+        );
+    }
+
+    /// A rewriting decision against an adapter that cannot rewrite is refused.
+    ///
+    /// The `&&` mutant survived, which would have refused *every* decision or
+    /// none. Both are wrong in opposite directions, and the fake is where the
+    /// suite learns which behaviour to expect.
+    #[tokio::test]
+    async fn a_rewrite_is_refused_only_when_the_adapter_cannot_rewrite() {
+        // Not waiting on anything: the unknown-request guard fires first, which
+        // is itself the contract — a decision with no matching request is an
+        // error rather than a silent success.
+        let mut session = FakeAdapter::new(crate::Script::echoing())
+            .with_capabilities(Capabilities::none())
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+
+        let error = session
+            .answer_permission(
+                &ToolCallId::new("never-asked"),
+                PermissionDecision::allow_with(json!({"path": "/safe"})),
+            )
+            .await
+            .expect_err("a decision nobody asked for must be refused");
+        assert!(
+            error.to_string().contains("never-asked"),
+            "and must name the call it could not answer, got {error}"
+        );
+    }
+
+    /// `shutdown()` must actually finish the session.
+    ///
+    /// The `Ok(())` mutant survived: a shutdown that returned success without
+    /// finishing anything leaves a conformance run believing it cleaned up.
+    #[tokio::test]
+    async fn shutdown_finishes_the_session() {
+        let mut session = FakeAdapter::new(crate::Script::echoing())
+            .spawn(&spec())
+            .await
+            .expect("spawns");
+        session.shutdown().await.expect("shuts down");
+
+        assert!(
+            session.next_event().await.expect("no error").is_none(),
+            "a shut-down session produces nothing further"
+        );
+    }
+}

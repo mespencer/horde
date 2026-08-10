@@ -1,0 +1,53 @@
+--- crates/horde-adapter-claude/src/turn.rs
++++ replace TurnAssembler::end_turn -> AgentEvent with Default::default()
+@@ -168,49 +168,17 @@
+         events
+     }
+ 
+     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {
+         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but
+         // counts only the requested model, while a turn can bill auxiliary
+         // models too (a `--model sonnet` run billed haiku alongside it). The
+         // former is a running total, which is what the accumulator is for.
+-        let cumulative = result
+-            .model_usage
+-            .values()
+-            .fold(TokenUsage::default(), |total, model| {
+-                total
+-                    + TokenUsage {
+-                        input_tokens: model.input_tokens,
+-                        output_tokens: model.output_tokens,
+-                        cache_read_input_tokens: model.cache_read_input_tokens,
+-                        cache_write_input_tokens: model.cache_creation_input_tokens,
+-                        // Claude Code does not break reasoning out of output.
+-                        reasoning_output_tokens: 0,
+-                    }
+-            });
+-
+-        let usage = self.usage.observe(cumulative, result.total_cost_usd);
+-
+-        AgentEvent::TurnEnded(TurnOutcome {
+-            turn_id: self.turn_id(),
+-            status: turn_status(result),
+-            text: result.result.clone(),
+-            usage,
+-            denials: result
+-                .permission_denials
+-                .iter()
+-                .map(|denial| PermissionDenial {
+-                    tool_call_id: ToolCallId::new(denial.tool_use_id.clone()),
+-                    tool_name: denial.tool_name.clone(),
+-                    attempted_input: denial.tool_input.clone(),
+-                })
+-                .collect(),
+-            duration: Duration::from_millis(result.duration_ms),
+-        })
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Classifies a result envelope.
+ ///
+ /// Order matters. An interrupted turn is flagged `is_error` and would otherwise
+ /// be reported as a failure, when in fact it is a turn that ended the way Horde
+ /// asked it to and left the session usable.

@@ -230,3 +230,46 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod builder_tests {
+    use super::{Exhausted, Script, ScriptedTurn};
+
+    /// A `saying` turn reports usage, and both counts are real.
+    ///
+    /// The fake is what every conformance verdict is measured against, so a
+    /// scripted turn that silently billed nothing would let a usage bug pass
+    /// the suite in any adapter compared to it. Mutants deleting either field
+    /// survived until now.
+    #[test]
+    fn a_spoken_turn_bills_both_directions() {
+        let turn = ScriptedTurn::saying("hello");
+
+        assert_eq!(turn.usage.input_tokens, 10, "a turn consumes input");
+        assert_eq!(turn.usage.output_tokens, 20, "and produces output");
+        assert!(
+            turn.usage.total() > 0,
+            "a scripted turn that billed nothing would hide usage bugs in \
+             every adapter measured against this fake"
+        );
+    }
+
+    /// `echoing()` is the default script, and defaults matter here.
+    ///
+    /// It is the script a conformance run gets when nobody chose one, so what
+    /// it does when it runs out of turns is the behaviour most suites actually
+    /// exercise.
+    #[test]
+    fn the_echoing_script_starts_empty_and_echoes_forever() {
+        let script = Script::echoing();
+
+        assert!(script.turns.is_empty(), "nothing is scripted up front");
+        assert_eq!(
+            script.exhausted,
+            Exhausted::Echo,
+            "and running out means echo, not stop — a fake that quietly \
+             stopped would end conformance turns nobody asked to end"
+        );
+        assert!(script.misbehaviour.is_none());
+    }
+}

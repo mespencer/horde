@@ -1,0 +1,26 @@
+--- crates/horde-adapter-claude/src/codec.rs
++++ replace system_event -> Result<Event, AdapterError> with Ok(Default::default())
+@@ -72,22 +72,17 @@
+ }
+ 
+ /// Splits a `system` envelope on its subtype.
+ ///
+ /// `init` is the one that carries session identity and model; the others are
+ /// kept as their subtype so a report can say which arrived without this crate
+ /// having to model each one.
+ fn system_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, AdapterError> {
+-    Ok(match raw.get("subtype").and_then(Value::as_str) {
+-        Some("init") => Event::Init(Box::new(typed(raw, event_type, line)?)),
+-        other => Event::System {
+-            subtype: other.unwrap_or_default().to_owned(),
+-        },
+-    })
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Deserializes a known envelope shape, keeping the raw line in the error so a
+ /// protocol change is diagnosable from the report alone.
+ fn typed<T: serde::de::DeserializeOwned>(
+     raw: &Value,
+     event_type: &str,
+     line: &str,

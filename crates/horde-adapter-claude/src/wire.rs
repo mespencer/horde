@@ -250,7 +250,7 @@ pub struct RateLimitInfo {
 mod tests {
     use serde_json::json;
 
-    use super::{Envelope, TurnResult};
+    use super::TurnResult;
 
     /// The conversation id is read from wherever the harness put it.
     ///

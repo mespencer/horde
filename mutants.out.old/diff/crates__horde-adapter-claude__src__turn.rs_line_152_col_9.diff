@@ -1,0 +1,37 @@
+--- crates/horde-adapter-claude/src/turn.rs
++++ replace TurnAssembler::tool_result_events -> Vec<AgentEvent> with vec![]
+@@ -144,33 +144,17 @@
+                 ContentBlock::ToolResult { .. } | ContentBlock::Other => {}
+             }
+         }
+         events
+     }
+ 
+     /// Tool results arrive echoed back through the user role.
+     fn tool_result_events(&mut self, message: &Message) -> Vec<AgentEvent> {
+-        let mut events = Vec::new();
+-        for block in &message.message.content {
+-            if let ContentBlock::ToolResult {
+-                tool_use_id,
+-                is_error,
+-                content,
+-            } = block
+-            {
+-                events.push(self.output(OutputChannel::ToolResult, render_content(content)));
+-                events.push(AgentEvent::ToolCompleted {
+-                    turn_id: self.turn_id(),
+-                    tool_call_id: ToolCallId::new(tool_use_id.clone()),
+-                    is_error: *is_error,
+-                });
+-            }
+-        }
+-        events
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {
+         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but
+         // counts only the requested model, while a turn can bill auxiliary
+         // models too (a `--model sonnet` run billed haiku alongside it). The
+         // former is a running total, which is what the accumulator is for.
+         let cumulative = result

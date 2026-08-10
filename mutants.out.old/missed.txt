@@ -1,2 +1,7 @@
-crates/horde-wire/src/capability.rs:23:9: replace <impl core::fmt::Display for UnknownCapability>::fmt -> core::fmt::Result with Ok(Default::default())
-crates/horde-wire/src/usage.rs:33:9: replace <impl core::fmt::Display for UnreadableUtilization>::fmt -> core::fmt::Result with Ok(Default::default())
+crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with None
+crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with Some("")
+crates/horde-adapter-claude/src/wire.rs:31:9: replace Envelope::session_id -> Option<&str> with Some("xyzzy")
+crates/horde-adapter-claude/src/wire.rs:177:9: replace TurnResult::is_unauthenticated -> bool with true
+crates/horde-adapter-claude/src/wire.rs:177:9: replace TurnResult::is_unauthenticated -> bool with false
+crates/horde-adapter-claude/src/wire.rs:177:23: replace && with || in TurnResult::is_unauthenticated
+crates/horde-adapter-claude/src/wire.rs:177:58: replace == with != in TurnResult::is_unauthenticated

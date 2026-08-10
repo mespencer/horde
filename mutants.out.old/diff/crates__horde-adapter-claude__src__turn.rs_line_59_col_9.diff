@@ -1,0 +1,43 @@
+--- crates/horde-adapter-claude/src/turn.rs
++++ replace TurnAssembler::feed -> Vec<AgentEvent> with vec![]
+@@ -51,39 +51,17 @@
+         self.session_id.as_deref().map(ProviderSessionId::new)
+     }
+ 
+     /// Feeds one envelope, returning the domain events it produced.
+     ///
+     /// Most envelopes produce none: thinking-token tallies, hook lifecycle, and
+     /// partial-message deltas carry nothing the assembled messages do not.
+     pub fn feed(&mut self, envelope: &Envelope) -> Vec<AgentEvent> {
+-        match &envelope.event {
+-            Event::Init(init) => self.begin_turn(&init.session_id, &init.model),
+-            Event::Assistant(message) => self.assistant_events(message),
+-            Event::User(message) => self.tool_result_events(message),
+-            Event::Result(result) => vec![self.end_turn(result)],
+-            Event::RateLimit(rate_limit) => vec![AgentEvent::HeadroomReported {
+-                window: RateWindow {
+-                    source: HeadroomSource::ProviderReported,
+-                    window: rate_limit.rate_limit_info.rate_limit_type.clone(),
+-                    // Claude Code reports only whether it is still serving, with
+-                    // no counts or percentage to derive headroom from.
+-                    utilization: Utilization::AllowedOnly {
+-                        allowed: rate_limit.rate_limit_info.status == "allowed",
+-                    },
+-                    window_duration: None,
+-                    resets_at_unix: rate_limit.rate_limit_info.resets_at,
+-                },
+-            }],
+-            Event::ControlResponse(_)
+-            | Event::StreamEvent
+-            | Event::System { .. }
+-            | Event::Unknown { .. } => Vec::new(),
+-        }
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// `system`/`init` opens each turn — it is a turn header, not a process
+     /// handshake, and arrives once per user message.
+     fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {
+         let is_new_session = self.session_id.as_deref() != Some(session_id);
+         if is_new_session {
+             self.session_id = Some(session_id.to_owned());

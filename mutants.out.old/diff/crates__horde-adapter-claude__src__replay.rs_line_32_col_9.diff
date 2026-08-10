@@ -1,0 +1,21 @@
+--- crates/horde-adapter-claude/src/replay.rs
++++ replace <impl LineDecoder for StreamJsonLines>::provider_session_id -> Option<ProviderSessionId> with None
+@@ -24,17 +24,17 @@
+ 
+ impl LineDecoder for StreamJsonLines {
+     fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {
+         let envelope = decode_line(line)?;
+         Ok(self.assembler.feed(&envelope))
+     }
+ 
+     fn provider_session_id(&self) -> Option<ProviderSessionId> {
+-        self.assembler.provider_session_id()
++        None /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {
+         // Permission prompts reach a live session over the MCP endpoint, not
+         // over stdout, so a recording of stdout has nothing to answer.
+         AdapterError::UnknownPermissionRequest {
+             tool_call_id: tool_call_id.clone(),
+         }

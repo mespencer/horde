@@ -1,0 +1,21 @@
+--- crates/horde-adapter-claude/src/codec.rs
++++ delete match arm "rate_limit_event" in classify
+@@ -59,17 +59,17 @@
+ /// are separately legible: everything above is about the bytes, everything here
+ /// is about the protocol.
+ fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {
+     Ok(match event_type.as_str() {
+         "assistant" => Event::Assistant(typed(raw, &event_type, line)?),
+         "user" => Event::User(typed(raw, &event_type, line)?),
+         "result" => Event::Result(Box::new(typed(raw, &event_type, line)?)),
+         "control_response" => Event::ControlResponse(typed(raw, &event_type, line)?),
+-        "rate_limit_event" => Event::RateLimit(typed(raw, &event_type, line)?),
++         /* ~ changed by cargo-mutants ~ */
+         "stream_event" => Event::StreamEvent,
+         "system" => system_event(raw, &event_type, line)?,
+         _ => Event::Unknown { event_type },
+     })
+ }
+ 
+ /// Splits a `system` envelope on its subtype.
+ ///

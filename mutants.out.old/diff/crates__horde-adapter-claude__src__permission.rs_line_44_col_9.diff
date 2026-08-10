@@ -1,0 +1,25 @@
+--- crates/horde-adapter-claude/src/permission.rs
++++ replace PromptRequest::to_proposed_call -> ProposedToolCall with Default::default()
+@@ -36,21 +36,17 @@
+     #[serde(default)]
+     pub tool_use_id: String,
+ }
+ 
+ impl PromptRequest {
+     /// Lifts the harness's request into the provider-neutral domain type.
+     #[must_use]
+     pub fn to_proposed_call(&self) -> ProposedToolCall {
+-        ProposedToolCall {
+-            tool_call_id: ToolCallId::new(self.tool_use_id.clone()),
+-            tool_name: self.tool_name.clone(),
+-            input: self.input.clone(),
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Renders a decision as the JSON string the harness expects.
+ ///
+ /// The harness wants this *stringified inside a text content block*, not as a
+ /// nested object; [`encode_tool_response`] wraps it accordingly.
+ #[must_use]
