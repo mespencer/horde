@@ -244,7 +244,11 @@ fn is_exclusion_key(line: &str) -> bool {
 fn toml_strings(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut rest = text;
-    while let Some((quote, open)) = next_quote(rest) {
+    // `find` over a character set already means "whichever quote comes first".
+    while let Some(open) = rest.find(['"', '\'']) {
+        let Some(quote) = rest.get(open..).and_then(|tail| tail.chars().next()) else {
+            break;
+        };
         let Some(after) = rest.get(open + 1..) else {
             break;
         };
@@ -261,17 +265,6 @@ fn toml_strings(text: &str) -> Vec<String> {
         rest = after.get(close + 1..).unwrap_or("");
     }
     found
-}
-
-fn next_quote(text: &str) -> Option<(char, usize)> {
-    let basic = text.find('"');
-    let literal = text.find('\'');
-    match (basic, literal) {
-        (Some(basic), Some(literal)) if literal < basic => Some(('\'', literal)),
-        (Some(basic), _) => Some(('"', basic)),
-        (None, Some(literal)) => Some(('\'', literal)),
-        (None, None) => None,
-    }
 }
 
 /// The literal path an exclusion names.
@@ -470,6 +463,40 @@ mod tests {
     }
 
     #[test]
+    fn a_table_header_before_the_key_is_not_mistaken_for_it() {
+        // The first `[` in the file belongs to a table header, not to the
+        // array, so finding the key by name has to actually find the key.
+        let config = "[mutants]\nminimum_test_timeout = 60\nexclude_re = ['a']\n";
+        assert_eq!(configured_exclusions(config), Ok(vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn a_key_that_merely_starts_with_the_name_is_not_the_key() {
+        let config = "exclude_reasoning = 'because'\nexclude_re = ['a']\n";
+        assert_eq!(configured_exclusions(config), Ok(vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn quoting_styles_may_be_mixed_in_either_order() {
+        assert_eq!(
+            configured_exclusions("exclude_re = [\"a\", 'b']\n"),
+            Ok(vec!["a".to_owned(), "b".to_owned()])
+        );
+        assert_eq!(
+            configured_exclusions("exclude_re = ['a', \"b\"]\n"),
+            Ok(vec!["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_quote_inside_the_other_quoting_style_is_content_not_a_delimiter() {
+        assert_eq!(
+            configured_exclusions("exclude_re = ['it\"s']\n"),
+            Ok(vec!["it\"s".to_owned()])
+        );
+    }
+
+    #[test]
     fn a_regex_reads_the_same_in_either_toml_quoting_style() {
         // A literal string is the idiom for a regex; a basic string has to
         // double the backslash. Both must reach cargo-mutants as `\\.`.
@@ -525,6 +552,103 @@ mod tests {
         let message = verify_exclusions(&patterns, &listed, |_| true)
             .expect_err("cargo-mutants still lists what the exclusion claims to remove");
         assert!(message.contains("did not take"), "{message}");
+    }
+
+    /// A workspace root whose `.cargo/mutants.toml` says `config`.
+    fn root_configured(config: &str) -> (tempfile::TempDir, GateContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join(".cargo")).expect("cargo dir");
+        std::fs::write(dir.path().join(CONFIG), config).expect("config");
+        let ctx = ctx_at(dir.path());
+        (dir, ctx)
+    }
+
+    #[test]
+    fn no_exclusions_means_no_listing_run_at_all() {
+        let (_dir, ctx) = root_configured("minimum_test_timeout = 60\n");
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            failed(128, "fatal: no main"),
+            exited(0, CLEAN),
+        ]);
+        assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
+        assert!(
+            !runner
+                .command_lines()
+                .iter()
+                .any(|line| line.contains("--list")),
+            "checking nothing must cost nothing: {:?}",
+            runner.command_lines()
+        );
+    }
+
+    #[test]
+    fn an_absent_config_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            failed(128, "fatal: no main"),
+            exited(0, CLEAN),
+        ]);
+        assert_eq!(
+            run_gate(&gate(), &ctx_at(dir.path()), &runner).label(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn a_live_exclusion_that_took_lets_the_run_proceed() {
+        let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            exited(0, "crates/other/src/lib.rs:1:1: replace f with ()"),
+            failed(128, "fatal: no main"),
+            exited(0, CLEAN),
+        ]);
+        assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
+        assert!(
+            runner.command_lines()[1].contains("--list"),
+            "{:?}",
+            runner.command_lines()
+        );
+    }
+
+    #[test]
+    fn an_exclusion_naming_nothing_stops_the_gate_before_it_mutates() {
+        let (_dir, ctx) = root_configured("exclude_re = ['crates/gone/src/bin/stub\\.rs']\n");
+        let runner = ScriptedRunner::new(vec![version(), exited(0, "")]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("an exclusion that names nothing misstates the measured scope");
+        };
+        assert!(reason.contains("not in the tree"), "{reason}");
+        assert_eq!(
+            runner.calls().len(),
+            2,
+            "no mutation run should start on an unverifiable configuration"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_that_did_not_take_stops_the_gate() {
+        let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            exited(0, ".cargo/mutants.toml:1:1: replace thing with ()"),
+        ]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("cargo-mutants still lists what the exclusion claims to remove");
+        };
+        assert!(reason.contains("did not take"), "{reason}");
+    }
+
+    #[test]
+    fn a_listing_that_fails_is_an_instrument_error() {
+        let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
+        let runner = ScriptedRunner::new(vec![version(), failed(1, "error: bad config")]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("exclusions that could not be checked were not checked");
+        };
+        assert!(reason.contains("bad config"), "{reason}");
     }
 
     #[test]
