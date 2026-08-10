@@ -783,3 +783,53 @@ fn uuid_like() -> String {
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::recorded_at;
+
+    /// Asserted against known values rather than a "plausible window": a window
+    /// wide enough not to flake is also wide enough to accept `secs + 1000` and
+    /// `secs / 1000`, which is exactly how both mutants survived the
+    /// integration test that checked the clock looked about right.
+    #[test]
+    fn milliseconds_split_into_whole_seconds_and_the_remainder_as_nanoseconds() {
+        let stamp = recorded_at(1_700_000_123_456);
+        assert_eq!(stamp.seconds, 1_700_000_123);
+        assert_eq!(
+            stamp.nanos, 456_000_000,
+            "456 ms is 456 million nanoseconds; adding or dividing by a million is not the same"
+        );
+    }
+
+    #[test]
+    fn a_whole_second_has_no_remainder() {
+        let stamp = recorded_at(1_000);
+        assert_eq!(stamp.seconds, 1);
+        assert_eq!(stamp.nanos, 0);
+    }
+
+    #[test]
+    fn the_epoch_is_zero_in_both_fields() {
+        let stamp = recorded_at(0);
+        assert_eq!(stamp.seconds, 0);
+        assert_eq!(stamp.nanos, 0);
+    }
+
+    #[test]
+    fn a_sub_second_reading_is_all_remainder() {
+        let stamp = recorded_at(999);
+        assert_eq!(stamp.seconds, 0);
+        assert_eq!(stamp.nanos, 999_000_000);
+    }
+
+    /// Floor division, so a pre-epoch reading is a negative second with a
+    /// non-negative nanosecond — not a timestamp that reads as later than it
+    /// was.
+    #[test]
+    fn a_pre_epoch_reading_floors_rather_than_truncating_toward_zero() {
+        let stamp = recorded_at(-1);
+        assert_eq!(stamp.seconds, -1);
+        assert_eq!(stamp.nanos, 999_000_000);
+    }
+}
