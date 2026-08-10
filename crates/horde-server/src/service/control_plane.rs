@@ -172,6 +172,17 @@ fn recorded_at(unix_ms: i64) -> prost_types::Timestamp {
     prost_types::Timestamp { seconds, nanos }
 }
 
+/// Whether the stream ends once history has been delivered.
+///
+/// Two independent reasons: the client hung up, or it never asked to follow.
+/// Extracted because inline they are not separately reachable — a
+/// non-following client also drops the stream immediately afterwards, so `&&`
+/// still returns in every end-to-end run, and dropping the `!` merely inverts
+/// which of two paths a passing test takes.
+fn stop_after_caught_up(send_failed: bool, follow: bool) -> bool {
+    send_failed || !follow
+}
+
 /// One sync stream: history, a caught-up marker, then the live tail.
 ///
 /// Split out of `sync_events` so the RPC is only about resolving the cursor,
@@ -200,7 +211,7 @@ async fn stream_session(
             },
         )),
     };
-    if sender.send(Ok(caught_up)).await.is_err() || !follow {
+    if stop_after_caught_up(sender.send(Ok(caught_up)).await.is_err(), follow) {
         return;
     }
 
@@ -786,7 +797,23 @@ fn uuid_like() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::recorded_at;
+    use super::{recorded_at, stop_after_caught_up};
+
+    #[test]
+    fn a_sync_stream_ends_after_history_unless_the_client_asked_to_follow() {
+        // The only case that keeps the stream open.
+        assert!(!stop_after_caught_up(false, true));
+
+        assert!(
+            stop_after_caught_up(false, false),
+            "a scriptable sync replays to head and completes"
+        );
+        assert!(
+            stop_after_caught_up(true, true),
+            "a client that hung up gets no tail however much it asked to follow"
+        );
+        assert!(stop_after_caught_up(true, false));
+    }
 
     /// Asserted against known values rather than a "plausible window": a window
     /// wide enough not to flake is also wide enough to accept `secs + 1000` and
