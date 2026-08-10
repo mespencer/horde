@@ -354,11 +354,36 @@ The fallback when there is no diff (or no `main`) is the *whole tree*, which is 
 stricter choice, so a missing branch can never quietly shrink the gate to nothing.
 Timeouts live in `.cargo/mutants.toml`; `--jobs` lives in the gate.
 
-**No exclusions.** `.cargo/mutants.toml` has no `exclude_re`. Skipping a function because
-its mutants survive is how a mutation gate becomes decorative. If a function cannot be
-mutation-tested, the fix is to move its logic somewhere that can be — which is why the
-gauntlet's own I/O is behind the `CommandRunner` seam and its parsing is in pure
+**No exclusions, today.** `.cargo/mutants.toml` has no `exclude_re`. Skipping a function
+because its mutants survive is how a mutation gate becomes decorative. If a function
+cannot be mutation-tested, the fix is to move its logic somewhere that can be — which is
+why the gauntlet's own I/O is behind the `CommandRunner` seam and its parsing is in pure
 functions.
+
+**The one exclusion that will be legitimate, and its criterion.** A binary that exists
+*to be spawned by the test suite* — a stub harness a process-supervision test launches —
+is test fixture wearing a `[[bin]]`'s clothes. Mutating it measures the fixture, not the
+product. When such a binary lands, exclude it by its own path and say so:
+
+```toml
+# Test fixture: the process suite spawns this binary, so mutating it measures
+# the fixture rather than the code under test.
+exclude_re = ["horde-worker/src/bin/stub_harness\\.rs"]
+```
+
+The criterion is *who exercises whom*: a binary the suite runs is excluded; a binary the
+suite tests is not. `horde-cli`'s `bin/horde.rs` is a product the suite tests, so it stays
+in scope — which is why the exclusion names one path rather than `src/bin/**`, a glob that
+would take the product out with the fixture.
+
+**Exclusions rot, and nothing here catches that yet.** An `exclude_re` that no longer
+matches anything is indistinguishable from one still doing its job, exactly like a
+`baselines/module-cycles.txt` entry for a cycle that has been fixed — and that file is
+ratcheted in both directions for precisely this reason. The mutation gate has no
+equivalent check. Doing it properly means asking cargo-mutants what its exclusions
+actually removed, because `exclude_re` is a regex over mutant descriptions rather than a
+path glob, and a cheaper approximation would be a check that lies. Until that exists, an
+exclusion added here is a promise someone has to keep by hand.
 
 **Local.** `gauntlet run mutants`, or `cargo mutants` directly. Survivors are listed in
 `target/quality/mutants.out/missed.txt`.
@@ -371,6 +396,34 @@ behaviour, but the number is surfaced so a creeping timeout count does not hide 
 green row. A run that produced no tally at all is an `error`, not a clean sheet.
 
 ---
+
+## Lessons the gates have already taught
+
+Each of these cost someone real time. They are here so it is only once.
+
+**Run the gates *before* `git commit`, not in the same command chain.** A
+`cargo test && git commit` that you interrupt, or whose test step you misread,
+commits red. Worse, a chain that commits first and measures second leaves the
+repository in a state the gate has never approved. Measure, read the result,
+then commit.
+
+**Tool debris is part of a tool's output.** cargo-mutants rotates its output
+directory to `mutants.out.old`; jscpd writes a report tree; llvm-cov leaves
+profraw files. Anything a gate's tool creates belongs under `target/` (already
+ignored) or in `.gitignore` — check what a new tool leaves behind the first time
+you run it, not the first time it shows up in `git status`.
+
+**A gate that only ever passes has not been shown to work.** Before trusting a
+new gate, break something on purpose and watch it go red — an unformatted file,
+a duplicated block, a deleted assertion. Every gate here was seen red before it
+was seen green, which is why the fixtures in `crates/horde-gauntlet/fixtures/`
+include dirty output as well as clean.
+
+**`mod.rs` declares and re-exports; it does not define.** A module that both
+re-exports a child and defines what that child imports is a cycle, and
+`module-structure` will say so. This has come up twice — in `horde-server`'s
+service spines and in `horde-adapter`'s crate root — and the fix is the same
+both times: move the shared definition into a sibling module.
 
 ## Adding a gate
 
