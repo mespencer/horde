@@ -18,10 +18,12 @@ use std::collections::VecDeque;
 
 use async_trait::async_trait;
 
-use crate::{
-    AdapterError, AgentEvent, AgentSession, PermissionDecision, ProviderSessionId, Result,
-    ToolCallId, TurnInput,
-};
+use crate::adapter::AgentSession;
+use crate::error::{AdapterError, Result};
+use crate::event::AgentEvent;
+use crate::ids::{ProviderSessionId, ToolCallId};
+use crate::permission::PermissionDecision;
+use crate::spec::TurnInput;
 
 /// One provider's answer to "what does this line mean?".
 ///
@@ -147,10 +149,12 @@ impl<D: LineDecoder> AgentSession for ReplaySession<D> {
 #[cfg(test)]
 mod tests {
     use super::{LineDecoder, ReplaySession};
-    use crate::{
-        AgentEvent, AgentSession, ProviderSessionId, Result, ToolCallId, TurnId, TurnInput,
-        TurnOutcome, TurnStatus, UsageDelta,
-    };
+    use crate::adapter::AgentSession;
+    use crate::error::{AdapterError, Result};
+    use crate::event::{AgentEvent, TurnOutcome, TurnStatus};
+    use crate::ids::{ProviderSessionId, ToolCallId, TurnId};
+    use crate::spec::TurnInput;
+    use crate::usage::UsageDelta;
 
     /// A decoder that treats each line as an event name, so the machinery can
     /// be tested without dragging in a provider's wire types.
@@ -177,7 +181,7 @@ mod tests {
                     denials: Vec::new(),
                     duration: core::time::Duration::ZERO,
                 })]),
-                other => Err(crate::AdapterError::Protocol {
+                other => Err(AdapterError::Protocol {
                     message: format!("unrecognised line `{other}`"),
                     raw: other.to_owned(),
                 }),
@@ -256,7 +260,7 @@ mod tests {
         let error = session
             .answer_permission(
                 &ToolCallId::new("toolu_01"),
-                crate::PermissionDecision::allow(),
+                crate::permission::PermissionDecision::allow(),
             )
             .await
             .expect_err("a recording carries no permission channel");

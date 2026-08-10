@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ProviderSessionId;
+use crate::ids::ProviderSessionId;
 
 /// Everything needed to resume one conversation with one provider.
 ///
@@ -68,7 +68,7 @@ mod tests {
     use std::path::Path;
 
     use super::RevivalIdentity;
-    use crate::{ProviderAccount, ProviderSessionId, account_dir};
+    use crate::ids::{ProviderAccount, ProviderSessionId, account_dir};
 
     #[test]
     fn an_identity_is_resumable_only_under_its_own_account_dir() {
