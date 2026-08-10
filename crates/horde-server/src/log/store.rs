@@ -285,20 +285,26 @@ fn now_unix_ms() -> i64 {
         })
 }
 
+/// A minimal event for one session, for tests across this module's tree.
+///
+/// Lives here rather than in each test module because both `log` and
+/// `log::store` need it, and `log` already depends on `log::store` — putting it
+/// the other way round would close a module cycle.
+#[cfg(test)]
+pub(crate) fn pending(session: &str, payload: &[u8]) -> PendingEvent {
+    PendingEvent {
+        session_id: session.to_owned(),
+        payload: payload.to_vec(),
+        ..PendingEvent::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingEvent, append, head, open_in_memory, read_from, session_ids,
+        PendingEvent, append, head, open_in_memory, pending, read_from, session_ids,
         worker_journal_watermark,
     };
-
-    fn pending(session: &str, payload: &[u8]) -> PendingEvent {
-        PendingEvent {
-            session_id: session.to_owned(),
-            payload: payload.to_vec(),
-            ..PendingEvent::default()
-        }
-    }
 
     #[test]
     fn sequences_are_dense_and_one_based_per_session() {

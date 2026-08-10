@@ -340,15 +340,8 @@ impl Tail {
 
 #[cfg(test)]
 mod tests {
+    use super::store::pending;
     use super::{EventLog, PendingEvent};
-
-    fn pending(session: &str, payload: &[u8]) -> PendingEvent {
-        PendingEvent {
-            session_id: session.to_owned(),
-            payload: payload.to_vec(),
-            ..PendingEvent::default()
-        }
-    }
 
     #[tokio::test]
     async fn appends_are_visible_to_a_later_read() {
