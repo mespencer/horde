@@ -15,103 +15,16 @@ use horde_proto::v1::{
     ListWorkspaceDefinitionsRequest, PushEventsRequest, PushEventsStart, RegisterWorkerRequest,
     SessionCursor, SessionId, SpawnAgentRequest, StreamCommandsRequest, SyncEventsRequest,
     WorkerCapabilities, WorkerId, control_plane_service_client::ControlPlaneServiceClient,
-    control_plane_service_server::ControlPlaneServiceServer, event::Kind, push_events_request,
-    push_events_response, stream_commands_response, sync_events_response,
-    worker_service_client::WorkerServiceClient, worker_service_server::WorkerServiceServer,
+    event::Kind, push_events_request, push_events_response, stream_commands_response,
+    sync_events_response,
 };
-use horde_server::EventLog;
-use horde_server::service::{ControlPlane, ServerCore, WorkerFacing};
 use tokio::io::DuplexStream;
 use tokio_stream::StreamExt;
 use tonic::Code;
-use tonic::transport::{Endpoint, Server, Uri};
 
-/// Both clients, wired to one server over in-process duplex transports.
-struct Harness {
-    control: ControlPlaneServiceClient<tonic::transport::Channel>,
-    worker: WorkerServiceClient<tonic::transport::Channel>,
-}
+mod common;
 
-/// Helpers return `Result` rather than unwrapping.
-///
-/// `allow-expect-in-tests` exempts anything under `#[cfg(test)]`, which an
-/// integration test file's free functions are not — so `expect` here would trip
-/// the deny-list. Wrapping the helpers in `#[cfg(test)] mod` would also fix it
-/// (see docs/QUALITY_GATES.md); threading the error to a `#[test]` is kept
-/// because it also reports *which* setup step failed.
-type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-async fn connect(core: ServerCore) -> Setup<Harness> {
-    Ok(Harness {
-        control: ControlPlaneServiceClient::new(channel_to(core.clone(), true).await?),
-        worker: WorkerServiceClient::new(channel_to(core, false).await?),
-    })
-}
-
-/// Stands up one server on a duplex pair and returns a channel to it.
-///
-/// Two connections rather than one so each client gets its own transport, which
-/// is how they behave in production.
-async fn channel_to(core: ServerCore, control_plane: bool) -> Setup<tonic::transport::Channel> {
-    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-
-    tokio::spawn(async move {
-        let mut builder = Server::builder();
-        let serve = async move {
-            if control_plane {
-                builder
-                    .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
-                    .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-                    .await
-            } else {
-                builder
-                    .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
-                    .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-                    .await
-            }
-        };
-        let _ = serve.await;
-    });
-
-    let mut client_side = Some(client_side);
-    let channel = Endpoint::try_from("http://[::]:50051")?
-        .connect_with_connector(tower::service_fn(move |_: Uri| {
-            let stream = client_side.take();
-            async move {
-                stream
-                    .map(hyper_util::rt::TokioIo::new)
-                    .ok_or_else(|| std::io::Error::other("the duplex was already taken"))
-            }
-        }))
-        .await?;
-    Ok(channel)
-}
-
-fn core() -> Setup<ServerCore> {
-    Ok(ServerCore::new(EventLog::in_memory()?))
-}
-
-/// Creates a session and returns its id.
-///
-/// Four tests need a session before they can test anything else; this is that
-/// preamble, once.
-async fn create_session(harness: &mut Harness, title: &str, key: &str) -> Setup<String> {
-    let created = harness
-        .control
-        .create_session(CreateSessionRequest {
-            title: title.to_owned(),
-            workspace_definition_id: None,
-            root_agent: Some(AgentSpec::default()),
-            idempotency_key: key.to_owned(),
-        })
-        .await?
-        .into_inner();
-    created
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .ok_or_else(|| "a created session must carry an id".into())
-}
+use common::{Harness, Setup, connect_to, core, seed};
 
 /// Opens a journal stream and announces the worker's journal position.
 ///
@@ -219,7 +132,7 @@ fn output_event(agent: &str, text: &str, index: u64) -> Event {
 #[tokio::test]
 async fn a_worker_and_a_client_meet_through_the_log() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core.clone())
+    let mut harness = connect_to(core.clone())
         .await
         .expect("the harness must connect");
 
@@ -233,7 +146,7 @@ async fn a_worker_and_a_client_meet_through_the_log() {
     );
 
     // 2. A client creates a session and spawns an agent under it.
-    let session_id = create_session(&mut harness, "ci-fix", "key-1")
+    let (session_id, _) = seed(&mut harness, "ci-fix", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -367,7 +280,7 @@ async fn sync_to_head(
 #[tokio::test]
 async fn sessions_are_listed_and_fetched_from_the_log() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
 
     assert!(
         harness
@@ -381,7 +294,7 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         "a fresh server has no sessions because the log has no events"
     );
 
-    let session_id = create_session(&mut harness, "first", "key-1")
+    let (session_id, _) = seed(&mut harness, "first", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -410,7 +323,7 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
 #[tokio::test]
 async fn creating_a_session_twice_with_one_key_creates_one_session() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
 
     let request = || CreateSessionRequest {
         title: "retried".to_owned(),
@@ -450,9 +363,9 @@ async fn creating_a_session_twice_with_one_key_creates_one_session() {
 #[tokio::test]
 async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
 
-    let session_id = create_session(&mut harness, "lonely", "key-1")
+    let (session_id, _) = seed(&mut harness, "lonely", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -478,7 +391,7 @@ async fn a_spawn_with_no_worker_is_queued_with_a_reason_rather_than_failing() {
 #[tokio::test]
 async fn unbuilt_rpcs_report_unimplemented_rather_than_a_fabricated_success() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
 
     let status = harness
         .control
@@ -492,7 +405,7 @@ async fn unbuilt_rpcs_report_unimplemented_rather_than_a_fabricated_success() {
 #[tokio::test]
 async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core.clone())
+    let mut harness = connect_to(core.clone())
         .await
         .expect("the harness must connect");
 
@@ -502,7 +415,7 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
 
     // Store some journal history directly, then have the worker claim it has
     // less than the server does.
-    let session_id = create_session(&mut harness, "s", "key-1")
+    let (session_id, _) = seed(&mut harness, "s", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -566,8 +479,8 @@ async fn a_permission_is_answered_by_request_id_alone() {
     // not the session, not the worker. Finding the rest is the server's job,
     // which is what makes a permission answerable from any attached client.
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
-    let session_id = create_session(&mut harness, "perms", "key-1")
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    let (session_id, _) = seed(&mut harness, "perms", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -610,8 +523,8 @@ async fn a_permission_is_answered_by_request_id_alone() {
 #[tokio::test]
 async fn answering_a_permission_nobody_asked_for_is_refused() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
-    create_session(&mut harness, "perms", "key-1")
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    seed(&mut harness, "perms", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -628,11 +541,11 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
     // find the session itself. The failure case matters as much: an unknown
     // agent must be refused rather than interrupting something else.
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
     register_worker(&mut harness, "worker-a")
         .await
         .expect("the worker must register");
-    let session_id = create_session(&mut harness, "findable", "key-1")
+    let (session_id, _) = seed(&mut harness, "findable", "key-1")
         .await
         .expect("a session must be creatable");
     let interrupted_session = session_id.clone();
@@ -740,8 +653,8 @@ async fn a_sync_that_is_not_following_ends_at_the_caught_up_marker() {
     // that is not following needs the stream to actually close, or it waits
     // forever for a completion that never comes.
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
-    let session_id = create_session(&mut harness, "syncing", "key-1")
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    let (session_id, _) = seed(&mut harness, "syncing", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -759,8 +672,8 @@ async fn a_sync_that_is_not_following_ends_at_the_caught_up_marker() {
 #[tokio::test]
 async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
     let core = core().expect("an in-memory core");
-    let mut harness = connect(core).await.expect("the harness must connect");
-    let session_id = create_session(&mut harness, "following", "key-1")
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    let (session_id, _) = seed(&mut harness, "following", "key-1")
         .await
         .expect("a session must be creatable");
 

@@ -152,9 +152,35 @@ fn envelope(event: &StoredEvent) -> Result<horde_proto::v1::EventEnvelope, Serve
     Ok(horde_proto::v1::EventEnvelope {
         session_id: Some(SessionId::new(event.session_id.clone())),
         sequence: event.sequence,
-        recorded_at: None,
+        recorded_at: Some(recorded_at(event.recorded_at_unix_ms)),
         event: Some(Event::decode(event.payload.as_slice())?),
     })
+}
+
+/// Converts the log's stored milliseconds into a wire timestamp.
+///
+/// The log has always recorded this; it was never put on the wire, so a client
+/// could not render when anything happened or reconcile clock skew against the
+/// server (DESIGN.md §2). Mutation testing found it: the stored value had no
+/// reader, so replacing the clock with a constant changed nothing observable.
+fn recorded_at(unix_ms: i64) -> prost_types::Timestamp {
+    // Floor division, so a pre-epoch reading yields a negative second and a
+    // non-negative nanosecond rather than a timestamp that reads as later than
+    // it was.
+    let seconds = unix_ms.div_euclid(1_000);
+    let nanos = i32::try_from(unix_ms.rem_euclid(1_000)).unwrap_or(0) * 1_000_000;
+    prost_types::Timestamp { seconds, nanos }
+}
+
+/// Whether the stream ends once history has been delivered.
+///
+/// Two independent reasons: the client hung up, or it never asked to follow.
+/// Extracted because inline they are not separately reachable — a
+/// non-following client also drops the stream immediately afterwards, so `&&`
+/// still returns in every end-to-end run, and dropping the `!` merely inverts
+/// which of two paths a passing test takes.
+fn stop_after_caught_up(send_failed: bool, follow: bool) -> bool {
+    send_failed || !follow
 }
 
 /// One sync stream: history, a caught-up marker, then the live tail.
@@ -185,7 +211,7 @@ async fn stream_session(
             },
         )),
     };
-    if sender.send(Ok(caught_up)).await.is_err() || !follow {
+    if stop_after_caught_up(sender.send(Ok(caught_up)).await.is_err(), follow) {
         return;
     }
 
@@ -701,11 +727,29 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
-        // Deliberately not stubbed away: the registry is real, so this can
-        // answer truthfully even though enrollment is not built.
-        Ok(Response::new(ListWorkersResponse {
-            workers: Vec::new(),
-        }))
+        // Answered from the registry rather than stubbed: the registry is real
+        // even though enrollment is not, and returning an empty list would make
+        // a connected worker indistinguishable from none.
+        let workers = self
+            .core
+            .workers
+            .connected()
+            .into_iter()
+            .map(|worker| horde_proto::v1::WorkerSummary {
+                worker_id: Some(horde_proto::v1::WorkerId::new(worker.worker_id.clone())),
+                name: worker.worker_id,
+                // Connection state is what the registry knows: a worker is in
+                // it because it registered and has not been dropped.
+                state: horde_proto::v1::WorkerConnectionState::Online as i32,
+                // Filled in with the handshake once enrollment carries it.
+                semver: String::new(),
+                capabilities: Some(worker.capabilities),
+                last_seen_at: None,
+                running_agents: 0,
+            })
+            .collect();
+
+        Ok(Response::new(ListWorkersResponse { workers }))
     }
 
     async fn mint_enrollment_code(
@@ -749,4 +793,70 @@ fn uuid_like() -> String {
     });
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recorded_at, stop_after_caught_up};
+
+    #[test]
+    fn a_sync_stream_ends_after_history_unless_the_client_asked_to_follow() {
+        // The only case that keeps the stream open.
+        assert!(!stop_after_caught_up(false, true));
+
+        assert!(
+            stop_after_caught_up(false, false),
+            "a scriptable sync replays to head and completes"
+        );
+        assert!(
+            stop_after_caught_up(true, true),
+            "a client that hung up gets no tail however much it asked to follow"
+        );
+        assert!(stop_after_caught_up(true, false));
+    }
+
+    /// Asserted against known values rather than a "plausible window": a window
+    /// wide enough not to flake is also wide enough to accept `secs + 1000` and
+    /// `secs / 1000`, which is exactly how both mutants survived the
+    /// integration test that checked the clock looked about right.
+    #[test]
+    fn milliseconds_split_into_whole_seconds_and_the_remainder_as_nanoseconds() {
+        let stamp = recorded_at(1_700_000_123_456);
+        assert_eq!(stamp.seconds, 1_700_000_123);
+        assert_eq!(
+            stamp.nanos, 456_000_000,
+            "456 ms is 456 million nanoseconds; adding or dividing by a million is not the same"
+        );
+    }
+
+    #[test]
+    fn a_whole_second_has_no_remainder() {
+        let stamp = recorded_at(1_000);
+        assert_eq!(stamp.seconds, 1);
+        assert_eq!(stamp.nanos, 0);
+    }
+
+    #[test]
+    fn the_epoch_is_zero_in_both_fields() {
+        let stamp = recorded_at(0);
+        assert_eq!(stamp.seconds, 0);
+        assert_eq!(stamp.nanos, 0);
+    }
+
+    #[test]
+    fn a_sub_second_reading_is_all_remainder() {
+        let stamp = recorded_at(999);
+        assert_eq!(stamp.seconds, 0);
+        assert_eq!(stamp.nanos, 999_000_000);
+    }
+
+    /// Floor division, so a pre-epoch reading is a negative second with a
+    /// non-negative nanosecond — not a timestamp that reads as later than it
+    /// was.
+    #[test]
+    fn a_pre_epoch_reading_floors_rather_than_truncating_toward_zero() {
+        let stamp = recorded_at(-1);
+        assert_eq!(stamp.seconds, -1);
+        assert_eq!(stamp.nanos, 999_000_000);
+    }
 }

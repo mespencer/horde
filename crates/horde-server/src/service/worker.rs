@@ -228,8 +228,9 @@ impl WorkerService for WorkerFacing {
                     Ok(reply) => Ok(reply),
                     Err(error) => Err(Status::from(error)),
                 };
-                let failed = reply.is_err();
-                if sender.send(reply).await.is_err() || failed {
+                let reply_failed = reply.is_err();
+                let send_failed = sender.send(reply).await.is_err();
+                if should_stop(send_failed, reply_failed) {
                     return;
                 }
             }
@@ -270,6 +271,21 @@ impl WorkerService for WorkerFacing {
             "workspace instance reporting",
         )))
     }
+}
+
+/// Whether the ingest loop should stop after this reply.
+///
+/// Extracted because inline the two halves are not separately reachable: a
+/// failed reply is usually followed by a worker that hangs up, so `&&` still
+/// stops the loop in most runs and survives every end-to-end test. As a
+/// predicate all four cases are asserted.
+///
+/// Stopping on a failed reply is deliberate. The stream carries one worker's
+/// journal, and a rejected batch means the server and the worker disagree about
+/// what is stored; continuing to accept batches after that would append on top
+/// of a disagreement rather than making the worker resynchronise.
+fn should_stop(send_failed: bool, reply_failed: bool) -> bool {
+    send_failed || reply_failed
 }
 
 /// Answers `PushEventsStart`, refusing a worker that lost its journal.
@@ -324,6 +340,21 @@ mod tests {
                 kind: Some(Kind::TurnInterrupted(TurnInterrupted::default())),
             }),
         }
+    }
+
+    #[test]
+    fn the_ingest_loop_stops_when_either_the_reply_or_the_send_failed() {
+        // Neither: the only case that keeps the stream open.
+        assert!(!super::should_stop(false, false));
+
+        // The worker hung up, so there is nobody to answer.
+        assert!(super::should_stop(true, false));
+
+        // The batch was rejected; continuing would append on top of a
+        // disagreement about what is stored.
+        assert!(super::should_stop(false, true));
+
+        assert!(super::should_stop(true, true));
     }
 
     #[tokio::test]
