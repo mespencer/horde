@@ -438,13 +438,20 @@ which is what a worker-spawned child process does natively.
     before a client does.
 11. **Sampling / Roots / Logging** — deprecated in this revision. Do not build on them.
 
-### Docs to update when the endpoint lands
+### Docs updated alongside this audit
 
-DESIGN.md §9's transport policy is confirmed and needs no correction, but two facts belong
-in the record: **ADR-0003 should gain the ambient-settings caveat from §2.4** (its "verified
-2026-08-09 against 2.1.226" status line is still accurate, but the permission-interception
-claim is conditional on Horde owning `--settings`), and both ADRs' version stamps are now
-one to two releases stale.
+Both applied on this branch:
+
+- **DESIGN.md §9 transport/spec policy** — the policy *shape* was already right (dual-era
+  serving, the `initialize`-vs-`_meta` discriminator), so the amendment fixes the emphasis:
+  legacy-era first and reaching back to `2025-06-18`, the zero-tools-silently failure mode,
+  the modern era arriving free from pinned rmcp, and the instruction to re-verify harness
+  support by wire trace rather than binary strings.
+- **ADR-0003** — gains the ambient-settings caveat from §2.4. Its "verified 2026-08-09
+  against 2.1.226" line stays accurate; what changes is that the permission-interception
+  claim is now explicitly conditional on Horde owning `--settings`.
+
+Both ADRs' version stamps remain one to two releases behind what is installed (§2).
 
 ---
 
@@ -467,8 +474,11 @@ one to two releases stale.
   mislead anyone debugging the endpoint with `mcp list`.
 - **Codex's client-side permission behaviour was not re-probed.** ADR-0005's finding (no
   client-facing approval requests) was verified at 0.145.0; this audit did not re-run those
-  six configurations against 0.147.0. ADR-0005 asks for a re-check on each Codex upgrade and
-  that debt is now two releases old.
+  six configurations against 0.147.0. ADR-0005 asks for a re-check on each Codex upgrade,
+  and that debt is now **two releases stale (0.145.0 → 0.147.0), carried into the endpoint
+  wave**. It matters more than it looks: if the two under-development approval flags have
+  since stabilized, ADR-0005's "Codex cannot be pre-authorized" consequence — and the
+  placement rule built on it — would need revisiting rather than working around.
 - **rmcp's dual-era behaviour was read from docs, not exercised.** The
   `StreamableHttpServerConfig` semantics above are quoted from the published API docs; no
   Horde spike has yet stood up an rmcp server and driven it with both eras. That spike is
