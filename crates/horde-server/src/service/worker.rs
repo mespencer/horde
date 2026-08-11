@@ -23,6 +23,7 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::instrument;
 
+use super::commands::{self, CommandStream};
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::PendingEvent;
@@ -120,8 +121,11 @@ impl WorkerService for WorkerFacing {
             .workers
             .register(&worker_id, request.capabilities.unwrap_or_default());
 
-        // Both watermarks are derived, not remembered: the journal one from the
-        // events actually stored, the command one from what the worker acked.
+        // Both watermarks are derived from the log rather than remembered, so a
+        // restarted server answers a reconnecting worker with the same numbers
+        // it would have given before the restart. The journal one comes from
+        // the events actually stored; the command one from folding the command
+        // stream. Neither survives in memory, and neither needs to.
         let resume_from_journal_sequence = self
             .core
             .log
@@ -130,13 +134,20 @@ impl WorkerService for WorkerFacing {
             .map_err(Status::from)?
             .saturating_add(1);
 
+        // What the server has ever issued this worker. The worker corrects this
+        // downwards on StreamCommands if it applied fewer; it is a ceiling, not
+        // an instruction, and saying "everything" would replay the world.
+        let issued = commands::issued_to(&self.core.log, &worker_id)
+            .await
+            .map_err(Status::from)?;
+
         tracing::info!(worker_id, resume_from_journal_sequence, "worker registered");
 
         Ok(Response::new(RegisterWorkerResponse {
             worker_id: Some(WorkerId::new(worker_id.clone())),
             server: Some(Self::server_hello()),
             resume_from_journal_sequence,
-            resume_from_command_sequence: self.core.commands.acked(&worker_id).saturating_add(1),
+            resume_from_command_sequence: issued.saturating_add(1),
         }))
     }
 
@@ -156,20 +167,32 @@ impl WorkerService for WorkerFacing {
             .unwrap_or_default();
 
         // The worker's own state decides what is replayed, not the server's
-        // guess: it is the only side that knows what it durably applied.
-        let mut next = request.resume_from_command_sequence.max(1);
-        let commands = self.core.commands.clone();
+        // guess: it is the only side that knows what it durably applied. That
+        // was true when commands lived in memory and it is load-bearing now
+        // they are folded from the log, because the fold can rebuild every
+        // command a worker was ever issued and only the worker knows which of
+        // them it finished.
+        let mut stream = CommandStream::open(
+            &self.core.log,
+            &worker_id,
+            request.resume_from_command_sequence,
+        );
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
-            loop {
-                for command in commands.since(&worker_id, next) {
-                    next = command.command_sequence.saturating_add(1);
+            while let Some(batch) = stream.next_batch().await {
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = sender.send(Err(Status::from(error))).await;
+                        return;
+                    }
+                };
+                for command in batch {
                     if sender.send(Ok(command)).await.is_err() {
                         return; // The worker hung up.
                     }
                 }
-                commands.changed().await;
             }
         });
 
@@ -210,7 +233,11 @@ impl WorkerService for WorkerFacing {
                         handle_start(&core, &worker_id, start.last_local_journal_sequence).await
                     }
                     Some(push_events_request::Body::Batch(batch)) => {
-                        core.commands.ack(&worker_id, batch.acked_command_sequence);
+                        // `acked_command_sequence` is deliberately not recorded
+                        // server-side. The worker replays from its own ack on
+                        // the next StreamCommands, so a server-held copy would
+                        // be a second answer to a question the worker already
+                        // answers — and the copy is the one a restart loses.
                         ingest_batch(&core, &worker_id, batch.events).await.map(
                             |acked_journal_sequence| PushEventsResponse {
                                 body: Some(push_events_response::Body::Ack(JournalAck {

@@ -8,17 +8,20 @@ use std::sync::Arc;
 
 use crate::log::EventLog;
 use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
-use crate::service::commands::CommandQueues;
 
 /// Everything the two services share.
 ///
 /// One value, cloned into both, so there is no question of them disagreeing
 /// about which log or which registry they are talking to.
+///
+/// There is no command queue here any more. Commands are folded out of `log`
+/// on demand by `service::commands`, so the only thing to share is the log
+/// they are derived from — which is also the only thing that survives a
+/// restart.
 #[derive(Clone)]
 pub struct ServerCore {
     pub log: EventLog,
     pub workers: WorkerRegistry,
-    pub commands: CommandQueues,
     pub scheduler: Arc<dyn Scheduler>,
 }
 
@@ -31,7 +34,6 @@ impl ServerCore {
         Self {
             log,
             workers,
-            commands: CommandQueues::new(),
             scheduler,
         }
     }

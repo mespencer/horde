@@ -50,7 +50,7 @@ use rusqlite::Connection;
 use tokio::sync::broadcast;
 use tracing::instrument;
 
-pub use store::{Appended, PendingEvent, StoredEvent};
+pub use store::{Appended, GlobalEvent, PendingEvent, StoredEvent};
 
 use crate::error::ServerError;
 
@@ -179,6 +179,22 @@ impl EventLog {
         let session_id = session_id.to_owned();
         self.with_connection(move |connection| store::head(connection, &session_id))
             .await
+    }
+
+    /// Reads up to `limit` events from anywhere in the log, in append order,
+    /// starting after `after_row`.
+    ///
+    /// The whole-log read the per-worker command projection folds over; see
+    /// [`store::read_global_from`] for why append order is `rowid`.
+    pub async fn read_global_from(
+        &self,
+        after_row: u64,
+        limit: u32,
+    ) -> Result<Vec<GlobalEvent>, ServerError> {
+        self.with_connection(move |connection| {
+            store::read_global_from(connection, after_row, limit)
+        })
+        .await
     }
 
     /// Every session that has at least one event, oldest first.

@@ -25,6 +25,7 @@ use tonic::Code;
 mod common;
 
 use common::{Harness, Setup, connect_to, core, seed};
+use horde_server::service::ServerCore;
 
 /// Opens a journal stream and announces the worker's journal position.
 ///
@@ -719,6 +720,182 @@ async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
             other => panic!("expected a batch after catching up, got {other:?}"),
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// Commands across a restart.
+//
+// The point of folding commands out of the log instead of queueing them in
+// memory. A "restart" here is a fresh `ServerCore` over the *same* `EventLog`:
+// every in-memory structure the old server had is gone, and the database is
+// the only thing that crosses the boundary. That is exactly what a process
+// restart leaves behind, without needing a process.
+//
+// The worker is still simulated at the wire level, per this file's header. The
+// end-to-end version — a real `horde-worker` applying these commands, crashing,
+// and reconciling what it actually ran against what it acked — is
+// `a_real_worker_reconciles_its_applied_commands_after_a_restart`, and it lands
+// in this file once the worker crate is on `main`. It is named here rather than
+// stubbed because an ignored empty test asserts nothing while looking like
+// coverage.
+// -------------------------------------------------------------------------
+
+/// A server with `worker-a` registered and one session seeded.
+///
+/// Returns the core as well as the harness, because a restart test needs the
+/// log to build the *next* server over — that log is the only thing a restart
+/// is allowed to carry across.
+async fn commanded_server(title: &str) -> Setup<(ServerCore, Harness, String)> {
+    let core = core()?;
+    let mut harness = connect_to(core.clone()).await?;
+    register_worker(&mut harness, "worker-a").await?;
+    let (session_id, _) = seed(&mut harness, title, "key-1").await?;
+    Ok((core, harness, session_id))
+}
+
+/// The same server again, over the same log and nothing else.
+///
+/// Every in-memory structure is discarded; if a command survives this, it
+/// survived because the log carried it.
+async fn restart(core: &ServerCore) -> Setup<Harness> {
+    connect_to(ServerCore::new(core.log.clone())).await
+}
+
+/// Opens a command stream and returns the first command on it.
+async fn first_command(
+    harness: &mut Harness,
+    worker_id: &str,
+    resume_from: u64,
+) -> Setup<horde_proto::v1::StreamCommandsResponse> {
+    let mut commands = harness
+        .worker
+        .stream_commands(StreamCommandsRequest {
+            worker_id: Some(WorkerId::new(worker_id)),
+            resume_from_command_sequence: resume_from,
+        })
+        .await?
+        .into_inner();
+
+    // Bounded: a command that never arrives must red this test rather than
+    // hang the suite.
+    tokio::time::timeout(std::time::Duration::from_secs(5), commands.next())
+        .await
+        .map_err(|_| "the command stream must produce a command rather than hang")?
+        .ok_or("the stream ended without a command")?
+        .map_err(Into::into)
+}
+
+/// A command placed before a restart must still be delivered after one.
+///
+/// This is the failure the in-memory queue had: the spawn is recorded in the
+/// log, the command derived from it lived only in the old process, and the
+/// worker connecting to the new process was told there was nothing to do.
+#[tokio::test]
+async fn a_command_issued_before_a_restart_is_still_delivered_after_it() {
+    let (core, mut harness, session_id) = commanded_server("restart").await.expect("a server");
+    let (agent_id, placement) = spawn_agent(&mut harness, &session_id).await.expect("spawn");
+    assert_eq!(
+        placement.worker_id.as_ref().map(ToString::to_string),
+        Some("worker-a".to_owned()),
+        "the agent must be placed for there to be a command at all"
+    );
+
+    // The worker never opened a stream, so nothing was ever delivered.
+    drop(harness);
+    let mut restarted = restart(&core).await.expect("the restarted server");
+    register_worker(&mut restarted, "worker-a")
+        .await
+        .expect("register");
+
+    let command = first_command(&mut restarted, "worker-a", 1)
+        .await
+        .expect("the command must survive the restart");
+    assert_eq!(command.command_sequence, 1);
+    match command.command {
+        Some(stream_commands_response::Command::SpawnAgent(spawn)) => {
+            assert_eq!(
+                spawn.agent_id.as_ref().map(ToString::to_string),
+                Some(agent_id),
+                "and it must still name the agent that was placed"
+            );
+        }
+        other => panic!("expected a spawn command, got {other:?}"),
+    }
+}
+
+/// A worker that reconnects after a restart must be handed the *same* command
+/// under the same sequence and id, or its ack points at something else.
+#[tokio::test]
+async fn a_restart_renumbers_nothing() {
+    let (core, mut harness, session_id) = commanded_server("stable").await.expect("a server");
+    spawn_agent(&mut harness, &session_id).await.expect("spawn");
+
+    let before = first_command(&mut harness, "worker-a", 1)
+        .await
+        .expect("a command before the restart");
+
+    drop(harness);
+    let mut restarted = restart(&core).await.expect("the restarted server");
+    let after = first_command(&mut restarted, "worker-a", 1)
+        .await
+        .expect("the same command after the restart");
+
+    assert_eq!(
+        before.command_sequence, after.command_sequence,
+        "a restart must not renumber a command the worker may have acked"
+    );
+    assert_eq!(
+        before.command_id, after.command_id,
+        "the id a worker dedupes on must be stable across a restart"
+    );
+}
+
+/// Registration answers with what the worker has actually been issued, folded
+/// from the log. The in-memory version answered 1 after every restart, which
+/// told a worker that had applied everything to start over.
+#[tokio::test]
+async fn a_restarted_server_still_knows_what_it_issued_a_worker() {
+    let (core, mut harness, session_id) = commanded_server("issued").await.expect("a server");
+    spawn_agent(&mut harness, &session_id).await.expect("spawn");
+    spawn_agent(&mut harness, &session_id).await.expect("spawn");
+
+    drop(harness);
+    let mut restarted = restart(&core).await.expect("the restarted server");
+
+    let resume = restarted
+        .worker
+        .register_worker(RegisterWorkerRequest {
+            hello: None,
+            worker_id: Some(WorkerId::new("worker-a")),
+            capabilities: Some(WorkerCapabilities::default()),
+        })
+        .await
+        .expect("register")
+        .into_inner()
+        .resume_from_command_sequence;
+
+    assert_eq!(
+        resume, 3,
+        "two commands were issued, so the next one is the third"
+    );
+}
+
+/// A worker that already applied command 1 must not be shown it again, and the
+/// commands it has not seen must still arrive — the dedupe story the log's own
+/// offsets have, applied to commands.
+#[tokio::test]
+async fn a_worker_resuming_mid_stream_sees_the_tail_and_no_duplicates() {
+    let (_core, mut harness, session_id) = commanded_server("resume").await.expect("a server");
+    spawn_agent(&mut harness, &session_id).await.expect("spawn");
+    spawn_agent(&mut harness, &session_id).await.expect("spawn");
+
+    let resumed = first_command(&mut harness, "worker-a", 2)
+        .await
+        .expect("a command");
+    assert_eq!(
+        resumed.command_sequence, 2,
+        "resuming at 2 must not redeliver 1"
+    );
 }
 
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.

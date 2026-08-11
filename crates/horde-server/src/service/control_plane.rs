@@ -620,29 +620,18 @@ impl ControlPlaneService for ControlPlane {
         .await
         .map_err(Status::from)?;
 
+        // No command is enqueued here. Recording the placement below *is* how
+        // the worker is told to spawn: `service::commands` folds that event
+        // into a `SpawnAgentCommand`. Writing the event and separately pushing
+        // a command would be two sources of truth for one decision, and the
+        // one held in memory is the one a restart loses.
         let wire_placement = match &placement {
-            Placement::Placed { worker_id } => {
-                self.core.commands.enqueue(
-                    worker_id,
-                    horde_proto::v1::stream_commands_response::Command::SpawnAgent(
-                        horde_proto::v1::SpawnAgentCommand {
-                            session_id: Some(SessionId::new(session_id.clone())),
-                            agent_id: Some(AgentId::new(agent_id.clone())),
-                            parent_agent_id: parent.map(AgentId::new),
-                            spec: Some(spec),
-                            binding: None,
-                            tree_path: Vec::new(),
-                            prompt_overlay: String::new(),
-                        },
-                    ),
-                );
-                horde_proto::v1::Placement {
-                    agent_id: Some(AgentId::new(agent_id.clone())),
-                    state: horde_proto::v1::PlacementState::Placed as i32,
-                    worker_id: Some(horde_proto::v1::WorkerId::new(worker_id.clone())),
-                    reason: String::new(),
-                }
-            }
+            Placement::Placed { worker_id } => horde_proto::v1::Placement {
+                agent_id: Some(AgentId::new(agent_id.clone())),
+                state: horde_proto::v1::PlacementState::Placed as i32,
+                worker_id: Some(horde_proto::v1::WorkerId::new(worker_id.clone())),
+                reason: String::new(),
+            },
             Placement::Queued { reason } => horde_proto::v1::Placement {
                 agent_id: Some(AgentId::new(agent_id.clone())),
                 state: horde_proto::v1::PlacementState::Queued as i32,

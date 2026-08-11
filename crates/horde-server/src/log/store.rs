@@ -22,6 +22,19 @@ pub struct StoredEvent {
     pub payload: Vec<u8>,
 }
 
+/// One row of the log, with its position in the log's *append* order.
+///
+/// The third sequence space in this system, and the only one that is total.
+/// `sequence` is per session and `journal_sequence` is per worker, so neither
+/// can order two events from different sessions — which is exactly what
+/// deriving one worker's command stream out of the whole log requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalEvent {
+    /// Append order. See [`read_global_from`] for why this is `rowid`.
+    pub row: u64,
+    pub event: StoredEvent,
+}
+
 /// What to append, before the server has assigned it a position.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PendingEvent {
@@ -221,6 +234,60 @@ pub fn read_from(
             })
         })
         .map_err(ServerError::storage("replaying events"))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(ServerError::storage("decoding a replayed event"))?);
+    }
+    Ok(events)
+}
+
+/// Reads up to `limit` events from anywhere in the log, in append order,
+/// starting after `after_row`.
+///
+/// **Why `rowid` is the append order, and why that is safe to lean on.** The
+/// log is append-only: nothing is ever deleted or updated, so SQLite never
+/// recycles a rowid, and each insert takes one strictly greater than every row
+/// before it. Appends are serialized through a single connection inside an
+/// `IMMEDIATE` transaction, so "the order rows were committed" and "the order
+/// of their rowids" are the same statement. This is not a new dependence:
+/// [`session_ids`] already orders by `MIN(rowid)` to report the order sessions
+/// came into existence.
+///
+/// The alternative — ordering by `(session_id, sequence)` — is deterministic
+/// but wrong for this job, and wrong in a way that only shows up in
+/// production. It is a *sort*, not an append order, so an event in a
+/// lexicographically earlier session sorts ahead of commands already sent, and
+/// every later command renumbers. A worker's acked watermark would then point
+/// at a different command than it did a moment ago.
+pub fn read_global_from(
+    connection: &Connection,
+    after_row: u64,
+    limit: u32,
+) -> Result<Vec<GlobalEvent>, ServerError> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT rowid, session_id, sequence, recorded_at_unix_ms, payload
+             FROM events
+             WHERE rowid > ?1
+             ORDER BY rowid ASC
+             LIMIT ?2",
+        )
+        .map_err(ServerError::storage("preparing a global replay"))?;
+
+    let rows = statement
+        .query_map(params![after_row, limit], |row| {
+            Ok(GlobalEvent {
+                row: row.get(0)?,
+                event: StoredEvent {
+                    session_id: row.get(1)?,
+                    sequence: row.get(2)?,
+                    recorded_at_unix_ms: row.get(3)?,
+                    payload: row.get(4)?,
+                },
+            })
+        })
+        .map_err(ServerError::storage("replaying the log"))?;
 
     let mut events = Vec::new();
     for row in rows {
