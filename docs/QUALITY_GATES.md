@@ -422,8 +422,16 @@ scope — which is why the entry names one path, with `\.` for a dot, rather tha
 `src/bin/**`, a glob that would take the product out with the fixture:
 
 ```toml
-exclude_re = ['horde-worker/src/bin/stub_harness\.rs']
+exclude_re = ['crates/horde-worker/src/bin/stub_harness\.rs']
 ```
+
+The path is written **from the workspace root**, `crates/` and all. Earlier revisions of
+this section omitted the `crates/` prefix, and when the exclusion first landed for real the
+self-check refused it — *"excludes horde-worker/src/bin/stub_harness.rs, which is not in
+the tree"*. The regex would in fact have matched, because `exclude_re` is tested against a
+mutant description that begins with the full path; it is the gate's *existence* check that
+insists on a path a reader can go and look at. That is the check earning its keep: a
+prefix-less path is one directory rename away from silently excluding nothing at all.
 
 *A function, when its mutant is provably equivalent.* Sometimes cargo-mutants' rewrite
 produces the expression that was already there. `Capabilities::none()` is written

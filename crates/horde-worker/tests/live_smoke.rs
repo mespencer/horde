@@ -23,10 +23,7 @@ async fn the_real_binary_still_streams_a_turn_through_the_supervisor() {
     let spec = AgentSpec {
         model: Some("haiku".to_owned()),
         append_system_prompt: Some("Answer with exactly the token asked for.".to_owned()),
-        cwd: None,
-        account: None,
-        horde_endpoint: None,
-        provider_options: std::collections::BTreeMap::new(),
+        ..AgentSpec::default()
     };
 
     let mut session = adapter.spawn(&spec).await.expect("claude must be on PATH");

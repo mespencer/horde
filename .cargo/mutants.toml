@@ -22,6 +22,9 @@ exclude_re = [
     # `Script::echoing()` is `Self::default()` for the same reason, over a
     # `Script` that also derives `Default`.
     'Script::echoing',
+    # Test fixture: the process suite spawns this binary, so mutating it measures
+    # the fixture rather than the code under test.
+    'crates/horde-worker/src/bin/stub_harness\.rs',
 ]
 
 # Parallelism is not settable here — cargo-mutants takes `--jobs` on the command

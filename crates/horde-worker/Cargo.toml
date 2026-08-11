@@ -16,8 +16,6 @@ horde-adapter-claude = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-horde-testkit = { workspace = true }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 # The stub harness is a real binary the process tests spawn, so supervision is

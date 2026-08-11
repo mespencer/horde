@@ -125,14 +125,7 @@ impl Adapter for ClaudeAdapter {
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
-        let harness =
-            SupervisedHarness::spawn(&self.harness_spec(spec, Vec::new())).map_err(|e| {
-                AdapterError::Spawn {
-                    provider: horde_adapter_claude::PROVIDER.to_owned(),
-                    message: e.to_string(),
-                }
-            })?;
-        Ok(Box::new(LiveClaudeSession::new(harness)))
+        self.start(spec, Vec::new())
     }
 
     async fn resume(
@@ -143,13 +136,27 @@ impl Adapter for ClaudeAdapter {
         // Under the SAME config dir: a session recorded under one account does
         // not exist under another, and an unauthenticated directory fails loudly
         // rather than starting a silently fresh conversation.
-        let extra = vec!["--resume".to_owned(), provider_session_id.to_string()];
-        let harness = SupervisedHarness::spawn(&self.harness_spec(spec, extra)).map_err(|e| {
-            AdapterError::Spawn {
-                provider: horde_adapter_claude::PROVIDER.to_owned(),
-                message: e.to_string(),
-            }
-        })?;
+        self.start(
+            spec,
+            vec!["--resume".to_owned(), provider_session_id.to_string()],
+        )
+    }
+}
+
+impl ClaudeAdapter {
+    /// Starts a supervised `claude` and wraps it as a session.
+    ///
+    /// Spawning and reviving differ only in the extra flags, so they share the
+    /// launch: a second copy is a second place for the provider to go missing
+    /// from a spawn failure.
+    fn start(&self, spec: &AgentSpec, extra: Vec<String>) -> Result<Box<dyn AgentSession>> {
+        let harness =
+            SupervisedHarness::spawn(&self.harness_spec(spec, extra)).map_err(|error| {
+                AdapterError::Spawn {
+                    provider: horde_adapter_claude::PROVIDER.to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
         Ok(Box::new(LiveClaudeSession::new(harness)))
     }
 }
@@ -268,17 +275,6 @@ mod tests {
 
     use super::ClaudeAdapter;
 
-    fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
-    }
-
     /// The flags W1c established as the minimum for a usable stream.
     ///
     /// `--verbose` is the one that bites: without it alongside `-p`, the harness
@@ -287,7 +283,7 @@ mod tests {
     /// arrives, just never incrementally.
     #[test]
     fn the_base_flags_keep_the_stream_watchable() {
-        let args = ClaudeAdapter::new().base_args(&spec());
+        let args = ClaudeAdapter::new().base_args(&AgentSpec::default());
 
         for required in [
             "-p",
@@ -309,7 +305,7 @@ mod tests {
         let args = ClaudeAdapter::new().base_args(&AgentSpec {
             model: Some("haiku".to_owned()),
             append_system_prompt: Some("overlay text".to_owned()),
-            ..spec()
+            ..AgentSpec::default()
         });
 
         // Appended, never replacing: the harness's own prompt is what makes its
@@ -326,7 +322,7 @@ mod tests {
     /// The permission seam: absent by default, present when configured.
     #[test]
     fn the_permission_prompt_tool_is_opt_in() {
-        let plain = ClaudeAdapter::new().base_args(&spec());
+        let plain = ClaudeAdapter::new().base_args(&AgentSpec::default());
         assert!(
             !plain.iter().any(|a| a == "--permission-prompt-tool"),
             "no endpoint means no flag, not an empty one"
@@ -334,7 +330,7 @@ mod tests {
 
         let mut wired = ClaudeAdapter::new();
         wired.permission_prompt_tool = Some("mcp__horde__approve".to_owned());
-        let args = wired.base_args(&spec());
+        let args = wired.base_args(&AgentSpec::default());
         assert!(args.iter().any(|a| a == "mcp__horde__approve"));
     }
 

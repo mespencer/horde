@@ -17,9 +17,11 @@ use horde_worker::{SupervisedHarness, SupervisorError};
 #[cfg(test)]
 mod harness {
     use super::{HarnessSpec, PathBuf};
+    use horde_adapter::{Adapter, AgentSession, AgentSpec};
+    use horde_worker::ClaudeAdapter;
 
     /// The stub binary cargo built alongside this test.
-    pub fn stub_binary() -> PathBuf {
+    pub(crate) fn stub_binary() -> PathBuf {
         let mut path = std::env::current_exe().unwrap_or_default();
         path.pop();
         if path.ends_with("deps") {
@@ -29,7 +31,10 @@ mod harness {
     }
 
     /// A spec whose child gets extra environment, for scripting the stub.
-    pub fn spec_with(transcript: &str, extra: &[(&str, &str)]) -> (HarnessSpec, tempfile::TempDir) {
+    pub(crate) fn spec_with(
+        transcript: &str,
+        extra: &[(&str, &str)],
+    ) -> (HarnessSpec, tempfile::TempDir) {
         let (mut spec, dir) = spec_for(transcript);
         for (key, value) in extra {
             spec.env.push(((*key).to_owned(), (*value).to_owned()));
@@ -37,7 +42,7 @@ mod harness {
         (spec, dir)
     }
 
-    pub fn spec_for(transcript: &str) -> (HarnessSpec, tempfile::TempDir) {
+    pub(crate) fn spec_for(transcript: &str) -> (HarnessSpec, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("a scratch dir");
         let file = dir.path().join("transcript.jsonl");
         std::fs::write(&file, transcript).expect("writes");
@@ -57,6 +62,30 @@ mod harness {
         };
         (spec, dir)
     }
+
+    /// A live session on the stub, playing `script`, with `extra` reaching the
+    /// child's environment.
+    ///
+    /// Every session test builds one the same way, and the `TempDir` has to
+    /// travel with it: dropping the directory deletes the transcript out from
+    /// under a child that has not finished reading it.
+    pub(crate) async fn session_on(
+        script: &str,
+        extra: &[(&str, &str)],
+    ) -> (Box<dyn AgentSession>, tempfile::TempDir) {
+        let (spec, dir) = spec_with(script, extra);
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = spec.env.clone();
+        let session = adapter
+            .spawn(&AgentSpec::default())
+            .await
+            .expect("the stub spawns");
+        (session, dir)
+    }
+
+    /// A script that reports one successful turn and nothing else.
+    pub(crate) const RESULT_ONLY: &str = "{\"type\":\"result\",\"subtype\":\"success\",\
+         \"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
 }
 
 use harness::spec_for;
@@ -186,10 +215,7 @@ mod live_session {
         let spec = AgentSpec {
             model: Some("haiku".to_owned()),
             append_system_prompt: Some("you are supervised".to_owned()),
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
+            ..AgentSpec::default()
         };
 
         let mut session = adapter.spawn(&spec).await.expect("the stub must spawn");
@@ -324,17 +350,6 @@ mod revival {
     use horde_adapter::{Adapter, AgentEvent, AgentSpec, ProviderSessionId, TurnInput};
     use horde_worker::ClaudeAdapter;
 
-    fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
-    }
-
     /// The handoff: a session id learned from one process is what revives the
     /// conversation in the next.
     ///
@@ -351,7 +366,7 @@ mod revival {
         let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
         adapter.extra_env = harness_spec.env.clone();
 
-        let mut first = adapter.spawn(&spec()).await.expect("spawns");
+        let mut first = adapter.spawn(&AgentSpec::default()).await.expect("spawns");
         first.send(TurnInput::queued("hello")).await.expect("sends");
         while let Ok(Some(event)) = first.next_event().await {
             if matches!(event, AgentEvent::TurnEnded(_)) {
@@ -368,7 +383,7 @@ mod revival {
 
         // A second, independent process, carrying the id.
         let mut revived = adapter
-            .resume(&spec(), &revival_id)
+            .resume(&AgentSpec::default(), &revival_id)
             .await
             .expect("resume spawns a fresh process");
         revived
@@ -400,7 +415,10 @@ mod revival {
         adapter.extra_env = harness_spec.env.clone();
 
         let mut revived = adapter
-            .resume(&spec(), &ProviderSessionId::new("sess-does-not-exist"))
+            .resume(
+                &AgentSpec::default(),
+                &ProviderSessionId::new("sess-does-not-exist"),
+            )
             .await
             .expect("the process starts; the failure is in what it does next");
         let _ = revived.send(TurnInput::queued("hello")).await;
@@ -430,20 +448,8 @@ mod revival {
 
 #[cfg(test)]
 mod side_effects {
-    use super::harness::{spec_with, stub_binary};
-    use horde_adapter::{Adapter, AgentSpec, TurnInput};
-    use horde_worker::ClaudeAdapter;
-
-    fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
-    }
+    use super::harness::{RESULT_ONLY, session_on};
+    use horde_adapter::TurnInput;
 
     /// `interrupt()` must actually put the control message on the wire.
     ///
@@ -461,16 +467,15 @@ mod side_effects {
         let log = tempfile::tempdir().expect("a scratch dir");
         let log_path = log.path().join("control.log");
 
-        let script = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\"}\n\
-                      {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
-        let (harness_spec, _dir) = spec_with(
-            script,
-            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        let script = format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\"}}\n{}",
+            RESULT_ONLY
         );
-        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
-        adapter.extra_env = harness_spec.env.clone();
-
-        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        let (mut session, _dir) = session_on(
+            &script,
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
         session.interrupt().await.expect("the write must succeed");
 
         // The child records what it received; poll briefly for the pipe to land.
@@ -509,14 +514,7 @@ mod side_effects {
     /// cannot tolerate.
     #[tokio::test]
     async fn answering_a_permission_request_that_cannot_exist_is_an_error() {
-        let (harness_spec, _dir) = spec_with(
-            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}",
-            &[],
-        );
-        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
-        adapter.extra_env = harness_spec.env.clone();
-
-        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        let (mut session, _dir) = session_on(RESULT_ONLY, &[]).await;
         let refused = session
             .answer_permission(
                 &horde_adapter::ToolCallId::new("toolu_01"),
@@ -542,14 +540,7 @@ mod side_effects {
     /// `shutdown()` must actually end the child.
     #[tokio::test]
     async fn shutdown_ends_the_child_and_closes_the_session() {
-        let (harness_spec, _dir) = spec_with(
-            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}",
-            &[],
-        );
-        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
-        adapter.extra_env = harness_spec.env.clone();
-
-        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        let (mut session, _dir) = session_on(RESULT_ONLY, &[]).await;
         session.shutdown().await.expect("shuts down");
 
         // A shut-down session is finished, not merely quiet: sending must fail
