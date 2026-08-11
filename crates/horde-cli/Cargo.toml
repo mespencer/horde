@@ -20,8 +20,6 @@ tonic = { version = "0.14.6", features = ["channel"] }
 
 [dev-dependencies]
 horde-server = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio"] }
-tower = { version = "0.5", features = ["util"] }
 tonic = { version = "0.14.6", features = ["channel", "server", "router"] }
 
 [[bin]]

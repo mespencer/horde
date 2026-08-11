@@ -1,49 +1,18 @@
 //! The real client library against a real server.
 //!
 //! Nothing is stubbed on either side: `horde_cli::Client` talks to
-//! `horde_server::service::ControlPlane` over tonic on a duplex stream. The
-//! only thing missing versus production is the socket, which is deliberate —
-//! DESIGN.md §3 forbids binding beyond localhost before auth exists, and a port
-//! would add a race without adding coverage.
+//! `horde_server::service::ControlPlane` over tonic, on the loopback socket
+//! `common::serve` binds. Everything above the socket — codegen, framing,
+//! streaming, status mapping — is the real thing, and this file enters the
+//! client through [`horde_cli::Client::with_channel`] so that seam is covered
+//! too.
 
+mod common;
+
+use common::Setup;
 use horde_cli::client::SyncOptions;
 use horde_cli::{Client, render};
-use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::{DeliveryMode, PermissionOutcome, PlacementState};
-use horde_server::EventLog;
-use horde_server::service::{ControlPlane, ServerCore};
-use tonic::transport::{Endpoint, Server, Uri};
-
-/// Helpers return `Result`: clippy's in-test allowance for `expect` does not
-/// reach free functions in an integration test file.
-type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-/// A client wired to its own in-process server.
-async fn client() -> Setup<Client> {
-    let core = ServerCore::new(EventLog::in_memory()?);
-    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-
-    tokio::spawn(async move {
-        let _ = Server::builder()
-            .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
-            .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-            .await;
-    });
-
-    let mut client_side = Some(client_side);
-    let channel = Endpoint::try_from("http://[::]:50051")?
-        .connect_with_connector(tower::service_fn(move |_: Uri| {
-            let stream = client_side.take();
-            async move {
-                stream
-                    .map(hyper_util::rt::TokioIo::new)
-                    .ok_or_else(|| std::io::Error::other("the duplex was already taken"))
-            }
-        }))
-        .await?;
-
-    Ok(Client::with_channel(channel))
-}
 
 /// Replays a session and returns the sequences the client observed.
 async fn replay(client: &mut Client, session_id: &str, from: u64) -> Setup<Vec<u64>> {
@@ -60,7 +29,7 @@ async fn replay(client: &mut Client, session_id: &str, from: u64) -> Setup<Vec<u
 
 #[tokio::test]
 async fn hello_reports_what_the_server_is() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
     let server = client.hello("0.1.0").await.expect("hello must succeed");
     assert!(
@@ -74,17 +43,11 @@ async fn hello_reports_what_the_server_is() {
 /// back.
 #[tokio::test]
 async fn create_spawn_send_then_sync_sees_every_event() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
-    let (summary, root) = client
-        .create_session("ci-fix", "key-1")
+    let (session_id, root) = common::seed(&mut client, "ci-fix")
         .await
         .expect("create must succeed");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("a created session has an id");
 
     let spawned = client
         .spawn_agent(&session_id, None, "")
@@ -97,12 +60,7 @@ async fn create_spawn_send_then_sync_sees_every_event() {
     );
 
     let sent = client
-        .send_assignment(
-            &root.to_string(),
-            "fix the build",
-            DeliveryMode::TurnBoundary,
-            "",
-        )
+        .send_assignment(&root, "fix the build", DeliveryMode::TurnBoundary, "")
         .await
         .expect("send must succeed");
     assert!(
@@ -128,29 +86,12 @@ async fn create_spawn_send_then_sync_sees_every_event() {
 /// scrollback, and attach are all built on.
 #[tokio::test]
 async fn syncing_from_an_offset_returns_exactly_the_tail_of_a_full_replay() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
-    let (summary, root) = client
-        .create_session("offsets", "key-1")
+    let (session_id, root) = common::seed(&mut client, "offsets").await.expect("create");
+    common::send_notes(&mut client, &root, 4)
         .await
-        .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
-
-    for index in 0..4 {
-        client
-            .send_note(
-                &root.to_string(),
-                &format!("note {index}"),
-                DeliveryMode::TurnBoundary,
-                "",
-            )
-            .await
-            .expect("send");
-    }
+        .expect("send");
 
     let full = replay(&mut client, &session_id, 0).await.expect("full");
     let from_third = replay(&mut client, &session_id, 3).await.expect("partial");
@@ -169,20 +110,12 @@ async fn syncing_from_an_offset_returns_exactly_the_tail_of_a_full_replay() {
 /// without re-seeing what it already had.
 #[tokio::test]
 async fn a_reconnecting_client_resumes_without_duplicates_or_gaps() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
-    let (summary, root) = client
-        .create_session("resume", "key-1")
-        .await
-        .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
+    let (session_id, root) = common::seed(&mut client, "resume").await.expect("create");
 
     client
-        .send_note(&root.to_string(), "before", DeliveryMode::TurnBoundary, "")
+        .send_note(&root, "before", DeliveryMode::TurnBoundary, "")
         .await
         .expect("send");
 
@@ -199,7 +132,7 @@ async fn a_reconnecting_client_resumes_without_duplicates_or_gaps() {
         .expect("first pass");
 
     client
-        .send_note(&root.to_string(), "after", DeliveryMode::TurnBoundary, "")
+        .send_note(&root, "after", DeliveryMode::TurnBoundary, "")
         .await
         .expect("send");
 
@@ -227,23 +160,17 @@ async fn a_reconnecting_client_resumes_without_duplicates_or_gaps() {
 /// `Ok(0)` and `Ok(1)` surviving here.
 #[tokio::test]
 async fn interrupt_returns_the_log_position_it_wrote() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
-    let (summary, root) = client
-        .create_session("interrupt", "key-1")
+    let (session_id, root) = common::seed(&mut client, "interrupt")
         .await
         .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
 
     let before = replay(&mut client, &session_id, 0).await.expect("replay");
     let head_before = before.last().copied().unwrap_or(0);
 
     let sequence = client
-        .interrupt(&root.to_string(), "changed my mind")
+        .interrupt(&root, "changed my mind")
         .await
         .expect("interrupt");
 
@@ -259,20 +186,12 @@ async fn interrupt_returns_the_log_position_it_wrote() {
 /// Same contract for send: the sequence is what a caller resumes from.
 #[tokio::test]
 async fn send_returns_the_log_position_it_wrote() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
-    let (summary, root) = client
-        .create_session("send", "key-1")
-        .await
-        .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
+    let (session_id, root) = common::seed(&mut client, "send").await.expect("create");
 
     let response = client
-        .send_note(&root.to_string(), "hello", DeliveryMode::TurnBoundary, "")
+        .send_note(&root, "hello", DeliveryMode::TurnBoundary, "")
         .await
         .expect("send");
 
@@ -286,7 +205,7 @@ async fn send_returns_the_log_position_it_wrote() {
 
 #[tokio::test]
 async fn approving_an_unknown_request_is_refused() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
     let error = client
         .answer_permission("no-such-request", PermissionOutcome::Allow, "", false)
@@ -302,7 +221,7 @@ async fn approving_an_unknown_request_is_refused() {
 /// bug against a roadmap item.
 #[tokio::test]
 async fn an_unbuilt_verb_reports_unimplemented_rather_than_a_fabricated_success() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
     // Archiving a session that does not exist proves the error path is real
     // status mapping rather than a client-side guess.
@@ -319,17 +238,11 @@ async fn an_unbuilt_verb_reports_unimplemented_rather_than_a_fabricated_success(
 
 #[tokio::test]
 async fn archiving_moves_a_session_out_of_the_default_listing() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
 
-    let (summary, _) = client
-        .create_session("temporary", "key-1")
+    let (session_id, _) = common::seed(&mut client, "temporary")
         .await
         .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
 
     assert_eq!(client.list_sessions(false).await.expect("list").len(), 1);
 
@@ -353,7 +266,7 @@ async fn archiving_moves_a_session_out_of_the_default_listing() {
 /// so `--json` is known to survive real wire values.
 #[tokio::test]
 async fn json_rendering_of_a_real_session_parses() {
-    let mut client = client().await.expect("a connected client");
+    let mut client = common::client().await.expect("a connected client");
     let (summary, _) = client
         .create_session("json", "key-1")
         .await

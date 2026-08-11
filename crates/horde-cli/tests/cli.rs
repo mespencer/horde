@@ -6,36 +6,14 @@
 //! code. A library test cannot catch a verb wired to the wrong call or a flag
 //! that parses and is then ignored.
 //!
-//! Binding is `127.0.0.1:0` — a real socket, on loopback only, with the port
-//! chosen by the OS so parallel tests cannot collide. DESIGN.md §3 forbids
-//! binding beyond localhost until auth exists.
+//! The server comes from `common::serve`, on a real loopback socket — which is
+//! the reason that harness binds one at all: a subprocess cannot be handed an
+//! in-process stream.
 
+mod common;
+
+use common::{Setup, serve};
 use tokio::process::Command;
-
-use horde_cli::Client;
-use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
-use horde_server::EventLog;
-use horde_server::service::{ControlPlane, ServerCore};
-use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-
-type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-/// A server listening on a loopback port, and its address.
-async fn serve() -> Setup<String> {
-    let core = ServerCore::new(EventLog::in_memory()?);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await;
-    });
-
-    Ok(format!("http://{address}"))
-}
 
 /// What a `horde` invocation produced.
 struct Run {
@@ -99,11 +77,7 @@ async fn session_list_json_is_machine_readable() {
 
     // Seed through the library, then read back through the binary — the point
     // is the CLI's output, not another round of the library's write path.
-    let mut client = Client::connect(&endpoint).await.expect("connect");
-    client
-        .create_session("ci-fix", "key-1")
-        .await
-        .expect("create");
+    common::seeded(&endpoint, "ci-fix").await.expect("seed");
 
     let run = horde(&endpoint, &["--json", "session", "list"])
         .await
@@ -140,16 +114,7 @@ async fn session_new_prints_the_root_agent_the_next_command_needs() {
 async fn sync_replays_a_session_to_stdout_and_exits() {
     let endpoint = serve().await.expect("a listening server");
 
-    let mut client = Client::connect(&endpoint).await.expect("connect");
-    let (summary, _) = client
-        .create_session("sync", "key-1")
-        .await
-        .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
+    let (_, session_id, _) = common::seeded(&endpoint, "sync").await.expect("seed");
 
     // No `--follow`: the scriptable form replays to head and completes, which
     // is what makes this test terminate at all.
@@ -169,27 +134,10 @@ async fn sync_replays_a_session_to_stdout_and_exits() {
 async fn sync_from_an_offset_skips_what_came_before() {
     let endpoint = serve().await.expect("a listening server");
 
-    let mut client = Client::connect(&endpoint).await.expect("connect");
-    let (summary, root) = client
-        .create_session("offsets", "key-1")
+    let (mut client, session_id, root) = common::seeded(&endpoint, "offsets").await.expect("seed");
+    common::send_notes(&mut client, &root, 3)
         .await
-        .expect("create");
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .expect("an id");
-    for index in 0..3 {
-        client
-            .send_note(
-                &root.to_string(),
-                &format!("note {index}"),
-                horde_proto::v1::DeliveryMode::TurnBoundary,
-                "",
-            )
-            .await
-            .expect("send");
-    }
+        .expect("send");
 
     let all = horde(&endpoint, &["--json", "sync", &session_id])
         .await

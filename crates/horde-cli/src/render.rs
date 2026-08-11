@@ -578,17 +578,26 @@ mod tests {
         assert_eq!(parsed["assignment_id"], serde_json::Value::Null);
     }
 
-    #[test]
-    fn a_placed_spawn_names_its_worker() {
-        let response = horde_proto::v1::SpawnAgentResponse {
+    /// A spawn response for `agent-1`, landed however the caller says.
+    fn spawn_response(
+        state: PlacementState,
+        worker: Option<&str>,
+        reason: &str,
+    ) -> horde_proto::v1::SpawnAgentResponse {
+        horde_proto::v1::SpawnAgentResponse {
             agent_id: Some(AgentId::new("agent-1")),
             placement: Some(Placement {
                 agent_id: Some(AgentId::new("agent-1")),
-                state: PlacementState::Placed as i32,
-                worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
-                reason: String::new(),
+                state: state as i32,
+                worker_id: worker.map(horde_proto::v1::WorkerId::new),
+                reason: reason.to_owned(),
             }),
-        };
+        }
+    }
+
+    #[test]
+    fn a_placed_spawn_names_its_worker() {
+        let response = spawn_response(PlacementState::Placed, Some("worker-a"), "");
 
         let human = spawned(&response, Format::Human);
         assert!(
@@ -604,15 +613,7 @@ mod tests {
     /// A queued spawn without its reason is not actionable.
     #[test]
     fn a_queued_spawn_keeps_its_reason_in_both_formats() {
-        let response = horde_proto::v1::SpawnAgentResponse {
-            agent_id: Some(AgentId::new("agent-1")),
-            placement: Some(Placement {
-                agent_id: Some(AgentId::new("agent-1")),
-                state: PlacementState::Queued as i32,
-                worker_id: None,
-                reason: "no worker is connected".to_owned(),
-            }),
-        };
+        let response = spawn_response(PlacementState::Queued, None, "no worker is connected");
 
         let human = spawned(&response, Format::Human);
         assert!(human.contains("queued") && human.contains("no worker is connected"));

@@ -453,13 +453,11 @@ dependencies = [
  "clap",
  "horde-proto",
  "horde-server",
- "hyper-util",
  "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
  "tonic",
- "tower",
 ]
 
 [[package]]

@@ -9,31 +9,12 @@
 //! Each case builds its `Cli` by parsing real argument vectors, so a flag that
 //! stops reaching its verb fails here rather than in someone's shell.
 
+mod common;
+
 use clap::Parser;
+use common::{Setup, serve};
 use horde_cli::Format;
 use horde_cli::cli::{Cli, run};
-use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
-use horde_server::EventLog;
-use horde_server::service::{ControlPlane, ServerCore};
-use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-
-type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-async fn serve() -> Setup<String> {
-    let core = ServerCore::new(EventLog::in_memory()?);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await;
-    });
-
-    Ok(format!("http://{address}"))
-}
 
 /// Parses an argument vector against a live endpoint and runs it.
 ///
@@ -51,14 +32,8 @@ async fn invoke(endpoint: &str, args: &[&str]) -> Setup<()> {
 
 /// Creates a session and returns its id and root agent id.
 async fn seed(endpoint: &str) -> Setup<(String, String)> {
-    let mut client = horde_cli::Client::connect(endpoint).await?;
-    let (summary, root) = client.create_session("verbs", "key-1").await?;
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .ok_or("a created session must have an id")?;
-    Ok((session_id, root.to_string()))
+    let (_, session_id, root) = common::seeded(endpoint, "verbs").await?;
+    Ok((session_id, root))
 }
 
 /// The event kinds a session's log contains, read back through the client.

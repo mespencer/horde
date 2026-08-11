@@ -99,10 +99,12 @@ impl Client {
         })
     }
 
-    /// Builds a client over an existing channel.
+    /// Builds a client over a channel the caller already has.
     ///
-    /// The seam integration tests use: an in-process server needs a channel
-    /// built from a duplex stream, which `connect` cannot produce.
+    /// The seam for anything that owns its transport rather than wanting one
+    /// dialled: a frontend embedding a server, a custom connector, a pooled or
+    /// pre-warmed channel. [`Self::connect`] is this plus the dialling, so this
+    /// is the wider of the two and the one a test enters through.
     #[must_use]
     pub fn with_channel(channel: Channel) -> Self {
         Self {
