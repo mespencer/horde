@@ -429,3 +429,202 @@ mod tests {
         assert_eq!(usage.total(), 31);
     }
 }
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::{HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, Utilization};
+
+    fn usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            ..TokenUsage::default()
+        }
+    }
+
+    /// `is_zero` must distinguish an interrupted turn from a billed one.
+    ///
+    /// A mutant returning `true` survived, which would report every turn as
+    /// free — and usage that always reads zero is worse than absent usage,
+    /// because it looks like a measurement.
+    #[test]
+    fn only_an_unbilled_turn_reads_as_zero() {
+        assert!(TokenUsage::default().is_zero());
+        assert!(!usage(1, 0).is_zero(), "input alone is still billed");
+        assert!(!usage(0, 1).is_zero(), "so is output alone");
+        assert!(
+            !TokenUsage {
+                cache_read_input_tokens: 5,
+                ..TokenUsage::default()
+            }
+            .is_zero(),
+            "cache traffic is billed too"
+        );
+    }
+
+    /// Addition must add every field, not return a default.
+    #[test]
+    fn adding_two_readings_sums_every_field() {
+        let a = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_input_tokens: 3,
+            cache_write_input_tokens: 4,
+            reasoning_output_tokens: 5,
+        };
+        let sum = a + a;
+
+        assert_eq!(sum.input_tokens, 2);
+        assert_eq!(sum.output_tokens, 4);
+        assert_eq!(sum.cache_read_input_tokens, 6);
+        assert_eq!(sum.cache_write_input_tokens, 8);
+        assert_eq!(sum.reasoning_output_tokens, 10);
+        assert_ne!(sum, TokenUsage::default(), "a sum is not a default");
+    }
+
+    /// `+=` must accumulate, and in the right direction.
+    ///
+    /// Mutants replacing the body with `()` and the `+` with `-` both survived.
+    /// A no-op `+=` silently under-bills a tree; a subtracting one saturates to
+    /// zero and reports the same thing.
+    #[test]
+    fn add_assign_accumulates_forward() {
+        let mut running = usage(10, 20);
+        running += usage(5, 7);
+
+        assert_eq!(running.input_tokens, 15);
+        assert_eq!(running.output_tokens, 27);
+    }
+
+    /// The restart check must look at **every** field.
+    ///
+    /// Four `||`-to-`&&` mutants survived, meaning a restart visible in only
+    /// one counter went unnoticed. That is the case that matters: a `--resume`
+    /// into a fresh child restarts its counters, and a Worker that missed it
+    /// would bill the difference between two unrelated processes.
+    #[test]
+    fn a_restart_is_detected_from_any_counter_going_backwards() {
+        let fields: [(&str, TokenUsage, TokenUsage); 4] = [
+            ("input", usage(10, 10), usage(1, 10)),
+            ("output", usage(10, 10), usage(10, 1)),
+            (
+                "cache read",
+                TokenUsage {
+                    cache_read_input_tokens: 10,
+                    ..TokenUsage::default()
+                },
+                TokenUsage {
+                    cache_read_input_tokens: 1,
+                    ..TokenUsage::default()
+                },
+            ),
+            (
+                "cache write",
+                TokenUsage {
+                    cache_write_input_tokens: 10,
+                    ..TokenUsage::default()
+                },
+                TokenUsage {
+                    cache_write_input_tokens: 1,
+                    ..TokenUsage::default()
+                },
+            ),
+        ];
+
+        for (name, first, restarted) in fields {
+            let mut accumulator = UsageAccumulator::new();
+            accumulator.observe(first, 0.0);
+            let delta = accumulator.observe(restarted, 0.0);
+
+            assert_eq!(
+                delta.tokens, restarted,
+                "a restart visible in {name} alone must be taken whole, not \
+                 differenced against a process that no longer exists"
+            );
+        }
+    }
+
+    /// A reading that did not go backwards is differenced, not taken whole.
+    ///
+    /// The other direction of the same guard: mutants flipping `<` to `>` would
+    /// treat ordinary growth as a restart and re-bill the running total every
+    /// turn.
+    #[test]
+    fn ordinary_growth_is_differenced() {
+        let mut accumulator = UsageAccumulator::new();
+        accumulator.observe(usage(10, 10), 0.001);
+
+        let delta = accumulator.observe(usage(15, 30), 0.003);
+        assert_eq!(delta.tokens, usage(5, 20), "only the new tokens are billed");
+        assert!((delta.cost_usd - 0.002).abs() < 1e-9);
+    }
+
+    /// A cost that drops without any counter dropping is still a restart.
+    ///
+    /// The `||` in `observe` had mutants surviving in both directions: cost and
+    /// tokens are independent restart signals, and a harness can reset one
+    /// before the other becomes visible.
+    #[test]
+    fn a_cost_going_backwards_alone_signals_a_restart() {
+        let mut accumulator = UsageAccumulator::new();
+        accumulator.observe(usage(10, 10), 0.005);
+
+        // Same counters, lower cost — the process was replaced.
+        let delta = accumulator.observe(usage(10, 10), 0.001);
+        assert!(
+            (delta.cost_usd - 0.001).abs() < 1e-9,
+            "the reading is taken whole, not differenced to a negative"
+        );
+    }
+
+    /// Equal readings are not a restart — they are a turn that billed nothing.
+    ///
+    /// `<`-to-`<=` survived, which would have taken every repeated reading
+    /// whole and re-billed the running total.
+    #[test]
+    fn an_unchanged_reading_bills_nothing() {
+        let mut accumulator = UsageAccumulator::new();
+        accumulator.observe(usage(10, 20), 0.001);
+
+        let delta = accumulator.observe(usage(10, 20), 0.001);
+        assert!(
+            delta.tokens.is_zero(),
+            "a repeated reading is no new work, not a fresh process"
+        );
+        assert_eq!(delta.cost_usd, 0.0);
+    }
+
+    /// A decrease of exactly one epsilon is noise, not a restart.
+    ///
+    /// `observe` compares `cost + EPSILON < previous`, and the `<`-to-`<=`
+    /// mutant differs only at that exact boundary. Pinning it documents the
+    /// deliberate choice: the epsilon exists to absorb float noise, so a drop
+    /// no larger than the noise floor is not treated as a replaced process.
+    #[test]
+    fn a_cost_drop_within_the_noise_floor_is_not_a_restart() {
+        let mut accumulator = UsageAccumulator::new();
+        accumulator.observe(usage(10, 10), f64::EPSILON);
+
+        // Same counters, cost lower by exactly one epsilon.
+        let delta = accumulator.observe(usage(10, 10), 0.0);
+        assert!(
+            delta.tokens.is_zero(),
+            "a drop at the noise floor bills nothing rather than re-billing \
+             the whole reading as a fresh process"
+        );
+    }
+
+    /// `remaining_fraction` on a window carrying nothing measurable.
+    #[test]
+    fn an_allowed_only_window_reports_no_fraction() {
+        let window = RateWindow {
+            source: HeadroomSource::ProviderReported,
+            window: "weekly".to_owned(),
+            utilization: Utilization::AllowedOnly { allowed: true },
+            window_duration: None,
+            resets_at_unix: None,
+        };
+        assert_eq!(window.utilization.remaining_fraction(), None);
+        assert!(!window.utilization.is_exhausted());
+    }
+}
