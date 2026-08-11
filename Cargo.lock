@@ -447,6 +447,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "horde-proto",
+ "horde-server",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "horde-gauntlet"
 version = "0.1.0"
 dependencies = [
