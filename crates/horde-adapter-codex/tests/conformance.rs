@@ -12,9 +12,9 @@
 use horde_adapter::AgentSession;
 use horde_adapter::usage::Utilization;
 use horde_adapter::{AgentEvent, TurnStatus};
-use horde_adapter_codex::ReplaySession;
 use horde_adapter_codex::TurnAssembler;
 use horde_adapter_codex::codec::decode_line;
+use horde_adapter_codex::replay::replay as replay_session;
 use horde_testkit::{HarnessOutputKey, Transcript};
 
 /// The W2c recordings, loaded through the shared testkit.
@@ -318,7 +318,7 @@ async fn a_recorded_session_satisfies_the_adapter_contract() {
     assert!(!turns.is_empty(), "the recording must contain a turn");
 
     let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
-    let mut session = ReplaySession::new(turns);
+    let mut session = replay_session(turns);
 
     let records = horde_testkit::conformance::check_session(&mut session, &messages).await;
     assert!(
@@ -334,7 +334,7 @@ async fn the_capability_claims_are_honest_about_gating() {
     // Codex claims no PreAuthorizeToolCalls, so the seam must never surface a
     // permission request — and answering one that cannot exist must be an
     // error rather than a silent success.
-    let mut session = ReplaySession::new(codex_turns("04-approval-echo-untrusted.jsonl"));
+    let mut session = replay_session(codex_turns("04-approval-echo-untrusted.jsonl"));
     let refused = session
         .answer_permission(
             &horde_adapter::ToolCallId::new("exec-1"),

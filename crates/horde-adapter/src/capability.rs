@@ -304,3 +304,44 @@ mod tests {
         assert!(!interrupt_only.supports(Capability::AmendActiveTurn));
     }
 }
+
+#[cfg(test)]
+mod enforcement_tests {
+    use super::{Capabilities, Capability, PermissionEnforcement};
+
+    /// Only per-call enforcement can adjudicate an individual tool call.
+    ///
+    /// The `false` mutant survived, which would have said *nothing* can gate —
+    /// and a placement layer reading that refuses high-trust work everywhere,
+    /// including on Claude, which demonstrably can gate (W1c).
+    #[test]
+    fn only_per_call_enforcement_gates_individual_calls() {
+        assert!(PermissionEnforcement::PerCall.can_gate_individual_calls());
+        assert!(
+            !PermissionEnforcement::SandboxAtSpawn.can_gate_individual_calls(),
+            "a sandbox tier constrains the agent but cannot adjudicate one call"
+        );
+        assert!(!PermissionEnforcement::Unenforced.can_gate_individual_calls());
+    }
+
+    /// `none()` must actually be empty.
+    ///
+    /// It is the base every capability set is built from, so a `none()` that
+    /// returned something else would silently widen every adapter's claim.
+    #[test]
+    fn the_empty_set_supports_nothing() {
+        let empty = Capabilities::none();
+
+        for capability in Capability::ALL {
+            assert!(
+                !empty.supports(capability),
+                "{capability:?} must not be claimed by an empty set"
+            );
+        }
+        assert_eq!(
+            empty.permission_enforcement(),
+            PermissionEnforcement::Unenforced,
+            "and an empty set enforces nothing"
+        );
+    }
+}

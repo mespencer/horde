@@ -97,6 +97,9 @@ fn exit_suffix(code: Option<i32>) -> String {
     )
 }
 
+/// Shorthand for fallible adapter operations.
+pub type Result<T> = core::result::Result<T, AdapterError>;
+
 #[cfg(test)]
 mod tests {
     use super::AdapterError;

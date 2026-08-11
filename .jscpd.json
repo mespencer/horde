@@ -1,0 +1,12 @@
+{
+  "minTokens": 50,
+  "minLines": 5,
+  "format": ["rust"],
+  "gitignore": true,
+  "ignore": [
+    "**/target/**",
+    "**/node_modules/**",
+    "spikes/**",
+    "docs/spikes/**"
+  ]
+}

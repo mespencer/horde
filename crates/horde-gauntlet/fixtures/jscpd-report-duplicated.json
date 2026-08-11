@@ -1,0 +1,69 @@
+{
+  "duplicates": [
+    {
+      "firstFile": {
+        "end": 16,
+        "endLoc": {
+          "column": 1,
+          "line": 16,
+          "position": 427
+        },
+        "name": "src/one.rs",
+        "start": 1,
+        "startLoc": {
+          "column": 22,
+          "line": 1,
+          "position": 22
+        }
+      },
+      "format": "rust",
+      "fragment": "<elided for fixture size>",
+      "lines": 16,
+      "secondFile": {
+        "end": 16,
+        "endLoc": {
+          "column": 1,
+          "line": 16,
+          "position": 426
+        },
+        "name": "src/two.rs",
+        "start": 1,
+        "startLoc": {
+          "column": 21,
+          "line": 1,
+          "position": 21
+        }
+      },
+      "tokens": 104
+    }
+  ],
+  "statistics": {
+    "detectionDate": "2026-08-09T21:11:03.584Z",
+    "formats": {
+      "rust": {
+        "clones": 1,
+        "duplicatedLines": 15,
+        "duplicatedTokens": 104,
+        "lines": 32,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 46.875,
+        "percentageTokens": 48.598130841121495,
+        "sources": 2,
+        "tokens": 214
+      }
+    },
+    "total": {
+      "clones": 1,
+      "duplicatedLines": 15,
+      "duplicatedTokens": 104,
+      "lines": 32,
+      "newClones": 0,
+      "newDuplicatedLines": 0,
+      "percentage": 46.875,
+      "percentageTokens": 48.598130841121495,
+      "sources": 2,
+      "tokens": 214
+    }
+  }
+}

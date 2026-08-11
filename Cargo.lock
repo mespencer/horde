@@ -410,13 +410,13 @@ dependencies = [
  "async-trait",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
 name = "horde-adapter-claude"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "horde-adapter",
  "horde-testkit",
  "serde",
@@ -428,7 +428,6 @@ dependencies = [
 name = "horde-adapter-codex"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "horde-adapter",
  "horde-testkit",
  "serde",
@@ -464,6 +463,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-gauntlet"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "horde-proto"
 version = "0.1.0"
 dependencies = [
@@ -484,6 +493,7 @@ dependencies = [
  "hyper-util",
  "proptest",
  "prost",
+ "prost-types",
  "rusqlite",
  "tempfile",
  "thiserror",
@@ -499,9 +509,12 @@ dependencies = [
 name = "horde-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "horde-adapter",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

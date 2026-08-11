@@ -1,107 +1,53 @@
-//! An [`AgentSession`] backed by recorded harness output instead of a process.
+//! An [`AgentSession`](horde_adapter::AgentSession) backed by recorded harness
+//! output instead of a process.
 //!
-//! This is how the codec is held to the real protocol. The bytes are what
-//! `claude` actually wrote during spike W1c; everything above the transport —
-//! decoding, turn assembly, usage normalization, session identity — is the same
-//! code a live session runs. What is missing is only the part that talks to an
-//! operating system.
+//! The machinery — replaying turns, draining events, tracking session identity
+//! — is shared with every other provider and lives in
+//! [`horde_adapter::replay`]. What is claude-specific, and all that lives here,
+//! is what one line of `claude`'s stdout means.
 //!
-//! It is therefore not a mock. The production adapter (wave 5) replaces the
-//! line source with a child process's stdout and keeps the rest, which is
-//! precisely why the conformance suite's verdict on this session means
-//! something about the real one.
+//! The bytes are what `claude` actually wrote during spike W1c, so the
+//! conformance suite's verdict on a replayed session means something about the
+//! live one: the production adapter (wave 5) swaps the line source for a child
+//! process's stdout and keeps everything above it.
 
-use std::collections::VecDeque;
-
-use async_trait::async_trait;
-use horde_adapter::{
-    AdapterError, AgentEvent, AgentSession, PermissionDecision, ProviderSessionId, Result,
-    ToolCallId, TurnInput,
-};
+use horde_adapter::{AdapterError, AgentEvent, LineDecoder, ProviderSessionId, Result, ToolCallId};
 
 use crate::codec::decode_line;
 use crate::turn::TurnAssembler;
 
-/// Replays recorded harness output, one turn per message sent.
-pub struct ReplaySession {
-    /// Remaining turns, each a run of stdout lines ending in a `result`.
-    turns: VecDeque<Vec<String>>,
-    /// Events decoded for the turn currently being drained.
-    pending: VecDeque<AgentEvent>,
+/// Reads one line of `claude` stream-json into events.
+#[derive(Debug, Default)]
+pub struct StreamJsonLines {
     assembler: TurnAssembler,
-    session_id: Option<ProviderSessionId>,
 }
 
-impl ReplaySession {
-    /// Builds a session from stdout lines already grouped into turns.
-    #[must_use]
-    pub fn new(turns: Vec<Vec<String>>) -> Self {
-        Self {
-            turns: turns.into(),
-            pending: VecDeque::new(),
-            assembler: TurnAssembler::new(),
-            session_id: None,
-        }
+impl LineDecoder for StreamJsonLines {
+    fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {
+        let envelope = decode_line(line)?;
+        Ok(self.assembler.feed(&envelope))
     }
 
-    /// How many recorded turns have not been replayed yet.
-    #[must_use]
-    pub fn remaining_turns(&self) -> usize {
-        self.turns.len()
-    }
-}
-
-#[async_trait]
-impl AgentSession for ReplaySession {
-    fn provider_session_id(&self) -> Option<&ProviderSessionId> {
-        self.session_id.as_ref()
+    fn provider_session_id(&self) -> Option<ProviderSessionId> {
+        self.assembler.provider_session_id()
     }
 
-    async fn send(&mut self, _input: TurnInput) -> Result<()> {
-        // The recording fixes what was said and what came back; the message
-        // text cannot change the reply, so it is deliberately ignored rather
-        // than matched against the recorded stdin.
-        let Some(lines) = self.turns.pop_front() else {
-            return Err(AdapterError::HarnessExited { exit_code: None });
-        };
-
-        for line in &lines {
-            let envelope = decode_line(line)?;
-            self.pending.extend(self.assembler.feed(&envelope));
-        }
-        self.session_id = self.assembler.provider_session_id();
-        Ok(())
-    }
-
-    async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
-        Ok(self.pending.pop_front())
-    }
-
-    async fn answer_permission(
-        &mut self,
-        tool_call_id: &ToolCallId,
-        _decision: PermissionDecision,
-    ) -> Result<()> {
+    fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {
         // Permission prompts reach a live session over the MCP endpoint, not
-        // over stdout, so a recording of stdout has nothing to answer. Reporting
-        // that honestly beats accepting a decision that would go nowhere.
-        Err(AdapterError::UnknownPermissionRequest {
+        // over stdout, so a recording of stdout has nothing to answer.
+        AdapterError::UnknownPermissionRequest {
             tool_call_id: tool_call_id.clone(),
-        })
+        }
     }
+}
 
-    async fn interrupt(&mut self) -> Result<()> {
-        // Whatever the interrupt did is already in the recording — the
-        // transcripts include a turn that ends `aborted_streaming`. There is
-        // nothing left to cancel.
-        Ok(())
-    }
+/// Replays recorded `claude` output, one turn per message sent.
+pub type ReplaySession = horde_adapter::ReplaySession<StreamJsonLines>;
 
-    async fn shutdown(&mut self) -> Result<()> {
-        self.turns.clear();
-        self.pending.clear();
-        Ok(())
-    }
+/// Builds a session from stdout lines already grouped into turns.
+#[must_use]
+pub fn replay(turns: Vec<Vec<String>>) -> ReplaySession {
+    ReplaySession::new(StreamJsonLines::default(), turns)
 }
 
 #[cfg(test)]
@@ -109,7 +55,7 @@ mod tests {
     use horde_adapter::{AgentSession, ToolCallId, TurnInput};
     use serde_json::json;
 
-    use super::ReplaySession;
+    use super::replay;
 
     fn one_turn() -> Vec<Vec<String>> {
         vec![vec![
@@ -121,44 +67,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sending_past_the_end_of_the_recording_reports_the_harness_as_gone() {
-        let mut session = ReplaySession::new(one_turn());
+    async fn a_recorded_turn_establishes_the_session_it_recorded() {
+        let mut session = replay(one_turn());
+        assert!(session.provider_session_id().is_none());
         session
-            .send(TurnInput::queued("first"))
+            .send(TurnInput::queued("hi"))
             .await
             .expect("the recorded turn must replay");
-
-        let error = session
-            .send(TurnInput::queued("second"))
-            .await
-            .expect_err("there is no second recorded turn");
-        assert!(error.to_string().contains("exited"));
+        assert_eq!(
+            session.provider_session_id().map(ToString::to_string),
+            Some("s1".to_owned())
+        );
     }
 
     #[tokio::test]
-    async fn answering_a_permission_request_that_cannot_exist_is_an_error() {
-        let mut session = ReplaySession::new(one_turn());
+    async fn stdout_recordings_carry_no_permission_channel() {
+        let mut session = replay(one_turn());
         let error = session
             .answer_permission(
                 &ToolCallId::new("toolu_01"),
                 horde_adapter::PermissionDecision::allow(),
             )
             .await
-            .expect_err("stdout recordings carry no permission channel");
-        assert!(error.to_string().contains("toolu_01"));
-    }
-
-    #[tokio::test]
-    async fn the_session_id_becomes_available_once_a_turn_has_replayed() {
-        let mut session = ReplaySession::new(one_turn());
-        assert!(session.provider_session_id().is_none());
-        session
-            .send(TurnInput::queued("hi"))
-            .await
-            .expect("must replay");
-        assert_eq!(
-            session.provider_session_id().map(ToString::to_string),
-            Some("s1".to_owned())
-        );
+            .expect_err("prompts arrive over MCP, not over stdout");
+        assert!(error.to_string().contains("toolu_01"), "{error}");
     }
 }

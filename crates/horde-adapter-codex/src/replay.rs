@@ -1,116 +1,59 @@
-//! An [`AgentSession`] backed by recorded app-server output instead of a
-//! process.
+//! An [`AgentSession`](horde_adapter::AgentSession) backed by recorded
+//! app-server output instead of a process.
 //!
-//! This is how the codec is held to the real protocol. The bytes are what
-//! `codex app-server` actually wrote during spike W2c; everything above the
-//! transport — decoding, turn assembly, usage idempotence, thread identity — is
-//! the same code a live session runs. What is missing is only the part that
-//! talks to an operating system.
+//! The machinery — replaying turns, draining events, tracking thread identity —
+//! is shared with every other provider and lives in [`horde_adapter::replay`].
+//! What is Codex-specific, and all that lives here, is what one app-server
+//! frame means.
 //!
-//! It is therefore not a mock. The production adapter (wave 5) replaces the
-//! line source with a child process's stdout and keeps the rest, which is
-//! precisely why the conformance suite's verdict on this session means
-//! something about the real one.
+//! The bytes are what `codex app-server` actually wrote during spike W2c, so
+//! the conformance suite's verdict on a replayed session means something about
+//! the live one.
 
-use std::collections::VecDeque;
-
-use async_trait::async_trait;
-use horde_adapter::{
-    AdapterError, AgentEvent, AgentSession, PermissionDecision, ProviderSessionId, Result,
-    ToolCallId, TurnInput,
-};
+use horde_adapter::{AdapterError, AgentEvent, LineDecoder, ProviderSessionId, Result, ToolCallId};
 
 use crate::codec::decode_line;
 use crate::turn::TurnAssembler;
 
-/// Replays recorded app-server output, one turn per message sent.
-pub struct ReplaySession {
-    /// Remaining turns, each a run of frames ending in the turn's terminal
-    /// signal — which for an interrupted turn is `thread/status → idle` and not
-    /// `turn/completed`, because Codex emits no terminal frame after an
-    /// interrupt.
-    turns: VecDeque<Vec<String>>,
-    pending: VecDeque<AgentEvent>,
+/// Reads one Codex app-server frame into events.
+#[derive(Debug, Default)]
+pub struct AppServerFrames {
     assembler: TurnAssembler,
-    session_id: Option<ProviderSessionId>,
 }
 
-impl ReplaySession {
-    /// Builds a session from frames already grouped into turns.
-    #[must_use]
-    pub fn new(turns: Vec<Vec<String>>) -> Self {
-        Self {
-            turns: turns.into(),
-            pending: VecDeque::new(),
-            assembler: TurnAssembler::new(),
-            session_id: None,
-        }
+impl LineDecoder for AppServerFrames {
+    fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {
+        let frame = decode_line(line)?;
+        Ok(self.assembler.feed(&frame))
     }
 
-    /// How many recorded turns have not been replayed yet.
-    #[must_use]
-    pub fn remaining_turns(&self) -> usize {
-        self.turns.len()
+    fn provider_session_id(&self) -> Option<ProviderSessionId> {
+        self.assembler.provider_session_id()
     }
 
-    fn drain_turn(&mut self, lines: &[String]) -> Result<()> {
-        for line in lines {
-            let frame = decode_line(line)?;
-            self.pending.extend(self.assembler.feed(&frame));
-        }
-        self.session_id = self.assembler.provider_session_id();
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AgentSession for ReplaySession {
-    fn provider_session_id(&self) -> Option<&ProviderSessionId> {
-        self.session_id.as_ref()
+    fn note_interrupt_requested(&mut self) {
+        // The assembler cannot infer this: `thread/status → idle` is both how
+        // an interrupted turn ends and the ordinary state between turns.
+        self.assembler.note_interrupt_requested();
     }
 
-    async fn send(&mut self, _input: TurnInput) -> Result<()> {
-        // The recording fixes what was said and what came back; the message
-        // text cannot change the reply, so it is deliberately ignored rather
-        // than matched against the recorded request.
-        let Some(lines) = self.turns.pop_front() else {
-            return Err(AdapterError::HarnessExited { exit_code: None });
-        };
-        self.drain_turn(&lines)
-    }
-
-    async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
-        Ok(self.pending.pop_front())
-    }
-
-    async fn answer_permission(
-        &mut self,
-        tool_call_id: &ToolCallId,
-        _decision: PermissionDecision,
-    ) -> Result<()> {
+    fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {
         // Codex 0.145.0 routes no approvals to the client at all (ADR-0005), so
         // there is never an outstanding request to answer — on a recording or
-        // on a live session. Reporting that honestly beats accepting a decision
-        // that would go nowhere.
-        Err(AdapterError::UnknownPermissionRequest {
+        // on a live session.
+        AdapterError::UnknownPermissionRequest {
             tool_call_id: tool_call_id.clone(),
-        })
+        }
     }
+}
 
-    async fn interrupt(&mut self) -> Result<()> {
-        // Tell the assembler, because it cannot infer this: `thread/status →
-        // idle` is both how an interrupted turn ends and the ordinary state
-        // between turns. Whatever the interrupt did is already in the
-        // recording; what is missing is the knowledge that it was asked for.
-        self.assembler.note_interrupt_requested();
-        Ok(())
-    }
+/// Replays recorded Codex output, one turn per message sent.
+pub type ReplaySession = horde_adapter::ReplaySession<AppServerFrames>;
 
-    async fn shutdown(&mut self) -> Result<()> {
-        self.turns.clear();
-        self.pending.clear();
-        Ok(())
-    }
+/// Builds a session from frames already grouped into turns.
+#[must_use]
+pub fn replay(turns: Vec<Vec<String>>) -> ReplaySession {
+    ReplaySession::new(AppServerFrames::default(), turns)
 }
 
 #[cfg(test)]
@@ -118,7 +61,7 @@ mod tests {
     use horde_adapter::{AgentEvent, AgentSession, ToolCallId, TurnInput, TurnStatus};
     use serde_json::json;
 
-    use super::ReplaySession;
+    use super::{ReplaySession, replay};
 
     fn one_turn() -> Vec<Vec<String>> {
         vec![vec![
@@ -141,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn sending_past_the_end_of_the_recording_reports_the_harness_as_gone() {
-        let mut session = ReplaySession::new(one_turn());
+        let mut session = replay(one_turn());
         session
             .send(TurnInput::queued("first"))
             .await
@@ -156,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn answering_a_permission_request_that_cannot_exist_is_an_error() {
-        let mut session = ReplaySession::new(one_turn());
+        let mut session = replay(one_turn());
         let error = session
             .answer_permission(
                 &ToolCallId::new("item-1"),
@@ -169,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn remaining_turns_counts_down_as_the_recording_drains() {
-        let mut session = ReplaySession::new(one_turn());
+        let mut session = replay(one_turn());
         assert_eq!(session.remaining_turns(), 1);
 
         session
@@ -181,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_discards_the_rest_of_the_recording() {
-        let mut session = ReplaySession::new(one_turn());
+        let mut session = replay(one_turn());
         session.shutdown().await.expect("shutdown is infallible");
 
         assert_eq!(session.remaining_turns(), 0, "the recording is dropped");
@@ -195,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_thread_id_becomes_available_once_a_turn_has_replayed() {
-        let mut session = ReplaySession::new(one_turn());
+        let mut session = replay(one_turn());
         assert!(session.provider_session_id().is_none());
 
         session
@@ -222,7 +165,7 @@ mod tests {
             ]]
         };
 
-        let mut uninterrupted = ReplaySession::new(idle_only());
+        let mut uninterrupted = replay(idle_only());
         uninterrupted
             .send(TurnInput::queued("hi"))
             .await
@@ -235,7 +178,7 @@ mod tests {
             "idle between turns is ordinary and must close nothing"
         );
 
-        let mut interrupted = ReplaySession::new(idle_only());
+        let mut interrupted = replay(idle_only());
         interrupted.interrupt().await.expect("noting is infallible");
         interrupted
             .send(TurnInput::queued("hi"))

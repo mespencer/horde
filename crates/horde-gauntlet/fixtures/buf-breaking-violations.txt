@@ -1,0 +1,2 @@
+proto/x/v1/bad.proto:3:17:Field "1" with name "renamed" on message "Thing" changed option "json_name" from "fieldOne" to "renamed".
+proto/x/v1/bad.proto:3:24:Field "1" on message "Thing" changed name from "field_one" to "renamed".

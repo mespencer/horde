@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+------------
+ Nextest run ID f2180d0e-2bbe-4567-8606-fa15573b5035 with nextest profile: default
+    Starting 8 tests across 2 binaries (1 test skipped)
+        PASS [   0.006s] testprobe tests::doubles
+        PASS [   0.006s] testprobe tests::doubles_negative
+        PASS [   0.006s] testprobe tests::doubles_zero
+        PASS [   0.006s] testprobe tests::halves
+        PASS [   0.006s] testprobe tests::halves_odd
+        PASS [   0.006s] testprobe tests::halves_negative
+        PASS [   0.006s] testprobe::integration doubling_then_halving_round_trips
+        PASS [   0.006s] testprobe::integration halving_then_doubling_loses_the_odd_bit
+------------
+     Summary [   0.008s] 8 tests run: 8 passed, 1 skipped
