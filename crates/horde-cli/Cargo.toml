@@ -1,0 +1,27 @@
+[package]
+name = "horde-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The `horde` client: a typed control-plane client library and the CLI over it."
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+horde-proto = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
+tokio-stream = "0.1.19"
+tonic = { version = "0.14.6", features = ["channel"] }
+
+[dev-dependencies]
+horde-server = { workspace = true }
+tonic = { version = "0.14.6", features = ["channel", "server", "router"] }
+
+[[bin]]
+name = "horde"
+path = "src/bin/horde.rs"
