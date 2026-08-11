@@ -91,20 +91,12 @@ pub struct CommandProjection {
     /// How many commands each worker has been issued. This *is* the per-worker
     /// command sequence.
     issued: BTreeMap<String, u64>,
-    /// Append position folded up to; the cursor the next read continues from.
-    row: u64,
 }
 
 impl CommandProjection {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// The append position this fold has consumed.
-    #[must_use]
-    pub fn row(&self) -> u64 {
-        self.row
     }
 
     /// How many commands this worker has been issued so far.
@@ -120,8 +112,6 @@ impl CommandProjection {
     /// commands: skipping them would leave this worker's numbering right and
     /// the fold's state wrong.
     pub fn advance(&mut self, global: &GlobalEvent) -> Option<(String, StreamCommandsResponse)> {
-        self.row = global.row;
-
         let event = Event::decode(global.event.payload.as_slice()).ok()?;
         let agent_id = event.agent_id.as_ref().map(ToString::to_string)?;
 
@@ -223,6 +213,13 @@ pub struct CommandStream {
     worker_id: String,
     resume_from: u64,
     projection: CommandProjection,
+    /// Append position read up to. Owned here rather than by the fold, because
+    /// this is what [`Self::catch_up`]'s loop terminates on and a loop whose
+    /// termination lives in another function is a hang waiting for a refactor.
+    /// Mutation testing found exactly that: every mutant of the fold that left
+    /// the cursor alone turned the loop into an infinite re-read of one page,
+    /// and hung the suite instead of failing it.
+    cursor: u64,
     notifications: broadcast::Receiver<Notification>,
     parks: Arc<AtomicU64>,
 }
@@ -241,6 +238,7 @@ impl CommandStream {
             worker_id: worker_id.to_owned(),
             resume_from: resume_from.max(1),
             projection: CommandProjection::new(),
+            cursor: 0,
             parks: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -300,13 +298,16 @@ impl CommandStream {
     async fn catch_up(&mut self) -> Result<Vec<StreamCommandsResponse>, ServerError> {
         let mut owed = Vec::new();
         loop {
-            let page = self
-                .log
-                .read_global_from(self.projection.row(), PAGE)
-                .await?;
-            if page.is_empty() {
+            let page = self.log.read_global_from(self.cursor, PAGE).await?;
+            // The cursor comes from the page just read, not from the fold. The
+            // page is strictly ascending in `row` and this is the only reader,
+            // so the next request always asks for something later and the loop
+            // cannot re-read what it just consumed.
+            let Some(last) = page.last() else {
                 return Ok(owed);
-            }
+            };
+            self.cursor = last.row;
+
             for global in &page {
                 if let Some((worker_id, command)) = self.projection.advance(global)
                     && is_owed(
@@ -329,7 +330,7 @@ impl std::fmt::Debug for CommandStream {
             .debug_struct("CommandStream")
             .field("worker_id", &self.worker_id)
             .field("resume_from", &self.resume_from)
-            .field("row", &self.projection.row())
+            .field("row", &self.cursor)
             .finish_non_exhaustive()
     }
 }
@@ -342,11 +343,17 @@ impl std::fmt::Debug for CommandStream {
 /// the beginning of a stream it has already applied.
 pub async fn issued_to(log: &EventLog, worker_id: &str) -> Result<u64, ServerError> {
     let mut projection = CommandProjection::new();
+    let mut cursor = 0;
     loop {
-        let page = log.read_global_from(projection.row(), PAGE).await?;
-        if page.is_empty() {
+        let page = log.read_global_from(cursor, PAGE).await?;
+        // Same rule as `CommandStream::catch_up`: the cursor advances from the
+        // page, so this loop terminates on what it read rather than on what the
+        // fold did with it.
+        let Some(last) = page.last() else {
             return Ok(projection.issued(worker_id));
-        }
+        };
+        cursor = last.row;
+
         for global in &page {
             projection.advance(global);
         }
@@ -636,32 +643,8 @@ mod tests {
         assert_eq!(before.len(), 3, "a vacuous pass here would prove nothing");
     }
 
-    /// The cursor is what lets a stream fold only what is new. It must track
-    /// the last row consumed, including rows that issue no command — a cursor
-    /// that only advanced on commands would re-fold the gaps forever.
-    #[test]
-    fn the_cursor_advances_over_rows_that_issue_nothing() {
-        let mut projection = CommandProjection::new();
-        assert_eq!(projection.row(), 0);
-
-        projection.advance(&row(4, "s1", 1, spawn_event("agent-1", None)));
-        assert_eq!(
-            projection.row(),
-            4,
-            "a spawn issues nothing but is consumed"
-        );
-
-        projection.advance(&row(
-            9,
-            "s1",
-            2,
-            placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
-        ));
-        assert_eq!(projection.row(), 9);
-    }
-
-    /// A payload that is not an `Event` must not stop the fold: the row is
-    /// consumed and skipped, or one bad row would wedge every worker's stream.
+    /// A payload that is not an `Event` must not stop the fold: it is skipped,
+    /// or one bad row would wedge every worker's stream.
     #[test]
     fn an_undecodable_payload_is_skipped_rather_than_fatal() {
         let mut projection = CommandProjection::new();
@@ -676,7 +659,47 @@ mod tests {
         };
 
         assert!(projection.advance(&garbage).is_none());
-        assert_eq!(projection.row(), 1, "and the cursor still moves past it");
+    }
+
+    /// The loop in `catch_up` terminates on the page it read, not on what the
+    /// fold did with it. Every mutation of the fold that left a cursor alone
+    /// used to turn that loop into an infinite re-read of one page — the suite
+    /// hung instead of failing, and cargo-mutants recorded five timeouts rather
+    /// than five kills. A log whose rows issue no commands at all is the case
+    /// that distinguishes the two: it must finish, and finish empty.
+    #[tokio::test]
+    async fn a_log_that_commands_nothing_still_terminates_the_catch_up() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for index in 0..3 {
+            log.append(PendingEvent {
+                session_id: "s1".to_owned(),
+                payload: Event {
+                    agent_id: Some(AgentId::new("agent-1")),
+                    occurred_at: None,
+                    idempotency_key: format!("k{index}"),
+                    kind: Some(Kind::TurnInterrupted(TurnInterrupted::default())),
+                }
+                .encode_to_vec(),
+                ..PendingEvent::default()
+            })
+            .await
+            .expect("append");
+        }
+
+        let mut stream = CommandStream::open(&log, "worker-a", 1);
+        let idle =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.next_batch()).await;
+
+        assert!(
+            idle.is_err(),
+            "there is no command in this log, so the stream must park rather than yield one"
+        );
+        assert_eq!(
+            stream.parks(),
+            1,
+            "and it must have reached the park exactly once: a catch-up that \
+             never terminates never parks at all"
+        );
     }
 
     #[test]
@@ -715,12 +738,20 @@ mod tests {
             .expect("fold")
     }
 
-    #[tokio::test]
-    async fn a_stream_replays_commands_already_in_the_log() {
+    /// A log holding one placed agent, and a stream over it from the start.
+    ///
+    /// The log comes back with the stream because dropping it closes the
+    /// notification channel, which would end the stream rather than park it.
+    async fn one_placement() -> (EventLog, CommandStream) {
         let log = EventLog::in_memory().expect("in-memory log");
         place(&log, "s1", "agent-1", "worker-a").await;
+        let stream = CommandStream::open(&log, "worker-a", 1);
+        (log, stream)
+    }
 
-        let mut stream = CommandStream::open(&log, "worker-a", 1);
+    #[tokio::test]
+    async fn a_stream_replays_commands_already_in_the_log() {
+        let (_log, mut stream) = one_placement().await;
         let batch = next_within(&mut stream).await;
 
         assert_eq!(batch.len(), 1);
@@ -816,6 +847,32 @@ mod tests {
         assert_eq!(
             batch[0].command_sequence, 1,
             "worker-a numbers from its own first command"
+        );
+    }
+
+    /// `Debug` on a stream is what an operator reads when one appears stuck,
+    /// and the two facts that diagnose it are which worker it belongs to and
+    /// how far through the log it has folded. An empty view answers neither —
+    /// the same reason `EventLog` and `ServerCore` assert on theirs.
+    #[tokio::test]
+    async fn the_debug_view_names_the_worker_and_how_far_it_has_read() {
+        let (_log, mut stream) = one_placement().await;
+        let fresh = format!("{stream:?}");
+        assert!(fresh.contains("CommandStream"), "got {fresh}");
+        assert!(
+            fresh.contains("worker-a"),
+            "an operator cannot act on a stream they cannot identify: {fresh}"
+        );
+        assert!(
+            fresh.contains("row: 0"),
+            "a stream that has read nothing must say so: {fresh}"
+        );
+
+        next_within(&mut stream).await;
+        let read = format!("{stream:?}");
+        assert!(
+            read.contains("row: 2"),
+            "the cursor is the whole diagnosis of a stuck stream: {read}"
         );
     }
 
