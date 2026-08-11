@@ -6,3 +6,7 @@
 /scratch/
 /mutants.out/
 **/mutants.out/
+# cargo-mutants rotates the previous run's output aside rather than deleting it,
+# so the debris of a hand-run comes in pairs.
+/mutants.out.old/
+**/mutants.out.old/

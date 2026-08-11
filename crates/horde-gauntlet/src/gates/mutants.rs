@@ -87,33 +87,114 @@ fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
     })
 }
 
+/// One way cargo-mutants says a run found no work, and how the row says it.
+struct NothingToMutate {
+    /// What cargo-mutants printed.
+    marker: &'static str,
+    /// How the row describes it, before the scope is named.
+    reason: &'static str,
+    /// What is worth adding after the scope, if anything.
+    note: &'static str,
+}
+
+/// Why cargo-mutants had nothing to do, when it ran fine and had nothing.
+///
+/// The work can run out at four different stages, and cargo-mutants words each
+/// differently: no Rust in the diff at all, no mutants generated, none left
+/// after filtering, none on the changed lines. Every one of them is the same
+/// fact to this gate — the run completed and there was nothing to measure.
+///
+/// `No mutants were viable` reads like a fifth and is deliberately absent.
+/// cargo-mutants' own wording continues "perhaps there is a problem with
+/// building in a scratch directory", which is the instrument failing rather
+/// than a change with nothing in it. That stays an `error`, and
+/// [`a_build_that_produced_no_viable_mutants_is_still_an_error`] holds the line
+/// — the two messages are one word apart, which is exactly how a broken
+/// instrument would come to be reported as a clean sheet.
+const NOTHING_TO_MUTATE: &[NothingToMutate] = &[
+    NothingToMutate {
+        marker: "changes no Rust source files",
+        reason: "no Rust changed in",
+        note: "",
+    },
+    NothingToMutate {
+        marker: "No mutants to filter",
+        reason: "nothing mutable in",
+        note: TESTS_ARE_NOT_MUTATED,
+    },
+    NothingToMutate {
+        marker: "diff matched no mutants",
+        reason: "nothing mutable in",
+        note: TESTS_ARE_NOT_MUTATED,
+    },
+    NothingToMutate {
+        marker: "No mutants found under the active filters",
+        reason: "nothing mutable in",
+        note: "",
+    },
+    NothingToMutate {
+        marker: "No mutants were generated",
+        reason: "nothing mutable in",
+        note: "",
+    },
+];
+
+/// Why a diff full of Rust can still produce no mutants at all.
+const TESTS_ARE_NOT_MUTATED: &str =
+    " (cargo-mutants does not mutate #[cfg(test)] code, so a tests-only change generates none)";
+
 /// Why there was nothing to mutate, if there was nothing.
 ///
 /// A change that touches no Rust — documentation, a proto file, a config —
-/// generates no mutants and cargo-mutants prints no tally. That is `skipped`,
-/// not `error`: nothing was measured because there was nothing to measure,
-/// which is a different fact from an instrument that broke, and the row has to
-/// say which.
+/// generates no mutants and cargo-mutants prints no tally. Neither does a
+/// change that touches plenty of Rust but only *test* Rust: cargo-mutants does
+/// not mutate `#[cfg(test)]` code or `tests/`, so a diff that is all test files
+/// is a diff with nothing mutable in it. Both are `skipped`, not `error`:
+/// nothing was measured because there was nothing to measure, which is a
+/// different fact from an instrument that broke, and the row has to say which.
+///
+/// Neither is a `pass` either. A zero has to say which of its two meanings it
+/// has, and "no mutant survived because none was ever built" must never read as
+/// "this change is covered".
 pub fn nothing_to_mutate(text: &str, scope: &Scope) -> Option<String> {
-    text.contains("changes no Rust source files")
-        .then(|| format!("no Rust changed in {}", scope.label()))
+    NOTHING_TO_MUTATE
+        .iter()
+        .find(|nothing| text.contains(nothing.marker))
+        .map(|nothing| format!("{} {}{}", nothing.reason, scope.label(), nothing.note))
 }
 
 /// Confirms the configured exclusions are real and took effect.
 ///
-/// Costs nothing when there are none, which is the usual case: the listing run
-/// only happens once something is excluded.
+/// Costs nothing when there are none, which is the usual case: the listing runs
+/// only happen once something is excluded.
+///
+/// Two listings are taken, one with the configuration and one without. Their
+/// difference is exactly what the exclusions removed, which is the only way to
+/// ask the question that matters — did each entry remove what it claims, and
+/// nothing else? — without reimplementing cargo-mutants' regex matching and
+/// hoping the imitation agrees.
 fn check_exclusions(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<(), String> {
     let config = ctx.workspace_root.join(CONFIG);
     let Ok(text) = std::fs::read_to_string(&config) else {
         return Ok(());
     };
-    let patterns = configured_exclusions(&text)?;
-    if patterns.is_empty() {
+    let entries = configured_exclusions(&text)?;
+    if entries.is_empty() {
         return Ok(());
     }
-    let spec = list_spec(ctx);
-    let output = runner.run(&spec).map_err(|error| error.to_string())?;
+    let listed = listing(runner, &list_spec(ctx))?;
+    let unexcluded = listing(runner, &unexcluded_list_spec(ctx))?;
+    let removed: Vec<String> = unexcluded
+        .into_iter()
+        .filter(|mutant| !listed.contains(mutant))
+        .collect();
+    let root = ctx.workspace_root.clone();
+    verify_exclusions(&entries, &listed, &removed, |path| root.join(path).exists())
+}
+
+/// The mutants one listing run names.
+fn listing(runner: &dyn CommandRunner, spec: &CommandSpec) -> Result<Vec<String>, String> {
+    let output = runner.run(spec).map_err(|error| error.to_string())?;
     if !output.success() {
         return Err(format!(
             "`{}` failed, so the exclusions could not be checked: {}",
@@ -121,9 +202,7 @@ fn check_exclusions(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<(),
             output.combined().trim()
         ));
     }
-    let listed: Vec<String> = output.stdout.lines().map(str::to_owned).collect();
-    let root = ctx.workspace_root.clone();
-    verify_exclusions(&patterns, &listed, |path| root.join(path).exists())
+    Ok(output.stdout.lines().map(str::to_owned).collect())
 }
 
 /// The command that finds where this branch left `main`.
@@ -259,39 +338,111 @@ pub fn spec(ctx: &GateContext, scope: &Scope) -> CommandSpec {
     CommandSpec::owned("cargo", args, &ctx.workspace_root)
 }
 
-/// The `exclude_re` patterns configured for cargo-mutants.
+/// One `exclude_re` entry, with the comment that justifies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exclusion {
+    /// The regex, exactly as cargo-mutants will see it.
+    pub pattern: String,
+    /// The comment written above or beside it.
+    pub why: String,
+}
+
+/// The `exclude_re` entries configured for cargo-mutants.
 ///
 /// # Errors
 ///
 /// Returns a message when the key is present but unreadable. A configuration
 /// this gate cannot read is an instrument it cannot vouch for, so it refuses
 /// rather than assuming there are no exclusions.
-pub fn configured_exclusions(config: &str) -> Result<Vec<String>, String> {
-    let Some(rest) = exclusion_value(config) else {
+pub fn configured_exclusions(config: &str) -> Result<Vec<Exclusion>, String> {
+    let Some(body) = exclusion_body(config)? else {
         return Ok(Vec::new());
     };
-    let (list, closed) = match rest.split_once(']') {
-        Some((list, _)) => (list, true),
-        None => (rest.as_str(), false),
-    };
-    if !closed {
-        return Err(format!("{CONFIG}: `exclude_re` is missing its closing `]`"));
-    }
-    Ok(toml_strings(list))
+    Ok(entries(&body))
 }
 
-/// The body of the `exclude_re` array, from just after its opening bracket.
-fn exclusion_value(config: &str) -> Option<String> {
-    let start = config
+/// The body of the `exclude_re` array, comments and all.
+///
+/// Comments are kept, rather than stripped as they used to be, because an
+/// equivalence claim is worth no more than the reason written beside it. That
+/// means the closing `]` has to be found the way TOML finds it — in code, not
+/// inside a comment that happens to mention one.
+fn exclusion_body(config: &str) -> Result<Option<String>, String> {
+    let Some(start) = config
         .lines()
-        .position(|line| is_exclusion_key(line.trim()))?;
-    let tail: String = config
-        .lines()
-        .skip(start)
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    tail.split_once('[').map(|(_, rest)| rest.to_owned())
+        .position(|line| is_exclusion_key(line.trim()))
+    else {
+        return Ok(None);
+    };
+    let tail: String = config.lines().skip(start).collect::<Vec<_>>().join("\n");
+    let opened = tail.split_once('[').map_or("", |(_, rest)| rest);
+    let mut body = String::new();
+    for line in opened.lines() {
+        let (code, comment) = split_comment(line);
+        let Some((last, _)) = code.split_once(']') else {
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        };
+        // A comment after the closing bracket still explains the entry beside
+        // it, so it travels with the body rather than being dropped.
+        body.push_str(last);
+        if let Some(comment) = comment {
+            body.push_str(" #");
+            body.push_str(comment);
+        }
+        return Ok(Some(body));
+    }
+    Err(format!("{CONFIG}: `exclude_re` is missing its closing `]`"))
+}
+
+/// A line split into its TOML code and the comment trailing it.
+///
+/// A `#` inside a quoted string is content rather than a comment, so the split
+/// tracks which quote is open — the same care [`toml_strings`] takes over
+/// quoting styles, for the same reason.
+fn split_comment(line: &str) -> (&str, Option<&str>) {
+    let mut quote: Option<char> = None;
+    for (at, character) in line.char_indices() {
+        match (quote, character) {
+            (Some(open), _) if open == character => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(character),
+            (None, '#') => return (&line[..at], Some(line[at + 1..].trim())),
+            (None, _) => {}
+        }
+    }
+    (line, None)
+}
+
+/// The entries in an array body, each carrying the comment that explains it.
+///
+/// A comment above an entry belongs to it, and so does one beside it. Comment
+/// lines accumulate until an entry claims them, which is how a reason spanning
+/// several lines stays attached to the one pattern it argues for.
+fn entries(body: &str) -> Vec<Exclusion> {
+    let mut found = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let (code, comment) = split_comment(line);
+        let patterns = toml_strings(code);
+        if patterns.is_empty() {
+            pending.extend(comment);
+            continue;
+        }
+        let why = pending
+            .iter()
+            .copied()
+            .chain(comment)
+            .collect::<Vec<_>>()
+            .join(" ");
+        found.extend(patterns.into_iter().map(|pattern| Exclusion {
+            pattern,
+            why: why.clone(),
+        }));
+        pending.clear();
+    }
+    found
 }
 
 fn is_exclusion_key(line: &str) -> bool {
@@ -335,26 +486,94 @@ fn toml_strings(text: &str) -> Vec<String> {
     found
 }
 
-/// The literal path an exclusion names.
+/// What an exclusion takes out of scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A file, whose every mutant is out of scope.
+    File(String),
+    /// One function, whose mutant is provably equivalent to the original.
+    Function(String),
+}
+
+impl Target {
+    /// Whether this mutant is one the exclusion claims.
+    ///
+    /// A file claims what is written in it. A function claims mutants that name
+    /// *it*, not ones that merely spell its letters somewhere: `none` does not
+    /// name `announced.is_none()`. That distinction is what stops an over-broad
+    /// entry from adopting the mutants it removed by accident — they surface as
+    /// unclaimed instead.
+    pub fn claims(&self, mutant: &str) -> bool {
+        match self {
+            Self::File(path) => mutant.contains(path),
+            Self::Function(name) => names_function(mutant, name),
+        }
+    }
+}
+
+/// Whether a mutant's description names this function, rather than one whose
+/// name contains it.
+pub fn names_function(mutant: &str, function: &str) -> bool {
+    mutant.match_indices(function).any(|(at, _)| {
+        let before = mutant[..at].chars().next_back();
+        let after = mutant[at + function.len()..].chars().next();
+        !before.is_some_and(part_of_a_path) && !after.is_some_and(part_of_a_path)
+    })
+}
+
+fn part_of_a_path(character: char) -> bool {
+    character.is_alphanumeric() || character == '_' || character == ':'
+}
+
+/// What an exclusion pattern names.
 ///
-/// Exclusions here must be plain paths, with `\.` for a dot. That is a real
-/// restriction on what may be excluded, and it buys the only thing that makes
-/// an exclusion trustworthy: "did this actually exclude anything?" can be
-/// answered by looking, instead of by reimplementing a regex engine and hoping
-/// the imitation agrees with cargo-mutants' own.
+/// Only two shapes are allowed, and both can be checked by looking rather than
+/// by reimplementing a regex engine and hoping the imitation agrees with
+/// cargo-mutants' own:
+///
+/// * a plain path, with `\.` for a dot, which excludes a file;
+/// * a plain Rust path — `Capabilities::none` — which excludes one function.
 ///
 /// # Errors
 ///
-/// Returns a message when the pattern is not a plain path.
+/// Returns a message when the pattern is neither.
+pub fn target(pattern: &str) -> Result<Target, String> {
+    let literal = literal_path(pattern)?;
+    if literal.contains('/') || literal.ends_with(".rs") {
+        return Ok(Target::File(literal));
+    }
+    if is_rust_path(&literal) {
+        return Ok(Target::Function(literal));
+    }
+    Err(shape_refusal(pattern))
+}
+
+/// Whether this is an identifier, or several joined by `::`.
+fn is_rust_path(literal: &str) -> bool {
+    !literal.is_empty()
+        && literal.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+        })
+}
+
+/// The literal text an exclusion pattern matches, with `\.` read as a dot.
+///
+/// # Errors
+///
+/// Returns a message when the pattern carries regex syntax, which would make
+/// what it excludes a question only a regex engine could answer.
 pub fn literal_path(pattern: &str) -> Result<String, String> {
     let mut literal = String::with_capacity(pattern.len());
     let mut characters = pattern.chars();
     while let Some(character) = characters.next() {
         match character {
             '\\' if characters.next() == Some('.') => literal.push('.'),
-            '\\' => return Err(escape_refusal(pattern)),
+            '\\' => return Err(shape_refusal(pattern)),
             '*' | '?' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
-                return Err(escape_refusal(pattern));
+                return Err(shape_refusal(pattern));
             }
             other => literal.push(other),
         }
@@ -362,49 +581,121 @@ pub fn literal_path(pattern: &str) -> Result<String, String> {
     Ok(literal)
 }
 
-fn escape_refusal(pattern: &str) -> String {
+fn shape_refusal(pattern: &str) -> String {
     format!(
-        "{CONFIG}: `{pattern}` is not a plain path. Exclusions must name one path, \
-         with `\\.` for a dot, so the gate can check the exclusion actually took"
+        "{CONFIG}: `{pattern}` is neither a plain path nor a function name. An exclusion \
+         must name one path, with `\\.` for a dot, or one function such as \
+         `Capabilities::none`, so the gate can check what it actually removed"
     )
 }
 
-/// Confirms every exclusion both names something and removed it.
+/// Confirms every exclusion names something, removed it, and removed only it.
 ///
-/// Two ways an exclusion lies, and both are checked:
+/// Four ways an exclusion lies, and all four are checked:
 ///
-/// * It names a path that no longer exists. A dead exclusion is
+/// * *It names nothing.* An exclusion for a path no longer in the tree is
 ///   indistinguishable from a live one, so it silently misstates what is being
 ///   measured — the same reason the module-cycle baseline ratchets both ways.
-/// * It is configured but had no effect. cargo-mutants matches `exclude_re`
+/// * *It claims equivalence without arguing it.* A function is excluded only
+///   when the mutated expression is identical to the original, and that is an
+///   argument, not an observation. It has to be written down.
+/// * *It was configured but had no effect.* cargo-mutants matches `exclude_re`
 ///   against a mutant's description, and an anchoring mistake makes an
 ///   exclusion quietly do nothing; the mutants it was meant to skip are tested
 ///   anyway. Configured is not the same as applied, so this checks applied.
+/// * *It removed something it does not name.* The two listings differ by
+///   exactly what the configuration took out, so anything missing that no entry
+///   claims means the configuration is quietly wider than it reads.
 ///
 /// # Errors
 ///
-/// Returns a message naming the exclusion and which of the two it is.
+/// Returns a message naming the exclusion and which of the four it is.
 pub fn verify_exclusions(
-    patterns: &[String],
+    entries: &[Exclusion],
     listed: &[String],
+    removed: &[String],
     exists: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
-    for pattern in patterns {
-        let literal = literal_path(pattern)?;
-        if !exists(&literal) {
+    let targets = entries
+        .iter()
+        .map(|entry| target(&entry.pattern))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (entry, target) in entries.iter().zip(&targets) {
+        check_entry(entry, target, listed, removed, &exists)?;
+    }
+    unclaimed(removed, &targets)
+}
+
+/// Everything one entry has to prove about itself.
+fn check_entry(
+    entry: &Exclusion,
+    target: &Target,
+    listed: &[String],
+    removed: &[String],
+    exists: &impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let pattern = &entry.pattern;
+    match target {
+        Target::File(path) if !exists(path) => {
             return Err(format!(
-                "{CONFIG}: `{pattern}` excludes {literal}, which is not in the tree — \
+                "{CONFIG}: `{pattern}` excludes {path}, which is not in the tree — \
                  an exclusion that names nothing misstates what is measured"
             ));
         }
-        if let Some(mutant) = listed.iter().find(|mutant| mutant.contains(&literal)) {
+        Target::Function(name) if entry.why.trim().is_empty() => {
             return Err(format!(
-                "{CONFIG}: `{pattern}` did not take — cargo-mutants still lists `{mutant}`. \
-                 Configured is not applied"
+                "{CONFIG}: `{pattern}` excludes the function {name} with no reason beside it. \
+                 A function is excluded only when its mutant is provably equivalent — the \
+                 mutated expression is identical to the original, so no test could tell them \
+                 apart — and that argument belongs in a comment, not in someone's memory"
             ));
         }
+        _ => {}
+    }
+    if let Some(mutant) = listed.iter().find(|mutant| target.claims(mutant)) {
+        return Err(format!(
+            "{CONFIG}: `{pattern}` did not take — cargo-mutants still lists `{mutant}`. \
+             Configured is not applied"
+        ));
+    }
+    let claimed = removed
+        .iter()
+        .filter(|mutant| target.claims(mutant))
+        .count();
+    if claimed == 0 {
+        return Err(format!(
+            "{CONFIG}: `{pattern}` removed no mutant at all — an exclusion nothing depends on \
+             reads exactly like one that is holding something back"
+        ));
+    }
+    if let Target::Function(name) = target
+        && claimed > 1
+    {
+        return Err(format!(
+            "{CONFIG}: `{pattern}` removed {claimed} mutants of {name}, and equivalence is a \
+             claim about one mutated expression. If the function grew, the argument has to be \
+             made again for what grew rather than widened to cover it"
+        ));
     }
     Ok(())
+}
+
+/// Refuses a difference between the listings that no entry accounts for.
+///
+/// An over-broad pattern removes mutants it does not name, and so does a
+/// configuration key this gate does not read. Both look identical from inside
+/// the excluded listing, and both are caught here.
+fn unclaimed(removed: &[String], targets: &[Target]) -> Result<(), String> {
+    let Some(mutant) = removed
+        .iter()
+        .find(|mutant| !targets.iter().any(|target| target.claims(mutant)))
+    else {
+        return Ok(());
+    };
+    Err(format!(
+        "{CONFIG}: `{mutant}` was excluded, but no entry names it — the configuration takes \
+         more out of scope than it says"
+    ))
 }
 
 /// The command that lists the mutants a run would test, without testing them.
@@ -412,6 +703,22 @@ pub fn list_spec(ctx: &GateContext) -> CommandSpec {
     CommandSpec::owned(
         "cargo",
         vec!["mutants".to_owned(), "--list".to_owned()],
+        &ctx.workspace_root,
+    )
+}
+
+/// The same listing with the configuration ignored.
+///
+/// What this listing has and the configured one does not is precisely what the
+/// exclusions removed — measured, rather than inferred from the patterns.
+pub fn unexcluded_list_spec(ctx: &GateContext) -> CommandSpec {
+    CommandSpec::owned(
+        "cargo",
+        vec![
+            "mutants".to_owned(),
+            "--list".to_owned(),
+            "--no-config".to_owned(),
+        ],
         &ctx.workspace_root,
     )
 }
@@ -494,6 +801,21 @@ mod tests {
         exited(0, "cargo-mutants 27.1.0")
     }
 
+    /// The patterns a config configures, with their comments set aside.
+    fn patterns(config: &str) -> Result<Vec<String>, String> {
+        configured_exclusions(config)
+            .map(|found| found.into_iter().map(|entry| entry.pattern).collect())
+    }
+
+    /// The reason written beside the one entry a config configures.
+    fn why(config: &str) -> String {
+        let found = configured_exclusions(config).expect("a readable config");
+        let [entry] = found.as_slice() else {
+            panic!("expected exactly one entry, got {found:?}");
+        };
+        entry.why.clone()
+    }
+
     #[test]
     fn a_config_without_exclusions_has_none() {
         let config = "# a comment\nminimum_test_timeout = 60\n";
@@ -508,12 +830,73 @@ mod tests {
     #[test]
     fn exclusions_are_read_inline_or_across_lines() {
         assert_eq!(
-            configured_exclusions("exclude_re = [\"a\", \"b\"]\n"),
+            patterns("exclude_re = [\"a\", \"b\"]\n"),
             Ok(vec!["a".to_owned(), "b".to_owned()])
         );
         assert_eq!(
-            configured_exclusions("exclude_re = [\n    \"a\",\n    \"b\",\n]\ntimeout = 1\n"),
+            patterns("exclude_re = [\n    \"a\",\n    \"b\",\n]\ntimeout = 1\n"),
             Ok(vec!["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_comment_above_an_entry_is_that_entry_s_reason() {
+        assert_eq!(
+            why("exclude_re = [\n    # it is default\n    'A::b',\n]\n"),
+            "it is default"
+        );
+    }
+
+    #[test]
+    fn a_comment_beside_an_entry_is_its_reason_too() {
+        assert_eq!(
+            why("exclude_re = [\n    'A::b', # it is default\n]\n"),
+            "it is default"
+        );
+        assert_eq!(
+            why("exclude_re = ['A::b'] # it is default\n"),
+            "it is default"
+        );
+    }
+
+    #[test]
+    fn a_reason_spanning_several_lines_stays_whole() {
+        assert_eq!(
+            why("exclude_re = [\n    # it is\n    # default\n    'A::b', # really\n]\n"),
+            "it is default really"
+        );
+    }
+
+    #[test]
+    fn a_reason_belongs_only_to_the_entry_it_was_written_above() {
+        let found = configured_exclusions(
+            "exclude_re = [\n    # only about a\n    'A::a',\n    'B::b',\n]\n",
+        )
+        .expect("a readable config");
+        assert_eq!(found[0].why, "only about a");
+        assert_eq!(found[1].why, "", "{found:?}");
+    }
+
+    #[test]
+    fn an_entry_with_no_comment_anywhere_has_no_reason() {
+        assert_eq!(why("exclude_re = ['A::b']\n"), "");
+    }
+
+    #[test]
+    fn a_hash_inside_a_pattern_is_content_not_a_comment() {
+        assert_eq!(
+            patterns("exclude_re = ['a#b']\n"),
+            Ok(vec!["a#b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_bracket_inside_a_comment_does_not_end_the_list() {
+        // The array is closed by the `]` TOML sees, not by the first one in the
+        // file — and comments are no longer stripped before the search.
+        assert_eq!(
+            patterns("exclude_re = [\n    # see [1] for why\n    'A::b',\n]\n"),
+            Ok(vec!["A::b".to_owned()])
         );
     }
 
@@ -535,23 +918,23 @@ mod tests {
         // The first `[` in the file belongs to a table header, not to the
         // array, so finding the key by name has to actually find the key.
         let config = "[mutants]\nminimum_test_timeout = 60\nexclude_re = ['a']\n";
-        assert_eq!(configured_exclusions(config), Ok(vec!["a".to_owned()]));
+        assert_eq!(patterns(config), Ok(vec!["a".to_owned()]));
     }
 
     #[test]
     fn a_key_that_merely_starts_with_the_name_is_not_the_key() {
         let config = "exclude_reasoning = 'because'\nexclude_re = ['a']\n";
-        assert_eq!(configured_exclusions(config), Ok(vec!["a".to_owned()]));
+        assert_eq!(patterns(config), Ok(vec!["a".to_owned()]));
     }
 
     #[test]
     fn quoting_styles_may_be_mixed_in_either_order() {
         assert_eq!(
-            configured_exclusions("exclude_re = [\"a\", 'b']\n"),
+            patterns("exclude_re = [\"a\", 'b']\n"),
             Ok(vec!["a".to_owned(), "b".to_owned()])
         );
         assert_eq!(
-            configured_exclusions("exclude_re = ['a', \"b\"]\n"),
+            patterns("exclude_re = ['a', \"b\"]\n"),
             Ok(vec!["a".to_owned(), "b".to_owned()])
         );
     }
@@ -559,7 +942,7 @@ mod tests {
     #[test]
     fn a_quote_inside_the_other_quoting_style_is_content_not_a_delimiter() {
         assert_eq!(
-            configured_exclusions("exclude_re = ['it\"s']\n"),
+            patterns("exclude_re = ['it\"s']\n"),
             Ok(vec!["it\"s".to_owned()])
         );
     }
@@ -568,8 +951,8 @@ mod tests {
     fn a_regex_reads_the_same_in_either_toml_quoting_style() {
         // A literal string is the idiom for a regex; a basic string has to
         // double the backslash. Both must reach cargo-mutants as `\\.`.
-        let literal = configured_exclusions("exclude_re = ['stub\\.rs']\n").expect("valid");
-        let basic = configured_exclusions("exclude_re = [\"stub\\\\.rs\"]\n").expect("valid");
+        let literal = patterns("exclude_re = ['stub\\.rs']\n").expect("valid");
+        let basic = patterns("exclude_re = [\"stub\\\\.rs\"]\n").expect("valid");
         assert_eq!(literal, basic);
         assert_eq!(literal, vec!["stub\\.rs".to_owned()]);
     }
@@ -583,19 +966,95 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_that_is_not_a_plain_path_is_refused() {
-        for pattern in ["src/bin/.*", "src/bin/**", "a(b)c", "a|b", "^a$", "a\\d"] {
-            let message = literal_path(pattern)
-                .expect_err("the gate can only vouch for exclusions it can check");
+    fn a_pattern_that_is_neither_a_path_nor_a_function_is_refused() {
+        for pattern in [
+            "src/bin/.*",
+            "src/bin/**",
+            "a(b)c",
+            "a|b",
+            "^a$",
+            "a\\d",
+            "a b",
+            "A::",
+            "",
+        ] {
+            let message =
+                target(pattern).expect_err("the gate can only vouch for exclusions it can check");
             assert!(message.contains("plain path"), "{pattern}: {message}");
         }
     }
 
     #[test]
+    fn a_pattern_naming_a_file_targets_the_file_and_one_naming_a_function_the_function() {
+        assert_eq!(
+            target("horde-worker/src/bin/stub_harness\\.rs"),
+            Ok(Target::File(
+                "horde-worker/src/bin/stub_harness.rs".to_owned()
+            ))
+        );
+        // A bare file name has no slash, so `.rs` is what marks it a file.
+        assert_eq!(
+            target("stub_harness\\.rs"),
+            Ok(Target::File("stub_harness.rs".to_owned()))
+        );
+        assert_eq!(
+            target("Capabilities::none"),
+            Ok(Target::Function("Capabilities::none".to_owned()))
+        );
+        assert_eq!(target("main"), Ok(Target::Function("main".to_owned())));
+    }
+
+    #[test]
+    fn a_function_claims_mutants_that_name_it_and_no_others() {
+        let target = Target::Function("none".to_owned());
+        assert!(target.claims("x.rs:1:1: replace none -> Self with Default::default()"));
+        assert!(
+            !target.claims("x.rs:1:1: replace match guard a.is_none() with true in check"),
+            "`none` inside `is_none` is a different function"
+        );
+        assert!(
+            !target.claims("x.rs:1:1: replace Caps::none_of -> Self with Default::default()"),
+            "`none` inside `none_of` is a different function"
+        );
+        assert!(
+            !target.claims("x.rs:1:1: delete ! in Caps::none"),
+            "`none` inside `Caps::none` is a different function"
+        );
+    }
+
+    #[test]
+    fn a_file_claims_everything_written_in_it() {
+        let target = Target::File("crates/w/src/bin/stub.rs".to_owned());
+        assert!(target.claims("crates/w/src/bin/stub.rs:9:5: replace main with ()"));
+        assert!(!target.claims("crates/w/src/lib.rs:9:5: replace main with ()"));
+    }
+
+    /// An entry whose reason is written beside it.
+    fn justified(pattern: &str) -> Exclusion {
+        Exclusion {
+            pattern: pattern.to_owned(),
+            why: "the mutated expression is the original".to_owned(),
+        }
+    }
+
+    fn owned(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    const STUB: &str = "crates/w/src/bin/stub.rs:9:5: replace main with ()";
+    const EQUIVALENT: &str =
+        "crates/a/src/c.rs:9:5: replace Caps::none -> Self with Default::default()";
+    const ALSO_NONE: &str = "crates/a/src/c.rs:10:9: delete ! in Caps::none";
+
+    #[test]
     fn an_exclusion_that_took_is_accepted() {
-        let patterns = ["crates/w/src/bin/stub\\.rs".to_owned()];
-        let listed = ["crates/other/src/lib.rs:1:1: replace f with ()".to_owned()];
-        assert_eq!(verify_exclusions(&patterns, &listed, |_| true), Ok(()));
+        let entries = [justified("crates/w/src/bin/stub\\.rs")];
+        let listed = owned(&["crates/other/src/lib.rs:1:1: replace f with ()"]);
+        let removed = owned(&[STUB]);
+        assert_eq!(
+            verify_exclusions(&entries, &listed, &removed, |_| true),
+            Ok(())
+        );
     }
 
     #[test]
@@ -603,8 +1062,8 @@ mod tests {
         // A dead exclusion looks exactly like a live one, so it silently
         // misstates the measured scope — the module-cycle baseline is
         // bidirectional for the same reason.
-        let patterns = ["crates/gone/src/bin/stub\\.rs".to_owned()];
-        let message = verify_exclusions(&patterns, &[], |_| false)
+        let entries = [justified("crates/gone/src/bin/stub\\.rs")];
+        let message = verify_exclusions(&entries, &[], &[], |_| false)
             .expect_err("the path it excludes is not in the tree");
         assert!(message.contains("not in the tree"), "{message}");
     }
@@ -615,11 +1074,82 @@ mod tests {
         // binary's mutants were tested anyway, because exclude_re matches a
         // mutant's description rather than a path glob. Configured is not
         // applied, so the gate checks applied.
-        let patterns = ["crates/w/src/bin/stub\\.rs".to_owned()];
-        let listed = ["crates/w/src/bin/stub.rs:9:5: replace main with ()".to_owned()];
-        let message = verify_exclusions(&patterns, &listed, |_| true)
+        let entries = [justified("crates/w/src/bin/stub\\.rs")];
+        let listed = owned(&[STUB]);
+        let message = verify_exclusions(&entries, &listed, &[], |_| true)
             .expect_err("cargo-mutants still lists what the exclusion claims to remove");
         assert!(message.contains("did not take"), "{message}");
+    }
+
+    #[test]
+    fn an_exclusion_that_removed_nothing_is_refused() {
+        // The path is in the tree and nothing it names is listed, and still the
+        // entry is doing nothing: the two listings are identical. Only the
+        // difference between them can tell that apart from a live exclusion.
+        let entries = [justified("crates/w/src/bin/stub\\.rs")];
+        let message = verify_exclusions(&entries, &[], &[], |_| true)
+            .expect_err("an exclusion that removes nothing is holding nothing back");
+        assert!(message.contains("removed no mutant"), "{message}");
+    }
+
+    #[test]
+    fn a_function_excluded_without_a_written_reason_is_refused() {
+        let entries = [Exclusion {
+            pattern: "Caps::none".to_owned(),
+            why: "   ".to_owned(),
+        }];
+        let message = verify_exclusions(&entries, &[], &owned(&[EQUIVALENT]), |_| true)
+            .expect_err("equivalence is an argument, and an argument has to be written down");
+        assert!(message.contains("no reason beside it"), "{message}");
+    }
+
+    #[test]
+    fn a_file_needs_no_written_reason() {
+        // A file exclusion is checked against the filesystem and reads for
+        // itself; an equivalence claim is checkable by nothing but the reader.
+        let entries = [Exclusion {
+            pattern: "crates/w/src/bin/stub\\.rs".to_owned(),
+            why: String::new(),
+        }];
+        assert_eq!(
+            verify_exclusions(&entries, &[], &owned(&[STUB]), |_| true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_function_exclusion_that_argues_its_equivalence_is_accepted() {
+        // The whole point of the mechanism, and the case the rest of these
+        // tests only approach from the outside: a reason written down, one
+        // mutant removed, nothing of it left in the listing.
+        let entries = [justified("Caps::none")];
+        assert_eq!(
+            verify_exclusions(&entries, &[], &owned(&[EQUIVALENT]), |_| true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_function_exclusion_that_removed_more_than_one_mutant_is_refused() {
+        // Equivalence is a claim about one mutated expression. A function that
+        // grew a second mutant has outgrown the argument made for it, and
+        // widening the entry to cover it silently excludes untested behaviour.
+        let entries = [justified("Caps::none")];
+        let removed = owned(&[EQUIVALENT, ALSO_NONE]);
+        let message = verify_exclusions(&entries, &[], &removed, |_| true)
+            .expect_err("two mutants, one argument");
+        assert!(message.contains("removed 2 mutants"), "{message}");
+    }
+
+    #[test]
+    fn a_mutant_removed_that_no_entry_names_is_refused() {
+        // Either the pattern is wider than it reads, or some other key in the
+        // config is quietly narrowing scope. The gate vouches for neither.
+        let entries = [justified("crates/w/src/bin/stub\\.rs")];
+        let removed = owned(&[STUB, "crates/product/src/lib.rs:3:1: replace go with ()"]);
+        let message = verify_exclusions(&entries, &[], &removed, |_| true)
+            .expect_err("the listings differ by more than the entries account for");
+        assert!(message.contains("no entry names it"), "{message}");
     }
 
     /// A workspace root whose `.cargo/mutants.toml` says `config`.
@@ -669,52 +1199,125 @@ mod tests {
         );
     }
 
+    /// The config used by the gate-level exclusion tests: one entry naming a
+    /// file that really is in the throwaway root.
+    const EXCLUDING_THE_CONFIG: &str = "exclude_re = ['.cargo/mutants\\.toml']\n";
+
+    /// What the excluded listing shows, and what the unexcluded one adds.
+    const ELSEWHERE: &str = "crates/other/src/lib.rs:1:1: replace f with ()";
+    const IN_THE_CONFIG: &str = ".cargo/mutants.toml:1:1: replace thing with ()";
+
     #[test]
     fn a_live_exclusion_that_took_lets_the_run_proceed() {
-        let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
-        let runner = ScriptedRunner::new(whole_tree_run(vec![exited(
-            0,
-            "crates/other/src/lib.rs:1:1: replace f with ()",
-        )]));
+        let (_dir, ctx) = root_configured(EXCLUDING_THE_CONFIG);
+        let runner = ScriptedRunner::new(whole_tree_run(vec![
+            exited(0, ELSEWHERE),
+            exited(0, &format!("{ELSEWHERE}\n{IN_THE_CONFIG}")),
+        ]));
         assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
+        let lines = runner.command_lines();
+        assert!(lines[1].contains("--list"), "{lines:?}");
         assert!(
-            runner.command_lines()[1].contains("--list"),
-            "{:?}",
-            runner.command_lines()
+            lines[2].contains("--no-config"),
+            "the difference between the listings is the measurement: {lines:?}"
         );
+    }
+
+    /// A function-scoped equivalence entry with its argument written beside it.
+    ///
+    /// The reason is what separates an equivalence from a survivor somebody got
+    /// tired of, so the gate-level tests carry a real one rather than a token.
+    const EXCLUDING_A_FUNCTION: &str = "exclude_re = [\n    \
+         # `Caps::none()` is written `Self::default()` over a type deriving\n    \
+         # `Default`, so the mutated expression is the original.\n    \
+         'Caps::none',\n]\n";
+
+    /// Why the gate refuses `config`, given what the two listings say.
+    ///
+    /// Every unverifiable configuration is refused the same way and has to cost
+    /// the same nothing, so both halves of that live here rather than being
+    /// restated once per lie: the caller is left with the one thing that differs
+    /// between these tests, which is which lie was told.
+    fn refusal(config: &str, listed: &str, unexcluded: &str) -> String {
+        let (_dir, ctx) = root_configured(config);
+        let runner = ScriptedRunner::new(vec![version(), exited(0, listed), exited(0, unexcluded)]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("an exclusion the gate cannot vouch for must stop it");
+        };
+        assert_eq!(
+            runner.calls().len(),
+            3,
+            "no mutation run should start on an unverifiable configuration"
+        );
+        reason
     }
 
     #[test]
     fn an_exclusion_naming_nothing_stops_the_gate_before_it_mutates() {
-        let (_dir, ctx) = root_configured("exclude_re = ['crates/gone/src/bin/stub\\.rs']\n");
-        let runner = ScriptedRunner::new(vec![version(), exited(0, "")]);
-        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
-            panic!("an exclusion that names nothing misstates the measured scope");
-        };
+        let reason = refusal("exclude_re = ['crates/gone/src/bin/stub\\.rs']\n", "", "");
         assert!(reason.contains("not in the tree"), "{reason}");
-        assert_eq!(
-            runner.calls().len(),
-            2,
-            "no mutation run should start on an unverifiable configuration"
-        );
     }
 
     #[test]
     fn an_exclusion_that_did_not_take_stops_the_gate() {
-        let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
-        let runner = ScriptedRunner::new(vec![
-            version(),
-            exited(0, ".cargo/mutants.toml:1:1: replace thing with ()"),
-        ]);
-        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
-            panic!("cargo-mutants still lists what the exclusion claims to remove");
-        };
+        let reason = refusal(EXCLUDING_THE_CONFIG, IN_THE_CONFIG, IN_THE_CONFIG);
         assert!(reason.contains("did not take"), "{reason}");
     }
 
     #[test]
+    fn an_exclusion_that_removed_nothing_stops_the_gate() {
+        // Both listings agree, so the entry is inert. Nothing in the excluded
+        // listing can show that; only the comparison can.
+        let reason = refusal(EXCLUDING_THE_CONFIG, ELSEWHERE, ELSEWHERE);
+        assert!(reason.contains("removed no mutant"), "{reason}");
+    }
+
+    #[test]
+    fn a_function_exclusion_that_proves_itself_lets_the_run_proceed() {
+        // The mechanism end to end: the entry names a function, the two
+        // listings differ by exactly that function's one mutant, and the
+        // argument for its equivalence is written where the next reader is.
+        let (_dir, ctx) = root_configured(EXCLUDING_A_FUNCTION);
+        let runner = ScriptedRunner::new(whole_tree_run(vec![
+            exited(0, ELSEWHERE),
+            exited(0, &format!("{ELSEWHERE}\n{EQUIVALENT}")),
+        ]));
+        assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
+    }
+
+    #[test]
+    fn a_planted_entry_naming_a_mutant_that_does_not_exist_reds_the_gate() {
+        // Nothing in the tree is called `Caps::none`, so both listings agree.
+        // A function entry has no path to check against the filesystem, which
+        // is exactly why "it removed something" is the check that catches this.
+        let reason = refusal(EXCLUDING_A_FUNCTION, ELSEWHERE, ELSEWHERE);
+        assert!(reason.contains("removed no mutant"), "{reason}");
+    }
+
+    #[test]
+    fn a_planted_entry_whose_mutant_was_not_removed_reds_the_gate() {
+        // The pattern is configured and the mutant is still there — an
+        // anchoring mistake, or a name that does not match what cargo-mutants
+        // prints. Configured is not applied, for functions as much as files.
+        let reason = refusal(EXCLUDING_A_FUNCTION, EQUIVALENT, EQUIVALENT);
+        assert!(reason.contains("did not take"), "{reason}");
+    }
+
+    #[test]
+    fn a_function_excluded_with_no_reason_written_down_stops_the_gate() {
+        // It removes exactly what it names, and it is still refused: nothing
+        // but a reader can check an equivalence, and a reader needs the reason.
+        let reason = refusal(
+            "exclude_re = ['Caps::none']\n",
+            ELSEWHERE,
+            &format!("{ELSEWHERE}\n{EQUIVALENT}"),
+        );
+        assert!(reason.contains("no reason beside it"), "{reason}");
+    }
+
+    #[test]
     fn a_listing_that_fails_is_an_instrument_error() {
-        let (_dir, ctx) = root_configured("exclude_re = ['.cargo/mutants\\.toml']\n");
+        let (_dir, ctx) = root_configured(EXCLUDING_THE_CONFIG);
         let runner = ScriptedRunner::new(vec![version(), failed(1, "error: bad config")]);
         let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
             panic!("exclusions that could not be checked were not checked");
@@ -723,11 +1326,29 @@ mod tests {
     }
 
     #[test]
-    fn the_listing_command_does_not_test_anything() {
+    fn an_unexcluded_listing_that_fails_is_an_instrument_error_too() {
+        let (_dir, ctx) = root_configured(EXCLUDING_THE_CONFIG);
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            exited(0, ELSEWHERE),
+            failed(1, "error: no such option --no-config"),
+        ]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
+            panic!("half a comparison measures nothing");
+        };
+        assert!(reason.contains("no such option"), "{reason}");
+    }
+
+    #[test]
+    fn the_listing_commands_do_not_test_anything() {
         assert_eq!(
             list_spec(&repo_ctx()).display(),
             "cargo mutants --list",
             "checking exclusions must not cost a mutation run"
+        );
+        assert_eq!(
+            unexcluded_list_spec(&repo_ctx()).display(),
+            "cargo mutants --list --no-config"
         );
     }
 
@@ -890,6 +1511,83 @@ mod tests {
         assert_eq!(
             nothing_to_mutate("858 mutants tested: 0 missed", &Scope::FullTree),
             None
+        );
+    }
+
+    #[test]
+    fn a_tests_only_change_is_skipped_rather_than_erroring() {
+        // The exact message from `main`: the merge at c5a31e7 brought in four
+        // files, all of them test files, so cargo-mutants filtered every mutant
+        // away, printed this on stderr, and exited 0 with no tally at all.
+        assert_eq!(
+            nothing_to_mutate(" INFO No mutants to filter\n", &Scope::Diff(PathBuf::new())),
+            Some(format!(
+                "nothing mutable in changed code{TESTS_ARE_NOT_MUTATED}"
+            ))
+        );
+    }
+
+    #[test]
+    fn every_way_cargo_mutants_reports_no_work_is_skipped() {
+        // Four stages the work can run out at, four wordings. Reading only one
+        // of them is how this gate erred on `main` after already having been
+        // fixed for the docs-only case.
+        for message in [
+            " INFO Diff changes no Rust source files",
+            " INFO No mutants to filter",
+            " INFO diff matched no mutants",
+            "No mutants found under the active filters",
+            "No mutants were generated",
+        ] {
+            assert!(
+                nothing_to_mutate(message, &Scope::FullTree).is_some(),
+                "a completed run with no work is not an instrument failure: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_that_produced_no_viable_mutants_is_still_an_error() {
+        // One word from "No mutants were generated", and the opposite meaning:
+        // cargo-mutants says this when it could not build in its scratch
+        // directory. A broken instrument tells you nothing, so it must not be
+        // absorbed into the skipped family by a loose substring match.
+        assert_eq!(
+            nothing_to_mutate(
+                "No mutants were viable: perhaps there is a problem with building \
+                 in a scratch directory.",
+                &Scope::FullTree
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tests_only_change_reports_skipped_through_the_whole_gate() {
+        // The repro end to end: a diff naming only test files, and the run that
+        // follows it saying it had nothing to filter.
+        let run = run_after_with(
+            vec![
+                exited(0, "branchpoint\n"),
+                exited(0, "tip\n"),
+                exited(
+                    0,
+                    "diff --git a/crates/horde-server/tests/contracts.rs \
+                     b/crates/horde-server/tests/contracts.rs\n",
+                ),
+            ],
+            failed(0, " INFO No mutants to filter\n"),
+        );
+        assert_eq!(run.outcome.label(), "skipped", "{:?}", run.outcome);
+        assert!(
+            run.outcome.detail().contains("nothing mutable"),
+            "{}",
+            run.outcome.detail()
+        );
+        assert!(
+            run.outcome.detail().contains("cfg(test)"),
+            "the row has to say why a diff full of Rust produced no mutants: {}",
+            run.outcome.detail()
         );
     }
 

@@ -406,53 +406,80 @@ Falling back to the whole tree when there is no baseline is deliberate: an absen
 or a root commit must never quietly shrink the gate to nothing. Timeouts live in
 `.cargo/mutants.toml`; `--jobs` and `--full` live in the gate.
 
-**No exclusions, today.** `.cargo/mutants.toml` has no `exclude_re`. Skipping a function
-because its mutants survive is how a mutation gate becomes decorative. If a function
-cannot be mutation-tested, the fix is to move its logic somewhere that can be — which is
+**Two kinds of exclusion, and nothing else.** Skipping a function because its mutants
+survive is how a mutation gate becomes decorative. If a function cannot be
+mutation-tested, the fix is normally to move its logic somewhere that can be — which is
 why the gauntlet's own I/O is behind the `CommandRunner` seam and its parsing is in pure
-functions.
+functions. `.cargo/mutants.toml` admits exactly two shapes of `exclude_re` entry, and the
+gate refuses anything else outright rather than accepting it and leaving it unverified.
 
-**The one exclusion that will be legitimate, and its criterion.** A binary that exists
-*to be spawned by the test suite* — a stub harness a process-supervision test launches —
-is test fixture wearing a `[[bin]]`'s clothes. Mutating it measures the fixture, not the
-product. When such a binary lands, exclude it by its own path and say so:
-
-```toml
-# Test fixture: the process suite spawns this binary, so mutating it measures
-# the fixture rather than the code under test.
-exclude_re = ["horde-worker/src/bin/stub_harness\\.rs"]
-```
-
-The criterion is *who exercises whom*: a binary the suite runs is excluded; a binary the
-suite tests is not. `horde-cli`'s `bin/horde.rs` is a product the suite tests, so it stays
-in scope — which is why the exclusion names one path rather than `src/bin/**`, a glob that
-would take the product out with the fixture.
-
-**Every exclusion is checked, both ways.** Before a mutation run, the gate reads
-`exclude_re` and refuses two kinds of lie:
-
-* *It names nothing.* An exclusion for a path no longer in the tree is
-  indistinguishable from one still doing its job, so it silently misstates what is being
-  measured — the same reason `baselines/module-cycles.txt` ratchets in both directions.
-* *It was configured but did not apply.* `exclude_re` is a regex over each mutant's
-  description, not a path glob, so an anchoring mistake makes an exclusion quietly do
-  nothing and the mutants it named get tested anyway. This is not hypothetical: a
-  `--exclude 'src/bin/**'` was accepted without complaint and the stub binary's mutants
-  were tested regardless. The gate runs `cargo mutants --list` and fails if anything the
-  exclusion claims to remove is still listed. Configured is not applied.
-
-The price is that an exclusion must name **one plain path**, with `\.` for a dot, in a
-TOML literal string:
+*A file, when the file is test fixture.* A binary that exists **to be spawned by the test
+suite** — a stub harness a process-supervision test launches — is fixture wearing a
+`[[bin]]`'s clothes, and mutating it measures the fixture rather than the product. The
+criterion is *who exercises whom*: a binary the suite runs is excluded; a binary the suite
+tests is not. `horde-cli`'s `bin/horde.rs` is a product the suite tests, so it stays in
+scope — which is why the entry names one path, with `\.` for a dot, rather than
+`src/bin/**`, a glob that would take the product out with the fixture:
 
 ```toml
 exclude_re = ['horde-worker/src/bin/stub_harness\.rs']
 ```
 
-That restriction is what makes the check answerable by looking, instead of by
-reimplementing a regex engine and hoping the imitation agrees with cargo-mutants' own. A
-pattern with any other regex syntax is refused outright rather than accepted and left
-unverified. The listing run costs nothing when there are no exclusions, which is the
-usual case.
+*A function, when its mutant is provably equivalent.* Sometimes cargo-mutants' rewrite
+produces the expression that was already there. `Capabilities::none()` is written
+`Self::default()` over a type deriving `Default`, and the mutation is
+`-> Self with Default::default()`: the same expression, character for character. No test
+can distinguish them, and a test written to look as if it had would be asserting on
+nothing — a hollow test is worse than the survivor it hides, because it also lies about
+coverage. Such an entry names the function as a Rust path and **must** carry a comment
+arguing the equivalence:
+
+```toml
+exclude_re = [
+    # `Capabilities::none()` is written `Self::default()`, and `Capabilities`
+    # derives `Default`, so the mutated expression is the original.
+    'Capabilities::none',
+]
+```
+
+**The criterion is identity, not difficulty.** An equivalence entry requires the mutated
+expression to be *provably identical* to the original. "No test kills it", "it would need
+an awkward harness", "the mutant is obviously harmless" are all findings, not
+equivalences, and belong in the test suite. The comment is mandatory because equivalence
+is an argument rather than an observation: nothing in the tree records it, so the next
+reader either finds the reasoning written down or has to re-derive it — and re-deriving it
+is exactly the work people skip.
+
+**Every exclusion proves itself, four ways.** Before a mutation run, the gate lists the
+mutants twice — `cargo mutants --list` and `cargo mutants --list --no-config`. The
+difference between the two listings *is* what the configuration removed, measured rather
+than inferred from reading the patterns. Four lies are refused:
+
+* *It names nothing.* An exclusion for a path no longer in the tree is indistinguishable
+  from one still doing its job, so it silently misstates what is being measured — the same
+  reason `baselines/module-cycles.txt` ratchets in both directions.
+* *It was configured but did not apply.* `exclude_re` is a regex over each mutant's
+  description, not a path glob, so an anchoring mistake makes an exclusion quietly do
+  nothing and the mutants it named get tested anyway. This is not hypothetical: a
+  `--exclude 'src/bin/**'` was accepted without complaint and the stub binary's mutants
+  were tested regardless. Configured is not applied.
+* *It removed nothing.* An entry whose two listings agree is inert, and an inert entry
+  reads exactly like one holding something back. Nothing inside the excluded listing can
+  tell those apart; only the comparison can.
+* *It removed something it does not name.* Anything missing from the excluded listing that
+  no entry claims means the configuration is wider than it reads — an over-broad pattern,
+  or a key this gate does not parse at all. A bare `none` would match `announced.is_none()`
+  in cargo-mutants' regex but not in the gate's idea of "names this function", so its
+  collateral surfaces here instead of passing as intended.
+
+An equivalence entry has one extra obligation: it must remove **exactly one** mutant.
+Equivalence is a claim about a single mutated expression, so a function that has grown a
+second one has outgrown the argument made for it. Widening the entry to cover the new
+mutant would silently exclude untested behaviour; the entry reds instead, and the argument
+has to be made again for what grew.
+
+Both listings cost nothing when there are no exclusions, which is the usual case: they run
+only once something is excluded.
 
 **Local.** `gauntlet run mutants`, or `cargo mutants` directly. Survivors are listed in
 `target/quality/mutants.out/missed.txt`.
@@ -460,9 +487,28 @@ usual case.
 **How to read.** A `fail` gives the number of survivors and points at `missed.txt`; each
 line there is a specific edit that no test noticed. A `pass` reports how many mutants were
 caught, how many were unviable (did not compile — legitimately not a finding), and how
-many timed out. Timeouts count as caught, since a mutant that hangs the suite did change
-behaviour, but the number is surfaced so a creeping timeout count does not hide inside a
-green row. A run that produced no tally at all is an `error`, not a clean sheet.
+many timed out. Timeouts count as caught in the tally — a mutant that hangs the suite did
+change behaviour — and the count is surfaced separately so a creeping number cannot hide
+inside a green row. Read that number every time, and read it as *unevaluated* rather than
+as killed: "A timeout is not a kill" below says why the classification is not stable. A
+run that produced no tally at all is an `error`, not a clean sheet — *unless* it said why
+it had nothing to do, in which case it is `skipped`.
+
+**A change with nothing mutable in it is `skipped`, and never `pass`.** cargo-mutants
+mutates product code, not tests: `#[cfg(test)]` modules and `tests/` are not mutated at
+all. So a diff can be full of Rust and still generate zero mutants — which is exactly what
+a test-only refactor is — and cargo-mutants then exits 0 having printed no tally. There
+are four wordings for it, depending on which stage the work ran out at (`Diff changes no
+Rust source files`, `No mutants to filter`, `diff matched no mutants`, `No mutants found
+under the active filters` / `No mutants were generated`), and the gate reads all of them.
+The row says `skipped` with the reason, because "no mutant survived" and "no mutant was
+ever built" are different facts and only one of them is evidence about the change.
+
+One message in that family is **not** in it: `No mutants were viable`, whose own text
+continues "perhaps there is a problem with building in a scratch directory". That is the
+instrument failing, so it stays an `error`. It is one word away from `No mutants were
+generated`, which is precisely how a broken build would come to be reported as a clean
+sheet; a test pins the distinction.
 
 ---
 
@@ -493,6 +539,56 @@ re-exports a child and defines what that child imports is a cycle, and
 `module-structure` will say so. This has come up twice — in `horde-server`'s
 service spines and in `horde-adapter`'s crate root — and the fix is the same
 both times: move the shared definition into a sibling module.
+
+**"It did not finish" is a weak assertion, and mutants know it.** A test whose
+only claim is that an operation blocked or timed out passes for *any* reason the
+operation blocked — including the mutant's. `FakeSession::advance` cost three
+attempts to this: the test scripted a `Say` before the `Stall`, so the mutant
+that plays straight through a stall still stopped one step later, still held the
+caller, and still passed. The killing version asks what the caller was *handed*
+before it blocked, not whether it blocked. When a test's assertion is the absence
+of something, check that the mutant would have produced something — otherwise
+both versions are equally silent and the test is measuring the clock.
+
+**Fixing one instance of a class leaves the class.** The mutants gate learned to treat
+a docs-only diff as `skipped` rather than a broken instrument. One merge later it went
+red on `main` again, for a tests-only diff — the same bug, one case over, because the fix
+had matched a single message string rather than asking what the tool says when it has
+nothing to do. The repair was to enumerate the family from `cargo-mutants --help` and the
+binary's own strings, and to write the test for each. When a gate misreads a tool, spend
+the extra ten minutes finding out how many ways that tool can say the same thing; the
+second instance always arrives, and it arrives on `main`.
+
+**A timeout is not a kill; it is a mutant nobody evaluated.** The tally counts a
+timed-out mutant as caught, which is the most defensible thing one number can
+say — but the classification is not stable, and the same mutant on the same tree
+comes back `MISSED` on an idle machine and `TIMEOUT` on a loaded one. The reason
+is visible in cargo-mutants' own output: it measures *one* unmutated baseline and
+derives the whole run's budget from it (`Auto-set build timeout to 23s`,
+`Auto-set test timeout to 60s`), so every mutant is judged against a clock that
+was started once, under whatever load the machine happened to be under then.
+Nothing about the mutant enters that number. So until cargo-mutants derives a
+per-mutant timeout from that mutant's own baseline, read a timeout as
+**unevaluated**: it is not evidence that a test noticed the change, and a green
+row containing timeouts has not been shown to be green. Re-run them on a quiet
+machine before believing the row — and never close out a survivor by observing
+that it timed out on the next attempt.
+
+**A compound condition inside a loop or a stream handler is untestable in place;
+extract it as a named predicate.** `while a && b` in a stream handler cannot have
+its truth table exercised, because the states that separate `&&` from `||` are
+the ones the surrounding machinery makes unreachable: a failed reply is usually
+followed by a hang-up, a non-following client also drops the stream, a tail only
+ever sees notifications it already delivered. The wrong operator therefore
+behaves correctly in every run anyone can stage, and the mutant survives an
+end-to-end suite that is genuinely exercising the feature. Lifted out as a free
+function the same expression is an ordinary truth table — four cases, all
+assertable, no runtime to arrange. Five of these have now been extracted in
+`horde-server` for exactly this reason: `needs_sweep`, `sweep_from` and
+`is_stale` in the log module, `stop_after_caught_up` in `service/control_plane.rs`
+and `should_stop` in `service/worker.rs`. Reaching for a harness clever enough to
+force the unreachable state is the wrong repair; the condition being hard to
+reach *is* the design feedback.
 
 ## Adding a gate
 
