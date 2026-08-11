@@ -17,7 +17,7 @@ use horde_worker::{SupervisedHarness, SupervisorError};
 #[cfg(test)]
 mod harness {
     use super::{HarnessSpec, PathBuf};
-    use horde_adapter::{Adapter, AgentSession, AgentSpec};
+    use horde_adapter::{Adapter, AgentEvent, AgentSession, AgentSpec, TurnOutcome};
     use horde_worker::ClaudeAdapter;
 
     /// The stub binary cargo built alongside this test.
@@ -86,9 +86,63 @@ mod harness {
     /// A script that reports one successful turn and nothing else.
     pub(crate) const RESULT_ONLY: &str = "{\"type\":\"result\",\"subtype\":\"success\",\
          \"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
+
+    /// How long any wait in this file may take before it is a failure.
+    ///
+    /// Generous against a loaded machine, and still three orders of magnitude
+    /// below the point where cargo-mutants gives up.
+    pub(crate) const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Runs `future` with a ceiling, failing the test if it does not finish.
+    ///
+    /// Every wait against a child process goes through here, because an
+    /// unbounded await turns a defect into a hang. A `write_line` that writes
+    /// nothing, a `read_line` that returns empty lines forever, a `kill` that
+    /// kills nothing, a `send` that sends nothing — each leaves a test waiting
+    /// for something that will never arrive, and cargo-mutants then records a
+    /// TIMEOUT. A timeout is a mutant nobody evaluated (docs/QUALITY_GATES.md),
+    /// so it protects nothing. With a ceiling the same mutants fail in seconds
+    /// and are caught, which is the difference between a test that watches the
+    /// clock and a test that watches the behaviour.
+    pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        match tokio::time::timeout(CEILING, future).await {
+            Ok(value) => value,
+            Err(_) => panic!("{what} must finish rather than hang"),
+        }
+    }
+
+    /// Drains `session` until its turn ends, under the ceiling.
+    ///
+    /// `None` means the stream ended first. A `send` that sends nothing reaches
+    /// this the same way it reaches every other caller — by never producing the
+    /// turn — so the ceiling is what turns that mutant into a failure instead
+    /// of a stalled suite.
+    pub(crate) async fn turn_end(session: &mut Box<dyn AgentSession>) -> Option<TurnOutcome> {
+        within("the turn ends", async {
+            while let Ok(Some(event)) = session.next_event().await {
+                if let AgentEvent::TurnEnded(outcome) = event {
+                    return Some(outcome);
+                }
+            }
+            None
+        })
+        .await
+    }
+
+    /// Everything `session` emits before its stream ends, under the ceiling.
+    pub(crate) async fn drain(session: &mut Box<dyn AgentSession>) -> Vec<AgentEvent> {
+        within("the stream ends", async {
+            let mut events = Vec::new();
+            while let Ok(Some(event)) = session.next_event().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+    }
 }
 
-use harness::spec_for;
+use harness::{spec_for, within};
 
 #[tokio::test]
 async fn a_turn_round_trips_through_a_real_child_process() {
@@ -105,8 +159,7 @@ async fn a_turn_round_trips_through_a_real_child_process() {
         .await
         .expect("writes");
 
-    let first = harness
-        .read_line()
+    let first = within("a line arrives", harness.read_line())
         .await
         .expect("reads")
         .unwrap_or_default();
@@ -128,14 +181,16 @@ async fn a_dead_harness_reads_as_eof_rather_than_hanging() {
         .write_line("{\"type\":\"user\"}")
         .await
         .expect("writes");
-    let _ = harness.read_line().await.expect("reads the scripted turn");
+    let _ = within("a line arrives", harness.read_line())
+        .await
+        .expect("reads the scripted turn");
 
     // Script exhausted: the stub exits and its stdout closes.
     let _ = harness.write_line("{\"type\":\"user\"}").await;
 
     let mut saw_eof = false;
     for _ in 0..64 {
-        match harness.read_line().await {
+        match within("a line arrives", harness.read_line()).await {
             Ok(None) => {
                 saw_eof = true;
                 break;
@@ -192,8 +247,8 @@ async fn the_account_directory_reaches_the_child() {
 
 #[cfg(test)]
 mod live_session {
-    use super::harness::{spec_for, stub_binary};
-    use horde_adapter::{Adapter, AgentEvent, AgentSpec, TurnInput, TurnStatus};
+    use super::harness::{spec_for, stub_binary, turn_end};
+    use horde_adapter::{Adapter, AgentSpec, TurnInput, TurnStatus};
     use horde_worker::ClaudeAdapter;
 
     /// A whole turn, from spawn to `TurnEnded`, against a real child.
@@ -224,15 +279,7 @@ mod live_session {
             .await
             .expect("sends");
 
-        let mut ended = None;
-        while let Ok(Some(event)) = session.next_event().await {
-            if let AgentEvent::TurnEnded(outcome) = event {
-                ended = Some(outcome);
-                break;
-            }
-        }
-
-        let ended = ended.expect("the turn must end");
+        let ended = turn_end(&mut session).await.expect("the turn must end");
         assert_eq!(ended.status, TurnStatus::Completed);
         assert_eq!(
             session.provider_session_id().map(ToString::to_string),
@@ -250,7 +297,7 @@ mod live_session {
 
 #[cfg(test)]
 mod failure_modes {
-    use super::harness::spec_with;
+    use super::harness::{spec_with, within};
     use horde_worker::SupervisedHarness;
 
     /// An interrupt the harness never acknowledges must not hang the supervisor.
@@ -300,14 +347,24 @@ mod failure_modes {
             .await
             .expect("writes");
 
-        // Drain to EOF — bounded, because a hang here is the bug under test.
-        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while let Ok(Some(_)) = harness.read_line().await {}
-            harness.wait().await
-        })
-        .await;
-
-        let status = drained.expect("a dead harness must not hang the reader");
+        // Drain to EOF, bounded by COUNT rather than by time. A clock is the
+        // wrong instrument here: a `read_line` that returns instantly forever
+        // never awaits anything, so on the current-thread runtime a
+        // `tokio::time::timeout` around this loop is never polled and the
+        // deadline it promises silently does not exist. The mutant that does
+        // exactly that spun here for a full minute while every other test in
+        // the file had already failed. A ceiling on iterations needs no
+        // scheduler co-operation, so it holds where the timer cannot.
+        let mut lines = 0_u32;
+        while let Ok(Some(_)) = within("a line arrives", harness.read_line()).await {
+            lines += 1;
+            assert!(
+                lines < 1024,
+                "the stub's stdout must reach EOF; a reader that never sees one \
+                 is the failure this test exists to catch"
+            );
+        }
+        let status = within("the child is reaped", harness.wait()).await;
         assert_eq!(
             status.ok().flatten(),
             Some(3),
@@ -324,8 +381,8 @@ mod failure_modes {
         spec.env.retain(|(k, _)| k != "HORDE_STUB_TRANSCRIPT");
 
         let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
-        let _ = harness.read_line().await;
-        let _ = harness.wait().await;
+        let _ = within("a line arrives", harness.read_line()).await;
+        let _ = within("the child is reaped", harness.wait()).await;
 
         // Give the drain task a moment to flush the pipe.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -346,7 +403,7 @@ mod failure_modes {
 
 #[cfg(test)]
 mod revival {
-    use super::harness::{spec_with, stub_binary};
+    use super::harness::{drain, spec_with, stub_binary, turn_end};
     use horde_adapter::{Adapter, AgentEvent, AgentSpec, ProviderSessionId, TurnInput};
     use horde_worker::ClaudeAdapter;
 
@@ -368,11 +425,10 @@ mod revival {
 
         let mut first = adapter.spawn(&AgentSpec::default()).await.expect("spawns");
         first.send(TurnInput::queued("hello")).await.expect("sends");
-        while let Ok(Some(event)) = first.next_event().await {
-            if matches!(event, AgentEvent::TurnEnded(_)) {
-                break;
-            }
-        }
+        assert!(
+            turn_end(&mut first).await.is_some(),
+            "the first session must complete a turn before it can hand over an id"
+        );
 
         let revival_id = first
             .provider_session_id()
@@ -391,14 +447,10 @@ mod revival {
             .await
             .expect("the revived session is usable");
 
-        let mut saw_turn = false;
-        while let Ok(Some(event)) = revived.next_event().await {
-            if matches!(event, AgentEvent::TurnEnded(_)) {
-                saw_turn = true;
-                break;
-            }
-        }
-        assert!(saw_turn, "the revived session must run a turn");
+        assert!(
+            turn_end(&mut revived).await.is_some(),
+            "the revived session must run a turn"
+        );
         revived.shutdown().await.expect("shuts down");
     }
 
@@ -424,10 +476,7 @@ mod revival {
         let _ = revived.send(TurnInput::queued("hello")).await;
 
         // No events, and the stream ends — never an invented SessionEstablished.
-        let mut events = Vec::new();
-        while let Ok(Some(event)) = revived.next_event().await {
-            events.push(event);
-        }
+        let events = drain(&mut revived).await;
 
         assert!(
             !events
@@ -448,7 +497,7 @@ mod revival {
 
 #[cfg(test)]
 mod side_effects {
-    use super::harness::{RESULT_ONLY, session_on};
+    use super::harness::{RESULT_ONLY, session_on, within};
     use horde_adapter::TurnInput;
 
     /// `interrupt()` must actually put the control message on the wire.
@@ -500,7 +549,10 @@ mod side_effects {
             .await
             .expect("the session survives an interrupt");
         assert!(
-            matches!(session.next_event().await, Ok(Some(_))),
+            matches!(
+                within("the steered turn produces an event", session.next_event()).await,
+                Ok(Some(_))
+            ),
             "a control-message interrupt leaves the session steerable"
         );
         session.shutdown().await.expect("shuts down");
@@ -550,7 +602,10 @@ mod side_effects {
             "a shut-down session must refuse work rather than hang"
         );
         assert!(
-            session.next_event().await.expect("no error").is_none(),
+            within("the closed stream answers", session.next_event())
+                .await
+                .expect("no error")
+                .is_none(),
             "and produce nothing further"
         );
     }
@@ -562,7 +617,7 @@ mod side_effects {
 
 #[cfg(test)]
 mod process_identity {
-    use super::harness::spec_with;
+    use super::harness::{spec_with, within};
     use horde_worker::SupervisedHarness;
 
     const SCRIPT: &str = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
@@ -636,7 +691,7 @@ mod process_identity {
         assert!(harness.id().is_some());
 
         harness.kill().await.expect("kill by handle");
-        let _ = harness.wait().await;
+        let _ = within("the child is reaped", harness.wait()).await;
 
         assert_eq!(
             harness.id(),
