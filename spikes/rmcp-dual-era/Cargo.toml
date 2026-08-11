@@ -1,0 +1,38 @@
+[package]
+name = "rmcp-dual-era"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Empty workspace table keeps this throwaway spike crate OUT of the Horde
+# workspace. Delete the whole `spikes/` tree once the real endpoint lands.
+[workspace]
+
+[dependencies]
+# Pinned exactly: the audit (docs/research/mcp-2026-audit.md §3) notes rmcp went
+# 3.0.0 -> 3.1.2 in eleven days, so the version under test must be unambiguous.
+rmcp = { version = "=3.1.2", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
+schemars = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tower-service = "0.3"
