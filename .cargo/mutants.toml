@@ -1,0 +1,39 @@
+# cargo-mutants configuration. Read by the `mutants` gate, which passes only
+# scope flags on the command line.
+#
+# Skipping a function because its mutants survive is how a mutation gate becomes
+# decorative, so the bar for an entry below is not "hard to test" but "no test
+# could possibly exist": the mutated expression has to be identical to the
+# original. A survivor that is merely awkward is a finding, and the fix is to
+# move its logic somewhere that can be tested.
+#
+# The gate enforces this rather than trusting it. It lists the mutants twice,
+# with this file and without it, and refuses an entry that names nothing, that
+# was configured but did not apply, that removed no mutant at all, or that
+# removed more than the one expression its comment argues about. It also refuses
+# any difference between the two listings that no entry accounts for.
+exclude_re = [
+    # `Capabilities::none()` is written `Self::default()`, and `Capabilities`
+    # derives `Default`. cargo-mutants' mutation of it is
+    # `-> Self with Default::default()`: the same expression, character for
+    # character. No test can distinguish the two, and one written to look as if
+    # it had would be asserting on nothing.
+    'Capabilities::none',
+    # `Script::echoing()` is `Self::default()` for the same reason, over a
+    # `Script` that also derives `Default`.
+    'Script::echoing',
+]
+
+# Parallelism is not settable here — cargo-mutants takes `--jobs` on the command
+# line only — so it lives in the gate, like every other flag.
+#
+# Tests here are in-process and finish in milliseconds; the floor exists so a
+# cold or contended machine does not report a spurious timeout.
+minimum_test_timeout = 60
+
+# A mutant that hangs usually hangs badly. Five times the clean-tree test time
+# is generous enough to avoid false timeouts without stalling a run.
+timeout_multiplier = 5.0
+
+# Mutants often produce code that takes longer to compile than the original.
+build_timeout_multiplier = 5.0

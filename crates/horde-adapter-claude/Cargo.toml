@@ -10,7 +10,6 @@ description = "Claude Code stream-json codec: wire types, turn assembly, usage n
 workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 horde-adapter = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -379,4 +379,39 @@ mod tests {
             );
         }
     }
+
+    /// Every variant's message, because a conversion error's whole job is to
+    /// tell a human which of four different refusals happened. An untested
+    /// Display is a message nobody has ever read.
+    #[test]
+    fn every_conversion_error_says_which_refusal_it_is() {
+        let unrepresentable = ConversionError::UnrepresentableNumber("9007199254740993".to_owned());
+        let cases = [
+            (
+                ConversionError::NotAnObject,
+                "updated_input must be a JSON object",
+            ),
+            (
+                unrepresentable,
+                "number 9007199254740993 has no exact f64 representation",
+            ),
+            (
+                ConversionError::UnusableOutcome(9_999),
+                "unusable PermissionOutcome 9999",
+            ),
+            (
+                ConversionError::RewriteUnsupported,
+                "decision rewrites tool input but the adapter cannot",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn a_conversion_error_is_a_std_error() {
+        let error: &dyn core::error::Error = &ConversionError::NotAnObject;
+        assert!(error.source().is_none());
+    }
 }

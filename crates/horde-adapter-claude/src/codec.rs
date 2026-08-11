@@ -48,23 +48,41 @@ pub fn decode_line(line: &str) -> Result<Envelope, AdapterError> {
         })?
         .to_owned();
 
-    let event = match event_type.as_str() {
-        "assistant" => Event::Assistant(typed(&raw, &event_type, line)?),
-        "user" => Event::User(typed(&raw, &event_type, line)?),
-        "result" => Event::Result(Box::new(typed(&raw, &event_type, line)?)),
-        "control_response" => Event::ControlResponse(typed(&raw, &event_type, line)?),
-        "rate_limit_event" => Event::RateLimit(typed(&raw, &event_type, line)?),
-        "stream_event" => Event::StreamEvent,
-        "system" => match raw.get("subtype").and_then(Value::as_str) {
-            Some("init") => Event::Init(Box::new(typed(&raw, &event_type, line)?)),
-            other => Event::System {
-                subtype: other.unwrap_or_default().to_owned(),
-            },
-        },
-        _ => Event::Unknown { event_type },
-    };
+    let event = classify(&raw, event_type, line)?;
 
     Ok(Envelope { raw, event })
+}
+
+/// Maps an envelope's `type` to the event this crate models.
+///
+/// Split out of [`decode_line`] so that reading the line and interpreting it
+/// are separately legible: everything above is about the bytes, everything here
+/// is about the protocol.
+fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {
+    Ok(match event_type.as_str() {
+        "assistant" => Event::Assistant(typed(raw, &event_type, line)?),
+        "user" => Event::User(typed(raw, &event_type, line)?),
+        "result" => Event::Result(Box::new(typed(raw, &event_type, line)?)),
+        "control_response" => Event::ControlResponse(typed(raw, &event_type, line)?),
+        "rate_limit_event" => Event::RateLimit(typed(raw, &event_type, line)?),
+        "stream_event" => Event::StreamEvent,
+        "system" => system_event(raw, &event_type, line)?,
+        _ => Event::Unknown { event_type },
+    })
+}
+
+/// Splits a `system` envelope on its subtype.
+///
+/// `init` is the one that carries session identity and model; the others are
+/// kept as their subtype so a report can say which arrived without this crate
+/// having to model each one.
+fn system_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, AdapterError> {
+    Ok(match raw.get("subtype").and_then(Value::as_str) {
+        Some("init") => Event::Init(Box::new(typed(raw, event_type, line)?)),
+        other => Event::System {
+            subtype: other.unwrap_or_default().to_owned(),
+        },
+    })
 }
 
 /// Deserializes a known envelope shape, keeping the raw line in the error so a

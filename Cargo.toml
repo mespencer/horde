@@ -1,24 +1,14 @@
-# MINIMAL root manifest, shared by the W1b (proto contracts) and W2b (adapter
-# core) worktrees.
-#
-# W1a owns the real workspace scaffold (full member list, shared dependency
-# table, toolchain pin, gauntlet crate). This file exists so the crates below
-# build and can be shown to pass the lint policy from docs/TESTING.md §4; the
-# orchestrator resolves this file in favour of W1a's version at merge, keeping
-# only the `members` entries each branch added.
 [workspace]
 resolver = "3"
-members = [
-    "crates/horde-adapter",
-    "crates/horde-adapter-claude",
-    "crates/horde-adapter-codex",
-    "crates/horde-adapter-fake",
-    "crates/horde-proto",
-    "crates/horde-server",
-    "crates/horde-testkit",
-    "crates/horde-worker",
-    "crates/horde-wire",
-]
+# A glob, not a list: every crate under crates/ is a member, so a new crate
+# joins by existing rather than by remembering to edit this line. The gauntlet
+# measures whatever `cargo metadata` reports, so the two cannot drift.
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+publish = false
 
 [workspace.dependencies]
 async-trait = "0.1.89"
@@ -35,12 +25,31 @@ horde-proto = { path = "crates/horde-proto" }
 horde-server = { path = "crates/horde-server" }
 horde-testkit = { path = "crates/horde-testkit" }
 
-# docs/TESTING.md §4. Reproduced here (not invented here) so the generated code
-# is verified against the real policy rather than assumed compatible with it.
+[workspace.lints.rust]
+# Deliberately *not* `warnings = "deny"`: denying every present and future rustc
+# warning from the manifest turns a toolchain bump into a broken build. The
+# `clippy` gate passes `-D warnings` instead, so the policy lives in one place
+# (the gate) and local `cargo build` stays usable.
+#
+# Everything listed here is already satisfied by every crate in the workspace.
+# `missing_docs` and `missing_debug_implementations` are deliberately NOT here:
+# they would red the clippy gate on 171 pre-existing items across five crates
+# whose owners never adopted them. Adopting them workspace-wide is a real and
+# worthwhile change — it is just a documentation task someone has to schedule,
+# not something to smuggle in through a lint table. horde-gauntlet holds itself
+# to both, via inner attributes in its own crate root.
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
 [workspace.lints.clippy]
+# docs/TESTING.md §4. `unwrap` is additionally banned in tests via clippy.toml.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+
+[profile.release]
+debug = "line-tables-only"

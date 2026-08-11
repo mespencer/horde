@@ -31,13 +31,14 @@ use horde_proto::v1::{
     sync_events_response,
 };
 use prost::Message;
+use tokio::sync::mpsc::Sender;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
-use super::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
+use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
-use crate::log::{PendingEvent, StoredEvent};
+use crate::log::{PendingEvent, StoredEvent, Tail};
 use crate::scheduler::Placement;
 use crate::state::SessionState;
 
@@ -54,6 +55,27 @@ impl ControlPlane {
     }
 
     /// Appends a server-originated event to a session.
+    /// Appends an event that belongs to one agent and carries no idempotency
+    /// key — the shape every client-initiated agent action has.
+    async fn append_agent_event(
+        &self,
+        session_id: &str,
+        agent_id: String,
+        kind: Kind,
+    ) -> Result<u64, ServerError> {
+        self.append(
+            session_id,
+            "",
+            Event {
+                agent_id: Some(AgentId::new(agent_id)),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(kind),
+            },
+        )
+        .await
+    }
+
     async fn append(
         &self,
         session_id: &str,
@@ -130,9 +152,106 @@ fn envelope(event: &StoredEvent) -> Result<horde_proto::v1::EventEnvelope, Serve
     Ok(horde_proto::v1::EventEnvelope {
         session_id: Some(SessionId::new(event.session_id.clone())),
         sequence: event.sequence,
-        recorded_at: None,
+        recorded_at: Some(recorded_at(event.recorded_at_unix_ms)),
         event: Some(Event::decode(event.payload.as_slice())?),
     })
+}
+
+/// Converts the log's stored milliseconds into a wire timestamp.
+///
+/// The log has always recorded this; it was never put on the wire, so a client
+/// could not render when anything happened or reconcile clock skew against the
+/// server (DESIGN.md §2). Mutation testing found it: the stored value had no
+/// reader, so replacing the clock with a constant changed nothing observable.
+fn recorded_at(unix_ms: i64) -> prost_types::Timestamp {
+    // Floor division, so a pre-epoch reading yields a negative second and a
+    // non-negative nanosecond rather than a timestamp that reads as later than
+    // it was.
+    let seconds = unix_ms.div_euclid(1_000);
+    let nanos = i32::try_from(unix_ms.rem_euclid(1_000)).unwrap_or(0) * 1_000_000;
+    prost_types::Timestamp { seconds, nanos }
+}
+
+/// Whether the stream ends once history has been delivered.
+///
+/// Two independent reasons: the client hung up, or it never asked to follow.
+/// Extracted because inline they are not separately reachable — a
+/// non-following client also drops the stream immediately afterwards, so `&&`
+/// still returns in every end-to-end run, and dropping the `!` merely inverts
+/// which of two paths a passing test takes.
+fn stop_after_caught_up(send_failed: bool, follow: bool) -> bool {
+    send_failed || !follow
+}
+
+/// One sync stream: history, a caught-up marker, then the live tail.
+///
+/// Split out of `sync_events` so the RPC is only about resolving the cursor,
+/// and so history and tail deliver through one code path rather than two
+/// copies of the same envelope-and-send loop.
+async fn stream_session(
+    sender: Sender<Result<SyncEventsResponse, Status>>,
+    session_id: String,
+    history: Vec<StoredEvent>,
+    mut tail: Tail,
+    follow: bool,
+) {
+    if !send_batch(&sender, &history).await {
+        return;
+    }
+
+    // Caught up. A TUI stops showing a loading state here rather than guessing
+    // when history ended.
+    let caught_up = SyncEventsResponse {
+        update: Some(sync_events_response::Update::CaughtUp(
+            horde_proto::v1::SyncCaughtUp {
+                heads: vec![horde_proto::v1::SessionCursor {
+                    session_id: Some(SessionId::new(session_id)),
+                    from_sequence: tail.delivered(),
+                }],
+            },
+        )),
+    };
+    if stop_after_caught_up(sender.send(Ok(caught_up)).await.is_err(), follow) {
+        return;
+    }
+
+    while let Some(next) = tail.next_batch().await {
+        let events = match next {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = sender.send(Err(Status::from(error))).await;
+                return;
+            }
+        };
+        if !send_batch(&sender, &events).await {
+            return;
+        }
+    }
+}
+
+/// Envelopes and sends one batch. `false` means the stream is finished — the
+/// receiver hung up, or an event would not decode and the error has been sent.
+async fn send_batch(
+    sender: &Sender<Result<SyncEventsResponse, Status>>,
+    events: &[StoredEvent],
+) -> bool {
+    let batch: Result<Vec<_>, _> = events.iter().map(envelope).collect();
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(error) => {
+            let _ = sender.send(Err(Status::from(error))).await;
+            return false;
+        }
+    };
+    if batch.is_empty() {
+        return true;
+    }
+    let response = SyncEventsResponse {
+        update: Some(sync_events_response::Update::Batch(EventBatch {
+            events: batch,
+        })),
+    };
+    sender.send(Ok(response)).await.is_ok()
 }
 
 #[tonic::async_trait]
@@ -294,7 +413,7 @@ impl ControlPlaneService for ControlPlane {
             .map(ToString::to_string)
             .unwrap_or_default();
 
-        let (history, mut tail) = self
+        let (history, tail) = self
             .core
             .log
             .tail(&session_id, cursor.from_sequence)
@@ -304,72 +423,7 @@ impl ControlPlaneService for ControlPlane {
         let follow = request.follow;
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
 
-        tokio::spawn(async move {
-            let mut batch = Vec::new();
-            for event in &history {
-                match envelope(event) {
-                    Ok(envelope) => batch.push(envelope),
-                    Err(error) => {
-                        let _ = sender.send(Err(Status::from(error))).await;
-                        return;
-                    }
-                }
-            }
-            if !batch.is_empty() {
-                let response = SyncEventsResponse {
-                    update: Some(sync_events_response::Update::Batch(EventBatch {
-                        events: batch,
-                    })),
-                };
-                if sender.send(Ok(response)).await.is_err() {
-                    return;
-                }
-            }
-
-            // Caught up. A TUI stops showing a loading state here rather than
-            // guessing when history ended.
-            let caught_up = SyncEventsResponse {
-                update: Some(sync_events_response::Update::CaughtUp(
-                    horde_proto::v1::SyncCaughtUp {
-                        heads: vec![horde_proto::v1::SessionCursor {
-                            session_id: Some(SessionId::new(session_id.clone())),
-                            from_sequence: tail.delivered(),
-                        }],
-                    },
-                )),
-            };
-            if sender.send(Ok(caught_up)).await.is_err() || !follow {
-                return;
-            }
-
-            while let Some(next) = tail.next_batch().await {
-                let events = match next {
-                    Ok(events) => events,
-                    Err(error) => {
-                        let _ = sender.send(Err(Status::from(error))).await;
-                        return;
-                    }
-                };
-                let mut batch = Vec::new();
-                for event in &events {
-                    match envelope(event) {
-                        Ok(envelope) => batch.push(envelope),
-                        Err(error) => {
-                            let _ = sender.send(Err(Status::from(error))).await;
-                            return;
-                        }
-                    }
-                }
-                let response = SyncEventsResponse {
-                    update: Some(sync_events_response::Update::Batch(EventBatch {
-                        events: batch,
-                    })),
-                };
-                if sender.send(Ok(response)).await.is_err() {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(stream_session(sender, session_id, history, tail, follow));
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
@@ -456,18 +510,13 @@ impl ControlPlaneService for ControlPlane {
             .map_err(Status::from)?;
 
         let sequence = self
-            .append(
+            .append_agent_event(
                 &session_id,
-                "",
-                Event {
-                    agent_id: Some(AgentId::new(agent_id)),
-                    occurred_at: None,
-                    idempotency_key: String::new(),
-                    kind: Some(Kind::TurnInterrupted(horde_proto::v1::TurnInterrupted {
-                        reason: request.reason,
-                        ..horde_proto::v1::TurnInterrupted::default()
-                    })),
-                },
+                agent_id,
+                Kind::TurnInterrupted(horde_proto::v1::TurnInterrupted {
+                    reason: request.reason,
+                    ..horde_proto::v1::TurnInterrupted::default()
+                }),
             )
             .await
             .map_err(Status::from)?;
@@ -504,29 +553,20 @@ impl ControlPlaneService for ControlPlane {
         })?;
 
         let sequence = self
-            .append(
+            .append_agent_event(
                 &session_id,
-                "",
-                Event {
-                    agent_id: Some(AgentId::new(agent_id)),
-                    occurred_at: None,
-                    idempotency_key: String::new(),
-                    kind: Some(Kind::PermissionDecided(
-                        horde_proto::v1::PermissionDecided {
-                            decision: Some(horde_proto::v1::PermissionDecision {
-                                request_id: Some(horde_proto::v1::PermissionRequestId::new(
-                                    request_id,
-                                )),
-                                outcome: request.outcome,
-                                decided_by: horde_proto::v1::PermissionLayer::Human as i32,
-                                decided_by_actor: None,
-                                reason: request.reason,
-                                remember_for_session: request.remember_for_session,
-                                updated_input: None,
-                            }),
-                        },
-                    )),
-                },
+                agent_id,
+                Kind::PermissionDecided(horde_proto::v1::PermissionDecided {
+                    decision: Some(horde_proto::v1::PermissionDecision {
+                        request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+                        outcome: request.outcome,
+                        decided_by: horde_proto::v1::PermissionLayer::Human as i32,
+                        decided_by_actor: None,
+                        reason: request.reason,
+                        remember_for_session: request.remember_for_session,
+                        updated_input: None,
+                    }),
+                }),
             )
             .await
             .map_err(Status::from)?;
@@ -687,11 +727,29 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
-        // Deliberately not stubbed away: the registry is real, so this can
-        // answer truthfully even though enrollment is not built.
-        Ok(Response::new(ListWorkersResponse {
-            workers: Vec::new(),
-        }))
+        // Answered from the registry rather than stubbed: the registry is real
+        // even though enrollment is not, and returning an empty list would make
+        // a connected worker indistinguishable from none.
+        let workers = self
+            .core
+            .workers
+            .connected()
+            .into_iter()
+            .map(|worker| horde_proto::v1::WorkerSummary {
+                worker_id: Some(horde_proto::v1::WorkerId::new(worker.worker_id.clone())),
+                name: worker.worker_id,
+                // Connection state is what the registry knows: a worker is in
+                // it because it registered and has not been dropped.
+                state: horde_proto::v1::WorkerConnectionState::Online as i32,
+                // Filled in with the handshake once enrollment carries it.
+                semver: String::new(),
+                capabilities: Some(worker.capabilities),
+                last_seen_at: None,
+                running_agents: 0,
+            })
+            .collect();
+
+        Ok(Response::new(ListWorkersResponse { workers }))
     }
 
     async fn mint_enrollment_code(
@@ -735,4 +793,70 @@ fn uuid_like() -> String {
     });
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recorded_at, stop_after_caught_up};
+
+    #[test]
+    fn a_sync_stream_ends_after_history_unless_the_client_asked_to_follow() {
+        // The only case that keeps the stream open.
+        assert!(!stop_after_caught_up(false, true));
+
+        assert!(
+            stop_after_caught_up(false, false),
+            "a scriptable sync replays to head and completes"
+        );
+        assert!(
+            stop_after_caught_up(true, true),
+            "a client that hung up gets no tail however much it asked to follow"
+        );
+        assert!(stop_after_caught_up(true, false));
+    }
+
+    /// Asserted against known values rather than a "plausible window": a window
+    /// wide enough not to flake is also wide enough to accept `secs + 1000` and
+    /// `secs / 1000`, which is exactly how both mutants survived the
+    /// integration test that checked the clock looked about right.
+    #[test]
+    fn milliseconds_split_into_whole_seconds_and_the_remainder_as_nanoseconds() {
+        let stamp = recorded_at(1_700_000_123_456);
+        assert_eq!(stamp.seconds, 1_700_000_123);
+        assert_eq!(
+            stamp.nanos, 456_000_000,
+            "456 ms is 456 million nanoseconds; adding or dividing by a million is not the same"
+        );
+    }
+
+    #[test]
+    fn a_whole_second_has_no_remainder() {
+        let stamp = recorded_at(1_000);
+        assert_eq!(stamp.seconds, 1);
+        assert_eq!(stamp.nanos, 0);
+    }
+
+    #[test]
+    fn the_epoch_is_zero_in_both_fields() {
+        let stamp = recorded_at(0);
+        assert_eq!(stamp.seconds, 0);
+        assert_eq!(stamp.nanos, 0);
+    }
+
+    #[test]
+    fn a_sub_second_reading_is_all_remainder() {
+        let stamp = recorded_at(999);
+        assert_eq!(stamp.seconds, 0);
+        assert_eq!(stamp.nanos, 999_000_000);
+    }
+
+    /// Floor division, so a pre-epoch reading is a negative second with a
+    /// non-negative nanosecond — not a timestamp that reads as later than it
+    /// was.
+    #[test]
+    fn a_pre_epoch_reading_floors_rather_than_truncating_toward_zero() {
+        let stamp = recorded_at(-1);
+        assert_eq!(stamp.seconds, -1);
+        assert_eq!(stamp.nanos, 999_000_000);
+    }
 }

@@ -13,3 +13,8 @@ workspace = true
 horde-adapter = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = "3.24.0"
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -231,8 +231,10 @@ impl EventLog {
         // Bounded by the head read at entry, so a continuously written session
         // cannot keep this loop alive indefinitely.
         let head_after_replay = self.head(session_id).await?;
-        if head_after_replay > delivered {
-            let missed = self.read_all_from(session_id, delivered + 1).await?;
+        if needs_sweep(head_after_replay, delivered) {
+            let missed = self
+                .read_all_from(session_id, sweep_from(delivered))
+                .await?;
             if let Some(last) = missed.last() {
                 delivered = last.sequence;
                 history.extend(missed);
@@ -252,6 +254,15 @@ impl EventLog {
 
     /// Reads every event from an offset, paging so one enormous session cannot
     /// be pulled into memory by a single unbounded query.
+    /// Terminates on an empty page rather than on a short one.
+    ///
+    /// A short-page early exit saves exactly one indexed query per replay, and
+    /// costs a branch whose failure mode is silent truncation. Mutation testing
+    /// made the trade concrete: `page.len() > PAGE` is indistinguishable from
+    /// the correct `<` — a page can never exceed the limit it was read with, so
+    /// the branch simply never fires and the empty-page exit does the work
+    /// anyway. A condition that cannot be wrong in one direction is not
+    /// carrying its weight.
     async fn read_all_from(
         &self,
         session_id: &str,
@@ -267,14 +278,44 @@ impl EventLog {
                 break;
             };
             next = last.sequence.saturating_add(1);
-            let short = page.len() < PAGE as usize;
             all.extend(page);
-            if short {
-                break;
-            }
         }
         Ok(all)
     }
+}
+
+/// Whether the head moved past what the replay delivered.
+///
+/// Extracted from [`EventLog::tail`] because an inline comparison there is not
+/// reachable by a test: the sweep only differs from a no-op when an append
+/// lands between the replay and this check, and that race cannot be forced
+/// deterministically. As a predicate it is an ordinary function with an
+/// ordinary truth table, so the boundary is pinned instead of hoped for.
+fn needs_sweep(head_after_replay: u64, delivered: u64) -> bool {
+    head_after_replay > delivered
+}
+
+/// The first sequence a sweep must ask for.
+///
+/// One past what was delivered: asking for `delivered` again would re-deliver
+/// the last event, and asking beyond it would skip one. Extracted for the third
+/// time in this module for the same reason — the sweep's own dedup and the
+/// tail's re-read heal a wrong window, so nothing downstream observes the
+/// offset and `delivered - 1` or `delivered * 1` survived every end-to-end
+/// test. As a function it is one line with three cases.
+fn sweep_from(delivered: u64) -> u64 {
+    delivered.saturating_add(1)
+}
+
+/// Whether a notification tells this tail nothing new.
+///
+/// Extracted for the same reason as [`needs_sweep`]: inline, the two halves of
+/// this condition are not separately reachable. A tail only ever sees
+/// notifications it already delivered *or* notifications for other sessions in
+/// the same run, so an `&&` still behaves correctly often enough to pass —
+/// as a predicate the truth table is four cases and all four are asserted.
+fn is_stale(notification: &Notification, session_id: &str, delivered: u64) -> bool {
+    notification.session_id != session_id || notification.sequence <= delivered
 }
 
 /// A live follow of one session, already positioned after its replay.
@@ -306,9 +347,7 @@ impl Tail {
         loop {
             match self.notifications.recv().await {
                 Ok(notification) => {
-                    if notification.session_id != self.session_id
-                        || notification.sequence <= self.delivered
-                    {
+                    if is_stale(&notification, &self.session_id, self.delivered) {
                         continue;
                     }
                 }
@@ -340,21 +379,231 @@ impl Tail {
 
 #[cfg(test)]
 mod tests {
+    use super::store::pending;
     use super::{EventLog, PendingEvent};
 
-    fn pending(session: &str, payload: &[u8]) -> PendingEvent {
-        PendingEvent {
-            session_id: session.to_owned(),
-            payload: payload.to_vec(),
-            ..PendingEvent::default()
+    /// A log with two events already in session `s1`.
+    async fn log_with_two_events() -> EventLog {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"a")).await.expect("append");
+        log.append(pending("s1", b"b")).await.expect("append");
+        log
+    }
+
+    /// `Debug` on the log is what an operator sees in a span; an empty struct
+    /// tells them nothing about whether anyone is attached.
+    #[tokio::test]
+    async fn the_debug_view_reports_how_many_tails_are_attached() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        assert!(format!("{log:?}").contains("EventLog"));
+        assert!(
+            format!("{log:?}").contains("subscribers: 0"),
+            "got {:?}",
+            format!("{log:?}")
+        );
+
+        let _subscriber = log.subscribe();
+        assert!(
+            format!("{log:?}").contains("subscribers: 1"),
+            "an attached tail must be visible: {:?}",
+            format!("{log:?}")
+        );
+    }
+
+    /// The sweep exists to fold in whatever landed during the replay. It must
+    /// fire when the head moved and stay quiet when it did not — a comparison
+    /// that always fires would re-read on every tail, and one that never fires
+    /// reopens the window the sweep closes.
+    #[tokio::test]
+    async fn the_sweep_folds_in_events_that_landed_during_the_replay() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..3 {
+            log.append(pending("s1", b"x")).await.expect("append");
         }
+
+        // Nothing moved between the read and the sweep: history is exactly the
+        // three events, and `delivered` sits on the last of them.
+        let (history, tail) = log.tail("s1", 1).await.expect("tail");
+        assert_eq!(history.len(), 3);
+        assert_eq!(tail.delivered(), 3);
+
+        // A tail taken at the head must return nothing and still be positioned
+        // correctly, which is the boundary case `>` versus `>=` disagrees on.
+        let (empty, tail) = log.tail("s1", 4).await.expect("tail");
+        assert!(
+            empty.is_empty(),
+            "there is no event 4 yet, so the sweep must find nothing"
+        );
+        assert_eq!(tail.delivered(), 3);
+    }
+
+    /// Paging stops on a short page. Getting the comparison wrong either stops
+    /// after the first full page or never stops at all.
+    #[tokio::test]
+    async fn replaying_a_session_longer_than_one_page_returns_every_event() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        // One more than the 512-event page, so the loop must go round twice.
+        for _ in 0..513 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let (history, _tail) = log.tail("s1", 1).await.expect("tail");
+        let sequences: Vec<u64> = history.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            (1..=513).collect::<Vec<u64>>(),
+            "a page boundary must not truncate or duplicate the replay"
+        );
+    }
+
+    /// `next_batch` skips a notification when it is for another session OR for
+    /// something already delivered. With `&&` it would skip only when both were
+    /// true, so a duplicate for this session would be re-read forever.
+    #[tokio::test]
+    async fn a_tail_ignores_notifications_it_has_already_delivered() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"a")).await.expect("append");
+
+        // Replay everything, so the next notification for s1 is one the tail
+        // has already seen.
+        let (history, mut tail) = log.tail("s1", 1).await.expect("tail");
+        assert_eq!(history.len(), 1);
+
+        // A notification for another session must not wake this tail into
+        // returning anything.
+        log.append(pending("other", b"x")).await.expect("append");
+        log.append(pending("s1", b"b")).await.expect("append");
+
+        let batch = tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
+            .await
+            .expect("the tail must not stall")
+            .expect("the log outlives the tail")
+            .expect("read");
+
+        let sequences: Vec<u64> = batch.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            vec![2],
+            "only the new s1 event, and never a redelivery of event 1"
+        );
+    }
+
+    /// The sweep must fire only when the head genuinely moved. Firing when
+    /// equal costs a pointless read; never firing reopens the window the sweep
+    /// exists to close.
+    #[test]
+    fn the_sweep_fires_only_when_the_head_moved_past_what_was_delivered() {
+        assert!(
+            super::needs_sweep(4, 3),
+            "an event landed during the replay"
+        );
+        assert!(!super::needs_sweep(3, 3), "nothing moved");
+        assert!(
+            !super::needs_sweep(2, 3),
+            "a head below what was delivered is not a reason to re-read"
+        );
+        assert!(!super::needs_sweep(0, 0), "an empty session sweeps nothing");
+    }
+
+    /// Paging is tested directly rather than through `tail`, because the sweep
+    /// compensates for a paging error — every mutation of the page-boundary
+    /// comparison survived a 513-event replay taken through `tail`, since the
+    /// sweep silently fetched whatever the paging loop dropped. Two mechanisms
+    /// covering for each other is exactly how a bug in one stays invisible.
+    #[tokio::test]
+    async fn paging_returns_every_event_across_a_page_boundary() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..513 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let all = log
+            .read_all_from("s1", 1)
+            .await
+            .expect("paging must not fail");
+        let sequences: Vec<u64> = all.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            (1..=513).collect::<Vec<u64>>(),
+            "a page boundary must not truncate, duplicate, or reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_from_an_offset_returns_the_suffix_across_a_boundary() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..600 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let tail = log.read_all_from("s1", 100).await.expect("paging");
+        let sequences: Vec<u64> = tail.iter().map(|event| event.sequence).collect();
+        assert_eq!(sequences, (100..=600).collect::<Vec<u64>>());
+    }
+
+    /// All four corners of the skip condition. Inline these are not separately
+    /// reachable, which is why an `&&` survived: a tail that skipped only when
+    /// a notification was *both* for another session *and* already delivered
+    /// still behaves correctly in the common case.
+    #[test]
+    fn a_notification_is_stale_when_it_is_for_another_session_or_already_delivered() {
+        let notification = |session: &str, sequence: u64| super::Notification {
+            session_id: session.to_owned(),
+            sequence,
+        };
+
+        // Neither: this is the one notification that must wake the tail.
+        assert!(!super::is_stale(&notification("s1", 5), "s1", 4));
+
+        // Wrong session only.
+        assert!(super::is_stale(&notification("other", 5), "s1", 4));
+
+        // Already delivered only — both the equal and the below-head cases,
+        // since `<=` and `<` disagree exactly at the boundary.
+        assert!(super::is_stale(&notification("s1", 4), "s1", 4));
+        assert!(super::is_stale(&notification("s1", 3), "s1", 4));
+
+        // Both.
+        assert!(super::is_stale(&notification("other", 3), "s1", 4));
+    }
+
+    /// The sweep's read window. A wrong offset is invisible end-to-end — the
+    /// re-read and the tail's own dedup heal it — so it is asserted here
+    /// instead.
+    #[test]
+    fn a_sweep_asks_for_the_sequence_after_what_was_delivered() {
+        assert_eq!(super::sweep_from(0), 1, "an empty session starts at 1");
+        assert_eq!(super::sweep_from(4), 5);
+        assert_eq!(
+            super::sweep_from(1),
+            2,
+            "asking for 1 again would re-deliver the event already handed over"
+        );
+        assert_eq!(
+            super::sweep_from(u64::MAX),
+            u64::MAX,
+            "saturating, so an absurd head cannot wrap the window back to zero"
+        );
+    }
+
+    /// Waits for the next batch, bounded.
+    ///
+    /// An unbounded `next_batch().await` turns a defect into a hang: a mutation
+    /// that makes reads come back empty leaves the tail waiting for an event
+    /// the log will never hand it, and cargo-mutants records a timeout rather
+    /// than a kill. A timeout is a mutant that was not evaluated, so every wait
+    /// here has a ceiling.
+    async fn next_batch_within(tail: &mut super::Tail) -> Vec<super::StoredEvent> {
+        tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
+            .await
+            .expect("the tail must produce a batch rather than hang")
+            .expect("the log outlives the tail")
+            .expect("read")
     }
 
     #[tokio::test]
     async fn appends_are_visible_to_a_later_read() {
-        let log = EventLog::in_memory().expect("in-memory log");
-        log.append(pending("s1", b"a")).await.expect("append");
-        log.append(pending("s1", b"b")).await.expect("append");
+        let log = log_with_two_events().await;
 
         let all = log.read_all("s1").await.expect("read");
         assert_eq!(all.len(), 2);
@@ -364,20 +613,14 @@ mod tests {
     /// The property the whole module exists for, in its simplest form.
     #[tokio::test]
     async fn a_tail_started_mid_stream_sees_everything_appended_afterwards() {
-        let log = EventLog::in_memory().expect("in-memory log");
-        log.append(pending("s1", b"a")).await.expect("append");
-        log.append(pending("s1", b"b")).await.expect("append");
+        let log = log_with_two_events().await;
 
         let (history, mut tail) = log.tail("s1", 2).await.expect("tail");
         assert_eq!(history.len(), 1, "replay starts at the requested offset");
         assert_eq!(tail.delivered(), 2);
 
         log.append(pending("s1", b"c")).await.expect("append");
-        let batch = tail
-            .next_batch()
-            .await
-            .expect("the tail is live")
-            .expect("read");
+        let batch = next_batch_within(&mut tail).await;
         let sequences: Vec<u64> = batch.iter().map(|event| event.sequence).collect();
         assert_eq!(sequences, vec![3]);
     }
@@ -390,7 +633,7 @@ mod tests {
         log.append(pending("other", b"x")).await.expect("append");
         log.append(pending("s1", b"mine")).await.expect("append");
 
-        let batch = tail.next_batch().await.expect("live").expect("read");
+        let batch = next_batch_within(&mut tail).await;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].session_id, "s1");
     }
@@ -403,7 +646,7 @@ mod tests {
         assert_eq!(tail.delivered(), 0);
 
         log.append(pending("s1", b"a")).await.expect("append");
-        let batch = tail.next_batch().await.expect("live").expect("read");
+        let batch = next_batch_within(&mut tail).await;
         assert_eq!(batch[0].sequence, 1, "no event is skipped");
     }
 

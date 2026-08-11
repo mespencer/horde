@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+   Doc-tests testprobe
+
+running 2 tests
+test src/lib.rs - half (line 12) ... ok
+test src/lib.rs - double (line 3) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+

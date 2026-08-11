@@ -160,6 +160,22 @@ mod tests {
         );
     }
 
+    /// The message a peer-from-the-future produces.
+    ///
+    /// Worth pinning because this is the only place the offending number
+    /// survives: an operator diagnosing a version-skew refusal has the log line
+    /// and nothing else, so a Display that dropped the value would leave them
+    /// knowing something was rejected but not what.
+    #[test]
+    fn an_unknown_capability_names_the_number_it_could_not_read() {
+        let rendered = UnknownCapability(9_999).to_string();
+        assert!(rendered.contains("9999"), "got {rendered}");
+        assert!(
+            rendered.contains("AdapterCapability"),
+            "and must say which enum it was reading, got {rendered}"
+        );
+    }
+
     #[test]
     fn unset_is_not_an_error_but_an_unknown_number_is() {
         assert_eq!(capability_from_wire(0), Ok(None));
