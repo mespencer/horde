@@ -491,7 +491,24 @@ many timed out. Timeouts count as caught in the tally — a mutant that hangs th
 change behaviour — and the count is surfaced separately so a creeping number cannot hide
 inside a green row. Read that number every time, and read it as *unevaluated* rather than
 as killed: "A timeout is not a kill" below says why the classification is not stable. A
-run that produced no tally at all is an `error`, not a clean sheet.
+run that produced no tally at all is an `error`, not a clean sheet — *unless* it said why
+it had nothing to do, in which case it is `skipped`.
+
+**A change with nothing mutable in it is `skipped`, and never `pass`.** cargo-mutants
+mutates product code, not tests: `#[cfg(test)]` modules and `tests/` are not mutated at
+all. So a diff can be full of Rust and still generate zero mutants — which is exactly what
+a test-only refactor is — and cargo-mutants then exits 0 having printed no tally. There
+are four wordings for it, depending on which stage the work ran out at (`Diff changes no
+Rust source files`, `No mutants to filter`, `diff matched no mutants`, `No mutants found
+under the active filters` / `No mutants were generated`), and the gate reads all of them.
+The row says `skipped` with the reason, because "no mutant survived" and "no mutant was
+ever built" are different facts and only one of them is evidence about the change.
+
+One message in that family is **not** in it: `No mutants were viable`, whose own text
+continues "perhaps there is a problem with building in a scratch directory". That is the
+instrument failing, so it stays an `error`. It is one word away from `No mutants were
+generated`, which is precisely how a broken build would come to be reported as a clean
+sheet; a test pins the distinction.
 
 ---
 
@@ -532,6 +549,15 @@ caller, and still passed. The killing version asks what the caller was *handed*
 before it blocked, not whether it blocked. When a test's assertion is the absence
 of something, check that the mutant would have produced something — otherwise
 both versions are equally silent and the test is measuring the clock.
+
+**Fixing one instance of a class leaves the class.** The mutants gate learned to treat
+a docs-only diff as `skipped` rather than a broken instrument. One merge later it went
+red on `main` again, for a tests-only diff — the same bug, one case over, because the fix
+had matched a single message string rather than asking what the tool says when it has
+nothing to do. The repair was to enumerate the family from `cargo-mutants --help` and the
+binary's own strings, and to write the test for each. When a gate misreads a tool, spend
+the extra ten minutes finding out how many ways that tool can say the same thing; the
+second instance always arrives, and it arrives on `main`.
 
 **A timeout is not a kill; it is a mutant nobody evaluated.** The tally counts a
 timed-out mutant as caught, which is the most defensible thing one number can

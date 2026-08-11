@@ -87,16 +87,80 @@ fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
     })
 }
 
+/// One way cargo-mutants says a run found no work, and how the row says it.
+struct NothingToMutate {
+    /// What cargo-mutants printed.
+    marker: &'static str,
+    /// How the row describes it, before the scope is named.
+    reason: &'static str,
+    /// What is worth adding after the scope, if anything.
+    note: &'static str,
+}
+
+/// Why cargo-mutants had nothing to do, when it ran fine and had nothing.
+///
+/// The work can run out at four different stages, and cargo-mutants words each
+/// differently: no Rust in the diff at all, no mutants generated, none left
+/// after filtering, none on the changed lines. Every one of them is the same
+/// fact to this gate — the run completed and there was nothing to measure.
+///
+/// `No mutants were viable` reads like a fifth and is deliberately absent.
+/// cargo-mutants' own wording continues "perhaps there is a problem with
+/// building in a scratch directory", which is the instrument failing rather
+/// than a change with nothing in it. That stays an `error`, and
+/// [`a_build_that_produced_no_viable_mutants_is_still_an_error`] holds the line
+/// — the two messages are one word apart, which is exactly how a broken
+/// instrument would come to be reported as a clean sheet.
+const NOTHING_TO_MUTATE: &[NothingToMutate] = &[
+    NothingToMutate {
+        marker: "changes no Rust source files",
+        reason: "no Rust changed in",
+        note: "",
+    },
+    NothingToMutate {
+        marker: "No mutants to filter",
+        reason: "nothing mutable in",
+        note: TESTS_ARE_NOT_MUTATED,
+    },
+    NothingToMutate {
+        marker: "diff matched no mutants",
+        reason: "nothing mutable in",
+        note: TESTS_ARE_NOT_MUTATED,
+    },
+    NothingToMutate {
+        marker: "No mutants found under the active filters",
+        reason: "nothing mutable in",
+        note: "",
+    },
+    NothingToMutate {
+        marker: "No mutants were generated",
+        reason: "nothing mutable in",
+        note: "",
+    },
+];
+
+/// Why a diff full of Rust can still produce no mutants at all.
+const TESTS_ARE_NOT_MUTATED: &str =
+    " (cargo-mutants does not mutate #[cfg(test)] code, so a tests-only change generates none)";
+
 /// Why there was nothing to mutate, if there was nothing.
 ///
 /// A change that touches no Rust — documentation, a proto file, a config —
-/// generates no mutants and cargo-mutants prints no tally. That is `skipped`,
-/// not `error`: nothing was measured because there was nothing to measure,
-/// which is a different fact from an instrument that broke, and the row has to
-/// say which.
+/// generates no mutants and cargo-mutants prints no tally. Neither does a
+/// change that touches plenty of Rust but only *test* Rust: cargo-mutants does
+/// not mutate `#[cfg(test)]` code or `tests/`, so a diff that is all test files
+/// is a diff with nothing mutable in it. Both are `skipped`, not `error`:
+/// nothing was measured because there was nothing to measure, which is a
+/// different fact from an instrument that broke, and the row has to say which.
+///
+/// Neither is a `pass` either. A zero has to say which of its two meanings it
+/// has, and "no mutant survived because none was ever built" must never read as
+/// "this change is covered".
 pub fn nothing_to_mutate(text: &str, scope: &Scope) -> Option<String> {
-    text.contains("changes no Rust source files")
-        .then(|| format!("no Rust changed in {}", scope.label()))
+    NOTHING_TO_MUTATE
+        .iter()
+        .find(|nothing| text.contains(nothing.marker))
+        .map(|nothing| format!("{} {}{}", nothing.reason, scope.label(), nothing.note))
 }
 
 /// Confirms the configured exclusions are real and took effect.
@@ -1447,6 +1511,83 @@ mod tests {
         assert_eq!(
             nothing_to_mutate("858 mutants tested: 0 missed", &Scope::FullTree),
             None
+        );
+    }
+
+    #[test]
+    fn a_tests_only_change_is_skipped_rather_than_erroring() {
+        // The exact message from `main`: the merge at c5a31e7 brought in four
+        // files, all of them test files, so cargo-mutants filtered every mutant
+        // away, printed this on stderr, and exited 0 with no tally at all.
+        assert_eq!(
+            nothing_to_mutate(" INFO No mutants to filter\n", &Scope::Diff(PathBuf::new())),
+            Some(format!(
+                "nothing mutable in changed code{TESTS_ARE_NOT_MUTATED}"
+            ))
+        );
+    }
+
+    #[test]
+    fn every_way_cargo_mutants_reports_no_work_is_skipped() {
+        // Four stages the work can run out at, four wordings. Reading only one
+        // of them is how this gate erred on `main` after already having been
+        // fixed for the docs-only case.
+        for message in [
+            " INFO Diff changes no Rust source files",
+            " INFO No mutants to filter",
+            " INFO diff matched no mutants",
+            "No mutants found under the active filters",
+            "No mutants were generated",
+        ] {
+            assert!(
+                nothing_to_mutate(message, &Scope::FullTree).is_some(),
+                "a completed run with no work is not an instrument failure: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_that_produced_no_viable_mutants_is_still_an_error() {
+        // One word from "No mutants were generated", and the opposite meaning:
+        // cargo-mutants says this when it could not build in its scratch
+        // directory. A broken instrument tells you nothing, so it must not be
+        // absorbed into the skipped family by a loose substring match.
+        assert_eq!(
+            nothing_to_mutate(
+                "No mutants were viable: perhaps there is a problem with building \
+                 in a scratch directory.",
+                &Scope::FullTree
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tests_only_change_reports_skipped_through_the_whole_gate() {
+        // The repro end to end: a diff naming only test files, and the run that
+        // follows it saying it had nothing to filter.
+        let run = run_after_with(
+            vec![
+                exited(0, "branchpoint\n"),
+                exited(0, "tip\n"),
+                exited(
+                    0,
+                    "diff --git a/crates/horde-server/tests/contracts.rs \
+                     b/crates/horde-server/tests/contracts.rs\n",
+                ),
+            ],
+            failed(0, " INFO No mutants to filter\n"),
+        );
+        assert_eq!(run.outcome.label(), "skipped", "{:?}", run.outcome);
+        assert!(
+            run.outcome.detail().contains("nothing mutable"),
+            "{}",
+            run.outcome.detail()
+        );
+        assert!(
+            run.outcome.detail().contains("cfg(test)"),
+            "the row has to say why a diff full of Rust produced no mutants: {}",
+            run.outcome.detail()
         );
     }
 
