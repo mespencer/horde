@@ -489,14 +489,23 @@ impl AgentSession for FakeSession {
     }
 }
 
+/// Scaffolding the test modules below share.
+///
+/// Three copies of the same `spec`, and the same spawn-and-send preamble beside
+/// them, is the shape the duplication gate exists to catch. The fix it asks for
+/// is one shared helper rather than a wider detection window, and putting these
+/// behind `#[cfg(test)] mod` is also what lets them use `expect`.
 #[cfg(test)]
-mod guard_tests {
-    use horde_adapter::{Adapter, AgentSpec, Capabilities, Capability, Delivery, TurnInput};
+mod harness {
+    use horde_adapter::{Adapter, AgentSession, AgentSpec, TurnInput};
     use serde_json::json;
 
     use super::FakeAdapter;
+    use crate::{Script, ScriptedTurn, Step};
 
-    fn spec() -> AgentSpec {
+    /// A spec with nothing configured: what a test asks for when it cares about
+    /// the script rather than the spawn.
+    pub(crate) fn spec() -> AgentSpec {
         AgentSpec {
             model: None,
             append_system_prompt: None,
@@ -506,6 +515,44 @@ mod guard_tests {
             provider_options: std::collections::BTreeMap::new(),
         }
     }
+
+    /// A script that asks permission for `call-1`, then takes a turn saying
+    /// `afterwards` — the step a session must not reach before the decision.
+    pub(crate) fn asking_before(afterwards: &str) -> Script {
+        Script::of(vec![
+            ScriptedTurn::saying("looking into it").with_step(Step::AskPermission {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                input: json!({ "command": "docker rm horde-test" }),
+            }),
+            ScriptedTurn::saying(afterwards),
+        ])
+    }
+
+    /// A session playing `script` on a fully capable adapter, with its first
+    /// message already sent.
+    pub(crate) async fn started(script: Script) -> Box<dyn AgentSession> {
+        started_on(FakeAdapter::new(script)).await
+    }
+
+    /// The same preamble, on an adapter the test has already narrowed.
+    ///
+    /// Takes the built adapter rather than a script and a `Capabilities` so the
+    /// builder chain stays at the call site, where a test that is *about* which
+    /// capabilities are set says so in its own body.
+    pub(crate) async fn started_on(adapter: FakeAdapter) -> Box<dyn AgentSession> {
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        session
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use horde_adapter::{Adapter, Capabilities, Capability, Delivery, TurnInput};
+
+    use super::FakeAdapter;
+    use super::harness::{asking_before, spec, started, started_on};
 
     /// The adapter reports the identity it was configured with.
     ///
@@ -612,27 +659,14 @@ mod guard_tests {
     /// against it would believe the permission chain had been honoured.
     #[tokio::test]
     async fn a_pending_permission_request_halts_the_script() {
-        use crate::{Script, ScriptedTurn, Step};
-
-        let script = Script::of(vec![
-            ScriptedTurn::saying("looking into it").with_step(Step::AskPermission {
-                tool_call_id: "call-1".to_owned(),
-                tool_name: "Bash".to_owned(),
-                input: json!({ "command": "docker rm horde-test" }),
-            }),
-            ScriptedTurn::saying("done"),
-        ]);
-
-        let mut session = FakeAdapter::new(script)
-            .with_capabilities(
+        let mut session = started_on(
+            FakeAdapter::new(asking_before("done")).with_capabilities(
                 Capabilities::none()
                     .with(Capability::PreAuthorizeToolCalls)
                     .with(Capability::RewritesToolInput),
-            )
-            .spawn(&spec())
-            .await
-            .expect("spawns");
-        session.send(TurnInput::queued("go")).await.expect("sends");
+            ),
+        )
+        .await;
 
         // Drain until the request surfaces, then confirm the turn has NOT
         // ended: a turn that finished while a decision was outstanding is the
@@ -685,15 +719,11 @@ mod guard_tests {
     async fn shutdown_discards_events_that_were_still_queued() {
         use crate::{Script, ScriptedTurn};
 
-        let script = Script::of(vec![
+        let mut session = started(Script::of(vec![
             ScriptedTurn::saying("one"),
             ScriptedTurn::saying("two"),
-        ]);
-        let mut session = FakeAdapter::new(script)
-            .spawn(&spec())
-            .await
-            .expect("spawns");
-        session.send(TurnInput::queued("go")).await.expect("sends");
+        ]))
+        .await;
 
         // Take a single event, deliberately leaving the rest queued.
         let first = session.next_event().await.expect("no error");
@@ -713,44 +743,20 @@ mod guard_tests {
 #[cfg(test)]
 mod permission_path_tests {
     use horde_adapter::{
-        Adapter, AgentEvent, AgentSession, AgentSpec, Capabilities, Capability, OutputChannel,
-        PermissionDecision, ToolCallId, TurnInput,
+        AgentEvent, AgentSession, Capabilities, Capability, OutputChannel, PermissionDecision,
+        ToolCallId,
     };
     use serde_json::json;
 
     use super::FakeAdapter;
-    use crate::{Script, ScriptedTurn, Step};
-
-    fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
-    }
-
-    fn asking_script() -> Script {
-        Script::of(vec![
-            ScriptedTurn::saying("looking into it").with_step(Step::AskPermission {
-                tool_call_id: "call-1".to_owned(),
-                tool_name: "Bash".to_owned(),
-                input: json!({ "command": "docker rm horde-test" }),
-            }),
-            ScriptedTurn::saying("second turn"),
-        ])
-    }
+    use super::harness::{asking_before, started_on};
 
     /// Drives a session to the point where it is genuinely waiting on `call-1`.
     async fn waiting_session(capabilities: Capabilities) -> Box<dyn AgentSession> {
-        let mut session = FakeAdapter::new(asking_script())
-            .with_capabilities(capabilities)
-            .spawn(&spec())
-            .await
-            .expect("spawns");
-        session.send(TurnInput::queued("go")).await.expect("sends");
+        let mut session = started_on(
+            FakeAdapter::new(asking_before("second turn")).with_capabilities(capabilities),
+        )
+        .await;
 
         for _ in 0..32 {
             match session.next_event().await {
@@ -850,21 +856,10 @@ mod permission_path_tests {
 mod stall_tests {
     use std::time::Duration;
 
-    use horde_adapter::{Adapter, AgentEvent, AgentSpec, TurnInput};
+    use horde_adapter::AgentEvent;
 
-    use super::FakeAdapter;
+    use super::harness::started;
     use crate::{Script, ScriptedTurn, Step};
-
-    fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
-    }
 
     /// Long enough that reaching it means the stall was not honoured.
     const FOREVER: Duration = Duration::from_secs(3600);
@@ -893,19 +888,14 @@ mod stall_tests {
     /// would never occur.
     #[tokio::test]
     async fn a_turn_that_stalls_first_plays_nothing_behind_the_stall() {
-        let script = Script::of(vec![ScriptedTurn {
+        let mut session = started(Script::of(vec![ScriptedTurn {
             steps: vec![
                 Step::Stall(FOREVER),
                 Step::Say("played on regardless".to_owned()),
             ],
             ..ScriptedTurn::saying("done")
-        }]);
-
-        let mut session = FakeAdapter::new(script)
-            .spawn(&spec())
-            .await
-            .expect("spawns");
-        session.send(TurnInput::queued("go")).await.expect("sends");
+        }]))
+        .await;
 
         // Bounded, because the stall is real time and an unbounded drain would
         // wait it out. Whatever arrives before the bound is what the session was
