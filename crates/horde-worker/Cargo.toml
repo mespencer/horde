@@ -1,0 +1,25 @@
+[package]
+name = "horde-worker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The Worker: supervises provider harnesses as child processes and drives them through their codecs."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+horde-adapter = { workspace = true }
+horde-adapter-claude = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# The stub harness is a real binary the process tests spawn, so supervision is
+# exercised over real stdio rather than simulated.
+[[bin]]
+name = "stub-harness"
+path = "src/bin/stub_harness.rs"

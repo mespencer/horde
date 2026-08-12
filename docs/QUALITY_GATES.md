@@ -422,8 +422,16 @@ scope — which is why the entry names one path, with `\.` for a dot, rather tha
 `src/bin/**`, a glob that would take the product out with the fixture:
 
 ```toml
-exclude_re = ['horde-worker/src/bin/stub_harness\.rs']
+exclude_re = ['crates/horde-worker/src/bin/stub_harness\.rs']
 ```
+
+The path is written **from the workspace root**, `crates/` and all. Earlier revisions of
+this section omitted the `crates/` prefix, and when the exclusion first landed for real the
+self-check refused it — *"excludes horde-worker/src/bin/stub_harness.rs, which is not in
+the tree"*. The regex would in fact have matched, because `exclude_re` is tested against a
+mutant description that begins with the full path; it is the gate's *existence* check that
+insists on a path a reader can go and look at. That is the check earning its keep: a
+prefix-less path is one directory rename away from silently excluding nothing at all.
 
 *A function, when its mutant is provably equivalent.* Sometimes cargo-mutants' rewrite
 produces the expression that was already there. `Capabilities::none()` is written
@@ -573,6 +581,35 @@ per-mutant timeout from that mutant's own baseline, read a timeout as
 row containing timeouts has not been shown to be green. Re-run them on a quiet
 machine before believing the row — and never close out a survivor by observing
 that it timed out on the next attempt.
+
+**Bound every wait, and bound a hot spin by count rather than by clock.** The way
+to turn a timeout into a kill is to give each wait a ceiling and assert on what
+arrived, so a mutant that stops the thing arriving fails in seconds instead of
+stalling the suite. `next_batch_within` in `horde-server`'s log tests and `within`
+in `horde-worker`'s supervision tests are the same helper, and every wait against
+a child process or a tail goes through one of them.
+
+A timer is not always enough, and the exception is worth knowing before it costs
+an afternoon. `#[tokio::test]` runs on the current-thread runtime, so a loop whose
+body never actually awaits — a `read_line` mutated to return `Ok(Some(""))`
+instantly, forever — never yields to the scheduler, the timer is never polled, and
+a `tokio::time::timeout` wrapped around that loop silently does not fire. The
+deadline reads as if it exists and does not. That mutant spun for a full minute
+while every other test in the file had already failed, hanging the whole binary on
+one starved timer. A ceiling on **iterations** needs no scheduler co-operation, so
+it holds exactly where the clock cannot:
+
+```rust
+let mut lines = 0_u32;
+while let Ok(Some(_)) = within("a line arrives", harness.read_line()).await {
+    lines += 1;
+    assert!(lines < 1024, "the stub's stdout must reach EOF");
+}
+```
+
+The same trap sits under any "wait for a notification" loop that can be woken
+spuriously — `tokio::time::pause` or an observable park signal is the equivalent
+fix where the spin is in production code rather than a test.
 
 **A compound condition inside a loop or a stream handler is untestable in place;
 extract it as a named predicate.** `while a && b` in a stream handler cannot have
