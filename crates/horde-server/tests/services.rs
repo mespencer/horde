@@ -12,7 +12,7 @@
 use horde_proto::v1::{
     AgentId, AgentOutputChannel, AgentOutputChunk, AgentSpec, CreateSessionRequest, Event,
     GetSessionRequest, JournaledEvent, JournaledEventBatch, ListSessionsRequest,
-    ListWorkspaceDefinitionsRequest, PushEventsRequest, PushEventsStart, RegisterWorkerRequest,
+    ListWorkspaceDefinitionsRequest, PermissionOutcome, PushEventsRequest, RegisterWorkerRequest,
     SessionCursor, SessionId, SpawnAgentRequest, StreamCommandsRequest, SyncEventsRequest,
     WorkerCapabilities, WorkerId, control_plane_service_client::ControlPlaneServiceClient,
     event::Kind, push_events_request, push_events_response, stream_commands_response,
@@ -39,21 +39,8 @@ async fn open_journal(
     tokio::sync::mpsc::Sender<PushEventsRequest>,
     tonic::Streaming<horde_proto::v1::PushEventsResponse>,
 )> {
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
-        .await?
-        .into_inner();
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new(worker_id)),
-                last_local_journal_sequence,
-            })),
-        })
-        .await?;
-    Ok((to_server, acks))
+    horde_server_testkit::open_journal(&mut harness.worker, worker_id, last_local_journal_sequence)
+        .await
 }
 
 /// Registers a worker so the scheduler has somewhere to place agents.
@@ -100,14 +87,17 @@ async fn answer_permission(
     harness: &mut Harness,
     request_id: &str,
     reason: &str,
+    outcome: PermissionOutcome,
+    updated_input: Option<horde_proto::prost_types::Struct>,
 ) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
     harness
         .control
         .answer_permission(horde_proto::v1::AnswerPermissionRequest {
             request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
-            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            outcome: outcome as i32,
             reason: reason.to_owned(),
             remember_for_session: false,
+            updated_input,
         })
         .await
         .map(tonic::Response::into_inner)
@@ -474,40 +464,62 @@ fn permission_requested(agent: &str, request_id: &str) -> Event {
     }
 }
 
+/// Journals one `PermissionRequested` per id, as a single worker batch.
+async fn journal_permission_requests(
+    harness: &mut Harness,
+    session_id: &str,
+    request_ids: &[&str],
+) -> Setup<()> {
+    let (to_server, mut acks) = open_journal(harness, "worker-a", 0).await?;
+    acks.next().await.ok_or("a start reply")??;
+
+    let mut events = Vec::new();
+    for (index, request_id) in request_ids.iter().enumerate() {
+        events.push(JournaledEvent {
+            journal_sequence: u64::try_from(index)? + 1,
+            session_id: Some(SessionId::new(session_id)),
+            event: Some(permission_requested("agent-1", request_id)),
+        });
+    }
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events,
+                acked_command_sequence: 0,
+            })),
+        })
+        .await?;
+    acks.next().await.ok_or("a batch reply")??;
+    Ok(())
+}
+
+/// A connected harness whose session already has one pending permission per
+/// id — the arrangement both answer-side tests start from.
+async fn harness_with_pending_permissions(request_ids: &[&str]) -> Setup<Harness> {
+    let mut harness = connect_to(core()?).await?;
+    let (session_id, _) = seed(&mut harness, "perms", "key-1").await?;
+    journal_permission_requests(&mut harness, &session_id, request_ids).await?;
+    Ok(harness)
+}
+
 #[tokio::test]
 async fn a_permission_is_answered_by_request_id_alone() {
     // The client answering a permission knows the request id and nothing else —
     // not the session, not the worker. Finding the rest is the server's job,
     // which is what makes a permission answerable from any attached client.
-    let core = core().expect("an in-memory core");
-    let mut harness = connect_to(core).await.expect("the harness must connect");
-    let (session_id, _) = seed(&mut harness, "perms", "key-1")
+    let mut harness = harness_with_pending_permissions(&["req-1"])
         .await
-        .expect("a session must be creatable");
+        .expect("a pending permission must be arrangeable");
 
-    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
-        .await
-        .expect("the event stream must open");
-    acks.next().await.expect("a reply").expect("accepted");
-
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
-                events: vec![JournaledEvent {
-                    journal_sequence: 1,
-                    session_id: Some(SessionId::new(session_id.clone())),
-                    event: Some(permission_requested("agent-1", "req-1")),
-                }],
-                acked_command_sequence: 0,
-            })),
-        })
-        .await
-        .expect("the request must journal");
-    acks.next().await.expect("a reply").expect("accepted");
-
-    let answered = answer_permission(&mut harness, "req-1", "looks fine")
-        .await
-        .expect("a pending permission must be answerable");
+    let answered = answer_permission(
+        &mut harness,
+        "req-1",
+        "looks fine",
+        PermissionOutcome::Allow,
+        None,
+    )
+    .await
+    .expect("a pending permission must be answerable");
     assert!(
         answered.sequence > 0,
         "the decision is an event like any other, so it has a sequence"
@@ -515,10 +527,49 @@ async fn a_permission_is_answered_by_request_id_alone() {
 
     // Answering it again fails: the projection dropped it when the decision
     // landed, so there is nothing left awaiting an answer.
-    let twice = answer_permission(&mut harness, "req-1", "")
+    let twice = answer_permission(&mut harness, "req-1", "", PermissionOutcome::Allow, None)
         .await
         .expect_err("an answered permission is no longer pending");
     assert_eq!(twice.code(), Code::InvalidArgument);
+}
+
+/// A narrowing rides an ALLOW and is refused on a DENY — both directions of
+/// the guard, because either operator slip (`&&`→`||`, `!=`→`==`) turns one
+/// of them into the other.
+#[tokio::test]
+async fn a_narrowing_is_accepted_with_allow_and_refused_with_deny() {
+    let mut harness = harness_with_pending_permissions(&["req-allow", "req-deny"])
+        .await
+        .expect("two pending permissions must be arrangeable");
+
+    let narrowing = horde_proto::prost_types::Struct::default();
+
+    // ALLOW with replacement arguments is the narrowing round trip working —
+    // the human clamped the call rather than merely permitting it.
+    let answered = answer_permission(
+        &mut harness,
+        "req-allow",
+        "clamped",
+        PermissionOutcome::Allow,
+        Some(narrowing.clone()),
+    )
+    .await
+    .expect("a narrowing alongside ALLOW must be accepted");
+    assert!(answered.sequence > 0);
+
+    // The same narrowing on a DENY would write replacement arguments every
+    // reader is entitled to ignore — refused, not dropped.
+    let refused = answer_permission(
+        &mut harness,
+        "req-deny",
+        "",
+        PermissionOutcome::Deny,
+        Some(narrowing),
+    )
+    .await
+    .expect_err("a narrowing alongside DENY must be refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("ALLOW"));
 }
 
 #[tokio::test]
@@ -529,9 +580,15 @@ async fn answering_a_permission_nobody_asked_for_is_refused() {
         .await
         .expect("a session must be creatable");
 
-    let status = answer_permission(&mut harness, "never-asked", "")
-        .await
-        .expect_err("inventing a decision for an unknown request would be worse");
+    let status = answer_permission(
+        &mut harness,
+        "never-asked",
+        "",
+        PermissionOutcome::Allow,
+        None,
+    )
+    .await
+    .expect_err("inventing a decision for an unknown request would be worse");
     assert_eq!(status.code(), Code::InvalidArgument);
     assert!(status.message().contains("never-asked"));
 }

@@ -93,6 +93,16 @@ impl ControlPlane {
                 payload: event.encode_to_vec(),
             })
             .await?;
+
+        // A deduplication that swallowed a different kind of event is a key
+        // collision, not a retry, and the caller has to hear about it.
+        crate::service::shared::refuse_kind_collision(
+            &appended,
+            session_id,
+            idempotency_key,
+            &event,
+        )?;
+
         Ok(appended.sequence)
     }
 
@@ -552,6 +562,19 @@ impl ControlPlaneService for ControlPlane {
             )))
         })?;
 
+        // A narrowing only means anything alongside ALLOW. Carrying one on a
+        // denial would write a decision whose replacement arguments every
+        // reader is entitled to ignore — a rewrite that silently evaporates,
+        // which is the exact failure permission.proto's reject-don't-drop note
+        // exists to prevent. Refused here rather than dropped here.
+        if request.updated_input.is_some()
+            && request.outcome != i32::from(horde_proto::v1::PermissionOutcome::Allow)
+        {
+            return Err(Status::from(ServerError::Invalid(
+                "a permission decision may only carry updated_input with outcome ALLOW".to_owned(),
+            )));
+        }
+
         let sequence = self
             .append_agent_event(
                 &session_id,
@@ -564,7 +587,13 @@ impl ControlPlaneService for ControlPlane {
                         decided_by_actor: None,
                         reason: request.reason,
                         remember_for_session: request.remember_for_session,
-                        updated_input: None,
+                        // Carried through rather than dropped. Absence and an
+                        // empty Struct are different instructions — "allow as
+                        // proposed" versus "allow with no arguments at all" —
+                        // and `Option` is what keeps them distinct across this
+                        // hop, so this is deliberately a move and not a
+                        // `unwrap_or_default`.
+                        updated_input: request.updated_input,
                     }),
                 }),
             )

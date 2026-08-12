@@ -47,6 +47,29 @@ pub enum ServerError {
         stored: u64,
     },
 
+    /// Two different kinds of event were written under one idempotency key.
+    ///
+    /// Deduplication exists for at-least-once delivery, where a retry replays
+    /// the *same* event — so a hit whose kind differs from the stored one is
+    /// never a retry. It is a key collision, and the caller's event is about to
+    /// be discarded.
+    ///
+    /// Refused loudly because the alternative is the worst failure shape there
+    /// is: the write is acked, the log stays silent, and the symptom surfaces
+    /// somewhere else entirely as a reader that blocks forever, with nothing
+    /// pointing back at the write that vanished.
+    #[error(
+        "idempotency key {key} in session {session_id} already holds a {stored} event at \
+         sequence {sequence}; refusing to silently discard this {incoming} one"
+    )]
+    IdempotencyKeyCollision {
+        session_id: String,
+        key: String,
+        sequence: u64,
+        stored: &'static str,
+        incoming: &'static str,
+    },
+
     /// Reached the wire but could not be decoded.
     #[error("could not decode a stored event: {0}")]
     Decode(#[from] prost::DecodeError),
@@ -74,6 +97,9 @@ impl From<ServerError> for Status {
             ServerError::Invalid(_) => Code::InvalidArgument,
             ServerError::NoWorkerAvailable { .. } => Code::FailedPrecondition,
             ServerError::JournalRegressed { .. } => Code::FailedPrecondition,
+            // The caller must change the key, not retry: sending the same
+            // bytes again produces the same collision.
+            ServerError::IdempotencyKeyCollision { .. } => Code::InvalidArgument,
             ServerError::Unimplemented(_) => Code::Unimplemented,
             ServerError::Storage { .. } | ServerError::StorageTask(_) | ServerError::Decode(_) => {
                 Code::Internal

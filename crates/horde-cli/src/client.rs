@@ -42,6 +42,28 @@ pub enum ClientError {
         "{endpoint} is not a valid endpoint URI (expected something like http://127.0.0.1:7777)"
     )]
     Endpoint { endpoint: String },
+
+    /// The replacement arguments on a narrowing answer cannot cross the wire.
+    ///
+    /// Refused before the RPC rather than sent as a plain allow: the whole
+    /// point of a narrowing is that the *narrowed* call runs, so an answer
+    /// whose narrowing was dropped would permit the original, wider call —
+    /// the failure `permission.proto` calls out by name.
+    #[error("the narrowing on this answer cannot be sent: {source}")]
+    Narrowing {
+        #[source]
+        source: horde_wire::permission::ConversionError,
+    },
+
+    /// The replacement arguments were not valid JSON.
+    ///
+    /// Caught before the RPC: a typo belongs to the person who typed it, and
+    /// reporting it as a server refusal would send them looking at the server.
+    #[error("the replacement arguments are not valid JSON: {source}")]
+    NarrowingJson {
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 impl ClientError {
@@ -277,20 +299,38 @@ impl Client {
     }
 
     /// Answers a human-layer permission escalation.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Narrowing`] when the answer carries replacement arguments
+    /// the wire cannot represent, and the RPC's own failures otherwise.
     pub async fn answer_permission(
         &mut self,
-        request_id: &str,
-        outcome: PermissionOutcome,
-        reason: &str,
-        remember_for_session: bool,
+        answer: PermissionAnswer<'_>,
     ) -> Result<u64, ClientError> {
+        // Converted through the one place that owns this correspondence rather
+        // than hand-rolled: a narrowing that silently altered an argument on
+        // its way to the wire would be a widened permission wearing a
+        // narrowing's clothes.
+        let updated_input = match answer.updated_input {
+            Some(value) => {
+                let decision =
+                    horde_adapter::permission::PermissionDecision::allow_with(value.clone());
+                horde_wire::permission::permission_decision_to_wire(&decision)
+                    .map_err(|source| ClientError::Narrowing { source })?
+                    .updated_input
+            }
+            None => None,
+        };
+
         Ok(self
             .inner
             .answer_permission(AnswerPermissionRequest {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                outcome: outcome as i32,
-                reason: reason.to_owned(),
-                remember_for_session,
+                request_id: Some(PermissionRequestId::new(answer.request_id)),
+                outcome: answer.outcome as i32,
+                reason: answer.reason.to_owned(),
+                remember_for_session: answer.remember_for_session,
+                updated_input,
             })
             .await?
             .into_inner()
@@ -315,6 +355,24 @@ impl Client {
             .into_inner())
     }
 
+    /// Opens a follow stream and hands it back before reading anything.
+    ///
+    /// The subscribe half of subscribe-before-write. See [`EventStream`] for
+    /// why the two steps are separate.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the subscription is refused.
+    pub async fn follow(&mut self, options: &SyncOptions) -> Result<EventStream, ClientError> {
+        let inner = self
+            .inner
+            .sync_events(sync_request(options, true))
+            .await?
+            .into_inner();
+
+        Ok(EventStream { inner })
+    }
+
     /// Replays a session from an offset, then optionally follows it.
     ///
     /// Each event is handed to `on_event` as it arrives rather than collected,
@@ -333,16 +391,7 @@ impl Client {
     {
         let mut stream = self
             .inner
-            .sync_events(SyncEventsRequest {
-                cursors: vec![SessionCursor {
-                    session_id: Some(SessionId::new(options.session_id.clone())),
-                    from_sequence: options.from_sequence,
-                }],
-                all_sessions: false,
-                subtree_root: None,
-                follow: options.follow,
-                max_batch_events: 0,
-            })
+            .sync_events(sync_request(options, options.follow))
             .await?
             .into_inner();
 
@@ -372,6 +421,146 @@ impl Client {
         }
 
         Ok(highest)
+    }
+}
+
+/// The request one set of options asks for.
+///
+/// Shared by [`Client::sync`] and [`Client::follow`] because the cursor is the
+/// same question either way — only whether to keep listening differs, and a
+/// second copy of this would be a second place for `all_sessions` to be wrong.
+fn sync_request(options: &SyncOptions, follow: bool) -> SyncEventsRequest {
+    SyncEventsRequest {
+        cursors: vec![SessionCursor {
+            session_id: Some(SessionId::new(options.session_id.clone())),
+            from_sequence: options.from_sequence,
+        }],
+        all_sessions: false,
+        subtree_root: None,
+        follow,
+        max_batch_events: 0,
+    }
+}
+
+/// A live event stream, already open.
+///
+/// Separate from [`Client::sync`] because of *when* it exists. `sync` opens a
+/// stream and drains it in one call, which is right for replay and for
+/// `--follow`, and wrong for anyone who must not miss the answer to something
+/// they are about to write: between deciding to write and starting to listen
+/// there is a window, and the answer can land inside it.
+///
+/// This is the two-step shape that closes that window — open the stream, do the
+/// write, then read. The server's own log tail is built the same way and for
+/// the same reason.
+///
+/// Dropping this cancels the subscription; there is no separate close.
+#[derive(Debug)]
+pub struct EventStream {
+    inner: tonic::Streaming<horde_proto::v1::SyncEventsResponse>,
+}
+
+impl EventStream {
+    /// Reads forward until `matches` yields a value.
+    ///
+    /// `Ok(None)` means the stream ended without a match — the server shut down
+    /// or the session went away. It is not a timeout: nothing here imposes one,
+    /// because the thing being waited for may legitimately take as long as a
+    /// human takes to answer. A caller that needs a deadline wraps this in one,
+    /// and a caller that needs to give up drops the stream.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the stream itself fails.
+    pub async fn next_matching<F, T>(&mut self, mut matches: F) -> Result<Option<T>, ClientError>
+    where
+        F: FnMut(&EventEnvelope) -> Option<T>,
+    {
+        while let Some(message) = self.inner.next().await {
+            match message?.update {
+                Some(sync_events_response::Update::Batch(batch)) => {
+                    for event in &batch.events {
+                        if let Some(found) = matches(event) {
+                            return Ok(Some(found));
+                        }
+                    }
+                }
+                // A heartbeat is what distinguishes a quiet wait from a dead
+                // one, and `CaughtUp` only says history ended — neither is an
+                // answer, and neither ends the wait.
+                Some(sync_events_response::Update::CaughtUp(_))
+                | Some(sync_events_response::Update::Heartbeat(_))
+                | None => {}
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// How a human answered a permission escalation.
+///
+/// A struct rather than five positional arguments, matching [`SyncOptions`]:
+/// the two booleans and two strings are otherwise indistinguishable at a call
+/// site, and `remember_for_session` silently swapped with `deny` is a mistake
+/// the compiler could not catch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionAnswer<'a> {
+    pub request_id: &'a str,
+    pub outcome: PermissionOutcome,
+    pub reason: &'a str,
+    /// Widen the deterministic-allow layer for the rest of the Session.
+    pub remember_for_session: bool,
+    /// Replacement arguments, when the human narrowed the call rather than
+    /// merely permitting it — clamping a path, dropping a flag.
+    ///
+    /// `None` means "allow as proposed". `Some` of an empty object means
+    /// "allow with no arguments at all", which is a different instruction, and
+    /// the distinction survives all the way to the harness.
+    pub updated_input: Option<&'a serde_json::Value>,
+}
+
+impl<'a> PermissionAnswer<'a> {
+    /// Allow the call exactly as the Agent proposed it.
+    #[must_use]
+    pub fn allow(request_id: &'a str) -> Self {
+        Self {
+            request_id,
+            outcome: PermissionOutcome::Allow,
+            reason: "",
+            remember_for_session: false,
+            updated_input: None,
+        }
+    }
+
+    /// Refuse the call, telling the Agent why.
+    #[must_use]
+    pub fn deny(request_id: &'a str, reason: &'a str) -> Self {
+        Self {
+            request_id,
+            outcome: PermissionOutcome::Deny,
+            reason,
+            remember_for_session: false,
+            updated_input: None,
+        }
+    }
+
+    /// Allow the call, but with these arguments instead of the proposed ones.
+    #[must_use]
+    pub fn narrowed(mut self, updated_input: &'a serde_json::Value) -> Self {
+        self.updated_input = Some(updated_input);
+        self
+    }
+
+    #[must_use]
+    pub fn remembering(mut self, remember: bool) -> Self {
+        self.remember_for_session = remember;
+        self
+    }
+
+    #[must_use]
+    pub fn because(mut self, reason: &'a str) -> Self {
+        self.reason = reason;
+        self
     }
 }
 

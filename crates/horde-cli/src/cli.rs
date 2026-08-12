@@ -9,7 +9,7 @@
 use clap::{Args, Parser, Subcommand};
 use horde_proto::v1::{DeliveryMode, PermissionOutcome};
 
-use crate::client::SyncOptions;
+use crate::client::{PermissionAnswer, SyncOptions};
 use crate::{Client, ClientError, Format, render};
 
 /// Where a server is expected when none is named.
@@ -122,6 +122,14 @@ pub struct ApproveArgs {
     /// Widen the deterministic-allow layer for the rest of the session.
     #[arg(long)]
     pub remember: bool,
+    /// Allow the call with these arguments instead of the proposed ones, as a
+    /// JSON object — clamping a path, dropping a flag.
+    ///
+    /// The harness runs what this says, so it narrows the call rather than
+    /// annotating it. Meaningless with `--deny`, and refused rather than
+    /// ignored there.
+    #[arg(long, value_name = "JSON")]
+    pub update_input: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -285,8 +293,24 @@ async fn run_approve(
     format: Format,
 ) -> Result<(), ClientError> {
     let (outcome, verb) = outcome_for(args.deny);
+
+    // Parsed before the RPC so a typo in the JSON is a local complaint rather
+    // than a round trip that comes back as a server-side refusal.
+    let narrowing: Option<serde_json::Value> = match &args.update_input {
+        Some(raw) => Some(
+            serde_json::from_str(raw).map_err(|source| ClientError::NarrowingJson { source })?,
+        ),
+        None => None,
+    };
+
     let sequence = client
-        .answer_permission(&args.request_id, outcome, &args.reason, args.remember)
+        .answer_permission(PermissionAnswer {
+            request_id: &args.request_id,
+            outcome,
+            reason: &args.reason,
+            remember_for_session: args.remember,
+            updated_input: narrowing.as_ref(),
+        })
         .await?;
     println!("{}", render::sequence(verb, sequence, format));
     Ok(())

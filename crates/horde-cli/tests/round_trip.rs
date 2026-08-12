@@ -10,9 +10,9 @@
 mod common;
 
 use common::Setup;
-use horde_cli::client::SyncOptions;
+use horde_cli::client::{PermissionAnswer, SyncOptions};
 use horde_cli::{Client, render};
-use horde_proto::v1::{DeliveryMode, PermissionOutcome, PlacementState};
+use horde_proto::v1::{DeliveryMode, PlacementState};
 
 /// Replays a session and returns the sequences the client observed.
 async fn replay(client: &mut Client, session_id: &str, from: u64) -> Setup<Vec<u64>> {
@@ -203,12 +203,122 @@ async fn send_returns_the_log_position_it_wrote() {
     );
 }
 
+/// A permission request, journaled the way a worker writes a real one.
+fn permission_requested(agent: &str, request_id: &str) -> horde_proto::v1::Event {
+    horde_proto::v1::Event {
+        agent_id: Some(horde_proto::v1::AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: String::new(),
+        kind: Some(horde_proto::v1::event::Kind::PermissionRequested(
+            horde_proto::v1::PermissionRequested {
+                request: Some(horde_proto::v1::PermissionRequest {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+                    agent_id: Some(horde_proto::v1::AgentId::new(agent)),
+                    ..horde_proto::v1::PermissionRequest::default()
+                }),
+            },
+        )),
+    }
+}
+
+/// The human half of a narrowing, end to end: a person clamps an argument and
+/// the clamp survives the client, the RPC, and the log.
+///
+/// The server half is covered by `CommandProjection`'s unit tests. This is the
+/// half those cannot reach — before this, the field existed on the wire and
+/// nothing a human drives could populate it, so the whole mechanism was
+/// unreachable in practice.
+#[tokio::test]
+async fn a_human_can_narrow_a_call_and_the_narrowing_reaches_the_log() {
+    let endpoint = common::serve().await.expect("a server");
+    let (mut client, session_id, agent_id) = common::seeded(&endpoint, "narrowing")
+        .await
+        .expect("a seeded session");
+
+    common::journal_event(
+        &endpoint,
+        &session_id,
+        permission_requested(&agent_id, "req-1"),
+    )
+    .await
+    .expect("the worker journals the escalation");
+
+    let narrowed = serde_json::json!({ "path": "/workspace/atlas", "recursive": false });
+    client
+        .answer_permission(PermissionAnswer::allow("req-1").narrowed(&narrowed))
+        .await
+        .expect("a narrowing answer must be accepted");
+
+    let mut decisions = Vec::new();
+    client
+        .sync(
+            &SyncOptions::new(session_id.clone()),
+            |envelope| {
+                if let Some(horde_proto::v1::event::Kind::PermissionDecided(decided)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                {
+                    decisions.push(decided.clone());
+                }
+            },
+            |_| {},
+        )
+        .await
+        .expect("replay");
+
+    let decision = decisions
+        .first()
+        .and_then(|decided| decided.decision.as_ref())
+        .expect("the answer must have been written as a PermissionDecided");
+
+    let updated = decision
+        .updated_input
+        .as_ref()
+        .expect("the narrowing must survive to the log, or the original call runs");
+
+    assert_eq!(
+        updated
+            .fields
+            .get("path")
+            .and_then(|value| match &value.kind {
+                Some(horde_proto::prost_types::value::Kind::StringValue(s)) => Some(s.as_str()),
+                _ => None,
+            }),
+        Some("/workspace/atlas"),
+        "the clamped path is the whole point of the narrowing"
+    );
+    assert!(
+        updated.fields.contains_key("recursive"),
+        "every replacement argument travels, not just the first"
+    );
+}
+
+/// A narrowing the wire cannot carry is refused locally rather than sent as a
+/// plain allow — which would permit the original, wider call.
+#[tokio::test]
+async fn a_narrowing_that_cannot_cross_the_wire_is_refused_before_the_rpc() {
+    let mut client = common::client().await.expect("a connected client");
+
+    let not_an_object = serde_json::json!(["not", "an", "object"]);
+    let error = client
+        .answer_permission(PermissionAnswer::allow("req-1").narrowed(&not_an_object))
+        .await
+        .expect_err("a non-object argument bag cannot be a Struct");
+
+    assert!(
+        matches!(error, horde_cli::client::ClientError::Narrowing { .. }),
+        "refusing the narrowing is the point; sending a bare allow would widen \
+         the permission: {error}"
+    );
+}
+
 #[tokio::test]
 async fn approving_an_unknown_request_is_refused() {
     let mut client = common::client().await.expect("a connected client");
 
     let error = client
-        .answer_permission("no-such-request", PermissionOutcome::Allow, "", false)
+        .answer_permission(PermissionAnswer::allow("no-such-request"))
         .await
         .expect_err("there is no such escalation");
     assert!(
@@ -277,4 +387,46 @@ async fn json_rendering_of_a_real_session_parses() {
         serde_json::from_str(&rendered).expect("--json must emit valid JSON for real values");
     assert_eq!(parsed["state"], "active");
     assert_eq!(parsed["agent_count"], 1);
+}
+
+/// The two-step subscribe-before-write shape, positively: a stream opened
+/// before the write hands back the event the write produced. A `next_matching`
+/// that answered `None` without reading would pass every test that only waits
+/// — this one asserts on what was handed back.
+#[tokio::test]
+async fn a_follow_stream_hands_back_the_matching_event() {
+    let endpoint = common::serve().await.expect("a server must start");
+    let (mut writer, session_id, root) = common::seeded(&endpoint, "follow")
+        .await
+        .expect("a session must be creatable");
+
+    let mut watcher = Client::connect(&endpoint)
+        .await
+        .expect("a second client connects");
+    let mut stream = watcher
+        .follow(&SyncOptions::new(session_id))
+        .await
+        .expect("the subscription opens");
+
+    writer
+        .send_note(&root, "the needle", DeliveryMode::TurnBoundary, "")
+        .await
+        .expect("the note sends");
+
+    let found = stream
+        .next_matching(|envelope| {
+            let horde_proto::v1::event::Kind::NoteSent(sent) =
+                envelope.event.as_ref()?.kind.as_ref()?
+            else {
+                return None;
+            };
+            sent.note.as_ref().map(|note| note.text.clone())
+        })
+        .await
+        .expect("the stream must not fail");
+    assert_eq!(
+        found.as_deref(),
+        Some("the needle"),
+        "the matched value is handed back, not merely consumed"
+    );
 }

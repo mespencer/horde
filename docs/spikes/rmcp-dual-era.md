@@ -3,6 +3,24 @@
 **Date:** 2026-08-11 · **Branch:** `mespencer/rmcp-spike` · **Base:** `95fe6a9`
 **Status:** spike + docs only, no production code
 
+> ### ⚠ The transcripts this document cites were not preserved
+>
+> `docs/spikes/rmcp-dual-era/transcripts/` contains only its README. The capture
+> files `01`–`06` never reached disk — they were lost to a session-tooling
+> incident, not deleted deliberately and not withheld.
+>
+> **The findings therefore rest on the excerpts quoted inline below**, which were
+> transcribed from the captures while they existed. Every "transcript `NN`"
+> reference is left in place on purpose: it still records *which run produced
+> which finding*, which is the part a re-run has to reproduce. Read those
+> references as provenance, not as a file you can go and open.
+>
+> **Regenerating them** means re-running the probes in `spikes/rmcp-dual-era/` —
+> the server/tee binary, `probe_modern.sh`, and `drive_codex.py` — against the
+> same client versions (`claude` 2.1.228, `codex-cli` 0.147.0). That is backlog,
+> not done. Until it is done, treat anything here that is *not* backed by a
+> quoted excerpt as unverified.
+
 `docs/research/mcp-2026-audit.md` §6 closes with the one recommendation in the audit
 that rested on documentation rather than measurement:
 
@@ -11,8 +29,9 @@ that rested on documentation rather than measurement:
 > no Horde spike has yet stood up an rmcp server and driven it with both eras.
 
 This is that spike. Everything below is a wire observation from this machine on
-**2026-08-11**, captured by a byte-level TCP tee that parses no HTTP. Transcripts are in
-`docs/spikes/rmcp-dual-era/transcripts/`; each finding names the file that produced it.
+**2026-08-11**, captured by a byte-level TCP tee that parses no HTTP. Each finding names
+the transcript that produced it — though, per the note above, those files were not
+preserved, so the excerpts quoted here are the surviving record.
 
 ## Verdict
 
@@ -426,3 +445,8 @@ Amended by this spike:
 - **`json_response`.** Left `false` throughout; every response here was `text/event-stream`
   even for trivial request/response tools. Whether `json_response = true` is worth it for
   the endpoint's latency is unmeasured.
+- **Re-capturing the transcripts.** Backlog, per the note at the top of this document: the
+  original captures were lost, so every claim not backed by an excerpt quoted here is
+  currently unverifiable. Re-running `spikes/rmcp-dual-era/` against `claude` 2.1.228 and
+  `codex-cli` 0.147.0 restores the record; done before either version moves, it also
+  re-checks the findings rather than merely re-filing them.

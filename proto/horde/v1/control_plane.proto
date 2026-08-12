@@ -7,6 +7,7 @@ syntax = "proto3";
 package horde.v1;
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "horde/v1/agent.proto";
 import "horde/v1/event.proto";
@@ -258,6 +259,24 @@ message AnswerPermissionRequest {
   string reason = 3;
 
   bool remember_for_session = 4;
+
+  // Replacement arguments, when the human narrowed the call rather than
+  // merely permitting it.
+  //
+  // Carried here because this RPC is the only way a human answers, and
+  // PermissionDecision.updated_input is meaningless if nothing can populate
+  // it: a narrowing that cannot cross this boundary dies here, and the
+  // original unnarrowed call runs. That is the failure permission.proto's
+  // reject-don't-drop note exists to prevent, arrived at from the one
+  // direction the note does not cover.
+  //
+  // Absent and empty stay distinct, as they do on PermissionDecision — a
+  // message field has explicit presence, so "allow as proposed" (absent) and
+  // "allow with no arguments at all" (empty Struct) remain different
+  // instructions across the wire.
+  //
+  // Meaningful only with outcome ALLOW.
+  google.protobuf.Struct updated_input = 5;
 }
 
 message AnswerPermissionResponse {

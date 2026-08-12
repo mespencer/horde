@@ -25,12 +25,18 @@ What ships is `guardian_approval`: Codex adjudicates against its own sandbox
 tiers and project-trust model and notifies the client afterwards via
 `item/started [commandExecution]`.
 
+**Scoped 2026-08-11 — see the amendment at the end of this ADR.** Every probe
+behind that conclusion was a *shell* command (`echo`, a write, `curl`), so what it
+established is that shell/exec approvals do not reach the client. No MCP server was
+in the loop. MCP tool calls *can* be intercepted.
+
 ## Consequences
 
 - Codex agents get a **coarser permission story than Claude agents**. Horde's
   deterministic-deny / deterministic-allow / judge / human chain (§10) cannot
   gate a Codex tool call; the enforcement that actually applies is Codex's own
-  sandbox tier, chosen by Horde at `thread/start`.
+  sandbox tier, chosen by Horde at `thread/start`. *(Scoped by the 2026-08-11
+  amendment: true for shell/exec, no longer true for MCP tool calls.)*
 - Sandbox tier and `cwd` become the real permission controls for this provider,
   which makes the orchestrator-level sandbox profile (§10, "sequenced later")
   more urgent for Codex than for Claude.
@@ -50,3 +56,49 @@ tiers and project-trust model and notifies the client afterwards via
   as config, so one account is one `CODEX_HOME`, mirroring `CLAUDE_CONFIG_DIR`.
 - Re-check the two feature flags on each Codex upgrade; when they stabilize,
   this ADR should be revisited rather than worked around.
+
+## Amendment, 2026-08-11: the exception is scoped to shell/exec, not to MCP tools
+
+The rmcp dual-era spike (`docs/spikes/rmcp-dual-era.md` §4) drove codex-cli
+**0.147.0** through `app-server` against a live MCP endpoint and measured an
+interception point this ADR concluded did not exist. **For MCP tool calls
+specifically, the "cannot intercept before they run" finding above is
+superseded.** For shell and exec approvals it stands, unre-probed.
+
+Codex routes every MCP tool call through a client-facing request:
+
+```
+SERVER-REQUEST mcpServer/elicitation/request
+  {"serverName":"spike","mode":"form",
+   "_meta":{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],
+            "tool_description":"Report the protocol version and HTTP headers…",
+            "tool_params":{}}}
+```
+
+It carries the server name, tool name, tool description and the full arguments
+**before the call runs**, and it supports `persist: ["session","always"]`. That is
+precisely the seam DESIGN §10's deterministic/judge/human chain wants, so for MCP
+tools a Codex agent is no coarser than a Claude one. Two details are load-bearing
+for whoever implements it:
+
+- **The answer's field is `action`, not `decision`.** The reply is an MCP
+  elicitation result — `{"action":"accept"}` / `{"action":"decline"}` — and *not*
+  the `decision` field that Codex's sandbox and exec approvals use. Sending the
+  approval shape produces `failed to deserialize
+  McpServerElicitationRequestResponse: missing field 'action'`.
+- **`codex exec` cannot answer it at all.** Exec mode never declares the
+  capability, so an MCP tool call made from `codex exec` is auto-cancelled
+  outright — not merely unapproved: no byte of the call reaches the MCP server,
+  and no `approval_policy` or `--disable` combination the spike tried changes
+  that. Interception by this route therefore requires `app-server`, which is the
+  transport this ADR already chose.
+
+**What still stands, and what is owed.** The spike re-probed only the MCP tool-call
+path. Shell and exec approvals were not exercised, so the six-configuration result
+above remains Horde's only measurement of them and every consequence in this ADR
+continues to hold there — the sandbox tier and `cwd` are still the real enforcement,
+and `AdapterCapability` still needs to say so, now worded per call kind rather than
+per provider. That measurement was taken against **0.145.0** and has not been
+repeated since; the spike ran **0.147.0** and did not touch it. The "re-check the two
+feature flags on each Codex upgrade" consequence above is two releases overdue, and
+re-probing exec/shell approvals at 0.147.0 is the outstanding debt.

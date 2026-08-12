@@ -18,6 +18,10 @@ _Avoid_: runner, node, host
 A user-facing program (TUI today) attached to the server to view, steer, and approve.
 _Avoid_: frontend, terminal
 
+**Command Stream**:
+One worker's sequence of commands, folded out of the event log rather than stored. Densely numbered per worker, so a reconnecting worker resumes from its own ack.
+_Avoid_: command queue, outbox, mailbox
+
 ### Agents and sessions
 
 **Agent**:
@@ -113,3 +117,9 @@ The cheap-model evaluator that applies a plain-text permission mode to a propose
 
 **Prompt Overlay**:
 The user-global prompt variant applied at spawn, differing for top-level agents vs spawned agents.
+
+### Process
+
+**Sweep**:
+The whole-tree `gauntlet run --full` mutation run, owed at every wave boundary — as opposed to the diff-scoped run every merge gets.
+_Avoid_: full run (alone), audit

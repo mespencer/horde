@@ -41,10 +41,9 @@
 //!
 //! # What is not here yet
 //!
-//! Only the spawn command is derived, because it is the only one the server
-//! currently issues. Delivery, interrupt and permission commands join the
-//! `match` in [`CommandProjection::advance`] as their causing events start
-//! being written; the shape does not change when they do. Reconciling against
+//! Spawn and permission-decision commands are derived. Delivery and interrupt
+//! join the `match` in [`CommandProjection::advance`] as their causing events
+//! start being written; the shape does not change when they do. Reconciling against
 //! what a *real* worker actually applied — as opposed to what it says it
 //! acked — needs the worker crate, which is not on `main` yet; see
 //! `tests/services.rs` for the marked seam.
@@ -54,8 +53,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use horde_proto::v1::{
-    AgentId, Event, Placement, PlacementState, SessionId, SpawnAgentCommand,
-    StreamCommandsResponse, event::Kind, stream_commands_response::Command,
+    AgentId, DeliverPermissionDecisionCommand, Event, Placement, PlacementState, SessionId,
+    SpawnAgentCommand, StreamCommandsResponse, event::Kind, stream_commands_response::Command,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -88,6 +87,15 @@ struct SpawnDetails {
 pub struct CommandProjection {
     /// Agents whose `AgentSpawned` has been folded, keyed by agent id.
     spawned: BTreeMap<String, SpawnDetails>,
+    /// Which worker each placed agent runs on, keyed by agent id.
+    ///
+    /// Separate from [`Self::spawned`] because it answers a different question
+    /// and outlives the answer to the first: `spawned` holds what a *spawn*
+    /// command needs and is only interesting until placement, whereas every
+    /// later command addressed to a running agent — a permission decision, an
+    /// interrupt — needs to know which worker to reach, and the only event that
+    /// ever says so is `PlacementChanged`.
+    placed: BTreeMap<String, String>,
     /// How many commands each worker has been issued. This *is* the per-worker
     /// command sequence.
     issued: BTreeMap<String, u64>,
@@ -130,6 +138,14 @@ impl CommandProjection {
             }
             Kind::PlacementChanged(changed) => {
                 let worker_id = placement_worker(changed.placement.as_ref()?)?;
+
+                // Recorded before the spawn details are looked up, because the
+                // two can fail independently: an agent may be placed without
+                // this fold having seen its `AgentSpawned` (a replay starting
+                // mid-log), and losing the placement in that case would leave
+                // every later command for the agent unroutable.
+                self.placed.insert(agent_id.clone(), worker_id.clone());
+
                 let details = self.spawned.get(&agent_id)?;
                 let command = Command::SpawnAgent(SpawnAgentCommand {
                     session_id: Some(SessionId::new(details.session_id.clone())),
@@ -140,6 +156,27 @@ impl CommandProjection {
                     tree_path: details.tree_path.clone(),
                     prompt_overlay: String::new(),
                 });
+                let issued = self.issue(&worker_id, &global.event, command);
+                Some((worker_id, issued))
+            }
+            // The return leg of the permission chain. A decision is written to
+            // the log by whoever answered it — a human through
+            // `AnswerPermission`, or a policy layer — and the agent that is
+            // blocked on it lives on a worker that reads commands, not the log.
+            // Without this arm the decision is durable and invisible: the
+            // human's answer lands, and the agent waits forever.
+            Kind::PermissionDecided(decided) => {
+                let decision = decided.decision?;
+                let worker_id = self.placed.get(&agent_id)?.clone();
+
+                let command =
+                    Command::DeliverPermissionDecision(DeliverPermissionDecisionCommand {
+                        agent_id: Some(AgentId::new(agent_id)),
+                        // Forwarded whole. `updated_input` rides inside, and a
+                        // decision that narrowed a call is worth nothing to the
+                        // worker if the narrowing is left behind here.
+                        decision: Some(decision),
+                    });
                 let issued = self.issue(&worker_id, &global.event, command);
                 Some((worker_id, issued))
             }
@@ -912,5 +949,146 @@ mod tests {
 
         assert_eq!(first, second, "the log is the only state there is");
         assert_eq!(first.len(), 2);
+    }
+
+    fn decision_event(agent: &str, decision: horde_proto::v1::PermissionDecision) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::PermissionDecided(
+                horde_proto::v1::PermissionDecided {
+                    decision: Some(decision),
+                },
+            )),
+        }
+    }
+
+    fn allow(
+        updated_input: Option<horde_proto::prost_types::Struct>,
+    ) -> horde_proto::v1::PermissionDecision {
+        horde_proto::v1::PermissionDecision {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new("req-1")),
+            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+            decided_by: horde_proto::v1::PermissionLayer::Human as i32,
+            decided_by_actor: None,
+            reason: String::new(),
+            remember_for_session: false,
+            updated_input,
+        }
+    }
+
+    /// Without this, a human's answer lands in the log and the agent blocked on
+    /// it waits forever — the decision is durable and invisible.
+    #[test]
+    fn a_permission_decision_becomes_a_command_for_the_agents_worker() {
+        let mut projection = CommandProjection::new();
+        for global in placed_agent(1, "s1", "agent-1", "worker-a") {
+            projection.advance(&global);
+        }
+
+        let issued = projection.advance(&row(3, "s1", 3, decision_event("agent-1", allow(None))));
+
+        let (worker, response) = issued.expect("a decision for a placed agent is a command");
+        assert_eq!(
+            worker, "worker-a",
+            "the decision must reach the worker the agent runs on"
+        );
+        match response.command {
+            Some(Command::DeliverPermissionDecision(command)) => {
+                assert_eq!(
+                    command
+                        .agent_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    Some("agent-1")
+                );
+            }
+            other => panic!("expected a permission-decision command, got {other:?}"),
+        }
+    }
+
+    /// The narrowing is the whole point of `updated_input`: a decision that
+    /// clamped a path is worth nothing to the worker if the clamp is left
+    /// behind in the projection.
+    #[test]
+    fn a_narrowing_survives_into_the_command() {
+        let mut projection = CommandProjection::new();
+        for global in placed_agent(1, "s1", "agent-1", "worker-a") {
+            projection.advance(&global);
+        }
+
+        let mut narrowed = horde_proto::prost_types::Struct::default();
+        narrowed.fields.insert(
+            "path".to_owned(),
+            horde_proto::prost_types::Value {
+                kind: Some(horde_proto::prost_types::value::Kind::StringValue(
+                    "/workspace/atlas".to_owned(),
+                )),
+            },
+        );
+
+        let issued = projection.advance(&row(
+            3,
+            "s1",
+            3,
+            decision_event("agent-1", allow(Some(narrowed.clone()))),
+        ));
+
+        let (_, response) = issued.expect("a decision for a placed agent is a command");
+        match response.command {
+            Some(Command::DeliverPermissionDecision(command)) => {
+                let decision = command.decision.expect("the command carries the decision");
+                assert_eq!(
+                    decision.updated_input,
+                    Some(narrowed),
+                    "dropping the replacement arguments here would run the \
+                     original, unnarrowed call"
+                );
+            }
+            other => panic!("expected a permission-decision command, got {other:?}"),
+        }
+    }
+
+    /// An agent whose placement this fold never saw cannot be addressed. No
+    /// command is better than a command sent to the wrong worker.
+    #[test]
+    fn a_decision_for_an_unplaced_agent_yields_no_command() {
+        let mut projection = CommandProjection::new();
+
+        assert!(
+            projection
+                .advance(&row(1, "s1", 1, decision_event("ghost", allow(None))))
+                .is_none()
+        );
+    }
+
+    /// Placement is recorded even when the spawn was never folded — a replay
+    /// starting mid-log sees the placement and not the spawn, and losing it
+    /// would leave every later command for that agent unroutable.
+    #[test]
+    fn placement_is_remembered_even_without_the_spawn_that_preceded_it() {
+        let mut projection = CommandProjection::new();
+
+        // Placement alone produces no spawn command, because the spec is not
+        // known — but it must still be remembered.
+        assert!(
+            projection
+                .advance(&row(
+                    1,
+                    "s1",
+                    1,
+                    placement_event("agent-1", Some("worker-a"), PlacementState::Placed)
+                ))
+                .is_none()
+        );
+
+        let issued = projection.advance(&row(2, "s1", 2, decision_event("agent-1", allow(None))));
+        assert_eq!(
+            issued.map(|(worker, _)| worker),
+            Some("worker-a".to_owned()),
+            "the placement must survive a fold that never saw the spawn"
+        );
     }
 }

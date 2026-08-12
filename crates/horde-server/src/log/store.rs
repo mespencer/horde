@@ -49,7 +49,11 @@ pub struct PendingEvent {
 }
 
 /// Where an append landed, and whether it was new.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: it carries the deduplicated event's payload, which is a
+/// `Vec`. Worth the trade — the alternative is a caller that cannot tell a
+/// retry from a collision.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Appended {
     pub sequence: u64,
     /// True when an equivalent event was already present.
@@ -58,6 +62,14 @@ pub struct Appended {
     /// so a duplicate is the system working. The caller still learns which
     /// position the event occupies, so it can be pointed at the log.
     pub deduplicated: bool,
+    /// The payload already stored, when this append was deduplicated.
+    ///
+    /// Returned because "a duplicate" is a claim worth checking rather than
+    /// trusting. This layer holds payloads as opaque bytes and cannot tell a
+    /// genuine retry from an idempotency-key collision, but a caller that
+    /// understands the encoding can — so the bytes travel up to whoever can
+    /// read them. See `service::shared::refuse_kind_collision`.
+    pub existing_payload: Option<Vec<u8>>,
 }
 
 /// Opens a connection and brings it up to schema.
@@ -101,10 +113,11 @@ pub fn append(connection: &mut Connection, event: &PendingEvent) -> Result<Appen
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(ServerError::storage("beginning an append"))?;
 
-    if let Some(existing) = find_duplicate(&transaction, event)? {
+    if let Some((sequence, existing_payload)) = find_duplicate(&transaction, event)? {
         return Ok(Appended {
-            sequence: existing,
+            sequence,
             deduplicated: true,
+            existing_payload: Some(existing_payload),
         });
     }
 
@@ -136,6 +149,7 @@ pub fn append(connection: &mut Connection, event: &PendingEvent) -> Result<Appen
     Ok(Appended {
         sequence: next,
         deduplicated: false,
+        existing_payload: None,
     })
 }
 
@@ -148,16 +162,16 @@ pub fn append(connection: &mut Connection, event: &PendingEvent) -> Result<Appen
 fn find_duplicate(
     transaction: &rusqlite::Transaction<'_>,
     event: &PendingEvent,
-) -> Result<Option<u64>, ServerError> {
+) -> Result<Option<(u64, Vec<u8>)>, ServerError> {
     if let Some(journal_sequence) = event.journal_sequence
         && !event.origin_worker_id.is_empty()
     {
-        let existing: Option<u64> = transaction
+        let existing: Option<(u64, Vec<u8>)> = transaction
             .query_row(
-                "SELECT sequence FROM events
+                "SELECT sequence, payload FROM events
                  WHERE origin_worker_id = ?1 AND journal_sequence = ?2",
                 params![event.origin_worker_id, journal_sequence],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(ServerError::storage("checking the journal watermark"))?;
@@ -172,10 +186,10 @@ fn find_duplicate(
 
     transaction
         .query_row(
-            "SELECT sequence FROM events
+            "SELECT sequence, payload FROM events
              WHERE session_id = ?1 AND idempotency_key = ?2",
             params![event.session_id, event.idempotency_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(ServerError::storage("checking the idempotency key"))

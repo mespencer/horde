@@ -1,11 +1,27 @@
 # rmcp dual-era spike — wire transcripts
 
-Every file here is a byte-for-byte record of TCP traffic between a real MCP
+> ### ⚠ This directory is empty — the transcripts were not preserved
+>
+> This README is the only file here. The captures it describes never reached
+> disk: they were lost to a session-tooling incident, not deleted deliberately.
+>
+> The descriptions below are kept, and so are the references to them in
+> `docs/spikes/rmcp-dual-era.md`, because they record **which run produced which
+> finding** — the provenance is still useful even though the bytes are gone. What
+> survives of the wire is the set of excerpts quoted inline in that document.
+>
+> **To regenerate:** re-run the probes in `spikes/rmcp-dual-era/` per the
+> *Reproducing* section below, against `claude` 2.1.228 and `codex-cli` 0.147.0,
+> capturing to this directory under the same filenames. Tracked as backlog in
+> `docs/spikes/rmcp-dual-era.md` §9; not done.
+
+Each transcript was a byte-for-byte record of TCP traffic between a real MCP
 client and one pinned **rmcp 3.1.2** streamable-HTTP endpoint, captured by the
 dumb TCP tee in `spikes/rmcp-dual-era/src/tee.rs`. The tee parses no HTTP, so
-nothing here has been reformatted, re-chunked, or summarised — chunk boundaries
-are real TCP reads, and the hex lines inside SSE bodies are HTTP chunked-transfer
-framing.
+nothing was reformatted, re-chunked, or summarised — chunk boundaries are real
+TCP reads, and the hex lines inside SSE bodies are HTTP chunked-transfer framing.
+The rest of this README describes that format, and stands as the specification a
+re-capture should meet.
 
 Captured on **2026-08-11** against `claude` 2.1.228 and `codex-cli` 0.147.0.
 
@@ -26,6 +42,9 @@ listing every header that survived into the tower service. The tee proves a
 header reached the socket; `SERVER-SAW` proves it reached rmcp.
 
 ## The transcripts
+
+*None of these files is on disk. The table is the capture manifest — what a
+re-run should produce, and what each `NN` reference in the spike document means.*
 
 | File | Client | Server config | What it shows |
 |---|---|---|---|

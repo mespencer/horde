@@ -582,30 +582,57 @@ row containing timeouts has not been shown to be green. Re-run them on a quiet
 machine before believing the row — and never close out a survivor by observing
 that it timed out on the next attempt.
 
-**Bound every wait, and bound a hot spin by count rather than by clock.** The way
-to turn a timeout into a kill is to give each wait a ceiling and assert on what
-arrived, so a mutant that stops the thing arriving fails in seconds instead of
+**Bound every wait — but bound *progress* by count or structure, never by clock.**
+The way to turn a timeout into a kill is to give each wait a ceiling and assert on
+what arrived, so a mutant that stops the thing arriving fails in seconds instead of
 stalling the suite. `next_batch_within` in `horde-server`'s log tests and `within`
 in `horde-worker`'s supervision tests are the same helper, and every wait against
 a child process or a tail goes through one of them.
 
 A timer is not always enough, and the exception is worth knowing before it costs
-an afternoon. `#[tokio::test]` runs on the current-thread runtime, so a loop whose
-body never actually awaits — a `read_line` mutated to return `Ok(Some(""))`
-instantly, forever — never yields to the scheduler, the timer is never polled, and
-a `tokio::time::timeout` wrapped around that loop silently does not fire. The
-deadline reads as if it exists and does not. That mutant spun for a full minute
-while every other test in the file had already failed, hanging the whole binary on
-one starved timer. A ceiling on **iterations** needs no scheduler co-operation, so
-it holds exactly where the clock cannot:
+an afternoon. Two mechanisms have now been measured here, opposite in behaviour and
+identical in effect — in both, the deadline reads as if it exists and does not:
 
-```rust
-let mut lines = 0_u32;
-while let Ok(Some(_)) = within("a line arrives", harness.read_line()).await {
-    lines += 1;
-    assert!(lines < 1024, "the stub's stdout must reach EOF");
-}
-```
+*The loop never yields.* `#[tokio::test]` runs on the current-thread runtime, so a
+loop whose body never actually awaits — a `read_line` mutated to return
+`Ok(Some(""))` instantly, forever — never yields to the scheduler, the timer is
+never polled, and a `tokio::time::timeout` wrapped around that loop silently does
+not fire. That mutant spun for a full minute while every other test in the file had
+already failed, hanging the whole binary on one starved timer.
+
+*The loop yields on every iteration.* The inverse defeats the same clock. A loop
+that genuinely awaits each time round — `spawn_blocking` into SQLite — starves the
+runtime and the test's own budget with real work rather than with a spin, and
+per-test clocks did not bound it either. Nothing is stalled, so nothing looks stuck;
+the deadline simply never comes out ahead of the loop. Yielding is not what makes a
+timer work, which is why "it awaits, so the timeout will fire" is not an argument.
+
+So the rule is the one both mechanisms point at: **a clock cannot bound a loop that
+fails to make progress, whether because it never yields or because it yields so hard
+it starves the runtime; bound progress by count or structure, never by time.**
+
+**The fix hierarchy, strongest first.**
+
+1. **Structural** — remove the loop's ability to not progress at all, so there is no
+   non-terminating case left to bound. A loop that consumes a finite input, or that
+   cannot repeat a state, needs no ceiling and no clock. This is the only fix that
+   makes the failure impossible rather than survivable, and it is the one to reach
+   for first.
+2. **A counted ceiling** — needs no scheduler co-operation, so it holds exactly where
+   a clock cannot:
+
+   ```rust
+   let mut lines = 0_u32;
+   while let Ok(Some(_)) = within("a line arrives", harness.read_line()).await {
+       lines += 1;
+       assert!(lines < 1024, "the stub's stdout must reach EOF");
+   }
+   ```
+
+3. **A clock** — legitimate only for a **positive** wait: something must arrive, and
+   the assertion is on what arrived. A deadline is evidence about an arrival, never
+   about a loop finishing; asking one to establish "this terminates" is asking the
+   instrument the one question it cannot answer.
 
 The same trap sits under any "wait for a notification" loop that can be woken
 spuriously — `tokio::time::pause` or an observable park signal is the equivalent
@@ -626,6 +653,31 @@ assertable, no runtime to arrange. Five of these have now been extracted in
 and `should_stop` in `service/worker.rs`. Reaching for a harness clever enough to
 force the unreachable state is the wrong repair; the condition being hard to
 reach *is* the design feedback.
+
+**A write that is acked but discarded is the worst failure shape there is —
+spend an error on it.** The permission and result verbs both key their events
+with an idempotency key, and the log deduplicates on `(session_id,
+idempotency_key)`. That check originally ignored the event *kind*, so a key
+already used by any other event in the session made the new event a duplicate:
+the write was acked, the call returned `Ok`, and nothing reached the log. The
+symptom then appeared in a completely different component — `wait_for_agent`
+blocking forever on a result that had been silently swallowed — with nothing
+connecting the hang to the write that caused it. Diagnosing it once meant
+dumping every event in the session and noticing an `agent_spawned` sitting where
+a `result_reported` should have been.
+
+The repair is `service::shared::refuse_kind_collision`: an exact-kind hit still
+deduplicates silently, because at-least-once delivery depends on that, but a hit
+whose kind differs is refused with both kinds and the key in the message. Every
+legitimate retry replays the same kind, so a kind mismatch is *always* a
+collision and never a retry.
+
+The general rule is worth more than the specific fix. When a write path can
+discard its input and still answer success, the resulting bug has no local
+symptom, cannot be found from the failing component, and survives every test
+that does not happen to read back what it wrote. Prefer an error at the write —
+even a noisy one, even one that costs a caller a rename — over a silence that
+someone else will pay for later, somewhere else, with no thread back to here.
 
 ## Adding a gate
 
