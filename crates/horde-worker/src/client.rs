@@ -226,35 +226,49 @@ impl Connection {
                 continue;
             }
 
-            let batch = PushEventsRequest {
-                body: Some(push_events_request::Body::Batch(JournaledEventBatch {
-                    events,
-                    // Piggybacked so command acks flow even when the command
-                    // stream is quiet.
-                    acked_command_sequence: journal.applied_command_sequence().await?,
-                })),
-            };
-            if to_server.send(batch).await.is_err() {
-                // The transport dropped the outbound side. The inbound read
-                // below reports the reason, which is more than "send failed".
-            }
-
-            match next_reply(&mut inbound).await? {
-                PushReply::Ack(ack) => {
-                    // Both the truncation and the cursor follow the *ack*,
-                    // never the batch: the server's word on what is durably
-                    // stored is the only justification for either. A cursor
-                    // that drifted below the floor this truncation sets would
-                    // fail the next read loudly (TruncatedPast) instead of
-                    // silently re-sending forever.
-                    let resume = ack.acked_journal_sequence.saturating_add(1);
-                    journal.truncate_below(resume).await?;
-                    cursor = resume;
-                }
-                PushReply::Accepted(_) => return Err(WorkerError::Incomplete("journal ack")),
-                PushReply::Ended => return Ok(()),
+            match exchange_batch(journal, &to_server, &mut inbound, events).await? {
+                Some(next_cursor) => cursor = next_cursor,
+                None => return Ok(()),
             }
         }
+    }
+}
+
+/// Sends one batch and applies the ack that answers it.
+///
+/// Returns the cursor to read the next batch from, or `None` when the Server
+/// ended the stream. Both the truncation and the cursor follow the *ack*,
+/// never the batch: the server's word on what is durably stored is the only
+/// justification for either. A cursor that drifted below the floor this
+/// truncation sets would fail the next read loudly (`TruncatedPast`) instead
+/// of silently re-sending forever.
+async fn exchange_batch(
+    journal: &Journal,
+    to_server: &tokio::sync::mpsc::Sender<PushEventsRequest>,
+    inbound: &mut tonic::Streaming<PushEventsResponse>,
+    events: Vec<horde_proto::v1::JournaledEvent>,
+) -> Result<Option<u64>, WorkerError> {
+    let batch = PushEventsRequest {
+        body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+            events,
+            // Piggybacked so command acks flow even when the command stream
+            // is quiet.
+            acked_command_sequence: journal.applied_command_sequence().await?,
+        })),
+    };
+    if to_server.send(batch).await.is_err() {
+        // The transport dropped the outbound side. The inbound read below
+        // reports the reason, which is more than "send failed".
+    }
+
+    match next_reply(inbound).await? {
+        PushReply::Ack(ack) => {
+            let resume = ack.acked_journal_sequence.saturating_add(1);
+            journal.truncate_below(resume).await?;
+            Ok(Some(resume))
+        }
+        PushReply::Accepted(_) => Err(WorkerError::Incomplete("journal ack")),
+        PushReply::Ended => Ok(None),
     }
 }
 
