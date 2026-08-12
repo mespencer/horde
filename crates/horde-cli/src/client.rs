@@ -366,16 +366,7 @@ impl Client {
     pub async fn follow(&mut self, options: &SyncOptions) -> Result<EventStream, ClientError> {
         let inner = self
             .inner
-            .sync_events(SyncEventsRequest {
-                cursors: vec![SessionCursor {
-                    session_id: Some(SessionId::new(options.session_id.clone())),
-                    from_sequence: options.from_sequence,
-                }],
-                all_sessions: false,
-                subtree_root: None,
-                follow: true,
-                max_batch_events: 0,
-            })
+            .sync_events(sync_request(options, true))
             .await?
             .into_inner();
 
@@ -400,16 +391,7 @@ impl Client {
     {
         let mut stream = self
             .inner
-            .sync_events(SyncEventsRequest {
-                cursors: vec![SessionCursor {
-                    session_id: Some(SessionId::new(options.session_id.clone())),
-                    from_sequence: options.from_sequence,
-                }],
-                all_sessions: false,
-                subtree_root: None,
-                follow: options.follow,
-                max_batch_events: 0,
-            })
+            .sync_events(sync_request(options, options.follow))
             .await?
             .into_inner();
 
@@ -439,6 +421,24 @@ impl Client {
         }
 
         Ok(highest)
+    }
+}
+
+/// The request one set of options asks for.
+///
+/// Shared by [`Client::sync`] and [`Client::follow`] because the cursor is the
+/// same question either way — only whether to keep listening differs, and a
+/// second copy of this would be a second place for `all_sessions` to be wrong.
+fn sync_request(options: &SyncOptions, follow: bool) -> SyncEventsRequest {
+    SyncEventsRequest {
+        cursors: vec![SessionCursor {
+            session_id: Some(SessionId::new(options.session_id.clone())),
+            from_sequence: options.from_sequence,
+        }],
+        all_sessions: false,
+        subtree_root: None,
+        follow,
+        max_batch_events: 0,
     }
 }
 

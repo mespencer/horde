@@ -30,12 +30,13 @@
 //! be exactly the declaring path that principle rules out. So the payload is
 //! left unset here, for the Worker to fill. That is a seam, not an omission.
 
-use horde_cli::client::{Client, SyncOptions};
+use horde_cli::client::SyncOptions;
 use horde_proto::v1::event::Kind as EventKind;
 use horde_proto::v1::{DeliveryMode, ResultStatus};
 
+use crate::context::AgentContext;
 use crate::identity::AgentIdentity;
-use crate::journal::{JournalEntry, JournalError, JournalSink};
+use crate::journal::{JournalEntry, JournalError};
 
 /// Why a verb did not do what it said.
 #[derive(Debug, thiserror::Error)]
@@ -112,23 +113,13 @@ pub struct SpawnOutcome {
 /// The orchestrator verbs for one Agent's endpoint.
 #[derive(Debug)]
 pub struct Verbs {
-    journal: std::sync::Arc<dyn JournalSink>,
-    client: Client,
-    session_id: String,
+    context: AgentContext,
 }
 
 impl Verbs {
     #[must_use]
-    pub fn new(
-        journal: std::sync::Arc<dyn JournalSink>,
-        client: Client,
-        session_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            journal,
-            client,
-            session_id: session_id.into(),
-        }
+    pub fn new(context: AgentContext) -> Self {
+        Self { context }
     }
 
     /// Spawns a child under the calling Agent.
@@ -138,7 +129,7 @@ impl Verbs {
     /// [`VerbError::ControlPlane`] if the Server refused. A *queued* spawn is
     /// not an error — it is a successful spawn with nowhere to run yet.
     pub async fn spawn_agent(
-        &mut self,
+        &self,
         identity: &AgentIdentity,
         idempotency_key: &str,
     ) -> Result<SpawnOutcome, VerbError> {
@@ -146,8 +137,13 @@ impl Verbs {
         // supplied: ancestry an Agent could forge is ancestry that cannot be
         // used to attenuate capabilities down the tree (§5).
         let response = self
-            .client
-            .spawn_agent(&self.session_id, Some(identity.agent_id()), idempotency_key)
+            .context
+            .client()
+            .spawn_agent(
+                self.context.session_id(),
+                Some(identity.agent_id()),
+                idempotency_key,
+            )
             .await?;
 
         let placement = response.placement.as_ref();
@@ -170,7 +166,7 @@ impl Verbs {
     ///
     /// [`VerbError::ControlPlane`] if the Server refused.
     pub async fn send_message(
-        &mut self,
+        &self,
         to_agent_id: &str,
         kind: MessageKind,
         text: &str,
@@ -185,14 +181,15 @@ impl Verbs {
             DeliveryMode::TurnBoundary
         };
 
+        let mut client = self.context.client();
         let response = match kind {
             MessageKind::Assign => {
-                self.client
+                client
                     .send_assignment(to_agent_id, text, delivery, idempotency_key)
                     .await?
             }
             MessageKind::Note => {
-                self.client
+                client
                     .send_note(to_agent_id, text, delivery, idempotency_key)
                     .await?
             }
@@ -230,9 +227,10 @@ impl Verbs {
         summary: &str,
         idempotency_key: &str,
     ) -> Result<u64, VerbError> {
-        self.journal
+        self.context
+            .journal()
             .record(JournalEntry {
-                session_id: self.session_id.clone(),
+                session_id: self.context.session_id().to_owned(),
                 agent_id: Some(identity.agent_id().to_owned()),
                 idempotency_key: idempotency_key.to_owned(),
                 kind: EventKind::ResultReported(horde_proto::v1::ResultReported {
@@ -262,7 +260,7 @@ impl Verbs {
     /// [`VerbError::Abandoned`] if the stream ended first, which is explicitly
     /// not the same as a failed result.
     pub async fn wait_for_agent(
-        &mut self,
+        &self,
         agent_id: &str,
     ) -> Result<horde_proto::v1::AgentResult, VerbError> {
         // Subscribed before anything is read, so a result that lands while this
@@ -270,8 +268,9 @@ impl Verbs {
         // because the match is on which agent reported, and a result already in
         // history is the answer rather than a stale one.
         let mut stream = self
-            .client
-            .follow(&SyncOptions::new(self.session_id.clone()))
+            .context
+            .client()
+            .follow(&SyncOptions::new(self.context.session_id().to_owned()))
             .await?;
 
         let wanted = agent_id.to_owned();

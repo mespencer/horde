@@ -392,6 +392,60 @@ mod tests {
         );
     }
 
+    /// `serve` stands the endpoint up behind the identity gate. The property
+    /// worth asserting is not that it binds — it is that the gate is actually
+    /// in front of rmcp on a real socket, because wiring the layer in the wrong
+    /// order would still compile and still serve.
+    #[tokio::test]
+    async fn a_served_endpoint_refuses_an_unidentified_request() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let endpoint = crate::endpoint::HordeEndpoint::new(crate::context::AgentContext::new(
+            std::sync::Arc::new(crate::journal::testing::RecordingJournal::new()),
+            horde_cli::client::Client::with_channel(channel),
+            "s1",
+        ));
+
+        let mut registry = AgentRegistry::new();
+        registry.insert("agent-42", "token");
+
+        let (bound, _serving) = super::serve(
+            &EndpointConfig::loopback(0),
+            std::sync::Arc::new(registry),
+            endpoint,
+        )
+        .await
+        .expect("the endpoint must bind on an OS-chosen port");
+
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0, "the bound port must be reported back");
+
+        // A raw request with no credentials, over the real socket.
+        let stream = tokio::net::TcpStream::connect(bound)
+            .await
+            .expect("the endpoint must accept a connection");
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .expect("http handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "127.0.0.1")
+            .body(String::new())
+            .expect("the probe request must build");
+
+        let response = sender.send_request(request).await.expect("a response");
+        assert_eq!(
+            response.status(),
+            http::StatusCode::UNAUTHORIZED,
+            "an unidentified request must be refused before it reaches rmcp"
+        );
+    }
+
     #[test]
     fn the_endpoint_binds_loopback_only() {
         let config = EndpointConfig::loopback(8931);

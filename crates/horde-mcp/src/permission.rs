@@ -47,11 +47,12 @@
 
 use horde_adapter::permission::PermissionDecision;
 use horde_adapter_claude::permission::{PromptRequest, encode_tool_response};
-use horde_cli::client::{Client, SyncOptions};
+use horde_cli::client::SyncOptions;
 use horde_proto::v1::event::Kind as EventKind;
 
+use crate::context::AgentContext;
 use crate::identity::AgentIdentity;
-use crate::journal::{JournalEntry, JournalError, JournalSink};
+use crate::journal::{JournalEntry, JournalError};
 
 /// Why an escalation did not produce a decision.
 #[derive(Debug, thiserror::Error)]
@@ -102,23 +103,13 @@ pub enum PermissionError {
 /// off the log (control plane).
 #[derive(Debug)]
 pub struct PermissionBroker {
-    journal: std::sync::Arc<dyn JournalSink>,
-    client: Client,
-    session_id: String,
+    context: AgentContext,
 }
 
 impl PermissionBroker {
     #[must_use]
-    pub fn new(
-        journal: std::sync::Arc<dyn JournalSink>,
-        client: Client,
-        session_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            journal,
-            client,
-            session_id: session_id.into(),
-        }
+    pub fn new(context: AgentContext) -> Self {
+        Self { context }
     }
 
     /// Raises the harness's proposed call and blocks until it is decided.
@@ -130,10 +121,12 @@ impl PermissionBroker {
     /// wrong in a way that hides itself — one widens a permission nobody
     /// granted, the other stalls an agent nobody refused.
     pub async fn adjudicate(
-        &mut self,
+        &self,
         identity: &AgentIdentity,
         prompt: &PromptRequest,
     ) -> Result<PermissionDecision, PermissionError> {
+        let session_id = self.context.session_id().to_owned();
+        let mut client = self.context.client();
         // The harness's own id for this tool call: unique per call, and stable
         // across a replay of the same call, which is exactly what both the
         // request id and the dedupe key need to be. Minting a fresh random one
@@ -143,15 +136,15 @@ impl PermissionBroker {
         // Subscribed FIRST. See the module docs — the answer can land between
         // the write and the listen, and from-zero is safe because the match is
         // by identity rather than position.
-        let mut stream = self
-            .client
-            .follow(&SyncOptions::new(self.session_id.clone()))
+        let mut stream = client
+            .follow(&SyncOptions::new(session_id.clone()))
             .await
             .map_err(|source| PermissionError::Unwatchable { source })?;
 
-        self.journal
+        self.context
+            .journal()
             .record(JournalEntry {
-                session_id: self.session_id.clone(),
+                session_id,
                 agent_id: Some(identity.agent_id().to_owned()),
                 idempotency_key: request_id.clone(),
                 kind: EventKind::PermissionRequested(requested(identity, prompt, &request_id)),
@@ -187,7 +180,7 @@ impl PermissionBroker {
     ///
     /// [`PermissionError`], for the caller to render as a tool error.
     pub async fn respond(
-        &mut self,
+        &self,
         identity: &AgentIdentity,
         prompt: &PromptRequest,
     ) -> Result<serde_json::Value, PermissionError> {

@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{ServerJournal, Setup, harness, identity_for};
+use common::{Setup, harness, identity_for};
 use horde_adapter::permission::PermissionDecision;
 use horde_adapter_claude::permission::PromptRequest;
 use horde_cli::client::{Client, PermissionAnswer, SyncOptions};
@@ -71,10 +71,7 @@ async fn round_trip(
 ) -> Setup<serde_json::Value> {
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
-    let journal = std::sync::Arc::new(ServerJournal::new(&harness.endpoint));
-    let client = Client::connect(&harness.endpoint).await?;
-
-    let mut broker = PermissionBroker::new(journal, client, harness.session_id.clone());
+    let broker = PermissionBroker::new(harness.context().await?);
     let prompt = prompt("Write", input, tool_use_id)?;
 
     // The agent's side: blocks until somebody answers.
@@ -184,18 +181,14 @@ fn decode(response: &serde_json::Value) -> Setup<serde_json::Value> {
 /// A sanity check that the fake and the real sink agree about the shape of a
 /// failure: an unwritable journal is an error to the agent, never a wait.
 #[tokio::test]
-async fn an_unraisable_request_fails_rather_than_blocking_forever() {
-    let harness = harness().await.expect("a harness");
-    let identity = identity_for(&harness.agent_id).expect("an identity");
-    let client = Client::connect(&harness.endpoint)
-        .await
-        .expect("a connected client");
+async fn an_unraisable_request_fails_rather_than_blocking_forever() -> Setup<()> {
+    let harness = harness().await?;
+    let identity = identity_for(&harness.agent_id)?;
 
     // A journal pointed at nothing: the request cannot be written, so no human
     // will ever see it.
-    let journal = std::sync::Arc::new(ServerJournal::new("http://127.0.0.1:1"));
-    let mut broker = PermissionBroker::new(journal, client, harness.session_id.clone());
-    let prompt = prompt("Write", serde_json::json!({}), "toolu_dead").expect("a prompt");
+    let broker = PermissionBroker::new(harness.context_with_dead_journal().await?);
+    let prompt = prompt("Write", serde_json::json!({}), "toolu_dead")?;
 
     let error = broker
         .respond(&identity, &prompt)
@@ -209,6 +202,7 @@ async fn an_unraisable_request_fails_rather_than_blocking_forever() {
         ),
         "the agent must be told the question was never asked: {error}"
     );
+    Ok(())
 }
 
 /// `PermissionDecision`'s domain type is what the endpoint reasons about, so

@@ -251,6 +251,43 @@ mod tests {
         ));
     }
 
+    /// Every arm, because a name only exists to be read in an error and an arm
+    /// nobody has exercised is a name nobody has read. Also pins that no two
+    /// kinds share a name — two kinds called the same thing would make the
+    /// collision error say nothing at all.
+    #[test]
+    fn every_kind_has_its_own_name() {
+        use horde_proto::v1::*;
+        let all = [
+            Kind::AgentOutputChunk(AgentOutputChunk::default()),
+            Kind::AgentSpawned(AgentSpawned::default()),
+            Kind::AssignmentSent(AssignmentSent::default()),
+            Kind::NoteSent(NoteSent::default()),
+            Kind::ResultReported(ResultReported::default()),
+            Kind::PermissionRequested(PermissionRequested::default()),
+            Kind::PermissionDecided(PermissionDecided::default()),
+            Kind::UsageRecorded(UsageRecorded::default()),
+            Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged::default()),
+            Kind::AgentLifecycleChanged(AgentLifecycleChanged::default()),
+            Kind::SessionLifecycleChanged(SessionLifecycleChanged::default()),
+            Kind::PlacementChanged(PlacementChanged::default()),
+            Kind::TurnInterrupted(TurnInterrupted::default()),
+        ];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in &all {
+            let name = kind_name(Some(kind));
+            assert!(!name.is_empty(), "every kind needs a name");
+            assert!(
+                seen.insert(name),
+                "{name} is used by more than one kind, which makes a collision \
+                 error unreadable"
+            );
+        }
+        assert_eq!(seen.len(), all.len());
+        assert!(!seen.contains("empty"), "`empty` belongs to the None case");
+    }
+
     #[test]
     fn every_named_kind_is_distinguishable() {
         // An error that called two different kinds by the same name would be

@@ -20,6 +20,7 @@
 #![allow(dead_code, unreachable_pub)]
 
 use horde_cli::client::Client;
+use horde_mcp::context::AgentContext;
 use horde_mcp::identity::{AgentIdentity, AgentRegistry};
 use horde_mcp::journal::{JournalEntry, JournalError, JournalSink};
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
@@ -146,6 +147,27 @@ impl Harness {
     /// Another client onto the same server.
     pub async fn client(&self) -> Setup<Client> {
         Ok(Client::connect(&self.endpoint).await?)
+    }
+
+    /// A context wired to this harness — the thing every verb needs.
+    ///
+    /// Each call builds a fresh one, which is what a test wanting two
+    /// independent actors (a reporter and a waiter, say) needs.
+    pub async fn context(&self) -> Setup<AgentContext> {
+        Ok(AgentContext::new(
+            self.journal(),
+            self.client().await?,
+            self.session_id.clone(),
+        ))
+    }
+
+    /// A context whose journal points nowhere, for testing the unwritable case.
+    pub async fn context_with_dead_journal(&self) -> Setup<AgentContext> {
+        Ok(AgentContext::new(
+            std::sync::Arc::new(ServerJournal::new("http://127.0.0.1:1")),
+            self.client().await?,
+            self.session_id.clone(),
+        ))
     }
 }
 

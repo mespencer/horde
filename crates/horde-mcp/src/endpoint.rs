@@ -29,8 +29,8 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
+use crate::context::AgentContext;
 use crate::identity::AgentIdentity;
-use crate::journal::JournalSink;
 use crate::permission::PermissionBroker;
 use crate::verbs::{MessageKind, Verbs};
 
@@ -96,19 +96,69 @@ pub struct ResultView {
     pub summary: String,
 }
 
+/// Renders any verb failure as an MCP tool error.
+///
+/// One conversion rather than a closure at each call site: the handlers should
+/// differ in what they do, not in how they spell the same `map_err`.
+fn internal<E: std::fmt::Display>(error: E) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
+}
+
+/// The `ResultStatus` an agent named, or `None` if it named nothing valid.
+///
+/// A free function rather than a `match` inside the handler, for the reason
+/// QUALITY_GATES records: a decision buried in a handler cannot have its truth
+/// table exercised, because arranging the handler means arranging a whole MCP
+/// request. Lifted out, it is four assertions and no runtime.
+#[must_use]
+pub fn status_from_name(name: &str) -> Option<horde_proto::v1::ResultStatus> {
+    match name {
+        "success" => Some(horde_proto::v1::ResultStatus::Success),
+        "partial" => Some(horde_proto::v1::ResultStatus::Partial),
+        "blocked" => Some(horde_proto::v1::ResultStatus::Blocked),
+        _ => None,
+    }
+}
+
+/// The name for a status coming back out of the log.
+///
+/// An unrecognized or unspecified status reports as `unknown` rather than
+/// being rounded to `success`: a parent acting on an invented outcome is worse
+/// than one told the outcome is unreadable.
+#[must_use]
+pub fn status_name(status: i32) -> &'static str {
+    match horde_proto::v1::ResultStatus::try_from(status) {
+        Ok(horde_proto::v1::ResultStatus::Success) => "success",
+        Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
+        Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
+        Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+/// Which message kind a `note` flag asks for.
+///
+/// One bit, one function, so the inversion is catchable — the same shape as
+/// `horde_cli::cli::delivery_for`, and for the same reason.
+#[must_use]
+pub fn message_kind_for(note: bool) -> MessageKind {
+    if note {
+        MessageKind::Note
+    } else {
+        MessageKind::Assign
+    }
+}
+
 /// The tools one Agent's endpoint serves.
 #[derive(Clone)]
 pub struct HordeEndpoint {
-    journal: std::sync::Arc<dyn JournalSink>,
-    client: horde_cli::client::Client,
-    session_id: String,
+    context: AgentContext,
     tool_router: ToolRouter<Self>,
 }
 
 impl std::fmt::Debug for HordeEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HordeEndpoint")
-            .field("session_id", &self.session_id)
+            .field("context", &self.context)
             .finish_non_exhaustive()
     }
 }
@@ -116,15 +166,9 @@ impl std::fmt::Debug for HordeEndpoint {
 #[tool_router]
 impl HordeEndpoint {
     #[must_use]
-    pub fn new(
-        journal: std::sync::Arc<dyn JournalSink>,
-        client: horde_cli::client::Client,
-        session_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(context: AgentContext) -> Self {
         Self {
-            journal,
-            client,
-            session_id: session_id.into(),
+            context,
             tool_router: Self::tool_router(),
         }
     }
@@ -163,19 +207,11 @@ impl HordeEndpoint {
     }
 
     fn broker(&self) -> PermissionBroker {
-        PermissionBroker::new(
-            std::sync::Arc::clone(&self.journal),
-            self.client.clone(),
-            self.session_id.clone(),
-        )
+        PermissionBroker::new(self.context.clone())
     }
 
     fn verbs(&self) -> Verbs {
-        Verbs::new(
-            std::sync::Arc::clone(&self.journal),
-            self.client.clone(),
-            self.session_id.clone(),
-        )
+        Verbs::new(self.context.clone())
     }
 
     /// The tool Claude's `--permission-prompt-tool` points at.
@@ -204,7 +240,7 @@ impl HordeEndpoint {
             .broker()
             .adjudicate(&identity, &prompt)
             .await
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            .map_err(internal)?;
 
         Ok(horde_adapter_claude::permission::encode_decision(
             &decision,
@@ -226,7 +262,7 @@ impl HordeEndpoint {
             .verbs()
             .spawn_agent(&identity, &params.task)
             .await
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            .map_err(internal)?;
 
         Ok(Json(SpawnResult {
             agent_id: outcome.agent_id,
@@ -245,11 +281,6 @@ impl HordeEndpoint {
         context: RequestContext<RoleServer>,
     ) -> Result<String, ErrorData> {
         let identity = Self::caller(&context)?;
-        let kind = if params.note {
-            MessageKind::Note
-        } else {
-            MessageKind::Assign
-        };
         // Keyed on the sender and the text so a retried send is not delivered
         // twice; see `Verbs::report_result` on why the key must be unique.
         let key = format!("{}:{}", identity.agent_id(), params.text);
@@ -258,13 +289,13 @@ impl HordeEndpoint {
             .verbs()
             .send_message(
                 &params.to_agent_id,
-                kind,
+                message_kind_for(params.note),
                 &params.text,
                 params.interrupt,
                 &key,
             )
             .await
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            .map_err(internal)?;
 
         Ok(format!("delivered at {sequence}"))
     }
@@ -279,23 +310,41 @@ impl HordeEndpoint {
         context: RequestContext<RoleServer>,
     ) -> Result<String, ErrorData> {
         let identity = Self::caller(&context)?;
-        let status = match params.status.as_str() {
-            "success" => horde_proto::v1::ResultStatus::Success,
-            "partial" => horde_proto::v1::ResultStatus::Partial,
-            "blocked" => horde_proto::v1::ResultStatus::Blocked,
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!("status must be success, partial, or blocked; got {other}"),
-                    None,
-                ));
-            }
-        };
+        self.record(&identity, &params).await
+    }
+
+    /// The body of `report_result`, without the request wrapping.
+    ///
+    /// Split out so it can be tested: a handler taking a `RequestContext` can
+    /// only be exercised by arranging a whole MCP request, which is why the
+    /// status validation and the failure path here would otherwise go
+    /// unmeasured. The handler above is now the two lines that cannot be tested
+    /// any other way.
+    ///
+    /// # Errors
+    ///
+    /// Invalid params for a status that is not one of the three; an internal
+    /// error when the journal would not take the result.
+    async fn record(
+        &self,
+        identity: &AgentIdentity,
+        params: &ReportParams,
+    ) -> Result<String, ErrorData> {
+        let status = status_from_name(&params.status).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!(
+                    "status must be success, partial, or blocked; got {}",
+                    params.status
+                ),
+                None,
+            )
+        })?;
 
         let key = format!("result:{}:{}", identity.agent_id(), params.summary);
         self.verbs()
-            .report_result(&identity, status, &params.summary, &key)
+            .report_result(identity, status, &params.summary, &key)
             .await
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            .map_err(internal)?;
 
         Ok("recorded".to_owned())
     }
@@ -313,20 +362,10 @@ impl HordeEndpoint {
             .verbs()
             .wait_for_agent(&params.agent_id)
             .await
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-
-        let status = match horde_proto::v1::ResultStatus::try_from(result.status) {
-            Ok(horde_proto::v1::ResultStatus::Success) => "success",
-            Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
-            Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
-            // Never guessed into a success: a result whose status this build
-            // does not recognize is reported as unknown so a parent does not
-            // act on an invented outcome.
-            Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
-        };
+            .map_err(internal)?;
 
         Ok(Json(ResultView {
-            status: status.to_owned(),
+            status: status_name(result.status).to_owned(),
             summary: result.summary,
         }))
     }
@@ -358,17 +397,19 @@ impl ServerHandler for HordeEndpoint {
 #[cfg(test)]
 mod tests {
     use super::HordeEndpoint;
+    use super::{AgentIdentity, ReportParams};
+    use crate::verbs::MessageKind;
     use rmcp::ServerHandler;
 
     fn endpoint() -> HordeEndpoint {
         // A client that dials nothing: these tests are about the tool surface,
         // which is decided before any call reaches the control plane.
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        HordeEndpoint::new(
+        HordeEndpoint::new(crate::context::AgentContext::new(
             std::sync::Arc::new(crate::journal::testing::RecordingJournal::new()),
             horde_cli::client::Client::with_channel(channel),
             "s1",
-        )
+        ))
     }
 
     /// The endpoint must advertise the legacy revision deliberately. A modern
@@ -395,6 +436,119 @@ mod tests {
     /// The names are the agent-facing contract — `--permission-prompt-tool` is
     /// pointed at `approve` by name, and renaming a verb silently breaks every
     /// prompt that mentions it.
+    fn identity() -> AgentIdentity {
+        let mut registry = crate::identity::AgentRegistry::new();
+        registry.insert("agent-42", "token");
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().expect("header"));
+        headers.insert("x-horde-agent", "agent-42".parse().expect("header"));
+        registry.authenticate(&headers).expect("authenticates")
+    }
+
+    /// A status the agent invented is refused before anything is written.
+    #[tokio::test]
+    async fn reporting_an_unknown_status_is_refused_rather_than_guessed() {
+        let error = endpoint()
+            .record(
+                &identity(),
+                &ReportParams {
+                    status: "finished".to_owned(),
+                    summary: "done".to_owned(),
+                },
+            )
+            .await
+            .expect_err("`finished` is not one of the three statuses");
+
+        assert!(
+            error.message.contains("success, partial, or blocked"),
+            "the message must say what is allowed: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("finished"),
+            "and what was received: {}",
+            error.message
+        );
+    }
+
+    /// A result that could not be journaled surfaces as an error. This endpoint
+    /// dials nowhere, so the journal is the in-memory one and the control plane
+    /// is unreachable — the interesting half is that a valid status gets past
+    /// validation and the failure comes from the write, not the parse.
+    #[tokio::test]
+    async fn a_valid_status_passes_validation_and_reaches_the_journal() {
+        let recorded = endpoint()
+            .record(
+                &identity(),
+                &ReportParams {
+                    status: "partial".to_owned(),
+                    summary: "got halfway".to_owned(),
+                },
+            )
+            .await
+            .expect("the in-memory journal accepts it");
+
+        assert_eq!(recorded, "recorded");
+    }
+
+    /// The three statuses an agent may name, and everything else.
+    #[test]
+    fn only_the_three_real_statuses_are_accepted() {
+        assert_eq!(
+            super::status_from_name("success"),
+            Some(horde_proto::v1::ResultStatus::Success)
+        );
+        assert_eq!(
+            super::status_from_name("partial"),
+            Some(horde_proto::v1::ResultStatus::Partial)
+        );
+        assert_eq!(
+            super::status_from_name("blocked"),
+            Some(horde_proto::v1::ResultStatus::Blocked)
+        );
+        for rejected in ["", "Success", "done", "ok", "unspecified"] {
+            assert_eq!(
+                super::status_from_name(rejected),
+                None,
+                "{rejected} is not a status and must be refused rather than \
+                 rounded to one"
+            );
+        }
+    }
+
+    /// An unreadable status must not become a success. A parent acts on this.
+    #[test]
+    fn an_unrecognized_status_reports_as_unknown_rather_than_success() {
+        assert_eq!(
+            super::status_name(horde_proto::v1::ResultStatus::Success as i32),
+            "success"
+        );
+        assert_eq!(
+            super::status_name(horde_proto::v1::ResultStatus::Partial as i32),
+            "partial"
+        );
+        assert_eq!(
+            super::status_name(horde_proto::v1::ResultStatus::Blocked as i32),
+            "blocked"
+        );
+        assert_eq!(
+            super::status_name(horde_proto::v1::ResultStatus::Unspecified as i32),
+            "unknown"
+        );
+        assert_eq!(
+            super::status_name(9_999),
+            "unknown",
+            "a status from a newer build is unreadable, not successful"
+        );
+    }
+
+    /// One bit, and the inversion is the whole risk.
+    #[test]
+    fn the_note_flag_selects_the_message_kind() {
+        assert_eq!(super::message_kind_for(true), MessageKind::Note);
+        assert_eq!(super::message_kind_for(false), MessageKind::Assign);
+    }
+
     #[tokio::test]
     async fn the_tool_names_are_the_ones_agents_are_told_about() {
         let names = endpoint().tool_names();

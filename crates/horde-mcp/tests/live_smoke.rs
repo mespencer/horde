@@ -93,11 +93,7 @@ async fn a_real_claude_routes_its_permission_prompt_through_this_endpoint() -> S
     let mut registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, TOKEN);
 
-    let mcp = HordeEndpoint::new(
-        horde.journal(),
-        horde.client().await?,
-        horde.session_id.clone(),
-    );
+    let mcp = HordeEndpoint::new(horde.context().await?);
     let (bound, _serving) = serve(
         &EndpointConfig::loopback(0),
         std::sync::Arc::new(registry),

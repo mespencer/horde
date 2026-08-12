@@ -37,6 +37,7 @@
 //!
 //! [`journal::JournalSink`] is the seam for the second plane.
 
+pub mod context;
 pub mod endpoint;
 pub mod identity;
 pub mod journal;

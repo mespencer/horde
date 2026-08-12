@@ -17,16 +17,8 @@ async fn a_reported_result_is_what_a_waiting_parent_receives() -> Setup<()> {
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
 
-    let reporter = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
-    let mut waiter = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let reporter = Verbs::new(harness.context().await?);
+    let waiter = Verbs::new(harness.context().await?);
 
     // The parent starts waiting before the child reports, which is the ordering
     // that actually happens and the one a naive implementation gets wrong.
@@ -60,11 +52,7 @@ async fn a_result_reported_before_the_wait_still_answers_it() -> Setup<()> {
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
 
-    let reporter = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let reporter = Verbs::new(harness.context().await?);
     reporter
         .report_result(
             &identity,
@@ -74,11 +62,7 @@ async fn a_result_reported_before_the_wait_still_answers_it() -> Setup<()> {
         )
         .await?;
 
-    let mut waiter = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let waiter = Verbs::new(harness.context().await?);
     let result = waiter.wait_for_agent(&harness.agent_id).await?;
 
     assert_eq!(result.summary, "done early");
@@ -93,20 +77,12 @@ async fn a_reported_result_carries_no_agent_declared_payload() -> Setup<()> {
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
 
-    let reporter = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let reporter = Verbs::new(harness.context().await?);
     reporter
         .report_result(&identity, ResultStatus::Success, "done", "result-done")
         .await?;
 
-    let mut waiter = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let waiter = Verbs::new(harness.context().await?);
     let result = waiter.wait_for_agent(&harness.agent_id).await?;
 
     assert!(
@@ -124,11 +100,7 @@ async fn a_spawn_with_nowhere_to_run_comes_back_queued_rather_than_failing() -> 
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
 
-    let mut verbs = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let verbs = Verbs::new(harness.context().await?);
     let outcome = verbs.spawn_agent(&identity, "spawn-1").await?;
 
     assert!(
@@ -148,11 +120,7 @@ async fn a_spawn_with_nowhere_to_run_comes_back_queued_rather_than_failing() -> 
 async fn assignments_and_notes_both_land_and_report_where() -> Setup<()> {
     let harness = harness().await?;
 
-    let mut verbs = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let verbs = Verbs::new(harness.context().await?);
 
     let assigned = verbs
         .send_message(
@@ -195,11 +163,7 @@ async fn reusing_another_events_idempotency_key_is_refused_rather_than_swallowed
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
 
-    let verbs = Verbs::new(
-        harness.journal(),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let verbs = Verbs::new(harness.context().await?);
 
     let error = verbs
         .report_result(&identity, ResultStatus::Success, "done", "key-1")
@@ -224,11 +188,7 @@ async fn a_result_that_cannot_be_recorded_is_an_error() -> Setup<()> {
     let harness = harness().await?;
     let identity = identity_for(&harness.agent_id)?;
 
-    let verbs = Verbs::new(
-        std::sync::Arc::new(common::ServerJournal::new("http://127.0.0.1:1")),
-        harness.client().await?,
-        harness.session_id.clone(),
-    );
+    let verbs = Verbs::new(harness.context_with_dead_journal().await?);
 
     let error = verbs
         .report_result(&identity, ResultStatus::Success, "done", "result-done")
