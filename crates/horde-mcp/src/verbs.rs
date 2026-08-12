@@ -305,26 +305,17 @@ mod tests {
     use horde_proto::v1::ResultStatus;
 
     fn reported(agent: &str, summary: &str) -> horde_proto::v1::EventEnvelope {
-        horde_proto::v1::EventEnvelope {
-            session_id: Some(horde_proto::v1::SessionId::new("s1")),
-            sequence: 1,
-            recorded_at: None,
-            event: Some(horde_proto::v1::Event {
-                agent_id: Some(horde_proto::v1::AgentId::new(agent)),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(horde_proto::v1::event::Kind::ResultReported(
-                    horde_proto::v1::ResultReported {
-                        result: Some(horde_proto::v1::AgentResult {
-                            assignment_id: None,
-                            status: ResultStatus::Success as i32,
-                            summary: summary.to_owned(),
-                            payload: None,
-                        }),
-                    },
-                )),
+        crate::testing::envelope(
+            agent,
+            horde_proto::v1::event::Kind::ResultReported(horde_proto::v1::ResultReported {
+                result: Some(horde_proto::v1::AgentResult {
+                    assignment_id: None,
+                    status: ResultStatus::Success as i32,
+                    summary: summary.to_owned(),
+                    payload: None,
+                }),
             }),
-        }
+        )
     }
 
     /// The property the whole wait turns on. A tree has many children reporting
@@ -358,24 +349,16 @@ mod tests {
 
     #[test]
     fn events_that_are_not_results_are_ignored() {
-        let envelope = horde_proto::v1::EventEnvelope {
-            event: Some(horde_proto::v1::Event {
-                agent_id: Some(horde_proto::v1::AgentId::new("child-1")),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(horde_proto::v1::event::Kind::PermissionRequested(
-                    horde_proto::v1::PermissionRequested::default(),
-                )),
-            }),
-            ..reported("child-1", "done")
-        };
-        assert!(result_from(&envelope, "child-1").is_none());
+        let requested = crate::testing::envelope(
+            "child-1",
+            horde_proto::v1::event::Kind::PermissionRequested(
+                horde_proto::v1::PermissionRequested::default(),
+            ),
+        );
+        assert!(result_from(&requested, "child-1").is_none());
         assert!(
             result_from(
-                &horde_proto::v1::EventEnvelope {
-                    event: None,
-                    ..reported("child-1", "done")
-                },
+                &crate::testing::envelope_without_event("child-1"),
                 "child-1"
             )
             .is_none(),

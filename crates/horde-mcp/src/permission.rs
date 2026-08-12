@@ -279,25 +279,16 @@ mod tests {
     }
 
     fn decided(request_id: &str) -> horde_proto::v1::EventEnvelope {
-        horde_proto::v1::EventEnvelope {
-            session_id: Some(horde_proto::v1::SessionId::new("s1")),
-            sequence: 1,
-            recorded_at: None,
-            event: Some(horde_proto::v1::Event {
-                agent_id: Some(horde_proto::v1::AgentId::new("agent-42")),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(horde_proto::v1::event::Kind::PermissionDecided(
-                    horde_proto::v1::PermissionDecided {
-                        decision: Some(horde_proto::v1::PermissionDecision {
-                            request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
-                            outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
-                            ..horde_proto::v1::PermissionDecision::default()
-                        }),
-                    },
-                )),
+        crate::testing::envelope(
+            "agent-42",
+            horde_proto::v1::event::Kind::PermissionDecided(horde_proto::v1::PermissionDecided {
+                decision: Some(horde_proto::v1::PermissionDecision {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+                    outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+                    ..horde_proto::v1::PermissionDecision::default()
+                }),
             }),
-        }
+        )
     }
 
     /// The whole wait turns on this: a decision for somebody else's request
@@ -314,26 +305,16 @@ mod tests {
 
     #[test]
     fn events_that_are_not_decisions_are_ignored() {
-        let envelope = horde_proto::v1::EventEnvelope {
-            session_id: Some(horde_proto::v1::SessionId::new("s1")),
-            sequence: 1,
-            recorded_at: None,
-            event: Some(horde_proto::v1::Event {
-                agent_id: Some(horde_proto::v1::AgentId::new("agent-42")),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(horde_proto::v1::event::Kind::PermissionRequested(
-                    horde_proto::v1::PermissionRequested::default(),
-                )),
-            }),
-        };
-        assert!(decision_for(&envelope, "toolu_01").is_none());
+        let requested = crate::testing::envelope(
+            "agent-42",
+            horde_proto::v1::event::Kind::PermissionRequested(
+                horde_proto::v1::PermissionRequested::default(),
+            ),
+        );
+        assert!(decision_for(&requested, "toolu_01").is_none());
         assert!(
             decision_for(
-                &horde_proto::v1::EventEnvelope {
-                    event: None,
-                    ..decided("toolu_01")
-                },
+                &crate::testing::envelope_without_event("agent-42"),
                 "toolu_01"
             )
             .is_none(),

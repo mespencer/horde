@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{Setup, harness, identity_for};
+use common::{Setup, harness, identity_for, verbs_for_one_agent};
 use horde_mcp::verbs::{MessageKind, Verbs};
 use horde_proto::v1::ResultStatus;
 
@@ -74,10 +74,7 @@ async fn a_result_reported_before_the_wait_still_answers_it() -> Setup<()> {
 /// asserts the absence deliberately rather than by accident.
 #[tokio::test]
 async fn a_reported_result_carries_no_agent_declared_payload() -> Setup<()> {
-    let harness = harness().await?;
-    let identity = identity_for(&harness.agent_id)?;
-
-    let reporter = Verbs::new(harness.context().await?);
+    let (harness, identity, reporter) = verbs_for_one_agent().await?;
     reporter
         .report_result(&identity, ResultStatus::Success, "done", "result-done")
         .await?;
@@ -97,10 +94,7 @@ async fn a_reported_result_carries_no_agent_declared_payload() -> Setup<()> {
 /// error, and not a wait.
 #[tokio::test]
 async fn a_spawn_with_nowhere_to_run_comes_back_queued_rather_than_failing() -> Setup<()> {
-    let harness = harness().await?;
-    let identity = identity_for(&harness.agent_id)?;
-
-    let verbs = Verbs::new(harness.context().await?);
+    let (_harness, identity, verbs) = verbs_for_one_agent().await?;
     let outcome = verbs.spawn_agent(&identity, "spawn-1").await?;
 
     assert!(
@@ -160,10 +154,7 @@ async fn assignments_and_notes_both_land_and_report_where() -> Setup<()> {
 /// nobody has connected to it yet.
 #[tokio::test]
 async fn reusing_another_events_idempotency_key_is_refused_rather_than_swallowed() -> Setup<()> {
-    let harness = harness().await?;
-    let identity = identity_for(&harness.agent_id)?;
-
-    let verbs = Verbs::new(harness.context().await?);
+    let (_harness, identity, verbs) = verbs_for_one_agent().await?;
 
     let error = verbs
         .report_result(&identity, ResultStatus::Success, "done", "key-1")

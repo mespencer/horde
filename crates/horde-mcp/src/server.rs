@@ -281,18 +281,28 @@ mod tests {
             .expect("the test request must build")
     }
 
-    #[tokio::test]
-    async fn an_authenticated_request_reaches_the_service_carrying_its_identity() {
+    /// Puts one request through the layer, answering with what the layer
+    /// returned and what the inner service saw.
+    ///
+    /// Every test here differs only in the headers it sends and the verdict it
+    /// expects, so the arrangement is shared and the assertions are not.
+    async fn call_with(headers: &[(&str, &str)]) -> (Spy, http::Response<String>) {
         let spy = Spy::default();
         let mut layer = RequireIdentity::new(spy.clone(), registry());
-
         let response = layer
-            .call(request(&[
-                ("authorization", "Bearer horde-agent-42-token"),
-                (AGENT_HEADER, "agent-42"),
-            ]))
+            .call(request(headers))
             .await
-            .expect("the layer must not fail an authenticated request");
+            .expect("the layer answers every request, refusal included");
+        (spy, response)
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_request_reaches_the_service_carrying_its_identity() {
+        let (spy, response) = call_with(&[
+            ("authorization", "Bearer horde-agent-42-token"),
+            (AGENT_HEADER, "agent-42"),
+        ])
+        .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(spy.reached.load(Ordering::SeqCst), 1);
@@ -311,13 +321,7 @@ mod tests {
     /// to stop it later.
     #[tokio::test]
     async fn an_unauthenticated_request_never_reaches_the_service() {
-        let spy = Spy::default();
-        let mut layer = RequireIdentity::new(spy.clone(), registry());
-
-        let response = layer
-            .call(request(&[]))
-            .await
-            .expect("a refusal is a response, not a transport failure");
+        let (spy, response) = call_with(&[]).await;
 
         assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -333,16 +337,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_forged_agent_header_never_reaches_the_service() {
-        let spy = Spy::default();
-        let mut layer = RequireIdentity::new(spy.clone(), registry());
-
-        let response = layer
-            .call(request(&[
-                ("authorization", "Bearer horde-agent-42-token"),
-                (AGENT_HEADER, "agent-99"),
-            ]))
-            .await
-            .expect("a refusal is a response");
+        let (spy, response) = call_with(&[
+            ("authorization", "Bearer horde-agent-42-token"),
+            (AGENT_HEADER, "agent-99"),
+        ])
+        .await;
 
         assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
         assert_eq!(spy.reached.load(Ordering::SeqCst), 0);

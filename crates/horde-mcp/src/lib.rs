@@ -43,6 +43,9 @@ pub mod identity;
 pub mod journal;
 pub mod permission;
 pub mod server;
+
+#[cfg(test)]
+mod testing;
 pub mod verbs;
 
 pub use identity::{AgentIdentity, AgentRegistry, IdentityError};

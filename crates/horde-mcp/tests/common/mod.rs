@@ -171,6 +171,18 @@ impl Harness {
     }
 }
 
+/// A harness, an authenticated identity for its agent, and the verbs.
+///
+/// Three lines that opened almost every verb test identically, which the
+/// duplication gate flagged. Sharing them also means a test reads as what it is
+/// testing rather than as four lines of arrangement.
+pub async fn verbs_for_one_agent() -> Setup<(Harness, AgentIdentity, horde_mcp::verbs::Verbs)> {
+    let harness = harness().await?;
+    let identity = identity_for(&harness.agent_id)?;
+    let verbs = horde_mcp::verbs::Verbs::new(harness.context().await?);
+    Ok((harness, identity, verbs))
+}
+
 /// Stands up both spines, creates a session, and returns what tests need.
 pub async fn harness() -> Setup<Harness> {
     let core = ServerCore::new(EventLog::in_memory()?);
