@@ -355,6 +355,33 @@ impl Client {
             .into_inner())
     }
 
+    /// Opens a follow stream and hands it back before reading anything.
+    ///
+    /// The subscribe half of subscribe-before-write. See [`EventStream`] for
+    /// why the two steps are separate.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the subscription is refused.
+    pub async fn follow(&mut self, options: &SyncOptions) -> Result<EventStream, ClientError> {
+        let inner = self
+            .inner
+            .sync_events(SyncEventsRequest {
+                cursors: vec![SessionCursor {
+                    session_id: Some(SessionId::new(options.session_id.clone())),
+                    from_sequence: options.from_sequence,
+                }],
+                all_sessions: false,
+                subtree_root: None,
+                follow: true,
+                max_batch_events: 0,
+            })
+            .await?
+            .into_inner();
+
+        Ok(EventStream { inner })
+    }
+
     /// Replays a session from an offset, then optionally follows it.
     ///
     /// Each event is handed to `on_event` as it arrives rather than collected,
@@ -412,6 +439,61 @@ impl Client {
         }
 
         Ok(highest)
+    }
+}
+
+/// A live event stream, already open.
+///
+/// Separate from [`Client::sync`] because of *when* it exists. `sync` opens a
+/// stream and drains it in one call, which is right for replay and for
+/// `--follow`, and wrong for anyone who must not miss the answer to something
+/// they are about to write: between deciding to write and starting to listen
+/// there is a window, and the answer can land inside it.
+///
+/// This is the two-step shape that closes that window — open the stream, do the
+/// write, then read. The server's own log tail is built the same way and for
+/// the same reason.
+///
+/// Dropping this cancels the subscription; there is no separate close.
+#[derive(Debug)]
+pub struct EventStream {
+    inner: tonic::Streaming<horde_proto::v1::SyncEventsResponse>,
+}
+
+impl EventStream {
+    /// Reads forward until `matches` yields a value.
+    ///
+    /// `Ok(None)` means the stream ended without a match — the server shut down
+    /// or the session went away. It is not a timeout: nothing here imposes one,
+    /// because the thing being waited for may legitimately take as long as a
+    /// human takes to answer. A caller that needs a deadline wraps this in one,
+    /// and a caller that needs to give up drops the stream.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the stream itself fails.
+    pub async fn next_matching<F, T>(&mut self, mut matches: F) -> Result<Option<T>, ClientError>
+    where
+        F: FnMut(&EventEnvelope) -> Option<T>,
+    {
+        while let Some(message) = self.inner.next().await {
+            match message?.update {
+                Some(sync_events_response::Update::Batch(batch)) => {
+                    for event in &batch.events {
+                        if let Some(found) = matches(event) {
+                            return Ok(Some(found));
+                        }
+                    }
+                }
+                // A heartbeat is what distinguishes a quiet wait from a dead
+                // one, and `CaughtUp` only says history ended — neither is an
+                // answer, and neither ends the wait.
+                Some(sync_events_response::Update::CaughtUp(_))
+                | Some(sync_events_response::Update::Heartbeat(_))
+                | None => {}
+            }
+        }
+        Ok(None)
     }
 }
 

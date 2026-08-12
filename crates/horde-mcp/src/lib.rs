@@ -39,6 +39,7 @@
 
 pub mod identity;
 pub mod journal;
+pub mod permission;
 pub mod server;
 
 pub use identity::{AgentIdentity, AgentRegistry, IdentityError};
