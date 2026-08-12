@@ -1,0 +1,69 @@
+[package]
+name = "horde-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The agent-facing MCP endpoint: orchestrator verbs and permission prompting, one endpoint per Agent."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+
+# Pinned exactly. The audit (docs/research/mcp-2026-audit.md §3) recorded rmcp
+# going 3.0.0 -> 3.1.2 in eleven days, and the dual-era spike's findings —
+# `ProtocolVersion::LATEST` being 2025-11-25, the `legacy_session_mode`
+# consequences, the `allowed_origins` default — are all properties of 3.1.2
+# specifically. A caret range would let any of them change under us silently.
+rmcp = { version = "=3.1.2", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+
+# The endpoint reads per-request identity off the HTTP parts rmcp injects into
+# the request context, so the http types are part of this crate's own surface
+# rather than an implementation detail of the transport.
+http = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
+tower-service = "0.3"
+
+schemars = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1.44"
+
+# The provider-specific half of permission prompting. DESIGN §10 routes Claude's
+# `--permission-prompt-tool` through this endpoint, and the payload contract for
+# it — including the rule that an unmodified allow must echo the proposal back
+# rather than omit `updatedInput` — is already owned and tested by the adapter.
+# The arrow points this way deliberately: an integration crate depending on a
+# provider crate is layering; the reverse would be the smell.
+horde-adapter = { path = "../horde-adapter" }
+horde-adapter-claude = { path = "../horde-adapter-claude" }
+horde-cli = { path = "../horde-cli" }
+horde-proto = { path = "../horde-proto" }
+horde-wire = { path = "../horde-wire" }
+
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-stream = "0.1.19"
+tonic = { version = "0.14.6", features = ["channel"] }
+
+[dev-dependencies]
+# The tests drive this endpoint against a real ControlPlane over a real socket,
+# the shape horde-cli already uses. The dependency points one way only —
+# horde-server knows nothing about this crate — so there is no cycle.
+horde-server = { workspace = true }
+tempfile = { workspace = true }
+tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
