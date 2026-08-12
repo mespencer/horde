@@ -198,6 +198,22 @@ mod tests {
         map
     }
 
+    /// The fold accumulates differences with `|`. An accumulator that
+    /// cancelled — xor — would read two positions differing by the same bits
+    /// as equal, and `"ab"` against `"ba"` is exactly that pair: both
+    /// positions differ by `'a' ^ 'b'`, so a cancelling fold comes out zero.
+    #[test]
+    fn differences_must_not_cancel_each_other_out() {
+        assert!(
+            !super::constant_time_eq(b"ab", b"ba"),
+            "two differences that xor to nothing are still two differences"
+        );
+        assert!(
+            super::constant_time_eq(b"ab", b"ab"),
+            "the positive control: identical bytes still compare equal"
+        );
+    }
+
     /// The shape the spike recorded off the wire from Claude Code 2.1.228.
     #[test]
     fn the_recorded_header_pair_authenticates() {

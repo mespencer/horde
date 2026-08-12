@@ -263,7 +263,7 @@ fn decision_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{decision_for, rendered};
+    use super::{as_struct, decision_for, rendered, requested};
     use serde_json::json;
 
     fn prompt(
@@ -276,6 +276,44 @@ mod tests {
             "tool_use_id": "toolu_01",
         }))
         .expect("the prompt shape must parse")
+    }
+
+    /// The escalation is attributed to the authenticated caller. An event
+    /// without the agent id is one the approver reads no tree path for — and
+    /// it is exactly what dropping the field produces.
+    #[test]
+    fn the_escalation_names_the_authenticated_agent() {
+        let event = requested(
+            &crate::testing::identity("agent-42"),
+            &prompt("Write", json!({"file_path": "/x"})),
+            "toolu_01",
+        );
+        let request = event.request.expect("the escalation carries its request");
+        assert_eq!(
+            request.agent_id.as_ref().map(ToString::to_string),
+            Some("agent-42".to_owned()),
+            "the identity's agent id must ride the event"
+        );
+    }
+
+    /// An object proposal reaches the approver as its own fields.
+    #[test]
+    fn an_object_proposal_rides_as_its_fields() {
+        let fields = as_struct(&json!({"file_path": "/etc/hosts"}))
+            .expect("an object proposal must convert")
+            .fields;
+        assert!(
+            fields.contains_key("file_path"),
+            "the proposal's own keys must survive the conversion"
+        );
+    }
+
+    /// A non-object proposal is dropped, not smuggled in as an empty bag: the
+    /// approver still gets the tool name and the rendering, but no fields that
+    /// were never fields.
+    #[test]
+    fn a_non_object_proposal_is_not_smuggled_in_as_fields() {
+        assert_eq!(as_struct(&json!("rm -rf /")), None);
     }
 
     fn decided(request_id: &str) -> horde_proto::v1::EventEnvelope {

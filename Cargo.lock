@@ -633,6 +633,7 @@ dependencies = [
  "horde-server-testkit",
  "horde-wire",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "rmcp",

@@ -388,3 +388,45 @@ async fn json_rendering_of_a_real_session_parses() {
     assert_eq!(parsed["state"], "active");
     assert_eq!(parsed["agent_count"], 1);
 }
+
+/// The two-step subscribe-before-write shape, positively: a stream opened
+/// before the write hands back the event the write produced. A `next_matching`
+/// that answered `None` without reading would pass every test that only waits
+/// — this one asserts on what was handed back.
+#[tokio::test]
+async fn a_follow_stream_hands_back_the_matching_event() {
+    let endpoint = common::serve().await.expect("a server must start");
+    let (mut writer, session_id, root) = common::seeded(&endpoint, "follow")
+        .await
+        .expect("a session must be creatable");
+
+    let mut watcher = Client::connect(&endpoint)
+        .await
+        .expect("a second client connects");
+    let mut stream = watcher
+        .follow(&SyncOptions::new(session_id))
+        .await
+        .expect("the subscription opens");
+
+    writer
+        .send_note(&root, "the needle", DeliveryMode::TurnBoundary, "")
+        .await
+        .expect("the note sends");
+
+    let found = stream
+        .next_matching(|envelope| {
+            let horde_proto::v1::event::Kind::NoteSent(sent) =
+                envelope.event.as_ref()?.kind.as_ref()?
+            else {
+                return None;
+            };
+            sent.note.as_ref().map(|note| note.text.clone())
+        })
+        .await
+        .expect("the stream must not fail");
+    assert_eq!(
+        found.as_deref(),
+        Some("the needle"),
+        "the matched value is handed back, not merely consumed"
+    );
+}

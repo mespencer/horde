@@ -65,6 +65,11 @@ tonic = { version = "0.14.6", features = ["channel"] }
 # `horde-server`'s own suites. The dependency points one way only —
 # horde-server knows nothing about this crate — so there is no cycle.
 horde-server-testkit = { workspace = true }
+# The HTTP round-trip tests speak a legacy-era JSON-RPC POST at the served
+# endpoint themselves, which needs the client half of hyper and a collector
+# for the answer's body.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client"] }
 tempfile = { workspace = true }
 # `process` is for the live smoke test, which spawns a real `claude`. Declared
 # here rather than relied on from workspace feature unification: this crate must

@@ -412,6 +412,27 @@ mod tests {
         ))
     }
 
+    /// `internal` must keep both the code and the cause. A default-constructed
+    /// `ErrorData` reports neither, and a failure that reaches the harness as
+    /// a blank error is one nobody can diagnose from the harness side.
+    #[test]
+    fn internal_keeps_the_code_and_the_cause() {
+        let error = super::internal("the journal is gone");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.message, "the journal is gone");
+    }
+
+    /// The Debug rendering names the type and shows the context. A `fmt` that
+    /// writes nothing turns every log line carrying an endpoint into silence.
+    #[tokio::test]
+    async fn debug_names_the_endpoint_rather_than_hiding_it() {
+        let rendered = format!("{:?}", endpoint());
+        assert!(
+            rendered.contains("HordeEndpoint"),
+            "the Debug form must say what it is; got {rendered:?}"
+        );
+    }
+
     /// The endpoint must advertise the legacy revision deliberately. A modern
     /// -only endpoint would ship zero tools to every agent Horde can drive,
     /// silently and with no error event.
@@ -437,12 +458,7 @@ mod tests {
     /// pointed at `approve` by name, and renaming a verb silently breaks every
     /// prompt that mentions it.
     fn identity() -> AgentIdentity {
-        let mut registry = crate::identity::AgentRegistry::new();
-        registry.insert("agent-42", "token");
-        let mut headers = http::HeaderMap::new();
-        headers.insert("authorization", "Bearer token".parse().expect("header"));
-        headers.insert("x-horde-agent", "agent-42".parse().expect("header"));
-        registry.authenticate(&headers).expect("authenticates")
+        crate::testing::identity("agent-42")
     }
 
     /// A status the agent invented is refused before anything is written.

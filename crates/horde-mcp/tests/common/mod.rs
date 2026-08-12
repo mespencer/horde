@@ -127,6 +127,26 @@ pub async fn harness() -> Setup<Harness> {
     })
 }
 
+/// The request id of a `PermissionRequested` envelope, if that is what it is.
+///
+/// The matcher every suite that answers an escalation hands to
+/// `next_matching`: the HTTP round trip and the live smoke both watch the log
+/// for the request they are about to decide.
+#[must_use]
+pub fn escalation_request_id(envelope: &horde_proto::v1::EventEnvelope) -> Option<String> {
+    let horde_proto::v1::event::Kind::PermissionRequested(requested) =
+        envelope.event.as_ref()?.kind.as_ref()?
+    else {
+        return None;
+    };
+    requested
+        .request
+        .as_ref()?
+        .request_id
+        .as_ref()
+        .map(ToString::to_string)
+}
+
 /// An authenticated identity for `agent_id`.
 ///
 /// Built through the real [`AgentRegistry`] rather than constructed directly —

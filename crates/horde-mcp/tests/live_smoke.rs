@@ -52,19 +52,8 @@ async fn answer_first_escalation(endpoint: &str, session_id: &str) -> Setup<Stri
 
     let request_id = stream
         .next_matching(|envelope| {
-            let horde_proto::v1::event::Kind::PermissionRequested(requested) =
-                envelope.event.as_ref()?.kind.as_ref()?
-            else {
-                return None;
-            };
-            let request = requested.request.as_ref()?;
-            let id = request.request_id.as_ref().map(ToString::to_string)?;
-            let rendered = request
-                .tool_call
-                .as_ref()
-                .map(|call| call.rendered.clone())
-                .unwrap_or_default();
-            eprintln!("SMOKE escalation raised: {id} — {rendered}");
+            let id = common::escalation_request_id(envelope)?;
+            eprintln!("SMOKE escalation raised: {id}");
             Some(id)
         })
         .await?

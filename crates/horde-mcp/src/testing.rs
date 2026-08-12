@@ -38,3 +38,21 @@ pub(crate) fn envelope_without_event(agent: &str) -> EventEnvelope {
         ..envelope(agent, Kind::TurnInterrupted(Default::default()))
     }
 }
+
+/// An identity for `agent_id`, minted the only way one can be: through the
+/// registry.
+///
+/// `AgentIdentity` has no public constructor precisely so that holding one is
+/// proof a token matched, so the tests go through the same door production
+/// does.
+pub(crate) fn identity(agent_id: &str) -> crate::identity::AgentIdentity {
+    let mut registry = crate::identity::AgentRegistry::new();
+    registry.insert(agent_id, "token");
+    let mut headers = http::HeaderMap::new();
+    headers.insert("authorization", "Bearer token".parse().expect("header"));
+    headers.insert(
+        "x-horde-agent",
+        agent_id.parse().expect("agent ids are header-safe"),
+    );
+    registry.authenticate(&headers).expect("authenticates")
+}
