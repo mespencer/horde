@@ -86,6 +86,60 @@ impl EndpointConfig {
     }
 }
 
+/// Serves one endpoint until the returned handle is dropped.
+///
+/// Returns the address actually bound, which is what a caller passes to the
+/// harness — a config with port 0 is resolved by the OS, and guessing at it
+/// afterwards is how two agents end up pointed at one endpoint.
+///
+/// # Errors
+///
+/// The bind failing, which is almost always the port already being held.
+pub async fn serve(
+    config: &EndpointConfig,
+    registry: std::sync::Arc<AgentRegistry>,
+    endpoint: crate::endpoint::HordeEndpoint,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    let service = StreamableHttpService::new(
+        move || Ok(endpoint.clone()),
+        std::sync::Arc::new(LocalSessionManager::default()),
+        config.transport(),
+    );
+    // The identity gate goes in front of rmcp, not inside a tool: under
+    // `legacy_session_mode` a client issues `initialize`, `tools/list`, and
+    // `GET /mcp` before any tool runs, and every one of those must be
+    // attributable.
+    let guarded = RequireIdentity::new(service, registry);
+
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let bound = listener.local_addr()?;
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let guarded = guarded.clone();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        hyper_util::rt::TokioIo::new(stream),
+                        hyper_util::service::TowerToHyperService::new(guarded),
+                    )
+                    // Legacy clients open a GET/SSE stream on this connection.
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+
+    Ok((bound, handle))
+}
+
 /// Rejects any request that does not carry a valid Agent identity.
 ///
 /// A tower layer rather than a check inside each tool, because the thing being
