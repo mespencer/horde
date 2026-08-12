@@ -13,10 +13,25 @@ workspace = true
 async-trait = { workspace = true }
 horde-adapter = { workspace = true }
 horde-adapter-claude = { workspace = true }
+horde-proto = { workspace = true }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1.19"
+tonic = { version = "0.14.6", features = ["channel"] }
+tracing = "0.1.44"
 
 [dev-dependencies]
+horde-adapter-fake = { workspace = true }
+# The dial tests run the real server over a real socket. The dependency points
+# this way only — horde-server knows nothing about the worker — so there is no
+# cycle, and it is the shape horde-cli already uses to test its client against a
+# server it stands up itself.
+horde-server = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
 
 # The stub harness is a real binary the process tests spawn, so supervision is
 # exercised over real stdio rather than simulated.
