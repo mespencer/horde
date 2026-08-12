@@ -330,6 +330,33 @@ mod tests {
         }
     }
 
+    /// Every channel's key code, pinned as distinct and stable.
+    ///
+    /// The codes are identity, not display: two channels sharing a code would
+    /// collide keys for the same turn and index (the server would silently
+    /// drop one chunk as a duplicate), and a changed code re-keys events a
+    /// journal already holds.
+    #[test]
+    fn channel_key_codes_are_distinct_and_stable() {
+        let codes: Vec<&str> = [
+            (OutputChannel::Assistant, "assistant"),
+            (OutputChannel::Reasoning, "reasoning"),
+            (OutputChannel::ToolCall, "tool-call"),
+            (OutputChannel::ToolResult, "tool-result"),
+            (OutputChannel::HarnessDiagnostic, "diagnostic"),
+        ]
+        .into_iter()
+        .map(|(channel, expected)| {
+            let code = super::channel_code(channel);
+            assert_eq!(code, expected, "{channel:?} must keep its stored code");
+            code
+        })
+        .collect();
+
+        let deduplicated: std::collections::BTreeSet<&str> = codes.iter().copied().collect();
+        assert_eq!(deduplicated.len(), codes.len(), "no two channels may share");
+    }
+
     #[test]
     fn output_chunks_key_by_turn_channel_and_index() {
         let chunk = |channel, index| AgentEvent::Output {

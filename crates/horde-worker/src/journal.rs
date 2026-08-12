@@ -559,10 +559,13 @@ fn mint_identity() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_nanos())
         .unwrap_or_default();
-    let pid = u128::from(std::process::id());
-    #[allow(clippy::cast_possible_truncation)] // masked below u64 range anyway
-    let mixed = (nanos ^ (pid << 96)) as u64;
-    mixed & (i64::MAX as u64)
+    #[allow(clippy::cast_possible_truncation)] // uniqueness needs only the low bits
+    let time = nanos as u64;
+    // The pid lands in the middle bits, where it survives the cast — two
+    // journals created in the same instant by different processes still
+    // differ.
+    let pid = u64::from(std::process::id());
+    (time ^ (pid << 32)) & (i64::MAX as u64)
 }
 
 /// When the journal observed an event, as a protobuf timestamp.

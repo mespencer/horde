@@ -219,7 +219,7 @@ impl Connection {
         let mut head = journal.watch_head();
         loop {
             let events = journal.read_from(cursor, PAGE).await?;
-            let Some(last) = events.last() else {
+            if events.is_empty() {
                 // Nothing owed: park until the journal moves. A closed watch
                 // means the journal's last handle is gone — the Worker is
                 // shutting down, and an empty journal is fully delivered.
@@ -227,8 +227,7 @@ impl Connection {
                     return Ok(());
                 }
                 continue;
-            };
-            let after_batch = last.journal_sequence.saturating_add(1);
+            }
 
             let batch = PushEventsRequest {
                 body: Some(push_events_request::Body::Batch(JournaledEventBatch {
@@ -247,10 +246,15 @@ impl Connection {
                 Some(PushEventsResponse {
                     body: Some(push_events_response::Body::Ack(ack)),
                 }) => {
-                    journal
-                        .truncate_below(ack.acked_journal_sequence.saturating_add(1))
-                        .await?;
-                    cursor = after_batch;
+                    // Both the truncation and the cursor follow the *ack*,
+                    // never the batch: the server's word on what is durably
+                    // stored is the only justification for either. A cursor
+                    // that drifted below the floor this truncation sets would
+                    // fail the next read loudly (TruncatedPast) instead of
+                    // silently re-sending forever.
+                    let resume = ack.acked_journal_sequence.saturating_add(1);
+                    journal.truncate_below(resume).await?;
+                    cursor = resume;
                 }
                 Some(_) => return Err(WorkerError::Incomplete("journal ack")),
                 None => return Ok(()),

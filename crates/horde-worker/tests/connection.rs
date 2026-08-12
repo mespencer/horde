@@ -349,6 +349,11 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
         // The ack came back and the journal truncated on it.
         harness::journal_truncated_to(&journal, 5).await;
 
+        // A fully synced worker parks; a finished run task means a pump or
+        // cursor defect errored out quietly — the kind of mutant that
+        // otherwise passes every functional assertion while spinning.
+        assert!(!run.is_finished(), "the synced connection must stay parked");
+
         // Crash: no shutdown, no goodbye. The journal file is what survives.
         run.abort();
     }
@@ -418,6 +423,10 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
         .count();
     assert_eq!(agent_1_starts, 1, "a restart must not respawn applied work");
 
+    assert!(
+        !run.is_finished(),
+        "the reconciled connection must stay parked, not die quietly"
+    );
     run.abort();
 }
 
@@ -497,6 +506,10 @@ async fn a_partitioned_worker_journals_locally_and_reconciles_on_reconnect() {
 
     // And the journal was told: the ack truncates through the healed link.
     harness::journal_truncated_to(&journal, 4).await;
+    assert!(
+        !run.is_finished(),
+        "the reconciled connection must stay parked, not die quietly"
+    );
     run.abort();
 }
 
