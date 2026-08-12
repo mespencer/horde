@@ -654,6 +654,31 @@ and `should_stop` in `service/worker.rs`. Reaching for a harness clever enough t
 force the unreachable state is the wrong repair; the condition being hard to
 reach *is* the design feedback.
 
+**A write that is acked but discarded is the worst failure shape there is —
+spend an error on it.** The permission and result verbs both key their events
+with an idempotency key, and the log deduplicates on `(session_id,
+idempotency_key)`. That check originally ignored the event *kind*, so a key
+already used by any other event in the session made the new event a duplicate:
+the write was acked, the call returned `Ok`, and nothing reached the log. The
+symptom then appeared in a completely different component — `wait_for_agent`
+blocking forever on a result that had been silently swallowed — with nothing
+connecting the hang to the write that caused it. Diagnosing it once meant
+dumping every event in the session and noticing an `agent_spawned` sitting where
+a `result_reported` should have been.
+
+The repair is `service::shared::refuse_kind_collision`: an exact-kind hit still
+deduplicates silently, because at-least-once delivery depends on that, but a hit
+whose kind differs is refused with both kinds and the key in the message. Every
+legitimate retry replays the same kind, so a kind mismatch is *always* a
+collision and never a retry.
+
+The general rule is worth more than the specific fix. When a write path can
+discard its input and still answer success, the resulting bug has no local
+symptom, cannot be found from the failing component, and survives every test
+that does not happen to read back what it wrote. Prefer an error at the write —
+even a noisy one, even one that costs a caller a rename — over a silence that
+someone else will pay for later, somewhere else, with no thread back to here.
+
 ## Adding a gate
 
 1. **Write the gate.** One module under `crates/horde-gauntlet/src/gates/`. Split it into

@@ -93,6 +93,16 @@ impl ControlPlane {
                 payload: event.encode_to_vec(),
             })
             .await?;
+
+        // A deduplication that swallowed a different kind of event is a key
+        // collision, not a retry, and the caller has to hear about it.
+        crate::service::shared::refuse_kind_collision(
+            &appended,
+            session_id,
+            idempotency_key,
+            &event,
+        )?;
+
         Ok(appended.sequence)
     }
 

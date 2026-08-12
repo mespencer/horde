@@ -82,15 +82,26 @@ async fn ingest_batch(
             ServerError::Invalid("a journaled event must carry an event".to_owned())
         })?;
 
-        core.log
+        let appended = core
+            .log
             .append(PendingEvent {
-                session_id,
+                session_id: session_id.clone(),
                 origin_worker_id: worker_id.to_owned(),
                 journal_sequence: Some(journaled.journal_sequence),
                 idempotency_key: event.idempotency_key.clone(),
                 payload: event.encode_to_vec(),
             })
             .await?;
+
+        // A journal replay is at-least-once and deduplicates silently, as it
+        // should. Two *different* events under one key is a different thing
+        // entirely, and would otherwise vanish here.
+        crate::service::shared::refuse_kind_collision(
+            &appended,
+            &session_id,
+            &event.idempotency_key,
+            &event,
+        )?;
 
         highest = highest.max(journaled.journal_sequence);
     }

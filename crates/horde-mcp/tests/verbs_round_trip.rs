@@ -180,6 +180,44 @@ async fn assignments_and_notes_both_land_and_report_where() -> Setup<()> {
     Ok(())
 }
 
+/// The regression test for the bug this crate's tests found the hard way.
+///
+/// `harness()` seeds its session with idempotency key `key-1`. Reusing that key
+/// for a result used to make the result a duplicate of the session's
+/// `agent_spawned` — acked, returned `Ok`, and silently absent from the log, so
+/// the wait in the tests above hung with no error anywhere to explain it.
+///
+/// It is now refused at the write, which is the whole point: the complaint
+/// arrives at the caller that caused it rather than as a hang in a reader
+/// nobody has connected to it yet.
+#[tokio::test]
+async fn reusing_another_events_idempotency_key_is_refused_rather_than_swallowed() -> Setup<()> {
+    let harness = harness().await?;
+    let identity = identity_for(&harness.agent_id)?;
+
+    let verbs = Verbs::new(
+        harness.journal(),
+        harness.client().await?,
+        harness.session_id.clone(),
+    );
+
+    let error = verbs
+        .report_result(&identity, ResultStatus::Success, "done", "key-1")
+        .await
+        .expect_err("key-1 already belongs to this session's agent_spawned");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("agent_spawned") && rendered.contains("result_reported"),
+        "the message must name both kinds so the collision is obvious: {rendered}"
+    );
+    assert!(
+        rendered.contains("key-1"),
+        "the message must name the key: {rendered}"
+    );
+    Ok(())
+}
+
 /// An unwritable journal must surface rather than look like a reported result.
 #[tokio::test]
 async fn a_result_that_cannot_be_recorded_is_an_error() -> Setup<()> {
