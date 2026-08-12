@@ -157,4 +157,18 @@ mod tests {
             "the platform is auto-detected, so it is always real"
         );
     }
+
+    /// The advertised platform is this machine's, through the vocabulary
+    /// mapping — a defaulted (empty) platform would have the scheduler
+    /// matching placement constraints against a machine that runs nothing.
+    #[test]
+    fn the_platform_reports_this_machines_facts() {
+        let platform = advertise([]).platform.expect("a platform");
+        assert_eq!(platform.os, goos(std::env::consts::OS));
+        assert_eq!(platform.arch, goarch(std::env::consts::ARCH));
+        assert!(
+            !platform.os.is_empty() && !platform.arch.is_empty(),
+            "an empty fact is not auto-detection"
+        );
+    }
 }

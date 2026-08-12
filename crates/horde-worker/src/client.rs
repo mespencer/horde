@@ -203,11 +203,8 @@ impl Connection {
             .await?
             .into_inner();
 
-        let accepted = match inbound.message().await? {
-            Some(PushEventsResponse {
-                body: Some(push_events_response::Body::Accepted(accepted)),
-            }) => accepted,
-            _ => return Err(WorkerError::Incomplete("accepted resume position")),
+        let PushReply::Accepted(accepted) = next_reply(&mut inbound).await? else {
+            return Err(WorkerError::Incomplete("accepted resume position"));
         };
 
         // Everything below the resume point is durably stored server-side.
@@ -242,10 +239,8 @@ impl Connection {
                 // below reports the reason, which is more than "send failed".
             }
 
-            match inbound.message().await? {
-                Some(PushEventsResponse {
-                    body: Some(push_events_response::Body::Ack(ack)),
-                }) => {
+            match next_reply(&mut inbound).await? {
+                PushReply::Ack(ack) => {
                     // Both the truncation and the cursor follow the *ack*,
                     // never the batch: the server's word on what is durably
                     // stored is the only justification for either. A cursor
@@ -256,10 +251,38 @@ impl Connection {
                     journal.truncate_below(resume).await?;
                     cursor = resume;
                 }
-                Some(_) => return Err(WorkerError::Incomplete("journal ack")),
-                None => return Ok(()),
+                PushReply::Accepted(_) => return Err(WorkerError::Incomplete("journal ack")),
+                PushReply::Ended => return Ok(()),
             }
         }
+    }
+}
+
+/// One reply on the push stream, seen through the protocol's eyes.
+///
+/// The wire allows any body in any position; the pump does not. Naming the
+/// three shapes here keeps the pump's loop about *ordering* (an ack answers a
+/// batch, an acceptance answers a start) while this stays about decoding.
+enum PushReply {
+    Accepted(horde_proto::v1::PushEventsAccepted),
+    Ack(horde_proto::v1::JournalAck),
+    /// The Server closed the stream.
+    Ended,
+}
+
+/// Reads the next reply from the Server's half of the push stream.
+async fn next_reply(
+    inbound: &mut tonic::Streaming<PushEventsResponse>,
+) -> Result<PushReply, WorkerError> {
+    match inbound.message().await? {
+        Some(PushEventsResponse {
+            body: Some(push_events_response::Body::Accepted(accepted)),
+        }) => Ok(PushReply::Accepted(accepted)),
+        Some(PushEventsResponse {
+            body: Some(push_events_response::Body::Ack(ack)),
+        }) => Ok(PushReply::Ack(ack)),
+        Some(PushEventsResponse { body: None }) => Err(WorkerError::Incomplete("push reply body")),
+        None => Ok(PushReply::Ended),
     }
 }
 

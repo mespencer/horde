@@ -162,22 +162,28 @@ impl Runtime {
         self.agents.len()
     }
 
-    /// Ends every agent and waits for their pumps to finish.
+    /// Ends every agent and waits for their pumps to finish, returning how
+    /// many pumps were reaped (running and retired alike).
     ///
     /// Bounded by structure: dropping the control senders ends each pump's
-    /// loop, and each shutdown is a kill-by-handle, not a wait-for-exit.
-    pub async fn shutdown(mut self) {
+    /// loop, and each shutdown is a kill-by-handle, not a wait-for-exit. The
+    /// count is returned rather than logged because "shutdown finished" and
+    /// "shutdown actually reaped the agents" are different facts, and only the
+    /// second one is evidence.
+    pub async fn shutdown(mut self) -> usize {
         let handles: Vec<AgentHandle> = std::mem::take(&mut self.agents).into_values().collect();
         let mut tasks = std::mem::take(&mut self.retired);
         for handle in handles {
             drop(handle.control);
             tasks.push(handle.task);
         }
+        let reaped = tasks.len();
         for task in tasks {
             if let Err(error) = task.await {
                 tracing::warn!(%error, "an agent pump ended abnormally during shutdown");
             }
         }
+        reaped
     }
 
     /// Executes one command kind, deciding its effects and follow-up.
@@ -632,70 +638,111 @@ async fn pump(
             Step::Control(control.recv().await)
         };
 
-        match step {
-            // The Runtime dropped this agent (archive, cancel, shutdown).
-            Step::Control(None) | Step::Control(Some(AgentControl::Archive)) => {
+        let flow = match step {
+            Step::Control(message) => {
+                apply_control(&mut session, &journal, &context, state, message).await
+            }
+            Step::Event(event) => apply_event(&mut session, &journal, &context, event).await,
+        };
+        match flow {
+            Flow::Continue(next) => state = next,
+            Flow::Stop => return,
+        }
+    }
+}
+
+/// What the pump does after handling one step.
+enum Flow {
+    Continue(PumpState),
+    Stop,
+}
+
+/// Obeys one control message.
+async fn apply_control(
+    session: &mut Box<dyn AgentSession>,
+    journal: &Journal,
+    context: &AgentContext,
+    state: PumpState,
+    message: Option<AgentControl>,
+) -> Flow {
+    match message {
+        // The Runtime dropped this agent (archive, cancel, shutdown).
+        None | Some(AgentControl::Archive) => {
+            let _ = session.shutdown().await;
+            Flow::Stop
+        }
+        Some(AgentControl::Deliver(input)) => match session.send(input).await {
+            Ok(()) => Flow::Continue(PumpState::Streaming),
+            Err(error) => {
+                record_failure(journal, context, &error.to_string()).await;
                 let _ = session.shutdown().await;
-                return;
+                Flow::Stop
             }
-            Step::Control(Some(AgentControl::Deliver(input))) => match session.send(input).await {
-                Ok(()) => state = PumpState::Streaming,
-                Err(error) => {
-                    record_failure(&journal, &context, &error.to_string()).await;
-                    let _ = session.shutdown().await;
-                    return;
-                }
-            },
-            Step::Control(Some(AgentControl::Answer {
-                tool_call_id,
-                decision,
-            })) => match session.answer_permission(&tool_call_id, decision).await {
-                Ok(()) => state = PumpState::Streaming,
-                Err(error) => {
-                    // A decision for a call that is not waiting (raced with an
-                    // interrupt, or duplicated). The agent is not broken;
-                    // saying so in the log is the whole handling.
-                    tracing::warn!(agent_id = %context.agent_id, %error, "permission answer went nowhere");
-                }
-            },
-            Step::Control(Some(AgentControl::Interrupt)) => {
-                if let Err(error) = session.interrupt().await {
-                    tracing::warn!(agent_id = %context.agent_id, %error, "interrupt failed");
-                }
-                // The interrupted turn still closes with TurnEnded, which
-                // arrives as an ordinary event.
+        },
+        Some(AgentControl::Answer {
+            tool_call_id,
+            decision,
+        }) => match session.answer_permission(&tool_call_id, decision).await {
+            Ok(()) => Flow::Continue(PumpState::Streaming),
+            Err(error) => {
+                // A decision for a call that is not waiting (raced with an
+                // interrupt, or duplicated). The agent is not broken; saying
+                // so in the log is the whole handling.
+                tracing::warn!(agent_id = %context.agent_id, %error, "permission answer went nowhere");
+                Flow::Continue(state)
             }
-            Step::Event(Ok(Some(event))) => {
-                state = state_after(&event);
-                match journal_entries(&context, &event) {
-                    Ok(entries) => {
-                        for entry in entries {
-                            if let Err(error) = journal.record(entry).await {
-                                // A journal that cannot append has lost the
-                                // partition-survival property; running an
-                                // agent whose evidence is being dropped is
-                                // worse than stopping it.
-                                tracing::error!(agent_id = %context.agent_id, %error, "journal append failed; stopping the agent");
-                                let _ = session.shutdown().await;
-                                return;
-                            }
+        },
+        Some(AgentControl::Interrupt) => {
+            if let Err(error) = session.interrupt().await {
+                tracing::warn!(agent_id = %context.agent_id, %error, "interrupt failed");
+            }
+            // The interrupted turn still closes with TurnEnded, which arrives
+            // as an ordinary event.
+            Flow::Continue(state)
+        }
+    }
+}
+
+/// Journals one session event, or the session's end.
+async fn apply_event(
+    session: &mut Box<dyn AgentSession>,
+    journal: &Journal,
+    context: &AgentContext,
+    event: Result<Option<AgentEvent>, horde_adapter::AdapterError>,
+) -> Flow {
+    match event {
+        Ok(Some(event)) => {
+            let next = state_after(&event);
+            match journal_entries(context, &event) {
+                Ok(entries) => {
+                    for entry in entries {
+                        if let Err(error) = journal.record(entry).await {
+                            // A journal that cannot append has lost the
+                            // partition-survival property; running an agent
+                            // whose evidence is being dropped is worse than
+                            // stopping it.
+                            tracing::error!(agent_id = %context.agent_id, %error, "journal append failed; stopping the agent");
+                            let _ = session.shutdown().await;
+                            return Flow::Stop;
                         }
                     }
-                    Err(error) => {
-                        tracing::error!(agent_id = %context.agent_id, %error, "an event could not be translated and was not journaled");
-                    }
+                    Flow::Continue(next)
+                }
+                Err(error) => {
+                    tracing::error!(agent_id = %context.agent_id, %error, "an event could not be translated and was not journaled");
+                    Flow::Continue(next)
                 }
             }
-            Step::Event(Ok(None)) => {
-                // EOF mid-conversation: the harness is gone.
-                record_failure(&journal, &context, "the harness ended its event stream").await;
-                return;
-            }
-            Step::Event(Err(error)) => {
-                record_failure(&journal, &context, &error.to_string()).await;
-                let _ = session.shutdown().await;
-                return;
-            }
+        }
+        Ok(None) => {
+            // EOF mid-conversation: the harness is gone.
+            record_failure(journal, context, "the harness ended its event stream").await;
+            Flow::Stop
+        }
+        Err(error) => {
+            record_failure(journal, context, &error.to_string()).await;
+            let _ = session.shutdown().await;
+            Flow::Stop
         }
     }
 }
@@ -735,9 +782,10 @@ mod tests {
     use horde_proto::prost_types::Struct;
     use horde_proto::v1::stream_commands_response::Command;
     use horde_proto::v1::{
-        AgentId, ArchiveAgentCommand, Assignment, DeliverPermissionDecisionCommand,
-        MaterializeWorkspaceCommand, PermissionOutcome, PermissionRequestId, SessionId,
-        SpawnAgentCommand, StreamCommandsResponse, event::Kind,
+        AgentId, ArchiveAgentCommand, Assignment, DeliverMessageCommand,
+        DeliverPermissionDecisionCommand, DeliveryMode, MaterializeWorkspaceCommand,
+        PermissionOutcome, PermissionRequestId, SessionId, SpawnAgentCommand,
+        StreamCommandsResponse, deliver_message_command, event::Kind,
     };
     use serde_json::json;
 
@@ -1043,6 +1091,315 @@ mod tests {
         assert!(archived, "the archive is an event like everything else");
         // Shutdown must complete even though the pump was already retired.
         runtime.shutdown().await;
+    }
+
+    fn deliver_command(
+        sequence: u64,
+        agent: &str,
+        body: deliver_message_command::Body,
+        delivery: DeliveryMode,
+    ) -> StreamCommandsResponse {
+        StreamCommandsResponse {
+            command_sequence: sequence,
+            command_id: format!("s1:{}", sequence + 200),
+            command: Some(Command::DeliverMessage(DeliverMessageCommand {
+                agent_id: Some(AgentId::new(agent)),
+                body: Some(body),
+                delivery: delivery.into(),
+            })),
+        }
+    }
+
+    /// The delivered text must reach the agent — the fake echoes it, and the
+    /// echo can only get back to the journal through the whole pump.
+    #[tokio::test]
+    async fn a_delivered_note_reaches_the_agent_and_its_echo_the_journal() {
+        let mut runtime = runtime_with(Script::echoing());
+        runtime
+            .apply(spawn_command(1, "agent-1", "first"))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&runtime, 4).await.len();
+
+        runtime
+            .apply(deliver_command(
+                2,
+                "agent-1",
+                deliver_message_command::Body::Note(horde_proto::v1::Note {
+                    text: "a mid-life note".to_owned(),
+                    payload: None,
+                }),
+                DeliveryMode::TurnBoundary,
+            ))
+            .await
+            .expect("the delivery applies");
+
+        let events = journal_at_least(&runtime, settled + 2).await;
+        let echoed = events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("a mid-life note")
+            )
+        });
+        assert!(
+            echoed,
+            "the note must reach the agent, not just the journal"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// The delivery mode is load-bearing: an interrupt-mode message toward a
+    /// provider that cannot interrupt must fail the agent loudly (the adapter
+    /// refuses it), never quietly downgrade to a queued delivery. This is the
+    /// observable difference between the Interrupt arm existing and not.
+    #[tokio::test]
+    async fn an_interrupt_delivery_is_refused_by_an_uninterruptible_provider() {
+        let adapter = FakeAdapter::new(Script::echoing())
+            .with_capabilities(Capabilities::none().with(Capability::PreAuthorizeToolCalls));
+        let mut runtime = Runtime::new(Journal::in_memory().expect("an in-memory journal"))
+            .with_adapter(Arc::new(adapter));
+
+        runtime
+            .apply(spawn_command(1, "agent-1", ""))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&runtime, 1).await.len();
+
+        runtime
+            .apply(deliver_command(
+                2,
+                "agent-1",
+                deliver_message_command::Body::Assignment(Assignment {
+                    assignment_id: None,
+                    text: "stop and do this".to_owned(),
+                    payload: None,
+                }),
+                DeliveryMode::Interrupt,
+            ))
+            .await
+            .expect("the command applies; the refusal is the agent's failure");
+
+        let events = journal_at_least(&runtime, settled + 1).await;
+        let refused = events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+                        && changed.reason.contains("does not support")
+            )
+        });
+        assert!(
+            refused,
+            "an interrupt the provider cannot honour must fail loudly, not \
+             quietly queue: {events:?}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// An interrupt command journals the interruption as its effect, with the
+    /// reason and the agent's session — the audit trail of who stopped what.
+    #[tokio::test]
+    async fn an_interrupt_command_journals_the_interruption() {
+        let mut runtime = runtime_with(Script::echoing());
+        runtime
+            .apply(spawn_command(1, "agent-1", "first"))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&runtime, 4).await.len();
+
+        runtime
+            .apply(StreamCommandsResponse {
+                command_sequence: 2,
+                command_id: "s1:300".to_owned(),
+                command: Some(Command::InterruptAgent(
+                    horde_proto::v1::InterruptAgentCommand {
+                        agent_id: Some(AgentId::new("agent-1")),
+                        reason: "the user pressed escape".to_owned(),
+                    },
+                )),
+            })
+            .await
+            .expect("the interrupt applies");
+
+        let events = journal_at_least(&runtime, settled + 1).await;
+        let interrupted = events.iter().find_map(|journaled| {
+            let event = journaled.event.as_ref()?;
+            match event.kind.as_ref()? {
+                Kind::TurnInterrupted(interrupted) => Some((
+                    interrupted.reason.clone(),
+                    journaled.session_id.as_ref().map(ToString::to_string),
+                )),
+                _ => None,
+            }
+        });
+        let (reason, session) = interrupted.expect("the interruption is journaled");
+        assert_eq!(reason, "the user pressed escape");
+        assert_eq!(
+            session.as_deref(),
+            Some("s1"),
+            "the effect lands in the agent's own session log"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A decision for a call nobody is waiting on is a race, not a crash: the
+    /// pump logs it and the agent lives on.
+    #[tokio::test]
+    async fn a_decision_for_no_outstanding_call_leaves_the_agent_alive() {
+        let mut runtime = runtime_with(Script::of(vec![ScriptedTurn::saying("hi")]));
+        runtime
+            .apply(spawn_command(1, "agent-1", "go"))
+            .await
+            .expect("the spawn applies");
+        journal_at_least(&runtime, 4).await;
+
+        runtime
+            .apply(decision_command(2, "agent-1", "no-such-call", None))
+            .await
+            .expect("a stray decision is not an error");
+
+        assert_eq!(runtime.running_agents(), 1, "the agent must survive");
+        assert_eq!(
+            runtime.shutdown().await,
+            1,
+            "and its pump is still reapable"
+        );
+    }
+
+    /// A dead harness fails the agent with a journaled reason — silence here
+    /// would leave a permanently hung agent that looks merely idle.
+    #[tokio::test]
+    async fn a_message_after_the_harness_died_fails_the_agent_loudly() {
+        let mut runtime =
+            runtime_with(Script::of(vec![ScriptedTurn::saying("hi")]).ending_after_the_script());
+        runtime
+            .apply(spawn_command(1, "agent-1", "go"))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&runtime, 4).await.len();
+
+        // The script is spent and the fake behaves as a dead harness; the
+        // next delivery must surface that, not hang.
+        runtime
+            .apply(deliver_command(
+                2,
+                "agent-1",
+                deliver_message_command::Body::Note(horde_proto::v1::Note {
+                    text: "anyone home?".to_owned(),
+                    payload: None,
+                }),
+                DeliveryMode::TurnBoundary,
+            ))
+            .await
+            .expect("the delivery applies; the death is the agent's failure");
+
+        let events = journal_at_least(&runtime, settled + 1).await;
+        let failed = events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+            )
+        });
+        assert!(
+            failed,
+            "a dead harness must be journaled, not hidden: {events:?}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// The registered adapters flow into the advertisement — an empty
+    /// iterator here would advertise a worker no harness can run on.
+    #[tokio::test]
+    async fn the_registered_adapters_are_what_the_advertisement_sees() {
+        let runtime = runtime_with(Script::echoing());
+        let advertised = crate::capabilities::advertise(runtime.adapters());
+        assert_eq!(advertised.harnesses.len(), 1);
+        assert_eq!(advertised.harnesses[0].provider, "fake");
+    }
+
+    /// Shutdown reports how many pumps it reaped — with two agents running,
+    /// anything but two means an agent leaked past its shutdown.
+    #[tokio::test]
+    async fn shutdown_reaps_every_running_agent() {
+        let mut runtime = runtime_with(Script::echoing());
+        runtime
+            .apply(spawn_command(1, "agent-1", "one"))
+            .await
+            .expect("the first spawn applies");
+        runtime
+            .apply(spawn_command(2, "agent-2", "two"))
+            .await
+            .expect("the second spawn applies");
+
+        assert_eq!(runtime.running_agents(), 2);
+        assert_eq!(
+            runtime.shutdown().await,
+            2,
+            "both pumps must be waited for, or an agent outlives its worker"
+        );
+    }
+
+    /// `Debug` on a runtime is what an operator reads when a worker looks
+    /// wedged: which adapters it holds and which agents it is running are the
+    /// two facts that diagnose it — same precedent as the server's views.
+    #[tokio::test]
+    async fn the_debug_view_names_the_adapters_and_the_agents() {
+        let mut runtime = runtime_with(Script::echoing());
+        runtime
+            .apply(spawn_command(1, "agent-1", "go"))
+            .await
+            .expect("the spawn applies");
+
+        let view = format!("{runtime:?}");
+        assert!(view.contains("Runtime"), "got {view}");
+        assert!(
+            view.contains("fake"),
+            "the adapters are half the diagnosis: {view}"
+        );
+        assert!(
+            view.contains("agent-1"),
+            "the agents are the other half: {view}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// The wire spawn maps onto the adapter spec field by field; a defaulted
+    /// spec would run every agent on the default model under the ambient
+    /// account with no overlay, silently.
+    #[test]
+    fn the_domain_spec_carries_binding_model_account_and_overlay() {
+        let spawn = SpawnAgentCommand {
+            binding: Some(horde_proto::v1::ModelBinding {
+                tier: String::new(),
+                provider: "fake".to_owned(),
+                model: "fake-deep".to_owned(),
+                provider_account: "work".to_owned(),
+            }),
+            prompt_overlay: "be brief".to_owned(),
+            ..SpawnAgentCommand::default()
+        };
+
+        let spec = super::domain_spec(&spawn);
+        assert_eq!(spec.model.as_deref(), Some("fake-deep"));
+        assert_eq!(
+            spec.account,
+            Some(horde_adapter::ProviderAccount::new("work"))
+        );
+        assert_eq!(spec.append_system_prompt.as_deref(), Some("be brief"));
+    }
+
+    /// The empty-string cases are decisions, not accidents: an empty model or
+    /// account means "the harness's default", and protobuf cannot say `None`.
+    #[test]
+    fn empty_wire_strings_mean_absent_not_empty() {
+        let spec = super::domain_spec(&SpawnAgentCommand::default());
+        assert_eq!(spec.model, None, "no binding is not an empty model name");
+        assert_eq!(spec.account, None, "no account is the ambient default");
+        assert_eq!(
+            spec.append_system_prompt, None,
+            "no overlay is no flag at all, not an empty one"
+        );
     }
 
     /// This Worker never advertised workspace support, so the command means

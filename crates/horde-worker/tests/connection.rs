@@ -586,9 +586,14 @@ async fn the_proxy_severs_on_cut_and_carries_again_on_heal() {
     let proxy = harness::SeverableProxy::front(&upstream).await;
     let config = harness::bare_config(&proxy.endpoint(), "worker-a");
 
-    Connection::dial(&config)
+    let (connection, _) = Connection::dial(&config)
         .await
         .expect("an intact proxy carries the dial");
+    assert_eq!(
+        connection.worker_id(),
+        "worker-a",
+        "the registered identity is the one every stream will claim"
+    );
 
     proxy.cut();
     let severed = Connection::dial(&config).await;

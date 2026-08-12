@@ -559,13 +559,18 @@ fn mint_identity() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_nanos())
         .unwrap_or_default();
+    mix_identity(nanos, std::process::id())
+}
+
+/// The arithmetic under [`mint_identity`], pure so known inputs can pin it.
+///
+/// The pid lands in the middle bits, where it survives the cast — two
+/// journals created in the same instant by different processes still differ —
+/// and the top bit is masked off because SQLite stores INTEGER as i64.
+fn mix_identity(nanos: u128, pid: u32) -> u64 {
     #[allow(clippy::cast_possible_truncation)] // uniqueness needs only the low bits
     let time = nanos as u64;
-    // The pid lands in the middle bits, where it survives the cast — two
-    // journals created in the same instant by different processes still
-    // differ.
-    let pid = u64::from(std::process::id());
-    (time ^ (pid << 32)) & (i64::MAX as u64)
+    (time ^ (u64::from(pid) << 32)) & (i64::MAX as u64)
 }
 
 /// When the journal observed an event, as a protobuf timestamp.
@@ -653,9 +658,10 @@ mod tests {
             event.agent_id.as_ref().map(ToString::to_string),
             Some("agent-1".to_owned())
         );
+        let occurred_at = event.occurred_at.as_ref().expect("a stamped time");
         assert!(
-            event.occurred_at.is_some(),
-            "the journal stamps observation time"
+            occurred_at.seconds > 1_700_000_000,
+            "the stamp must be the clock, not a default: {occurred_at:?}"
         );
         assert!(matches!(event.kind, Some(Kind::TurnInterrupted(_))));
     }
@@ -892,6 +898,40 @@ mod tests {
             first_key(&first).await,
             first_key(&second).await,
             "same sequence on two workers must not collide in the server's dedupe"
+        );
+    }
+
+    /// Known inputs, exact outputs — properties are too loose for arithmetic,
+    /// because a flipped operator often satisfies the same property.
+    #[test]
+    fn the_identity_mix_is_pinned_bit_for_bit() {
+        // The pid is shifted into bits 32..52: pid 0xFF against zero time is
+        // exactly 0xFF << 32. A shift the wrong way sends it to zero.
+        assert_eq!(super::mix_identity(0, 0xFF), 0xFF_0000_0000);
+
+        // Time bits that collide with the shifted pid must XOR, not OR: the
+        // overlapping 0xFF cancels, leaving only the low time bits.
+        assert_eq!(super::mix_identity(0x0000_00FF_0000_0001, 0xFF), 1);
+
+        // The top bit is masked off, not folded in: a time with only the sign
+        // bit set mixes to zero, so the value always fits SQLite's i64.
+        assert_eq!(super::mix_identity(1_u128 << 63, 0), 0);
+        assert_eq!(super::mix_identity(u128::MAX, u32::MAX) >> 63, 0);
+    }
+
+    /// `Debug` on a journal is what an operator reads when a worker looks
+    /// stuck, and the head is the diagnosis — same precedent as the server's
+    /// `EventLog` and `CommandStream` views.
+    #[tokio::test]
+    async fn the_debug_view_names_the_type_and_its_head() {
+        let journal = journal();
+        journal.record(entry("s1", "k1")).await.expect("append");
+
+        let view = format!("{journal:?}");
+        assert!(view.contains("Journal"), "got {view}");
+        assert!(
+            view.contains("head: 1"),
+            "the head is the whole diagnosis of a stuck push: {view}"
         );
     }
 
