@@ -291,6 +291,12 @@ impl Client {
                 outcome: outcome as i32,
                 reason: reason.to_owned(),
                 remember_for_session,
+                // The CLI has no way to author a narrowing yet — there is no
+                // flag that would carry replacement arguments — so this is
+                // honestly absent rather than a dropped value. A frontend that
+                // grows one needs a parameter here; until then "allow as
+                // proposed" is the only thing this verb can mean.
+                updated_input: None,
             })
             .await?
             .into_inner()

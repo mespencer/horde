@@ -108,6 +108,7 @@ async fn answer_permission(
             outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
             reason: reason.to_owned(),
             remember_for_session: false,
+            updated_input: None,
         })
         .await
         .map(tonic::Response::into_inner)
