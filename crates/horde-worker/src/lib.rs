@@ -23,7 +23,11 @@
 //! something it did not start.
 
 pub mod claude;
+pub mod error;
+pub mod journal;
 pub mod process;
 
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
+pub use error::WorkerError;
+pub use journal::{CommandApplication, Journal, JournalEntry, JournalSink};
 pub use process::{SupervisedHarness, SupervisorError};
