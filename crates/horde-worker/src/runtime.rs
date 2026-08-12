@@ -799,6 +799,15 @@ mod tests {
             .with_adapter(Arc::new(FakeAdapter::new(script)))
     }
 
+    /// A runtime whose adapter advertises only pre-authorization — the shape
+    /// of a provider that can neither rewrite inputs nor take an interrupt.
+    fn preauthorize_only_runtime(script: Script) -> Runtime {
+        let adapter = FakeAdapter::new(script)
+            .with_capabilities(Capabilities::none().with(Capability::PreAuthorizeToolCalls));
+        Runtime::new(Journal::in_memory().expect("an in-memory journal"))
+            .with_adapter(Arc::new(adapter))
+    }
+
     fn spawn_command(sequence: u64, agent: &str, first_message: &str) -> StreamCommandsResponse {
         StreamCommandsResponse {
             command_sequence: sequence,
@@ -999,11 +1008,7 @@ mod tests {
     /// adapter that cannot rewrite is refused loudly, never silently widened.
     #[tokio::test]
     async fn a_narrowing_decision_is_refused_when_the_adapter_cannot_rewrite() {
-        let adapter = FakeAdapter::new(asking_permission())
-            .with_capabilities(Capabilities::none().with(Capability::PreAuthorizeToolCalls));
-        let mut runtime = Runtime::new(Journal::in_memory().expect("an in-memory journal"))
-            .with_adapter(Arc::new(adapter));
-
+        let mut runtime = preauthorize_only_runtime(asking_permission());
         runtime
             .apply(spawn_command(1, "agent-1", "go"))
             .await
@@ -1110,16 +1115,23 @@ mod tests {
         }
     }
 
-    /// The delivered text must reach the agent — the fake echoes it, and the
-    /// echo can only get back to the journal through the whole pump.
-    #[tokio::test]
-    async fn a_delivered_note_reaches_the_agent_and_its_echo_the_journal() {
+    /// An `agent-1` mid-conversation: spawned with an echoing script, its
+    /// opening turn settled. Returns the runtime and the settled event count.
+    async fn spawned_echoing_agent() -> (Runtime, usize) {
         let mut runtime = runtime_with(Script::echoing());
         runtime
             .apply(spawn_command(1, "agent-1", "first"))
             .await
             .expect("the spawn applies");
         let settled = journal_at_least(&runtime, 4).await.len();
+        (runtime, settled)
+    }
+
+    /// The delivered text must reach the agent — the fake echoes it, and the
+    /// echo can only get back to the journal through the whole pump.
+    #[tokio::test]
+    async fn a_delivered_note_reaches_the_agent_and_its_echo_the_journal() {
+        let (mut runtime, settled) = spawned_echoing_agent().await;
 
         runtime
             .apply(deliver_command(
@@ -1148,17 +1160,29 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// Did any journaled event mark the agent Failed, with a reason this
+    /// predicate accepts? The loud-failure tests differ only in the reason.
+    fn failed_with_reason(
+        events: &[horde_proto::v1::JournaledEvent],
+        reason: impl Fn(&str) -> bool,
+    ) -> bool {
+        events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+                        && reason(&changed.reason)
+            )
+        })
+    }
+
     /// The delivery mode is load-bearing: an interrupt-mode message toward a
     /// provider that cannot interrupt must fail the agent loudly (the adapter
     /// refuses it), never quietly downgrade to a queued delivery. This is the
     /// observable difference between the Interrupt arm existing and not.
     #[tokio::test]
     async fn an_interrupt_delivery_is_refused_by_an_uninterruptible_provider() {
-        let adapter = FakeAdapter::new(Script::echoing())
-            .with_capabilities(Capabilities::none().with(Capability::PreAuthorizeToolCalls));
-        let mut runtime = Runtime::new(Journal::in_memory().expect("an in-memory journal"))
-            .with_adapter(Arc::new(adapter));
-
+        let mut runtime = preauthorize_only_runtime(Script::echoing());
         runtime
             .apply(spawn_command(1, "agent-1", ""))
             .await
@@ -1180,14 +1204,7 @@ mod tests {
             .expect("the command applies; the refusal is the agent's failure");
 
         let events = journal_at_least(&runtime, settled + 1).await;
-        let refused = events.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentLifecycleChanged(changed))
-                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
-                        && changed.reason.contains("does not support")
-            )
-        });
+        let refused = failed_with_reason(&events, |reason| reason.contains("does not support"));
         assert!(
             refused,
             "an interrupt the provider cannot honour must fail loudly, not \
@@ -1200,12 +1217,7 @@ mod tests {
     /// reason and the agent's session — the audit trail of who stopped what.
     #[tokio::test]
     async fn an_interrupt_command_journals_the_interruption() {
-        let mut runtime = runtime_with(Script::echoing());
-        runtime
-            .apply(spawn_command(1, "agent-1", "first"))
-            .await
-            .expect("the spawn applies");
-        let settled = journal_at_least(&runtime, 4).await.len();
+        let (mut runtime, settled) = spawned_echoing_agent().await;
 
         runtime
             .apply(StreamCommandsResponse {
@@ -1294,13 +1306,7 @@ mod tests {
             .expect("the delivery applies; the death is the agent's failure");
 
         let events = journal_at_least(&runtime, settled + 1).await;
-        let failed = events.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentLifecycleChanged(changed))
-                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
-            )
-        });
+        let failed = failed_with_reason(&events, |_| true);
         assert!(
             failed,
             "a dead harness must be journaled, not hidden: {events:?}"
