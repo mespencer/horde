@@ -1,0 +1,21 @@
+[package]
+name = "horde-server-testkit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Shared server-harness test support: both service spines on a loopback socket, session seeding, and the worker-shaped journal push."
+
+[lints]
+workspace = true
+
+[dependencies]
+horde-cli = { workspace = true }
+horde-proto = { workspace = true }
+horde-server = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
+tokio-stream = "0.1.19"
+tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

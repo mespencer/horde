@@ -57,14 +57,14 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel"] }
 
 [dev-dependencies]
 # The tests drive this endpoint against a real ControlPlane over a real socket,
-# the shape horde-cli already uses. The dependency points one way only —
+# through the harness `horde-server-testkit` shares with `horde-cli` and
+# `horde-server`'s own suites. The dependency points one way only —
 # horde-server knows nothing about this crate — so there is no cycle.
-horde-server = { workspace = true }
+horde-server-testkit = { workspace = true }
 tempfile = { workspace = true }
 # `process` is for the live smoke test, which spawns a real `claude`. Declared
 # here rather than relied on from workspace feature unification: this crate must

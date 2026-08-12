@@ -602,7 +602,7 @@ dependencies = [
  "clap",
  "horde-adapter",
  "horde-proto",
- "horde-server",
+ "horde-server-testkit",
  "horde-wire",
  "serde_json",
  "thiserror",
@@ -630,7 +630,7 @@ dependencies = [
  "horde-adapter-claude",
  "horde-cli",
  "horde-proto",
- "horde-server",
+ "horde-server-testkit",
  "horde-wire",
  "http",
  "hyper",
@@ -642,7 +642,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tonic",
  "tower-service",
  "tracing",
@@ -666,6 +665,7 @@ name = "horde-server"
 version = "0.1.0"
 dependencies = [
  "horde-proto",
+ "horde-server-testkit",
  "hyper-util",
  "proptest",
  "prost",
@@ -679,6 +679,18 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "horde-server-testkit"
+version = "0.1.0"
+dependencies = [
+ "horde-cli",
+ "horde-proto",
+ "horde-server",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

@@ -12,11 +12,10 @@
 use horde_proto::v1::{
     AgentId, AgentOutputChannel, AgentOutputChunk, AgentSpec, CreateSessionRequest, Event,
     GetSessionRequest, JournaledEvent, JournaledEventBatch, ListSessionsRequest,
-    ListWorkspaceDefinitionsRequest, PushEventsRequest, PushEventsStart, RegisterWorkerRequest,
-    SessionCursor, SessionId, SpawnAgentRequest, StreamCommandsRequest, SyncEventsRequest,
-    WorkerCapabilities, WorkerId, control_plane_service_client::ControlPlaneServiceClient,
-    event::Kind, push_events_request, push_events_response, stream_commands_response,
-    sync_events_response,
+    ListWorkspaceDefinitionsRequest, PushEventsRequest, RegisterWorkerRequest, SessionCursor,
+    SessionId, SpawnAgentRequest, StreamCommandsRequest, SyncEventsRequest, WorkerCapabilities,
+    WorkerId, control_plane_service_client::ControlPlaneServiceClient, event::Kind,
+    push_events_request, push_events_response, stream_commands_response, sync_events_response,
 };
 use tokio::io::DuplexStream;
 use tokio_stream::StreamExt;
@@ -39,21 +38,8 @@ async fn open_journal(
     tokio::sync::mpsc::Sender<PushEventsRequest>,
     tonic::Streaming<horde_proto::v1::PushEventsResponse>,
 )> {
-    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
-    let acks = harness
-        .worker
-        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
-        .await?
-        .into_inner();
-    to_server
-        .send(PushEventsRequest {
-            body: Some(push_events_request::Body::Start(PushEventsStart {
-                worker_id: Some(WorkerId::new(worker_id)),
-                last_local_journal_sequence,
-            })),
-        })
-        .await?;
-    Ok((to_server, acks))
+    horde_server_testkit::open_journal(&mut harness.worker, worker_id, last_local_journal_sequence)
+        .await
 }
 
 /// Registers a worker so the scheduler has somewhere to place agents.

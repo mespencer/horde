@@ -22,6 +22,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [dev-dependencies]
+# A dev-dependency on a crate that depends on this one. Cargo permits the
+# cycle — dev-dependencies are outside the package's own build graph — and it
+# is what lets the server's tests share the harness its clients test against.
+horde-server-testkit = { workspace = true }
 tempfile = "3.24.0"
 hyper-util = { version = "0.1", features = ["tokio"] }
 proptest = "1.9.0"
