@@ -25,6 +25,7 @@ horde-cli = { path = "crates/horde-cli" }
 horde-proto = { path = "crates/horde-proto" }
 horde-server = { path = "crates/horde-server" }
 horde-testkit = { path = "crates/horde-testkit" }
+horde-wire = { path = "crates/horde-wire" }
 
 [workspace.lints.rust]
 # Deliberately *not* `warnings = "deny"`: denying every present and future rustc
