@@ -278,21 +278,40 @@ mod tests {
         .expect("the prompt shape must parse")
     }
 
+    /// One `Write` escalation from agent-42, unwrapped to its request — the
+    /// arrangement every field-attribution test below shares.
+    fn escalation() -> horde_proto::v1::PermissionRequest {
+        requested(
+            &crate::testing::identity("agent-42"),
+            &prompt("Write", json!({"file_path": "/x"})),
+            "toolu_01",
+        )
+        .request
+        .expect("the escalation carries its request")
+    }
+
     /// The escalation is attributed to the authenticated caller. An event
     /// without the agent id is one the approver reads no tree path for — and
     /// it is exactly what dropping the field produces.
     #[test]
     fn the_escalation_names_the_authenticated_agent() {
-        let event = requested(
-            &crate::testing::identity("agent-42"),
-            &prompt("Write", json!({"file_path": "/x"})),
-            "toolu_01",
-        );
-        let request = event.request.expect("the escalation carries its request");
         assert_eq!(
-            request.agent_id.as_ref().map(ToString::to_string),
+            escalation().agent_id.as_ref().map(ToString::to_string),
             Some("agent-42".to_owned()),
             "the identity's agent id must ride the event"
+        );
+    }
+
+    /// The escalation carries the id the answer must quote. The whole wait
+    /// matches by identity, so a request journaled without its id is one no
+    /// decision can ever answer — the agent blocks forever on a question
+    /// nobody can address.
+    #[test]
+    fn the_escalation_carries_the_id_the_answer_must_quote() {
+        assert_eq!(
+            escalation().request_id.as_ref().map(ToString::to_string),
+            Some("toolu_01".to_owned()),
+            "the request id must ride the event, or no decision can match it"
         );
     }
 

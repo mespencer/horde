@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{Setup, harness};
+use common::{Setup, harness, within};
 use horde_mcp::endpoint::HordeEndpoint;
 use horde_mcp::identity::AgentRegistry;
 use horde_mcp::server::{EndpointConfig, serve};
@@ -280,10 +280,15 @@ async fn deny_first_escalation(endpoint: &str, session_id: &str) -> Setup<()> {
         .follow(&horde_cli::client::SyncOptions::new(session_id.to_owned()))
         .await?;
 
-    let request_id = stream
-        .next_matching(common::escalation_request_id)
-        .await?
-        .ok_or("the escalation never appeared in the log")?;
+    // Bounded: an `approve` that never raises the request, or a request
+    // journaled without its id, would otherwise leave this watching forever
+    // for an event that never matches.
+    let request_id = within(
+        "the escalation appears in the log",
+        stream.next_matching(common::escalation_request_id),
+    )
+    .await?
+    .ok_or("the escalation never appeared in the log")?;
 
     let mut answering = horde_cli::client::Client::connect(endpoint).await?;
     answering
@@ -316,17 +321,21 @@ async fn approve_answers_with_the_decision_that_was_made() {
             async move { deny_first_escalation(&watching_endpoint, &watching_session).await },
         );
 
-    let answer = mcp
-        .call_tool(
+    // Bounded like every other wait against the log: the block is the point,
+    // but a block the denial cannot end is a defect, not a decision.
+    let answer = within(
+        "the prompt tool answers once the denial lands",
+        mcp.call_tool(
             "approve",
             serde_json::json!({
                 "tool_name": "Write",
                 "input": { "file_path": "/tmp/x" },
                 "tool_use_id": "toolu_http",
             }),
-        )
-        .await
-        .expect("the prompt tool must answer");
+        ),
+    )
+    .await
+    .expect("the prompt tool must answer");
 
     let decision: serde_json::Value = serde_json::from_str(&answer)
         .expect("the decision is a JSON string, the shape the harness parses");

@@ -162,3 +162,42 @@ pub fn identity_for(agent_id: &str) -> Setup<AgentIdentity> {
     headers.insert("x-horde-agent", agent_id.parse()?);
     Ok(registry.authenticate(&headers)?)
 }
+
+// Unused where a binary never waits on the log; the module-scoped `dead_code`
+// allow does not reach imports.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub use bounds::within;
+
+/// The wait ceiling, in its own `#[cfg(test)]` module (and last in the file)
+/// so the workspace's `panic` exemption applies: clippy exempts anything
+/// under a `cfg(test)` module, but not a bare helper beside a `#[test]` fn.
+#[cfg(test)]
+mod bounds {
+    /// How long any wait against the log may take before it is a failure.
+    ///
+    /// Generous against a loaded machine, and still an order of magnitude
+    /// below the point where cargo-mutants gives up.
+    pub const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Runs `future` with a ceiling, failing the test if it does not finish.
+    ///
+    /// Every wait against the log goes through here, because an unbounded
+    /// await turns a defect into a hang. A `respond` that answers without
+    /// ever raising the request, or a journaled request whose `request_id`
+    /// was dropped, each leaves a watcher waiting for an event that will
+    /// never match, and cargo-mutants then records a TIMEOUT. A timeout is a
+    /// mutant nobody evaluated (docs/QUALITY_GATES.md), so it protects
+    /// nothing. With a ceiling the same mutants fail in seconds and are
+    /// caught.
+    ///
+    /// This bound is a test-harness ceiling, not a decision deadline: the
+    /// production wait stays unbounded on purpose (see `permission.rs`'s
+    /// module docs), because a human may answer from a phone.
+    pub async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        let Ok(value) = tokio::time::timeout(CEILING, future).await else {
+            panic!("{what} must finish rather than hang");
+        };
+        value
+    }
+}

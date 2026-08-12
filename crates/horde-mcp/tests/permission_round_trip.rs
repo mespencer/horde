@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{Setup, harness, identity_for};
+use common::{Setup, harness, identity_for, within};
 use horde_adapter::permission::PermissionDecision;
 use horde_adapter_claude::permission::PromptRequest;
 use horde_cli::client::{Client, PermissionAnswer, SyncOptions};
@@ -35,9 +35,13 @@ async fn await_escalation(endpoint: &str, session_id: &str, request_id: &str) ->
         .follow(&SyncOptions::new(session_id.to_owned()))
         .await?;
 
+    // Bounded: a `respond` that never raises the request, or a request
+    // journaled without its id, would otherwise leave this watching forever
+    // for an event that never matches.
     let wanted = request_id.to_owned();
-    let found = stream
-        .next_matching(move |envelope| {
+    let found = within(
+        "the escalation appears in the log",
+        stream.next_matching(move |envelope| {
             let Some(horde_proto::v1::event::Kind::PermissionRequested(requested)) = envelope
                 .event
                 .as_ref()
@@ -54,9 +58,10 @@ async fn await_escalation(endpoint: &str, session_id: &str, request_id: &str) ->
                     .map(|call| call.rendered.clone())
                     .unwrap_or_default()
             })
-        })
-        .await?
-        .ok_or("the escalation never appeared in the log")?;
+        }),
+    )
+    .await?
+    .ok_or("the escalation never appeared in the log")?;
     Ok(found)
 }
 
@@ -98,7 +103,7 @@ async fn round_trip(
         })
         .await?;
 
-    Ok(blocked.await??)
+    Ok(within("the decision reaches the blocked agent", blocked).await??)
 }
 
 /// The decision the model sees is the one the human made, carried across two
