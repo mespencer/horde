@@ -43,24 +43,43 @@
 
 use horde_proto::v1::event::Kind as EventKind;
 
-/// One event to append, as the endpoint knows it.
+/// One event to record, as the endpoint knows it.
 ///
-/// The journal owns sequencing and framing; this is only the part the endpoint
-/// can speak to.
+/// The journal owns sequencing, framing, and `occurred_at`; this is only the
+/// part the endpoint can speak to. Mirrors the Worker's own `JournalEntry`
+/// field for field, so replacing this module with the real type at merge is a
+/// rename rather than a redesign.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JournalEntry {
     /// The Session whose log this belongs to.
     pub session_id: String,
     /// The Agent the event is about — the authenticated caller, never a value
     /// the Agent supplied for itself.
-    pub agent_id: String,
-    /// Deduplication key. The journal is at-least-once, so a retried append
-    /// must not become a second permission request.
+    ///
+    /// `None` for session-scoped events that belong to no single Agent.
+    /// Everything this crate writes is Agent-scoped, so in practice it is
+    /// always `Some`; the shape matches the Worker's so the swap stays
+    /// mechanical.
+    pub agent_id: Option<String>,
+    /// Deduplication key, minted by the **caller** and stable across replays.
+    ///
+    /// The journal is at-least-once and the Server dedupes on
+    /// `(session_id, idempotency_key)`, so this is the field that stops a
+    /// retried raise becoming a second permission request. Stable is the
+    /// operative word: a fresh random key on every attempt would dedupe
+    /// nothing. This crate mints it from the permission request's own id,
+    /// which is already unique and already survives a replay.
     pub idempotency_key: String,
     pub kind: EventKind,
 }
 
-/// Why an append did not land.
+/// Why a record did not land.
+///
+/// The Worker's implementation fails with its own `WorkerError`. This crate
+/// keeps its own error until the two branches merge, at which point the
+/// adapter between them is the only thing that has to change — deliberately
+/// not a re-export, because a crate that names another crate's error type
+/// before it can compile against it is a merge conflict waiting to be written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JournalError {
     /// The journal is not reachable — the Worker is disconnected, or shutting
@@ -82,8 +101,12 @@ pub enum JournalError {
 /// handlers nor their tests should be generic over which.
 #[async_trait::async_trait]
 pub trait JournalSink: Send + Sync + core::fmt::Debug {
-    /// Appends one event, answering with the Worker-local journal sequence it
+    /// Records one event, answering with the Worker-local journal sequence it
     /// landed at.
+    ///
+    /// Named to match the Worker's `JournalSink::record` rather than the
+    /// `append` this started as, so the swap at merge is a type substitution
+    /// and not a call-site edit.
     ///
     /// That number is the Worker's own bookkeeping and is **not** a
     /// `SyncEvents` offset — see the module docs. Callers here ignore it.
@@ -91,10 +114,10 @@ pub trait JournalSink: Send + Sync + core::fmt::Debug {
     /// # Errors
     ///
     /// [`JournalError`] when the entry did not land. A caller must never treat
-    /// a failed append as a written event: an unwritten permission request is
+    /// a failed record as a written event: an unwritten permission request is
     /// one no human will ever see, so it has to surface to the Agent as an
     /// error rather than as a wait.
-    async fn append(&self, entry: JournalEntry) -> Result<u64, JournalError>;
+    async fn record(&self, entry: JournalEntry) -> Result<u64, JournalError>;
 }
 
 #[cfg(test)]
@@ -129,7 +152,7 @@ pub(crate) mod testing {
             self.lock().entries.clone()
         }
 
-        /// Makes every subsequent append fail.
+        /// Makes every subsequent record fail.
         pub(crate) fn fail_with(&self, error: JournalError) {
             self.lock().failure = Some(error);
         }
@@ -146,7 +169,7 @@ pub(crate) mod testing {
 
     #[async_trait::async_trait]
     impl JournalSink for RecordingJournal {
-        async fn append(&self, entry: JournalEntry) -> Result<u64, JournalError> {
+        async fn record(&self, entry: JournalEntry) -> Result<u64, JournalError> {
             let mut state = self.lock();
             if let Some(failure) = &state.failure {
                 return Err(failure.clone());
@@ -169,32 +192,33 @@ mod tests {
     fn entry(key: &str) -> JournalEntry {
         JournalEntry {
             session_id: "s1".to_owned(),
-            agent_id: "agent-42".to_owned(),
+            agent_id: Some("agent-42".to_owned()),
             idempotency_key: key.to_owned(),
             kind: EventKind::PermissionRequested(horde_proto::v1::PermissionRequested::default()),
         }
     }
 
     #[tokio::test]
-    async fn appends_answer_with_ascending_sequences() {
-        // The sequence is the offset a blocked caller resumes reading from, so
-        // it has to be both real and ordered.
+    async fn records_answer_with_ascending_sequences() {
+        // Ordering is the Worker's own bookkeeping rather than anything this
+        // crate resumes from, but a sink that renumbered or repeated would be
+        // lying to whoever does read it.
         let journal = RecordingJournal::new();
 
-        assert_eq!(journal.append(entry("a")).await, Ok(1));
-        assert_eq!(journal.append(entry("b")).await, Ok(2));
+        assert_eq!(journal.record(entry("a")).await, Ok(1));
+        assert_eq!(journal.record(entry("b")).await, Ok(2));
         assert_eq!(journal.entries().len(), 2);
     }
 
     #[tokio::test]
-    async fn a_failed_append_is_an_error_rather_than_a_silent_drop() {
+    async fn a_failed_record_is_an_error_rather_than_a_silent_drop() {
         // An unwritten permission request is one no human will ever answer.
         // The caller has to hear about it rather than settle in to wait.
         let journal = RecordingJournal::new();
         journal.fail_with(JournalError::Unavailable("worker offline".to_owned()));
 
         assert_eq!(
-            journal.append(entry("a")).await,
+            journal.record(entry("a")).await,
             Err(JournalError::Unavailable("worker offline".to_owned()))
         );
         assert!(
