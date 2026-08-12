@@ -22,8 +22,19 @@
 //! by pattern is how a supervisor reaches outside its own subtree and takes down
 //! something it did not start.
 
+pub mod capabilities;
 pub mod claude;
+pub mod client;
+pub mod error;
+pub mod journal;
 pub mod process;
+pub mod runtime;
+pub mod translate;
 
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
+pub use client::{ApplyCommand, Connection, DialConfig};
+pub use error::WorkerError;
+pub use journal::{CommandApplication, Journal, JournalEntry, JournalSink};
 pub use process::{SupervisedHarness, SupervisorError};
+pub use runtime::Runtime;
+pub use translate::AgentContext;

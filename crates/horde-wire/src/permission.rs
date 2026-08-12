@@ -12,10 +12,13 @@
 //! is specifically an object. That asymmetry is surfaced as
 //! [`ConversionError::NotAnObject`] rather than smoothed over.
 
-use horde_adapter::permission::PermissionDecision;
+use horde_adapter::permission::{PermissionDecision, ProposedToolCall};
 use horde_proto::prost_types::value::Kind;
 use horde_proto::prost_types::{ListValue, Struct, Value as WireValue};
-use horde_proto::v1::{PermissionDecision as WirePermissionDecision, PermissionOutcome};
+use horde_proto::v1::{
+    PermissionDecision as WirePermissionDecision, PermissionOutcome,
+    ProposedToolCall as WireProposedToolCall,
+};
 use serde_json::{Map, Number, Value as JsonValue};
 
 /// Why a permission decision could not cross the seam.
@@ -151,6 +154,40 @@ fn struct_to_json(value: &Struct) -> JsonValue {
             .map(|(k, v)| (k.clone(), wire_to_json(v)))
             .collect(),
     )
+}
+
+/// Domain → wire, for the Worker journaling a `PermissionRequested` event.
+///
+/// Fills only what the call itself carries: the tool name, the arguments, and
+/// a deterministic rendering for approval UIs. The correlation identity is
+/// deliberately *not* here — the wire `ProposedToolCall` has no id field, and
+/// `PermissionRequest.request_id` is minted by whoever raises the request
+/// (the Worker uses the harness's `tool_call_id`), which is a policy this
+/// conversion must not own.
+///
+/// An empty argument object survives as an empty `Struct`: "a call with no
+/// arguments" and "arguments unknown" are different facts, same as the
+/// absent-versus-empty rule on `PermissionDecision.updated_input`.
+///
+/// # Errors
+///
+/// [`ConversionError::NotAnObject`] when the arguments are not a JSON object —
+/// tool arguments are always a named bag, and truncating a bare array or
+/// scalar would journal a call other than the one proposed.
+/// [`ConversionError::UnrepresentableNumber`] when an argument has no exact
+/// `f64` representation, for the same reason the decision path refuses one.
+pub fn proposed_tool_call_to_wire(
+    call: &ProposedToolCall,
+) -> Result<WireProposedToolCall, ConversionError> {
+    let input = match &call.input {
+        JsonValue::Object(map) => object_to_struct(map)?,
+        _ => return Err(ConversionError::NotAnObject),
+    };
+    Ok(WireProposedToolCall {
+        tool_name: call.tool_name.clone(),
+        input: Some(input),
+        rendered: format!("{} {}", call.tool_name, call.input),
+    })
 }
 
 /// Domain → wire.
@@ -413,5 +450,88 @@ mod tests {
     fn a_conversion_error_is_a_std_error() {
         let error: &dyn core::error::Error = &ConversionError::NotAnObject;
         assert!(error.source().is_none());
+    }
+}
+
+#[cfg(test)]
+mod proposed_tool_call_tests {
+    use horde_adapter::ToolCallId;
+    use horde_adapter::permission::ProposedToolCall;
+    use serde_json::json;
+
+    use super::{ConversionError, proposed_tool_call_to_wire, struct_to_json};
+
+    fn call(input: serde_json::Value) -> ProposedToolCall {
+        ProposedToolCall {
+            tool_call_id: ToolCallId::new("toolu_01"),
+            tool_name: "Bash".to_owned(),
+            input,
+        }
+    }
+
+    #[test]
+    fn a_proposal_carries_its_arguments_structurally() {
+        let proposed = call(json!({
+            "command": "docker rm horde-test",
+            "timeout": 30,
+            "flags": ["-f"],
+        }));
+
+        let wire = proposed_tool_call_to_wire(&proposed).expect("an object converts");
+
+        assert_eq!(wire.tool_name, "Bash");
+        let arguments = struct_to_json(wire.input.as_ref().expect("arguments survive"));
+        assert_eq!(
+            arguments,
+            json!({ "command": "docker rm horde-test", "timeout": 30, "flags": ["-f"] }),
+            "deterministic rules and the judge must read the values the harness sent"
+        );
+    }
+
+    /// The rendering is what a human approves from a phone. It must name the
+    /// tool and show the arguments — an empty or tool-less rendering turns the
+    /// approval UI into a yes/no with no question.
+    #[test]
+    fn the_rendering_names_the_tool_and_shows_the_arguments() {
+        let wire = proposed_tool_call_to_wire(&call(json!({ "command": "docker rm horde-test" })))
+            .expect("converts");
+
+        assert!(wire.rendered.contains("Bash"), "got {}", wire.rendered);
+        assert!(
+            wire.rendered.contains("docker rm horde-test"),
+            "got {}",
+            wire.rendered
+        );
+    }
+
+    /// Absent and empty are different states, exactly as they are on
+    /// `updated_input`: a call with no arguments is still a concrete call.
+    #[test]
+    fn a_call_with_no_arguments_is_an_empty_struct_not_an_absence() {
+        let wire = proposed_tool_call_to_wire(&call(json!({}))).expect("converts");
+        let input = wire.input.expect("an empty bag is still a bag");
+        assert!(input.fields.is_empty());
+    }
+
+    #[test]
+    fn a_non_object_proposal_is_refused_rather_than_truncated() {
+        for input in [json!("bare string"), json!([1, 2]), json!(3)] {
+            assert_eq!(
+                proposed_tool_call_to_wire(&call(input)),
+                Err(ConversionError::NotAnObject)
+            );
+        }
+    }
+
+    /// The same 2^53 rule as the decision path: silently altering an argument
+    /// inside a permission artifact is worse than failing loudly.
+    #[test]
+    fn an_unrepresentable_argument_is_refused() {
+        assert_eq!(
+            proposed_tool_call_to_wire(&call(json!({ "id": 9_007_199_254_740_993_i64 }))),
+            Err(ConversionError::UnrepresentableNumber(
+                "9007199254740993".to_owned()
+            ))
+        );
     }
 }

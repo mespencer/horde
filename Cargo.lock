@@ -722,8 +722,18 @@ dependencies = [
  "async-trait",
  "horde-adapter",
  "horde-adapter-claude",
+ "horde-adapter-fake",
+ "horde-proto",
+ "horde-server",
+ "horde-wire",
+ "rusqlite",
+ "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

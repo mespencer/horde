@@ -791,10 +791,10 @@ async fn a_following_sync_delivers_what_is_appended_after_it_caught_up() {
 // The worker is still simulated at the wire level, per this file's header. The
 // end-to-end version — a real `horde-worker` applying these commands, crashing,
 // and reconciling what it actually ran against what it acked — is
-// `a_real_worker_reconciles_its_applied_commands_after_a_restart`, and it lands
-// in this file once the worker crate is on `main`. It is named here rather than
-// stubbed because an ignored empty test asserts nothing while looking like
-// coverage.
+// `a_real_worker_reconciles_its_applied_commands_after_a_restart` in
+// `horde-worker/tests/connection.rs`. It lives there rather than here because
+// the dependency points that way only: the worker's tests may build a real
+// server, but this crate knows nothing about the worker.
 // -------------------------------------------------------------------------
 
 /// A server with `worker-a` registered and one session seeded.
