@@ -41,6 +41,7 @@ pub mod identity;
 pub mod journal;
 pub mod permission;
 pub mod server;
+pub mod verbs;
 
 pub use identity::{AgentIdentity, AgentRegistry, IdentityError};
 pub use journal::{JournalEntry, JournalError, JournalSink};
