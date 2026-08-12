@@ -145,6 +145,30 @@ impl Connection {
         Ok(())
     }
 
+    /// Runs both streams until either finishes; the other is cancelled by
+    /// drop.
+    ///
+    /// Returning means this connection is over — a partition, a server
+    /// restart, a refused batch. Reconnection is the caller's policy, not this
+    /// function's: dial again and run again over the same journal and
+    /// runtime, and the resume rules do the rest.
+    ///
+    /// # Errors
+    ///
+    /// Whatever ended the connection first; `Ok` when the Server closed a
+    /// stream cleanly.
+    pub async fn run(
+        &mut self,
+        journal: &Journal,
+        target: &mut dyn ApplyCommand,
+    ) -> Result<(), WorkerError> {
+        let mut push_side = self.clone();
+        tokio::select! {
+            outcome = self.feed_commands(journal, target) => outcome,
+            outcome = push_side.push_events(journal) => outcome,
+        }
+    }
+
     /// Pushes journaled events until the Server hangs up, truncating on acks.
     ///
     /// Opens the stream with the journal's highest-ever sequence (which
