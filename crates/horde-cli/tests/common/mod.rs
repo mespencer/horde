@@ -24,10 +24,15 @@
 #![allow(dead_code, unreachable_pub)]
 
 use horde_cli::Client;
-use horde_proto::v1::DeliveryMode;
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
+use horde_proto::v1::worker_service_client::WorkerServiceClient;
+use horde_proto::v1::worker_service_server::WorkerServiceServer;
+use horde_proto::v1::{
+    DeliveryMode, Event, JournaledEvent, JournaledEventBatch, PushEventsRequest, PushEventsStart,
+    SessionId, WorkerId, push_events_request,
+};
 use horde_server::EventLog;
-use horde_server::service::{ControlPlane, ServerCore};
+use horde_server::service::{ControlPlane, ServerCore, WorkerFacing};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
@@ -48,12 +53,66 @@ pub async fn serve() -> Setup<String> {
 
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
+            .add_service(ControlPlaneServiceServer::new(ControlPlane::new(
+                core.clone(),
+            )))
+            // The worker spine too, because some client-facing behaviour has no
+            // reachable starting state without it. A permission escalation is
+            // the case in point: nothing on the control plane can author one —
+            // that is a deliberate design property, not a gap — so a test that
+            // wants to *answer* a permission has to journal the request the way
+            // a real worker does.
+            .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;
     });
 
     Ok(format!("http://{address}"))
+}
+
+/// Journals one event the way a worker does, and waits for the server's ack.
+///
+/// The escape hatch for tests whose subject is a client verb but whose
+/// precondition is an observed fact — which only the worker's journal can
+/// write.
+pub async fn journal_event(endpoint: &str, session_id: &str, event: Event) -> Setup<()> {
+    let mut worker =
+        WorkerServiceClient::connect(tonic::transport::Endpoint::try_from(endpoint.to_owned())?)
+            .await?;
+
+    let (to_server, from_client) = tokio::sync::mpsc::channel(8);
+    let mut acks = worker
+        .push_events(tokio_stream::wrappers::ReceiverStream::new(from_client))
+        .await?
+        .into_inner();
+
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Start(PushEventsStart {
+                worker_id: Some(WorkerId::new("test-worker")),
+                last_local_journal_sequence: 0,
+            })),
+        })
+        .await?;
+    // The start is acked before the batch is sent, so a failure to register is
+    // reported as itself rather than as a confusing batch rejection.
+    acks.message().await?;
+
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events: vec![JournaledEvent {
+                    session_id: Some(SessionId::new(session_id)),
+                    journal_sequence: 1,
+                    event: Some(event),
+                }],
+                acked_command_sequence: 0,
+            })),
+        })
+        .await?;
+    acks.message().await?;
+
+    Ok(())
 }
 
 /// A client wired to its own private server, over a channel the caller built

@@ -42,6 +42,28 @@ pub enum ClientError {
         "{endpoint} is not a valid endpoint URI (expected something like http://127.0.0.1:7777)"
     )]
     Endpoint { endpoint: String },
+
+    /// The replacement arguments on a narrowing answer cannot cross the wire.
+    ///
+    /// Refused before the RPC rather than sent as a plain allow: the whole
+    /// point of a narrowing is that the *narrowed* call runs, so an answer
+    /// whose narrowing was dropped would permit the original, wider call —
+    /// the failure `permission.proto` calls out by name.
+    #[error("the narrowing on this answer cannot be sent: {source}")]
+    Narrowing {
+        #[source]
+        source: horde_wire::permission::ConversionError,
+    },
+
+    /// The replacement arguments were not valid JSON.
+    ///
+    /// Caught before the RPC: a typo belongs to the person who typed it, and
+    /// reporting it as a server refusal would send them looking at the server.
+    #[error("the replacement arguments are not valid JSON: {source}")]
+    NarrowingJson {
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 impl ClientError {
@@ -277,26 +299,38 @@ impl Client {
     }
 
     /// Answers a human-layer permission escalation.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Narrowing`] when the answer carries replacement arguments
+    /// the wire cannot represent, and the RPC's own failures otherwise.
     pub async fn answer_permission(
         &mut self,
-        request_id: &str,
-        outcome: PermissionOutcome,
-        reason: &str,
-        remember_for_session: bool,
+        answer: PermissionAnswer<'_>,
     ) -> Result<u64, ClientError> {
+        // Converted through the one place that owns this correspondence rather
+        // than hand-rolled: a narrowing that silently altered an argument on
+        // its way to the wire would be a widened permission wearing a
+        // narrowing's clothes.
+        let updated_input = match answer.updated_input {
+            Some(value) => {
+                let decision =
+                    horde_adapter::permission::PermissionDecision::allow_with(value.clone());
+                horde_wire::permission::permission_decision_to_wire(&decision)
+                    .map_err(|source| ClientError::Narrowing { source })?
+                    .updated_input
+            }
+            None => None,
+        };
+
         Ok(self
             .inner
             .answer_permission(AnswerPermissionRequest {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                outcome: outcome as i32,
-                reason: reason.to_owned(),
-                remember_for_session,
-                // The CLI has no way to author a narrowing yet — there is no
-                // flag that would carry replacement arguments — so this is
-                // honestly absent rather than a dropped value. A frontend that
-                // grows one needs a parameter here; until then "allow as
-                // proposed" is the only thing this verb can mean.
-                updated_input: None,
+                request_id: Some(PermissionRequestId::new(answer.request_id)),
+                outcome: answer.outcome as i32,
+                reason: answer.reason.to_owned(),
+                remember_for_session: answer.remember_for_session,
+                updated_input,
             })
             .await?
             .into_inner()
@@ -378,6 +412,73 @@ impl Client {
         }
 
         Ok(highest)
+    }
+}
+
+/// How a human answered a permission escalation.
+///
+/// A struct rather than five positional arguments, matching [`SyncOptions`]:
+/// the two booleans and two strings are otherwise indistinguishable at a call
+/// site, and `remember_for_session` silently swapped with `deny` is a mistake
+/// the compiler could not catch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionAnswer<'a> {
+    pub request_id: &'a str,
+    pub outcome: PermissionOutcome,
+    pub reason: &'a str,
+    /// Widen the deterministic-allow layer for the rest of the Session.
+    pub remember_for_session: bool,
+    /// Replacement arguments, when the human narrowed the call rather than
+    /// merely permitting it — clamping a path, dropping a flag.
+    ///
+    /// `None` means "allow as proposed". `Some` of an empty object means
+    /// "allow with no arguments at all", which is a different instruction, and
+    /// the distinction survives all the way to the harness.
+    pub updated_input: Option<&'a serde_json::Value>,
+}
+
+impl<'a> PermissionAnswer<'a> {
+    /// Allow the call exactly as the Agent proposed it.
+    #[must_use]
+    pub fn allow(request_id: &'a str) -> Self {
+        Self {
+            request_id,
+            outcome: PermissionOutcome::Allow,
+            reason: "",
+            remember_for_session: false,
+            updated_input: None,
+        }
+    }
+
+    /// Refuse the call, telling the Agent why.
+    #[must_use]
+    pub fn deny(request_id: &'a str, reason: &'a str) -> Self {
+        Self {
+            request_id,
+            outcome: PermissionOutcome::Deny,
+            reason,
+            remember_for_session: false,
+            updated_input: None,
+        }
+    }
+
+    /// Allow the call, but with these arguments instead of the proposed ones.
+    #[must_use]
+    pub fn narrowed(mut self, updated_input: &'a serde_json::Value) -> Self {
+        self.updated_input = Some(updated_input);
+        self
+    }
+
+    #[must_use]
+    pub fn remembering(mut self, remember: bool) -> Self {
+        self.remember_for_session = remember;
+        self
+    }
+
+    #[must_use]
+    pub fn because(mut self, reason: &'a str) -> Self {
+        self.reason = reason;
+        self
     }
 }
 

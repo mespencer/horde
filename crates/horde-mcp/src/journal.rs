@@ -15,10 +15,31 @@
 //! landed at. The Worker implements it; the tests implement it in memory; the
 //! endpoint cannot tell the difference and must not try.
 //!
-//! The sequence comes back because the permission flow needs it: an Agent
-//! blocked on a decision resumes by reading the log forward from a known point,
-//! and "the point my request was written at" is the only offset that cannot
-//! miss a decision answered before the reader started looking.
+//! # The returned sequence is not a resume offset
+//!
+//! It is tempting to treat the number `append` hands back as the position a
+//! blocked Agent resumes reading the log from. It is not, and the mistake is
+//! invisible rather than loud. `event.proto` opens by naming the two spaces:
+//!
+//! * `EventEnvelope.sequence` — per **Session**, assigned by the Server. This
+//!   is what `SyncEvents` cursors mean.
+//! * `JournaledEvent.journal_sequence` — per **Worker**, assigned by the
+//!   Worker's local journal. This is what an append can answer with.
+//!
+//! Journal 7 and session 7 are unrelated events, and on a Worker serving more
+//! than one Session they diverge immediately — so feeding one into the other
+//! yields a plausible offset pointing somewhere arbitrary, with no error. The
+//! Server does not even assign the session sequence until `ingest_batch`, well
+//! after this call returns, so the right number cannot be known here in
+//! principle.
+//!
+//! So nothing in this crate resumes from it. Waiters match on **identity**
+//! instead — a `PermissionDecided` carrying the `request_id` that was raised —
+//! and subscribe *before* appending, which is what closes the window rather
+//! than an offset. The sequence stays in the signature as the Worker's own
+//! bookkeeping, useful to an implementer and load-bearing for nobody here.
+//! That is the seam working correctly: this crate's correctness does not
+//! depend on the Worker's storage internals.
 
 use horde_proto::v1::event::Kind as EventKind;
 
@@ -61,7 +82,11 @@ pub enum JournalError {
 /// handlers nor their tests should be generic over which.
 #[async_trait::async_trait]
 pub trait JournalSink: Send + Sync + core::fmt::Debug {
-    /// Appends one event, answering with the journal sequence it landed at.
+    /// Appends one event, answering with the Worker-local journal sequence it
+    /// landed at.
+    ///
+    /// That number is the Worker's own bookkeeping and is **not** a
+    /// `SyncEvents` offset — see the module docs. Callers here ignore it.
     ///
     /// # Errors
     ///

@@ -11,7 +11,14 @@ workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
+horde-adapter = { path = "../horde-adapter" }
 horde-proto = { workspace = true }
+# The single owner of the domain↔wire correspondence. A narrowing arrives here
+# as JSON and has to reach the wire as a `Struct`, and that conversion has real
+# failure modes — a non-object bag, an integer with no exact double — which are
+# already decided and tested there. Re-deriving them here would be a second
+# answer to a settled question.
+horde-wire = { path = "../horde-wire" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
