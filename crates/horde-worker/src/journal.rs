@@ -55,6 +55,13 @@ pub struct JournalEntry {
     pub agent_id: Option<String>,
     /// Stable across replays of the same event — the Server dedupes on it, so
     /// a replayed journal cannot double-append. Caller-minted and opaque.
+    ///
+    /// Leave empty to let the journal mint one from its persistent identity
+    /// and the assigned sequence: unique across Workers and across restarts,
+    /// and stable across replays because it is stored in the encoded event the
+    /// moment it is assigned. Supply your own only when a richer key exists —
+    /// one derived from a fact the event is about, like a permission request
+    /// id — never a timestamp or a counter that restarts.
     pub idempotency_key: String,
     /// What happened.
     pub kind: Kind,
@@ -124,6 +131,7 @@ impl std::fmt::Debug for Journal {
 const NEXT_SEQUENCE: &str = "next_journal_sequence";
 const FLOOR: &str = "floor";
 const APPLIED_COMMAND: &str = "applied_command_sequence";
+const IDENTITY: &str = "journal_identity";
 
 impl Journal {
     /// Opens (or creates) a journal at `path`.
@@ -169,6 +177,19 @@ impl Journal {
             )
             .map_err(|source| WorkerError::Journal {
                 context: "creating the journal schema",
+                source,
+            })?;
+
+        // A persistent identity, minted once per journal, for auto-minted
+        // idempotency keys: it is what keeps a key unique across Workers and
+        // across restarts without any coordination.
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+                params![IDENTITY, mint_identity()],
+            )
+            .map_err(|source| WorkerError::Journal {
+                context: "minting the journal identity",
                 source,
             })?;
 
@@ -341,6 +362,35 @@ impl Journal {
         .await
     }
 
+    /// Whether a command was already applied, by its stable id.
+    ///
+    /// The pre-execution dedupe check: commands are at-least-once, and the
+    /// side effects of applying one (spawning a harness process) must not run
+    /// twice. [`Self::apply_command`] re-checks inside its transaction, so
+    /// this being a separate read is a fast path, not a race.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the lookup fails.
+    pub async fn is_command_applied(&self, command_id: &str) -> Result<bool, WorkerError> {
+        let command_id = command_id.to_owned();
+        self.with_connection("checking a command for redelivery", move |connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM applied_command WHERE command_id = ?1",
+                    params![command_id],
+                    |_| Ok(()),
+                )
+                .map(|()| true)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                    other => Err(other),
+                })
+                .map_err(read_error)
+        })
+        .await
+    }
+
     /// The highest command sequence ever applied — what the Worker acks and
     /// resumes `StreamCommands` from.
     ///
@@ -458,12 +508,18 @@ fn append_all(
     transaction: &rusqlite::Transaction<'_>,
     entries: &[JournalEntry],
 ) -> Result<u64, rusqlite::Error> {
+    let identity = meta(transaction, IDENTITY)?;
     let mut next = meta(transaction, NEXT_SEQUENCE)?;
     for entry in entries {
+        let idempotency_key = if entry.idempotency_key.is_empty() {
+            format!("j{identity:016x}:{next}")
+        } else {
+            entry.idempotency_key.clone()
+        };
         let event = Event {
             agent_id: entry.agent_id.clone().map(AgentId::new),
             occurred_at: Some(now()),
-            idempotency_key: entry.idempotency_key.clone(),
+            idempotency_key,
             kind: Some(entry.kind.clone()),
         };
         transaction.execute(
@@ -490,6 +546,23 @@ fn set_meta(connection: &Connection, key: &str, value: u64) -> Result<(), rusqli
         params![key, value],
     )?;
     Ok(())
+}
+
+/// A fresh journal identity: unique enough that two Workers' auto-minted
+/// idempotency keys cannot collide, without a coordination service or a
+/// dependency on a random-number crate.
+///
+/// Masked to 63 bits because SQLite stores INTEGER as i64 and the value only
+/// needs to be distinct, not uniformly random.
+fn mint_identity() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    let pid = u128::from(std::process::id());
+    #[allow(clippy::cast_possible_truncation)] // masked below u64 range anyway
+    let mixed = (nanos ^ (pid << 96)) as u64;
+    mixed & (i64::MAX as u64)
 }
 
 /// When the journal observed an event, as a protobuf timestamp.
@@ -756,6 +829,91 @@ mod tests {
             *watch.borrow(),
             1,
             "the watch moves only after the commit, so this value is readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_idempotency_key_is_minted_stored_and_stable() {
+        let journal = journal();
+        journal.record(entry("s1", "")).await.expect("append");
+        journal.record(entry("s1", "")).await.expect("append");
+
+        let keys = |events: &[horde_proto::v1::JournaledEvent]| -> Vec<String> {
+            events
+                .iter()
+                .map(|journaled| {
+                    journaled
+                        .event
+                        .as_ref()
+                        .expect("an event")
+                        .idempotency_key
+                        .clone()
+                })
+                .collect()
+        };
+
+        let first_read = keys(&journal.read_from(1, 10).await.expect("readable"));
+        assert!(
+            !first_read[0].is_empty() && !first_read[1].is_empty(),
+            "an empty key would defeat the server's dedupe entirely"
+        );
+        assert_ne!(
+            first_read[0], first_read[1],
+            "two events must never share a minted key"
+        );
+
+        // A replay reads the same stored bytes, so the keys cannot move.
+        let second_read = keys(&journal.read_from(1, 10).await.expect("readable"));
+        assert_eq!(
+            first_read, second_read,
+            "minted keys are stored, not derived"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_journals_mint_from_different_identities() {
+        let first = journal();
+        let second = journal();
+        first.record(entry("s1", "")).await.expect("append");
+        second.record(entry("s1", "")).await.expect("append");
+
+        async fn first_key(journal: &Journal) -> String {
+            journal.read_from(1, 10).await.expect("readable")[0]
+                .event
+                .as_ref()
+                .expect("an event")
+                .idempotency_key
+                .clone()
+        }
+        assert_ne!(
+            first_key(&first).await,
+            first_key(&second).await,
+            "same sequence on two workers must not collide in the server's dedupe"
+        );
+    }
+
+    #[tokio::test]
+    async fn redelivery_is_visible_before_anything_executes() {
+        let journal = journal();
+        assert!(
+            !journal
+                .is_command_applied("s1:2")
+                .await
+                .expect("a readable journal"),
+            "a command never seen is not applied"
+        );
+
+        journal
+            .apply_command("s1:2", 1, Vec::new())
+            .await
+            .expect("apply");
+
+        assert!(
+            journal
+                .is_command_applied("s1:2")
+                .await
+                .expect("a readable journal"),
+            "the pre-execution check is what stops a harness spawning twice"
         );
     }
 

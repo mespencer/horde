@@ -88,6 +88,15 @@ pub enum WorkerError {
     #[error("no adapter is registered for provider {0:?}")]
     UnknownProvider(String),
 
+    /// A domain value could not be put on the wire, or a wire value could not
+    /// be read back into the domain.
+    ///
+    /// Carries `horde-wire`'s own reason, which names the exact refusal — a
+    /// non-object argument bag, an unrepresentable number, an unusable
+    /// outcome, or a rewrite this adapter cannot apply.
+    #[error("could not translate between domain and wire: {0}")]
+    Translate(#[from] horde_wire::ConversionError),
+
     /// The harness itself failed.
     #[error("the harness failed: {0}")]
     Adapter(#[from] AdapterError),
