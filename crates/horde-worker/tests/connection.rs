@@ -188,6 +188,31 @@ mod harness {
         }
     }
 
+    /// Dials as `config` and runs the connection over `journal`, driving
+    /// `runtime` — the whole worker, in one line of test.
+    ///
+    /// Returns the running task (abort it to crash the worker) and the
+    /// registration, whose resume positions are what reconciliation tests
+    /// assert on.
+    pub(crate) async fn dial_and_run(
+        config: &DialConfig,
+        journal: &horde_worker::Journal,
+        runtime: Runtime,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), horde_worker::WorkerError>>,
+        horde_proto::v1::RegisterWorkerResponse,
+    ) {
+        let (mut connection, registration) = horde_worker::Connection::dial(config)
+            .await
+            .expect("the dial succeeds");
+        let journal = journal.clone();
+        let task = tokio::spawn(async move {
+            let mut runtime = runtime;
+            connection.run(&journal, &mut runtime).await
+        });
+        (task, registration)
+    }
+
     /// A dial config advertising this runtime's adapters.
     pub(crate) fn config_for(endpoint: &str, worker_id: &str, runtime: &Runtime) -> DialConfig {
         DialConfig {
@@ -310,14 +335,11 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
     // First life: apply the spawn, run the turn, push and get acked.
     {
         let journal = Journal::open(&journal_path).expect("a fresh journal");
-        let mut runtime = Runtime::new(journal.clone()).with_adapter(Arc::new(FakeAdapter::new(
+        let runtime = Runtime::new(journal.clone()).with_adapter(Arc::new(FakeAdapter::new(
             Script::of(vec![ScriptedTurn::saying("hello")]),
         )));
         let config = harness::config_for(&endpoint, "worker-a", &runtime);
-        let (mut connection, _) = Connection::dial(&config).await.expect("the dial succeeds");
-
-        let run_journal = journal.clone();
-        let run = tokio::spawn(async move { connection.run(&run_journal, &mut runtime).await });
+        let (run, _) = harness::dial_and_run(&config, &journal, runtime).await;
 
         // Two seed events, then the worker's four: starting, established,
         // one output chunk, one usage record.
@@ -350,21 +372,16 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
         "and journaled four events before dying"
     );
 
-    let mut runtime =
+    let runtime =
         Runtime::new(journal.clone()).with_adapter(Arc::new(FakeAdapter::new(Script::of(vec![
             ScriptedTurn::saying("more"),
         ]))));
     let config = harness::config_for(&endpoint, "worker-a", &runtime);
-    let (mut connection, registration) = Connection::dial(&config)
-        .await
-        .expect("the redial succeeds");
+    let (run, registration) = harness::dial_and_run(&config, &journal, runtime).await;
     assert_eq!(
         registration.resume_from_journal_sequence, 5,
         "the server remembered everything the first life pushed"
     );
-
-    let run_journal = journal.clone();
-    let run = tokio::spawn(async move { connection.run(&run_journal, &mut runtime).await });
 
     // Only agent-2's spawn is replayed: its two seed events plus its four
     // worker events, on top of the six already there.
@@ -418,17 +435,10 @@ async fn a_partitioned_worker_journals_locally_and_reconciles_on_reconnect() {
 
     // Connected: one event flows end to end.
     let config = harness::bare_config(&proxy.endpoint(), "worker-a");
-    let (mut connection, _) = Connection::dial(&config)
-        .await
-        .expect("the dial goes through the proxy");
     sink.record(harness::marker_entry("s1", "before the cut"))
         .await
         .expect("the journal accepts");
-    let run_journal = journal.clone();
-    let run = tokio::spawn(async move {
-        let mut runtime = Runtime::new(run_journal.clone());
-        connection.run(&run_journal, &mut runtime).await
-    });
+    let (run, _) = harness::dial_and_run(&config, &journal, Runtime::new(journal.clone())).await;
     harness::server_log_at_least(&core.log, "s1", 1).await;
 
     // The cable is yanked mid-connection.
@@ -456,18 +466,12 @@ async fn a_partitioned_worker_journals_locally_and_reconciles_on_reconnect() {
 
     // Heal, redial, reconcile.
     proxy.heal();
-    let (mut connection, registration) = Connection::dial(&config)
-        .await
-        .expect("the redial succeeds");
+    let (run, registration) =
+        harness::dial_and_run(&config, &journal, Runtime::new(journal.clone())).await;
     assert_eq!(
         registration.resume_from_journal_sequence, 2,
         "the server asks for exactly what it missed"
     );
-    let run_journal = journal.clone();
-    let run = tokio::spawn(async move {
-        let mut runtime = Runtime::new(run_journal.clone());
-        connection.run(&run_journal, &mut runtime).await
-    });
 
     let head = harness::server_log_at_least(&core.log, "s1", 3).await;
     assert_eq!(
@@ -521,12 +525,10 @@ async fn the_real_claude_path_streams_a_turn_into_the_server_log() {
     .await;
 
     let journal = Journal::in_memory().expect("an in-memory journal");
-    let mut runtime =
+    let runtime =
         Runtime::new(journal.clone()).with_adapter(Arc::new(horde_worker::ClaudeAdapter::new()));
     let config = harness::config_for(&endpoint, "worker-a", &runtime);
-    let (mut connection, _) = Connection::dial(&config).await.expect("the dial succeeds");
-    let run_journal = journal.clone();
-    let run = tokio::spawn(async move { connection.run(&run_journal, &mut runtime).await });
+    let (run, _) = harness::dial_and_run(&config, &journal, runtime).await;
 
     let events = harness::server_log_until(
         &core.log,

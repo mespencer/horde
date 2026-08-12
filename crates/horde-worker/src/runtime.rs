@@ -900,16 +900,21 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn a_permission_decision_unblocks_the_waiting_agent() {
-        let script = Script::of(vec![ScriptedTurn::saying("checking").with_step(
+    /// A turn that proposes `Bash ls` as tool call `call-1` and blocks on the
+    /// decision — the shape both permission tests drive.
+    fn asking_permission() -> Script {
+        Script::of(vec![ScriptedTurn::saying("checking").with_step(
             Step::AskPermission {
                 tool_call_id: "call-1".to_owned(),
                 tool_name: "Bash".to_owned(),
                 input: json!({ "command": "ls" }),
             },
-        )]);
-        let mut runtime = runtime_with(script);
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_permission_decision_unblocks_the_waiting_agent() {
+        let mut runtime = runtime_with(asking_permission());
         runtime
             .apply(spawn_command(1, "agent-1", "go"))
             .await
@@ -946,14 +951,7 @@ mod tests {
     /// adapter that cannot rewrite is refused loudly, never silently widened.
     #[tokio::test]
     async fn a_narrowing_decision_is_refused_when_the_adapter_cannot_rewrite() {
-        let script = Script::of(vec![ScriptedTurn::saying("checking").with_step(
-            Step::AskPermission {
-                tool_call_id: "call-1".to_owned(),
-                tool_name: "Bash".to_owned(),
-                input: json!({ "command": "ls" }),
-            },
-        )]);
-        let adapter = FakeAdapter::new(script)
+        let adapter = FakeAdapter::new(asking_permission())
             .with_capabilities(Capabilities::none().with(Capability::PreAuthorizeToolCalls));
         let mut runtime = Runtime::new(Journal::in_memory().expect("an in-memory journal"))
             .with_adapter(Arc::new(adapter));
