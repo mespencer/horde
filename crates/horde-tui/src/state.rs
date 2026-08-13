@@ -247,30 +247,42 @@ fn feed_line(sequence: u64, event: &Event) -> FeedLine {
 /// The tag and the one line of text an event is worth in a feed.
 ///
 /// Deliberately shallow, like the CLI's renderer: a feed that dumps whole
-/// payloads is unreadable, and anything deeper is a detail pane's job.
+/// payloads is unreadable, and anything deeper is a detail pane's job. Split
+/// into the conversation half and the machinery half — one 14-arm match sat
+/// exactly on the CRAP boundary, and the two halves are also the two voices
+/// a feed actually interleaves: what the agents said, and what happened to
+/// them.
 fn describe(kind: Option<&Kind>) -> (&'static str, String) {
-    match kind {
-        Some(Kind::AgentOutputChunk(chunk)) => (channel_name(chunk.channel), chunk.text.clone()),
-        Some(Kind::AgentSpawned(spawned)) => ("spawned", spawned.tree_path.join(" > ")),
-        Some(Kind::AssignmentSent(sent)) => (
+    kind.map_or(("unknown", String::new()), |kind| {
+        conversation_line(kind).unwrap_or_else(|| machinery_line(kind))
+    })
+}
+
+/// The conversational kinds: output, spawns, messages, results, escalations.
+/// `None` for the kinds that belong to [`machinery_line`].
+fn conversation_line(kind: &Kind) -> Option<(&'static str, String)> {
+    Some(match kind {
+        Kind::AgentOutputChunk(chunk) => (channel_name(chunk.channel), chunk.text.clone()),
+        Kind::AgentSpawned(spawned) => ("spawned", spawned.tree_path.join(" > ")),
+        Kind::AssignmentSent(sent) => (
             "assign",
             sent.assignment
                 .as_ref()
                 .map_or_else(String::new, |assignment| assignment.text.clone()),
         ),
-        Some(Kind::NoteSent(sent)) => (
+        Kind::NoteSent(sent) => (
             "note",
             sent.note
                 .as_ref()
                 .map_or_else(String::new, |note| note.text.clone()),
         ),
-        Some(Kind::ResultReported(reported)) => (
+        Kind::ResultReported(reported) => (
             "result",
             reported.result.as_ref().map_or_else(String::new, |result| {
                 joined(result_status_name(result.status), &result.summary)
             }),
         ),
-        Some(Kind::PermissionRequested(requested)) => (
+        Kind::PermissionRequested(requested) => (
             "needs you",
             requested
                 .request
@@ -278,7 +290,7 @@ fn describe(kind: Option<&Kind>) -> (&'static str, String) {
                 .and_then(|request| request.tool_call.as_ref())
                 .map_or_else(String::new, |call| call.rendered.clone()),
         ),
-        Some(Kind::PermissionDecided(decided)) => (
+        Kind::PermissionDecided(decided) => (
             "decided",
             decided
                 .decision
@@ -287,23 +299,30 @@ fn describe(kind: Option<&Kind>) -> (&'static str, String) {
                     joined(permission_outcome_name(decision.outcome), &decision.reason)
                 }),
         ),
-        Some(Kind::UsageRecorded(_)) => ("usage", String::new()),
-        Some(Kind::WorkspaceInstanceChanged(changed)) => (
+        _ => return None,
+    })
+}
+
+/// The machinery kinds: usage, workspaces, lifecycles, placement, interrupts.
+fn machinery_line(kind: &Kind) -> (&'static str, String) {
+    match kind {
+        Kind::UsageRecorded(_) => ("usage", String::new()),
+        Kind::WorkspaceInstanceChanged(changed) => (
             "workspace",
             changed
                 .report
                 .as_ref()
                 .map_or_else(String::new, |report| report.detail.clone()),
         ),
-        Some(Kind::AgentLifecycleChanged(changed)) => (
+        Kind::AgentLifecycleChanged(changed) => (
             "lifecycle",
             joined(agent_lifecycle_name(changed.state), &changed.reason),
         ),
-        Some(Kind::SessionLifecycleChanged(changed)) => (
+        Kind::SessionLifecycleChanged(changed) => (
             "session",
             joined(session_lifecycle_name(changed.state), &changed.reason),
         ),
-        Some(Kind::PlacementChanged(changed)) => (
+        Kind::PlacementChanged(changed) => (
             "placement",
             changed
                 .placement
@@ -312,8 +331,10 @@ fn describe(kind: Option<&Kind>) -> (&'static str, String) {
                     joined(placement_state_name(placement.state), &placement.reason)
                 }),
         ),
-        Some(Kind::TurnInterrupted(interrupted)) => ("interrupt", interrupted.reason.clone()),
-        None => ("unknown", String::new()),
+        Kind::TurnInterrupted(interrupted) => ("interrupt", interrupted.reason.clone()),
+        // Only reachable for a conversational kind handed here directly; the
+        // dispatcher never does, but a total answer beats a panic.
+        _ => ("unknown", String::new()),
     }
 }
 
@@ -975,5 +996,13 @@ mod tests {
     fn a_reason_joins_its_state_only_when_there_is_one() {
         assert_eq!(super::joined("idle", ""), "idle");
         assert_eq!(super::joined("idle", "reaped"), "idle: reaped");
+    }
+
+    /// The dispatcher never hands the machinery half a conversational kind,
+    /// but its total-answer arm is a promise, and promises get tests.
+    #[test]
+    fn the_machinery_half_answers_unknown_for_a_conversational_kind() {
+        let (label, text) = super::machinery_line(&Kind::NoteSent(NoteSent::default()));
+        assert_eq!((label, text.as_str()), ("unknown", ""));
     }
 }
