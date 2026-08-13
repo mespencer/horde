@@ -61,6 +61,10 @@ pub struct Runtime {
     /// The provider used when a spawn command names none — the state of the
     /// world before the scheduler resolves bindings.
     default_provider: Option<String>,
+    /// Materializes instances and produces per-agent checkouts. `None` means
+    /// this Worker does not advertise workspace support and refuses
+    /// materialize commands loudly.
+    workspaces: Option<crate::workspace::WorkspaceManager>,
     agents: BTreeMap<String, AgentHandle>,
     /// Pumps whose agents were archived, kept so shutdown can wait for them.
     retired: Vec<tokio::task::JoinHandle<()>>,
@@ -134,9 +138,25 @@ impl Runtime {
             journal,
             adapters: BTreeMap::new(),
             default_provider: None,
+            workspaces: None,
             agents: BTreeMap::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Enables workspace support: materialize commands are applied, spawns
+    /// naming a workspace get a checkout, and the advertisement says so.
+    #[must_use]
+    pub fn with_workspaces(mut self, workspaces: crate::workspace::WorkspaceManager) -> Self {
+        self.workspaces = Some(workspaces);
+        self
+    }
+
+    /// The workspace manager, when this Worker has one — the advertisement
+    /// builder reads warmth and support from it.
+    #[must_use]
+    pub fn workspaces(&self) -> Option<&crate::workspace::WorkspaceManager> {
+        self.workspaces.as_ref()
     }
 
     /// Registers an adapter under its provider key. The first registered
@@ -197,13 +217,44 @@ impl Runtime {
             Command::DeliverPermissionDecision(decision) => {
                 self.deliver_permission_decision(decision)
             }
-            // The Worker did not advertise workspace support, so receiving
-            // this means the handshake promised something it cannot honour.
-            // Loud beats acking work that never happened.
-            Command::MaterializeWorkspace(_) => {
-                Err(WorkerError::UnsupportedCommand("materialize workspace"))
+            Command::MaterializeWorkspace(materialize) => {
+                self.materialize_workspace(materialize).await
             }
         }
+    }
+
+    /// Creates or repairs an Instance and journals what is now on disk.
+    ///
+    /// A Worker with no workspace manager never advertised support, so
+    /// receiving this means the handshake promised something it cannot
+    /// honour — loud beats acking work that never happened. A *degraded*
+    /// materialization, by contrast, applies fine: the report carries the
+    /// failure, and the Server can stop preferring this Worker.
+    async fn materialize_workspace(
+        &mut self,
+        materialize: horde_proto::v1::MaterializeWorkspaceCommand,
+    ) -> Result<Applied, WorkerError> {
+        let Some(workspaces) = &self.workspaces else {
+            return Err(WorkerError::UnsupportedCommand("materialize workspace"));
+        };
+        let definition = materialize
+            .definition
+            .ok_or(WorkerError::Incomplete("workspace definition"))?;
+        let session_id = required_id(materialize.session_id.as_ref(), "session id")?;
+
+        let report = workspaces.materialize(&definition).await;
+        Ok(Applied {
+            effects: vec![JournalEntry {
+                session_id,
+                agent_id: None,
+                idempotency_key: String::new(),
+                kind: Kind::WorkspaceInstanceChanged(horde_proto::v1::WorkspaceInstanceChanged {
+                    report: Some(report),
+                    progress: None,
+                }),
+            }],
+            then: AfterCommit::Nothing,
+        })
     }
 
     async fn spawn_agent(&mut self, spawn: SpawnAgentCommand) -> Result<Applied, WorkerError> {
@@ -284,12 +335,56 @@ impl Runtime {
             .get(&provider)
             .ok_or_else(|| WorkerError::UnknownProvider(provider.clone()))?;
 
-        let spec = domain_spec(spawn);
+        let cwd = self.agent_checkout(spawn).await?;
+        let spec = domain_spec(spawn, cwd);
         let session = adapter.spawn(&spec).await?;
         let can_rewrite = adapter
             .capabilities()
             .supports(Capability::RewritesToolInput);
         Ok((session, can_rewrite))
+    }
+
+    /// The working directory a spawn's workspace and Checkout Policy call
+    /// for; `None` when the spawn names no workspace and the agent runs
+    /// where the Worker runs.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Workspace`] when a workspace is named but this Worker
+    /// has no manager, no materialized instance, or the checkout fails — the
+    /// spawn's failure, journaled as a failed lifecycle by the caller.
+    async fn agent_checkout(
+        &self,
+        spawn: &SpawnAgentCommand,
+    ) -> Result<Option<std::path::PathBuf>, WorkerError> {
+        let Some(spec) = spawn.spec.as_ref() else {
+            return Ok(None);
+        };
+        let Some(definition_id) = spec
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(None);
+        };
+        let workspaces = self.workspaces.as_ref().ok_or_else(|| {
+            WorkerError::Workspace(format!(
+                "the spawn names workspace {definition_id}, but this worker has no workspace root"
+            ))
+        })?;
+
+        let agent_id = spawn
+            .agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let policy = horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy)
+            .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified);
+        workspaces
+            .checkout(&definition_id, &agent_id, policy)
+            .await
+            .map(Some)
     }
 
     fn deliver_message(&mut self, deliver: DeliverMessageCommand) -> Applied {
@@ -578,7 +673,10 @@ fn known_agent(
 }
 
 /// What the wire spawn command means to an adapter.
-fn domain_spec(spawn: &SpawnAgentCommand) -> horde_adapter::AgentSpec {
+fn domain_spec(
+    spawn: &SpawnAgentCommand,
+    cwd: Option<std::path::PathBuf>,
+) -> horde_adapter::AgentSpec {
     let binding = spawn.binding.as_ref();
     horde_adapter::AgentSpec {
         model: binding
@@ -586,8 +684,9 @@ fn domain_spec(spawn: &SpawnAgentCommand) -> horde_adapter::AgentSpec {
             .filter(|model| !model.is_empty()),
         append_system_prompt: (!spawn.prompt_overlay.is_empty())
             .then(|| spawn.prompt_overlay.clone()),
-        // Workspaces are wave 4; until then agents run where the Worker runs.
-        cwd: None,
+        // The checkout the spawn's workspace and policy called for; `None`
+        // runs the agent where the Worker runs.
+        cwd,
         account: binding
             .map(|binding| binding.provider_account.clone())
             .filter(|account| !account.is_empty())
@@ -1319,7 +1418,10 @@ mod tests {
     #[tokio::test]
     async fn the_registered_adapters_are_what_the_advertisement_sees() {
         let runtime = runtime_with(Script::echoing());
-        let advertised = crate::capabilities::advertise(runtime.adapters());
+        let advertised = crate::capabilities::advertise(
+            runtime.adapters(),
+            runtime.workspaces().map(|_| Vec::new()),
+        );
         assert_eq!(advertised.harnesses.len(), 1);
         assert_eq!(advertised.harnesses[0].provider, "fake");
     }
@@ -1386,7 +1488,7 @@ mod tests {
             ..SpawnAgentCommand::default()
         };
 
-        let spec = super::domain_spec(&spawn);
+        let spec = super::domain_spec(&spawn, None);
         assert_eq!(spec.model.as_deref(), Some("fake-deep"));
         assert_eq!(
             spec.account,
@@ -1399,7 +1501,7 @@ mod tests {
     /// account means "the harness's default", and protobuf cannot say `None`.
     #[test]
     fn empty_wire_strings_mean_absent_not_empty() {
-        let spec = super::domain_spec(&SpawnAgentCommand::default());
+        let spec = super::domain_spec(&SpawnAgentCommand::default(), None);
         assert_eq!(spec.model, None, "no binding is not an empty model name");
         assert_eq!(spec.account, None, "no account is the ambient default");
         assert_eq!(
@@ -1433,6 +1535,159 @@ mod tests {
             0,
             "a refused command is not acked"
         );
+    }
+
+    /// A single-commit origin, built with git itself.
+    fn tiny_origin(root: &std::path::Path) -> std::path::PathBuf {
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).expect("origin dir");
+        for arguments in [
+            ["init", "-q", "-b", "main"].as_slice(),
+            [
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+                "--allow-empty",
+            ]
+            .as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&origin)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {arguments:?} failed");
+        }
+        origin
+    }
+
+    /// A materialize command for one definition cloning `origin`.
+    fn materialize_command(sequence: u64, origin: &std::path::Path) -> StreamCommandsResponse {
+        StreamCommandsResponse {
+            command_sequence: sequence,
+            command_id: format!("s1:{sequence}"),
+            command: Some(Command::MaterializeWorkspace(MaterializeWorkspaceCommand {
+                definition: Some(horde_proto::v1::WorkspaceDefinition {
+                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                        "ws-1",
+                    )),
+                    name: "atlas".to_owned(),
+                    repos: vec![horde_proto::v1::WorkspaceRepo {
+                        name: "atlas".to_owned(),
+                        remote_url: origin.display().to_string(),
+                        default_branch: "main".to_owned(),
+                        layout_path: String::new(),
+                    }],
+                    unmanaged_paths: Vec::new(),
+                    created_at: None,
+                    etag: "1".to_owned(),
+                }),
+                session_id: Some(SessionId::new("s1")),
+            })),
+        }
+    }
+
+    /// The full workspace path through the runtime: materialize journals what
+    /// landed on disk, and the spawn that follows runs in its checkout.
+    #[tokio::test]
+    async fn a_materialize_then_spawn_runs_the_agent_in_its_checkout() {
+        let temp = tempfile::tempdir().expect("a tempdir");
+        let origin = tiny_origin(temp.path());
+        let workspaces_root = temp.path().join("workspaces");
+        let mut runtime =
+            runtime_with(Script::of(vec![ScriptedTurn::saying("hi")])).with_workspaces(
+                crate::workspace::WorkspaceManager::new("worker-a", workspaces_root.clone()),
+            );
+
+        runtime
+            .apply(materialize_command(1, &origin))
+            .await
+            .expect("the materialize applies");
+
+        let events = journal_at_least(&runtime, 1).await;
+        match events[0]
+            .event
+            .as_ref()
+            .and_then(|event| event.kind.as_ref())
+        {
+            Some(Kind::WorkspaceInstanceChanged(changed)) => {
+                let report = changed.report.as_ref().expect("a report");
+                assert_eq!(
+                    report.state,
+                    horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+                    "detail: {}",
+                    report.detail
+                );
+            }
+            other => panic!("expected a workspace instance report, got {other:?}"),
+        }
+
+        let mut spawn = spawn_command(2, "agent-1", "hello");
+        if let Some(Command::SpawnAgent(command)) = &mut spawn.command
+            && let Some(spec) = &mut command.spec
+        {
+            spec.workspace_definition_id =
+                Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1"));
+            spec.checkout_policy = horde_proto::v1::CheckoutPolicy::Worktree as i32;
+        }
+        runtime.apply(spawn).await.expect("the spawn applies");
+
+        assert_eq!(runtime.running_agents(), 1);
+        assert!(
+            workspaces_root
+                .join("ws-1")
+                .join(".horde-agents")
+                .join("agent-1")
+                .join("atlas")
+                .join(".git")
+                .is_file(),
+            "the agent's worktree checkout was composed before the harness started"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A spawn naming a workspace on a Worker with no workspace root fails
+    /// the *agent* honestly rather than the command loop.
+    #[tokio::test]
+    async fn a_workspace_spawn_without_support_fails_the_agent_honestly() {
+        let mut runtime = runtime_with(Script::echoing());
+        let mut spawn = spawn_command(1, "agent-1", "hello");
+        if let Some(Command::SpawnAgent(command)) = &mut spawn.command
+            && let Some(spec) = &mut command.spec
+        {
+            spec.workspace_definition_id =
+                Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1"));
+        }
+
+        runtime
+            .apply(spawn)
+            .await
+            .expect("the command applies; the agent is what failed");
+
+        assert_eq!(runtime.running_agents(), 0);
+        let events = journal_at_least(&runtime, 1).await;
+        match events[0]
+            .event
+            .as_ref()
+            .and_then(|event| event.kind.as_ref())
+        {
+            Some(Kind::AgentLifecycleChanged(changed)) => {
+                assert_eq!(
+                    changed.state,
+                    i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+                );
+                assert!(
+                    changed.reason.contains("workspace"),
+                    "the reason names the missing half: {}",
+                    changed.reason
+                );
+            }
+            other => panic!("expected a failed lifecycle, got {other:?}"),
+        }
     }
 
     /// A spawn that cannot start fails the *agent*, not the command loop: the

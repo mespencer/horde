@@ -30,6 +30,7 @@ pub mod journal;
 pub mod process;
 pub mod runtime;
 pub mod translate;
+pub mod workspace;
 
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use client::{ApplyCommand, Connection, DialConfig};
@@ -38,3 +39,4 @@ pub use journal::{CommandApplication, Journal, JournalEntry, JournalSink};
 pub use process::{SupervisedHarness, SupervisorError};
 pub use runtime::Runtime;
 pub use translate::AgentContext;
+pub use workspace::WorkspaceManager;

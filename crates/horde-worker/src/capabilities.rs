@@ -8,7 +8,9 @@
 //! would then fail to drive.
 
 use horde_adapter::Adapter;
-use horde_proto::v1::{HarnessCapability, Hello, Platform, Role, WorkerCapabilities};
+use horde_proto::v1::{
+    HarnessCapability, Hello, Platform, Role, WorkerCapabilities, WorkspaceInstanceReport,
+};
 use horde_wire::capability_to_wire;
 
 /// The version/role handshake sent at registration (DESIGN.md §2).
@@ -26,26 +28,29 @@ pub fn hello(display_name: &str) -> Hello {
     }
 }
 
-/// The full advertisement placement matches on, from the registered adapters.
+/// The full advertisement placement matches on, from the registered adapters
+/// and the Instances actually on disk.
 ///
-/// Tags, provider accounts, reachable remotes and warm instances stay empty
-/// until the subsystems that own those facts exist (accounts are wave-5
-/// enrollment, instances wave-4 workspaces); advertising them earlier would
-/// have the scheduler matching on facts nothing maintains.
+/// Tags, provider accounts and reachable remotes stay empty until the
+/// subsystems that own those facts exist (accounts are wave-5 enrollment);
+/// advertising them earlier would have the scheduler matching on facts
+/// nothing maintains. Warm instances and workspace support come from the
+/// workspace half: `None` honestly advertises a Worker that would refuse a
+/// materialize command.
 #[must_use]
-pub fn advertise<'a>(adapters: impl IntoIterator<Item = &'a dyn Adapter>) -> WorkerCapabilities {
+pub fn advertise<'a>(
+    adapters: impl IntoIterator<Item = &'a dyn Adapter>,
+    warm_instances: Option<Vec<WorkspaceInstanceReport>>,
+) -> WorkerCapabilities {
     WorkerCapabilities {
         tags: Vec::new(),
         platform: Some(platform()),
         provider_accounts: Vec::new(),
         reachable_remotes: Vec::new(),
-        warm_instances: Vec::new(),
+        supports_workspaces: warm_instances.is_some(),
+        warm_instances: warm_instances.unwrap_or_default(),
         harnesses: adapters.into_iter().map(harness).collect(),
         max_concurrent_agents: 0,
-        // Advertised by the runtime once it is configured with a workspace
-        // root (`Runtime::with_workspaces`); a bare advertisement stays honest
-        // about a worker that would refuse a materialize command.
-        supports_workspaces: false,
     }
 }
 
@@ -119,7 +124,7 @@ mod tests {
     #[test]
     fn a_registered_claude_adapter_is_advertised_with_its_gating() {
         let claude = ClaudeAdapter::new();
-        let capabilities = advertise([&claude as &dyn Adapter]);
+        let capabilities = advertise([&claude as &dyn Adapter], None);
 
         let harnesses = &capabilities.harnesses;
         assert_eq!(harnesses.len(), 1);
@@ -152,7 +157,7 @@ mod tests {
 
     #[test]
     fn nothing_unmaintained_is_advertised() {
-        let capabilities = advertise([]);
+        let capabilities = advertise([], None);
         assert!(capabilities.provider_accounts.is_empty());
         assert!(capabilities.warm_instances.is_empty());
         assert!(capabilities.reachable_remotes.is_empty());
@@ -167,7 +172,7 @@ mod tests {
     /// matching placement constraints against a machine that runs nothing.
     #[test]
     fn the_platform_reports_this_machines_facts() {
-        let platform = advertise([]).platform.expect("a platform");
+        let platform = advertise([], None).platform.expect("a platform");
         assert_eq!(platform.os, goos(std::env::consts::OS));
         assert_eq!(platform.arch, goarch(std::env::consts::ARCH));
         assert!(

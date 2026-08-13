@@ -235,7 +235,10 @@ mod harness {
             endpoint: endpoint.to_owned(),
             worker_id: worker_id.to_owned(),
             hello: capabilities::hello(worker_id),
-            capabilities: capabilities::advertise(runtime.adapters()),
+            capabilities: capabilities::advertise(
+                runtime.adapters(),
+                runtime.workspaces().map(|_| Vec::new()),
+            ),
         }
     }
 
@@ -245,7 +248,7 @@ mod harness {
             endpoint: endpoint.to_owned(),
             worker_id: worker_id.to_owned(),
             hello: capabilities::hello(worker_id),
-            capabilities: capabilities::advertise(std::iter::empty::<&dyn Adapter>()),
+            capabilities: capabilities::advertise(std::iter::empty::<&dyn Adapter>(), None),
         }
     }
 
