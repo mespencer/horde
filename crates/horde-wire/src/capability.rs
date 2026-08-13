@@ -141,7 +141,10 @@ mod tests {
     /// land here", which ungated exec forbids.
     #[test]
     fn scoped_mcp_gating_does_not_advertise_as_blanket_gating() {
-        assert_eq!(capability_to_wire(Capability::PreAuthorizeMcpToolCalls), None);
+        assert_eq!(
+            capability_to_wire(Capability::PreAuthorizeMcpToolCalls),
+            None
+        );
     }
 
     #[test]

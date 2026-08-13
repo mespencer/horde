@@ -10,7 +10,10 @@
 //! the conformance suite's verdict on a replayed session means something about
 //! the live one.
 
-use horde_adapter::{AdapterError, AgentEvent, LineDecoder, ProviderSessionId, Result, ToolCallId};
+use horde_adapter::{
+    AdapterError, AgentEvent, Capability, LineDecoder, PermissionDecision, ProviderSessionId,
+    Result, ToolCallId,
+};
 
 use crate::codec::decode_line;
 use crate::turn::TurnAssembler;
@@ -38,12 +41,41 @@ impl LineDecoder for AppServerFrames {
     }
 
     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {
-        // Codex 0.145.0 routes no approvals to the client at all (ADR-0005), so
-        // there is never an outstanding request to answer — on a recording or
-        // on a live session.
+        // Exec approvals never reach the client (ADR-0005), and an MCP
+        // elicitation that is not outstanding is not answerable either way.
         AdapterError::UnknownPermissionRequest {
             tool_call_id: tool_call_id.clone(),
         }
+    }
+
+    fn answer_permission(
+        &mut self,
+        tool_call_id: &ToolCallId,
+        decision: &PermissionDecision,
+    ) -> Result<()> {
+        // The same two rules a live session applies. A narrowing decision is
+        // refused — the elicitation reply is accept-or-decline with nowhere to
+        // carry replacement arguments — and an answer for a call that is not
+        // waiting is an error, never a no-op.
+        if decision.updated_input().is_some() {
+            return Err(AdapterError::Unsupported {
+                provider: crate::PROVIDER.to_owned(),
+                capability: Capability::RewritesToolInput,
+            });
+        }
+        match self
+            .assembler
+            .resolve_elicitation(tool_call_id, decision.is_allow())
+        {
+            // On a recording there is no wire to write the reply to; the
+            // recorded continuation is the harness's reaction to it.
+            Some(_rpc_id) => Ok(()),
+            None => Err(self.no_permission_channel(tool_call_id)),
+        }
+    }
+
+    fn awaiting_decision(&self) -> Option<ToolCallId> {
+        self.assembler.awaiting_decision()
     }
 }
 

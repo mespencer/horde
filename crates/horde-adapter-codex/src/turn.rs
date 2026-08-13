@@ -4,15 +4,18 @@
 //! traps spike W2c measured live here, because each is a place where following
 //! the protocol's apparent shape produces a bug that only shows under load.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use horde_adapter::permission::{PermissionDenial, ProposedToolCall};
 use horde_adapter::usage::{HeadroomSource, RateWindow, TokenUsage, UsageDelta, Utilization};
 use horde_adapter::{
-    AgentEvent, OutputChannel, ProviderSessionId, TurnId, TurnOutcome, TurnStatus,
+    AgentEvent, OutputChannel, ProviderSessionId, ToolCallId, TurnId, TurnOutcome, TurnStatus,
 };
 
-use crate::wire::{Frame, Item, Notification, TokenCounts};
+use crate::wire::{
+    ErrorBody, Frame, Item, MCP_ELICITATION_METHOD, McpElicitation, Notification, TokenCounts,
+};
 
 /// Turns a stream of frames into agent events.
 #[derive(Debug, Default)]
@@ -35,13 +38,39 @@ pub struct TurnAssembler {
     /// consumed by the next turn and cleared when a turn closes, so it can
     /// never leak into a later, unrelated turn.
     interrupt_pending: bool,
+    /// Elicitations awaiting Horde's answer, by the tool-call id the
+    /// [`AgentEvent::PermissionRequested`] carried. The value holds the JSON-RPC
+    /// request id the reply must correlate to, plus what a denial record needs.
+    outstanding: BTreeMap<ToolCallId, OutstandingElicitation>,
+}
+
+/// One elicitation Horde has been offered and not yet answered.
+#[derive(Debug)]
+struct OutstandingElicitation {
+    /// The server->client JSON-RPC id the reply correlates to.
+    rpc_id: u64,
+    tool_name: String,
+    input: serde_json::Value,
+}
+
+/// An `mcpToolCall` item that has started and may be about to elicit.
+///
+/// The elicitation names the server but **not the tool** (transcript 17); the
+/// item started just before it carries the tool's name, its arguments, and the
+/// id everything later correlates by. This is the join record.
+#[derive(Debug, Clone)]
+struct StartedMcpCall {
+    item_id: String,
+    server: String,
+    tool: String,
+    arguments: serde_json::Value,
 }
 
 #[derive(Debug)]
 struct OpenTurn {
     id: TurnId,
-    /// Deltas seen, per channel, for gap detection downstream.
-    chunk_index: u64,
+    /// Next chunk index per channel, for gap detection downstream.
+    chunks: Vec<(OutputChannel, u64)>,
     /// Final-answer texts. A steered turn produces more than one (transcript
     /// 15); the last is the answer to the steer, which is what a Result should
     /// carry.
@@ -49,17 +78,37 @@ struct OpenTurn {
     usage: TokenUsage,
     interrupt_requested: bool,
     duration: Duration,
+    /// MCP tool calls that have started and not yet elicited, oldest first.
+    started_mcp_calls: VecDeque<StartedMcpCall>,
+    /// Calls the permission chain refused during this turn.
+    denials: Vec<PermissionDenial>,
 }
 
 impl OpenTurn {
     fn new(id: TurnId) -> Self {
         Self {
             id,
-            chunk_index: 0,
+            chunks: Vec::new(),
             final_answers: Vec::new(),
             usage: TokenUsage::default(),
             interrupt_requested: false,
             duration: Duration::ZERO,
+            started_mcp_calls: VecDeque::new(),
+            denials: Vec::new(),
+        }
+    }
+
+    fn next_chunk_index(&mut self, channel: OutputChannel) -> u64 {
+        match self.chunks.iter_mut().find(|(known, _)| *known == channel) {
+            Some((_, next)) => {
+                let index = *next;
+                *next = next.saturating_add(1);
+                index
+            }
+            None => {
+                self.chunks.push((channel, 1));
+                0
+            }
         }
     }
 }
@@ -89,15 +138,132 @@ impl TurnAssembler {
         }
     }
 
+    /// The id of the turn currently open, when one is.
+    ///
+    /// This is what `turn/steer` needs as its `expectedTurnId` precondition —
+    /// steering amends the *active* turn, so the caller has to name it.
+    #[must_use]
+    pub fn active_turn_id(&self) -> Option<&TurnId> {
+        self.turn.as_ref().map(|turn| &turn.id)
+    }
+
     /// Feeds one frame, returning the events it produced.
+    ///
+    /// A [`Frame::ServerRequest`] carrying an MCP tool-call elicitation
+    /// becomes an [`AgentEvent::PermissionRequested`] and is tracked until
+    /// [`Self::resolve_elicitation`] answers it. Every other server request
+    /// produces nothing here — the caller owns the wire and must reply to it
+    /// (deny-by-default), or the harness parks forever (transcript 19).
     pub fn feed(&mut self, frame: &Frame) -> Vec<AgentEvent> {
         match frame {
             Frame::Notification(notification) => self.feed_notification(notification),
+            Frame::ServerRequest { id, method, params } if method == MCP_ELICITATION_METHOD => {
+                self.feed_elicitation(*id, params)
+            }
             // Responses correlate to requests the Worker made and carry nothing
-            // the event stream needs; server requests are approvals, which
-            // Codex does not send (ADR-0005).
+            // the event stream needs; other server requests are the caller's to
+            // refuse.
             Frame::Response { .. } | Frame::ServerRequest { .. } => Vec::new(),
         }
+    }
+
+    /// The JSON-RPC id the answer to `tool_call_id` must correlate to, while
+    /// that elicitation is still outstanding.
+    #[must_use]
+    pub fn elicitation_rpc_id(&self, tool_call_id: &ToolCallId) -> Option<u64> {
+        self.outstanding.get(tool_call_id).map(|e| e.rpc_id)
+    }
+
+    /// The elicitation the session is blocked on, if any.
+    ///
+    /// The harness will not run the call — or write the frames behind it —
+    /// until this is answered, so a caller that keeps polling for events while
+    /// owing an answer deserves to be told what it owes.
+    #[must_use]
+    pub fn awaiting_decision(&self) -> Option<ToolCallId> {
+        self.outstanding.keys().next().cloned()
+    }
+
+    /// Records Horde's answer to an outstanding elicitation, returning the
+    /// JSON-RPC id the caller must reply to — `None` means nothing was waiting
+    /// under that id, which the caller reports as an error rather than a no-op.
+    ///
+    /// A denial is recorded on the open turn, because "the chain refused a
+    /// call" is part of the turn's outcome (`TurnOutcome::denials`) — the
+    /// harness itself only ever shows the agent the fixed rejection string.
+    pub fn resolve_elicitation(&mut self, tool_call_id: &ToolCallId, allowed: bool) -> Option<u64> {
+        let outstanding = self.outstanding.remove(tool_call_id)?;
+        if !allowed && let Some(turn) = self.turn.as_mut() {
+            turn.denials.push(PermissionDenial {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: outstanding.tool_name.clone(),
+                attempted_input: outstanding.input.clone(),
+            });
+        }
+        Some(outstanding.rpc_id)
+    }
+
+    /// An MCP tool-call elicitation: the interception point, as an event.
+    fn feed_elicitation(&mut self, rpc_id: u64, params: &serde_json::Value) -> Vec<AgentEvent> {
+        let Ok(elicitation) = serde_json::from_value::<McpElicitation>(params.clone()) else {
+            return Vec::new();
+        };
+        if !elicitation.is_mcp_tool_call_approval() {
+            return Vec::new();
+        }
+
+        // The elicitation names the server but not the tool; the started item
+        // is the join. Absent one (shape drift), the event still carries the
+        // server and the _meta arguments, and mints an id from the request —
+        // an approval the chain can act on beats a dropped frame.
+        let started = self
+            .turn
+            .as_mut()
+            .and_then(|turn| turn.started_mcp_calls.pop_front());
+        let (tool_call_id, tool_name, input) = match started {
+            Some(call) => (
+                ToolCallId::new(call.item_id),
+                format!("{}/{}", call.server, call.tool),
+                call.arguments,
+            ),
+            None => (
+                ToolCallId::new(format!("elicitation-{rpc_id}")),
+                elicitation.server_name.clone(),
+                elicitation
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.tool_params.clone())
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+        };
+
+        let turn_id = self
+            .turn
+            .as_ref()
+            .map(|turn| turn.id.clone())
+            .or_else(|| elicitation.turn_id.as_deref().map(TurnId::new));
+        let Some(turn_id) = turn_id else {
+            // No turn to attribute the request to — nothing downstream could
+            // journal or answer it coherently.
+            return Vec::new();
+        };
+
+        self.outstanding.insert(
+            tool_call_id.clone(),
+            OutstandingElicitation {
+                rpc_id,
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+            },
+        );
+        vec![AgentEvent::PermissionRequested {
+            turn_id,
+            request: ProposedToolCall {
+                tool_call_id,
+                tool_name,
+                input,
+            },
+        }]
     }
 
     fn feed_notification(&mut self, notification: &Notification) -> Vec<AgentEvent> {
@@ -135,8 +301,7 @@ impl TurnAssembler {
                 let Some(turn) = self.turn.as_mut() else {
                     return Vec::new();
                 };
-                let chunk_index = turn.chunk_index;
-                turn.chunk_index += 1;
+                let chunk_index = turn.next_chunk_index(OutputChannel::Assistant);
                 vec![AgentEvent::Output {
                     turn_id: turn.id.clone(),
                     channel: OutputChannel::Assistant,
@@ -145,7 +310,29 @@ impl TurnAssembler {
                 }]
             }
 
+            Notification::ItemStarted(started) => {
+                // Only mcpToolCall starts matter: they carry the tool identity
+                // the elicitation that follows will not repeat.
+                if started.item.is_mcp_tool_call()
+                    && let Some(turn) = self.turn.as_mut()
+                {
+                    turn.started_mcp_calls.push_back(StartedMcpCall {
+                        item_id: started.item.id.clone().unwrap_or_default(),
+                        server: started.item.server.clone().unwrap_or_default(),
+                        tool: started.item.tool.clone().unwrap_or_default(),
+                        arguments: started
+                            .item
+                            .arguments
+                            .clone()
+                            .unwrap_or(serde_json::Value::Null),
+                    });
+                }
+                Vec::new()
+            }
+
             Notification::ItemCompleted(completed) => self.item_completed(&completed.item),
+
+            Notification::Error(error) => self.error_notified(error),
 
             Notification::TokenUsageUpdated(update) => {
                 self.record_usage(update.turn_id.as_deref(), update.token_usage.last.as_ref());
@@ -180,7 +367,23 @@ impl TurnAssembler {
 
             Notification::TurnCompleted(completed) => {
                 let duration = completed.turn.duration_ms.map(Duration::from_millis);
-                self.close_turn(TurnStatus::Completed, duration)
+                // `turn/completed` is a framing terminal, not a verdict: the
+                // 0.147.0 schema gives the turn itself a status of completed,
+                // interrupted, or failed, and reporting a failed turn as
+                // Completed would hand the orchestrator a Result built from
+                // an error.
+                let status = match completed.turn.status.as_deref() {
+                    Some("failed") => TurnStatus::Failed {
+                        message: completed
+                            .turn
+                            .error
+                            .as_ref()
+                            .map_or_else(|| "the harness failed the turn".to_owned(), turn_error),
+                    },
+                    Some("interrupted") => TurnStatus::Interrupted,
+                    _ => TurnStatus::Completed,
+                };
+                self.close_turn(status, duration)
             }
 
             // The interrupt trap. `turn/interrupt` produces no terminal frame at
@@ -221,20 +424,55 @@ impl TurnAssembler {
             return Vec::new();
         }
 
-        if item.is_command_execution() {
+        if item.is_command_execution() || item.is_mcp_tool_call() {
             let turn_id = turn.id.clone();
+            // An mcpToolCall can fail without an exit code — a declined
+            // elicitation reads `status: "failed"` with an error message and
+            // nothing else (transcript 18) — so all three signals count.
             let is_error = item.exit_code.is_some_and(|code| code != 0)
-                || item.status.as_deref() == Some("failed");
+                || item.status.as_deref() == Some("failed")
+                || item.error.is_some();
+            // A call that completed without ever eliciting must not linger as
+            // a candidate join for the *next* elicitation.
+            let item_id = item.id.clone().unwrap_or_default();
+            turn.started_mcp_calls
+                .retain(|started| started.item_id != item_id);
             return vec![AgentEvent::ToolCompleted {
                 turn_id,
                 // Codex numbers its own items; there is no separate tool-call
                 // id, so the item id is the identity.
-                tool_call_id: horde_adapter::ToolCallId::new(item.id.clone().unwrap_or_default()),
+                tool_call_id: ToolCallId::new(item_id),
                 is_error,
             }];
         }
 
         Vec::new()
+    }
+
+    /// The `error` notification: a retryable hiccup is surfaced as harness
+    /// diagnostics; a terminal one is the turn's ending.
+    fn error_notified(&mut self, error: &ErrorBody) -> Vec<AgentEvent> {
+        if error.will_retry {
+            let Some(turn) = self.turn.as_mut() else {
+                return Vec::new();
+            };
+            let chunk_index = turn.next_chunk_index(OutputChannel::HarnessDiagnostic);
+            return vec![AgentEvent::Output {
+                turn_id: turn.id.clone(),
+                channel: OutputChannel::HarnessDiagnostic,
+                text: format!("codex will retry: {}", turn_error(&error.error)),
+                chunk_index,
+            }];
+        }
+        // Terminal. The spike's interrupt finding generalizes: nothing
+        // promises a turn/completed after a fatal error, so the error is the
+        // turn's ending or the turn never ends.
+        self.close_turn(
+            TurnStatus::Failed {
+                message: turn_error(&error.error),
+            },
+            None,
+        )
     }
 
     /// Adds a per-turn usage reading, once.
@@ -272,7 +510,7 @@ impl TurnAssembler {
     }
 
     fn close_turn(&mut self, status: TurnStatus, duration: Option<Duration>) -> Vec<AgentEvent> {
-        let Some(turn) = self.turn.take() else {
+        let Some(mut turn) = self.turn.take() else {
             return Vec::new();
         };
         // A closed turn ends the interrupt's reach; the next one starts clean.
@@ -294,11 +532,21 @@ impl TurnAssembler {
                 // Codex prices nothing per turn under a subscription.
                 cost_usd: 0.0,
             },
-            // Codex never surfaces a refusal to Horde — it adjudicates
-            // internally (ADR-0005), so there is nothing to report here.
-            denials: Vec::new(),
+            // Exec refusals never reach Horde — Codex adjudicates those
+            // internally (ADR-0005) — but MCP calls the chain declined through
+            // the elicitation seam are this turn's refusals, and they are what
+            // keeps `is_clean_success` honest for a Codex agent.
+            denials: std::mem::take(&mut turn.denials),
             duration: duration.unwrap_or(turn.duration),
         })]
+    }
+}
+
+/// One line for a turn failure, code first when codex named one.
+fn turn_error(error: &crate::wire::TurnErrorBody) -> String {
+    match error.code() {
+        Some(code) => format!("{code}: {}", error.message),
+        None => error.message.clone(),
     }
 }
 
@@ -419,6 +667,310 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolCompleted { .. })),
             "a user message is not a tool call"
+        );
+    }
+
+    fn mcp_started(id: &str) -> serde_json::Value {
+        json!({"method":"item/started","params":{"item":{
+            "type":"mcpToolCall","id":id,"server":"spike","tool":"horde_probe",
+            "status":"inProgress","arguments":{"token":"HORDE_MCP_OK"}}}})
+    }
+
+    fn elicitation_request(rpc_id: u64) -> serde_json::Value {
+        json!({"id":rpc_id,"method":"mcpServer/elicitation/request","params":{
+            "threadId":"t1","turnId":"turn-1","serverName":"spike","mode":"form",
+            "_meta":{"codex_approval_kind":"mcp_tool_call",
+                     "tool_params":{"token":"HORDE_MCP_OK"}},
+            "message":"Allow?","requestedSchema":{"type":"object","properties":{}}}})
+    }
+
+    /// The interception seam end to end in the assembler: the started item
+    /// supplies the tool identity the elicitation omits, the event carries the
+    /// full arguments, and the answer correlates back to the JSON-RPC id.
+    #[test]
+    fn an_elicitation_joins_its_started_item_and_correlates_its_answer() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        feed(&mut assembler, mcp_started("exec-45"));
+
+        let events = feed(&mut assembler, elicitation_request(7));
+        let request = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::PermissionRequested { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+            .expect("the elicitation must surface as a permission request");
+
+        assert_eq!(request.tool_call_id.as_str(), "exec-45");
+        assert_eq!(
+            request.tool_name, "spike/horde_probe",
+            "the tool identity comes from the started item, not the elicitation"
+        );
+        assert_eq!(request.input, json!({"token":"HORDE_MCP_OK"}));
+
+        assert_eq!(
+            assembler.elicitation_rpc_id(&request.tool_call_id),
+            Some(7),
+            "the reply must correlate to the server's request id"
+        );
+        assert_eq!(
+            assembler.resolve_elicitation(&request.tool_call_id, true),
+            Some(7)
+        );
+        assert_eq!(
+            assembler.resolve_elicitation(&request.tool_call_id, true),
+            None,
+            "an answer consumes the outstanding request; a second one has \
+             nothing to go to"
+        );
+    }
+
+    /// A denied elicitation is the turn's refusal record — this is what keeps
+    /// `is_clean_success` honest for a Codex agent.
+    #[test]
+    fn a_denied_elicitation_lands_in_the_turn_outcomes_denials() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        feed(&mut assembler, mcp_started("exec-45"));
+        let events = feed(&mut assembler, elicitation_request(3));
+        let tool_call_id = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::PermissionRequested { request, .. } => {
+                    Some(request.tool_call_id.clone())
+                }
+                _ => None,
+            })
+            .expect("the request surfaces");
+
+        assert_eq!(assembler.resolve_elicitation(&tool_call_id, false), Some(3));
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"turn/completed",
+                   "params":{"turn":{"id":"turn-1","status":"completed","durationMs":5}}}),
+        );
+        let outcome = events
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::TurnEnded(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("the turn closes");
+        assert_eq!(outcome.denials.len(), 1);
+        assert_eq!(outcome.denials[0].tool_name, "spike/horde_probe");
+        assert_eq!(
+            outcome.denials[0].attempted_input,
+            json!({"token":"HORDE_MCP_OK"})
+        );
+        assert!(
+            !outcome.is_clean_success(),
+            "a turn that hit a refusal is not a clean success"
+        );
+
+        // And an allowed elicitation records no denial.
+        let mut clean = TurnAssembler::new();
+        open_turn(&mut clean);
+        feed(&mut clean, mcp_started("exec-1"));
+        let events = feed(&mut clean, elicitation_request(4));
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::PermissionRequested { request, .. } => {
+                    Some(request.tool_call_id.clone())
+                }
+                _ => None,
+            })
+            .expect("surfaces");
+        clean.resolve_elicitation(&id, true);
+        let events = feed(
+            &mut clean,
+            json!({"method":"turn/completed",
+                   "params":{"turn":{"id":"turn-1","status":"completed"}}}),
+        );
+        let outcome = events
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::TurnEnded(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("closes");
+        assert!(outcome.denials.is_empty(), "an allow is not a refusal");
+    }
+
+    /// Shape drift tolerated: an elicitation with no started item to join
+    /// still surfaces, carrying the `_meta` arguments and a minted id — an
+    /// approval the chain can act on beats a dropped frame.
+    #[test]
+    fn an_elicitation_without_a_started_item_still_surfaces() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(&mut assembler, elicitation_request(9));
+        let request = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::PermissionRequested { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+            .expect("must surface without the join");
+        assert_eq!(request.tool_call_id.as_str(), "elicitation-9");
+        assert_eq!(request.tool_name, "spike");
+        assert_eq!(request.input, json!({"token":"HORDE_MCP_OK"}));
+    }
+
+    /// A non-approval elicitation must not be surfaced as a permission
+    /// request — the discriminator is `codex_approval_kind`, and the caller
+    /// declines what produced no event.
+    #[test]
+    fn a_non_tool_call_elicitation_produces_no_permission_request() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(
+            &mut assembler,
+            json!({"id":5,"method":"mcpServer/elicitation/request","params":{
+                "threadId":"t1","serverName":"spike",
+                "_meta":{"codex_approval_kind":"oauth_login"}}}),
+        );
+        assert!(events.is_empty(), "not a tool-call approval: {events:?}");
+    }
+
+    /// The mcpToolCall completion is a tool event, and a declined call — which
+    /// fails with an error message and no exit code (transcript 18) — must
+    /// read as an error.
+    #[test]
+    fn an_mcp_tool_call_completion_reports_success_and_rejection_honestly() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let ok = tool_error(
+            &mut assembler,
+            json!({"method":"item/completed","params":{"item":{
+                "type":"mcpToolCall","id":"exec-1","server":"spike","tool":"horde_probe",
+                "status":"completed","arguments":{},
+                "result":{"content":[{"type":"text","text":"PROBE:HORDE_MCP_OK"}]}}}}),
+        );
+        assert_eq!(ok, Some(false), "a completed call is not an error");
+
+        let rejected = tool_error(
+            &mut assembler,
+            json!({"method":"item/completed","params":{"item":{
+                "type":"mcpToolCall","id":"exec-2","server":"spike","tool":"horde_probe",
+                "status":"failed","arguments":{},
+                "error":{"message":"user rejected MCP tool call"}}}}),
+        );
+        assert_eq!(rejected, Some(true), "a rejected call is an error");
+    }
+
+    /// The `error` notification's retry bit is the difference between a
+    /// diagnostic and a verdict: willRetry surfaces as harness noise, a
+    /// terminal error is the turn's ending — nothing promises a
+    /// `turn/completed` after one.
+    #[test]
+    fn a_retryable_error_is_diagnostic_and_a_terminal_one_ends_the_turn() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"error","params":{
+                "error":{"message":"stream disconnected"},
+                "threadId":"t1","turnId":"turn-1","willRetry":true}}),
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Output {
+                    channel: horde_adapter::OutputChannel::HarnessDiagnostic,
+                    ..
+                }
+            )),
+            "a retryable error is worth showing: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnded(_))),
+            "and must not end the turn"
+        );
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"error","params":{
+                "error":{"message":"401 Unauthorized","codexErrorInfo":"unauthorized"},
+                "threadId":"t1","turnId":"turn-1","willRetry":false}}),
+        );
+        let outcome = events
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::TurnEnded(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("a terminal error ends the turn");
+        match outcome.status {
+            TurnStatus::Failed { message } => {
+                assert!(
+                    message.contains("unauthorized") && message.contains("401"),
+                    "the lifecycle reason carries both the code and the text: {message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// `turn/completed` is framing, not a verdict: a turn whose own status is
+    /// failed must not be reported as Completed.
+    #[test]
+    fn a_completed_frame_with_a_failed_status_reports_the_failure() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"turn/completed","params":{"turn":{
+                "id":"turn-1","status":"failed",
+                "error":{"message":"context window exceeded",
+                         "codexErrorInfo":"contextWindowExceeded"}}}}),
+        );
+        let outcome = events
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::TurnEnded(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("closes");
+        assert!(
+            matches!(
+                &outcome.status,
+                TurnStatus::Failed { message } if message.contains("contextWindowExceeded")
+            ),
+            "got {:?}",
+            outcome.status
+        );
+    }
+
+    /// Steering needs the active turn's id as its precondition; between turns
+    /// there is nothing to steer.
+    #[test]
+    fn the_active_turn_id_exists_exactly_while_a_turn_is_open() {
+        let mut assembler = TurnAssembler::new();
+        assert!(assembler.active_turn_id().is_none());
+
+        open_turn(&mut assembler);
+        assert_eq!(
+            assembler.active_turn_id().map(|id| id.as_str().to_owned()),
+            Some("turn-1".to_owned())
+        );
+
+        feed(
+            &mut assembler,
+            json!({"method":"turn/completed","params":{"turn":{"id":"turn-1"}}}),
+        );
+        assert!(
+            assembler.active_turn_id().is_none(),
+            "a closed turn cannot be steered"
         );
     }
 

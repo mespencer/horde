@@ -240,6 +240,9 @@ fn every_codex_transcript_decodes() {
         "14-rust-probe.jsonl",
         "15-steer.jsonl",
         "16-thread-resume.jsonl",
+        "17-mcp-elicitation-accept.jsonl",
+        "18-mcp-elicitation-decline.jsonl",
+        "19-mcp-elicitation-onrequest.jsonl",
     ] {
         let mut assembler = TurnAssembler::new();
         for line in transcript(name) {
@@ -250,9 +253,10 @@ fn every_codex_transcript_decodes() {
     }
 }
 
-/// The approval recordings prove the negative ADR-0005 rests on.
+/// The exec-approval recordings prove the negative ADR-0005 rests on — for
+/// shell/exec it stands, unmoved by the amendment that reversed the MCP half.
 #[test]
-fn no_recording_ever_produced_a_permission_request() {
+fn no_exec_recording_ever_produced_a_permission_request() {
     for name in [
         "04-approval-echo-untrusted.jsonl",
         "06-approval-write-granular.jsonl",
@@ -263,9 +267,95 @@ fn no_recording_ever_produced_a_permission_request() {
             !events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::PermissionRequested { .. })),
-            "{name}: Codex 0.145.0 routes no approvals to the client (ADR-0005)"
+            "{name}: Codex routes no shell/exec approvals to the client (ADR-0005)"
         );
     }
+}
+
+/// Transcript 17 — the ADR-0005 amendment, in recorded bytes: an MCP tool
+/// call surfaces as a permission request carrying the full arguments, and
+/// only after the answer does the call complete.
+#[test]
+fn an_mcp_tool_call_is_offered_before_it_runs_with_its_full_arguments() {
+    let (events, _) = replay("17-mcp-elicitation-accept.jsonl");
+
+    let request_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::PermissionRequested { .. }))
+        .expect("the elicitation must surface as a permission request");
+    let completed_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolCompleted { .. }))
+        .expect("the allowed call completes");
+    assert!(
+        request_at < completed_at,
+        "the request precedes the call's completion — that ordering is the seam"
+    );
+
+    let Some(AgentEvent::PermissionRequested { request, .. }) = events.get(request_at) else {
+        unreachable!("position() found it");
+    };
+    assert_eq!(request.tool_name, "spike/horde_probe");
+    assert_eq!(
+        request.input,
+        serde_json::json!({"token": "HORDE_MCP_OK"}),
+        "the chain sees the full arguments before the call runs"
+    );
+
+    let Some(AgentEvent::ToolCompleted { is_error, .. }) = events.get(completed_at) else {
+        unreachable!("position() found it");
+    };
+    assert!(!is_error, "the accepted call succeeded");
+}
+
+/// Transcript 18 — the decline path: the call fails without a byte reaching
+/// the MCP server, and the denial rides the turn's outcome.
+#[tokio::test]
+async fn a_declined_mcp_call_fails_the_tool_and_records_the_denial() {
+    let turns = codex_turns("18-mcp-elicitation-decline.jsonl");
+    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
+    let mut session = replay_session(turns);
+
+    let records = horde_testkit::conformance::check_session_with(&mut session, &messages, &|_| {
+        horde_adapter::PermissionDecision::deny("blocked by policy")
+    })
+    .await
+    .expect("the declined recording must still satisfy the contract");
+
+    let outcome = &records.last().expect("the recording has a turn").outcome;
+    assert_eq!(outcome.denials.len(), 1, "the refusal is the turn's record");
+    assert_eq!(outcome.denials[0].tool_name, "spike/horde_probe");
+    assert!(
+        !outcome.is_clean_success(),
+        "a turn that hit a refusal is not a clean success"
+    );
+
+    let rejected = records
+        .last()
+        .into_iter()
+        .flat_map(|r| &r.events)
+        .any(|event| matches!(event, AgentEvent::ToolCompleted { is_error: true, .. }));
+    assert!(
+        rejected,
+        "the declined call surfaces to the agent as a failed tool"
+    );
+}
+
+/// The accept recording, driven through the whole session seam under the
+/// shared conformance checks — permission answered where a live worker would
+/// answer it.
+#[tokio::test]
+async fn the_elicitation_recording_satisfies_the_adapter_contract() {
+    let turns = codex_turns("17-mcp-elicitation-accept.jsonl");
+    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
+    let mut session = replay_session(turns);
+
+    let records = horde_testkit::conformance::check_session(&mut session, &messages).await;
+    assert!(
+        records.is_ok(),
+        "the recorded session violated the adapter contract: {:?}",
+        records.err()
+    );
 }
 
 // ---------------------------------------------------------------------------
