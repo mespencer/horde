@@ -421,7 +421,10 @@ mod tests {
         }
 
         let peers = broker.peer_paths("atlas", "agent-1");
-        assert_eq!(peers, vec![std::path::PathBuf::from("/w/agents/agent-2/atlas")]);
+        assert_eq!(
+            peers,
+            vec![std::path::PathBuf::from("/w/agents/agent-2/atlas")]
+        );
     }
 
     /// An agent with no checkout stamps nothing — the honest answer for an
