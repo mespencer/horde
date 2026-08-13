@@ -276,6 +276,68 @@ async fn a_shared_checkout_is_the_instance_itself() {
     assert_eq!(checkout.display().to_string(), instance.root_path);
 }
 
+/// The definition's declared branch is what materializes — not whatever the
+/// origin's HEAD happens to point at.
+#[tokio::test]
+async fn materialize_checks_out_the_declared_branch_not_the_origins_head() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let atlas = harness::origin(temp.path(), "atlas");
+    harness::git(&atlas, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(atlas.join("FEATURE.md"), "on the feature branch\n").expect("a change");
+    harness::git(&atlas, &["add", "-A"]);
+    harness::git(
+        &atlas,
+        &[
+            "-c",
+            "user.email=horde@test",
+            "-c",
+            "user.name=horde",
+            "commit",
+            "-qm",
+            "feature",
+        ],
+    );
+    let feature_sha = harness::git(&atlas, &["rev-parse", "HEAD"]);
+    harness::git(&atlas, &["checkout", "-q", "main"]);
+
+    let manager = harness::manager_under(temp.path());
+    let mut repo = harness::repo("atlas", &atlas);
+    repo.default_branch = "feature".to_owned();
+    let report = manager
+        .materialize(&harness::definition("ws-1", vec![repo]))
+        .await;
+
+    assert_eq!(
+        report.state,
+        WorkspaceInstanceState::Ready as i32,
+        "detail: {}",
+        report.detail
+    );
+    assert_eq!(
+        report.repos[0].head_commit_sha,
+        feature_sha.trim(),
+        "the instance is on the declared branch, not the origin's HEAD"
+    );
+}
+
+/// An agent id that is not a plain directory component is refused even when
+/// the workspace itself is fine: a cleaned-up or trusted-through id is a path
+/// escape wearing an agent's name.
+#[tokio::test]
+async fn a_checkout_for_a_path_hostile_agent_id_is_refused() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
+
+    let refused = manager
+        .checkout("ws-1", "agent/../escape", CheckoutPolicy::Worktree)
+        .await
+        .expect_err("a separator in an agent id is an escape, not a name");
+    assert!(
+        refused.to_string().contains("not directory names"),
+        "the refusal says why: {refused}"
+    );
+}
+
 /// An agent cannot run in a checkout that does not exist: instances are never
 /// self-initiated, so an unmaterialized workspace is a refusal, not a clone.
 #[tokio::test]

@@ -489,6 +489,7 @@ mod tests {
         let current = WorkspaceDefinition {
             name: "ws".to_owned(),
             repos: vec![repo("a", "u1")],
+            etag: "7".to_owned(),
             ..definition("ws-1", "ws")
         };
 
@@ -499,7 +500,11 @@ mod tests {
             widened.repos[1].layout_path, "b",
             "the added repo is normalized like any other"
         );
-        assert_eq!(widened.etag, "", "the append stamps the fresh etag");
+        assert_eq!(
+            widened.etag, "",
+            "the held token is cleared, not carried: the append stamps the \
+             fresh etag, and a stale token riding the log would look current"
+        );
 
         assert!(
             widened_with(current.clone(), None).is_err(),

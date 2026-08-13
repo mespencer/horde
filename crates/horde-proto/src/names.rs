@@ -58,13 +58,19 @@ fn kind_names_by_tag() -> &'static BTreeMap<u32, &'static str> {
             .flat_map(|file| &file.message_type)
             .filter(|message| message.name() == "Event");
         for message in events {
-            let kind_oneof = message
+            // An Event without a `kind` oneof has nothing to name; skipping it
+            // outright keeps the field check below a single comparison against
+            // a known index rather than a compound over two optionals.
+            let Some(kind_oneof) = message
                 .oneof_decl
                 .iter()
                 .position(|oneof| oneof.name() == "kind")
-                .and_then(|index| i32::try_from(index).ok());
+                .and_then(|index| i32::try_from(index).ok())
+            else {
+                continue;
+            };
             for field in &message.field {
-                if field.oneof_index.is_some() && field.oneof_index == kind_oneof {
+                if field.oneof_index == Some(kind_oneof) {
                     let name: &'static str = Box::leak(field.name().to_owned().into_boxed_str());
                     names.insert(u32::try_from(field.number()).unwrap_or(0), name);
                 }

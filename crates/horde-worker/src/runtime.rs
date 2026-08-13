@@ -1643,6 +1643,21 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// The advertisement builder reads workspace support from this accessor,
+    /// so it has to report what the builder actually installed — a `None`
+    /// here would un-advertise a capability the runtime honours.
+    #[test]
+    fn workspace_support_is_what_the_builder_installed() {
+        let bare = Runtime::new(Journal::in_memory().expect("a journal"));
+        assert!(bare.workspaces().is_none());
+
+        let temp = tempfile::tempdir().expect("a tempdir");
+        let with = Runtime::new(Journal::in_memory().expect("a journal")).with_workspaces(
+            crate::workspace::WorkspaceManager::new("worker-a", temp.path()),
+        );
+        assert!(with.workspaces().is_some());
+    }
+
     /// A spawn command whose spec names `workspace`, under the worktree
     /// policy — the shape the server sends once placement chose this worker.
     fn workspace_spawn(sequence: u64, agent: &str, workspace: &str) -> StreamCommandsResponse {

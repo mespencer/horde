@@ -489,6 +489,38 @@ mod tests {
         assert_eq!(placed_on(place_default(&harness)), "worker-a");
     }
 
+    /// The epoch is what keeps a stale command stream from knocking a
+    /// re-registered worker out of placement: every registration is a new
+    /// epoch, and only the current one may deregister.
+    #[test]
+    fn registration_epochs_grow_and_gate_deregistration() {
+        let registry = WorkerRegistry::new();
+        assert_eq!(registry.epoch_of("w"), 0, "never registered is epoch zero");
+
+        registry.register("w", capabilities(&[]));
+        assert_eq!(registry.epoch_of("w"), 1);
+        registry.register("w", capabilities(&[]));
+        assert_eq!(
+            registry.epoch_of("w"),
+            2,
+            "each registration is a new epoch"
+        );
+
+        assert!(
+            !registry.deregister_if_current("w", 1),
+            "a stream from the old registration must not disturb the new one"
+        );
+        assert!(registry.contains("w"));
+
+        assert!(registry.deregister_if_current("w", 2));
+        assert!(!registry.contains("w"));
+        assert!(
+            !registry.deregister_if_current("w", 2),
+            "nothing was removed the second time, so the caller must not \
+             run the disconnect consequences again"
+        );
+    }
+
     #[test]
     fn deregistering_removes_a_worker_from_placement() {
         let harness = harness();

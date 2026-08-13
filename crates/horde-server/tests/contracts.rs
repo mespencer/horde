@@ -176,11 +176,11 @@ async fn get_by_id(
         .map(tonic::Response::into_inner)
 }
 
-async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinition> {
+async fn create_named(h: &mut Harness, name: &str) -> Setup<horde_proto::v1::WorkspaceDefinition> {
     let created = h
         .control
         .create_workspace_definition(CreateWorkspaceDefinitionRequest {
-            name: "atlas".to_owned(),
+            name: name.to_owned(),
             repos: vec![atlas_repo()],
             unmanaged_paths: vec!["datasets".to_owned()],
         })
@@ -189,6 +189,10 @@ async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefini
         .definition
         .ok_or("a created definition")?;
     Ok(created)
+}
+
+async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinition> {
+    create_named(h, "atlas").await
 }
 
 /// [`create_atlas`], returning the id the instance-facing tests key on.
@@ -238,6 +242,146 @@ async fn a_workspace_definition_round_trips_through_the_catalog() {
         .into_inner()
         .definitions;
     assert_eq!(listed, vec![created]);
+}
+
+/// A lookup that names nothing must be refused as the caller's mistake — a
+/// NotFound for an empty name would read as "no workspaces exist".
+#[tokio::test]
+async fn a_lookup_with_neither_id_nor_name_is_invalid_not_missing() {
+    let mut h = connect().await.expect("a harness");
+    create_atlas(&mut h).await.expect("create");
+
+    let refused = get_by_id(&mut h, None)
+        .await
+        .expect_err("nothing was asked for");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused.message().contains("id or a name"),
+        "the refusal says what a lookup needs: {}",
+        refused.message()
+    );
+}
+
+/// Renaming may not shadow another live definition, and keeping one's own
+/// name is not a collision with oneself.
+#[tokio::test]
+async fn a_rename_may_keep_its_own_name_but_not_take_a_neighbours() {
+    let mut h = connect().await.expect("a harness");
+    let atlas = create_atlas(&mut h).await.expect("create atlas");
+    let beta = create_named(&mut h, "beta").await.expect("create beta");
+
+    let update = |definition: &horde_proto::v1::WorkspaceDefinition, name: &str| {
+        UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: definition.workspace_definition_id.clone(),
+            etag: definition.etag.clone(),
+            name: name.to_owned(),
+            unmanaged_paths: vec!["datasets".to_owned()],
+            repos: vec![],
+        }
+    };
+
+    let taken = h
+        .control
+        .update_workspace_definition(update(&beta, "atlas"))
+        .await
+        .expect_err("atlas is a live neighbour's name");
+    assert_eq!(taken.code(), Code::AlreadyExists);
+
+    let unchanged = h
+        .control
+        .update_workspace_definition(update(&atlas, "atlas"))
+        .await
+        .expect("keeping one's own name is not a collision")
+        .into_inner()
+        .definition
+        .expect("the updated definition");
+    assert_eq!(unchanged.name, "atlas");
+}
+
+/// An update's changes actually land — the returned definition and the
+/// catalog agree on the new layout and unmanaged paths, and the events the
+/// catalog stream carries hold no stale etag for a replay to trust.
+#[tokio::test]
+async fn an_update_lands_its_layout_and_the_log_carries_no_stale_etag() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+
+    let mut relaid = atlas_repo();
+    relaid.layout_path = "code/atlas".to_owned();
+    h.control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: created.etag.clone(),
+            name: String::new(),
+            unmanaged_paths: vec!["weights".to_owned()],
+            repos: vec![relaid],
+        })
+        .await
+        .expect("the layout update");
+
+    let fetched = get_by_id(&mut h, created.workspace_definition_id.as_ref())
+        .await
+        .expect("get")
+        .definition
+        .expect("a definition");
+    assert_eq!(
+        fetched.repos[0].layout_path, "code/atlas",
+        "the layout change is what update exists for"
+    );
+    assert_eq!(
+        fetched.unmanaged_paths,
+        vec!["weights".to_owned()],
+        "so is the unmanaged set"
+    );
+
+    // The catalog stream's own events never carry an etag: the token is
+    // derived from the log position on every fold, and a stored copy would
+    // let a replay trust a token that was stale the moment it was written.
+    let etags = drain_catalog(&mut h, |changed, out| {
+        if let Some(definition) = &changed.definition {
+            out.push(definition.etag.clone());
+        }
+    })
+    .await
+    .expect("the catalog stream replays");
+    assert_eq!(
+        etags,
+        vec![String::new(), String::new()],
+        "two changes, neither storing a token"
+    );
+}
+
+/// Replays the workspace catalog stream, collecting from each definition
+/// change. The catalog is a log stream like any other; it is only session
+/// *listings* it stays out of.
+async fn drain_catalog<T>(
+    h: &mut Harness,
+    mut collect: impl FnMut(&horde_proto::v1::WorkspaceDefinitionChanged, &mut Vec<T>),
+) -> Setup<Vec<T>> {
+    let mut stream = open_sync(
+        &mut h.control,
+        horde_server::workspace::CATALOG_STREAM,
+        0,
+        false,
+    )
+    .await?;
+    let mut out = Vec::new();
+    while let Some(message) = stream.next().await {
+        match message?.update {
+            Some(sync_events_response::Update::Batch(batch)) => {
+                for envelope in batch.events {
+                    if let Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(changed)) =
+                        envelope.event.and_then(|event| event.kind)
+                    {
+                        collect(&changed, &mut out);
+                    }
+                }
+            }
+            Some(sync_events_response::Update::CaughtUp(_)) => break,
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 #[tokio::test]
@@ -427,7 +571,7 @@ async fn prewarm_targets_a_connected_worker_and_reports_materializing() {
     let report = h
         .control
         .prewarm_workspace(PrewarmWorkspaceRequest {
-            workspace_definition_id: Some(definition_id),
+            workspace_definition_id: Some(definition_id.clone()),
             worker_id: Some(WorkerId::new("worker-a")),
             session_id: None,
         })
@@ -440,6 +584,49 @@ async fn prewarm_targets_a_connected_worker_and_reports_materializing() {
         report.state,
         horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
         "acceptance is materializing; completion arrives as events"
+    );
+
+    // A prewarm with an *empty* session id names no session, so its request
+    // journals to the catalog stream like a session-less one — an empty
+    // stream name is not a stream.
+    register(&mut h, "worker-b", &[]).await.expect("register");
+    h.control
+        .prewarm_workspace(PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(definition_id),
+            worker_id: Some(WorkerId::new("worker-b")),
+            session_id: Some(SessionId::new("")),
+        })
+        .await
+        .expect("prewarm with an empty session id");
+
+    let mut prewarm_events = 0_u32;
+    let mut stream = open_sync(
+        &mut h.control,
+        horde_server::workspace::CATALOG_STREAM,
+        0,
+        false,
+    )
+    .await
+    .expect("the catalog stream replays");
+    while let Some(message) = stream.next().await {
+        match message.expect("a sync message").update {
+            Some(sync_events_response::Update::Batch(batch)) => {
+                for envelope in batch.events {
+                    if matches!(
+                        envelope.event.and_then(|event| event.kind),
+                        Some(horde_proto::v1::event::Kind::WorkspacePrewarmRequested(_))
+                    ) {
+                        prewarm_events += 1;
+                    }
+                }
+            }
+            Some(sync_events_response::Update::CaughtUp(_)) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        prewarm_events, 2,
+        "both session-less prewarms journal to the catalog stream"
     );
 }
 

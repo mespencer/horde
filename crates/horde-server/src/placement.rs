@@ -458,6 +458,10 @@ mod tests {
 
     #[test]
     fn the_queue_timeout_defaults_and_rounds_up_rather_than_vanishing() {
+        assert_eq!(
+            DEFAULT_QUEUE_TIMEOUT_MS, 3_600_000,
+            "the default is one hour of milliseconds, as the doc promises"
+        );
         assert_eq!(queue_timeout_ms(None), DEFAULT_QUEUE_TIMEOUT_MS);
         assert_eq!(
             queue_timeout_ms(Some(&AgentSpec::default())),
@@ -478,6 +482,13 @@ mod tests {
             queue_timeout_ms(Some(&spec_with_timeout(0, 1))),
             1,
             "a positive sub-millisecond timeout is a timeout, not unset"
+        );
+        assert_eq!(
+            queue_timeout_ms(Some(&spec_with_timeout(1, -1_500_000_000))),
+            1,
+            "positive seconds keep a mixed-sign duration a timeout — the \
+             sign of `seconds`, not its inverse, is what says the caller \
+             asked for one"
         );
     }
 

@@ -89,21 +89,207 @@ async fn register(
     Ok(())
 }
 
-async fn spawn(harness: &mut Harness, session_id: &str, spec: AgentSpec) -> Setup<String> {
+/// Spawns under `parent` (the root when `None`), returning the agent id and
+/// the placement the caller was answered with.
+async fn spawn_under(
+    harness: &mut Harness,
+    session_id: &str,
+    parent: Option<&str>,
+    spec: AgentSpec,
+) -> Setup<(String, horde_proto::v1::Placement)> {
     let spawned = harness
         .control
         .spawn_agent(SpawnAgentRequest {
             session_id: Some(SessionId::new(session_id)),
-            parent_agent_id: None,
+            parent_agent_id: parent.map(horde_proto::v1::AgentId::new),
             spec: Some(spec),
             idempotency_key: String::new(),
         })
         .await?
         .into_inner();
-    spawned
+    let placement = spawned
+        .placement
+        .ok_or("a spawn always answers placement")?;
+    let agent_id = spawned
         .agent_id
         .map(|id| id.to_string())
-        .ok_or_else(|| "a spawned agent has an id".into())
+        .ok_or("a spawned agent has an id")?;
+    Ok((agent_id, placement))
+}
+
+async fn spawn(harness: &mut Harness, session_id: &str, spec: AgentSpec) -> Setup<String> {
+    Ok(spawn_under(harness, session_id, None, spec).await?.0)
+}
+
+/// Capacity is measured from the log, per spawn, over the wire: a worker at
+/// its declared limit refuses the next spawn with the arithmetic in the
+/// reason. This is the load computation's only observable edge — a scheduler
+/// handed an empty load map places here and never says the numbers.
+#[tokio::test]
+async fn a_spawn_against_a_full_worker_queues_with_the_arithmetic() {
+    let mut harness = connect().await.expect("a harness");
+    register(
+        &mut harness,
+        "small",
+        WorkerCapabilities {
+            max_concurrent_agents: 1,
+            ..WorkerCapabilities::default()
+        },
+    )
+    .await
+    .expect("register");
+
+    // The root agent takes the only slot at creation.
+    let (session_id, _root) = seed(&mut harness, "full", "key-1")
+        .await
+        .expect("a session");
+
+    let (_agent, placement) = spawn_under(&mut harness, &session_id, None, AgentSpec::default())
+        .await
+        .expect("the spawn is answered");
+    assert_eq!(placement.state, PlacementState::Queued as i32);
+    assert_eq!(
+        placement.reason, "no connected worker matches: small is at capacity (1/1)",
+        "the load is counted from the log, and the refusal shows the count"
+    );
+}
+
+/// One drain pass tracks the load it is creating: two queued agents draining
+/// onto a one-slot worker place exactly one of them, and the other waits for
+/// the next worker.
+#[tokio::test]
+async fn a_drain_pass_counts_its_own_placements_against_capacity() {
+    let mut harness = connect().await.expect("a harness");
+    let (session_id, _root) = seed(&mut harness, "drain", "key-1")
+        .await
+        .expect("a session");
+    spawn(&mut harness, &session_id, AgentSpec::default())
+        .await
+        .expect("a second queued spawn");
+
+    register(
+        &mut harness,
+        "small",
+        WorkerCapabilities {
+            max_concurrent_agents: 1,
+            ..WorkerCapabilities::default()
+        },
+    )
+    .await
+    .expect("register the one-slot worker");
+
+    // Two queued answers, then exactly one placement.
+    let after_small = placements_until(&mut harness, &session_id, 3)
+        .await
+        .expect("the first drain");
+    let on_small = after_small
+        .iter()
+        .filter(|observed| observed.worker_id.as_deref() == Some("small"))
+        .count();
+    assert_eq!(
+        on_small, 1,
+        "one slot, one placement — a pass that does not count its own \
+         placements would seat both: {after_small:?}"
+    );
+
+    register(&mut harness, "big", WorkerCapabilities::default())
+        .await
+        .expect("register the unlimited worker");
+    let after_big = placements_until(&mut harness, &session_id, 4)
+        .await
+        .expect("the second drain");
+    assert_eq!(
+        after_big
+            .iter()
+            .filter(|observed| observed.worker_id.as_deref() == Some("big"))
+            .count(),
+        1,
+        "the agent the full worker refused lands on the next one: {after_big:?}"
+    );
+}
+
+/// The parent's worker is preferred when nothing forces otherwise
+/// (DESIGN §6) — through the RPC, not just the scheduler unit.
+#[tokio::test]
+async fn a_child_lands_beside_its_parent_when_nothing_forces_otherwise() {
+    let mut harness = connect().await.expect("a harness");
+    register(&mut harness, "alpha", WorkerCapabilities::default())
+        .await
+        .expect("register");
+    register(&mut harness, "beta", WorkerCapabilities::default())
+        .await
+        .expect("register");
+    let (session_id, _root) = seed(&mut harness, "sticky", "key-1")
+        .await
+        .expect("a session");
+
+    // Pin the parent onto the worker the tiebreak would not choose, so the
+    // child's preference is distinguishable from alphabetical accident.
+    let pinned = AgentSpec {
+        placement: Some(PlacementConstraints {
+            pinned_worker_id: Some(WorkerId::new("beta")),
+            ..PlacementConstraints::default()
+        }),
+        ..AgentSpec::default()
+    };
+    let (parent, placement) = spawn_under(&mut harness, &session_id, None, pinned)
+        .await
+        .expect("the pinned spawn");
+    assert_eq!(
+        placement
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("beta")
+    );
+
+    let (_child, placement) = spawn_under(
+        &mut harness,
+        &session_id,
+        Some(&parent),
+        AgentSpec::default(),
+    )
+    .await
+    .expect("the child spawn");
+    assert_eq!(
+        placement
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("beta"),
+        "the child prefers its parent's worker over the alphabetical tiebreak"
+    );
+}
+
+/// A session whose root names a workspace the catalog does not hold is
+/// refused before it exists — the same check every spawn makes.
+#[tokio::test]
+async fn a_session_rooted_in_an_unknown_workspace_is_refused() {
+    let mut harness = connect().await.expect("a harness");
+
+    let refused = harness
+        .control
+        .create_session(horde_proto::v1::CreateSessionRequest {
+            title: "ghost".to_owned(),
+            workspace_definition_id: None,
+            root_agent: Some(AgentSpec {
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                    "ws-ghost",
+                )),
+                ..AgentSpec::default()
+            }),
+            idempotency_key: String::new(),
+        })
+        .await
+        .expect_err("an unknown workspace must refuse the session");
+    assert_eq!(refused.code(), tonic::Code::NotFound);
+    assert!(
+        refused.message().contains("ws-ghost"),
+        "the refusal names what was asked for: {}",
+        refused.message()
+    );
 }
 
 /// The queue drains when the pool changes: a session created with no worker
