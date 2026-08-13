@@ -1122,6 +1122,8 @@ name = "horde-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "horde-cli",
+ "horde-identity",
  "horde-proto",
  "horde-server-testkit",
  "hyper-util",
@@ -1144,6 +1146,7 @@ name = "horde-server-testkit"
 version = "0.1.0"
 dependencies = [
  "horde-cli",
+ "horde-identity",
  "horde-proto",
  "horde-server",
  "tokio",

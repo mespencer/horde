@@ -11,10 +11,12 @@
 
 pub mod commands;
 pub mod control_plane;
+pub mod enrollment;
 pub mod shared;
 pub mod worker;
 
 pub use commands::{CommandProjection, CommandStream};
 pub use control_plane::ControlPlane;
+pub use enrollment::{Enrollment, EnrollmentAuthority, MintedCode};
 pub use shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 pub use worker::WorkerFacing;

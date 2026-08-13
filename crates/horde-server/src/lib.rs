@@ -10,6 +10,7 @@
 //! and subscriber policy, and nothing in the library installs a global
 //! subscriber or decides how logs are formatted.
 
+pub mod enrollment;
 pub mod error;
 pub mod log;
 pub mod permission;
@@ -18,8 +19,10 @@ pub mod scheduler;
 pub mod service;
 pub mod startup;
 pub mod state;
+pub mod transport;
 pub mod workspace;
 
+pub use enrollment::EnrollmentRoster;
 pub use error::ServerError;
 pub use log::EventLog;
 pub use scheduler::{CapabilityScheduler, Placement, Scheduler, WorkerRegistry};

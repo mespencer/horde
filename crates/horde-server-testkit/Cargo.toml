@@ -11,11 +11,12 @@ workspace = true
 
 [dependencies]
 horde-cli = { workspace = true }
+horde-identity = { workspace = true }
 horde-proto = { workspace = true }
 horde-server = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync"] }
 tokio-stream = "0.1.19"
-tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
+tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ring"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

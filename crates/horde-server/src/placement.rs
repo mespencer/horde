@@ -43,7 +43,6 @@ use crate::error::ServerError;
 use crate::scheduler::{Placement, PlacementRequest};
 use crate::service::shared::{ServerCore, append_server_event};
 use crate::state::{AgentState, SessionState};
-use crate::workspace::is_catalog_stream;
 
 /// How long a spawn may sit queued when its constraints do not say:
 /// one hour. Long enough to bring a worker online by hand, short enough that
@@ -127,11 +126,12 @@ fn now_unix_ms() -> i64 {
         .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0))
 }
 
-/// Projects every session — the catalog stream is not one.
+/// Projects every session — the reserved streams (catalog, enrollment) are
+/// not sessions.
 async fn session_states(core: &ServerCore) -> Result<Vec<SessionState>, ServerError> {
     let mut states = Vec::new();
     for session_id in core.log.session_ids().await? {
-        if is_catalog_stream(&session_id) {
+        if crate::enrollment::is_reserved_stream(&session_id) {
             continue;
         }
         let events = core.log.read_all(&session_id).await?;

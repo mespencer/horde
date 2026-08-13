@@ -94,6 +94,18 @@ pub enum ServerError {
     #[error("could not decode a stored event: {0}")]
     Decode(#[from] prost::DecodeError),
 
+    /// An enrollment code that does not redeem: wrong, expired, or spent.
+    ///
+    /// Unauthenticated on the wire — the caller has no identity yet and the
+    /// credential it presented was not accepted; the remedy is a fresh code.
+    #[error("enrollment refused: {0}")]
+    EnrollmentRefused(&'static str),
+
+    /// Something on the server's own side of the trust machinery broke —
+    /// the CA refusing to sign, the randomness source failing.
+    #[error("internal failure: {0}")]
+    Internal(String),
+
     /// Deliberately not implemented yet.
     ///
     /// Present so an unbuilt RPC answers honestly instead of returning a
@@ -124,10 +136,12 @@ impl From<ServerError> for Status {
             // The caller must change the key, not retry: sending the same
             // bytes again produces the same collision.
             ServerError::IdempotencyKeyCollision { .. } => Code::InvalidArgument,
+            ServerError::EnrollmentRefused(_) => Code::Unauthenticated,
             ServerError::Unimplemented(_) => Code::Unimplemented,
-            ServerError::Storage { .. } | ServerError::StorageTask(_) | ServerError::Decode(_) => {
-                Code::Internal
-            }
+            ServerError::Storage { .. }
+            | ServerError::StorageTask(_)
+            | ServerError::Decode(_)
+            | ServerError::Internal(_) => Code::Internal,
         };
         Status::new(code, message)
     }
@@ -146,6 +160,21 @@ mod tests {
         });
         assert_eq!(status.code(), Code::NotFound);
         assert!(status.message().contains("s1"));
+    }
+
+    /// A refused code is a credential problem, not a server fault: the joiner
+    /// reacts by getting a fresh code, so the code must say Unauthenticated.
+    #[test]
+    fn a_refused_enrollment_is_unauthenticated_and_says_why() {
+        let status = tonic::Status::from(ServerError::EnrollmentRefused("the code has expired"));
+        assert_eq!(status.code(), Code::Unauthenticated);
+        assert!(status.message().contains("expired"));
+    }
+
+    #[test]
+    fn a_broken_trust_machinery_is_internal() {
+        let status = tonic::Status::from(ServerError::Internal("the CA refused".to_owned()));
+        assert_eq!(status.code(), Code::Internal);
     }
 
     /// An unbuilt RPC must be distinguishable from a broken one, or callers

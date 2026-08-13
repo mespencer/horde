@@ -43,20 +43,42 @@ use crate::placement;
 use crate::scheduler::PlacementRequest;
 use crate::state::SessionState;
 use crate::workspace::{
-    CATALOG_STREAM, WorkspaceCatalog, check_etag, is_catalog_stream, normalized_repos,
-    same_repo_set, validate_definition, widened_with,
+    CATALOG_STREAM, WorkspaceCatalog, check_etag, normalized_repos, same_repo_set,
+    validate_definition, widened_with,
 };
 
 /// Implements `horde.v1.ControlPlaneService`.
 #[derive(Clone, Debug)]
 pub struct ControlPlane {
     core: ServerCore,
+    /// The enrollment authority behind `MintEnrollmentCode` and
+    /// `RevokeEnrollment`. `None` on a plane serving without transport
+    /// security (in-process harnesses), where those verbs honestly answer
+    /// `Unimplemented`: minting identities over an unauthenticated channel
+    /// would be worse than not minting them.
+    enrollment: Option<std::sync::Arc<super::enrollment::EnrollmentAuthority>>,
 }
 
 impl ControlPlane {
     #[must_use]
     pub fn new(core: ServerCore) -> Self {
-        Self { core }
+        Self {
+            core,
+            enrollment: None,
+        }
+    }
+
+    /// A control plane whose enrollment verbs are live, for serving behind
+    /// mTLS (`crate::transport::serve_main`).
+    #[must_use]
+    pub fn with_enrollment(
+        core: ServerCore,
+        enrollment: std::sync::Arc<super::enrollment::EnrollmentAuthority>,
+    ) -> Self {
+        Self {
+            core,
+            enrollment: Some(enrollment),
+        }
     }
 
     /// Appends a server-originated event to a session.
@@ -181,7 +203,7 @@ impl ControlPlane {
     /// once there are enough sessions for it to matter.
     async fn session_of_agent(&self, agent_id: &str) -> Result<String, ServerError> {
         for session_id in self.core.log.session_ids().await? {
-            if is_catalog_stream(&session_id) {
+            if crate::enrollment::is_reserved_stream(&session_id) {
                 continue;
             }
             let state = self.project(&session_id).await?;
@@ -409,8 +431,9 @@ impl ControlPlaneService for ControlPlane {
 
         let mut sessions = Vec::new();
         for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
-            // The workspace catalog lives in the log but is not a session.
-            if is_catalog_stream(&session_id) {
+            // The reserved streams (catalog, enrollment) live in the log but
+            // are not sessions.
+            if crate::enrollment::is_reserved_stream(&session_id) {
                 continue;
             }
             let state = self.project(&session_id).await.map_err(Status::from)?;
@@ -1064,16 +1087,82 @@ impl ControlPlaneService for ControlPlane {
 
     async fn mint_enrollment_code(
         &self,
-        _request: Request<MintEnrollmentCodeRequest>,
+        request: Request<MintEnrollmentCodeRequest>,
     ) -> Result<Response<MintEnrollmentCodeResponse>, Status> {
-        Err(ServerError::Unimplemented("enrollment").into())
+        let Some(authority) = self.enrollment.as_ref() else {
+            return Err(ServerError::Unimplemented("enrollment on this listener").into());
+        };
+        let request = request.into_inner();
+
+        let role = crate::enrollment::role_from_wire(request.role)
+            .ok_or_else(|| Status::invalid_argument("a code must name a role: worker or client"))?;
+        let principal = horde_identity::Principal::new(role, request.name)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let requested_ttl_ms = request
+            .ttl
+            .as_ref()
+            .map_or(0, crate::enrollment::duration_to_ms);
+
+        let minted = authority
+            .mint(
+                &principal,
+                requested_ttl_ms,
+                super::enrollment::wall_clock_ms(),
+            )
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(MintEnrollmentCodeResponse {
+            code: minted.join_code(),
+            server_cert_fingerprint: minted.server_fingerprint.clone(),
+            expires_at: Some(crate::enrollment::ms_to_timestamp(
+                minted.expires_at_unix_ms,
+            )),
+        }))
     }
 
     async fn revoke_enrollment(
         &self,
-        _request: Request<RevokeEnrollmentRequest>,
+        request: Request<RevokeEnrollmentRequest>,
     ) -> Result<Response<RevokeEnrollmentResponse>, Status> {
-        Err(ServerError::Unimplemented("enrollment").into())
+        let Some(authority) = self.enrollment.as_ref() else {
+            return Err(ServerError::Unimplemented("enrollment on this listener").into());
+        };
+        let request = request.into_inner();
+
+        use horde_proto::v1::revoke_enrollment_request::Principal as Wire;
+        let principal = match request.principal {
+            Some(Wire::WorkerId(id)) => horde_identity::Principal::new(
+                horde_identity::PrincipalRole::Worker,
+                id.to_string(),
+            ),
+            Some(Wire::ClientId(id)) => horde_identity::Principal::new(
+                horde_identity::PrincipalRole::Client,
+                id.to_string(),
+            ),
+            None => {
+                return Err(Status::invalid_argument(
+                    "a revocation must name a worker or client",
+                ));
+            }
+        }
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        let revoked = authority
+            .revoke(
+                &principal,
+                &request.reason,
+                super::enrollment::wall_clock_ms(),
+            )
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(RevokeEnrollmentResponse {
+            // The proto carries one serial; every revoked serial is in the
+            // log. Joined so a caller revoking a re-enrolled principal still
+            // sees everything that stopped working.
+            revoked_serial: revoked.join(","),
+        }))
     }
 
     async fn query_usage(
