@@ -18,8 +18,6 @@
 //! [`Client`] verb that also exists as `horde <verb>` (DESIGN.md §11: CLI
 //! parity is a hard rule; the TUI is optional).
 
-use std::collections::HashSet;
-
 use horde_proto::v1::DeliveryMode;
 use horde_tui::{App, Directive, Update};
 use ratatui::Terminal;
@@ -27,7 +25,7 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event as TermEvent;
 use tokio::sync::mpsc;
 
-use crate::client::{PermissionAnswer, StreamUpdate, SyncOptions};
+use crate::client::{PermissionAnswer, StreamUpdate};
 use crate::{Client, ClientError};
 
 /// What the user asked to open.
@@ -118,14 +116,27 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let (updates, mut inbox) = mpsc::channel::<Update>(256);
-    let mut streams = StreamSet::new(updates);
 
-    refresh_sessions(&mut client, &mut app, &mut streams).await?;
-    // The attach target may be archived and so missing from the list; its
-    // stream is owed either way.
-    if let Some(attachment) = app.attachment() {
-        streams.ensure(&client, &attachment.session_id.clone());
+    let sessions = refresh_sessions(&mut client, &mut app).await?;
+
+    // One merged stream serves the whole TUI: every listed session replays
+    // from its start, the attach target is named too in case it is archived
+    // and missing from the list, and the server's all-sessions net carries
+    // any session created while we watch. This used to be a fan-in of one
+    // stream per session; the server grew `all_sessions`, so it collapsed.
+    let mut cursors: Vec<(String, u64)> = sessions
+        .iter()
+        .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
+        .map(|session_id| (session_id, 0))
+        .collect();
+    if let Some(attachment) = app.attachment()
+        && !cursors
+            .iter()
+            .any(|(session_id, _)| session_id == &attachment.session_id)
+    {
+        cursors.push((attachment.session_id.clone(), 0));
     }
+    tokio::spawn(pump(client.clone(), cursors, updates));
 
     while !app.should_quit() {
         terminal
@@ -137,7 +148,7 @@ where
             event = input.recv() => match event {
                 Some(event) => {
                     let directives = app.on_input(&event);
-                    perform(directives, &mut client, &mut app, &mut streams).await;
+                    perform(directives, &mut client, &mut app).await;
                 }
                 // The terminal went away under us; there is no one left to draw for.
                 None => app.request_quit(),
@@ -156,14 +167,9 @@ where
 }
 
 /// Executes what the App asked for, reporting refusals into its status line.
-async fn perform(
-    directives: Vec<Directive>,
-    client: &mut Client,
-    app: &mut App,
-    streams: &mut StreamSet,
-) {
+async fn perform(directives: Vec<Directive>, client: &mut Client, app: &mut App) {
     for directive in directives {
-        if let Err(error) = execute(directive, client, app, streams).await {
+        if let Err(error) = execute(directive, client, app).await {
             app.report_error(error.to_string());
         }
     }
@@ -174,10 +180,9 @@ async fn execute(
     directive: Directive,
     client: &mut Client,
     app: &mut App,
-    streams: &mut StreamSet,
 ) -> Result<(), ClientError> {
     match directive {
-        Directive::RefreshSessions => refresh_sessions(client, app, streams).await,
+        Directive::RefreshSessions => refresh_sessions(client, app).await.map(drop),
         Directive::Approve { request_id } => client
             .answer_permission(PermissionAnswer::allow(&request_id))
             .await
@@ -197,77 +202,37 @@ async fn execute(
     }
 }
 
-/// Lists sessions, folds the answer in, and makes sure each listed session
-/// has a live follow stream.
+/// Lists sessions and folds the answer in, returning the summaries so the
+/// startup path can name its stream cursors. No stream management happens
+/// here: the one merged stream already carries every session, listed or not.
 async fn refresh_sessions(
     client: &mut Client,
     app: &mut App,
-    streams: &mut StreamSet,
-) -> Result<(), ClientError> {
+) -> Result<Vec<horde_proto::v1::SessionSummary>, ClientError> {
     let sessions = client.list_sessions(false).await?;
-    for summary in &sessions {
-        if let Some(session_id) = summary.session_id.as_ref() {
-            streams.ensure(client, &session_id.to_string());
-        }
-    }
-    app.apply(Update::Sessions(sessions));
-    Ok(())
+    app.apply(Update::Sessions(sessions.clone()));
+    Ok(sessions)
 }
 
-/// One follow stream per session, opened once.
-///
-/// The server serves one session per sync call for now, so the overview and
-/// the inbox are fan-in: every session's stream feeds the same channel and
-/// the App does the merging. When the server grows `all_sessions`, this set
-/// collapses to one stream without the App noticing.
-struct StreamSet {
-    opened: HashSet<String>,
-    updates: mpsc::Sender<Update>,
-}
-
-impl StreamSet {
-    fn new(updates: mpsc::Sender<Update>) -> Self {
-        Self {
-            opened: HashSet::new(),
-            updates,
-        }
-    }
-
-    /// Opens a follow stream for the session unless one is already running.
-    fn ensure(&mut self, client: &Client, session_id: &str) {
-        if self.opened.insert(session_id.to_owned()) {
-            tokio::spawn(pump(
-                client.clone(),
-                session_id.to_owned(),
-                self.updates.clone(),
-            ));
-        }
-    }
-}
-
-/// Replays one session from the beginning and follows it, forwarding
-/// everything onto the shared channel. Ends silently when the receiver goes
-/// away (the loop exited) or the stream does (the server went away — the
-/// heartbeat gap will show soon enough).
-async fn pump(mut client: Client, session_id: String, updates: mpsc::Sender<Update>) {
-    let _ = follow_into(&mut client, &session_id, &updates).await;
+/// The TUI's one stream: replays the named sessions from their cursors,
+/// follows everything else live, and forwards it all onto the shared
+/// channel. Ends silently when the receiver goes away (the loop exited) or
+/// the stream does (the server went away — the heartbeat gap will show soon
+/// enough).
+async fn pump(mut client: Client, cursors: Vec<(String, u64)>, updates: mpsc::Sender<Update>) {
+    let _ = follow_into(&mut client, cursors, &updates).await;
 }
 
 async fn follow_into(
     client: &mut Client,
-    session_id: &str,
+    cursors: Vec<(String, u64)>,
     updates: &mpsc::Sender<Update>,
 ) -> Result<(), ClientError> {
-    let mut stream = client
-        .follow(&SyncOptions::new(session_id).following(true))
-        .await?;
+    let mut stream = client.follow_everything(&cursors).await?;
     while let Some(update) = stream.next_update().await? {
         let update = match update {
             StreamUpdate::Event(envelope) => Update::Event(envelope),
-            StreamUpdate::CaughtUp(head) => Update::CaughtUp {
-                session_id: session_id.to_owned(),
-                head,
-            },
+            StreamUpdate::CaughtUp { session_id, head } => Update::CaughtUp { session_id, head },
         };
         if updates.send(update).await.is_err() {
             return Ok(());

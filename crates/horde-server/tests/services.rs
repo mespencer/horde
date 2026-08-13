@@ -991,7 +991,11 @@ async fn collect_synced(
         if let sync_events_response::Update::Batch(batch) = next_sync_frame(stream).await? {
             for event in &batch.events {
                 rows.push((
-                    event.session_id.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    event
+                        .session_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     event
                         .event
                         .as_ref()
@@ -1053,8 +1057,10 @@ async fn an_all_sessions_sync_merges_every_sessions_tail_into_one_stream() {
         .expect("journal");
 
     let rows = collect_synced(&mut stream, |rows| {
-        let sessions: std::collections::BTreeSet<&str> =
-            rows.iter().map(|(session, _, _)| session.as_str()).collect();
+        let sessions: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .map(|(session, _, _)| session.as_str())
+            .collect();
         sessions.contains(newborn.as_str()) && sessions.contains(first.as_str())
     })
     .await
@@ -1074,8 +1080,12 @@ async fn journal_output(
     text: &str,
     journal_sequence: u64,
 ) -> Setup<()> {
-    let (to_server, mut acks) =
-        open_journal(harness, "sync-test-worker", journal_sequence.saturating_sub(1)).await?;
+    let (to_server, mut acks) = open_journal(
+        harness,
+        "sync-test-worker",
+        journal_sequence.saturating_sub(1),
+    )
+    .await?;
     acks.next().await.ok_or("an acceptance")??;
     to_server
         .send(PushEventsRequest {
@@ -1106,7 +1116,9 @@ async fn a_subtree_scoped_sync_filters_on_the_server() {
     let (sibling, _) = spawn_agent(&mut harness, &session_id).await.expect("spawn");
 
     // Both children speak; only one is in scope.
-    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0).await.expect("open");
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("open");
     acks.next().await.expect("accepted").expect("accepted");
     to_server
         .send(PushEventsRequest {

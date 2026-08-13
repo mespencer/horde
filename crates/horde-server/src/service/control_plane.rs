@@ -17,15 +17,15 @@ use horde_proto::v1::{
     AnswerPermissionRequest, AnswerPermissionResponse, ArchiveSessionRequest,
     ArchiveSessionResponse, AssignmentId, AssignmentSent, CreateSessionRequest,
     CreateSessionResponse, CreateWorkspaceDefinitionRequest, CreateWorkspaceDefinitionResponse,
-    DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse, Event,
-    GetSessionRequest, GetSessionResponse, GetWorkspaceDefinitionRequest,
-    GetWorkspaceDefinitionResponse, HelloRequest, HelloResponse, InterruptAgentRequest,
-    InterruptAgentResponse, ListSessionsRequest, ListSessionsResponse, ListWorkersRequest,
-    ListWorkersResponse, ListWorkspaceDefinitionsRequest, ListWorkspaceDefinitionsResponse,
-    MintEnrollmentCodeRequest, MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest,
-    PrewarmWorkspaceResponse, QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest,
-    RevokeEnrollmentResponse, SendMessageRequest, SendMessageResponse, ServerHello, SessionId,
-    SessionSummary, SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
+    DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse, Event, GetSessionRequest,
+    GetSessionResponse, GetWorkspaceDefinitionRequest, GetWorkspaceDefinitionResponse,
+    HelloRequest, HelloResponse, InterruptAgentRequest, InterruptAgentResponse,
+    ListSessionsRequest, ListSessionsResponse, ListWorkersRequest, ListWorkersResponse,
+    ListWorkspaceDefinitionsRequest, ListWorkspaceDefinitionsResponse, MintEnrollmentCodeRequest,
+    MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest, PrewarmWorkspaceResponse,
+    QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
+    SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
+    SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
     UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
 };
@@ -445,7 +445,12 @@ impl ControlPlaneService for ControlPlane {
                 // membership may lie before the cursor's offset.
                 let mut filter = SubtreeFilter::scoped(root);
                 for (session_id, _) in &cursors {
-                    let history = self.core.log.read_all(session_id).await.map_err(Status::from)?;
+                    let history = self
+                        .core
+                        .log
+                        .read_all(session_id)
+                        .await
+                        .map_err(Status::from)?;
                     filter.seed(session_id, &history);
                 }
                 filter
@@ -458,11 +463,7 @@ impl ControlPlaneService for ControlPlane {
         let (history, tail) = self
             .core
             .log
-            .tail_merged(
-                &cursors,
-                request.all_sessions,
-                &[CATALOG_STREAM.to_owned()],
-            )
+            .tail_merged(&cursors, request.all_sessions, &[CATALOG_STREAM.to_owned()])
             .await
             .map_err(Status::from)?;
 
@@ -1061,4 +1062,3 @@ fn uuid_like() -> String {
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
 }
-

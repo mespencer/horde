@@ -118,10 +118,13 @@ impl SubtreeFilter {
         if let Some(Kind::AgentSpawned(spawned)) = event.kind.as_ref()
             && let Some(agent_id) = event.agent_id.as_ref()
         {
-            self.parents.entry(session_id.to_owned()).or_default().insert(
-                agent_id.to_string(),
-                spawned.parent_agent_id.as_ref().map(ToString::to_string),
-            );
+            self.parents
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(
+                    agent_id.to_string(),
+                    spawned.parent_agent_id.as_ref().map(ToString::to_string),
+                );
         }
     }
 

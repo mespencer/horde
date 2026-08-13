@@ -309,9 +309,7 @@ impl EventLog {
 
         if all_sessions {
             for session_id in self.session_ids().await? {
-                if delivered.contains_key(&session_id)
-                    || excluded.contains(&session_id)
-                {
+                if delivered.contains_key(&session_id) || excluded.contains(&session_id) {
                     continue;
                 }
                 // From the current head: the overview wants the live tail,
@@ -573,8 +571,7 @@ impl MultiTail {
     async fn read_everything(&mut self) -> Result<Vec<StoredEvent>, ServerError> {
         if self.all_sessions {
             for session_id in self.log.session_ids().await? {
-                if !self.delivered.contains_key(&session_id)
-                    && !self.excluded.contains(&session_id)
+                if !self.delivered.contains_key(&session_id) && !self.excluded.contains(&session_id)
                 {
                     // Never seen and the notification that would have
                     // announced it is gone: adopt it from the start.
@@ -896,12 +893,11 @@ mod tests {
     #[tokio::test]
     async fn an_all_sessions_tail_adopts_existing_heads_and_newborn_sessions() {
         let log = EventLog::in_memory().expect("in-memory log");
-        log.append(pending("veteran", b"old")).await.expect("append");
-
-        let (history, mut tail) = log
-            .tail_merged(&[], true, &[])
+        log.append(pending("veteran", b"old"))
             .await
-            .expect("merged tail");
+            .expect("append");
+
+        let (history, mut tail) = log.tail_merged(&[], true, &[]).await.expect("merged tail");
         assert!(
             history.is_empty(),
             "an unnamed session is followed from its head, not replayed"
@@ -909,7 +905,9 @@ mod tests {
         assert_eq!(tail.heads(), vec![("veteran".to_owned(), 1)]);
 
         // The veteran moves: only the new event arrives.
-        log.append(pending("veteran", b"new")).await.expect("append");
+        log.append(pending("veteran", b"new"))
+            .await
+            .expect("append");
         let batch = merged_batch_within(&mut tail).await;
         assert_eq!(
             (batch[0].session_id.as_str(), batch[0].sequence),
@@ -917,7 +915,9 @@ mod tests {
         );
 
         // A session created after the subscription arrives from its start.
-        log.append(pending("newborn", b"first")).await.expect("append");
+        log.append(pending("newborn", b"first"))
+            .await
+            .expect("append");
         let batch = merged_batch_within(&mut tail).await;
         assert_eq!(
             (batch[0].session_id.as_str(), batch[0].sequence),
@@ -931,7 +931,9 @@ mod tests {
     #[tokio::test]
     async fn an_excluded_stream_is_not_adopted_but_can_be_named() {
         let log = EventLog::in_memory().expect("in-memory log");
-        log.append(pending("catalog", b"defn")).await.expect("append");
+        log.append(pending("catalog", b"defn"))
+            .await
+            .expect("append");
         log.append(pending("s1", b"a")).await.expect("append");
 
         let excluded = vec!["catalog".to_owned()];
@@ -945,7 +947,9 @@ mod tests {
             "the excluded stream must not be adopted"
         );
 
-        log.append(pending("catalog", b"more")).await.expect("append");
+        log.append(pending("catalog", b"more"))
+            .await
+            .expect("append");
         log.append(pending("s1", b"b")).await.expect("append");
         let batch = merged_batch_within(&mut tail).await;
         assert_eq!(
