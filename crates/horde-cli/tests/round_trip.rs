@@ -454,7 +454,11 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
 
     let mut sequences = Vec::new();
     loop {
-        match stream.next_update().await.expect("the stream must not fail") {
+        match stream
+            .next_update()
+            .await
+            .expect("the stream must not fail")
+        {
             Some(StreamUpdate::Event(envelope)) => sequences.push(envelope.sequence),
             Some(StreamUpdate::CaughtUp(head)) => {
                 assert_eq!(head, 3, "the marker must carry the real head");

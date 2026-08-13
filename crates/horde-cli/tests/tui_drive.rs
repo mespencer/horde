@@ -179,32 +179,32 @@ async fn the_overview_shows_a_live_session_and_quits_cleanly() {
     );
 }
 
-#[tokio::test]
-async fn an_escalation_reaches_the_inbox_and_y_approves_it_on_the_server() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, root) = seeded(&endpoint, "tui-inbox")
-        .await
-        .expect("a seeded session");
+/// Seeds a session, journals one escalation into it the way a worker would,
+/// and hands back a loop already sitting in the inbox looking at it — the
+/// shared preamble of the approve and deny round trips.
+async fn inbox_with_one_escalation(title: &str, request_id: &str) -> Setup<(String, Harness)> {
+    let endpoint = serve().await?;
+    let (_, session_id, root) = seeded(&endpoint, title).await?;
     journal_event(
         &endpoint,
         &session_id,
-        escalation(&root, "req-tui-1", "docker rm x"),
+        escalation(&root, request_id, "docker rm x"),
     )
-    .await
-    .expect("a journaled escalation");
+    .await?;
 
-    let mut harness = start(&endpoint, App::overview())
-        .await
-        .expect("a running loop");
+    let mut harness = start(&endpoint, App::overview()).await?;
     harness
         .state("the escalation to arrive", |app| app.waiting_total() == 1)
-        .await
-        .expect("the journaled request must reach the inbox fold");
+        .await?;
+    harness.press(KeyCode::Char('i')).await?;
+    Ok((session_id, harness))
+}
 
-    harness
-        .press(KeyCode::Char('i'))
+#[tokio::test]
+async fn an_escalation_reaches_the_inbox_and_y_approves_it_on_the_server() {
+    let (session_id, mut harness) = inbox_with_one_escalation("tui-inbox", "req-tui-1")
         .await
-        .expect("open the inbox");
+        .expect("an inbox holding one journaled escalation");
     harness.press(KeyCode::Char('y')).await.expect("approve it");
 
     // The pending set only empties when the server's PermissionDecided event
@@ -228,30 +228,9 @@ async fn an_escalation_reaches_the_inbox_and_y_approves_it_on_the_server() {
 
 #[tokio::test]
 async fn n_denies_with_the_tui_reason() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, root) = seeded(&endpoint, "tui-deny")
+    let (session_id, mut harness) = inbox_with_one_escalation("tui-deny", "req-tui-2")
         .await
-        .expect("a seeded session");
-    journal_event(
-        &endpoint,
-        &session_id,
-        escalation(&root, "req-tui-2", "rm -rf /"),
-    )
-    .await
-    .expect("a journaled escalation");
-
-    let mut harness = start(&endpoint, App::overview())
-        .await
-        .expect("a running loop");
-    harness
-        .state("the escalation to arrive", |app| app.waiting_total() == 1)
-        .await
-        .expect("the request must arrive first");
-
-    harness
-        .press(KeyCode::Char('i'))
-        .await
-        .expect("open the inbox");
+        .expect("an inbox holding one journaled escalation");
     harness.press(KeyCode::Char('n')).await.expect("deny it");
 
     let app = harness

@@ -376,7 +376,13 @@ fn session_lifecycle_name(state: i32) -> &'static str {
     }
 }
 
-fn placement_state_name(state: i32) -> &'static str {
+/// The word a placement state renders as.
+///
+/// Public because the CLI's renderer says the same words for the same wire
+/// values — two frontends, one vocabulary (DESIGN.md §11) — and a private
+/// copy over there was a duplicate block the gate rightly counted.
+#[must_use]
+pub fn placement_state_name(state: i32) -> &'static str {
     match PlacementState::try_from(state) {
         Ok(PlacementState::Placed) => "placed",
         Ok(PlacementState::Queued) => "queued",
@@ -402,42 +408,39 @@ mod tests {
 
     /// One event at a log position, about one agent.
     fn envelope(sequence: u64, agent: &str, kind: Kind) -> EventEnvelope {
+        let event = Event {
+            kind: Some(kind),
+            agent_id: (!agent.is_empty()).then(|| AgentId::new(agent)),
+            ..Event::default()
+        };
         EventEnvelope {
-            session_id: Some(SessionId::new("s1")),
             sequence,
-            recorded_at: None,
-            event: Some(Event {
-                agent_id: (!agent.is_empty()).then(|| AgentId::new(agent)),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(kind),
-            }),
+            event: Some(event),
+            session_id: Some(SessionId::new("s1")),
+            ..EventEnvelope::default()
         }
     }
 
     fn spawned(parent: Option<&str>, tree_path: &[&str]) -> Kind {
         Kind::AgentSpawned(AgentSpawned {
-            parent_agent_id: parent.map(AgentId::new),
-            spawned_by: None,
-            spec: None,
             tree_path: tree_path.iter().map(ToString::to_string).collect(),
+            parent_agent_id: parent.map(AgentId::new),
+            ..AgentSpawned::default()
         })
     }
 
     fn requested(request_id: &str, rendered: &str) -> Kind {
+        let tool_call = ProposedToolCall {
+            rendered: rendered.to_owned(),
+            ..ProposedToolCall::default()
+        };
         Kind::PermissionRequested(PermissionRequested {
             request: Some(PermissionRequest {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                agent_id: None,
-                tool_call: Some(ProposedToolCall {
-                    tool_name: String::new(),
-                    input: None,
-                    rendered: rendered.to_owned(),
-                }),
-                tree_path: vec!["ci-fix".to_owned(), "reviewer".to_owned()],
                 permission_mode: "manual".to_owned(),
-                escalated_from: 0,
-                expires_at: None,
+                tree_path: vec!["ci-fix".to_owned(), "reviewer".to_owned()],
+                tool_call: Some(tool_call),
+                request_id: Some(PermissionRequestId::new(request_id)),
+                ..PermissionRequest::default()
             }),
         })
     }
@@ -445,13 +448,10 @@ mod tests {
     fn decided(request_id: &str, outcome: PermissionOutcome, reason: &str) -> Kind {
         Kind::PermissionDecided(PermissionDecided {
             decision: Some(PermissionDecision {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                outcome: outcome as i32,
-                decided_by: 0,
-                decided_by_actor: None,
                 reason: reason.to_owned(),
-                remember_for_session: false,
-                updated_input: None,
+                outcome: outcome as i32,
+                request_id: Some(PermissionRequestId::new(request_id)),
+                ..PermissionDecision::default()
             }),
         })
     }
@@ -708,15 +708,31 @@ mod tests {
         assert_eq!(state.title, "");
     }
 
+    /// Applies one spawn through the production fold.
+    fn spawn_into(
+        state: &mut SessionState,
+        sequence: u64,
+        agent: &str,
+        parent: Option<&str>,
+        tree_path: &[&str],
+    ) {
+        state.apply(&envelope(sequence, agent, spawned(parent, tree_path)));
+    }
+
+    /// A session grown by applying each `(agent, parent)` spawn in order,
+    /// the root carrying the "ci-fix" display name.
+    fn tree_of(spawns: &[(&str, Option<&str>)]) -> SessionState {
+        let mut state = SessionState::new("s1");
+        for (index, (agent, parent)) in spawns.iter().enumerate() {
+            let path: &[&str] = if parent.is_none() { &["ci-fix"] } else { &[] };
+            spawn_into(&mut state, (index + 1) as u64, agent, *parent, path);
+        }
+        state
+    }
+
     #[test]
     fn the_first_parentless_spawn_is_the_root() {
-        let mut state = SessionState::new("s1");
-        state.apply(&envelope(1, "root-1", spawned(None, &["ci-fix"])));
-        state.apply(&envelope(
-            2,
-            "child-1",
-            spawned(Some("root-1"), &["ci-fix", "reviewer"]),
-        ));
+        let state = tree_of(&[("root-1", None), ("child-1", Some("root-1"))]);
         assert_eq!(state.root_agent_id.as_deref(), Some("root-1"));
         assert_eq!(state.agents.len(), 2);
         assert_eq!(
@@ -787,11 +803,12 @@ mod tests {
 
     #[test]
     fn subtree_membership_follows_parent_links_and_nothing_else() {
-        let mut state = SessionState::new("s1");
-        state.apply(&envelope(1, "root-1", spawned(None, &["ci-fix"])));
-        state.apply(&envelope(2, "child-1", spawned(Some("root-1"), &[])));
-        state.apply(&envelope(3, "grandchild-1", spawned(Some("child-1"), &[])));
-        state.apply(&envelope(4, "child-2", spawned(Some("root-1"), &[])));
+        let state = tree_of(&[
+            ("root-1", None),
+            ("child-1", Some("root-1")),
+            ("grandchild-1", Some("child-1")),
+            ("child-2", Some("root-1")),
+        ]);
 
         assert!(
             state.in_subtree("child-1", "child-1"),
@@ -835,68 +852,82 @@ mod tests {
         assert!(!state.in_subtree("root-1", "a"));
     }
 
+    /// One scaffold for six vocabularies, so a renamed word or a dropped arm
+    /// fails on the exact pair that changed.
+    fn assert_names(name_of: fn(i32) -> &'static str, cases: &[(i32, &'static str)]) {
+        for (value, expected) in cases {
+            assert_eq!(name_of(*value), *expected, "for wire value {value}");
+        }
+    }
+
     #[test]
     fn every_channel_and_state_name_is_pinned() {
-        for (channel, expected) in [
-            (AgentOutputChannel::Assistant as i32, "assistant"),
-            (AgentOutputChannel::Reasoning as i32, "reasoning"),
-            (AgentOutputChannel::ToolCall as i32, "tool call"),
-            (AgentOutputChannel::ToolResult as i32, "tool result"),
-            (AgentOutputChannel::HarnessDiagnostic as i32, "harness"),
-            (887, "output"),
-        ] {
-            assert_eq!(super::channel_name(channel), expected);
-        }
-        for (status, expected) in [
-            (ResultStatus::Success as i32, "success"),
-            (ResultStatus::Partial as i32, "partial"),
-            (ResultStatus::Blocked as i32, "blocked"),
-            (887, "unspecified"),
-        ] {
-            assert_eq!(super::result_status_name(status), expected);
-        }
-        for (outcome, expected) in [
-            (PermissionOutcome::Allow as i32, "allowed"),
-            (PermissionOutcome::Deny as i32, "denied"),
-            (887, "unspecified"),
-        ] {
-            assert_eq!(super::permission_outcome_name(outcome), expected);
-        }
-        for (state, expected) in [
-            (AgentLifecycleState::Queued as i32, "queued"),
-            (AgentLifecycleState::Starting as i32, "starting"),
-            (AgentLifecycleState::Running as i32, "running"),
-            (
-                AgentLifecycleState::WaitingOnChild as i32,
-                "waiting on child",
-            ),
-            (
-                AgentLifecycleState::WaitingOnHuman as i32,
-                "waiting on human",
-            ),
-            (AgentLifecycleState::Idle as i32, "idle"),
-            (AgentLifecycleState::Archived as i32, "archived"),
-            (AgentLifecycleState::Failed as i32, "failed"),
-            (887, "unspecified"),
-        ] {
-            assert_eq!(super::agent_lifecycle_name(state), expected);
-        }
-        for (state, expected) in [
-            (SessionLifecycleState::Active as i32, "active"),
-            (SessionLifecycleState::Archived as i32, "archived"),
-            (887, "unspecified"),
-        ] {
-            assert_eq!(super::session_lifecycle_name(state), expected);
-        }
-        for (state, expected) in [
-            (PlacementState::Placed as i32, "placed"),
-            (PlacementState::Queued as i32, "queued"),
-            (PlacementState::Expired as i32, "expired"),
-            (PlacementState::Cancelled as i32, "cancelled"),
-            (887, "unspecified"),
-        ] {
-            assert_eq!(super::placement_state_name(state), expected);
-        }
+        assert_names(
+            super::channel_name,
+            &[
+                (AgentOutputChannel::Assistant as i32, "assistant"),
+                (AgentOutputChannel::Reasoning as i32, "reasoning"),
+                (AgentOutputChannel::ToolCall as i32, "tool call"),
+                (AgentOutputChannel::ToolResult as i32, "tool result"),
+                (AgentOutputChannel::HarnessDiagnostic as i32, "harness"),
+                (887, "output"),
+            ],
+        );
+        assert_names(
+            super::result_status_name,
+            &[
+                (ResultStatus::Success as i32, "success"),
+                (ResultStatus::Partial as i32, "partial"),
+                (ResultStatus::Blocked as i32, "blocked"),
+                (887, "unspecified"),
+            ],
+        );
+        assert_names(
+            super::permission_outcome_name,
+            &[
+                (PermissionOutcome::Allow as i32, "allowed"),
+                (PermissionOutcome::Deny as i32, "denied"),
+                (887, "unspecified"),
+            ],
+        );
+        assert_names(
+            super::agent_lifecycle_name,
+            &[
+                (AgentLifecycleState::Queued as i32, "queued"),
+                (AgentLifecycleState::Starting as i32, "starting"),
+                (AgentLifecycleState::Running as i32, "running"),
+                (
+                    AgentLifecycleState::WaitingOnChild as i32,
+                    "waiting on child",
+                ),
+                (
+                    AgentLifecycleState::WaitingOnHuman as i32,
+                    "waiting on human",
+                ),
+                (AgentLifecycleState::Idle as i32, "idle"),
+                (AgentLifecycleState::Archived as i32, "archived"),
+                (AgentLifecycleState::Failed as i32, "failed"),
+                (887, "unspecified"),
+            ],
+        );
+        assert_names(
+            super::session_lifecycle_name,
+            &[
+                (SessionLifecycleState::Active as i32, "active"),
+                (SessionLifecycleState::Archived as i32, "archived"),
+                (887, "unspecified"),
+            ],
+        );
+        assert_names(
+            super::placement_state_name,
+            &[
+                (PlacementState::Placed as i32, "placed"),
+                (PlacementState::Queued as i32, "queued"),
+                (PlacementState::Expired as i32, "expired"),
+                (PlacementState::Cancelled as i32, "cancelled"),
+                (887, "unspecified"),
+            ],
+        );
     }
 
     #[test]

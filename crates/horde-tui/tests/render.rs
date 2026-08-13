@@ -165,6 +165,14 @@ fn busy_session(app: &mut App) {
     caught_up(app, "s1", 7);
 }
 
+/// A second, quieter session beside the busy one, listed at `head`.
+fn second_session(app: &mut App, head: u64) {
+    app.apply(Update::Sessions(vec![
+        summary("s1", "ci-fix", "root-1", 7),
+        summary("s2", "write the docs", "root-2", head),
+    ]));
+}
+
 #[test]
 fn the_overview_with_nothing_says_so() {
     let app = App::overview();
@@ -175,10 +183,7 @@ fn the_overview_with_nothing_says_so() {
 fn the_overview_lists_sessions_and_counts_what_waits() {
     let mut app = App::overview();
     busy_session(&mut app);
-    app.apply(Update::Sessions(vec![
-        summary("s1", "ci-fix", "root-1", 7),
-        summary("s2", "write the docs", "root-2", 3),
-    ]));
+    second_session(&mut app, 3);
     caught_up(&mut app, "s2", 3);
     press(&mut app, KeyCode::Down);
     insta::assert_snapshot!(drawn(&app));
@@ -233,10 +238,7 @@ fn scrolling_back_freezes_the_view_on_older_lines() {
 fn the_inbox_lists_escalations_across_sessions() {
     let mut app = App::overview();
     busy_session(&mut app);
-    app.apply(Update::Sessions(vec![
-        summary("s1", "ci-fix", "root-1", 7),
-        summary("s2", "write the docs", "root-2", 1),
-    ]));
+    second_session(&mut app, 1);
     app.apply(event_in(
         "s2",
         1,

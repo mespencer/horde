@@ -548,24 +548,24 @@ mod tests {
 
     fn summary(session_id: &str, title: &str, root: &str) -> SessionSummary {
         SessionSummary {
-            session_id: Some(SessionId::new(session_id)),
-            title: title.to_owned(),
             root_agent_id: Some(AgentId::new(root)),
+            title: title.to_owned(),
+            session_id: Some(SessionId::new(session_id)),
             ..SessionSummary::default()
         }
     }
 
     fn event_in(session_id: &str, sequence: u64, agent: &str, kind: Kind) -> Update {
+        let event = Event {
+            agent_id: Some(AgentId::new(agent)),
+            kind: Some(kind),
+            ..Event::default()
+        };
         Update::Event(Box::new(EventEnvelope {
-            session_id: Some(SessionId::new(session_id)),
+            event: Some(event),
             sequence,
-            recorded_at: None,
-            event: Some(Event {
-                agent_id: Some(AgentId::new(agent)),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(kind),
-            }),
+            session_id: Some(SessionId::new(session_id)),
+            ..EventEnvelope::default()
         }))
     }
 
