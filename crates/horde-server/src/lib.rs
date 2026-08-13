@@ -12,6 +12,7 @@
 
 pub mod error;
 pub mod log;
+pub mod permission;
 pub mod placement;
 pub mod scheduler;
 pub mod service;

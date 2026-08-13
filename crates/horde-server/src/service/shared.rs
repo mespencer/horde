@@ -74,38 +74,6 @@ impl std::fmt::Debug for ServerCore {
     }
 }
 
-/// Appends one server-originated event, refusing idempotency-key collisions.
-///
-/// The single append path for everything the server itself writes — the
-/// control plane's verbs and the placement passes — so the collision refusal
-/// below cannot be forgotten by a new write site.
-///
-/// # Errors
-///
-/// Storage failures, and [`ServerError::IdempotencyKeyCollision`] when the key
-/// already holds a different kind of event.
-pub async fn append_event(
-    core: &ServerCore,
-    session_id: &str,
-    idempotency_key: &str,
-    event: Event,
-) -> Result<u64, ServerError> {
-    let appended = core
-        .log
-        .append(PendingEvent {
-            session_id: session_id.to_owned(),
-            origin_worker_id: String::new(),
-            journal_sequence: None,
-            idempotency_key: idempotency_key.to_owned(),
-            payload: event.encode_to_vec(),
-        })
-        .await?;
-
-    refuse_kind_collision(&appended, session_id, idempotency_key, &event)?;
-
-    Ok(appended.sequence)
-}
-
 /// This build's semver, echoed in every handshake.
 pub const SERVER_SEMVER: &str = env!("CARGO_PKG_VERSION");
 
@@ -125,6 +93,38 @@ pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";
 pub fn kind_name(kind: Option<&Kind>) -> &'static str {
     kind.and_then(horde_proto::kind_field_name)
         .unwrap_or("empty")
+}
+
+/// Appends a server-originated event: no origin worker, no journal sequence.
+///
+/// The one append shape everything server-side shares — the control plane's
+/// verbs, the placement passes, and the permission chain all write through
+/// here, so the kind-collision refusal below cannot be forgotten by any of
+/// them.
+///
+/// # Errors
+///
+/// Whatever the log refuses, plus
+/// [`ServerError::IdempotencyKeyCollision`] when the key already holds a
+/// different kind of event.
+pub async fn append_server_event(
+    log: &EventLog,
+    session_id: &str,
+    idempotency_key: &str,
+    event: Event,
+) -> Result<u64, ServerError> {
+    let appended = log
+        .append(PendingEvent {
+            session_id: session_id.to_owned(),
+            origin_worker_id: String::new(),
+            journal_sequence: None,
+            idempotency_key: idempotency_key.to_owned(),
+            payload: event.encode_to_vec(),
+        })
+        .await?;
+
+    refuse_kind_collision(&appended, session_id, idempotency_key, &event)?;
+    Ok(appended.sequence)
 }
 
 /// Refuses a deduplication that silently swallowed a *different* kind of event.

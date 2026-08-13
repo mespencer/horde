@@ -36,7 +36,7 @@ use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
-use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore, append_event};
+use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::{StoredEvent, Tail};
 use crate::placement;
@@ -87,7 +87,15 @@ impl ControlPlane {
         idempotency_key: &str,
         event: Event,
     ) -> Result<u64, ServerError> {
-        append_event(&self.core, session_id, idempotency_key, event).await
+        // Shared with the placement passes and the permission chain: one
+        // append shape, one place the kind-collision refusal lives.
+        crate::service::shared::append_server_event(
+            &self.core.log,
+            session_id,
+            idempotency_key,
+            event,
+        )
+        .await
     }
 
     /// The workspace catalog, folded fresh from its stream.
@@ -627,8 +635,8 @@ impl ControlPlaneService for ControlPlane {
         let mut found = None;
         for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
             let state = self.project(&session_id).await.map_err(Status::from)?;
-            if let Some(agent) = state.pending_permissions.get(&request_id) {
-                found = Some((session_id, agent.clone()));
+            if let Some(pending) = state.pending_permissions.get(&request_id) {
+                found = Some((session_id, pending.agent_id.clone()));
                 break;
             }
         }

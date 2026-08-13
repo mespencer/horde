@@ -1,0 +1,19 @@
+[package]
+name = "horde-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The TUI core: session view, attach, and inbox as a pure state machine over the event log, rendered with ratatui."
+
+[lints]
+workspace = true
+
+[dependencies]
+horde-proto = { workspace = true }
+ratatui = "0.30.2"
+
+[dev-dependencies]
+# Pinned exactly: snapshot output is a calibration baseline, and an unpinned
+# snapshot tool silently moves it (docs/TESTING.md §1).
+insta = "=1.48.0"

@@ -11,10 +11,11 @@
 //! an event kind this build has never seen, and refusing to project a session
 //! because of one unfamiliar event would take down the whole view.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use horde_proto::prost_types::Struct;
 use horde_proto::v1::{
-    AgentLifecycleState, AgentSpec, Event, PlacementState, SessionLifecycleState,
+    AgentLifecycleState, AgentSpec, Event, PlacementState, ProposedToolCall, SessionLifecycleState,
     event::Kind as EventKind,
 };
 use prost::Message;
@@ -32,6 +33,8 @@ pub struct AgentState {
     /// Ancestry display names, root first.
     pub tree_path: Vec<String>,
     pub agent_type: String,
+    /// Named permission mode from the spawn spec; empty means the default.
+    pub permission_mode: String,
     /// The worker this agent was placed on, once it has been placed.
     pub worker_id: Option<String>,
     /// What the spawn asked for — constraints, workspace, checkout policy.
@@ -48,6 +51,41 @@ pub struct AgentState {
     pub queued_at_unix_ms: Option<i64>,
 }
 
+/// One permission request still awaiting its decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPermission {
+    /// The agent blocked on the answer.
+    pub agent_id: String,
+    /// The call as proposed, kept so a decision that remembers itself can
+    /// record *what* was allowed — the decision event alone names only the
+    /// request id.
+    pub tool_call: Option<ProposedToolCall>,
+}
+
+/// The identity of a proposed call, for remember-for-session matching.
+///
+/// The arguments ride as their canonical encoding rather than as a `Struct`,
+/// because the map needs a total order and prost's `Struct` (a `BTreeMap`
+/// underneath) encodes deterministically. Absent and empty input stay
+/// distinct, same as everywhere else in the permission chain: "a call with no
+/// arguments" and "arguments unknown" are different calls.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RememberedCall {
+    pub tool_name: String,
+    pub input: Option<Vec<u8>>,
+}
+
+impl RememberedCall {
+    /// The remembering key for one proposed call.
+    #[must_use]
+    pub fn of(call: &ProposedToolCall) -> Self {
+        Self {
+            tool_name: call.tool_name.clone(),
+            input: call.input.as_ref().map(Message::encode_to_vec),
+        }
+    }
+}
+
 /// One session's derived state.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SessionState {
@@ -60,7 +98,16 @@ pub struct SessionState {
     /// Agents by id, in insertion order of their spawn events.
     pub agents: BTreeMap<String, AgentState>,
     /// Permission requests still awaiting a decision.
-    pub pending_permissions: BTreeMap<String, String>,
+    pub pending_permissions: BTreeMap<String, PendingPermission>,
+    /// Requests already decided. Kept so a later `PermissionRequested` with a
+    /// decided id — the chain's enriched re-raise racing a human's answer —
+    /// cannot re-open a request forever.
+    pub decided_permissions: BTreeSet<String>,
+    /// Calls a human allowed with remember-for-session, keyed by the proposed
+    /// call and carrying the narrowing to re-apply, if the decision had one.
+    /// This is the widened deterministic-allow layer from
+    /// `PermissionDecision.remember_for_session`.
+    pub remembered_allows: BTreeMap<RememberedCall, Option<Struct>>,
 }
 
 impl SessionState {
@@ -137,6 +184,11 @@ impl SessionState {
                     .as_ref()
                     .map(|spec| spec.agent_type.clone())
                     .unwrap_or_default(),
+                permission_mode: spawned
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.permission_mode.clone())
+                    .unwrap_or_default(),
                 worker_id: None,
                 spec: spawned.spec,
                 placement_state: PlacementState::Unspecified,
@@ -186,27 +238,64 @@ impl SessionState {
         }
     }
 
-    /// Remembers which agent is waiting on a permission decision.
+    /// Remembers which agent is waiting on a permission decision, and what it
+    /// proposed.
+    ///
+    /// A request whose id was already decided is ignored: the chain re-raises
+    /// an escalation with context for the approver, and that re-raise racing a
+    /// human's answer must not re-open a request that will never be answered
+    /// again.
     fn permission_requested(&mut self, requested: horde_proto::v1::PermissionRequested) {
         if let Some(request) = requested.request
             && let Some(id) = request.request_id.as_ref().map(ToString::to_string)
+            && !self.decided_permissions.contains(&id)
         {
-            let agent = request
+            let agent_id = request
                 .agent_id
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            self.pending_permissions.insert(id, agent);
+            self.pending_permissions.insert(
+                id,
+                PendingPermission {
+                    agent_id,
+                    tool_call: request.tool_call,
+                },
+            );
         }
     }
 
-    /// Forgets a permission once its decision has landed.
+    /// Settles a permission: the request stops being pending, its id can never
+    /// be re-opened, and a remembering allow widens the session's
+    /// deterministic-allow layer with the call it approved.
     fn permission_decided(&mut self, decided: horde_proto::v1::PermissionDecided) {
         if let Some(decision) = decided.decision
             && let Some(id) = decision.request_id.as_ref().map(ToString::to_string)
         {
-            self.pending_permissions.remove(&id);
+            if let Some(pending) = self.pending_permissions.remove(&id)
+                && decision_remembers(&decision)
+                && let Some(call) = pending.tool_call
+            {
+                // The key is the *proposed* call, and the value re-applies the
+                // same narrowing: remembering the narrowed arguments as if
+                // they had been proposed would auto-allow the original,
+                // unnarrowed call — wider than what the human approved.
+                self.remembered_allows
+                    .insert(RememberedCall::of(&call), decision.updated_input);
+            }
+            self.decided_permissions.insert(id);
         }
+    }
+
+    /// Whether the deterministic-allow layer already covers this call, and
+    /// with what narrowing.
+    ///
+    /// `None` means the call is not remembered. `Some(None)` means it is
+    /// remembered as proposed; `Some(Some(_))` carries the narrowing the
+    /// original decision applied.
+    #[must_use]
+    pub fn remembered_narrowing(&self, call: &ProposedToolCall) -> Option<&Option<Struct>> {
+        self.remembered_allows.get(&RememberedCall::of(call))
     }
 
     /// Agents whose parent is `parent`, or the roots when `None`.
@@ -218,6 +307,18 @@ impl SessionState {
             .values()
             .filter(move |agent| agent.parent_agent_id.as_deref() == parent)
     }
+}
+
+/// Whether a decision widens the deterministic-allow layer for the session.
+///
+/// Both halves matter and are not separately reachable inline: humans answer
+/// allow-without-remember constantly, and a deny that asked to be remembered
+/// is refusable UI nonsense — remembering a *denial* as an allow would be the
+/// silently widened permission this chain exists to prevent, so `&&` versus
+/// `||` here is a security property, not a style choice.
+fn decision_remembers(decision: &horde_proto::v1::PermissionDecision) -> bool {
+    let allowed = decision.outcome == horde_proto::v1::PermissionOutcome::Allow as i32;
+    allowed && decision.remember_for_session
 }
 
 #[cfg(test)]
@@ -453,5 +554,268 @@ mod tests {
             all_at_once, incremental,
             "a live projection kept up to date must equal a cold replay"
         );
+    }
+
+    #[test]
+    fn the_permission_mode_rides_the_projection_from_the_spawn_spec() {
+        let with_mode = Kind::AgentSpawned(AgentSpawned {
+            parent_agent_id: None,
+            spawned_by: None,
+            spec: Some(AgentSpec {
+                agent_type: "reviewer".to_owned(),
+                permission_mode: "cautious".to_owned(),
+                ..AgentSpec::default()
+            }),
+            tree_path: Vec::new(),
+        });
+        let state =
+            SessionState::project("s1", &[stored(1, Some("root"), with_mode)]).expect("project");
+
+        assert_eq!(state.agents["root"].permission_mode, "cautious");
+    }
+}
+
+#[cfg(test)]
+mod permission_fold_tests {
+    use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
+    use horde_proto::v1::{
+        AgentId, Event, PermissionDecided, PermissionDecision, PermissionOutcome,
+        PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall, event::Kind,
+    };
+    use prost::Message;
+
+    use super::{PendingPermission, SessionState, decision_remembers};
+    use crate::log::StoredEvent;
+
+    fn stored(sequence: u64, kind: Kind) -> StoredEvent {
+        StoredEvent {
+            session_id: "s1".to_owned(),
+            sequence,
+            recorded_at_unix_ms: 0,
+            payload: Event {
+                agent_id: Some(AgentId::new("agent-1")),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(kind),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    fn arguments(path: &str) -> Struct {
+        let mut input = Struct::default();
+        input.fields.insert(
+            "file_path".to_owned(),
+            Value {
+                kind: Some(ValueKind::StringValue(path.to_owned())),
+            },
+        );
+        input
+    }
+
+    fn call(path: &str) -> ProposedToolCall {
+        ProposedToolCall {
+            tool_name: "Write".to_owned(),
+            input: Some(arguments(path)),
+            rendered: format!("Write {path}"),
+        }
+    }
+
+    fn requested(request_id: &str, tool_call: Option<ProposedToolCall>) -> Kind {
+        Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                agent_id: Some(AgentId::new("agent-1")),
+                tool_call,
+                ..PermissionRequest::default()
+            }),
+        })
+    }
+
+    fn decided(
+        request_id: &str,
+        outcome: PermissionOutcome,
+        remember: bool,
+        updated_input: Option<Struct>,
+    ) -> Kind {
+        Kind::PermissionDecided(PermissionDecided {
+            decision: Some(PermissionDecision {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                outcome: outcome as i32,
+                remember_for_session: remember,
+                updated_input,
+                ..PermissionDecision::default()
+            }),
+        })
+    }
+
+    #[test]
+    fn a_pending_permission_holds_the_agent_and_the_proposed_call() {
+        let state = SessionState::project(
+            "s1",
+            &[stored(1, requested("req-1", Some(call("/etc/hosts"))))],
+        )
+        .expect("project");
+
+        assert_eq!(
+            state.pending_permissions.get("req-1"),
+            Some(&PendingPermission {
+                agent_id: "agent-1".to_owned(),
+                tool_call: Some(call("/etc/hosts")),
+            })
+        );
+    }
+
+    #[test]
+    fn a_decision_settles_the_request() {
+        let state = SessionState::project(
+            "s1",
+            &[
+                stored(1, requested("req-1", Some(call("/etc/hosts")))),
+                stored(2, decided("req-1", PermissionOutcome::Deny, false, None)),
+            ],
+        )
+        .expect("project");
+
+        assert!(state.pending_permissions.is_empty());
+        assert!(state.decided_permissions.contains("req-1"));
+    }
+
+    /// The race this guard exists for: the chain's enriched re-raise lands
+    /// *after* a human's answer. Without the decided set, the re-raise
+    /// re-opens a request nobody will ever answer again, and it reads as
+    /// pending forever.
+    #[test]
+    fn a_request_re_raised_after_its_decision_stays_settled() {
+        let state = SessionState::project(
+            "s1",
+            &[
+                stored(1, requested("req-1", Some(call("/etc/hosts")))),
+                stored(2, decided("req-1", PermissionOutcome::Allow, false, None)),
+                stored(3, requested("req-1", Some(call("/etc/hosts")))),
+            ],
+        )
+        .expect("project");
+
+        assert!(
+            state.pending_permissions.is_empty(),
+            "a decided request must never come back as pending"
+        );
+    }
+
+    /// All four corners. The false rows are each reachable in production —
+    /// plain allows are constant, and a remembered denial would widen the
+    /// allow layer with something a human refused.
+    #[test]
+    fn only_an_allow_that_asked_to_be_remembered_remembers() {
+        let case = |outcome: PermissionOutcome, remember: bool| {
+            decision_remembers(&PermissionDecision {
+                outcome: outcome as i32,
+                remember_for_session: remember,
+                ..PermissionDecision::default()
+            })
+        };
+
+        assert!(case(PermissionOutcome::Allow, true));
+        assert!(!case(PermissionOutcome::Allow, false));
+        assert!(
+            !case(PermissionOutcome::Deny, true),
+            "remembering a denial as an allow is the silently widened permission"
+        );
+        assert!(!case(PermissionOutcome::Deny, false));
+    }
+
+    #[test]
+    fn a_remembering_allow_widens_the_session_for_that_exact_call() {
+        let state = SessionState::project(
+            "s1",
+            &[
+                stored(1, requested("req-1", Some(call("/tmp/x")))),
+                stored(2, decided("req-1", PermissionOutcome::Allow, true, None)),
+            ],
+        )
+        .expect("project");
+
+        assert_eq!(
+            state.remembered_narrowing(&call("/tmp/x")),
+            Some(&None),
+            "the identical call is now allowed as proposed"
+        );
+        assert_eq!(
+            state.remembered_narrowing(&call("/etc/hosts")),
+            None,
+            "a different argument is a different call and must re-escalate"
+        );
+    }
+
+    /// Remembering keys on the *proposed* call and re-applies the narrowing.
+    /// Keying on the narrowed arguments would auto-allow the original,
+    /// unnarrowed proposal later — wider than what the human approved.
+    #[test]
+    fn a_remembered_narrowing_is_reapplied_not_forgotten() {
+        let state = SessionState::project(
+            "s1",
+            &[
+                stored(1, requested("req-1", Some(call("/etc/hosts")))),
+                stored(
+                    2,
+                    decided(
+                        "req-1",
+                        PermissionOutcome::Allow,
+                        true,
+                        Some(arguments("/tmp/safe")),
+                    ),
+                ),
+            ],
+        )
+        .expect("project");
+
+        assert_eq!(
+            state.remembered_narrowing(&call("/etc/hosts")),
+            Some(&Some(arguments("/tmp/safe"))),
+            "the repeat of the proposal must carry the same clamp"
+        );
+    }
+
+    #[test]
+    fn a_denial_never_widens_the_allow_layer_even_when_asked_to() {
+        let state = SessionState::project(
+            "s1",
+            &[
+                stored(1, requested("req-1", Some(call("/etc/hosts")))),
+                stored(2, decided("req-1", PermissionOutcome::Deny, true, None)),
+            ],
+        )
+        .expect("project");
+
+        assert!(state.remembered_allows.is_empty());
+    }
+
+    /// Absent and empty arguments are different calls, the same distinction
+    /// `updated_input` draws. A remember of one must not cover the other.
+    #[test]
+    fn a_call_with_no_arguments_is_not_a_call_with_empty_arguments() {
+        let bare = ProposedToolCall {
+            tool_name: "Read".to_owned(),
+            input: None,
+            rendered: String::new(),
+        };
+        let empty = ProposedToolCall {
+            tool_name: "Read".to_owned(),
+            input: Some(Struct::default()),
+            rendered: String::new(),
+        };
+
+        let state = SessionState::project(
+            "s1",
+            &[
+                stored(1, requested("req-1", Some(bare.clone()))),
+                stored(2, decided("req-1", PermissionOutcome::Allow, true, None)),
+            ],
+        )
+        .expect("project");
+
+        assert_eq!(state.remembered_narrowing(&bare), Some(&None));
+        assert_eq!(state.remembered_narrowing(&empty), None);
     }
 }

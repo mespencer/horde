@@ -41,7 +41,7 @@ use horde_proto::v1::{
 
 use crate::error::ServerError;
 use crate::scheduler::{Placement, PlacementRequest};
-use crate::service::shared::{ServerCore, append_event};
+use crate::service::shared::{ServerCore, append_server_event};
 use crate::state::{AgentState, SessionState};
 use crate::workspace::is_catalog_stream;
 
@@ -184,8 +184,8 @@ pub async fn append_placement(
     placement: horde_proto::v1::Placement,
 ) -> Result<u64, ServerError> {
     let agent_id = placement.agent_id.clone();
-    append_event(
-        core,
+    append_server_event(
+        &core.log,
         session_id,
         "",
         Event {
@@ -219,8 +219,8 @@ pub async fn ensure_instance(
         return Ok(());
     }
 
-    append_event(
-        core,
+    append_server_event(
+        &core.log,
         session_id,
         "",
         Event {
@@ -525,6 +525,7 @@ mod tests {
             lifecycle: AgentLifecycleState::Queued,
             tree_path: Vec::new(),
             agent_type: String::new(),
+            permission_mode: String::new(),
             worker_id: None,
             spec: Some(spec_with_timeout(0, 1_000_000)),
             placement_state: state,
@@ -616,6 +617,7 @@ mod tests {
                     lifecycle,
                     tree_path: Vec::new(),
                     agent_type: String::new(),
+                    permission_mode: String::new(),
                     worker_id: worker.map(ToString::to_string),
                     spec: None,
                     placement_state: PlacementState::Placed,
@@ -727,7 +729,7 @@ mod tests {
     /// child on the idle worker instead.
     #[tokio::test]
     async fn a_drained_child_prefers_its_parents_worker_over_the_idle_one() {
-        use crate::service::shared::{ServerCore, append_event};
+        use crate::service::shared::{ServerCore, append_server_event};
         use horde_proto::v1::{AgentId, AgentSpawned, Event, WorkerCapabilities, event::Kind};
 
         let core = ServerCore::new(crate::EventLog::in_memory().expect("an in-memory log"));
@@ -746,7 +748,7 @@ mod tests {
         };
 
         // The parent already runs on beta; the child has no placement yet.
-        append_event(&core, "s1", "", spawn("parent", None))
+        append_server_event(&core.log, "s1", "", spawn("parent", None))
             .await
             .expect("append the parent");
         append_placement(
@@ -761,7 +763,7 @@ mod tests {
         )
         .await
         .expect("place the parent");
-        append_event(&core, "s1", "", spawn("child", Some("parent")))
+        append_server_event(&core.log, "s1", "", spawn("child", Some("parent")))
             .await
             .expect("append the child");
 
