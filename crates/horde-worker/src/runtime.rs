@@ -49,6 +49,7 @@ use tokio::sync::mpsc;
 use crate::client::ApplyCommand;
 use crate::error::WorkerError;
 use crate::journal::{AgentBookkeeping, AgentProgress, Journal, JournalEntry, RevivableAgent};
+use crate::share::{AgentCheckout, ShareBroker, StampingSink};
 use crate::translate::{AgentContext, failure_reason, journal_entries};
 
 /// How many control messages may queue for one agent's pump.
@@ -65,6 +66,9 @@ pub struct Runtime {
     /// this Worker does not advertise workspace support and refuses
     /// materialize commands loudly.
     workspaces: Option<crate::workspace::WorkspaceManager>,
+    /// Tracks every running agent's checkout and executes payload shares —
+    /// stamping on the way out, obtaining on the way in.
+    broker: Arc<ShareBroker>,
     agents: BTreeMap<String, AgentHandle>,
     /// Pumps whose agents were archived, kept so shutdown can wait for them.
     retired: Vec<tokio::task::JoinHandle<()>>,
@@ -153,9 +157,29 @@ impl Runtime {
             adapters: BTreeMap::new(),
             default_provider: None,
             workspaces: None,
+            broker: Arc::new(ShareBroker::new(None)),
             agents: BTreeMap::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Points payload shares at a Relay: stamped commits are pushed to their
+    /// share refs, and commits absent from this Worker are fetched through
+    /// it. Without one, only the local routes exist. Configure before any
+    /// spawn — the broker is rebuilt, not updated.
+    #[must_use]
+    pub fn with_relay(mut self, relay: horde_relay::RelayLocation) -> Self {
+        self.broker = Arc::new(ShareBroker::new(Some(relay)));
+        self
+    }
+
+    /// The journal sink the Worker hands its MCP endpoint: results reported
+    /// without a payload are stamped with the reporting agent's observed
+    /// HEAD on their way into the journal ("the Worker's to stamp",
+    /// horde-mcp's `report_result`).
+    #[must_use]
+    pub fn stamping_sink(&self) -> StampingSink {
+        StampingSink::new(self.journal.sink(), Arc::clone(&self.broker))
     }
 
     /// Enables workspace support: materialize commands are applied, spawns
@@ -281,22 +305,21 @@ impl Runtime {
         // loop: the command still applies, with the failure as its journaled
         // effect, and the Server hears an honest lifecycle instead of losing
         // its Worker.
-        let (session, can_rewrite) = match self.start_session(&spawn).await {
-            Ok(started) => started,
-            Err(error) => {
-                return Ok(Applied {
-                    effects: vec![lifecycle_entry(
-                        &context,
-                        format!("{agent_id}:spawn-failed"),
-                        AgentLifecycleState::Queued,
-                        AgentLifecycleState::Failed,
-                        error.to_string(),
-                    )],
-                    bookkeeping: AgentBookkeeping::None,
-                    then: AfterCommit::Nothing,
-                });
-            }
+        let checkout = match self.agent_checkout(&spawn).await {
+            Ok(checkout) => checkout,
+            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
         };
+        let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
+        let (session, can_rewrite) = match self.start_session(&spawn, cwd).await {
+            Ok(started) => started,
+            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
+        };
+        // Registered only once the harness actually started: a checkout with
+        // no agent behind it must not become a peer-fetch source or a
+        // stamping target.
+        if let Some(checkout) = checkout {
+            self.broker.register(&agent_id, checkout);
+        }
 
         let first_input = spawn
             .spec
@@ -332,13 +355,13 @@ impl Runtime {
         })
     }
 
-    /// Resolves the adapter and starts the harness session.
+    /// Resolves the adapter and starts the harness session in `cwd`.
     async fn start_session(
         &self,
         spawn: &SpawnAgentCommand,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<(Box<dyn AgentSession>, bool), WorkerError> {
         let adapter = self.adapter_for(spawn)?;
-        let cwd = self.agent_checkout(spawn).await?;
         let spec = domain_spec(spawn, cwd);
         let session = adapter.spawn(&spec).await?;
         let can_rewrite = adapter
@@ -361,8 +384,9 @@ impl Runtime {
             .ok_or(WorkerError::UnknownProvider(provider))
     }
 
-    /// The working directory a spawn's workspace and Checkout Policy call
-    /// for; `None` when the spawn names no workspace and the agent runs
+    /// The checkout a spawn's workspace and Checkout Policy call for — its
+    /// root is the agent's working directory, its repos the payload seam's
+    /// map — or `None` when the spawn names no workspace and the agent runs
     /// where the Worker runs.
     ///
     /// # Errors
@@ -373,7 +397,7 @@ impl Runtime {
     async fn agent_checkout(
         &self,
         spawn: &SpawnAgentCommand,
-    ) -> Result<Option<std::path::PathBuf>, WorkerError> {
+    ) -> Result<Option<AgentCheckout>, WorkerError> {
         let Some(spec) = spawn.spec.as_ref() else {
             return Ok(None);
         };
@@ -398,10 +422,11 @@ impl Runtime {
             .unwrap_or_default();
         let policy = horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy)
             .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified);
-        workspaces
+        let root = workspaces
             .checkout(&definition_id, &agent_id, policy)
-            .await
-            .map(Some)
+            .await?;
+        let repos = workspaces.instance_repos(&definition_id).await?;
+        Ok(Some(AgentCheckout { root, repos }))
     }
 
     async fn deliver_message(
@@ -410,9 +435,11 @@ impl Runtime {
     ) -> Result<Applied, WorkerError> {
         let agent_id = required_id(deliver.agent_id.as_ref(), "agent id")?;
 
-        let text = match deliver.body {
-            Some(deliver_message_command::Body::Assignment(assignment)) => assignment.text,
-            Some(deliver_message_command::Body::Note(note)) => note.text,
+        let (text, payload) = match deliver.body {
+            Some(deliver_message_command::Body::Assignment(assignment)) => {
+                (assignment.text, assignment.payload)
+            }
+            Some(deliver_message_command::Body::Note(note)) => (note.text, note.payload),
             None => {
                 tracing::warn!(
                     agent_id,
@@ -431,6 +458,15 @@ impl Runtime {
         };
 
         if has_live_pump(&self.agents, &agent_id) {
+            // A Payload's commits are made present in the receiving agent's
+            // checkout *before* the message text reaches it — the message
+            // names work, and handing the agent a name it cannot check out
+            // would be the transport becoming the agent's concern (DESIGN §5).
+            if let Some(payload) = carried_payload(payload.as_ref())
+                && let Err(error) = self.broker.obtain(&agent_id, payload).await
+            {
+                return Ok(self.payload_failed(&agent_id, &error));
+            }
             // No journal effect: the Server wrote AssignmentSent/NoteSent when
             // the message happened; that event is why this command exists.
             return Ok(Applied {
@@ -445,8 +481,10 @@ impl Runtime {
 
         // Nobody is running the agent — a dead harness, a retired pump, or a
         // Worker that restarted. Sending an agent another message is what
-        // revives it (DESIGN.md §5), and the journal remembers how.
-        self.revive_and_deliver(agent_id, input).await
+        // revives it (DESIGN.md §5), and the journal remembers how. The
+        // payload rides along: it can only be obtained once the revival has
+        // re-registered the agent's checkout.
+        self.revive_and_deliver(agent_id, input, payload).await
     }
 
     /// Revives a remembered agent to deliver `input`, or journals why not.
@@ -454,6 +492,7 @@ impl Runtime {
         &mut self,
         agent_id: String,
         input: TurnInput,
+        payload: Option<horde_proto::v1::Payload>,
     ) -> Result<Applied, WorkerError> {
         let Some(record) = self.journal.revivable_agent(&agent_id).await? else {
             // Never spawned here (or long archived): the race case, applied
@@ -484,26 +523,41 @@ impl Runtime {
         }
 
         match self.resume_session(&record).await {
-            Ok((session, can_rewrite)) => Ok(Applied {
-                effects: vec![lifecycle_entry(
-                    &context,
-                    // Revivals can repeat; the journal mints each key.
-                    String::new(),
-                    // The Worker does not track how the last incarnation
-                    // ended; claiming one would be invention.
-                    AgentLifecycleState::Unspecified,
-                    AgentLifecycleState::Starting,
-                    "revived to deliver a message".to_owned(),
-                )],
-                bookkeeping: AgentBookkeeping::None,
-                then: AfterCommit::Start {
-                    agent_id,
-                    session,
-                    context,
-                    can_rewrite,
-                    first_input: Some(input),
-                },
-            }),
+            Ok((session, can_rewrite, checkout)) => {
+                // Re-registered before the payload is obtained: the broker
+                // routes the obtain through the receiver's own checkout.
+                if let Some(checkout) = checkout {
+                    self.broker.register(&agent_id, checkout);
+                }
+                if let Some(payload) = carried_payload(payload.as_ref())
+                    && let Err(error) = self.broker.obtain(&agent_id, payload).await
+                {
+                    // The revived checkout must not linger as a stamping
+                    // target for an agent whose pump never started.
+                    self.broker.forget(&agent_id);
+                    return Ok(self.payload_failed(&agent_id, &error));
+                }
+                Ok(Applied {
+                    effects: vec![lifecycle_entry(
+                        &context,
+                        // Revivals can repeat; the journal mints each key.
+                        String::new(),
+                        // The Worker does not track how the last incarnation
+                        // ended; claiming one would be invention.
+                        AgentLifecycleState::Unspecified,
+                        AgentLifecycleState::Starting,
+                        "revived to deliver a message".to_owned(),
+                    )],
+                    bookkeeping: AgentBookkeeping::None,
+                    then: AfterCommit::Start {
+                        agent_id,
+                        session,
+                        context,
+                        can_rewrite,
+                        first_input: Some(input),
+                    },
+                })
+            }
             Err(error) => Ok(Applied {
                 // The revival failing is the *agent's* failure, journaled so
                 // the sender learns the message has no one to reach — silence
@@ -528,10 +582,11 @@ impl Runtime {
     async fn resume_session(
         &self,
         record: &RevivableAgent,
-    ) -> Result<(Box<dyn AgentSession>, bool), WorkerError> {
+    ) -> Result<(Box<dyn AgentSession>, bool, Option<AgentCheckout>), WorkerError> {
         let provider_session_id = record.provider_session_id.as_deref().unwrap_or_default();
         let adapter = self.adapter_for(&record.spawn)?;
-        let cwd = self.agent_checkout(&record.spawn).await?;
+        let checkout = self.agent_checkout(&record.spawn).await?;
+        let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
         // One past the recorded count: a turn that died half-journaled has
         // already spent its ordinal, and reusing it would hand the revived
         // turn journal keys the Server has partially seen. Turn ids need
@@ -546,7 +601,38 @@ impl Runtime {
         let can_rewrite = adapter
             .capabilities()
             .supports(Capability::RewritesToolInput);
-        Ok((session, can_rewrite))
+        Ok((session, can_rewrite, checkout))
+    }
+
+    /// A delivery whose Payload could not be obtained fails the *agent*,
+    /// loudly: the message names work the agent cannot see, and delivering
+    /// the text anyway would have it act on a payload it cannot check out —
+    /// a silent drop with a delayed symptom. The command still applies, the
+    /// failure is its journaled effect, and the pump is retired.
+    fn payload_failed(&self, agent_id: &str, error: &WorkerError) -> Applied {
+        let session_id = self
+            .agents
+            .get(agent_id)
+            .map(|handle| handle.session_id.clone())
+            .unwrap_or_default();
+        Applied {
+            effects: vec![JournalEntry {
+                session_id,
+                agent_id: Some(agent_id.to_owned()),
+                idempotency_key: String::new(),
+                kind: Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                    previous_state: AgentLifecycleState::Running.into(),
+                    state: AgentLifecycleState::Failed.into(),
+                    reason: format!("a delivered payload could not be obtained: {error}"),
+                }),
+            }],
+            // Failed, not archived: the context survives, so another message
+            // (with an obtainable payload) may still revive the agent.
+            bookkeeping: AgentBookkeeping::None,
+            then: AfterCommit::Retire {
+                agent_id: agent_id.to_owned(),
+            },
+        }
     }
 
     fn interrupt_agent(&mut self, interrupt: &InterruptAgentCommand) -> Applied {
@@ -734,6 +820,10 @@ impl Runtime {
                 }
             }
             AfterCommit::Retire { agent_id } => {
+                // The checkout registry must not outlive the agent: a stale
+                // entry would stamp an archived agent's HEAD, or offer its
+                // checkout as a peer-fetch source, forever.
+                self.broker.forget(&agent_id);
                 if let Some(handle) = self.agents.remove(&agent_id) {
                     let _ = handle.control.send(AgentControl::Archive).await;
                     self.retired.push(handle.task);
@@ -770,6 +860,32 @@ impl ApplyCommand for Runtime {
         self.after_commit(applied.then).await;
         Ok(())
     }
+}
+
+/// The applied form of a spawn that could not start: the command applies,
+/// with the agent's failure as its journaled effect — the Server hears an
+/// honest lifecycle instead of losing its Worker.
+fn spawn_failed(context: &AgentContext, agent_id: &str, error: &WorkerError) -> Applied {
+    Applied {
+        effects: vec![lifecycle_entry(
+            context,
+            format!("{agent_id}:spawn-failed"),
+            AgentLifecycleState::Queued,
+            AgentLifecycleState::Failed,
+            error.to_string(),
+        )],
+        // An agent that never started has nothing to revive; remembering it
+        // would promise a revival the journal cannot deliver.
+        bookkeeping: AgentBookkeeping::None,
+        then: AfterCommit::Nothing,
+    }
+}
+
+/// The payload a message actually carries, if it names any commits.
+fn carried_payload(
+    payload: Option<&horde_proto::v1::Payload>,
+) -> Option<&horde_proto::v1::Payload> {
+    payload.filter(|payload| !payload.git_refs.is_empty())
 }
 
 /// A lifecycle transition as a journal effect.

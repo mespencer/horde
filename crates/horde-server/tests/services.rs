@@ -23,7 +23,7 @@ use tonic::Code;
 
 mod common;
 
-use common::{Harness, Setup, connect_to, core, open_sync, seed};
+use common::{Harness, Setup, connect_to, connect_with_plane, core, open_sync, seed};
 use horde_server::service::ServerCore;
 
 /// Opens a journal stream and announces the worker's journal position.
@@ -315,6 +315,11 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         .expect("list must succeed")
         .into_inner();
     assert_eq!(listed.sessions.len(), 1);
+    assert_eq!(
+        listed.sessions[0].title, "first",
+        "the summary carries the title the root spawn recorded, so clients \
+         do not have to reconstruct it from the spawn event"
+    );
 
     let fetched = harness
         .control
@@ -957,6 +962,312 @@ async fn a_worker_resuming_mid_stream_sees_the_tail_and_no_duplicates() {
         resumed.command_sequence, 2,
         "resuming at 2 must not redeliver 1"
     );
+}
+
+/// Reads the next sync frame within a ceiling — a stream that stalls is a
+/// finding, not a slow machine, and an unbounded wait would report it as a
+/// hang instead (docs/QUALITY_GATES.md).
+async fn next_sync_frame(
+    stream: &mut tonic::Streaming<horde_proto::v1::SyncEventsResponse>,
+) -> Setup<sync_events_response::Update> {
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .map_err(|_| "the sync stream went quiet instead of answering")?
+        .ok_or("the sync stream ended early")??;
+    message.update.ok_or("an empty sync frame".into())
+}
+
+/// Collects `(session, agent, sequence)` rows from sync frames until `enough`
+/// says so, ignoring heartbeats and catch-up markers. Count-bounded.
+async fn collect_synced(
+    stream: &mut tonic::Streaming<horde_proto::v1::SyncEventsResponse>,
+    enough: impl Fn(&[(String, String, u64)]) -> bool,
+) -> Setup<Vec<(String, String, u64)>> {
+    let mut rows = Vec::new();
+    for _ in 0..64 {
+        if enough(&rows) {
+            return Ok(rows);
+        }
+        if let sync_events_response::Update::Batch(batch) = next_sync_frame(stream).await? {
+            for event in &batch.events {
+                rows.push((
+                    event
+                        .session_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    event
+                        .event
+                        .as_ref()
+                        .and_then(|event| event.agent_id.as_ref())
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    event.sequence,
+                ));
+            }
+        }
+    }
+    Err("the stream never produced what the test was waiting for".into())
+}
+
+/// One stream serves the whole overview: an all-sessions sync subscribes at
+/// each existing session's head, reports those heads at catch-up, and then
+/// carries live events from every session — including one born afterwards.
+#[tokio::test]
+async fn an_all_sessions_sync_merges_every_sessions_tail_into_one_stream() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    let (first, _) = seed(&mut harness, "first", "key-1").await.expect("seed");
+    let (second, _) = seed(&mut harness, "second", "key-2").await.expect("seed");
+
+    let mut stream = harness
+        .control
+        .sync_events(horde_proto::v1::SyncEventsRequest {
+            cursors: Vec::new(),
+            all_sessions: true,
+            subtree_root: None,
+            follow: true,
+            max_batch_events: 0,
+        })
+        .await
+        .expect("an all-sessions sync opens")
+        .into_inner();
+
+    // No cursors were named, so the first frame is the catch-up: existing
+    // sessions are followed from their heads, not replayed.
+    let frame = next_sync_frame(&mut stream).await.expect("a frame");
+    let sync_events_response::Update::CaughtUp(caught_up) = frame else {
+        panic!("an all-sessions sync with no cursors replays nothing, got {frame:?}");
+    };
+    let mut heads: Vec<String> = caught_up
+        .heads
+        .iter()
+        .filter_map(|cursor| cursor.session_id.as_ref().map(ToString::to_string))
+        .collect();
+    heads.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(heads, expected, "both existing sessions are followed");
+
+    // A session born after the subscription joins the merge from its start,
+    // and an event journaled into an old session arrives on the same stream.
+    let (newborn, _) = seed(&mut harness, "newborn", "key-3").await.expect("seed");
+    journal_output(&mut harness, &first, "still here", 7)
+        .await
+        .expect("journal");
+
+    let rows = collect_synced(&mut stream, |rows| {
+        let sessions: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .map(|(session, _, _)| session.as_str())
+            .collect();
+        sessions.contains(newborn.as_str()) && sessions.contains(first.as_str())
+    })
+    .await
+    .expect("the merge must carry both sessions");
+    assert!(
+        rows.iter()
+            .any(|(session, _, sequence)| session == &newborn && *sequence == 1),
+        "the newborn session arrives from its first event: {rows:?}"
+    );
+}
+
+/// Journals one output chunk into a session through the worker plane, as
+/// `journal_sequence` for a throwaway worker.
+async fn journal_output(
+    harness: &mut Harness,
+    session_id: &str,
+    text: &str,
+    journal_sequence: u64,
+) -> Setup<()> {
+    let (to_server, mut acks) = open_journal(
+        harness,
+        "sync-test-worker",
+        journal_sequence.saturating_sub(1),
+    )
+    .await?;
+    acks.next().await.ok_or("an acceptance")??;
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events: vec![JournaledEvent {
+                    journal_sequence,
+                    session_id: Some(SessionId::new(session_id)),
+                    event: Some(output_event("agent-x", text, journal_sequence)),
+                }],
+                acked_command_sequence: 0,
+            })),
+        })
+        .await?;
+    acks.next().await.ok_or("an ack")??;
+    Ok(())
+}
+
+/// The server-side subtree scope: a sync with `subtree_root` carries the
+/// attached agent's subtree and nothing else — the sibling's events never
+/// cross the wire, which is the point of doing it server-side.
+#[tokio::test]
+async fn a_subtree_scoped_sync_filters_on_the_server() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    let (session_id, root) = seed(&mut harness, "scoped", "key-1").await.expect("seed");
+
+    let (mine, _) = spawn_agent(&mut harness, &session_id).await.expect("spawn");
+    let (sibling, _) = spawn_agent(&mut harness, &session_id).await.expect("spawn");
+
+    // Both children speak; only one is in scope.
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("open");
+    acks.next().await.expect("accepted").expect("accepted");
+    to_server
+        .send(PushEventsRequest {
+            body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+                events: vec![
+                    JournaledEvent {
+                        journal_sequence: 1,
+                        session_id: Some(SessionId::new(session_id.clone())),
+                        event: Some(output_event(&mine, "in scope", 0)),
+                    },
+                    JournaledEvent {
+                        journal_sequence: 2,
+                        session_id: Some(SessionId::new(session_id.clone())),
+                        event: Some(output_event(&sibling, "out of scope", 0)),
+                    },
+                ],
+                acked_command_sequence: 0,
+            })),
+        })
+        .await
+        .expect("batch sends");
+    acks.next().await.expect("ack").expect("ack");
+
+    let mut stream = harness
+        .control
+        .sync_events(horde_proto::v1::SyncEventsRequest {
+            cursors: vec![horde_proto::v1::SessionCursor {
+                session_id: Some(SessionId::new(session_id.clone())),
+                from_sequence: 0,
+            }],
+            all_sessions: false,
+            subtree_root: Some(AgentId::new(mine.clone())),
+            follow: false,
+            max_batch_events: 0,
+        })
+        .await
+        .expect("a scoped sync opens")
+        .into_inner();
+
+    let mut agents = Vec::new();
+    loop {
+        match next_sync_frame(&mut stream).await.expect("a frame") {
+            sync_events_response::Update::Batch(batch) => {
+                for event in &batch.events {
+                    agents.push(
+                        event
+                            .event
+                            .as_ref()
+                            .and_then(|event| event.agent_id.as_ref())
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            sync_events_response::Update::CaughtUp(_) => break,
+            sync_events_response::Update::Heartbeat(_) => {}
+        }
+    }
+
+    assert!(
+        agents.contains(&mine),
+        "the attached agent's own events must arrive: {agents:?}"
+    );
+    assert!(
+        !agents.iter().any(|agent| agent == &sibling),
+        "the sibling's events must never cross the wire: {agents:?}"
+    );
+    assert!(
+        !agents.iter().any(|agent| agent == &root),
+        "membership goes down the tree, never up: {agents:?}"
+    );
+}
+
+/// A subtree scope combined with all_sessions would silently drop nearly
+/// everything the flag promised; it is refused instead.
+#[tokio::test]
+async fn a_subtree_scope_cannot_be_combined_with_all_sessions() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+
+    let status = harness
+        .control
+        .sync_events(horde_proto::v1::SyncEventsRequest {
+            cursors: Vec::new(),
+            all_sessions: true,
+            subtree_root: Some(AgentId::new("agent-1")),
+            follow: false,
+            max_batch_events: 0,
+        })
+        .await
+        .expect_err("the combination is refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("all_sessions"),
+        "the refusal names the conflict: {}",
+        status.message()
+    );
+}
+
+/// A sync naming nothing at all is a request for nothing; it is refused
+/// rather than answered with a stream that will never speak.
+#[tokio::test]
+async fn a_sync_with_neither_cursors_nor_all_sessions_is_refused() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+
+    let status = harness
+        .control
+        .sync_events(horde_proto::v1::SyncEventsRequest::default())
+        .await
+        .expect_err("an empty sync is refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+/// The staleness signal: a follow stream with nothing to say emits a
+/// heartbeat once its quiet period elapses, stamped with the server's clock —
+/// which is what lets a client distinguish "nothing is happening" from "the
+/// connection died".
+#[tokio::test]
+async fn a_quiet_follow_stream_heartbeats_instead_of_going_silent() {
+    let core = core().expect("an in-memory core");
+    let plane = horde_server::service::ControlPlane::new(core.clone())
+        .with_heartbeat_period(std::time::Duration::from_millis(50));
+    let mut harness = connect_with_plane(plane, core)
+        .await
+        .expect("the harness must connect");
+    let (session_id, _) = seed(&mut harness, "quiet", "key-1").await.expect("seed");
+
+    let mut stream = open_sync(&mut harness.control, &session_id, 0, true)
+        .await
+        .expect("a follow stream opens");
+
+    // History, then catch-up, then — with nothing happening — a heartbeat.
+    let mut saw_caught_up = false;
+    for _ in 0..8 {
+        match next_sync_frame(&mut stream).await.expect("a frame") {
+            sync_events_response::Update::Batch(_) => {}
+            sync_events_response::Update::CaughtUp(_) => saw_caught_up = true,
+            sync_events_response::Update::Heartbeat(beat) => {
+                assert!(saw_caught_up, "the tail begins before the first heartbeat");
+                assert!(
+                    beat.server_time.is_some(),
+                    "a heartbeat carries the server's clock for skew reconciliation"
+                );
+                return;
+            }
+        }
+    }
+    panic!("a quiet follow stream must announce itself with a heartbeat");
 }
 
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.

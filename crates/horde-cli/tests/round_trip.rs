@@ -449,7 +449,7 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
     // Head is now 4: the root's spawn, its placement answer, then the two
     // notes.
     let mut stream = client
-        .follow(&SyncOptions::new(session_id))
+        .follow(&SyncOptions::new(session_id.clone()))
         .await
         .expect("the subscription opens");
 
@@ -461,8 +461,15 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
             .expect("the stream must not fail")
         {
             Some(StreamUpdate::Event(envelope)) => sequences.push(envelope.sequence),
-            Some(StreamUpdate::CaughtUp(head)) => {
+            Some(StreamUpdate::CaughtUp {
+                session_id: caught,
+                head,
+            }) => {
                 assert_eq!(head, 4, "the marker must carry the real head");
+                assert_eq!(
+                    caught, session_id,
+                    "a merged stream's consumer needs to know which replay finished"
+                );
                 break;
             }
             None => panic!("the stream ended before catching up"),

@@ -107,6 +107,14 @@ pub enum WorkerError {
     #[error("the workspace checkout failed: {0}")]
     Workspace(String),
 
+    /// A Payload's commits could not be staged or obtained.
+    ///
+    /// Carries the share layer's own words — a dirty tree, a missing commit,
+    /// a cross-Worker route with no Relay — because "the payload failed" is
+    /// not actionable and each of those is.
+    #[error("the payload share failed: {0}")]
+    Share(#[from] horde_relay::ShareError),
+
     /// A domain value could not be put on the wire, or a wire value could not
     /// be read back into the domain.
     ///
