@@ -674,14 +674,12 @@ mod tests {
 
         let spawn = |agent: &str, parent: Option<&str>| Event {
             agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: String::new(),
             kind: Some(Kind::AgentSpawned(AgentSpawned {
                 parent_agent_id: parent.map(AgentId::new),
-                spawned_by: None,
                 spec: Some(AgentSpec::default()),
-                tree_path: Vec::new(),
+                ..AgentSpawned::default()
             })),
+            ..Event::default()
         };
 
         // The parent already runs on beta; the child has no placement yet.

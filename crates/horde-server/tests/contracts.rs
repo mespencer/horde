@@ -337,8 +337,10 @@ async fn an_update_lands_its_layout_and_the_log_carries_no_stale_etag() {
     // The catalog stream's own events never carry an etag: the token is
     // derived from the log position on every fold, and a stored copy would
     // let a replay trust a token that was stale the moment it was written.
-    let etags = drain_catalog(&mut h, |changed, out| {
-        if let Some(definition) = &changed.definition {
+    let etags = drain_catalog(&mut h, |kind, out| {
+        if let horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(changed) = kind
+            && let Some(definition) = &changed.definition
+        {
             out.push(definition.etag.clone());
         }
     })
@@ -351,37 +353,25 @@ async fn an_update_lands_its_layout_and_the_log_carries_no_stale_etag() {
     );
 }
 
-/// Replays the workspace catalog stream, collecting from each definition
-/// change. The catalog is a log stream like any other; it is only session
-/// *listings* it stays out of.
+/// Replays the workspace catalog stream, collecting each event's kind. The
+/// catalog is a log stream like any other — it is only session *listings* it
+/// stays out of — which is why [`drain_sync`]'s loop can read it too.
 async fn drain_catalog<T>(
     h: &mut Harness,
-    mut collect: impl FnMut(&horde_proto::v1::WorkspaceDefinitionChanged, &mut Vec<T>),
+    mut collect: impl FnMut(&horde_proto::v1::event::Kind, &mut Vec<T>),
 ) -> Setup<Vec<T>> {
-    let mut stream = open_sync(
-        &mut h.control,
-        horde_server::workspace::CATALOG_STREAM,
-        0,
-        false,
-    )
-    .await?;
-    let mut out = Vec::new();
-    while let Some(message) = stream.next().await {
-        match message?.update {
-            Some(sync_events_response::Update::Batch(batch)) => {
-                for envelope in batch.events {
-                    if let Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(changed)) =
-                        envelope.event.and_then(|event| event.kind)
-                    {
-                        collect(&changed, &mut out);
-                    }
-                }
+    drain_sync(h, horde_server::workspace::CATALOG_STREAM, |batch, out| {
+        for envelope in &batch.events {
+            if let Some(kind) = envelope
+                .event
+                .as_ref()
+                .and_then(|event| event.kind.as_ref())
+            {
+                collect(kind, out);
             }
-            Some(sync_events_response::Update::CaughtUp(_)) => break,
-            _ => {}
         }
-    }
-    Ok(out)
+    })
+    .await
 }
 
 #[tokio::test]
@@ -599,33 +589,19 @@ async fn prewarm_targets_a_connected_worker_and_reports_materializing() {
         .await
         .expect("prewarm with an empty session id");
 
-    let mut prewarm_events = 0_u32;
-    let mut stream = open_sync(
-        &mut h.control,
-        horde_server::workspace::CATALOG_STREAM,
-        0,
-        false,
-    )
+    let prewarms = drain_catalog(&mut h, |kind, out| {
+        if matches!(
+            kind,
+            horde_proto::v1::event::Kind::WorkspacePrewarmRequested(_)
+        ) {
+            out.push(());
+        }
+    })
     .await
     .expect("the catalog stream replays");
-    while let Some(message) = stream.next().await {
-        match message.expect("a sync message").update {
-            Some(sync_events_response::Update::Batch(batch)) => {
-                for envelope in batch.events {
-                    if matches!(
-                        envelope.event.and_then(|event| event.kind),
-                        Some(horde_proto::v1::event::Kind::WorkspacePrewarmRequested(_))
-                    ) {
-                        prewarm_events += 1;
-                    }
-                }
-            }
-            Some(sync_events_response::Update::CaughtUp(_)) => break,
-            _ => {}
-        }
-    }
     assert_eq!(
-        prewarm_events, 2,
+        prewarms.len(),
+        2,
         "both session-less prewarms journal to the catalog stream"
     );
 }
