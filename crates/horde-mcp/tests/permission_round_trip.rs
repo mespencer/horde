@@ -13,19 +13,11 @@
 mod common;
 
 use common::{Setup, harness, identity_for, within};
+use common::{decode_tool_response as decode, prompt_request as prompt};
 use horde_adapter::permission::PermissionDecision;
-use horde_adapter_claude::permission::PromptRequest;
 use horde_cli::client::{Client, PermissionAnswer, SyncOptions};
 use horde_mcp::permission::PermissionBroker;
 use horde_proto::v1::PermissionOutcome;
-
-fn prompt(tool: &str, input: serde_json::Value, tool_use_id: &str) -> Setup<PromptRequest> {
-    Ok(serde_json::from_value(serde_json::json!({
-        "tool_name": tool,
-        "input": input,
-        "tool_use_id": tool_use_id,
-    }))?)
-}
 
 /// Waits for the escalation to become visible, the way an attached client does:
 /// by watching the log, not by being told.
@@ -171,16 +163,6 @@ async fn a_denial_reaches_the_blocked_agent_with_its_reason() {
         decoded["message"], "outside the workspace",
         "the agent is told why, or it retries the same call forever"
     );
-}
-
-/// The harness wants the decision stringified inside a text content block, not
-/// as a nested object. Getting this wrong is invisible until a real agent
-/// silently ignores every decision.
-fn decode(response: &serde_json::Value) -> Setup<serde_json::Value> {
-    let text = response["content"][0]["text"]
-        .as_str()
-        .ok_or("the decision must be a string inside a text block")?;
-    Ok(serde_json::from_str(text)?)
 }
 
 /// A sanity check that the fake and the real sink agree about the shape of a

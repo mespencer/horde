@@ -10,8 +10,8 @@ use horde_proto::v1::{Event, event::Kind};
 use prost::Message;
 
 use crate::error::ServerError;
-use crate::log::EventLog;
 use crate::log::store::Appended;
+use crate::log::{EventLog, PendingEvent};
 use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
 
 /// Everything the two services share.
@@ -94,6 +94,37 @@ pub fn kind_name(kind: Option<&Kind>) -> &'static str {
         Some(Kind::TurnInterrupted(_)) => "turn_interrupted",
         None => "empty",
     }
+}
+
+/// Appends a server-originated event: no origin worker, no journal sequence.
+///
+/// The one append shape everything server-side shares — the control plane's
+/// verbs and the permission chain both write through here, so the
+/// kind-collision refusal below cannot be forgotten by one of them.
+///
+/// # Errors
+///
+/// Whatever the log refuses, plus
+/// [`ServerError::IdempotencyKeyCollision`] when the key already holds a
+/// different kind of event.
+pub async fn append_server_event(
+    log: &EventLog,
+    session_id: &str,
+    idempotency_key: &str,
+    event: Event,
+) -> Result<u64, ServerError> {
+    let appended = log
+        .append(PendingEvent {
+            session_id: session_id.to_owned(),
+            origin_worker_id: String::new(),
+            journal_sequence: None,
+            idempotency_key: idempotency_key.to_owned(),
+            payload: event.encode_to_vec(),
+        })
+        .await?;
+
+    refuse_kind_collision(&appended, session_id, idempotency_key, &event)?;
+    Ok(appended.sequence)
 }
 
 /// Refuses a deduplication that silently swallowed a *different* kind of event.
