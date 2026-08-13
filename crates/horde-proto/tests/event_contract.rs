@@ -8,13 +8,13 @@ use horde_proto::prost::Message;
 use horde_proto::prost_types::{DescriptorProto, FileDescriptorSet};
 use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
-    AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, Event, EventEnvelope,
-    Note, NoteSent, Payload, PermissionDecided, PermissionDecision, PermissionRequest,
-    PermissionRequested, Placement, PlacementChanged, PlacementState, ResultReported, ResultStatus,
-    SessionId, SessionLifecycleChanged, SessionLifecycleState, TurnInterrupted, UsageRecord,
-    UsageRecorded, WorkerId, WorkspaceDefinition, WorkspaceDefinitionChanged,
-    WorkspaceDefinitionId, WorkspaceInstanceChanged, WorkspaceInstanceReport,
-    WorkspacePrewarmRequested, event,
+    AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, EnrollmentCodeMinted,
+    EnrollmentRevoked, Event, EventEnvelope, IdentityEnrolled, Note, NoteSent, Payload,
+    PermissionDecided, PermissionDecision, PermissionRequest, PermissionRequested, Placement,
+    PlacementChanged, PlacementState, ResultReported, ResultStatus, Role, SessionId,
+    SessionLifecycleChanged, SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded,
+    WorkerId, WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
+    WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:
@@ -30,6 +30,9 @@ use horde_proto::v1::{
 /// * Turn interruption, distinct from a message queued to a turn boundary.
 /// * The Workspace Definition catalog and prewarm requests — Definitions are
 ///   Server-owned state, and ADR-0001 admits no store for them but the log.
+/// * Enrollment (DESIGN §3): codes minted, identities issued, certificates
+///   revoked — journaled through the log like everything else, in a reserved
+///   stream like the Definition catalog's.
 const EVENT_VOCABULARY: &[&str] = &[
     "agent_output_chunk",
     "agent_spawned",
@@ -46,6 +49,9 @@ const EVENT_VOCABULARY: &[&str] = &[
     "turn_interrupted",
     "workspace_definition_changed",
     "workspace_prewarm_requested",
+    "enrollment_code_minted",
+    "identity_enrolled",
+    "enrollment_revoked",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -69,6 +75,9 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::TurnInterrupted(_) => "turn_interrupted",
         event::Kind::WorkspaceDefinitionChanged(_) => "workspace_definition_changed",
         event::Kind::WorkspacePrewarmRequested(_) => "workspace_prewarm_requested",
+        event::Kind::EnrollmentCodeMinted(_) => "enrollment_code_minted",
+        event::Kind::IdentityEnrolled(_) => "identity_enrolled",
+        event::Kind::EnrollmentRevoked(_) => "enrollment_revoked",
     }
 }
 
@@ -167,6 +176,24 @@ fn every_kind() -> Vec<event::Kind> {
         event::Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested {
             workspace_definition_id: Some(WorkspaceDefinitionId::new("ws-1")),
             worker_id: Some(WorkerId::new("worker-a")),
+        }),
+        event::Kind::EnrollmentCodeMinted(EnrollmentCodeMinted {
+            role: Role::Worker.into(),
+            name: "mac-studio".to_owned(),
+            code_hash: "b5bb9d8014a0f9b1d61e21e796d78dcc".to_owned(),
+            expires_at: None,
+        }),
+        event::Kind::IdentityEnrolled(IdentityEnrolled {
+            role: Role::Worker.into(),
+            name: "mac-studio".to_owned(),
+            certificate_serial: "0a1b2c3d".to_owned(),
+            code_hash: "b5bb9d8014a0f9b1d61e21e796d78dcc".to_owned(),
+        }),
+        event::Kind::EnrollmentRevoked(EnrollmentRevoked {
+            role: Role::Worker.into(),
+            name: "mac-studio".to_owned(),
+            certificate_serial: "0a1b2c3d".to_owned(),
+            reason: "laptop stolen".to_owned(),
         }),
     ]
 }
@@ -278,7 +305,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 15] = [
+    let expected: [(&str, i32); 18] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -294,6 +321,9 @@ fn event_kind_tags_are_stable() {
         ("turn_interrupted", 22),
         ("workspace_definition_changed", 23),
         ("workspace_prewarm_requested", 24),
+        ("enrollment_code_minted", 25),
+        ("identity_enrolled", 26),
+        ("enrollment_revoked", 27),
     ];
 
     let expected: Vec<(String, i32)> = expected

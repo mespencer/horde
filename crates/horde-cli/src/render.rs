@@ -423,10 +423,10 @@ mod tests {
     #[test]
     fn every_event_kind_has_a_wire_name() {
         use horde_proto::v1::{
-            AgentLifecycleChanged, AgentSpawned, AssignmentSent, NoteSent, PermissionDecided,
-            PermissionRequested, ResultReported, SessionLifecycleChanged, TurnInterrupted,
-            UsageRecorded, WorkspaceDefinitionChanged, WorkspaceInstanceChanged,
-            WorkspacePrewarmRequested,
+            AgentLifecycleChanged, AgentSpawned, AssignmentSent, EnrollmentCodeMinted,
+            EnrollmentRevoked, IdentityEnrolled, NoteSent, PermissionDecided, PermissionRequested,
+            ResultReported, SessionLifecycleChanged, TurnInterrupted, UsageRecorded,
+            WorkspaceDefinitionChanged, WorkspaceInstanceChanged, WorkspacePrewarmRequested,
         };
 
         let cases: Vec<(Kind, &str)> = vec![
@@ -483,6 +483,18 @@ mod tests {
             (
                 Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested::default()),
                 "workspace_prewarm_requested",
+            ),
+            (
+                Kind::EnrollmentCodeMinted(EnrollmentCodeMinted::default()),
+                "enrollment_code_minted",
+            ),
+            (
+                Kind::IdentityEnrolled(IdentityEnrolled::default()),
+                "identity_enrolled",
+            ),
+            (
+                Kind::EnrollmentRevoked(EnrollmentRevoked::default()),
+                "enrollment_revoked",
             ),
         ];
 
