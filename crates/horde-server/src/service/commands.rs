@@ -41,9 +41,10 @@
 //!
 //! # What is not here yet
 //!
-//! Spawn and permission-decision commands are derived. Delivery and interrupt
-//! join the `match` in [`CommandProjection::advance`] as their causing events
-//! start being written; the shape does not change when they do. Reconciling against
+//! Spawn, permission-decision, delivery and interrupt commands are derived.
+//! Delivery to an agent that is not yet *placed* issues nothing — the event
+//! stays in the log, and deliverability-before-placement is the scheduler's
+//! queue problem (DESIGN.md §6), not the stream's. Reconciling against
 //! what a *real* worker actually applied — as opposed to what it says it
 //! acked — needs the worker crate, which is not on `main` yet; see
 //! `tests/services.rs` for the marked seam.
@@ -53,9 +54,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use horde_proto::v1::{
-    AgentId, CancelPlacementCommand, DeliverPermissionDecisionCommand, Event,
-    MaterializeWorkspaceCommand, Placement, PlacementState, SessionId, SpawnAgentCommand,
-    StreamCommandsResponse, WorkspaceDefinition, event::Kind, stream_commands_response::Command,
+    AgentId, CancelPlacementCommand, DeliverMessageCommand, DeliverPermissionDecisionCommand,
+    Event, InterruptAgentCommand, MaterializeWorkspaceCommand, Placement, PlacementState,
+    SessionId, SpawnAgentCommand, StreamCommandsResponse, WorkspaceDefinition,
+    deliver_message_command, event::Kind, stream_commands_response::Command,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -166,6 +168,37 @@ impl CommandProjection {
             // blocked on it lives on a worker that reads commands, not the log.
             // Without this arm the decision is durable and invisible: the
             // human's answer lands, and the agent waits forever.
+            // Steering: a message to an agent lives in the log, but the agent
+            // lives on a worker that reads commands. The delivery mode rides
+            // whole — turn-boundary or interrupt is the sender's call, and a
+            // fold that dropped it would downgrade every interrupt to a queue.
+            (Some(Kind::AssignmentSent(sent)), Some(agent_id)) => self.deliver_commands(
+                global,
+                &agent_id,
+                sent.assignment
+                    .map(deliver_message_command::Body::Assignment),
+                sent.delivery,
+            ),
+            (Some(Kind::NoteSent(sent)), Some(agent_id)) => self.deliver_commands(
+                global,
+                &agent_id,
+                sent.note.map(deliver_message_command::Body::Note),
+                sent.delivery,
+            ),
+            // The interrupt verb. The RPC journals the request; the worker
+            // holding the agent is the only place it can be carried out.
+            (Some(Kind::TurnInterrupted(interrupted)), Some(agent_id)) => {
+                let Some(worker_id) = self.placed.get(&agent_id).cloned() else {
+                    // An unplaced agent has no turn in flight to abort.
+                    return Vec::new();
+                };
+                let command = Command::InterruptAgent(InterruptAgentCommand {
+                    agent_id: Some(AgentId::new(agent_id)),
+                    reason: interrupted.reason,
+                });
+                let issued = self.issue(&worker_id, &global.event, command, MAIN);
+                vec![(worker_id, issued)]
+            }
             (Some(Kind::PermissionDecided(decided)), Some(agent_id)) => {
                 let (Some(decision), Some(worker_id)) =
                     (decided.decision, self.placed.get(&agent_id).cloned())
@@ -296,6 +329,33 @@ impl CommandProjection {
             }
         }
         commands
+    }
+
+    /// The command one sent message causes: deliver it to the worker holding
+    /// the agent, mode intact.
+    ///
+    /// A message to an *unplaced* agent has nobody to deliver to and issues
+    /// nothing — the event stays in the log, but this fold does not buffer it
+    /// for a later placement. Deliverability before placement is the
+    /// scheduler's queue problem, not the stream's; see DESIGN.md §6.
+    fn deliver_commands(
+        &mut self,
+        global: &GlobalEvent,
+        agent_id: &str,
+        body: Option<deliver_message_command::Body>,
+        delivery: i32,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        let (Some(body), Some(worker_id)) = (body, self.placed.get(agent_id).cloned()) else {
+            return Vec::new();
+        };
+
+        let command = Command::DeliverMessage(DeliverMessageCommand {
+            agent_id: Some(AgentId::new(agent_id)),
+            body: Some(body),
+            delivery,
+        });
+        let issued = self.issue(&worker_id, &global.event, command, MAIN);
+        vec![(worker_id, issued)]
     }
 
     /// Assigns the next per-worker sequence, and the command's stable id.
@@ -523,7 +583,7 @@ pub async fn issued_to(log: &EventLog, worker_id: &str) -> Result<u64, ServerErr
 #[cfg(test)]
 mod tests {
     use horde_proto::v1::{
-        AgentSpawned, AgentSpec, PlacementChanged, TurnInterrupted, WorkerId,
+        AgentSpawned, AgentSpec, DeliveryMode, PlacementChanged, TurnInterrupted, WorkerId,
         stream_commands_response::Command,
     };
 
@@ -951,9 +1011,157 @@ mod tests {
                 agent_id: Some(AgentId::new("agent-1")),
                 occurred_at: None,
                 idempotency_key: String::new(),
-                kind: Some(Kind::TurnInterrupted(TurnInterrupted::default())),
+                kind: Some(Kind::UsageRecorded(
+                    horde_proto::v1::UsageRecorded::default(),
+                )),
             },
         )];
+        assert!(fold(&rows).is_empty());
+    }
+
+    fn assignment_event(agent: &str, text: &str, delivery: DeliveryMode) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::AssignmentSent(horde_proto::v1::AssignmentSent {
+                from: None,
+                assignment: Some(horde_proto::v1::Assignment {
+                    assignment_id: None,
+                    text: text.to_owned(),
+                    payload: None,
+                }),
+                delivery: delivery.into(),
+            })),
+        }
+    }
+
+    fn interrupt_event(agent: &str, reason: &str) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::TurnInterrupted(TurnInterrupted {
+                requested_by: None,
+                turn_id: String::new(),
+                reason: reason.to_owned(),
+            })),
+        }
+    }
+
+    /// The steering leg: a message written to the log reaches the worker
+    /// holding the agent, body and delivery mode intact. A fold that dropped
+    /// the mode would downgrade every interrupt-delivery to a quiet queue.
+    #[test]
+    fn a_sent_assignment_is_delivered_to_the_placed_worker_mode_intact() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            assignment_event("agent-1", "stop and do this", DeliveryMode::Interrupt),
+        ));
+
+        let issued = fold(&rows);
+        let (worker, response) = issued.last().expect("the message must be commanded");
+        assert_eq!(worker, "worker-a");
+        match response.command.as_ref() {
+            Some(Command::DeliverMessage(deliver)) => {
+                assert_eq!(
+                    deliver.agent_id.as_ref().map(ToString::to_string),
+                    Some("agent-1".to_owned())
+                );
+                assert_eq!(deliver.delivery, i32::from(DeliveryMode::Interrupt));
+                match deliver.body.as_ref() {
+                    Some(deliver_message_command::Body::Assignment(assignment)) => {
+                        assert_eq!(assignment.text, "stop and do this");
+                    }
+                    other => panic!("expected the assignment to ride whole, got {other:?}"),
+                }
+            }
+            other => panic!("expected a DeliverMessage command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sent_note_is_delivered_as_a_note_not_an_assignment() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            Event {
+                agent_id: Some(AgentId::new("agent-1")),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(Kind::NoteSent(horde_proto::v1::NoteSent {
+                    from: None,
+                    note: Some(horde_proto::v1::Note {
+                        text: "status?".to_owned(),
+                        payload: None,
+                    }),
+                    delivery: DeliveryMode::TurnBoundary.into(),
+                })),
+            },
+        ));
+
+        let issued = fold(&rows);
+        match issued.last().map(|(_, response)| response.command.as_ref()) {
+            Some(Some(Command::DeliverMessage(deliver))) => match deliver.body.as_ref() {
+                Some(deliver_message_command::Body::Note(note)) => {
+                    assert_eq!(note.text, "status?");
+                }
+                other => panic!("a note must not arrive as an assignment: {other:?}"),
+            },
+            other => panic!("expected a DeliverMessage command, got {other:?}"),
+        }
+    }
+
+    /// A message to an agent nobody placed issues nothing: there is no worker
+    /// to address, and buffering for a later placement is the scheduler's
+    /// problem, not the stream's.
+    #[test]
+    fn a_message_to_an_unplaced_agent_issues_no_command() {
+        let rows = vec![row(
+            1,
+            "s1",
+            1,
+            assignment_event("agent-1", "hello", DeliveryMode::TurnBoundary),
+        )];
+        assert!(fold(&rows).is_empty());
+    }
+
+    /// The interrupt verb's missing leg: the journaled request becomes a
+    /// command to the worker holding the agent, reason intact.
+    #[test]
+    fn an_interrupt_reaches_the_placed_worker_with_its_reason() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            interrupt_event("agent-1", "the user pressed escape"),
+        ));
+
+        let issued = fold(&rows);
+        let (worker, response) = issued.last().expect("the interrupt must be commanded");
+        assert_eq!(worker, "worker-a");
+        match response.command.as_ref() {
+            Some(Command::InterruptAgent(interrupt)) => {
+                assert_eq!(
+                    interrupt.agent_id.as_ref().map(ToString::to_string),
+                    Some("agent-1".to_owned())
+                );
+                assert_eq!(interrupt.reason, "the user pressed escape");
+            }
+            other => panic!("expected an InterruptAgent command, got {other:?}"),
+        }
+    }
+
+    /// An unplaced agent has no turn in flight to abort.
+    #[test]
+    fn an_interrupt_for_an_unplaced_agent_issues_no_command() {
+        let rows = vec![row(1, "s1", 1, interrupt_event("agent-1", "escape"))];
         assert!(fold(&rows).is_empty());
     }
 
