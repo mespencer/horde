@@ -454,6 +454,40 @@ mod revival {
         revived.shutdown().await.expect("shuts down");
     }
 
+    /// A revived session numbers its turns after the ones already taken.
+    ///
+    /// The journal keys events by turn id, so a revived process that restarted
+    /// at `#1` would re-mint keys the journal already holds — and the Server's
+    /// dedupe would then discard the revived turns' events while acking them.
+    #[tokio::test]
+    async fn a_revived_session_continues_the_turn_numbering() {
+        let script = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-9\",\"model\":\"haiku\"}\n\
+                      {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"sess-9\",\"duration_ms\":3,\"result\":\"revived\"}";
+        let (harness_spec, _dir) = spec_with(script, &[]);
+        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        adapter.extra_env = harness_spec.env.clone();
+
+        let mut revived = adapter
+            .resume(
+                &AgentSpec::default().with_turns_taken(3),
+                &ProviderSessionId::new("sess-9"),
+            )
+            .await
+            .expect("resume spawns");
+        revived
+            .send(TurnInput::queued("continue"))
+            .await
+            .expect("sends");
+
+        let outcome = turn_end(&mut revived).await.expect("the turn ends");
+        assert_eq!(
+            outcome.turn_id.to_string(),
+            "sess-9#4",
+            "a revived turn must continue the conversation's numbering"
+        );
+        revived.shutdown().await.expect("shuts down");
+    }
+
     /// Resuming an id the harness has never heard of must fail loudly.
     ///
     /// Silently starting a fresh conversation is the dangerous alternative: the
@@ -560,6 +594,55 @@ mod side_effects {
                 Ok(Some(_))
             ),
             "a control-message interrupt leaves the session steerable"
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// An interrupting send aborts first: the control message reaches the
+    /// child before the text does, which is what "cancel the current turn and
+    /// deliver immediately" means at the wire.
+    #[tokio::test]
+    async fn an_interrupting_send_puts_the_control_message_before_the_text() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+
+        let script = format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\"}}\n{}",
+            RESULT_ONLY
+        );
+        let (mut session, _dir) = session_on(
+            &script,
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+
+        session
+            .send(horde_adapter::TurnInput::interrupting("change of plan"))
+            .await
+            .expect("an interrupting send is accepted");
+
+        // The child records what it received; the control request must be
+        // there. That the turn still runs proves the text followed it.
+        let expects_interrupt = |recorded: &str| recorded.contains("interrupt");
+        let mut recorded = String::new();
+        for _ in 0..250 {
+            recorded = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if expects_interrupt(&recorded) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            expects_interrupt(&recorded),
+            "the abort must reach the child ahead of the message, got {recorded:?}"
+        );
+
+        assert!(
+            matches!(
+                within("the steered turn produces an event", session.next_event()).await,
+                Ok(Some(_))
+            ),
+            "the interrupting message must still start its own turn"
         );
         session.shutdown().await.expect("shuts down");
     }
