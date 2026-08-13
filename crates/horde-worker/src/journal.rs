@@ -1224,13 +1224,14 @@ mod tests {
         );
     }
 
-    /// The two progress facts, committed with the events that carry them.
-    #[tokio::test]
-    async fn progress_advances_the_identity_and_the_turn_count_atomically() {
-        let journal = journal();
+    /// Applies a spawn that remembers `agent-1` under command id `command_id`.
+    ///
+    /// The shared preamble of every revival-bookkeeping test: what varies per
+    /// test is what happens *after* the agent is remembered.
+    async fn remember_agent_one(journal: &Journal, command_id: &str) {
         journal
             .apply_command(
-                "s1:1",
+                command_id,
                 1,
                 Vec::new(),
                 super::AgentBookkeeping::Remember {
@@ -1241,6 +1242,13 @@ mod tests {
             )
             .await
             .expect("the spawn applies");
+    }
+
+    /// The two progress facts, committed with the events that carry them.
+    #[tokio::test]
+    async fn progress_advances_the_identity_and_the_turn_count_atomically() {
+        let journal = journal();
+        remember_agent_one(&journal, "s1:1").await;
 
         journal
             .record_batch(
@@ -1288,19 +1296,7 @@ mod tests {
     #[tokio::test]
     async fn forgetting_an_agent_ends_its_revivability() {
         let journal = journal();
-        journal
-            .apply_command(
-                "s1:1",
-                1,
-                Vec::new(),
-                super::AgentBookkeeping::Remember {
-                    agent_id: "agent-1".to_owned(),
-                    session_id: "s1".to_owned(),
-                    spawn: Box::default(),
-                },
-            )
-            .await
-            .expect("the spawn applies");
+        remember_agent_one(&journal, "s1:1").await;
         journal
             .apply_command(
                 "s1:2",
@@ -1328,19 +1324,7 @@ mod tests {
     async fn a_redelivered_remember_does_not_conflict_with_itself() {
         let journal = journal();
         for command_id in ["s1:1", "s1:1-again"] {
-            journal
-                .apply_command(
-                    command_id,
-                    1,
-                    Vec::new(),
-                    super::AgentBookkeeping::Remember {
-                        agent_id: "agent-1".to_owned(),
-                        session_id: "s1".to_owned(),
-                        spawn: Box::default(),
-                    },
-                )
-                .await
-                .expect("both applications succeed");
+            remember_agent_one(&journal, command_id).await;
         }
         assert!(
             journal

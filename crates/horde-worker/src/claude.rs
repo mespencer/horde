@@ -212,15 +212,27 @@ impl LiveClaudeSession {
     async fn report_death(&mut self) -> AdapterError {
         self.ended = true;
         let exit_code = self.harness.wait().await.ok().flatten();
-        let diagnostics = self.harness.diagnostics().await;
-        if !diagnostics.is_empty() {
+        if let Some(stderr) = death_diagnostics(&self.harness.diagnostics().await) {
             tracing::warn!(
                 ?exit_code,
-                stderr = %diagnostics.join("\n"),
+                %stderr,
                 "the claude harness died; its stderr is the only explanation it left"
             );
         }
         AdapterError::HarnessExited { exit_code }
+    }
+}
+
+/// What a dead harness left on stderr, or `None` when it left nothing.
+///
+/// Pure so the distinction is testable: a death that logs an empty stderr
+/// drowns the real explanation in noise, and one that drops a non-empty
+/// stderr discards the only explanation there is.
+fn death_diagnostics(diagnostics: &[String]) -> Option<String> {
+    if diagnostics.is_empty() {
+        None
+    } else {
+        Some(diagnostics.join("\n"))
     }
 }
 
@@ -410,6 +422,22 @@ mod tests {
         assert!(
             !plain.iter().any(|a| a == "--settings"),
             "no chain means no override, not an empty one"
+        );
+    }
+
+    /// Both directions of the stderr distinction: a silent death reports no
+    /// diagnostics, a noisy one reports exactly what was said.
+    #[test]
+    fn death_diagnostics_report_what_was_said_and_only_that() {
+        assert_eq!(
+            super::death_diagnostics(&[]),
+            None,
+            "a silent death must not log an empty explanation"
+        );
+        assert_eq!(
+            super::death_diagnostics(&["boom".to_owned(), "trace".to_owned()]).as_deref(),
+            Some("boom\ntrace"),
+            "the harness's own words are the only explanation it left"
         );
     }
 

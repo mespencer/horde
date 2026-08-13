@@ -1011,13 +1011,8 @@ impl Pump {
         let interrupting = input.delivery == horde_adapter::Delivery::Interrupt;
         match self.session.send(input).await {
             Ok(()) => {
-                // An interrupting send aborts the turn in flight AND starts
-                // its own, so both endings are now owed.
-                if interrupting && self.state != PumpState::Idle {
-                    self.turns_in_flight = self.turns_in_flight.saturating_add(1);
-                } else {
-                    self.turns_in_flight = 1;
-                }
+                self.turns_in_flight =
+                    turns_owed_after_send(interrupting, self.state, self.turns_in_flight);
                 self.state = PumpState::Streaming;
                 Flow::Continue
             }
@@ -1123,6 +1118,22 @@ fn should_hold_for_boundary(input: &TurnInput, state: PumpState) -> bool {
     let mid_turn = state != PumpState::Idle;
     let boundary_delivery = input.delivery == horde_adapter::Delivery::TurnBoundary;
     mid_turn && boundary_delivery
+}
+
+/// How many turn endings a send leaves outstanding.
+///
+/// An interrupting send into a live turn aborts it AND starts its own, so
+/// both endings are owed; every other send owes exactly one. Both halves of
+/// the condition matter and are not separately reachable through the pump —
+/// it never sends a queued message mid-turn (it queues them itself), and an
+/// idle pump has nothing in flight to add to — which is exactly the shape
+/// that hides a flipped operator from an end-to-end suite.
+fn turns_owed_after_send(interrupting: bool, state: PumpState, owed: u32) -> u32 {
+    if interrupting && state != PumpState::Idle {
+        owed.saturating_add(1)
+    } else {
+        1
+    }
 }
 
 /// Where the pump stands after asking for an interrupt.
@@ -1857,6 +1868,29 @@ mod tests {
         assert_eq!(state_after_interrupt(PumpState::Idle), PumpState::Idle);
     }
 
+    /// The send-side ledger. The unreachable corners are pinned here because
+    /// the pump's own discipline (queue mid-turn, idle means nothing owed)
+    /// keeps every live run away from them.
+    #[test]
+    fn a_send_owes_one_ending_unless_it_also_aborted_a_turn() {
+        use super::{PumpState, turns_owed_after_send};
+
+        // The interrupting-send-into-a-live-turn case: two endings owed.
+        assert_eq!(turns_owed_after_send(true, PumpState::Streaming, 1), 2);
+        assert_eq!(
+            turns_owed_after_send(true, PumpState::AwaitingDecision, 1),
+            2
+        );
+        // A queued send owes one, whatever was in flight before it.
+        assert_eq!(
+            turns_owed_after_send(false, PumpState::Streaming, 1),
+            1,
+            "a queued send aborts nothing and must not inflate the ledger"
+        );
+        // An idle interrupting send has nothing to abort.
+        assert_eq!(turns_owed_after_send(true, PumpState::Idle, 0), 1);
+    }
+
     /// The turn-ending state table: an ending is the boundary only when no
     /// other turn still owes its ending — the interrupting-send case, where
     /// the aborted turn ends while the steered turn is still running.
@@ -1885,29 +1919,55 @@ mod tests {
         );
     }
 
-    /// Steering, end to end: a turn-boundary message that arrives while the
-    /// agent is blocked mid-turn is held by the pump and delivered at the turn
-    /// boundary — after the blocked turn ends, never into the middle of it.
-    #[tokio::test]
-    async fn a_boundary_message_during_a_blocked_turn_waits_for_the_boundary() {
+    /// An `agent-1` blocked mid-turn on permission call `call-1`, plus the
+    /// settled journal length — the preamble every steering and interrupt
+    /// test shares.
+    async fn blocked_agent() -> (Runtime, usize) {
         let mut runtime = runtime_with(asking_permission());
         runtime
             .apply(spawn_command(1, "agent-1", "go"))
             .await
             .expect("the spawn applies");
-        journal_at_least(&runtime, 4).await;
+        let settled = journal_at_least(&runtime, 4).await.len();
+        (runtime, settled)
+    }
+
+    /// A turn-boundary note to `agent-1` — the routine delivery the revival
+    /// and steering tests keep sending.
+    fn note_command(sequence: u64, text: &str) -> StreamCommandsResponse {
+        deliver_command(
+            sequence,
+            "agent-1",
+            deliver_message_command::Body::Note(horde_proto::v1::Note {
+                text: text.to_owned(),
+                payload: None,
+            }),
+            DeliveryMode::TurnBoundary,
+        )
+    }
+
+    /// A restarted Worker: a fresh runtime over `journal` with an echoing
+    /// adapter, that has just been asked to deliver a note to `agent-1`.
+    async fn restarted_runtime_delivering(journal: &Journal, sequence: u64) -> Runtime {
+        let mut second = Runtime::new(journal.clone())
+            .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())));
+        second
+            .apply(note_command(sequence, "hello?"))
+            .await
+            .expect("the delivery applies");
+        second
+    }
+
+    /// Steering, end to end: a turn-boundary message that arrives while the
+    /// agent is blocked mid-turn is held by the pump and delivered at the turn
+    /// boundary — after the blocked turn ends, never into the middle of it.
+    #[tokio::test]
+    async fn a_boundary_message_during_a_blocked_turn_waits_for_the_boundary() {
+        let (mut runtime, _settled) = blocked_agent().await;
 
         // Mid-turn, blocked on the decision: steer.
         runtime
-            .apply(deliver_command(
-                2,
-                "agent-1",
-                deliver_message_command::Body::Note(horde_proto::v1::Note {
-                    text: "steered note".to_owned(),
-                    payload: None,
-                }),
-                DeliveryMode::TurnBoundary,
-            ))
+            .apply(note_command(2, "steered note"))
             .await
             .expect("the delivery applies");
 
@@ -1944,12 +2004,7 @@ mod tests {
     /// now-dead decision would hang both.
     #[tokio::test]
     async fn an_interrupt_releases_an_agent_blocked_on_a_decision() {
-        let mut runtime = runtime_with(asking_permission());
-        runtime
-            .apply(spawn_command(1, "agent-1", "go"))
-            .await
-            .expect("the spawn applies");
-        let settled = journal_at_least(&runtime, 4).await.len();
+        let (mut runtime, settled) = blocked_agent().await;
 
         runtime
             .apply(StreamCommandsResponse {
@@ -1975,15 +2030,7 @@ mod tests {
 
         // And the agent is idle, not wedged: a follow-up message echoes.
         runtime
-            .apply(deliver_command(
-                3,
-                "agent-1",
-                deliver_message_command::Body::Note(horde_proto::v1::Note {
-                    text: "after the interrupt".to_owned(),
-                    payload: None,
-                }),
-                DeliveryMode::TurnBoundary,
-            ))
+            .apply(note_command(3, "after the interrupt"))
             .await
             .expect("the delivery applies");
         let events = journal_at_least(&runtime, settled + 4).await;
@@ -2001,12 +2048,7 @@ mod tests {
     /// the blocked turn ends, the message starts its own.
     #[tokio::test]
     async fn an_interrupting_message_cuts_through_a_blocked_turn() {
-        let mut runtime = runtime_with(asking_permission());
-        runtime
-            .apply(spawn_command(1, "agent-1", "go"))
-            .await
-            .expect("the spawn applies");
-        let settled = journal_at_least(&runtime, 4).await.len();
+        let (mut runtime, settled) = blocked_agent().await;
 
         runtime
             .apply(deliver_command(
@@ -2068,15 +2110,7 @@ mod tests {
         assert_eq!(second.running_agents(), 0);
 
         second
-            .apply(deliver_command(
-                2,
-                "agent-1",
-                deliver_message_command::Body::Note(horde_proto::v1::Note {
-                    text: "are you still there?".to_owned(),
-                    payload: None,
-                }),
-                DeliveryMode::TurnBoundary,
-            ))
+            .apply(note_command(2, "are you still there?"))
             .await
             .expect("the delivery applies by reviving");
 
@@ -2143,20 +2177,7 @@ mod tests {
         let settled = journal_at_least(&first, 5).await.len();
         first.shutdown().await;
 
-        let mut second = Runtime::new(journal.clone())
-            .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())));
-        second
-            .apply(deliver_command(
-                3,
-                "agent-1",
-                deliver_message_command::Body::Note(horde_proto::v1::Note {
-                    text: "hello?".to_owned(),
-                    payload: None,
-                }),
-                DeliveryMode::TurnBoundary,
-            ))
-            .await
-            .expect("the delivery applies with nobody to revive");
+        let mut second = restarted_runtime_delivering(&journal, 3).await;
 
         assert_eq!(
             second.running_agents(),
@@ -2195,20 +2216,7 @@ mod tests {
         let settled = journal_at_least(&first, 3).await.len();
         first.shutdown().await;
 
-        let mut second = Runtime::new(journal.clone())
-            .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())));
-        second
-            .apply(deliver_command(
-                2,
-                "agent-1",
-                deliver_message_command::Body::Note(horde_proto::v1::Note {
-                    text: "hello?".to_owned(),
-                    payload: None,
-                }),
-                DeliveryMode::TurnBoundary,
-            ))
-            .await
-            .expect("the delivery applies; the failure is the agent's");
+        let mut second = restarted_runtime_delivering(&journal, 2).await;
 
         let events = journal_at_least(&second, settled + 1).await;
         assert!(

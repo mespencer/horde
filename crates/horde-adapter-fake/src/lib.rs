@@ -936,6 +936,37 @@ mod steering_and_revival_tests {
         );
     }
 
+    /// The other half of the abort-first guard: a *queued* send mid-turn must
+    /// not fabricate an Interrupted ending — only an interrupting delivery
+    /// aborts the turn in flight.
+    #[tokio::test]
+    async fn a_queued_send_mid_turn_does_not_interrupt_the_turn_in_flight() {
+        let adapter = FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("one").with_step(Step::Say("more".to_owned())),
+            ScriptedTurn::saying("two"),
+        ]));
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        assert!(session.next_event().await.expect("no error").is_some());
+
+        session
+            .send(TurnInput::queued("a second message"))
+            .await
+            .expect("a queued send is accepted");
+
+        let mut endings = Vec::new();
+        while let Ok(Some(event)) = session.next_event().await {
+            if let AgentEvent::TurnEnded(outcome) = event {
+                endings.push(outcome.status);
+            }
+        }
+        assert!(
+            !endings.contains(&TurnStatus::Interrupted),
+            "nothing asked for an interrupt, so nothing may end as one: {endings:?}"
+        );
+    }
+
     /// Revival continues the turn numbering and the script position, so a
     /// revived fake behaves like a revived harness rather than a fresh one.
     #[tokio::test]
