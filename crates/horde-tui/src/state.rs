@@ -852,6 +852,27 @@ mod tests {
         assert!(!state.in_subtree("root-1", "a"));
     }
 
+    /// The ceiling is `len + 1`, not `len`: a walk that ends on a root known
+    /// only as a parent reference — never spawned in this replay — needs one
+    /// comparison per known agent plus the final one against the root itself.
+    #[test]
+    fn membership_can_end_on_a_root_the_replay_never_spawned() {
+        let mut state = SessionState::new("s1");
+        for (agent, parent) in [("a1", "r"), ("a2", "a1")] {
+            state.agents.insert(
+                agent.to_owned(),
+                AgentNode {
+                    parent: Some(parent.to_owned()),
+                    tree_path: Vec::new(),
+                },
+            );
+        }
+        assert!(
+            state.in_subtree("r", "a2"),
+            "the walk must be allowed one more comparison than there are known agents"
+        );
+    }
+
     /// One scaffold for six vocabularies, so a renamed word or a dropped arm
     /// fails on the exact pair that changed.
     fn assert_names(name_of: fn(i32) -> &'static str, cases: &[(i32, &'static str)]) {
