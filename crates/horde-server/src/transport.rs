@@ -58,13 +58,7 @@ pub async fn serve_main(
 ) -> Result<BoundListener, ServerError> {
     let deny = authority.deny_list();
     let tls = horde_identity::tls::grpc_server_mtls(authority.credential(), authority.ca_pem());
-
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(|e| ServerError::Internal(format!("binding {bind}: {e}")))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let (listener, addr) = bound(bind).await?;
 
     let control_plane = ControlPlaneServiceServer::with_interceptor(
         ControlPlane::with_enrollment(core.clone(), authority),
@@ -103,13 +97,7 @@ pub async fn serve_enrollment(
     authority: Arc<EnrollmentAuthority>,
 ) -> Result<BoundListener, ServerError> {
     let tls = horde_identity::tls::grpc_server_tls(authority.credential());
-
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(|e| ServerError::Internal(format!("binding {bind}: {e}")))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let (listener, addr) = bound(bind).await?;
 
     let router = tonic::transport::Server::builder()
         .tls_config(tls)
@@ -126,6 +114,17 @@ pub async fn serve_enrollment(
     });
 
     Ok(BoundListener { addr, task })
+}
+
+/// Binds and reports the address the OS actually chose.
+async fn bound(bind: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServerError> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|e| ServerError::Internal(format!("binding {bind}: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    Ok((listener, addr))
 }
 
 #[cfg(test)]

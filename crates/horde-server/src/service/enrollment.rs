@@ -293,13 +293,7 @@ fn identity_internal(error: horde_identity::IdentityError) -> ServerError {
 /// explicitly so every decision stays testable at any instant.
 #[must_use]
 pub fn wall_clock_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_millis())
-            .unwrap_or_default(),
-    )
-    .unwrap_or_default()
+    horde_identity::clock::unix_now_ms()
 }
 
 /// The tonic service on the enrollment listener: `Join`, and nothing else.

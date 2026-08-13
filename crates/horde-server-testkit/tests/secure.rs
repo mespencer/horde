@@ -8,15 +8,9 @@
 //! enrollment suite; this file holds the harness itself to its promises.
 
 use horde_identity::PrincipalRole;
-use horde_server_testkit::secure::{hello, serve_secured};
+use horde_server_testkit::secure::{hello, serve_secured, within};
 
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-async fn within<T>(what: &str, future: impl Future<Output = T>) -> Setup<T> {
-    tokio::time::timeout(std::time::Duration::from_secs(15), future)
-        .await
-        .map_err(|_| format!("timed out waiting for {what}").into())
-}
 
 #[tokio::test]
 async fn the_harness_issues_identities_that_open_the_spines_they_are_for() -> Setup<()> {

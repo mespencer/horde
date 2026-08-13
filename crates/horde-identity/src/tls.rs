@@ -148,6 +148,48 @@ pub fn pinned_verifier(
     })
 }
 
+/// One `verify_tlsNN_signature` method of a verifier impl, delegating to
+/// [`check_signature`] against the impl's own `provider` field.
+///
+/// Trait plumbing with no policy in it: the six-line signatures are fixed by
+/// rustls, so without this macro every verifier repeats them verbatim — and
+/// a copy that drifted (a 12 delegating to a 13, say) would be a protocol
+/// bug wearing boilerplate's clothes.
+macro_rules! handshake_signature_check {
+    ($name:ident, $version:expr) => {
+        fn $name(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            check_signature(&self.provider, message, cert, dss, $version)
+        }
+    };
+}
+
+/// Which protocol's signature scheme rules apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tls {
+    V1_2,
+    V1_3,
+}
+
+/// The one place a handshake signature is actually checked.
+fn check_signature(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+    version: Tls,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    let algorithms = &provider.signature_verification_algorithms;
+    match version {
+        Tls::V1_2 => rustls::crypto::verify_tls12_signature(message, cert, dss, algorithms),
+        Tls::V1_3 => rustls::crypto::verify_tls13_signature(message, cert, dss, algorithms),
+    }
+}
+
 impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
@@ -166,33 +208,8 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
         }
     }
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
+    handshake_signature_check!(verify_tls12_signature, Tls::V1_2);
+    handshake_signature_check!(verify_tls13_signature, Tls::V1_3);
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.provider
@@ -214,6 +231,9 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
 struct RevocationAwareVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     deny: RevocationList,
+    /// The same provider the inner webpki verifier was built with; kept so
+    /// signature checks go through the one shared [`check_signature`].
+    provider: Arc<CryptoProvider>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for RevocationAwareVerifier {
@@ -243,23 +263,8 @@ impl rustls::server::danger::ClientCertVerifier for RevocationAwareVerifier {
         Ok(verified)
     }
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
+    handshake_signature_check!(verify_tls12_signature, Tls::V1_2);
+    handshake_signature_check!(verify_tls13_signature, Tls::V1_3);
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner.supported_verify_schemes()
@@ -288,7 +293,11 @@ pub fn mtls_acceptor(
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| IdentityError::Tls(e.to_string()))?
-        .with_client_cert_verifier(Arc::new(RevocationAwareVerifier { inner, deny }))
+        .with_client_cert_verifier(Arc::new(RevocationAwareVerifier {
+            inner,
+            deny,
+            provider: provider(),
+        }))
         .with_single_cert(
             pem_certificates(&credential.certificate_pem, "the server certificate")?,
             pem_key(&credential.key_pem, "the server key")?,
@@ -365,15 +374,7 @@ mod tests {
     /// The real clock, because these handshakes are verified by webpki
     /// against the real clock — a pinned epoch here would start failing the
     /// day the leaf validity window slid past it.
-    fn now_ms() -> i64 {
-        i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_millis())
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default()
-    }
+    use crate::clock::unix_now_ms as now_ms;
 
     struct Harness {
         ca: CertificateAuthority,
@@ -383,11 +384,7 @@ mod tests {
     fn harness() -> Harness {
         let ca = CertificateAuthority::generate(now_ms()).expect("a CA generates");
         let credential = ca
-            .issue_server(
-                now_ms(),
-                &["localhost".to_owned()],
-                &[std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            )
+            .issue_localhost_server(now_ms())
             .expect("a server credential issues");
         Harness { ca, credential }
     }
@@ -409,6 +406,15 @@ mod tests {
             },
             issued.serial_hex,
         )
+    }
+
+    /// An acceptor over `credential` trusting `ca_pem`, with nothing revoked
+    /// — the arrangement most of these tests share.
+    fn acceptor_with(
+        credential: &crate::ca::ServerCredential,
+        ca_pem: &str,
+    ) -> tokio_rustls::TlsAcceptor {
+        mtls_acceptor(credential, ca_pem, RevocationList::new()).expect("an acceptor builds")
     }
 
     /// One accept + one dial over a real socket; answers what each side saw.
@@ -466,12 +472,7 @@ mod tests {
         let harness = harness();
         let (identity, serial_hex) = enrolled(&harness, "mac-studio");
 
-        let acceptor = mtls_acceptor(
-            &harness.credential,
-            harness.ca.certificate_pem(),
-            RevocationList::new(),
-        )
-        .expect("an acceptor builds");
+        let acceptor = acceptor_with(&harness.credential, harness.ca.certificate_pem());
         let client = client_mtls_config(&identity).expect("a client config builds");
 
         let (server_saw, client_saw) = handshake(acceptor, client).await;
@@ -484,12 +485,7 @@ mod tests {
     #[tokio::test]
     async fn a_peer_with_no_certificate_is_refused_at_the_handshake() {
         let harness = harness();
-        let acceptor = mtls_acceptor(
-            &harness.credential,
-            harness.ca.certificate_pem(),
-            RevocationList::new(),
-        )
-        .expect("an acceptor builds");
+        let acceptor = acceptor_with(&harness.credential, harness.ca.certificate_pem());
 
         // Trusts our CA but presents nothing.
         let bare = rustls::ClientConfig::builder_with_provider(super::provider())
@@ -515,12 +511,7 @@ mod tests {
             ..foreign_identity
         };
 
-        let acceptor = mtls_acceptor(
-            &ours.credential,
-            ours.ca.certificate_pem(),
-            RevocationList::new(),
-        )
-        .expect("an acceptor builds");
+        let acceptor = acceptor_with(&ours.credential, ours.ca.certificate_pem());
         let client = client_mtls_config(&foreign).expect("a client config builds");
 
         let (server_saw, client_saw) = handshake(acceptor, client).await;
@@ -560,12 +551,8 @@ mod tests {
         };
         let (identity, _) = enrolled(&reloaded_harness, "after-restart");
 
-        let acceptor = mtls_acceptor(
-            &reloaded_harness.credential,
-            harness.ca.certificate_pem(), // the ORIGINAL root
-            RevocationList::new(),
-        )
-        .expect("an acceptor builds");
+        // The ORIGINAL root, not the reloaded copy's.
+        let acceptor = acceptor_with(&reloaded_harness.credential, harness.ca.certificate_pem());
         let client = client_mtls_config(&identity).expect("a client config builds");
 
         let (server_saw, client_saw) = handshake(acceptor, client).await;

@@ -218,6 +218,24 @@ impl CertificateAuthority {
         })
     }
 
+    /// [`issue_server`](Self::issue_server) for the names every loopback
+    /// deployment shares — `localhost` and `127.0.0.1` — which is also what
+    /// every in-workspace suite serves as.
+    ///
+    /// # Errors
+    ///
+    /// As [`issue_server`](Self::issue_server).
+    pub fn issue_localhost_server(
+        &self,
+        now_unix_ms: i64,
+    ) -> Result<ServerCredential, IdentityError> {
+        self.issue_server(
+            now_unix_ms,
+            &["localhost".to_owned()],
+            &[std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+        )
+    }
+
     /// Signs a joining machine's CSR as `principal`.
     ///
     /// Only the public key survives from the CSR. Subject, SANs, usages,

@@ -21,19 +21,7 @@ use horde_proto::v1::{
 };
 use horde_server::enrollment::ENROLLMENT_STREAM;
 use horde_server::service::enrollment::wall_clock_ms;
-use horde_server_testkit::secure::{SecureHarness, hello, serve_secured};
-
-/// Every wait in this file is ceilinged: a refused handshake must fail in
-/// milliseconds, and a test that would instead hang has found a worse bug
-/// than the one it was looking for.
-async fn within<T>(
-    what: &str,
-    future: impl Future<Output = T>,
-) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
-    tokio::time::timeout(std::time::Duration::from_secs(15), future)
-        .await
-        .map_err(|_| format!("timed out waiting for {what}").into())
-}
+use horde_server_testkit::secure::{SecureHarness, hello, serve_secured, tls_trusting_ca, within};
 
 /// An enrollment-listener client that trusts the harness CA (the state every
 /// peer is in *after* one join, or by carrying the CA out of band).
@@ -41,13 +29,7 @@ async fn enrollment_client(
     harness: &SecureHarness,
 ) -> Setup<EnrollmentServiceClient<tonic::transport::Channel>> {
     let channel = tonic::transport::Endpoint::from_shared(harness.enrollment_endpoint())?
-        .tls_config(
-            tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(
-                    harness.authority.ca_pem(),
-                ))
-                .domain_name("localhost"),
-        )?
+        .tls_config(tls_trusting_ca(harness.authority.ca_pem()))?
         .connect()
         .await?;
     Ok(EnrollmentServiceClient::new(channel))
@@ -140,13 +122,8 @@ async fn a_peer_without_a_certificate_is_refused_by_the_main_listener() -> Setup
     let harness = serve_secured().await?;
 
     // TLS, trusting the right CA, but presenting no client certificate.
-    let bare = tonic::transport::Endpoint::from_shared(harness.main_endpoint())?.tls_config(
-        tonic::transport::ClientTlsConfig::new()
-            .ca_certificate(tonic::transport::Certificate::from_pem(
-                harness.authority.ca_pem(),
-            ))
-            .domain_name("localhost"),
-    )?;
+    let bare = tonic::transport::Endpoint::from_shared(harness.main_endpoint())?
+        .tls_config(tls_trusting_ca(harness.authority.ca_pem()))?;
 
     let refused = within("the certificate-less dial to fail", async {
         let channel = bare.connect().await?;

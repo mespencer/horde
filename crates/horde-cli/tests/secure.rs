@@ -11,15 +11,9 @@ use clap::Parser;
 use horde_cli::Format;
 use horde_cli::cli::{Cli, run};
 use horde_identity::PrincipalRole;
-use horde_server_testkit::secure::serve_secured;
+use horde_server_testkit::secure::{serve_secured, within};
 
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-async fn within<T>(what: &str, future: impl Future<Output = T>) -> Setup<T> {
-    tokio::time::timeout(std::time::Duration::from_secs(15), future)
-        .await
-        .map_err(|_| format!("timed out waiting for {what}").into())
-}
 
 /// Runs one argument vector through the real dispatch.
 async fn invoke(args: &[&str]) -> Setup<()> {

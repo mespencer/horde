@@ -14,20 +14,11 @@ mod common;
 #[cfg(test)]
 mod suite {
     use crate::common::harness::{commit_file, init_repo, within};
+    use horde_identity::clock::unix_now_ms as now_ms;
     use horde_identity::{
         CertificateAuthority, Principal, PrincipalRole, RevocationList, StoredIdentity,
     };
     use tokio_rustls::rustls;
-
-    fn now_ms() -> i64 {
-        i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_millis())
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default()
-    }
 
     struct TlsRelay {
         server: horde_relay::RelayServer,
@@ -59,11 +50,7 @@ mod suite {
 
         let ca = CertificateAuthority::generate(now_ms()).expect("a CA generates");
         let credential = ca
-            .issue_server(
-                now_ms(),
-                &["localhost".to_owned()],
-                &[std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
-            )
+            .issue_localhost_server(now_ms())
             .expect("a credential issues");
 
         let (key_pem, csr_pem) = horde_identity::enroll::generate_csr().expect("a CSR");

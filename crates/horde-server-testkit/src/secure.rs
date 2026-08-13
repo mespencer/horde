@@ -20,6 +20,30 @@ use horde_server::{EventLog, ServerCore};
 
 use crate::Setup;
 
+/// A future bounded by a fifteen-second ceiling, failing with `what`.
+///
+/// The one wait helper every secured suite shares: a refused handshake must
+/// fail in milliseconds, and a test that would instead hang has found a
+/// worse bug than the one it was looking for.
+///
+/// # Errors
+///
+/// The ceiling elapsing, named.
+pub async fn within<T>(what: &str, future: impl Future<Output = T>) -> Setup<T> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), future)
+        .await
+        .map_err(|_| format!("timed out waiting for {what}").into())
+}
+
+/// A tonic client TLS config that trusts `ca_pem` and presents nothing —
+/// the state every peer is in before its first join.
+#[must_use]
+pub fn tls_trusting_ca(ca_pem: &str) -> tonic::transport::ClientTlsConfig {
+    tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem))
+        .domain_name("localhost")
+}
+
 /// A secured server, and the levers a suite needs around it.
 ///
 /// The authority handle is deliberately exposed: minting is a control-plane
@@ -51,11 +75,7 @@ pub async fn serve_secured() -> Setup<SecureHarness> {
     let log = EventLog::in_memory()?;
     let now = wall_clock_ms();
     let ca = horde_identity::CertificateAuthority::generate(now)?;
-    let credential = ca.issue_server(
-        now,
-        &["localhost".to_owned()],
-        &[std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
-    )?;
+    let credential = ca.issue_localhost_server(now)?;
     let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
 
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));

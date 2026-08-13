@@ -26,6 +26,7 @@
 //! configuration drift, and a drifted one fails open.
 
 pub mod ca;
+pub mod clock;
 pub mod code;
 pub mod enroll;
 pub mod error;

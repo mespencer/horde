@@ -22,15 +22,7 @@ use tokio_rustls::rustls;
 
 const TOKEN: &str = "endpoint-tls-token";
 
-fn now_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_millis())
-            .unwrap_or_default(),
-    )
-    .unwrap_or_default()
-}
+use horde_identity::clock::unix_now_ms as now_ms;
 
 /// Everything a TLS round-trip needs: the CA, a served endpoint behind it,
 /// and one enrolled machine identity.
@@ -47,11 +39,7 @@ struct Tls {
 async fn served_tls() -> Setup<Tls> {
     let horde = harness().await?;
     let ca = CertificateAuthority::generate(now_ms())?;
-    let credential = ca.issue_server(
-        now_ms(),
-        &["localhost".to_owned()],
-        &[std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
-    )?;
+    let credential = ca.issue_localhost_server(now_ms())?;
 
     // The peer machine, enrolled the production way: keypair here, CSR
     // signed by the CA, subject written by the CA.
