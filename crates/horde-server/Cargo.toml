@@ -10,6 +10,7 @@ description = "The Horde control plane: the append-only event log and the servic
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 horde-proto = { workspace = true }
 prost = "0.14.4"
 prost-types = "0.14.4"

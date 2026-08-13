@@ -665,6 +665,7 @@ dependencies = [
 name = "horde-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "horde-proto",
  "horde-server-testkit",
  "hyper-util",

@@ -38,7 +38,7 @@ use tracing::instrument;
 
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
-use crate::log::{PendingEvent, StoredEvent, Tail};
+use crate::log::{StoredEvent, Tail};
 use crate::scheduler::Placement;
 use crate::state::SessionState;
 
@@ -82,28 +82,10 @@ impl ControlPlane {
         idempotency_key: &str,
         event: Event,
     ) -> Result<u64, ServerError> {
-        let appended = self
-            .core
-            .log
-            .append(PendingEvent {
-                session_id: session_id.to_owned(),
-                origin_worker_id: String::new(),
-                journal_sequence: None,
-                idempotency_key: idempotency_key.to_owned(),
-                payload: event.encode_to_vec(),
-            })
-            .await?;
-
-        // A deduplication that swallowed a different kind of event is a key
-        // collision, not a retry, and the caller has to hear about it.
-        crate::service::shared::refuse_kind_collision(
-            &appended,
-            session_id,
-            idempotency_key,
-            &event,
-        )?;
-
-        Ok(appended.sequence)
+        // Shared with the permission chain: one append shape, one place the
+        // kind-collision refusal lives.
+        crate::service::shared::append_server_event(&self.core.log, session_id, idempotency_key, event)
+            .await
     }
 
     /// Projects a session, refusing one that has no events.
@@ -551,8 +533,8 @@ impl ControlPlaneService for ControlPlane {
         let mut found = None;
         for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
             let state = self.project(&session_id).await.map_err(Status::from)?;
-            if let Some(agent) = state.pending_permissions.get(&request_id) {
-                found = Some((session_id, agent.clone()));
+            if let Some(pending) = state.pending_permissions.get(&request_id) {
+                found = Some((session_id, pending.agent_id.clone()));
                 break;
             }
         }
