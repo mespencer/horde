@@ -809,3 +809,68 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod enrollment_render_tests {
+    use super::{Format, joined, minted, revoked};
+
+    fn response(code: &str) -> horde_proto::v1::MintEnrollmentCodeResponse {
+        horde_proto::v1::MintEnrollmentCodeResponse {
+            code: code.to_owned(),
+            server_cert_fingerprint: "ab".repeat(32),
+            expires_at: Some(horde_proto::prost_types::Timestamp {
+                seconds: 1_755,
+                nanos: 500_000_000,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_minted_code_prints_the_code_and_its_deadline_in_both_formats() {
+        let human = minted(&response("s.fp"), Format::Human);
+        assert_eq!(human, "code s.fp\nexpires-at-unix-ms 1755500");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&minted(&response("s.fp"), Format::Json))
+                .expect("json mode emits json");
+        assert_eq!(json["code"], "s.fp");
+        assert_eq!(json["expires_at_unix_ms"], 1_755_500);
+        assert_eq!(json["server_cert_fingerprint"], "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_revocation_names_who_and_what_and_admits_a_no_op() {
+        assert_eq!(
+            revoked("gpu-box", "0a,0b", Format::Human),
+            "revoked gpu-box: 0a,0b"
+        );
+        assert_eq!(
+            revoked("gpu-box", "", Format::Human),
+            "gpu-box held no active certificate",
+            "a no-op revocation must not read as a revocation"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&revoked("gpu-box", "0a,0b", Format::Json))
+                .expect("json mode emits json");
+        assert_eq!(json["revoked"], "gpu-box");
+        assert_eq!(json["serials"], serde_json::json!(["0a", "0b"]));
+        let empty: serde_json::Value =
+            serde_json::from_str(&revoked("g", "", Format::Json)).expect("json mode emits json");
+        assert_eq!(empty["serials"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_join_reports_the_principal_and_where_the_identity_lives() {
+        let dir = std::path::Path::new("/tmp/id");
+        assert_eq!(
+            joined("client:laptop", dir, Format::Human),
+            "enrolled as client:laptop; identity in /tmp/id"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&joined("client:laptop", dir, Format::Json))
+                .expect("json mode emits json");
+        assert_eq!(json["principal"], "client:laptop");
+        assert_eq!(json["identity_dir"], "/tmp/id");
+    }
+}

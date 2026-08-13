@@ -296,6 +296,16 @@ pub fn mtls_acceptor(
         .map_err(|e| IdentityError::Tls(e.to_string()))?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
+    // No session resumption, deliberately. A resumed session restores the
+    // client certificate *without re-running the verifier*, so a serial
+    // revoked after one successful handshake would ride its ticket straight
+    // past the deny-list — measured here, not hypothesized: the revocation
+    // test answered `200` before these two lines. Enrollment-scale channels
+    // do not need resumption's latency win; they need the door to stay a
+    // door.
+    config.send_tls13_tickets = 0;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 

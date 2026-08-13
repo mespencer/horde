@@ -1073,6 +1073,7 @@ dependencies = [
  "horde-adapter",
  "horde-adapter-claude",
  "horde-cli",
+ "horde-identity",
  "horde-proto",
  "horde-server",
  "horde-server-testkit",
@@ -1088,6 +1089,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tower-service",
  "tracing",
@@ -1111,6 +1113,7 @@ name = "horde-relay"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "horde-identity",
  "http",
  "http-body-util",
  "hyper",
@@ -1118,6 +1121,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

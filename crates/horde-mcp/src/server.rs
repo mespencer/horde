@@ -15,12 +15,39 @@ use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 
 use crate::identity::AgentRegistry;
 
+/// The mTLS termination for an endpoint bound beyond loopback (DESIGN §3).
+///
+/// The presented certificate is the Server credential; the peer must present
+/// a certificate chaining to the CA, and revoked serials are refused *at the
+/// handshake* — this channel has no per-RPC interceptor to do it later. The
+/// per-agent headers keep carrying the agent identity within the channel:
+/// mTLS answers "which enrolled machine", the headers answer "which agent on
+/// it", and both checks run.
+#[derive(Clone)]
+pub struct MutualTls {
+    pub credential: horde_identity::ServerCredential,
+    /// The trust root the peer's certificate must chain to.
+    pub ca_pem: String,
+    /// The live deny-list; shared with the rest of the server's doors.
+    pub deny: horde_identity::RevocationList,
+}
+
+impl std::fmt::Debug for MutualTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The credential's own Debug already withholds the key.
+        f.debug_struct("MutualTls")
+            .field("credential", &self.credential)
+            .field("deny", &self.deny)
+            .finish_non_exhaustive()
+    }
+}
+
 /// How to serve one endpoint.
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
-    /// Loopback only. DESIGN §3 forbids binding beyond localhost until
-    /// enrollment and mTLS exist, and this endpoint hands out orchestrator
-    /// verbs, so it is the last thing that should reach the network early.
+    /// Loopback without [`tls`](Self::tls); binding wider requires it —
+    /// DESIGN §3 forbids an unauthenticated networked listener, and this
+    /// endpoint hands out orchestrator verbs.
     pub bind: SocketAddr,
 
     /// Origins allowed to reach the endpoint from a browser.
@@ -32,6 +59,15 @@ pub struct EndpointConfig {
     /// defends against — a page in a browser on this machine reaching a
     /// loopback MCP endpoint — is precisely Horde's deployment shape.
     pub allowed_origins: Vec<String>,
+
+    /// mTLS termination, for an endpoint reached over the network.
+    pub tls: Option<MutualTls>,
+
+    /// Host names beyond rmcp's loopback defaults that requests may carry in
+    /// `Host:` — the names remote peers dial a TLS endpoint by. Empty keeps
+    /// rmcp's default loopback-only list, which is what loopback serving
+    /// wants.
+    pub extra_hosts: Vec<String>,
 }
 
 impl EndpointConfig {
@@ -44,6 +80,20 @@ impl EndpointConfig {
             // A single self-origin entry turns the check on without admitting
             // anything; adding a real browser origin is a deliberate act.
             allowed_origins: vec![format!("http://127.0.0.1:{port}")],
+            tls: None,
+            extra_hosts: Vec::new(),
+        }
+    }
+
+    /// An mTLS endpoint on `bind`, reachable as `host` (DESIGN §3: the
+    /// localhost-only rule lifts exactly when the channel authenticates).
+    #[must_use]
+    pub fn secured(bind: SocketAddr, host: &str, tls: MutualTls) -> Self {
+        Self {
+            bind,
+            allowed_origins: vec![format!("https://{host}:{}", bind.port())],
+            tls: Some(tls),
+            extra_hosts: vec![host.to_owned(), format!("{host}:{}", bind.port())],
         }
     }
 
@@ -77,10 +127,23 @@ impl EndpointConfig {
         // Off by default, and the default fails *open*. See the field docs.
         config.allowed_origins = self.allowed_origins.clone();
 
-        // The `Host` default (`localhost`, `127.0.0.1`, `::1`) is already
-        // correct — the spike measured a forged `Host` refused `403` — so it is
-        // deliberately left alone rather than restated and allowed to drift out
-        // of step with rmcp's own list.
+        // The `Host` default (`localhost`, `127.0.0.1`, `::1` — rmcp's
+        // empty-list special case) is already correct for loopback serving;
+        // the spike measured a forged `Host` refused `403`, so it is left
+        // alone. When this endpoint is dialed by other names,
+        // `with_allowed_hosts` *replaces* the list rather than extending it,
+        // so the loopback names are restated alongside the extras — dropping
+        // them would break every local harness the moment the endpoint also
+        // served the network.
+        if !self.extra_hosts.is_empty() {
+            let mut hosts = vec![
+                "localhost".to_owned(),
+                "127.0.0.1".to_owned(),
+                "::1".to_owned(),
+            ];
+            hosts.extend(self.extra_hosts.iter().cloned());
+            config = config.with_allowed_hosts(hosts);
+        }
 
         config
     }
@@ -115,6 +178,16 @@ pub async fn serve(
     // attributable.
     let guarded = RequireIdentity::new(service, registry);
 
+    // Built once, before accepting: an acceptor that cannot be built is a
+    // startup failure, never a per-connection surprise.
+    let acceptor = match &config.tls {
+        Some(tls) => Some(
+            horde_identity::tls::mtls_acceptor(&tls.credential, &tls.ca_pem, tls.deny.clone())
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        ),
+        None => None,
+    };
+
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let bound = listener.local_addr()?;
 
@@ -124,21 +197,48 @@ pub async fn serve(
                 break;
             };
             let guarded = guarded.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(
-                        hyper_util::rt::TokioIo::new(stream),
-                        hyper_util::service::TowerToHyperService::new(guarded),
-                    )
-                    // Legacy clients open a GET/SSE stream on this connection.
-                    .with_upgrades()
-                    .await;
+                match acceptor {
+                    // mTLS: a peer with no certificate, a foreign one, or a
+                    // revoked serial fails here and the connection ends —
+                    // the refused-connection outcome for this channel.
+                    Some(acceptor) => {
+                        let Ok(tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        serve_connection(tls, guarded).await;
+                    }
+                    None => serve_connection(stream, guarded).await,
+                }
             });
         }
     });
 
     Ok((bound, handle))
 }
+
+/// One HTTP/1.1 connection over whichever transport the endpoint accepted.
+async fn serve_connection<IO>(io: IO, service: RequireIdentity<RmcpService>)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(io),
+            hyper_util::service::TowerToHyperService::new(service),
+        )
+        // Legacy clients open a GET/SSE stream on this connection.
+        .with_upgrades()
+        .await;
+}
+
+/// The concrete rmcp service the gate wraps, named so the connection helper
+/// can be a function rather than a second copy of its body per transport.
+type RmcpService = rmcp::transport::streamable_http_server::StreamableHttpService<
+    crate::endpoint::HordeEndpoint,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+>;
 
 /// Rejects any request that does not carry a valid Agent identity.
 ///

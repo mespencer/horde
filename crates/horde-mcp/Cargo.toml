@@ -46,6 +46,9 @@ tracing = "0.1.44"
 # provider crate is layering; the reverse would be the smell.
 horde-adapter = { path = "../horde-adapter" }
 horde-adapter-claude = { path = "../horde-adapter-claude" }
+# The mTLS termination for an endpoint bound beyond loopback (DESIGN §3):
+# the acceptor and its revocation-aware verifier have one owner.
+horde-identity = { workspace = true }
 horde-cli = { path = "../horde-cli" }
 horde-proto = { path = "../horde-proto" }
 horde-wire = { path = "../horde-wire" }
@@ -60,6 +63,8 @@ tokio = { workspace = true, features = [
 tonic = { version = "0.14.6", features = ["channel"] }
 
 [dev-dependencies]
+# The TLS round-trip needs the client half of a rustls connection.
+tokio-rustls = { workspace = true }
 # The tests drive this endpoint against a real ControlPlane over a real socket,
 # through the harness `horde-server-testkit` shares with `horde-cli` and
 # `horde-server`'s own suites. The dependency points one way only —
