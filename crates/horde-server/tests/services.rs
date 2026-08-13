@@ -11,12 +11,11 @@
 
 use horde_proto::v1::{
     AgentId, AgentOutputChannel, AgentOutputChunk, AgentSpec, CreateSessionRequest, Event,
-    GetSessionRequest, JournaledEvent, JournaledEventBatch, ListSessionsRequest,
-    ListWorkspaceDefinitionsRequest, PermissionOutcome, PushEventsRequest, RegisterWorkerRequest,
-    SessionCursor, SessionId, SpawnAgentRequest, StreamCommandsRequest, SyncEventsRequest,
-    WorkerCapabilities, WorkerId, control_plane_service_client::ControlPlaneServiceClient,
-    event::Kind, push_events_request, push_events_response, stream_commands_response,
-    sync_events_response,
+    GetSessionRequest, JournaledEvent, JournaledEventBatch, ListSessionsRequest, PermissionOutcome,
+    PushEventsRequest, RegisterWorkerRequest, SessionCursor, SessionId, SpawnAgentRequest,
+    StreamCommandsRequest, SyncEventsRequest, WorkerCapabilities, WorkerId,
+    control_plane_service_client::ControlPlaneServiceClient, event::Kind, push_events_request,
+    push_events_response, stream_commands_response, sync_events_response,
 };
 use tokio::io::DuplexStream;
 use tokio_stream::StreamExt;
