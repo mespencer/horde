@@ -19,14 +19,23 @@ horde-proto = { workspace = true }
 # already decided and tested there. Re-deriving them here would be a second
 # answer to a settled question.
 horde-wire = { path = "../horde-wire" }
+# The TUI's state machine and renderer; this crate adds only the terminal
+# plumbing and the client wiring around it (DESIGN.md §11: two frontends,
+# one client library).
+horde-tui = { workspace = true }
+ratatui = "0.30.2"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel"] }
 
 [dev-dependencies]
 horde-server-testkit = { workspace = true }
+# Only the PTY suite in tests/tui.rs: the interactive shell around the event
+# loop needs a real terminal to be tested honestly, and a pty is the only
+# terminal a test can own.
+portable-pty = "0.9.0"
 tonic = { version = "0.14.6", features = ["channel", "server", "router"] }
 
 [[bin]]

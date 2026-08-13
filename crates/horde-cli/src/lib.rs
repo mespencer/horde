@@ -14,6 +14,7 @@
 pub mod cli;
 pub mod client;
 pub mod render;
+pub mod tui;
 
 pub use client::{Client, ClientError, SyncOptions};
 pub use render::Format;

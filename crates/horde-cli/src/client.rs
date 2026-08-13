@@ -64,6 +64,15 @@ pub enum ClientError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// The terminal itself failed the TUI — raw mode refused, a draw failed.
+    ///
+    /// Its own variant because the remedy is different in kind: every other
+    /// error here sends the user toward the server or their own arguments,
+    /// and this one means the *local* terminal is not usable (no TTY, a
+    /// dumb terminal, a closed pty).
+    #[error("the terminal is not usable for the TUI: {0}")]
+    Terminal(#[source] std::io::Error),
 }
 
 impl ClientError {
@@ -370,7 +379,10 @@ impl Client {
             .await?
             .into_inner();
 
-        Ok(EventStream { inner })
+        Ok(EventStream {
+            inner,
+            queued: std::collections::VecDeque::new(),
+        })
     }
 
     /// Replays a session from an offset, then optionally follows it.
@@ -458,9 +470,61 @@ fn sync_request(options: &SyncOptions, follow: bool) -> SyncEventsRequest {
 #[derive(Debug)]
 pub struct EventStream {
     inner: tonic::Streaming<horde_proto::v1::SyncEventsResponse>,
+    /// Events from a batch not yet handed out one at a time.
+    queued: std::collections::VecDeque<EventEnvelope>,
+}
+
+/// One meaningful thing a follow stream can say.
+///
+/// Heartbeats are absorbed below this surface: they exist to keep the
+/// connection distinguishable from a dead one, and a consumer that had to
+/// skip them itself would be one more loop with a skip-arm to get wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamUpdate {
+    /// The next event, in log order. Boxed: an envelope dwarfs the marker
+    /// variant, and every update would pay its size otherwise.
+    Event(Box<EventEnvelope>),
+    /// Replay finished at this head; everything after is live. A frontend
+    /// stops showing its loading state here instead of guessing.
+    CaughtUp(u64),
 }
 
 impl EventStream {
+    /// The next event or catch-up marker, or `Ok(None)` when the stream ends.
+    ///
+    /// Batches are handed out one event at a time so a consumer folds a
+    /// single shape; the batching is the transport's business, not the
+    /// view's.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the stream itself fails.
+    pub async fn next_update(&mut self) -> Result<Option<StreamUpdate>, ClientError> {
+        if let Some(event) = self.queued.pop_front() {
+            return Ok(Some(StreamUpdate::Event(Box::new(event))));
+        }
+        while let Some(message) = self.inner.next().await {
+            match message?.update {
+                Some(sync_events_response::Update::Batch(batch)) => {
+                    self.queued.extend(batch.events);
+                    if let Some(event) = self.queued.pop_front() {
+                        return Ok(Some(StreamUpdate::Event(Box::new(event))));
+                    }
+                    // An empty batch said nothing; keep reading.
+                }
+                Some(sync_events_response::Update::CaughtUp(caught_up)) => {
+                    let head = caught_up
+                        .heads
+                        .first()
+                        .map_or(0, |cursor| cursor.from_sequence);
+                    return Ok(Some(StreamUpdate::CaughtUp(head)));
+                }
+                Some(sync_events_response::Update::Heartbeat(_)) | None => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// Reads forward until `matches` yields a value.
     ///
     /// `Ok(None)` means the stream ended without a match — the server shut down
@@ -476,21 +540,13 @@ impl EventStream {
     where
         F: FnMut(&EventEnvelope) -> Option<T>,
     {
-        while let Some(message) = self.inner.next().await {
-            match message?.update {
-                Some(sync_events_response::Update::Batch(batch)) => {
-                    for event in &batch.events {
-                        if let Some(found) = matches(event) {
-                            return Ok(Some(found));
-                        }
-                    }
-                }
-                // A heartbeat is what distinguishes a quiet wait from a dead
-                // one, and `CaughtUp` only says history ended — neither is an
-                // answer, and neither ends the wait.
-                Some(sync_events_response::Update::CaughtUp(_))
-                | Some(sync_events_response::Update::Heartbeat(_))
-                | None => {}
+        while let Some(update) = self.next_update().await? {
+            // A catch-up marker only says history ended — it is not an answer,
+            // and it does not end the wait.
+            if let StreamUpdate::Event(event) = update
+                && let Some(found) = matches(&event)
+            {
+                return Ok(Some(found));
             }
         }
         Ok(None)

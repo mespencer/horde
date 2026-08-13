@@ -31,8 +31,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// No verb opens the interactive multi-session overview (DESIGN.md §11:
+    /// two zoom levels, one binary — `horde` is the overview, `horde attach`
+    /// the per-session view).
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -52,6 +55,9 @@ pub enum Command {
     Approve(ApproveArgs),
     /// Spawn an agent under an existing one.
     Spawn(SpawnArgs),
+    /// Attach to a session interactively. `sync --follow` is the headless,
+    /// scriptable form of the same subscription.
+    Attach(AttachArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,6 +139,15 @@ pub struct ApproveArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct AttachArgs {
+    pub session_id: String,
+    /// Scope the view to this agent's subtree instead of the whole session.
+    /// Prompts from elsewhere show only as a passive badge.
+    #[arg(long)]
+    pub agent: Option<String>,
+}
+
+#[derive(Args, Debug)]
 pub struct SpawnArgs {
     pub session_id: String,
     /// The spawner. Defaults to the session's top-level agent.
@@ -153,13 +168,24 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     let client = &mut client;
 
     match &cli.command {
-        Command::Hello => run_hello(client, format).await,
-        Command::Session(command) => run_session(client, command, format).await,
-        Command::Sync(args) => run_sync(client, args, format).await,
-        Command::Send(args) => run_send(client, args, format).await,
-        Command::Interrupt(args) => run_interrupt(client, args, format).await,
-        Command::Approve(args) => run_approve(client, args, format).await,
-        Command::Spawn(args) => run_spawn(client, args, format).await,
+        None => crate::tui::launch(client.clone(), crate::tui::Launch::Overview).await,
+        Some(Command::Attach(args)) => {
+            crate::tui::launch(
+                client.clone(),
+                crate::tui::Launch::Attach {
+                    session_id: args.session_id.clone(),
+                    agent_id: args.agent.clone(),
+                },
+            )
+            .await
+        }
+        Some(Command::Hello) => run_hello(client, format).await,
+        Some(Command::Session(command)) => run_session(client, command, format).await,
+        Some(Command::Sync(args)) => run_sync(client, args, format).await,
+        Some(Command::Send(args)) => run_send(client, args, format).await,
+        Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
+        Some(Command::Approve(args)) => run_approve(client, args, format).await,
+        Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
     }
 }
 
@@ -343,7 +369,7 @@ mod tests {
             .expect("valid arguments");
         assert!(cli.json);
         match cli.command {
-            Command::Sync(args) => {
+            Some(Command::Sync(args)) => {
                 assert_eq!(args.session_id, "s1");
                 assert_eq!(args.from, 7);
                 assert!(args.follow);
@@ -357,14 +383,14 @@ mod tests {
         let assignment =
             Cli::try_parse_from(["horde", "send", "a1", "do the thing"]).expect("valid arguments");
         match assignment.command {
-            Command::Send(args) => assert!(!args.note && !args.interrupt),
+            Some(Command::Send(args)) => assert!(!args.note && !args.interrupt),
             other => panic!("expected send, got {other:?}"),
         }
 
         let note = Cli::try_parse_from(["horde", "send", "a1", "fyi", "--note", "--interrupt"])
             .expect("valid arguments");
         match note.command {
-            Command::Send(args) => assert!(args.note && args.interrupt),
+            Some(Command::Send(args)) => assert!(args.note && args.interrupt),
             other => panic!("expected send, got {other:?}"),
         }
     }
@@ -374,7 +400,7 @@ mod tests {
         let cli = Cli::try_parse_from(["horde", "session", "list", "--include-archived"])
             .expect("valid arguments");
         match cli.command {
-            Command::Session(SessionCommand::List { include_archived }) => {
+            Some(Command::Session(SessionCommand::List { include_archived })) => {
                 assert!(include_archived);
             }
             other => panic!("expected session list, got {other:?}"),
@@ -396,6 +422,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["horde", "sync"]).is_err(),
             "sync needs a session"
+        );
+    }
+
+    /// `horde` with no verb is the interactive overview, not a usage error —
+    /// DESIGN.md §11's top-level zoom.
+    #[test]
+    fn no_verb_means_the_interactive_overview() {
+        let cli = Cli::try_parse_from(["horde"]).expect("bare horde is valid");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn attach_takes_a_session_and_optionally_an_agent_scope() {
+        let cli = Cli::try_parse_from(["horde", "attach", "s1", "--agent", "a9"])
+            .expect("valid arguments");
+        match cli.command {
+            Some(Command::Attach(args)) => {
+                assert_eq!(args.session_id, "s1");
+                assert_eq!(args.agent.as_deref(), Some("a9"));
+            }
+            other => panic!("expected attach, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["horde", "attach"]).is_err(),
+            "attach needs a session"
         );
     }
 }
