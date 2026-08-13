@@ -26,6 +26,7 @@ horde-proto = { path = "crates/horde-proto" }
 horde-server = { path = "crates/horde-server" }
 horde-server-testkit = { path = "crates/horde-server-testkit" }
 horde-testkit = { path = "crates/horde-testkit" }
+horde-tui = { path = "crates/horde-tui" }
 horde-wire = { path = "crates/horde-wire" }
 
 [workspace.lints.rust]
