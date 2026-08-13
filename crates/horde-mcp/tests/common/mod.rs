@@ -117,7 +117,20 @@ pub async fn verbs_for_one_agent() -> Setup<(Harness, AgentIdentity, horde_mcp::
 
 /// Stands up both spines, creates a session, and returns what tests need.
 pub async fn harness() -> Setup<Harness> {
-    let endpoint = horde_server_testkit::serve().await?;
+    seeded_on(horde_server_testkit::serve().await?).await
+}
+
+/// [`harness`], with the server's permission chain live under `modes` and an
+/// optional Policy Judge — the arrangement the chain e2e opts into.
+pub async fn harness_with_permissions(
+    modes: horde_server::permission::PermissionModes,
+    judge: Option<std::sync::Arc<dyn horde_server::permission::PolicyJudge>>,
+) -> Setup<Harness> {
+    seeded_on(horde_server_testkit::serve_with_permissions(modes, judge).await?).await
+}
+
+/// Seeds one session on an already-running server.
+async fn seeded_on(endpoint: String) -> Setup<Harness> {
     let (_client, session_id, root) = horde_server_testkit::seeded(&endpoint, "endpoint").await?;
 
     Ok(Harness {
@@ -125,6 +138,31 @@ pub async fn harness() -> Setup<Harness> {
         session_id,
         agent_id: root,
     })
+}
+
+/// A harness-shaped prompt, the way the Claude permission tool would send it.
+pub fn prompt_request(
+    tool: &str,
+    input: serde_json::Value,
+    tool_use_id: &str,
+) -> Setup<horde_adapter_claude::permission::PromptRequest> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "tool_name": tool,
+        "input": input,
+        "tool_use_id": tool_use_id,
+    }))?)
+}
+
+/// Unwraps the decision from the harness-facing tool response.
+///
+/// The harness wants the decision stringified inside a text content block, not
+/// as a nested object. Getting this wrong is invisible until a real agent
+/// silently ignores every decision.
+pub fn decode_tool_response(response: &serde_json::Value) -> Setup<serde_json::Value> {
+    let text = response["content"][0]["text"]
+        .as_str()
+        .ok_or("the decision must be a string inside a text block")?;
+    Ok(serde_json::from_str(text)?)
 }
 
 /// The request id of a `PermissionRequested` envelope, if that is what it is.

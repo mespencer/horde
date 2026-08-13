@@ -67,7 +67,34 @@ pub type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 ///
 /// Any failure to build the log or bind the socket.
 pub async fn serve() -> Setup<String> {
+    serve_core(ServerCore::new(EventLog::in_memory()?)).await
+}
+
+/// [`serve`], with the permission chain (DESIGN §10) running against the same
+/// log, configured with `modes` and an optional judge.
+///
+/// A separate entry point rather than a default of [`serve`], deliberately:
+/// the chain appends events of its own (decisions, enriched escalations), and
+/// a suite that arranged an exact event sequence should not gain rows because
+/// the harness grew an opinion. Tests whose subject *is* the chain opt in.
+///
+/// The chain task is aborted with the server task when the runtime shuts
+/// down, the same lifetime every other harness task has.
+///
+/// # Errors
+///
+/// As [`serve`].
+pub async fn serve_with_permissions(
+    modes: horde_server::permission::PermissionModes,
+    judge: Option<std::sync::Arc<dyn horde_server::permission::PolicyJudge>>,
+) -> Setup<String> {
     let core = ServerCore::new(EventLog::in_memory()?);
+    let _chain = horde_server::permission::spawn(&core.log, std::sync::Arc::new(modes), judge);
+    serve_core(core).await
+}
+
+/// Serves both spines over a caller-built core.
+async fn serve_core(core: ServerCore) -> Setup<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
 
