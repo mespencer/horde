@@ -385,6 +385,42 @@ impl Client {
         })
     }
 
+    /// Opens *one* follow stream carrying every named session from its
+    /// cursor, plus every other session — current and future — from its head.
+    ///
+    /// This is the multi-session overview and the global inbox as a single
+    /// subscription: name the sessions whose history you need replayed, and
+    /// the `all_sessions` net carries everything else live, including
+    /// sessions created after the call. One stream, where the TUI used to
+    /// fan in one per session.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the subscription is refused.
+    pub async fn follow_everything(
+        &mut self,
+        cursors: &[(String, u64)],
+    ) -> Result<EventStream, ClientError> {
+        let request = SyncEventsRequest {
+            cursors: cursors
+                .iter()
+                .map(|(session_id, from_sequence)| SessionCursor {
+                    session_id: Some(SessionId::new(session_id.clone())),
+                    from_sequence: *from_sequence,
+                })
+                .collect(),
+            all_sessions: true,
+            subtree_root: None,
+            follow: true,
+            max_batch_events: 0,
+        };
+        let inner = self.inner.sync_events(request).await?.into_inner();
+        Ok(EventStream {
+            inner,
+            queued: std::collections::VecDeque::new(),
+        })
+    }
+
     /// Replays a session from an offset, then optionally follows it.
     ///
     /// Each event is handed to `on_event` as it arrives rather than collected,
@@ -448,7 +484,7 @@ fn sync_request(options: &SyncOptions, follow: bool) -> SyncEventsRequest {
             from_sequence: options.from_sequence,
         }],
         all_sessions: false,
-        subtree_root: None,
+        subtree_root: options.subtree_root.clone().map(AgentId::new),
         follow,
         max_batch_events: 0,
     }
@@ -470,8 +506,8 @@ fn sync_request(options: &SyncOptions, follow: bool) -> SyncEventsRequest {
 #[derive(Debug)]
 pub struct EventStream {
     inner: tonic::Streaming<horde_proto::v1::SyncEventsResponse>,
-    /// Events from a batch not yet handed out one at a time.
-    queued: std::collections::VecDeque<EventEnvelope>,
+    /// Updates from a frame not yet handed out one at a time.
+    queued: std::collections::VecDeque<StreamUpdate>,
 }
 
 /// One meaningful thing a follow stream can say.
@@ -484,9 +520,11 @@ pub enum StreamUpdate {
     /// The next event, in log order. Boxed: an envelope dwarfs the marker
     /// variant, and every update would pay its size otherwise.
     Event(Box<EventEnvelope>),
-    /// Replay finished at this head; everything after is live. A frontend
-    /// stops showing its loading state here instead of guessing.
-    CaughtUp(u64),
+    /// One session's replay finished at this head; everything after it is
+    /// live. A frontend stops showing that session's loading state here
+    /// instead of guessing. A merged stream yields one of these per followed
+    /// session.
+    CaughtUp { session_id: String, head: u64 },
 }
 
 impl EventStream {
@@ -500,29 +538,41 @@ impl EventStream {
     ///
     /// [`ClientError::Rpc`] if the stream itself fails.
     pub async fn next_update(&mut self) -> Result<Option<StreamUpdate>, ClientError> {
-        if let Some(event) = self.queued.pop_front() {
-            return Ok(Some(StreamUpdate::Event(Box::new(event))));
-        }
-        while let Some(message) = self.inner.next().await {
+        loop {
+            if let Some(update) = self.queued.pop_front() {
+                return Ok(Some(update));
+            }
+            let Some(message) = self.inner.next().await else {
+                return Ok(None);
+            };
             match message?.update {
                 Some(sync_events_response::Update::Batch(batch)) => {
-                    self.queued.extend(batch.events);
-                    if let Some(event) = self.queued.pop_front() {
-                        return Ok(Some(StreamUpdate::Event(Box::new(event))));
-                    }
-                    // An empty batch said nothing; keep reading.
+                    self.queued.extend(
+                        batch
+                            .events
+                            .into_iter()
+                            .map(|event| StreamUpdate::Event(Box::new(event))),
+                    );
+                    // An empty batch said nothing; the loop keeps reading.
                 }
                 Some(sync_events_response::Update::CaughtUp(caught_up)) => {
-                    let head = caught_up
-                        .heads
-                        .first()
-                        .map_or(0, |cursor| cursor.from_sequence);
-                    return Ok(Some(StreamUpdate::CaughtUp(head)));
+                    // One marker per followed session: a merged stream's
+                    // consumer needs to know *which* replay finished.
+                    self.queued
+                        .extend(caught_up.heads.into_iter().map(|cursor| {
+                            StreamUpdate::CaughtUp {
+                                session_id: cursor
+                                    .session_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default(),
+                                head: cursor.from_sequence,
+                            }
+                        }));
                 }
                 Some(sync_events_response::Update::Heartbeat(_)) | None => {}
             }
         }
-        Ok(None)
     }
 
     /// Reads forward until `matches` yields a value.
@@ -628,6 +678,9 @@ pub struct SyncOptions {
     pub from_sequence: u64,
     /// False replays to head and completes — the scriptable form.
     pub follow: bool,
+    /// Restrict the stream to this agent's subtree, server-side. `None` is
+    /// session-root attachment, which sees everything (DESIGN §11).
+    pub subtree_root: Option<String>,
 }
 
 impl SyncOptions {
@@ -637,6 +690,7 @@ impl SyncOptions {
             session_id: session_id.into(),
             from_sequence: 0,
             follow: false,
+            subtree_root: None,
         }
     }
 
@@ -649,6 +703,13 @@ impl SyncOptions {
     #[must_use]
     pub fn following(mut self, follow: bool) -> Self {
         self.follow = follow;
+        self
+    }
+
+    /// Scope the stream to one agent's subtree.
+    #[must_use]
+    pub fn scoped_to(mut self, agent_id: impl Into<String>) -> Self {
+        self.subtree_root = Some(agent_id.into());
         self
     }
 }

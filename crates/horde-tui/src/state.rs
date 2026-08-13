@@ -83,9 +83,9 @@ impl SessionState {
     ///
     /// The summary's head is a lower bound, never a rewind: the stream may
     /// already be ahead of the snapshot the list answer was built from. The
-    /// title is likewise never blanked: the server does not project titles
-    /// into summaries yet, and a name learned from the root agent's spawn
-    /// event must survive the next refresh.
+    /// title is likewise never blanked: summaries carry it now, but a name
+    /// already learned — from an earlier summary or from the root agent's
+    /// spawn event — must survive a refresh whose answer predates it.
     pub fn absorb_summary(&mut self, summary: &SessionSummary) {
         if !summary.title.is_empty() {
             self.title = summary.title.clone();
@@ -129,8 +129,8 @@ impl SessionState {
                     self.root_agent_id = Some(agent_id.clone());
                 }
                 // The root's first tree-path element is the session's display
-                // name — the only place the wire carries it today, since
-                // summaries come back untitled.
+                // name — the same rule the server projects into summaries,
+                // kept here for streams read before any summary arrives.
                 if self.takes_title_from(parent.as_deref())
                     && let Some(name) = spawned.tree_path.first()
                 {
@@ -697,9 +697,9 @@ mod tests {
         );
     }
 
-    /// Summaries come back untitled today (the server does not project
-    /// titles), so the name learned from the root spawn must not be blanked
-    /// by the next refresh.
+    /// A name learned from the root spawn must not be blanked by a refresh
+    /// whose summary carries no title — an archived session's, or a summary
+    /// built before the spawn landed.
     #[test]
     fn the_root_spawn_names_the_session_and_a_blank_summary_cannot_unname_it() {
         let mut state = SessionState::new("s1");

@@ -145,12 +145,7 @@ impl WorkspaceManager {
             )));
         }
         let instance_root = self.instance_root(definition_id);
-        let definition = read_state_file(&instance_root).await.ok_or_else(|| {
-            WorkerError::Workspace(format!(
-                "no instance of {definition_id} is materialized under {}",
-                instance_root.display()
-            ))
-        })?;
+        let definition = required_state(&instance_root, definition_id).await?;
 
         match policy {
             CheckoutPolicy::Shared => Ok(instance_root),
@@ -191,6 +186,29 @@ impl WorkspaceManager {
             checkout_repo(source, destination, format!("horde/{agent_id}")).await?;
         }
         Ok(agent_root)
+    }
+
+    /// The repos a checkout of this Instance composes: `(repo name, relative
+    /// directory under the checkout root)`.
+    ///
+    /// Read from the state file — the worker-local truth — so a caller
+    /// stamping a Payload names repos exactly as the Definition does
+    /// (`GitRef.repo_name` is the Definition's name, never a path or a URL).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Workspace`] when no Instance is materialized here.
+    pub async fn instance_repos(
+        &self,
+        definition_id: &str,
+    ) -> Result<Vec<(String, PathBuf)>, WorkerError> {
+        let instance_root = self.instance_root(definition_id);
+        let definition = required_state(&instance_root, definition_id).await?;
+        Ok(definition
+            .repos
+            .iter()
+            .map(|repo| (repo.name.clone(), PathBuf::from(layout_of(repo))))
+            .collect())
     }
 
     /// The Instances already on this Worker's disk, for the capability
@@ -397,6 +415,19 @@ fn path_str(path: &Path) -> String {
 async fn read_state_file(instance_root: &Path) -> Option<WorkspaceDefinition> {
     let bytes = tokio::fs::read(instance_root.join(STATE_FILE)).await.ok()?;
     WorkspaceDefinition::decode(bytes.as_slice()).ok()
+}
+
+/// The state file's definition, or the error naming what is not there.
+async fn required_state(
+    instance_root: &Path,
+    definition_id: &str,
+) -> Result<WorkspaceDefinition, WorkerError> {
+    read_state_file(instance_root).await.ok_or_else(|| {
+        WorkerError::Workspace(format!(
+            "no instance of {definition_id} is materialized under {}",
+            instance_root.display()
+        ))
+    })
 }
 
 #[cfg(test)]

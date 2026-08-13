@@ -52,36 +52,52 @@ pub async fn connect() -> Setup<Harness> {
 
 /// A harness over a caller-supplied core, for tests that also hold it directly.
 pub async fn connect_to(core: ServerCore) -> Setup<Harness> {
+    let plane = ControlPlane::new(core.clone());
+    connect_with_plane(plane, core).await
+}
+
+/// A harness whose control plane the caller configured — a shortened
+/// heartbeat, say — over the same core the worker spine serves.
+pub async fn connect_with_plane(plane: ControlPlane, core: ServerCore) -> Setup<Harness> {
     Ok(Harness {
-        control: ControlPlaneServiceClient::new(channel_to(core.clone(), true).await?),
-        worker: WorkerServiceClient::new(channel_to(core, false).await?),
+        control: ControlPlaneServiceClient::new(
+            duplex_channel(move |server_side| {
+                tokio::spawn(async move {
+                    let _ = Server::builder()
+                        .add_service(ControlPlaneServiceServer::new(plane))
+                        .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(
+                            server_side,
+                        )))
+                        .await;
+                });
+            })
+            .await?,
+        ),
+        worker: WorkerServiceClient::new(
+            duplex_channel(move |server_side| {
+                tokio::spawn(async move {
+                    let _ = Server::builder()
+                        .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
+                        .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(
+                            server_side,
+                        )))
+                        .await;
+                });
+            })
+            .await?,
+        ),
     })
 }
 
-/// Stands up one server on a duplex pair and returns a channel to it.
+/// Stands up one service on a duplex pair and returns a channel to it.
 ///
-/// Two connections rather than one so each client gets its own transport, which
-/// is how they behave in production.
-async fn channel_to(core: ServerCore, control_plane: bool) -> Setup<tonic::transport::Channel> {
+/// Each client gets its own transport, which is how they behave in
+/// production; `serve` is handed the server half and owns starting it.
+async fn duplex_channel(
+    serve: impl FnOnce(tokio::io::DuplexStream),
+) -> Setup<tonic::transport::Channel> {
     let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-
-    tokio::spawn(async move {
-        let mut builder = Server::builder();
-        let serve = async move {
-            if control_plane {
-                builder
-                    .add_service(ControlPlaneServiceServer::new(ControlPlane::new(core)))
-                    .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-                    .await
-            } else {
-                builder
-                    .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
-                    .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_side)))
-                    .await
-            }
-        };
-        let _ = serve.await;
-    });
+    serve(server_side);
 
     let mut client_side = Some(client_side);
     let channel = Endpoint::try_from("http://[::]:50051")?

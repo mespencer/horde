@@ -14,6 +14,9 @@ async-trait = { workspace = true }
 horde-adapter = { workspace = true }
 horde-adapter-claude = { workspace = true }
 horde-proto = { workspace = true }
+# The share layer: observe_head for stamping a result's Payload, and the
+# stage/obtain halves of moving a commit between checkouts (DESIGN §5, §8).
+horde-relay = { workspace = true }
 horde-wire = { workspace = true }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = { workspace = true }
