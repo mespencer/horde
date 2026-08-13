@@ -430,3 +430,42 @@ async fn a_follow_stream_hands_back_the_matching_event() {
         "the matched value is handed back, not merely consumed"
     );
 }
+
+/// The stream's one-at-a-time surface: every replayed event in log order,
+/// then a catch-up marker carrying the actual head — the number a frontend
+/// resumes from, so "some marker arrived" is not enough.
+#[tokio::test]
+async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
+    use horde_cli::client::StreamUpdate;
+
+    let endpoint = common::serve().await.expect("a server must start");
+    let (mut client, session_id, root) = common::seeded(&endpoint, "updates")
+        .await
+        .expect("a session must be creatable");
+    common::send_notes(&mut client, &root, 2)
+        .await
+        .expect("two notes append");
+
+    // Head is now 3: the root's spawn, then the two notes.
+    let mut stream = client
+        .follow(&SyncOptions::new(session_id))
+        .await
+        .expect("the subscription opens");
+
+    let mut sequences = Vec::new();
+    loop {
+        match stream
+            .next_update()
+            .await
+            .expect("the stream must not fail")
+        {
+            Some(StreamUpdate::Event(envelope)) => sequences.push(envelope.sequence),
+            Some(StreamUpdate::CaughtUp(head)) => {
+                assert_eq!(head, 3, "the marker must carry the real head");
+                break;
+            }
+            None => panic!("the stream ended before catching up"),
+        }
+    }
+    assert_eq!(sequences, vec![1, 2, 3], "replay is dense and in order");
+}

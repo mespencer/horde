@@ -10,9 +10,7 @@
 //! events it cannot pretty-print is worse than one that admits it saw
 //! something.
 
-use horde_proto::v1::{
-    EventEnvelope, PlacementState, SessionLifecycleState, SessionSummary, event::Kind,
-};
+use horde_proto::v1::{EventEnvelope, SessionLifecycleState, SessionSummary, event::Kind};
 use serde_json::{Value, json};
 
 /// How to print.
@@ -199,14 +197,10 @@ fn session_state(state: i32) -> &'static str {
     }
 }
 
+/// Delegated to the TUI crate's vocabulary: two frontends, one set of words
+/// for the same wire values, and one place for a new state to be named.
 fn placement_state(state: i32) -> &'static str {
-    match PlacementState::try_from(state) {
-        Ok(PlacementState::Placed) => "placed",
-        Ok(PlacementState::Queued) => "queued",
-        Ok(PlacementState::Expired) => "expired",
-        Ok(PlacementState::Cancelled) => "cancelled",
-        _ => "unspecified",
-    }
+    horde_tui::state::placement_state_name(state)
 }
 
 fn id(value: Option<String>) -> Value {
