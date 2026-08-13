@@ -506,14 +506,7 @@ mod harness {
     /// A spec with nothing configured: what a test asks for when it cares about
     /// the script rather than the spawn.
     pub(crate) fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
+        AgentSpec::default()
     }
 
     /// A script that asks permission for `call-1`, then takes a turn saying

@@ -42,6 +42,9 @@ pub struct TurnAssembler {
     /// [`AgentEvent::PermissionRequested`] carried. The value holds the JSON-RPC
     /// request id the reply must correlate to, plus what a denial record needs.
     outstanding: BTreeMap<ToolCallId, OutstandingElicitation>,
+    /// Spawn-time facts to journal on the first turn — see
+    /// [`Self::note_startup_diagnostic`].
+    startup_diagnostics: Vec<String>,
 }
 
 /// One elicitation Horde has been offered and not yet answered.
@@ -145,6 +148,15 @@ impl TurnAssembler {
     #[must_use]
     pub fn active_turn_id(&self) -> Option<&TurnId> {
         self.turn.as_ref().map(|turn| &turn.id)
+    }
+
+    /// Queues a spawn-time fact for the journal — which sandbox tier was
+    /// chosen and why, notably (ADR-0005: the tier *is* the enforcement, so
+    /// its choice must be auditable). Emitted as a
+    /// [`OutputChannel::HarnessDiagnostic`] chunk when the next turn opens,
+    /// because an output event needs a turn to be attributed to.
+    pub fn note_startup_diagnostic(&mut self, text: impl Into<String>) {
+        self.startup_diagnostics.push(text.into());
     }
 
     /// Feeds one frame, returning the events it produced.
@@ -293,8 +305,20 @@ impl TurnAssembler {
                 let mut turn = OpenTurn::new(TurnId::new(&started.turn.id));
                 // Consume any interrupt that arrived before this turn existed.
                 turn.interrupt_requested = std::mem::take(&mut self.interrupt_pending);
+                // Spawn-time facts owed to the journal ride the first turn as
+                // harness diagnostics: an Output event needs a turn to belong
+                // to, and this is the first moment one exists.
+                let events = std::mem::take(&mut self.startup_diagnostics)
+                    .into_iter()
+                    .map(|text| AgentEvent::Output {
+                        turn_id: turn.id.clone(),
+                        channel: OutputChannel::HarnessDiagnostic,
+                        chunk_index: turn.next_chunk_index(OutputChannel::HarnessDiagnostic),
+                        text,
+                    })
+                    .collect();
                 self.turn = Some(turn);
-                Vec::new()
+                events
             }
 
             Notification::AgentMessageDelta(delta) => {
@@ -971,6 +995,48 @@ mod tests {
         assert!(
             assembler.active_turn_id().is_none(),
             "a closed turn cannot be steered"
+        );
+    }
+
+    /// The tier-choice audit trail: a startup diagnostic rides the first turn
+    /// exactly once, on the diagnostic channel, and never repeats.
+    #[test]
+    fn a_startup_diagnostic_rides_the_first_turn_once() {
+        let mut assembler = TurnAssembler::new();
+        assembler.note_startup_diagnostic("sandbox tier read-only: no permission mode");
+
+        let mut events = feed(
+            &mut assembler,
+            json!({"method":"thread/started","params":{"thread":{"id":"t1"}}}),
+        );
+        events.extend(feed(
+            &mut assembler,
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-1"}}}),
+        ));
+        let diagnostic = events.iter().find_map(|event| match event {
+            AgentEvent::Output {
+                channel: horde_adapter::OutputChannel::HarnessDiagnostic,
+                text,
+                chunk_index,
+                ..
+            } => Some((text.clone(), *chunk_index)),
+            _ => None,
+        });
+        let (text, chunk_index) = diagnostic.expect("the tier choice must reach the journal");
+        assert!(text.contains("read-only"), "got {text}");
+        assert_eq!(chunk_index, 0);
+
+        feed(
+            &mut assembler,
+            json!({"method":"turn/completed","params":{"turn":{"id":"turn-1"}}}),
+        );
+        let second = feed(
+            &mut assembler,
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-2"}}}),
+        );
+        assert!(
+            second.is_empty(),
+            "a spawn-time fact is journaled once, not per turn: {second:?}"
         );
     }
 
