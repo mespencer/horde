@@ -118,6 +118,13 @@ message WorkerCapabilities {
 
   // Zero means the Worker declares no limit.
   uint32 max_concurrent_agents = 7;
+
+  // This Worker can materialize Workspace Instances and apply Checkout
+  // Policies. Absence is a real state, not a gap in the advertisement:
+  // placement must not send a MaterializeWorkspaceCommand to a Worker that
+  // would refuse it, so an Agent that names a Workspace can only land where
+  // this is set.
+  bool supports_workspaces = 8;
 }
 
 enum WorkerConnectionState {

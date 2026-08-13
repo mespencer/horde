@@ -27,6 +27,7 @@ use super::commands::{self, CommandStream};
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::PendingEvent;
+use crate::placement;
 
 /// Implements `horde.v1.WorkerService`.
 #[derive(Clone, Debug)]
@@ -103,6 +104,14 @@ async fn ingest_batch(
             &event,
         )?;
 
+        // A journaled instance report is also the freshest fact about that
+        // worker's disk, so the cache placement reads hears it too.
+        if let Some(horde_proto::v1::event::Kind::WorkspaceInstanceChanged(changed)) = &event.kind
+            && let Some(report) = &changed.report
+        {
+            core.instances.record(report);
+        }
+
         highest = highest.max(journaled.journal_sequence);
     }
 
@@ -128,29 +137,18 @@ impl WorkerService for WorkerFacing {
                 ))
             })?;
 
-        self.core
-            .workers
-            .register(&worker_id, request.capabilities.unwrap_or_default());
+        register_and_replace(
+            &self.core,
+            &worker_id,
+            request.capabilities.unwrap_or_default(),
+        )
+        .await
+        .map_err(Status::from)?;
 
-        // Both watermarks are derived from the log rather than remembered, so a
-        // restarted server answers a reconnecting worker with the same numbers
-        // it would have given before the restart. The journal one comes from
-        // the events actually stored; the command one from folding the command
-        // stream. Neither survives in memory, and neither needs to.
-        let resume_from_journal_sequence = self
-            .core
-            .log
-            .worker_journal_watermark(&worker_id)
-            .await
-            .map_err(Status::from)?
-            .saturating_add(1);
-
-        // What the server has ever issued this worker. The worker corrects this
-        // downwards on StreamCommands if it applied fewer; it is a ceiling, not
-        // an instruction, and saying "everything" would replay the world.
-        let issued = commands::issued_to(&self.core.log, &worker_id)
-            .await
-            .map_err(Status::from)?;
+        let (resume_from_journal_sequence, resume_from_command_sequence) =
+            resume_positions(&self.core, &worker_id)
+                .await
+                .map_err(Status::from)?;
 
         tracing::info!(worker_id, resume_from_journal_sequence, "worker registered");
 
@@ -158,7 +156,7 @@ impl WorkerService for WorkerFacing {
             worker_id: Some(WorkerId::new(worker_id.clone())),
             server: Some(Self::server_hello()),
             resume_from_journal_sequence,
-            resume_from_command_sequence: issued.saturating_add(1),
+            resume_from_command_sequence,
         }))
     }
 
@@ -190,20 +188,43 @@ impl WorkerService for WorkerFacing {
         );
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let core = self.core.clone();
+        // Captured now, checked at disconnect: by the time this stream
+        // notices its peer is gone, the worker may have re-registered, and a
+        // stale stream must not knock the fresh registration out of placement.
+        let epoch = core.workers.epoch_of(&worker_id);
         tokio::spawn(async move {
-            while let Some(batch) = stream.next_batch().await {
+            'stream: while let Some(batch) = stream.next_batch().await {
                 let batch = match batch {
                     Ok(batch) => batch,
                     Err(error) => {
                         let _ = sender.send(Err(Status::from(error))).await;
-                        return;
+                        break 'stream;
                     }
                 };
                 for command in batch {
                     if sender.send(Ok(command)).await.is_err() {
-                        return; // The worker hung up.
+                        break 'stream; // The worker hung up.
                     }
                 }
+            }
+
+            // The command stream is the worker's lifeline: once it is gone the
+            // server cannot command this worker, so it leaves placement and
+            // the agents it never started are re-queued — unless the worker
+            // has re-registered since, in which case this stream is stale and
+            // the disconnect is not its to declare. This is a background
+            // task, so a failed re-queue can only be logged — the next
+            // placement pass will see the same queued agents anyway.
+            if !worker_id.is_empty()
+                && core.workers.deregister_if_current(&worker_id, epoch)
+                && let Err(error) = worker_lost(&core, &worker_id).await
+            {
+                tracing::warn!(
+                    %error,
+                    worker_id,
+                    "re-queueing a disconnected worker's agents failed"
+                );
             }
         });
 
@@ -291,24 +312,82 @@ impl WorkerService for WorkerFacing {
 
         // Wholesale replacement, per the proto: a partial update is how a
         // scheduler ends up matching on facts that stopped being true.
-        self.core
-            .workers
-            .register(&worker_id, request.capabilities.unwrap_or_default());
+        register_and_replace(
+            &self.core,
+            &worker_id,
+            request.capabilities.unwrap_or_default(),
+        )
+        .await
+        .map_err(Status::from)?;
         Ok(Response::new(ReportCapabilitiesResponse {}))
     }
 
     #[instrument(skip_all)]
     async fn report_workspace_instances(
         &self,
-        _request: Request<ReportWorkspaceInstancesRequest>,
+        request: Request<ReportWorkspaceInstancesRequest>,
     ) -> Result<Response<ReportWorkspaceInstancesResponse>, Status> {
-        // Workspace instances land with workspaces in wave 4. Accepting and
-        // discarding would make a worker believe the server knows about its
-        // checkouts.
-        Err(Status::from(ServerError::Unimplemented(
-            "workspace instance reporting",
-        )))
+        let request = request.into_inner();
+        let worker_id = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+
+        // The worker-local state file is the truth; this call corrects the
+        // server's cache. An authoritative report is the worker's complete
+        // set, so cached instances absent from it are dropped.
+        if request.authoritative {
+            self.core
+                .instances
+                .replace_worker(&worker_id, &request.reports);
+        } else {
+            for report in &request.reports {
+                self.core.instances.record(report);
+            }
+        }
+        Ok(Response::new(ReportWorkspaceInstancesResponse {}))
     }
+}
+
+/// Where a registering worker resumes both streams: `(journal, command)`.
+///
+/// Both watermarks are derived from the log rather than remembered, so a
+/// restarted server answers a reconnecting worker with the same numbers it
+/// would have given before the restart. The journal one comes from the events
+/// actually stored; the command one from folding the command stream — a
+/// ceiling the worker corrects downwards on `StreamCommands` if it applied
+/// fewer, because saying "everything" would replay the world.
+async fn resume_positions(core: &ServerCore, worker_id: &str) -> Result<(u64, u64), ServerError> {
+    let journal = core
+        .log
+        .worker_journal_watermark(worker_id)
+        .await?
+        .saturating_add(1);
+    let issued = commands::issued_to(&core.log, worker_id).await?;
+    Ok((journal, issued.saturating_add(1)))
+}
+
+/// Registers a worker's capabilities, refreshes the instance cache from its
+/// advertised warm instances, and runs a placement pass — a worker appearing
+/// (or changing) is exactly the moment a queued agent may become placeable.
+async fn register_and_replace(
+    core: &ServerCore,
+    worker_id: &str,
+    capabilities: horde_proto::v1::WorkerCapabilities,
+) -> Result<(), ServerError> {
+    core.instances
+        .replace_worker(worker_id, &capabilities.warm_instances);
+    core.workers.register(worker_id, capabilities);
+    placement::place_queued(core).await
+}
+
+/// What losing a worker means once it has left the registry: the agents it
+/// never started are re-queued and re-placed elsewhere. Agents mid-turn stay
+/// placed — a disconnect is a partition, not a death.
+async fn worker_lost(core: &ServerCore, worker_id: &str) -> Result<(), ServerError> {
+    placement::queue_lost_worker(core, worker_id).await?;
+    placement::place_queued(core).await
 }
 
 /// Whether the ingest loop should stop after this reply.
@@ -451,6 +530,25 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(error, ServerError::Invalid(_)));
+    }
+
+    /// Both resume positions come from the log, so a fresh worker starts both
+    /// streams at one, and a worker with stored history resumes after it.
+    #[tokio::test]
+    async fn resume_positions_are_folded_from_the_log_not_remembered() {
+        let core = core();
+        let (journal, command) = super::resume_positions(&core, "worker-a")
+            .await
+            .expect("positions");
+        assert_eq!((journal, command), (1, 1), "a fresh worker starts at one");
+
+        ingest_batch(&core, "worker-a", vec![journaled("s1", 1, "k1")])
+            .await
+            .expect("ingest");
+        let (journal, _) = super::resume_positions(&core, "worker-a")
+            .await
+            .expect("positions");
+        assert_eq!(journal, 2, "the journal resumes after what is stored");
     }
 
     #[tokio::test]

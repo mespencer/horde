@@ -39,8 +39,13 @@ use tracing::instrument;
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::{StoredEvent, Tail};
-use crate::scheduler::Placement;
+use crate::placement;
+use crate::scheduler::PlacementRequest;
 use crate::state::SessionState;
+use crate::workspace::{
+    CATALOG_STREAM, WorkspaceCatalog, check_etag, is_catalog_stream, normalized_repos,
+    same_repo_set, validate_definition, widened_with,
+};
 
 /// Implements `horde.v1.ControlPlaneService`.
 #[derive(Clone, Debug)]
@@ -82,8 +87,8 @@ impl ControlPlane {
         idempotency_key: &str,
         event: Event,
     ) -> Result<u64, ServerError> {
-        // Shared with the permission chain: one append shape, one place the
-        // kind-collision refusal lives.
+        // Shared with the placement passes and the permission chain: one
+        // append shape, one place the kind-collision refusal lives.
         crate::service::shared::append_server_event(
             &self.core.log,
             session_id,
@@ -91,6 +96,71 @@ impl ControlPlane {
             event,
         )
         .await
+    }
+
+    /// The workspace catalog, folded fresh from its stream.
+    async fn catalog(&self) -> Result<WorkspaceCatalog, ServerError> {
+        let events = self.core.log.read_all(CATALOG_STREAM).await?;
+        WorkspaceCatalog::project(&events)
+    }
+
+    /// Appends one catalog change and returns the definition with the etag
+    /// that change produced.
+    async fn append_definition(
+        &self,
+        definition: horde_proto::v1::WorkspaceDefinition,
+        deleted: bool,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ServerError> {
+        let mut stamped = definition.clone();
+        let sequence = self
+            .append(
+                CATALOG_STREAM,
+                "",
+                Event {
+                    agent_id: None,
+                    occurred_at: None,
+                    idempotency_key: String::new(),
+                    kind: Some(Kind::WorkspaceDefinitionChanged(
+                        horde_proto::v1::WorkspaceDefinitionChanged {
+                            definition: Some(definition),
+                            deleted,
+                        },
+                    )),
+                },
+            )
+            .await?;
+        stamped.etag = sequence.to_string();
+        Ok(stamped)
+    }
+
+    /// A live definition by id, or the error that names what was asked for.
+    async fn required_definition(
+        &self,
+        workspace_definition_id: &str,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ServerError> {
+        self.catalog()
+            .await?
+            .get(workspace_definition_id)
+            .cloned()
+            .ok_or_else(|| ServerError::NoSuchWorkspace {
+                wanted: workspace_definition_id.to_owned(),
+            })
+    }
+
+    /// The preamble every workspace mutation shares: resolve the id, fetch the
+    /// live definition, and enforce the optimistic-concurrency token. One
+    /// copy, so no mutation can forget the etag check.
+    async fn mutable_definition(
+        &self,
+        workspace_definition_id: Option<&horde_proto::v1::WorkspaceDefinitionId>,
+        etag: &str,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ServerError> {
+        let id = workspace_definition_id
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let current = self.required_definition(&id).await?;
+        check_etag(&current, etag)?;
+        Ok(current)
     }
 
     /// Projects a session, refusing one that has no events.
@@ -111,6 +181,9 @@ impl ControlPlane {
     /// once there are enough sessions for it to matter.
     async fn session_of_agent(&self, agent_id: &str) -> Result<String, ServerError> {
         for session_id in self.core.log.session_ids().await? {
+            if is_catalog_stream(&session_id) {
+                continue;
+            }
             let state = self.project(&session_id).await?;
             if state.agents.contains_key(agent_id) {
                 return Ok(session_id);
@@ -272,6 +345,19 @@ impl ControlPlaneService for ControlPlane {
     ) -> Result<Response<CreateSessionResponse>, Status> {
         let request = request.into_inner();
 
+        // A root agent naming a workspace the catalog does not hold is
+        // refused before the session exists — the same check spawn makes,
+        // made here for the same reason.
+        let root_workspace = request
+            .root_agent
+            .as_ref()
+            .and_then(|spec| spec.workspace_definition_id.as_ref())
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        if let Some(id) = root_workspace.as_deref() {
+            self.required_definition(id).await.map_err(Status::from)?;
+        }
+
         // The session id and root agent id are server-assigned. Derived from the
         // idempotency key when one is supplied, so a retry after a lost response
         // lands on the same session rather than creating a second one.
@@ -298,6 +384,13 @@ impl ControlPlaneService for ControlPlane {
             .await
             .map_err(Status::from)?;
 
+        // The root agent needs a worker like any other agent; a placement
+        // pass answers its spawn now (placed, or queued with the reason)
+        // instead of leaving it to wait for the pool to change.
+        placement::place_queued(&self.core)
+            .await
+            .map_err(Status::from)?;
+
         let state = self.project(&session_id).await.map_err(Status::from)?;
         tracing::info!(session_id, root_agent_id, "session created");
 
@@ -316,6 +409,10 @@ impl ControlPlaneService for ControlPlane {
 
         let mut sessions = Vec::new();
         for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
+            // The workspace catalog lives in the log but is not a session.
+            if is_catalog_stream(&session_id) {
+                continue;
+            }
             let state = self.project(&session_id).await.map_err(Status::from)?;
             let archived = state.lifecycle == horde_proto::v1::SessionLifecycleState::Archived;
             if archived && !include_archived {
@@ -611,12 +708,40 @@ impl ControlPlaneService for ControlPlane {
         let agent_id = format!("agent-{}", uuid_like());
         let spec = request.spec.unwrap_or_default();
 
+        // A spawn naming a workspace the catalog does not hold is refused
+        // before anything is written: placing it would eventually command a
+        // materialization of nothing.
+        let workspace = spec
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        if let Some(id) = workspace.as_deref() {
+            self.required_definition(id).await.map_err(Status::from)?;
+        }
+
+        // The whole decision — project, place, append — runs under the
+        // placement lock so a drain pass woken by a worker registering cannot
+        // place this agent between our appends.
+        let serialized = self.core.placement_lock.clone();
+        let _serialized = serialized.lock().await;
+
         // The agent exists whether or not it is placed: spawn never blocks, and
         // an unmatched spawn comes back queued with a reason (DESIGN.md §6).
-        let placement = self
-            .core
-            .scheduler
-            .place(spec.placement.as_ref().unwrap_or(&Default::default()));
+        let load = placement::worker_load(&self.core)
+            .await
+            .map_err(Status::from)?;
+        let parent_worker = parent
+            .as_ref()
+            .and_then(|parent_id| state.agents.get(parent_id))
+            .and_then(|parent_state| parent_state.worker_id.clone());
+        let constraints = spec.placement.clone().unwrap_or_default();
+        let placement = self.core.scheduler.place(&PlacementRequest {
+            constraints: &constraints,
+            parent_worker_id: parent_worker.as_deref(),
+            workspace_definition_id: workspace.as_deref(),
+            load: &load,
+        });
 
         self.append(
             &session_id,
@@ -640,36 +765,19 @@ impl ControlPlaneService for ControlPlane {
         // the worker is told to spawn: `service::commands` folds that event
         // into a `SpawnAgentCommand`. Writing the event and separately pushing
         // a command would be two sources of truth for one decision, and the
-        // one held in memory is the one a restart loses.
-        let wire_placement = match &placement {
-            Placement::Placed { worker_id } => horde_proto::v1::Placement {
-                agent_id: Some(AgentId::new(agent_id.clone())),
-                state: horde_proto::v1::PlacementState::Placed as i32,
-                worker_id: Some(horde_proto::v1::WorkerId::new(worker_id.clone())),
-                reason: String::new(),
-            },
-            Placement::Queued { reason } => horde_proto::v1::Placement {
-                agent_id: Some(AgentId::new(agent_id.clone())),
-                state: horde_proto::v1::PlacementState::Queued as i32,
-                worker_id: None,
-                reason: reason.clone(),
-            },
-        };
+        // one held in memory is the one a restart loses. The prewarm request,
+        // when one is needed, is appended *first*, so the worker's command
+        // stream carries materialize-then-spawn.
+        if let crate::scheduler::Placement::Placed { worker_id } = &placement {
+            placement::ensure_instance(&self.core, &session_id, workspace.as_deref(), worker_id)
+                .await
+                .map_err(Status::from)?;
+        }
 
-        self.append(
-            &session_id,
-            "",
-            Event {
-                agent_id: Some(AgentId::new(agent_id.clone())),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(Kind::PlacementChanged(horde_proto::v1::PlacementChanged {
-                    placement: Some(wire_placement.clone()),
-                })),
-            },
-        )
-        .await
-        .map_err(Status::from)?;
+        let wire_placement = placement::wire_placement(&agent_id, &placement);
+        placement::append_placement(&self.core, &session_id, wire_placement.clone())
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(SpawnAgentResponse {
             agent_id: Some(AgentId::new(agent_id)),
@@ -677,55 +785,252 @@ impl ControlPlaneService for ControlPlane {
         }))
     }
 
-    // -- Not built yet. Honest refusals, not fabricated successes. -----------
+    // -- Workspaces -----------------------------------------------------------
 
+    #[instrument(skip_all)]
     async fn create_workspace_definition(
         &self,
-        _request: Request<CreateWorkspaceDefinitionRequest>,
+        request: Request<CreateWorkspaceDefinitionRequest>,
     ) -> Result<Response<CreateWorkspaceDefinitionResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace definitions").into())
+        let request = request.into_inner();
+        let repos = normalized_repos(request.repos);
+        validate_definition(&request.name, &repos).map_err(Status::from)?;
+
+        let catalog = self.catalog().await.map_err(Status::from)?;
+        if catalog.get_by_name(&request.name).is_some() {
+            return Err(Status::from(ServerError::WorkspaceNameTaken {
+                name: request.name,
+            }));
+        }
+
+        let definition = horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(format!(
+                "ws-{}",
+                uuid_like()
+            ))),
+            name: request.name,
+            repos,
+            unmanaged_paths: request.unmanaged_paths,
+            created_at: None,
+            etag: String::new(),
+        };
+        let stamped = self
+            .append_definition(definition, false)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(CreateWorkspaceDefinitionResponse {
+            definition: Some(stamped),
+        }))
     }
 
+    #[instrument(skip_all)]
     async fn get_workspace_definition(
         &self,
-        _request: Request<GetWorkspaceDefinitionRequest>,
+        request: Request<GetWorkspaceDefinitionRequest>,
     ) -> Result<Response<GetWorkspaceDefinitionResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace definitions").into())
+        let request = request.into_inner();
+        let catalog = self.catalog().await.map_err(Status::from)?;
+
+        let id = request
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let definition = match (id, request.name.as_str()) {
+            (Some(id), _) => catalog
+                .get(&id)
+                .cloned()
+                .ok_or(ServerError::NoSuchWorkspace { wanted: id }),
+            (None, name) if !name.is_empty() => {
+                catalog
+                    .get_by_name(name)
+                    .cloned()
+                    .ok_or(ServerError::NoSuchWorkspace {
+                        wanted: name.to_owned(),
+                    })
+            }
+            (None, _) => Err(ServerError::Invalid(
+                "a lookup needs an id or a name".to_owned(),
+            )),
+        }
+        .map_err(Status::from)?;
+
+        let instances = definition
+            .workspace_definition_id
+            .as_ref()
+            .map(|id| self.core.instances.for_definition(&id.to_string()))
+            .unwrap_or_default();
+
+        Ok(Response::new(GetWorkspaceDefinitionResponse {
+            definition: Some(definition),
+            instances,
+        }))
     }
 
+    #[instrument(skip_all)]
     async fn list_workspace_definitions(
         &self,
         _request: Request<ListWorkspaceDefinitionsRequest>,
     ) -> Result<Response<ListWorkspaceDefinitionsResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace definitions").into())
+        let catalog = self.catalog().await.map_err(Status::from)?;
+        Ok(Response::new(ListWorkspaceDefinitionsResponse {
+            definitions: catalog.live().cloned().collect(),
+            // Paging lands when a catalog is large enough to need it; an
+            // empty token honestly means "that was all of them".
+            next_page_token: String::new(),
+        }))
     }
 
+    #[instrument(skip_all)]
     async fn update_workspace_definition(
         &self,
-        _request: Request<UpdateWorkspaceDefinitionRequest>,
+        request: Request<UpdateWorkspaceDefinitionRequest>,
     ) -> Result<Response<UpdateWorkspaceDefinitionResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace definitions").into())
+        let request = request.into_inner();
+        let current = self
+            .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
+            .await
+            .map_err(Status::from)?;
+
+        // Layout changes only: the update's repos may not add or remove.
+        // An empty list means "unchanged" — proto3 cannot tell an omitted
+        // repeated field from an empty one, and reading empty as "remove
+        // every repo" would let the field edit the proto forbids.
+        let repos = if request.repos.is_empty() {
+            current.repos.clone()
+        } else {
+            let updated = normalized_repos(request.repos);
+            same_repo_set(&current.repos, &updated).map_err(Status::from)?;
+            updated
+        };
+
+        let name = if request.name.is_empty() {
+            current.name.clone()
+        } else {
+            request.name
+        };
+        validate_definition(&name, &repos).map_err(Status::from)?;
+        let catalog = self.catalog().await.map_err(Status::from)?;
+        if let Some(holder) = catalog.get_by_name(&name)
+            && holder.workspace_definition_id != current.workspace_definition_id
+        {
+            return Err(Status::from(ServerError::WorkspaceNameTaken { name }));
+        }
+
+        let stamped = self
+            .append_definition(
+                horde_proto::v1::WorkspaceDefinition {
+                    name,
+                    repos,
+                    unmanaged_paths: request.unmanaged_paths,
+                    etag: String::new(),
+                    ..current
+                },
+                false,
+            )
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(UpdateWorkspaceDefinitionResponse {
+            definition: Some(stamped),
+        }))
     }
 
+    #[instrument(skip_all)]
     async fn add_workspace_repo(
         &self,
-        _request: Request<AddWorkspaceRepoRequest>,
+        request: Request<AddWorkspaceRepoRequest>,
     ) -> Result<Response<AddWorkspaceRepoResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace definitions").into())
+        let request = request.into_inner();
+        let current = self
+            .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
+            .await
+            .map_err(Status::from)?;
+
+        let widened = widened_with(current, request.repo).map_err(Status::from)?;
+        let stamped = self
+            .append_definition(widened, false)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(AddWorkspaceRepoResponse {
+            definition: Some(stamped),
+        }))
     }
 
+    #[instrument(skip_all)]
     async fn delete_workspace_definition(
         &self,
-        _request: Request<DeleteWorkspaceDefinitionRequest>,
+        request: Request<DeleteWorkspaceDefinitionRequest>,
     ) -> Result<Response<DeleteWorkspaceDefinitionResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace definitions").into())
+        let request = request.into_inner();
+        let current = self
+            .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
+            .await
+            .map_err(Status::from)?;
+
+        self.append_definition(current, true)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(DeleteWorkspaceDefinitionResponse {}))
     }
 
+    #[instrument(skip_all)]
     async fn prewarm_workspace(
         &self,
-        _request: Request<PrewarmWorkspaceRequest>,
+        request: Request<PrewarmWorkspaceRequest>,
     ) -> Result<Response<PrewarmWorkspaceResponse>, Status> {
-        Err(ServerError::Unimplemented("workspace prewarming").into())
+        let request = request.into_inner();
+        let id = request
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        self.required_definition(&id).await.map_err(Status::from)?;
+        let worker_id = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if !self.core.workers.contains(&worker_id) {
+            return Err(Status::from(ServerError::NoWorkerAvailable {
+                what: format!("workspace {id} on worker `{worker_id}`"),
+            }));
+        }
+
+        // Progress rides the named session's log when one is given; otherwise
+        // the catalog stream carries it, so prewarming ahead of any session
+        // still journals its materialization somewhere findable.
+        let carrying_stream = request
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|session| !session.is_empty())
+            .unwrap_or_else(|| CATALOG_STREAM.to_owned());
+
+        placement::ensure_instance(&self.core, &carrying_stream, Some(&id), &worker_id)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(PrewarmWorkspaceResponse {
+            report: Some(
+                self.core
+                    .instances
+                    .for_definition(&id)
+                    .into_iter()
+                    .find(|report| {
+                        report
+                            .worker_id
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .as_deref()
+                            == Some(worker_id.as_str())
+                    })
+                    .unwrap_or_default(),
+            ),
+        }))
     }
 
     async fn list_workers(

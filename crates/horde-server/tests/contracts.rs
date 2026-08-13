@@ -11,16 +11,16 @@ use horde_proto::v1::{
     GetWorkspaceDefinitionRequest, HelloRequest, ListSessionsRequest, ListWorkersRequest,
     ListWorkspaceDefinitionsRequest, MintEnrollmentCodeRequest, PrewarmWorkspaceRequest,
     QueryUsageRequest, RegisterWorkerRequest, ReportCapabilitiesRequest,
-    ReportWorkspaceInstancesRequest, RevokeEnrollmentRequest, SendMessageRequest, SessionCursor,
-    SessionId, SyncEventsRequest, UpdateWorkspaceDefinitionRequest, WorkerCapabilities, WorkerId,
-    send_message_request, sync_events_response,
+    ReportWorkspaceInstancesRequest, RevokeEnrollmentRequest, SendMessageRequest, SessionId,
+    UpdateWorkspaceDefinitionRequest, WorkerCapabilities, WorkerId, send_message_request,
+    sync_events_response,
 };
 use tokio_stream::StreamExt;
 use tonic::Code;
 
 mod common;
 
-use common::{Harness, Setup, connect, seed};
+use common::{Harness, Setup, connect, open_sync, seed};
 
 /// Every sequence in a session, read back through SyncEvents.
 async fn sequences(harness: &mut Harness, session_id: &str) -> Setup<Vec<u64>> {
@@ -40,20 +40,7 @@ async fn drain_sync<T>(
     session_id: &str,
     mut collect: impl FnMut(&horde_proto::v1::EventBatch, &mut Vec<T>),
 ) -> Setup<Vec<T>> {
-    let mut stream = harness
-        .control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow: false,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(&mut harness.control, session_id, 0, false).await?;
 
     let mut out = Vec::new();
     while let Some(message) = stream.next().await {
@@ -149,41 +136,6 @@ async fn every_unbuilt_control_plane_rpc_refuses_rather_than_fabricating_success
 
     refuses!(
         h.control
-            .create_workspace_definition(CreateWorkspaceDefinitionRequest::default()),
-        "create_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .get_workspace_definition(GetWorkspaceDefinitionRequest::default()),
-        "get_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .list_workspace_definitions(ListWorkspaceDefinitionsRequest::default()),
-        "list_workspace_definitions"
-    );
-    refuses!(
-        h.control
-            .update_workspace_definition(UpdateWorkspaceDefinitionRequest::default()),
-        "update_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .add_workspace_repo(AddWorkspaceRepoRequest::default()),
-        "add_workspace_repo"
-    );
-    refuses!(
-        h.control
-            .delete_workspace_definition(DeleteWorkspaceDefinitionRequest::default()),
-        "delete_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .prewarm_workspace(PrewarmWorkspaceRequest::default()),
-        "prewarm_workspace"
-    );
-    refuses!(
-        h.control
             .mint_enrollment_code(MintEnrollmentCodeRequest::default()),
         "mint_enrollment_code"
     );
@@ -198,17 +150,460 @@ async fn every_unbuilt_control_plane_rpc_refuses_rather_than_fabricating_success
     );
 }
 
-#[tokio::test]
-async fn reporting_workspace_instances_refuses_rather_than_pretending_to_record_them() {
-    let mut h = connect().await.expect("a harness");
+// -- Workspaces --------------------------------------------------------------
 
-    let status = h
-        .worker
-        .report_workspace_instances(ReportWorkspaceInstancesRequest::default())
+fn atlas_repo() -> horde_proto::v1::WorkspaceRepo {
+    horde_proto::v1::WorkspaceRepo {
+        name: "atlas".to_owned(),
+        remote_url: "https://example.com/atlas.git".to_owned(),
+        default_branch: "main".to_owned(),
+        layout_path: String::new(),
+    }
+}
+
+/// Fetches a definition by id, returning the whole response — the read every
+/// workspace assertion goes through.
+async fn get_by_id(
+    h: &mut Harness,
+    id: Option<&horde_proto::v1::WorkspaceDefinitionId>,
+) -> Result<horde_proto::v1::GetWorkspaceDefinitionResponse, tonic::Status> {
+    h.control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: id.cloned(),
+            name: String::new(),
+        })
         .await
-        .expect_err("workspace instances are not built");
-    assert_eq!(status.code(), Code::Unimplemented);
-    assert!(status.message().contains("workspace instance"));
+        .map(tonic::Response::into_inner)
+}
+
+async fn create_named(h: &mut Harness, name: &str) -> Setup<horde_proto::v1::WorkspaceDefinition> {
+    let created = h
+        .control
+        .create_workspace_definition(CreateWorkspaceDefinitionRequest {
+            name: name.to_owned(),
+            repos: vec![atlas_repo()],
+            unmanaged_paths: vec!["datasets".to_owned()],
+        })
+        .await?
+        .into_inner()
+        .definition
+        .ok_or("a created definition")?;
+    Ok(created)
+}
+
+async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinition> {
+    create_named(h, "atlas").await
+}
+
+/// [`create_atlas`], returning the id the instance-facing tests key on.
+async fn created_atlas_id(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinitionId> {
+    create_atlas(h)
+        .await?
+        .workspace_definition_id
+        .ok_or_else(|| "a definition id".into())
+}
+
+#[tokio::test]
+async fn a_workspace_definition_round_trips_through_the_catalog() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+
+    assert!(!created.etag.is_empty(), "an etag is minted at creation");
+    assert_eq!(
+        created.repos[0].layout_path, "atlas",
+        "an unset layout path defaults to the repo's name"
+    );
+
+    let fetched = get_by_id(&mut h, created.workspace_definition_id.as_ref())
+        .await
+        .expect("get by id")
+        .definition
+        .expect("a definition");
+    assert_eq!(fetched, created, "the catalog returns what was created");
+
+    let by_name = h
+        .control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: None,
+            name: "atlas".to_owned(),
+        })
+        .await
+        .expect("get by name")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    assert_eq!(by_name, created);
+
+    let listed = h
+        .control
+        .list_workspace_definitions(ListWorkspaceDefinitionsRequest::default())
+        .await
+        .expect("list")
+        .into_inner()
+        .definitions;
+    assert_eq!(listed, vec![created]);
+}
+
+/// A lookup that names nothing must be refused as the caller's mistake — a
+/// NotFound for an empty name would read as "no workspaces exist".
+#[tokio::test]
+async fn a_lookup_with_neither_id_nor_name_is_invalid_not_missing() {
+    let mut h = connect().await.expect("a harness");
+    create_atlas(&mut h).await.expect("create");
+
+    let refused = get_by_id(&mut h, None)
+        .await
+        .expect_err("nothing was asked for");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused.message().contains("id or a name"),
+        "the refusal says what a lookup needs: {}",
+        refused.message()
+    );
+}
+
+/// Renaming may not shadow another live definition, and keeping one's own
+/// name is not a collision with oneself.
+#[tokio::test]
+async fn a_rename_may_keep_its_own_name_but_not_take_a_neighbours() {
+    let mut h = connect().await.expect("a harness");
+    let atlas = create_atlas(&mut h).await.expect("create atlas");
+    let beta = create_named(&mut h, "beta").await.expect("create beta");
+
+    let update = |definition: &horde_proto::v1::WorkspaceDefinition, name: &str| {
+        UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: definition.workspace_definition_id.clone(),
+            etag: definition.etag.clone(),
+            name: name.to_owned(),
+            unmanaged_paths: vec!["datasets".to_owned()],
+            repos: vec![],
+        }
+    };
+
+    let taken = h
+        .control
+        .update_workspace_definition(update(&beta, "atlas"))
+        .await
+        .expect_err("atlas is a live neighbour's name");
+    assert_eq!(taken.code(), Code::AlreadyExists);
+
+    let unchanged = h
+        .control
+        .update_workspace_definition(update(&atlas, "atlas"))
+        .await
+        .expect("keeping one's own name is not a collision")
+        .into_inner()
+        .definition
+        .expect("the updated definition");
+    assert_eq!(unchanged.name, "atlas");
+}
+
+/// An update's changes actually land — the returned definition and the
+/// catalog agree on the new layout and unmanaged paths, and the events the
+/// catalog stream carries hold no stale etag for a replay to trust.
+#[tokio::test]
+async fn an_update_lands_its_layout_and_the_log_carries_no_stale_etag() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+
+    let mut relaid = atlas_repo();
+    relaid.layout_path = "code/atlas".to_owned();
+    h.control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: created.etag.clone(),
+            name: String::new(),
+            unmanaged_paths: vec!["weights".to_owned()],
+            repos: vec![relaid],
+        })
+        .await
+        .expect("the layout update");
+
+    let fetched = get_by_id(&mut h, created.workspace_definition_id.as_ref())
+        .await
+        .expect("get")
+        .definition
+        .expect("a definition");
+    assert_eq!(
+        fetched.repos[0].layout_path, "code/atlas",
+        "the layout change is what update exists for"
+    );
+    assert_eq!(
+        fetched.unmanaged_paths,
+        vec!["weights".to_owned()],
+        "so is the unmanaged set"
+    );
+
+    // The catalog stream's own events never carry an etag: the token is
+    // derived from the log position on every fold, and a stored copy would
+    // let a replay trust a token that was stale the moment it was written.
+    let etags = drain_catalog(&mut h, |kind, out| {
+        if let horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(changed) = kind
+            && let Some(definition) = &changed.definition
+        {
+            out.push(definition.etag.clone());
+        }
+    })
+    .await
+    .expect("the catalog stream replays");
+    assert_eq!(
+        etags,
+        vec![String::new(), String::new()],
+        "two changes, neither storing a token"
+    );
+}
+
+/// Replays the workspace catalog stream, collecting each event's kind. The
+/// catalog is a log stream like any other — it is only session *listings* it
+/// stays out of — which is why [`drain_sync`]'s loop can read it too.
+async fn drain_catalog<T>(
+    h: &mut Harness,
+    mut collect: impl FnMut(&horde_proto::v1::event::Kind, &mut Vec<T>),
+) -> Setup<Vec<T>> {
+    drain_sync(h, horde_server::workspace::CATALOG_STREAM, |batch, out| {
+        for envelope in &batch.events {
+            if let Some(kind) = envelope
+                .event
+                .as_ref()
+                .and_then(|event| event.kind.as_ref())
+            {
+                collect(kind, out);
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_second_definition_may_not_take_a_live_name() {
+    let mut h = connect().await.expect("a harness");
+    create_atlas(&mut h).await.expect("create");
+
+    let status = create_atlas(&mut h)
+        .await
+        .expect_err("the name is taken")
+        .downcast::<tonic::Status>()
+        .expect("a status");
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert!(status.message().contains("atlas"));
+}
+
+/// The etag is the whole optimistic-concurrency story: a stale one must be
+/// refused as ABORTED, and every successful mutation mints a fresh one.
+#[tokio::test]
+async fn workspace_mutations_enforce_the_etag() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+
+    let stale = h
+        .control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: "stale".to_owned(),
+            name: String::new(),
+            unmanaged_paths: vec![],
+            repos: vec![],
+        })
+        .await
+        .expect_err("a stale etag is refused");
+    assert_eq!(stale.code(), Code::Aborted);
+    assert!(
+        stale.message().contains("stale"),
+        "the refusal names the supplied token: {}",
+        stale.message()
+    );
+
+    let renamed = h
+        .control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: created.etag.clone(),
+            name: "atlas-v2".to_owned(),
+            unmanaged_paths: vec!["datasets".to_owned()],
+            repos: vec![],
+        })
+        .await
+        .expect("a fresh etag updates")
+        .into_inner()
+        .definition
+        .expect("the updated definition");
+    assert_eq!(renamed.name, "atlas-v2");
+    assert_ne!(renamed.etag, created.etag, "a mutation mints a fresh etag");
+    assert_eq!(
+        renamed.repos, created.repos,
+        "an update with no repos leaves the repo set alone"
+    );
+
+    // Widening the repo set is AddWorkspaceRepo's job, and Update refuses it.
+    let widened = h
+        .control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: renamed.etag.clone(),
+            name: String::new(),
+            unmanaged_paths: vec![],
+            repos: vec![
+                atlas_repo(),
+                horde_proto::v1::WorkspaceRepo {
+                    name: "extra".to_owned(),
+                    remote_url: "https://example.com/extra.git".to_owned(),
+                    default_branch: String::new(),
+                    layout_path: String::new(),
+                },
+            ],
+        })
+        .await
+        .expect_err("update may not widen the repo set");
+    assert_eq!(widened.code(), Code::InvalidArgument);
+
+    let added = h
+        .control
+        .add_workspace_repo(AddWorkspaceRepoRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            repo: Some(horde_proto::v1::WorkspaceRepo {
+                name: "docs".to_owned(),
+                remote_url: "https://example.com/docs.git".to_owned(),
+                default_branch: "main".to_owned(),
+                layout_path: String::new(),
+            }),
+            etag: renamed.etag.clone(),
+        })
+        .await
+        .expect("add repo")
+        .into_inner()
+        .definition
+        .expect("the widened definition");
+    assert_eq!(added.repos.len(), 2, "the deliberate ceremony widens it");
+
+    h.control
+        .delete_workspace_definition(DeleteWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: added.etag.clone(),
+        })
+        .await
+        .expect("delete with the fresh etag");
+
+    let gone = get_by_id(&mut h, created.workspace_definition_id.as_ref())
+        .await
+        .expect_err("a deleted definition is not found");
+    assert_eq!(gone.code(), Code::NotFound);
+}
+
+/// The worker-local state file is the truth; a report corrects the server's
+/// cache, and the cached view is what `GetWorkspaceDefinition` returns.
+#[tokio::test]
+async fn reported_instances_appear_on_the_definition_they_materialize() {
+    let mut h = connect().await.expect("a harness");
+    let definition_id = created_atlas_id(&mut h).await.expect("create");
+
+    let report = horde_proto::v1::WorkspaceInstanceReport {
+        workspace_definition_id: Some(definition_id.clone()),
+        worker_id: Some(WorkerId::new("worker-a")),
+        state: horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+        root_path: "/workspaces/atlas".to_owned(),
+        repos: vec![],
+        detail: String::new(),
+        observed_at: None,
+    };
+    h.worker
+        .report_workspace_instances(ReportWorkspaceInstancesRequest {
+            worker_id: Some(WorkerId::new("worker-a")),
+            reports: vec![report.clone()],
+            authoritative: false,
+        })
+        .await
+        .expect("reporting instances is built now");
+
+    let instances = get_by_id(&mut h, Some(&definition_id))
+        .await
+        .expect("get")
+        .instances;
+    assert_eq!(instances, vec![report]);
+
+    // An authoritative empty set means the worker no longer has it.
+    h.worker
+        .report_workspace_instances(ReportWorkspaceInstancesRequest {
+            worker_id: Some(WorkerId::new("worker-a")),
+            reports: vec![],
+            authoritative: true,
+        })
+        .await
+        .expect("authoritative replacement");
+    let instances = get_by_id(&mut h, Some(&definition_id))
+        .await
+        .expect("get")
+        .instances;
+    assert!(
+        instances.is_empty(),
+        "the cache dropped what the worker lost"
+    );
+}
+
+/// Prewarm requires a live definition and a connected worker, and answers
+/// with the materializing report placement colocates onto.
+#[tokio::test]
+async fn prewarm_targets_a_connected_worker_and_reports_materializing() {
+    let mut h = connect().await.expect("a harness");
+    let definition_id = created_atlas_id(&mut h).await.expect("create");
+
+    let unplaced = h
+        .control
+        .prewarm_workspace(PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(definition_id.clone()),
+            worker_id: Some(WorkerId::new("nobody")),
+            session_id: None,
+        })
+        .await
+        .expect_err("no such worker is connected");
+    assert_eq!(unplaced.code(), Code::FailedPrecondition);
+
+    register(&mut h, "worker-a", &[]).await.expect("register");
+    let report = h
+        .control
+        .prewarm_workspace(PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(definition_id.clone()),
+            worker_id: Some(WorkerId::new("worker-a")),
+            session_id: None,
+        })
+        .await
+        .expect("prewarm")
+        .into_inner()
+        .report
+        .expect("a report at acceptance");
+    assert_eq!(
+        report.state,
+        horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
+        "acceptance is materializing; completion arrives as events"
+    );
+
+    // A prewarm with an *empty* session id names no session, so its request
+    // journals to the catalog stream like a session-less one — an empty
+    // stream name is not a stream.
+    register(&mut h, "worker-b", &[]).await.expect("register");
+    h.control
+        .prewarm_workspace(PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(definition_id),
+            worker_id: Some(WorkerId::new("worker-b")),
+            session_id: Some(SessionId::new("")),
+        })
+        .await
+        .expect("prewarm with an empty session id");
+
+    let prewarms = drain_catalog(&mut h, |kind, out| {
+        if matches!(
+            kind,
+            horde_proto::v1::event::Kind::WorkspacePrewarmRequested(_)
+        ) {
+            out.push(());
+        }
+    })
+    .await
+    .expect("the catalog stream replays");
+    assert_eq!(
+        prewarms.len(),
+        2,
+        "both session-less prewarms journal to the catalog stream"
+    );
 }
 
 // -- Handshake ---------------------------------------------------------------

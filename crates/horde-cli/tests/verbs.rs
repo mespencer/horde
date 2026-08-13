@@ -134,8 +134,9 @@ async fn a_spawn_actually_adds_an_agent_and_records_its_placement() {
     );
     assert_eq!(
         count_of(&endpoint, &session_id, "PlacementChanged").await,
-        1,
-        "a spawn records where it landed, even when that is nowhere"
+        2,
+        "a spawn records where it landed, even when that is nowhere — \
+         beside the placement the root agent got at session creation"
     );
 }
 

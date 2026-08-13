@@ -101,11 +101,7 @@ pub fn event(envelope: &EventEnvelope, format: Format) -> String {
     let agent_id = inner
         .and_then(|event| event.agent_id.as_ref())
         .map(ToString::to_string);
-    let kind_name = inner.and_then(|event| event.kind.as_ref()).map_or(
-        // An event with no kind is still a position in the log, and hiding it
-        // would make the printed sequence look gapped.
-        "unknown", kind_name,
-    );
+    let kind_name = kind_name(inner.and_then(|event| event.kind.as_ref()));
 
     match format {
         Format::Json => json!({
@@ -132,23 +128,14 @@ pub fn event(envelope: &EventEnvelope, format: Format) -> String {
     }
 }
 
-/// The event kind's wire name.
-fn kind_name(kind: &Kind) -> &'static str {
-    match kind {
-        Kind::AgentOutputChunk(_) => "agent_output_chunk",
-        Kind::AgentSpawned(_) => "agent_spawned",
-        Kind::AssignmentSent(_) => "assignment_sent",
-        Kind::NoteSent(_) => "note_sent",
-        Kind::ResultReported(_) => "result_reported",
-        Kind::PermissionRequested(_) => "permission_requested",
-        Kind::PermissionDecided(_) => "permission_decided",
-        Kind::UsageRecorded(_) => "usage_recorded",
-        Kind::WorkspaceInstanceChanged(_) => "workspace_instance_changed",
-        Kind::AgentLifecycleChanged(_) => "agent_lifecycle_changed",
-        Kind::SessionLifecycleChanged(_) => "session_lifecycle_changed",
-        Kind::PlacementChanged(_) => "placement_changed",
-        Kind::TurnInterrupted(_) => "turn_interrupted",
-    }
+/// The event kind's wire name, straight from the compiled schema via
+/// [`horde_proto::kind_field_name`] — no hand-kept match to drift or outgrow
+/// the complexity gate. An event with no kind (or one this build's descriptor
+/// cannot name) is still a position in the log, and hiding it would make the
+/// printed sequence look gapped, so it renders as `unknown`.
+fn kind_name(kind: Option<&Kind>) -> &'static str {
+    kind.and_then(horde_proto::kind_field_name)
+        .unwrap_or("unknown")
 }
 
 /// The one piece of an event worth showing beside its kind.
@@ -438,7 +425,8 @@ mod tests {
         use horde_proto::v1::{
             AgentLifecycleChanged, AgentSpawned, AssignmentSent, NoteSent, PermissionDecided,
             PermissionRequested, ResultReported, SessionLifecycleChanged, TurnInterrupted,
-            UsageRecorded, WorkspaceInstanceChanged,
+            UsageRecorded, WorkspaceDefinitionChanged, WorkspaceInstanceChanged,
+            WorkspacePrewarmRequested,
         };
 
         let cases: Vec<(Kind, &str)> = vec![
@@ -487,6 +475,14 @@ mod tests {
             (
                 Kind::TurnInterrupted(TurnInterrupted::default()),
                 "turn_interrupted",
+            ),
+            (
+                Kind::WorkspaceDefinitionChanged(WorkspaceDefinitionChanged::default()),
+                "workspace_definition_changed",
+            ),
+            (
+                Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested::default()),
+                "workspace_prewarm_requested",
             ),
         ];
 

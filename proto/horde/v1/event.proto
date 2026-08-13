@@ -134,6 +134,28 @@ message PlacementChanged {
   Placement placement = 1;
 }
 
+// The catalog of Workspace Definitions changed: one was created, updated,
+// widened by AddWorkspaceRepo, or deleted. Carries the full post-change
+// Definition rather than a delta, so the catalog fold is last-writer-wins and
+// a replay from any offset converges on the same catalog.
+message WorkspaceDefinitionChanged {
+  WorkspaceDefinition definition = 1;
+
+  // The Definition no longer exists. The event still carries its last state,
+  // so the log alone records what was deleted.
+  bool deleted = 2;
+}
+
+// The Server asked a Worker to materialize a Workspace Instance — at
+// placement time, or via an explicit prewarm. The command fold turns this into
+// a MaterializeWorkspaceCommand; recording the request as an event is what
+// lets the command survive a Server restart (ADR-0001).
+message WorkspacePrewarmRequested {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  WorkerId worker_id = 2;
+}
+
 // A turn in flight was cancelled. Distinct from a queued message, which is a
 // delivery mode on AssignmentSent or NoteSent.
 message TurnInterrupted {
@@ -177,6 +199,8 @@ message Event {
     SessionLifecycleChanged session_lifecycle_changed = 20;
     PlacementChanged placement_changed = 21;
     TurnInterrupted turn_interrupted = 22;
+    WorkspaceDefinitionChanged workspace_definition_changed = 23;
+    WorkspacePrewarmRequested workspace_prewarm_requested = 24;
   }
 }
 

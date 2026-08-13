@@ -1291,6 +1291,9 @@ mod tests {
             agent_type: "reviewer".to_owned(),
             permission_mode: String::new(),
             worker_id: None,
+            spec: None,
+            placement_state: horde_proto::v1::PlacementState::Unspecified,
+            queued_at_unix_ms: None,
         };
         assert_eq!(display_name(&typed), "reviewer");
 

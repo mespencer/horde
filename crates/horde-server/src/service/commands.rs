@@ -53,8 +53,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use horde_proto::v1::{
-    AgentId, DeliverPermissionDecisionCommand, Event, Placement, PlacementState, SessionId,
-    SpawnAgentCommand, StreamCommandsResponse, event::Kind, stream_commands_response::Command,
+    AgentId, CancelPlacementCommand, DeliverPermissionDecisionCommand, Event,
+    MaterializeWorkspaceCommand, Placement, PlacementState, SessionId, SpawnAgentCommand,
+    StreamCommandsResponse, WorkspaceDefinition, event::Kind, stream_commands_response::Command,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -96,6 +97,13 @@ pub struct CommandProjection {
     /// interrupt — needs to know which worker to reach, and the only event that
     /// ever says so is `PlacementChanged`.
     placed: BTreeMap<String, String>,
+    /// The workspace catalog as this fold has seen it, keyed by definition id.
+    ///
+    /// A `MaterializeWorkspaceCommand` carries the *full* definition — a
+    /// worker must be able to materialize without a round trip — and the only
+    /// place a fold can get one is the `WorkspaceDefinitionChanged` events
+    /// that precede every prewarm request in append order.
+    definitions: BTreeMap<String, WorkspaceDefinition>,
     /// How many commands each worker has been issued. This *is* the per-worker
     /// command sequence.
     issued: BTreeMap<String, u64>,
@@ -113,18 +121,31 @@ impl CommandProjection {
         self.issued.get(worker_id).copied().unwrap_or(0)
     }
 
-    /// Folds one log row, returning the command it causes and whose it is.
+    /// Folds one log row, returning the commands it causes and whose they are.
     ///
-    /// The worker id comes back alongside the command because a fold advanced
+    /// The worker id comes back alongside each command because a fold advanced
     /// by one worker's stream still has to account for every other worker's
     /// commands: skipping them would leave this worker's numbering right and
-    /// the fold's state wrong.
-    pub fn advance(&mut self, global: &GlobalEvent) -> Option<(String, StreamCommandsResponse)> {
-        let event = Event::decode(global.event.payload.as_slice()).ok()?;
-        let agent_id = event.agent_id.as_ref().map(ToString::to_string)?;
+    /// the fold's state wrong. A `Vec` because one event can command two
+    /// workers at once: a re-placement spawns on the new worker *and* cancels
+    /// on the old one.
+    pub fn advance(&mut self, global: &GlobalEvent) -> Vec<(String, StreamCommandsResponse)> {
+        let Ok(event) = Event::decode(global.event.payload.as_slice()) else {
+            return Vec::new();
+        };
+        let agent_id = event.agent_id.as_ref().map(ToString::to_string);
 
-        match event.kind? {
-            Kind::AgentSpawned(spawned) => {
+        match (event.kind, agent_id) {
+            // The catalog half of materialization: a prewarm request can only
+            // become a command if the definition it names has been folded.
+            (Some(Kind::WorkspaceDefinitionChanged(changed)), _) => {
+                self.fold_definition(changed);
+                Vec::new()
+            }
+            (Some(Kind::WorkspacePrewarmRequested(prewarm)), _) => {
+                self.materialize_command(global, &prewarm)
+            }
+            (Some(Kind::AgentSpawned(spawned)), Some(agent_id)) => {
                 self.spawned.insert(
                     agent_id,
                     SpawnDetails {
@@ -134,30 +155,10 @@ impl CommandProjection {
                         tree_path: spawned.tree_path,
                     },
                 );
-                None
+                Vec::new()
             }
-            Kind::PlacementChanged(changed) => {
-                let worker_id = placement_worker(changed.placement.as_ref()?)?;
-
-                // Recorded before the spawn details are looked up, because the
-                // two can fail independently: an agent may be placed without
-                // this fold having seen its `AgentSpawned` (a replay starting
-                // mid-log), and losing the placement in that case would leave
-                // every later command for the agent unroutable.
-                self.placed.insert(agent_id.clone(), worker_id.clone());
-
-                let details = self.spawned.get(&agent_id)?;
-                let command = Command::SpawnAgent(SpawnAgentCommand {
-                    session_id: Some(SessionId::new(details.session_id.clone())),
-                    agent_id: Some(AgentId::new(agent_id)),
-                    parent_agent_id: details.parent_agent_id.clone().map(AgentId::new),
-                    spec: details.spec.clone(),
-                    binding: None,
-                    tree_path: details.tree_path.clone(),
-                    prompt_overlay: String::new(),
-                });
-                let issued = self.issue(&worker_id, &global.event, command);
-                Some((worker_id, issued))
+            (Some(Kind::PlacementChanged(changed)), Some(agent_id)) => {
+                self.placement_commands(global, &agent_id, changed)
             }
             // The return leg of the permission chain. A decision is written to
             // the log by whoever answered it — a human through
@@ -165,9 +166,12 @@ impl CommandProjection {
             // blocked on it lives on a worker that reads commands, not the log.
             // Without this arm the decision is durable and invisible: the
             // human's answer lands, and the agent waits forever.
-            Kind::PermissionDecided(decided) => {
-                let decision = decided.decision?;
-                let worker_id = self.placed.get(&agent_id)?.clone();
+            (Some(Kind::PermissionDecided(decided)), Some(agent_id)) => {
+                let (Some(decision), Some(worker_id)) =
+                    (decided.decision, self.placed.get(&agent_id).cloned())
+                else {
+                    return Vec::new();
+                };
 
                 let command =
                     Command::DeliverPermissionDecision(DeliverPermissionDecisionCommand {
@@ -177,11 +181,121 @@ impl CommandProjection {
                         // worker if the narrowing is left behind here.
                         decision: Some(decision),
                     });
-                let issued = self.issue(&worker_id, &global.event, command);
-                Some((worker_id, issued))
+                let issued = self.issue(&worker_id, &global.event, command, MAIN);
+                vec![(worker_id, issued)]
             }
-            _ => None,
+            _ => Vec::new(),
         }
+    }
+
+    /// Keeps the fold's copy of the workspace catalog current.
+    fn fold_definition(&mut self, changed: horde_proto::v1::WorkspaceDefinitionChanged) {
+        let Some(definition) = changed.definition else {
+            return;
+        };
+        let Some(id) = definition
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+        else {
+            return;
+        };
+        if changed.deleted {
+            self.definitions.remove(&id);
+        } else {
+            self.definitions.insert(id, definition);
+        }
+    }
+
+    /// A prewarm request for a known definition is a materialize command.
+    ///
+    /// An unknown definition yields nothing rather than a command with an
+    /// empty definition in it: a worker told to materialize nothing would
+    /// create an instance of nothing. Control-plane validation makes this
+    /// unreachable in a live log; a replay of a partial log makes it real.
+    fn materialize_command(
+        &mut self,
+        global: &GlobalEvent,
+        prewarm: &horde_proto::v1::WorkspacePrewarmRequested,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        let Some(worker_id) = prewarm.worker_id.as_ref().map(ToString::to_string) else {
+            return Vec::new();
+        };
+        let Some(definition) = prewarm
+            .workspace_definition_id
+            .as_ref()
+            .and_then(|id| self.definitions.get(&id.to_string()).cloned())
+        else {
+            return Vec::new();
+        };
+
+        let command = Command::MaterializeWorkspace(MaterializeWorkspaceCommand {
+            definition: Some(definition),
+            session_id: Some(SessionId::new(global.event.session_id.clone())),
+        });
+        let issued = self.issue(&worker_id, &global.event, command, MAIN);
+        vec![(worker_id, issued)]
+    }
+
+    /// The commands one placement transition causes.
+    ///
+    /// A placement that lands an agent issues its spawn command; a placement
+    /// that *moves or unseats* an agent also cancels it on the worker that
+    /// held it — that cancel is what settles the at-least-once race with a
+    /// worker that reconnects and replays a spawn it never applied.
+    fn placement_commands(
+        &mut self,
+        global: &GlobalEvent,
+        agent_id: &str,
+        changed: horde_proto::v1::PlacementChanged,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        let new_worker = changed.placement.as_ref().and_then(placement_worker);
+        let previous_worker = self.placed.get(agent_id).cloned();
+        let mut commands = Vec::new();
+
+        if let Some(previous) = previous_worker.as_ref()
+            && new_worker.as_deref() != Some(previous)
+        {
+            let cancel = Command::CancelPlacement(CancelPlacementCommand {
+                agent_id: Some(AgentId::new(agent_id)),
+                reason: "the agent is no longer placed on this worker".to_owned(),
+            });
+            let issued = self.issue(previous, &global.event, cancel, CANCEL);
+            commands.push((previous.clone(), issued));
+        }
+
+        match new_worker {
+            Some(worker_id) => {
+                // Recorded before the spawn details are looked up, because the
+                // two can fail independently: an agent may be placed without
+                // this fold having seen its `AgentSpawned` (a replay starting
+                // mid-log), and losing the placement in that case would leave
+                // every later command for the agent unroutable.
+                self.placed.insert(agent_id.to_owned(), worker_id.clone());
+
+                // A placement re-stating the same worker is not a new spawn.
+                if previous_worker.as_deref() == Some(worker_id.as_str()) {
+                    return commands;
+                }
+                if let Some(details) = self.spawned.get(agent_id) {
+                    let spawn = Command::SpawnAgent(SpawnAgentCommand {
+                        session_id: Some(SessionId::new(details.session_id.clone())),
+                        agent_id: Some(AgentId::new(agent_id)),
+                        parent_agent_id: details.parent_agent_id.clone().map(AgentId::new),
+                        spec: details.spec.clone(),
+                        binding: None,
+                        tree_path: details.tree_path.clone(),
+                        prompt_overlay: String::new(),
+                    });
+                    let issued = self.issue(&worker_id, &global.event, spawn, MAIN);
+                    commands.push((worker_id, issued));
+                }
+            }
+            None => {
+                self.placed.remove(agent_id);
+            }
+        }
+        commands
     }
 
     /// Assigns the next per-worker sequence, and the command's stable id.
@@ -190,6 +304,7 @@ impl CommandProjection {
         worker_id: &str,
         cause: &StoredEvent,
         command: Command,
+        role: &str,
     ) -> StreamCommandsResponse {
         let next = self.issued.entry(worker_id.to_owned()).or_insert(0);
         *next = next.saturating_add(1);
@@ -201,11 +316,18 @@ impl CommandProjection {
             // primary key, so this is unique by construction and identical
             // every time the fold is recomputed — which is what "stable across
             // redelivery" has to mean once a redelivery can follow a restart.
-            command_id: command_id(&cause.session_id, cause.sequence),
+            command_id: command_id(&cause.session_id, cause.sequence, role),
             command: Some(command),
         }
     }
 }
+
+/// The main command an event causes. Its id is the bare log position.
+const MAIN: &str = "";
+
+/// A cancel issued *alongside* an event's main command. Suffixed so the two
+/// ids stay distinct even though one event caused both.
+const CANCEL: &str = ":cancel";
 
 /// The worker a placement names, if it is actually placed on one.
 ///
@@ -224,9 +346,10 @@ fn placement_worker(placement: &Placement) -> Option<String> {
     }
 }
 
-/// A command's stable identity: the log position of the event that caused it.
-fn command_id(session_id: &str, sequence: u64) -> String {
-    format!("{session_id}:{sequence}")
+/// A command's stable identity: the log position of the event that caused it,
+/// plus a role suffix when one event causes more than one command.
+fn command_id(session_id: &str, sequence: u64, role: &str) -> String {
+    format!("{session_id}:{sequence}{role}")
 }
 
 /// Whether a folded command is one this stream still owes its worker.
@@ -346,15 +469,15 @@ impl CommandStream {
             self.cursor = last.row;
 
             for global in &page {
-                if let Some((worker_id, command)) = self.projection.advance(global)
-                    && is_owed(
+                for (worker_id, command) in self.projection.advance(global) {
+                    if is_owed(
                         &self.worker_id,
                         &worker_id,
                         command.command_sequence,
                         self.resume_from,
-                    )
-                {
-                    owed.push(command);
+                    ) {
+                        owed.push(command);
+                    }
                 }
             }
         }
@@ -467,7 +590,7 @@ mod tests {
     fn fold(rows: &[GlobalEvent]) -> Vec<(String, StreamCommandsResponse)> {
         let mut projection = CommandProjection::new();
         rows.iter()
-            .filter_map(|global| projection.advance(global))
+            .flat_map(|global| projection.advance(global))
             .collect()
     }
 
@@ -524,11 +647,16 @@ mod tests {
 
     #[test]
     fn a_command_is_identified_by_the_log_position_that_caused_it() {
-        assert_eq!(command_id("s1", 7), "s1:7");
+        assert_eq!(command_id("s1", 7, MAIN), "s1:7");
         assert_eq!(
-            command_id("s2", 7),
+            command_id("s2", 7, MAIN),
             "s2:7",
             "the same sequence in another session is a different command"
+        );
+        assert_eq!(
+            command_id("s1", 7, CANCEL),
+            "s1:7:cancel",
+            "a cancel issued beside a main command needs its own identity"
         );
     }
 
@@ -621,6 +749,198 @@ mod tests {
         assert!(fold(&orphan).is_empty());
     }
 
+    /// A re-placement moves the spawn and settles the loser: the old worker is
+    /// cancelled with its own command id, the new one gets the spawn, and both
+    /// stay independently numbered.
+    #[test]
+    fn a_re_placement_cancels_the_old_worker_and_spawns_on_the_new() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            placement_event("agent-1", None, PlacementState::Queued),
+        ));
+        rows.push(row(
+            4,
+            "s1",
+            4,
+            placement_event("agent-1", Some("worker-b"), PlacementState::Placed),
+        ));
+
+        let issued = fold(&rows);
+        let summary: Vec<(&str, &str, u64)> = issued
+            .iter()
+            .map(|(worker, response)| {
+                let kind = match response.command.as_ref() {
+                    Some(Command::SpawnAgent(_)) => "spawn",
+                    Some(Command::CancelPlacement(_)) => "cancel",
+                    other => panic!("unexpected command {other:?}"),
+                };
+                (worker.as_str(), kind, response.command_sequence)
+            })
+            .collect();
+
+        assert_eq!(
+            summary,
+            vec![
+                ("worker-a", "spawn", 1),
+                ("worker-a", "cancel", 2),
+                ("worker-b", "spawn", 1),
+            ],
+            "the queued transition cancels worker-a; the new placement spawns \
+             on worker-b under its own numbering"
+        );
+        assert_eq!(
+            issued[1].1.command_id, "s1:3:cancel",
+            "the cancel carries its own identity beside the event's main id"
+        );
+    }
+
+    /// A placement event that re-states the standing worker is not a new
+    /// spawn: at-least-once redelivery of the *event* must not become an
+    /// at-least-twice delivery of the agent.
+    #[test]
+    fn a_placement_restating_the_same_worker_issues_nothing() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
+        ));
+
+        let issued = fold(&rows);
+        assert_eq!(issued.len(), 1, "one spawn, not two: {issued:?}");
+    }
+
+    /// An unseating with no new home still cancels: the lost worker may
+    /// reconnect and replay a spawn it never applied, and the cancel is what
+    /// makes that replay harmless.
+    #[test]
+    fn an_unseated_agent_is_cancelled_even_before_it_is_replaced() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            placement_event("agent-1", None, PlacementState::Queued),
+        ));
+
+        let issued = fold(&rows);
+        assert_eq!(issued.len(), 2);
+        let (worker, response) = &issued[1];
+        assert_eq!(worker, "worker-a");
+        assert!(matches!(
+            response.command.as_ref(),
+            Some(Command::CancelPlacement(_))
+        ));
+    }
+
+    fn definition(id: &str) -> horde_proto::v1::WorkspaceDefinition {
+        horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(id)),
+            name: format!("{id}-name"),
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        }
+    }
+
+    fn definition_event(id: &str, deleted: bool) -> Event {
+        Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::WorkspaceDefinitionChanged(
+                horde_proto::v1::WorkspaceDefinitionChanged {
+                    definition: Some(definition(id)),
+                    deleted,
+                },
+            )),
+        }
+    }
+
+    fn prewarm_event(id: &str, worker: &str) -> Event {
+        Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::WorkspacePrewarmRequested(
+                horde_proto::v1::WorkspacePrewarmRequested {
+                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(id)),
+                    worker_id: Some(WorkerId::new(worker)),
+                },
+            )),
+        }
+    }
+
+    /// The materialize command must carry the *full* definition, folded from
+    /// the catalog event that precedes every prewarm in append order — a
+    /// worker must be able to materialize without a round trip.
+    #[test]
+    fn a_prewarm_for_a_known_definition_commands_a_materialization() {
+        let rows = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(2, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued = fold(&rows);
+
+        assert_eq!(issued.len(), 1);
+        let (worker, response) = &issued[0];
+        assert_eq!(worker, "worker-a");
+        match response.command.as_ref().expect("a command") {
+            Command::MaterializeWorkspace(materialize) => {
+                assert_eq!(
+                    materialize
+                        .definition
+                        .as_ref()
+                        .map(|definition| definition.name.as_str()),
+                    Some("ws-1-name"),
+                    "the full definition rides the command"
+                );
+                assert_eq!(
+                    materialize.session_id.as_ref().map(ToString::to_string),
+                    Some("s1".to_owned()),
+                    "progress events belong to the session that asked"
+                );
+            }
+            other => panic!("expected a materialize command, got {other:?}"),
+        }
+    }
+
+    /// A prewarm naming a definition the fold has not seen — or one that was
+    /// deleted — yields nothing: a worker told to materialize an empty
+    /// definition would create an instance of nothing.
+    #[test]
+    fn a_prewarm_without_a_live_definition_commands_nothing() {
+        let unknown = vec![row(1, "s1", 1, prewarm_event("ws-ghost", "worker-a"))];
+        assert!(fold(&unknown).is_empty());
+
+        let deleted = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(
+                2,
+                "horde-workspace-catalog",
+                2,
+                definition_event("ws-1", true),
+            ),
+            row(3, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        assert!(
+            fold(&deleted).is_empty(),
+            "a deleted definition is not materializable"
+        );
+    }
+
     #[test]
     fn events_that_command_nothing_are_folded_without_issuing() {
         let rows = vec![row(
@@ -695,7 +1015,7 @@ mod tests {
             },
         };
 
-        assert!(projection.advance(&garbage).is_none());
+        assert!(projection.advance(&garbage).is_empty());
     }
 
     /// The loop in `catch_up` terminates on the page it read, not on what the
@@ -987,9 +1307,11 @@ mod tests {
             projection.advance(&global);
         }
 
-        let issued = projection.advance(&row(3, "s1", 3, decision_event("agent-1", allow(None))));
+        let mut issued =
+            projection.advance(&row(3, "s1", 3, decision_event("agent-1", allow(None))));
 
-        let (worker, response) = issued.expect("a decision for a placed agent is a command");
+        assert_eq!(issued.len(), 1, "one decision, one command");
+        let (worker, response) = issued.remove(0);
         assert_eq!(
             worker, "worker-a",
             "the decision must reach the worker the agent runs on"
@@ -1029,14 +1351,19 @@ mod tests {
             },
         );
 
-        let issued = projection.advance(&row(
+        let mut issued = projection.advance(&row(
             3,
             "s1",
             3,
             decision_event("agent-1", allow(Some(narrowed.clone()))),
         ));
 
-        let (_, response) = issued.expect("a decision for a placed agent is a command");
+        assert_eq!(
+            issued.len(),
+            1,
+            "a decision for a placed agent is a command"
+        );
+        let (_, response) = issued.remove(0);
         match response.command {
             Some(Command::DeliverPermissionDecision(command)) => {
                 let decision = command.decision.expect("the command carries the decision");
@@ -1060,7 +1387,7 @@ mod tests {
         assert!(
             projection
                 .advance(&row(1, "s1", 1, decision_event("ghost", allow(None))))
-                .is_none()
+                .is_empty()
         );
     }
 
@@ -1081,13 +1408,13 @@ mod tests {
                     1,
                     placement_event("agent-1", Some("worker-a"), PlacementState::Placed)
                 ))
-                .is_none()
+                .is_empty()
         );
 
         let issued = projection.advance(&row(2, "s1", 2, decision_event("agent-1", allow(None))));
         assert_eq!(
-            issued.map(|(worker, _)| worker),
-            Some("worker-a".to_owned()),
+            issued.first().map(|(worker, _)| worker.as_str()),
+            Some("worker-a"),
             "the placement must survive a fold that never saw the spawn"
         );
     }

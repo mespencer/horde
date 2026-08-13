@@ -12,7 +12,9 @@ use horde_proto::v1::{
     Note, NoteSent, Payload, PermissionDecided, PermissionDecision, PermissionRequest,
     PermissionRequested, Placement, PlacementChanged, PlacementState, ResultReported, ResultStatus,
     SessionId, SessionLifecycleChanged, SessionLifecycleState, TurnInterrupted, UsageRecord,
-    UsageRecorded, WorkspaceInstanceChanged, WorkspaceInstanceReport, event,
+    UsageRecorded, WorkerId, WorkspaceDefinition, WorkspaceDefinitionChanged,
+    WorkspaceDefinitionId, WorkspaceInstanceChanged, WorkspaceInstanceReport,
+    WorkspacePrewarmRequested, event,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:
@@ -26,6 +28,8 @@ use horde_proto::v1::{
 /// * Lifecycle transitions for Agents and Sessions, and Placement — including
 ///   queued-with-reason, because spawn never blocks the caller.
 /// * Turn interruption, distinct from a message queued to a turn boundary.
+/// * The Workspace Definition catalog and prewarm requests — Definitions are
+///   Server-owned state, and ADR-0001 admits no store for them but the log.
 const EVENT_VOCABULARY: &[&str] = &[
     "agent_output_chunk",
     "agent_spawned",
@@ -40,6 +44,8 @@ const EVENT_VOCABULARY: &[&str] = &[
     "session_lifecycle_changed",
     "placement_changed",
     "turn_interrupted",
+    "workspace_definition_changed",
+    "workspace_prewarm_requested",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -61,6 +67,8 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::SessionLifecycleChanged(_) => "session_lifecycle_changed",
         event::Kind::PlacementChanged(_) => "placement_changed",
         event::Kind::TurnInterrupted(_) => "turn_interrupted",
+        event::Kind::WorkspaceDefinitionChanged(_) => "workspace_definition_changed",
+        event::Kind::WorkspacePrewarmRequested(_) => "workspace_prewarm_requested",
     }
 }
 
@@ -148,6 +156,18 @@ fn every_kind() -> Vec<event::Kind> {
             turn_id: "turn-3".to_owned(),
             reason: "user pressed escape".to_owned(),
         }),
+        event::Kind::WorkspaceDefinitionChanged(WorkspaceDefinitionChanged {
+            definition: Some(WorkspaceDefinition {
+                workspace_definition_id: Some(WorkspaceDefinitionId::new("ws-1")),
+                name: "atlas".to_owned(),
+                ..WorkspaceDefinition::default()
+            }),
+            deleted: false,
+        }),
+        event::Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new("ws-1")),
+            worker_id: Some(WorkerId::new("worker-a")),
+        }),
     ]
 }
 
@@ -213,6 +233,21 @@ fn generated_event_kinds_are_exactly_the_context_vocabulary() {
     assert_eq!(sorted(from_rust.collect()), vocabulary());
 }
 
+/// The production name lookup reads the descriptor; this exhaustive match is
+/// the hand-written oracle it is held against, kind by kind. A drift between
+/// schema and lookup — a misdecoded tag, a missed oneof field — shows up here
+/// as the exact kind that misnamed itself.
+#[test]
+fn the_descriptor_lookup_names_every_kind_like_the_schema_does() {
+    for kind in every_kind() {
+        assert_eq!(
+            horde_proto::kind_field_name(&kind),
+            Some(kind_field_name(&kind)),
+            "the descriptor-derived name must match the declared field"
+        );
+    }
+}
+
 #[test]
 fn every_event_kind_survives_an_envelope_round_trip() {
     for kind in every_kind() {
@@ -243,7 +278,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 13] = [
+    let expected: [(&str, i32); 15] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -257,6 +292,8 @@ fn event_kind_tags_are_stable() {
         ("session_lifecycle_changed", 20),
         ("placement_changed", 21),
         ("turn_interrupted", 22),
+        ("workspace_definition_changed", 23),
+        ("workspace_prewarm_requested", 24),
     ];
 
     let expected: Vec<(String, i32)> = expected

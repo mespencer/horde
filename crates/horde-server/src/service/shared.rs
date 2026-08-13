@@ -12,7 +12,8 @@ use prost::Message;
 use crate::error::ServerError;
 use crate::log::store::Appended;
 use crate::log::{EventLog, PendingEvent};
-use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
+use crate::scheduler::{CapabilityScheduler, Scheduler, WorkerRegistry};
+use crate::workspace::InstanceCache;
 
 /// Everything the two services share.
 ///
@@ -22,24 +23,37 @@ use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
 /// There is no command queue here any more. Commands are folded out of `log`
 /// on demand by `service::commands`, so the only thing to share is the log
 /// they are derived from — which is also the only thing that survives a
-/// restart.
+/// restart. The instance cache is the one exception, and it is allowed to be:
+/// instances are worker-owned truth the workers re-report on connect, so the
+/// cache is honestly a cache and never a second store.
 #[derive(Clone)]
 pub struct ServerCore {
     pub log: EventLog,
     pub workers: WorkerRegistry,
+    pub instances: InstanceCache,
     pub scheduler: Arc<dyn Scheduler>,
+    /// Serializes placement decisions against their appends. Two concurrent
+    /// passes — a spawn and a drain woken by a registration — each project the
+    /// log and then write placements; unserialized, both can place the same
+    /// agent and the fold would command two spawns. The lock makes
+    /// project-then-append atomic per decision. It guards no data, so a
+    /// restart losing it loses nothing.
+    pub placement_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ServerCore {
-    /// Builds a core around a log, with the bootstrap single-worker scheduler.
+    /// Builds a core around a log, with the capability scheduler.
     #[must_use]
     pub fn new(log: EventLog) -> Self {
         let workers = WorkerRegistry::new();
-        let scheduler = Arc::new(SingleWorkerScheduler::new(workers.clone()));
+        let instances = InstanceCache::new();
+        let scheduler = Arc::new(CapabilityScheduler::new(workers.clone(), instances.clone()));
         Self {
             log,
             workers,
+            instances,
             scheduler,
+            placement_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -69,38 +83,24 @@ pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";
 /// A human-readable name for an event kind.
 ///
 /// Only for diagnostics, which is why it is a `&'static str` rather than
-/// anything the wire carries. `event_contract.rs` owns the canonical names; a
-/// drift between the two would cost a slightly worse error message and nothing
-/// else, which is the right amount of coupling for a string that exists to be
-/// read by a person.
+/// anything the wire carries. The names come from the compiled schema through
+/// [`horde_proto::kind_field_name`], so they cannot drift from `event.proto`
+/// and no hand-kept match has to grow with the oneof. `empty` covers both a
+/// kindless event and a kind the descriptor cannot name — either way, an
+/// event this build cannot describe must not collide under a neighbour's
+/// name.
 #[must_use]
 pub fn kind_name(kind: Option<&Kind>) -> &'static str {
-    // Exhaustive rather than wildcarded, matching `event_contract.rs`: a new
-    // arm on the oneof should stop compiling here too, so a kind added later
-    // cannot collide under a name nobody chose for it.
-    match kind {
-        Some(Kind::AgentOutputChunk(_)) => "agent_output_chunk",
-        Some(Kind::AgentSpawned(_)) => "agent_spawned",
-        Some(Kind::AssignmentSent(_)) => "assignment_sent",
-        Some(Kind::NoteSent(_)) => "note_sent",
-        Some(Kind::ResultReported(_)) => "result_reported",
-        Some(Kind::PermissionRequested(_)) => "permission_requested",
-        Some(Kind::PermissionDecided(_)) => "permission_decided",
-        Some(Kind::UsageRecorded(_)) => "usage_recorded",
-        Some(Kind::WorkspaceInstanceChanged(_)) => "workspace_instance_changed",
-        Some(Kind::AgentLifecycleChanged(_)) => "agent_lifecycle_changed",
-        Some(Kind::SessionLifecycleChanged(_)) => "session_lifecycle_changed",
-        Some(Kind::PlacementChanged(_)) => "placement_changed",
-        Some(Kind::TurnInterrupted(_)) => "turn_interrupted",
-        None => "empty",
-    }
+    kind.and_then(horde_proto::kind_field_name)
+        .unwrap_or("empty")
 }
 
 /// Appends a server-originated event: no origin worker, no journal sequence.
 ///
 /// The one append shape everything server-side shares — the control plane's
-/// verbs and the permission chain both write through here, so the
-/// kind-collision refusal below cannot be forgotten by one of them.
+/// verbs, the placement passes, and the permission chain all write through
+/// here, so the kind-collision refusal below cannot be forgotten by any of
+/// them.
 ///
 /// # Errors
 ///
@@ -303,6 +303,8 @@ mod tests {
             Kind::SessionLifecycleChanged(SessionLifecycleChanged::default()),
             Kind::PlacementChanged(PlacementChanged::default()),
             Kind::TurnInterrupted(TurnInterrupted::default()),
+            Kind::WorkspaceDefinitionChanged(WorkspaceDefinitionChanged::default()),
+            Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested::default()),
         ];
 
         let mut seen = std::collections::BTreeSet::new();

@@ -13,13 +13,16 @@
 pub mod error;
 pub mod log;
 pub mod permission;
+pub mod placement;
 pub mod scheduler;
 pub mod service;
 pub mod startup;
 pub mod state;
+pub mod workspace;
 
 pub use error::ServerError;
 pub use log::EventLog;
-pub use scheduler::{Placement, Scheduler, SingleWorkerScheduler, WorkerRegistry};
+pub use scheduler::{CapabilityScheduler, Placement, Scheduler, WorkerRegistry};
 pub use service::ServerCore;
 pub use state::{AgentState, SessionState};
+pub use workspace::{InstanceCache, WorkspaceCatalog};

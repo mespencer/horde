@@ -27,6 +27,26 @@ pub enum ServerError {
     #[error("no agent {agent_id}")]
     NoSuchAgent { agent_id: String },
 
+    #[error("no workspace definition {wanted}")]
+    NoSuchWorkspace { wanted: String },
+
+    /// A create would shadow a live definition's name.
+    #[error("a workspace definition named {name} already exists")]
+    WorkspaceNameTaken { name: String },
+
+    /// The optimistic-concurrency token did not match: someone else changed
+    /// the definition since the caller read it. ABORTED per the proto, so the
+    /// caller re-reads and retries rather than blindly re-sending.
+    #[error(
+        "workspace definition {workspace_definition_id} is at etag {current}, \
+         but the request supplied {supplied:?}; re-read and retry"
+    )]
+    StaleEtag {
+        workspace_definition_id: String,
+        current: String,
+        supplied: String,
+    },
+
     #[error("no worker is registered, so {what} cannot be placed")]
     NoWorkerAvailable { what: String },
 
@@ -93,7 +113,11 @@ impl From<ServerError> for Status {
     fn from(error: ServerError) -> Self {
         let message = error.to_string();
         let code = match &error {
-            ServerError::NoSuchSession { .. } | ServerError::NoSuchAgent { .. } => Code::NotFound,
+            ServerError::NoSuchSession { .. }
+            | ServerError::NoSuchAgent { .. }
+            | ServerError::NoSuchWorkspace { .. } => Code::NotFound,
+            ServerError::WorkspaceNameTaken { .. } => Code::AlreadyExists,
+            ServerError::StaleEtag { .. } => Code::Aborted,
             ServerError::Invalid(_) => Code::InvalidArgument,
             ServerError::NoWorkerAvailable { .. } => Code::FailedPrecondition,
             ServerError::JournalRegressed { .. } => Code::FailedPrecondition,
@@ -143,6 +167,36 @@ mod tests {
         assert_eq!(status.code(), Code::FailedPrecondition);
         let message = status.message();
         assert!(message.contains('3') && message.contains('9'));
+    }
+
+    /// The three workspace refusals map to three different retry strategies,
+    /// so each needs its own code: re-ask (NotFound), re-name
+    /// (AlreadyExists), re-read-and-retry (Aborted).
+    #[test]
+    fn workspace_refusals_are_distinguishable_by_code() {
+        let missing = tonic::Status::from(ServerError::NoSuchWorkspace {
+            wanted: "ws-9".to_owned(),
+        });
+        assert_eq!(missing.code(), Code::NotFound);
+        assert!(missing.message().contains("ws-9"));
+
+        let taken = tonic::Status::from(ServerError::WorkspaceNameTaken {
+            name: "atlas".to_owned(),
+        });
+        assert_eq!(taken.code(), Code::AlreadyExists);
+        assert!(taken.message().contains("atlas"));
+
+        let stale = tonic::Status::from(ServerError::StaleEtag {
+            workspace_definition_id: "ws-1".to_owned(),
+            current: "7".to_owned(),
+            supplied: "3".to_owned(),
+        });
+        assert_eq!(stale.code(), Code::Aborted, "the proto promises ABORTED");
+        assert!(
+            stale.message().contains('7') && stale.message().contains('3'),
+            "both tokens are needed to see what raced: {}",
+            stale.message()
+        );
     }
 
     #[test]

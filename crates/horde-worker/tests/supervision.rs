@@ -527,18 +527,24 @@ mod side_effects {
         .await;
         session.interrupt().await.expect("the write must succeed");
 
-        // The child records what it received; poll briefly for the pipe to land.
+        // The child records what it received; poll, bounded by count, until
+        // the *whole* fact has landed. The predicate is the full expected
+        // content rather than "non-empty" because a slow machine (coverage
+        // instrumentation, a loaded suite) can expose a partially flushed
+        // line, and reading it early is a flake, not a finding.
+        let expected =
+            |recorded: &str| recorded.contains("control_request") && recorded.contains("interrupt");
         let mut recorded = String::new();
-        for _ in 0..50 {
+        for _ in 0..250 {
             recorded = std::fs::read_to_string(&log_path).unwrap_or_default();
-            if !recorded.is_empty() {
+            if expected(&recorded) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         assert!(
-            recorded.contains("control_request") && recorded.contains("interrupt"),
+            expected(&recorded),
             "the child must actually receive the interrupt, got {recorded:?}"
         );
 

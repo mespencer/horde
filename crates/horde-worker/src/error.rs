@@ -88,6 +88,14 @@ pub enum WorkerError {
     #[error("no adapter is registered for provider {0:?}")]
     UnknownProvider(String),
 
+    /// A workspace checkout could not be produced for an agent.
+    ///
+    /// This is the *spawn's* failure, not the Worker's: the runtime journals
+    /// it as a failed lifecycle so the Server hears which agent has no
+    /// working directory, and every other agent keeps running.
+    #[error("the workspace checkout failed: {0}")]
+    Workspace(String),
+
     /// A domain value could not be put on the wire, or a wire value could not
     /// be read back into the domain.
     ///
@@ -148,6 +156,13 @@ mod tests {
             WorkerError::UnknownProvider("codex".to_owned())
                 .to_string()
                 .contains("codex")
+        );
+
+        assert!(
+            WorkerError::Workspace("no instance of ws-1".to_owned())
+                .to_string()
+                .contains("ws-1"),
+            "the failing workspace is what an operator materializes"
         );
 
         assert!(

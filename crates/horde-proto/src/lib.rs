@@ -24,6 +24,9 @@ pub mod v1 {
 }
 
 mod ids;
+mod names;
+
+pub use names::kind_field_name;
 
 /// Compiled `FileDescriptorSet` for every file in `horde.v1`.
 ///

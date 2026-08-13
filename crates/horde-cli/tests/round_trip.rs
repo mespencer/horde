@@ -446,7 +446,8 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
         .await
         .expect("two notes append");
 
-    // Head is now 3: the root's spawn, then the two notes.
+    // Head is now 4: the root's spawn, its placement answer, then the two
+    // notes.
     let mut stream = client
         .follow(&SyncOptions::new(session_id))
         .await
@@ -461,11 +462,11 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
         {
             Some(StreamUpdate::Event(envelope)) => sequences.push(envelope.sequence),
             Some(StreamUpdate::CaughtUp(head)) => {
-                assert_eq!(head, 3, "the marker must carry the real head");
+                assert_eq!(head, 4, "the marker must carry the real head");
                 break;
             }
             None => panic!("the stream ended before catching up"),
         }
     }
-    assert_eq!(sequences, vec![1, 2, 3], "replay is dense and in order");
+    assert_eq!(sequences, vec![1, 2, 3, 4], "replay is dense and in order");
 }

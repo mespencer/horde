@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use horde_proto::prost_types::Struct;
 use horde_proto::v1::{
-    AgentLifecycleState, Event, ProposedToolCall, SessionLifecycleState, event::Kind as EventKind,
+    AgentLifecycleState, AgentSpec, Event, PlacementState, ProposedToolCall, SessionLifecycleState,
+    event::Kind as EventKind,
 };
 use prost::Message;
 
@@ -36,6 +37,18 @@ pub struct AgentState {
     pub permission_mode: String,
     /// The worker this agent was placed on, once it has been placed.
     pub worker_id: Option<String>,
+    /// What the spawn asked for — constraints, workspace, checkout policy.
+    /// Kept whole because re-placing a queued agent asks the same question
+    /// the original spawn did, and a projection that dropped the spec would
+    /// force the scheduler to guess.
+    pub spec: Option<AgentSpec>,
+    /// The latest placement outcome. `Unspecified` means no placement event
+    /// has been folded yet, which the placement pass treats as awaiting
+    /// placement — a spawn is incomplete until some placement answers it.
+    pub placement_state: PlacementState,
+    /// When the latest `Queued` placement was recorded, for queue-timeout
+    /// expiry. Cleared by any other placement outcome.
+    pub queued_at_unix_ms: Option<i64>,
 }
 
 /// One permission request still awaiting its decision.
@@ -132,7 +145,9 @@ impl SessionState {
             EventKind::AgentLifecycleChanged(changed) => {
                 self.agent_lifecycle_changed(agent_id, &changed);
             }
-            EventKind::PlacementChanged(changed) => self.placement_changed(changed),
+            EventKind::PlacementChanged(changed) => {
+                self.placement_changed(changed, stored.recorded_at_unix_ms);
+            }
             EventKind::SessionLifecycleChanged(changed) => {
                 self.session_lifecycle_changed(&changed);
             }
@@ -157,7 +172,6 @@ impl SessionState {
         if parent.is_none() {
             self.root_agent_id.get_or_insert_with(|| agent_id.clone());
         }
-        let spec = spawned.spec.unwrap_or_default();
         self.agents.insert(
             agent_id.clone(),
             AgentState {
@@ -165,9 +179,20 @@ impl SessionState {
                 parent_agent_id: parent,
                 lifecycle: AgentLifecycleState::Queued,
                 tree_path: spawned.tree_path,
-                agent_type: spec.agent_type,
-                permission_mode: spec.permission_mode,
+                agent_type: spawned
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.agent_type.clone())
+                    .unwrap_or_default(),
+                permission_mode: spawned
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.permission_mode.clone())
+                    .unwrap_or_default(),
                 worker_id: None,
+                spec: spawned.spec,
+                placement_state: PlacementState::Unspecified,
+                queued_at_unix_ms: None,
             },
         );
     }
@@ -186,13 +211,23 @@ impl SessionState {
         }
     }
 
-    /// Records which worker an agent landed on.
-    fn placement_changed(&mut self, changed: horde_proto::v1::PlacementChanged) {
+    /// Records the latest placement outcome: the worker (when placed), the
+    /// state, and — for a queued outcome — when it queued, which is what the
+    /// queue timeout is measured from.
+    fn placement_changed(
+        &mut self,
+        changed: horde_proto::v1::PlacementChanged,
+        recorded_at_unix_ms: i64,
+    ) {
         if let Some(placement) = changed.placement
             && let Some(id) = placement.agent_id.as_ref().map(ToString::to_string)
             && let Some(agent) = self.agents.get_mut(&id)
         {
             agent.worker_id = placement.worker_id.as_ref().map(ToString::to_string);
+            agent.placement_state =
+                PlacementState::try_from(placement.state).unwrap_or(PlacementState::Unspecified);
+            agent.queued_at_unix_ms =
+                (agent.placement_state == PlacementState::Queued).then_some(recorded_at_unix_ms);
         }
     }
 
@@ -391,6 +426,71 @@ mod tests {
         ];
         let state = SessionState::project("s1", &events).expect("project");
         assert_eq!(state.agents["root"].worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(state.agents["root"].placement_state, PlacementState::Placed);
+        assert_eq!(
+            state.agents["root"].queued_at_unix_ms, None,
+            "a placed agent is not waiting, so nothing can expire it"
+        );
+    }
+
+    /// A queued placement stamps *when* from the event's recorded time —
+    /// that stamp is the whole basis of queue-timeout expiry — and any later
+    /// outcome clears it.
+    #[test]
+    fn a_queued_placement_remembers_when_and_a_later_one_forgets() {
+        let queued = |sequence: u64, at_ms: i64| StoredEvent {
+            recorded_at_unix_ms: at_ms,
+            ..stored(
+                sequence,
+                Some("root"),
+                Kind::PlacementChanged(PlacementChanged {
+                    placement: Some(Placement {
+                        agent_id: Some(AgentId::new("root")),
+                        state: PlacementState::Queued as i32,
+                        worker_id: None,
+                        reason: "no worker is connected".to_owned(),
+                    }),
+                }),
+            )
+        };
+
+        let events = vec![
+            stored(1, Some("root"), spawned(None, "o")),
+            queued(2, 1_234),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.agents["root"].placement_state, PlacementState::Queued);
+        assert_eq!(
+            state.agents["root"].queued_at_unix_ms,
+            Some(1_234),
+            "expiry is measured from the queued event's own clock"
+        );
+
+        // A later queued event moves the stamp; it does not accumulate.
+        let requeued = vec![
+            stored(1, Some("root"), spawned(None, "o")),
+            queued(2, 1_234),
+            queued(3, 9_999),
+        ];
+        let state = SessionState::project("s1", &requeued).expect("project");
+        assert_eq!(state.agents["root"].queued_at_unix_ms, Some(9_999));
+    }
+
+    /// The spec survives into the projection whole: re-placing a queued agent
+    /// asks the same question the original spawn did, and a projection that
+    /// dropped the constraints would make the scheduler guess.
+    #[test]
+    fn the_spawn_spec_is_retained_for_re_placement() {
+        let events = vec![stored(1, Some("root"), spawned(None, "orchestrator"))];
+        let state = SessionState::project("s1", &events).expect("project");
+
+        let spec = state.agents["root"].spec.as_ref().expect("the spec");
+        assert_eq!(spec.agent_type, "orchestrator");
+        assert_eq!(
+            state.agents["root"].placement_state,
+            PlacementState::Unspecified,
+            "no placement event has answered this spawn yet"
+        );
     }
 
     #[test]

@@ -17,7 +17,8 @@
 #![allow(dead_code, unreachable_pub)]
 
 use horde_proto::v1::{
-    AgentSpec, CreateSessionRequest, control_plane_service_client::ControlPlaneServiceClient,
+    AgentSpec, CreateSessionRequest, SessionCursor, SessionId, SyncEventsRequest,
+    control_plane_service_client::ControlPlaneServiceClient,
     control_plane_service_server::ControlPlaneServiceServer,
     worker_service_client::WorkerServiceClient, worker_service_server::WorkerServiceServer,
 };
@@ -94,6 +95,30 @@ async fn channel_to(core: ServerCore, control_plane: bool) -> Setup<tonic::trans
         }))
         .await?;
     Ok(channel)
+}
+
+/// Opens a sync stream over one session — the resilience primitive every
+/// suite reads through, kept here so there is exactly one copy of the cursor
+/// arithmetic to get wrong.
+pub async fn open_sync(
+    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
+    session_id: &str,
+    from_sequence: u64,
+    follow: bool,
+) -> Setup<tonic::Streaming<horde_proto::v1::SyncEventsResponse>> {
+    Ok(control
+        .sync_events(SyncEventsRequest {
+            cursors: vec![SessionCursor {
+                session_id: Some(SessionId::new(session_id)),
+                from_sequence,
+            }],
+            all_sessions: false,
+            subtree_root: None,
+            follow,
+            max_batch_events: 0,
+        })
+        .await?
+        .into_inner())
 }
 
 /// Creates a session, returning its id and its root agent's id.
