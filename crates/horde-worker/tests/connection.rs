@@ -239,6 +239,7 @@ mod harness {
                 runtime.adapters(),
                 runtime.workspaces().map(|_| Vec::new()),
             ),
+            identity: None,
         }
     }
 
@@ -249,6 +250,7 @@ mod harness {
             worker_id: worker_id.to_owned(),
             hello: capabilities::hello(worker_id),
             capabilities: capabilities::advertise(std::iter::empty::<&dyn Adapter>(), None),
+            identity: None,
         }
     }
 
@@ -628,4 +630,81 @@ async fn the_proxy_severs_on_cut_and_carries_again_on_heal() {
     Connection::dial(&config)
         .await
         .expect("a healed proxy carries the dial again");
+}
+
+/// The wave-5 dial (DESIGN §3): a worker whose identity came off the
+/// production issuance path dials the secured server over mTLS, and the two
+/// refusal shapes — no certificate, revoked certificate — are first-class
+/// outcomes of the same dial.
+#[tokio::test]
+async fn an_enrolled_worker_dials_mtls_and_the_unenrolled_or_revoked_are_refused() {
+    let secured = horde_server_testkit::secure::serve_secured()
+        .await
+        .expect("a secured server comes up");
+    let identity = secured
+        .enroll(horde_identity::PrincipalRole::Worker, "worker-a")
+        .await
+        .expect("the production issuance path enrolls the worker");
+
+    let config = horde_worker::DialConfig {
+        endpoint: secured.main_endpoint(),
+        worker_id: "worker-a".to_owned(),
+        hello: horde_worker::capabilities::hello("worker-a"),
+        capabilities: horde_worker::capabilities::advertise(
+            std::iter::empty::<&dyn horde_adapter::Adapter>(),
+            None,
+        ),
+        identity: Some(identity.clone()),
+    };
+
+    let (connection, _) = tokio::time::timeout(
+        core::time::Duration::from_secs(15),
+        Connection::dial(&config),
+    )
+    .await
+    .expect("the mTLS dial answers within its ceiling")
+    .expect("an enrolled worker dials and registers");
+    assert_eq!(connection.worker_id(), "worker-a");
+
+    // Refused: same server, no certificate. The dial itself must fail —
+    // there is no state in which an unenrolled worker is half-connected.
+    let mut bare = config.clone();
+    bare.identity = None;
+    let refused =
+        tokio::time::timeout(core::time::Duration::from_secs(15), Connection::dial(&bare))
+            .await
+            .expect("the refusal answers within its ceiling");
+    assert!(
+        refused.is_err(),
+        "a certificate-less dial to the secured listener must fail"
+    );
+
+    // Refused: enrolled, then revoked. The next dial carries a valid chain
+    // and is turned away by the deny-list at the door.
+    let principal =
+        horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "worker-a")
+            .expect("a valid name");
+    let revoked_serials = secured
+        .authority
+        .revoke(
+            &principal,
+            "test revocation",
+            horde_server::service::enrollment::wall_clock_ms(),
+        )
+        .await
+        .expect("the revocation journals");
+    assert!(
+        !revoked_serials.is_empty(),
+        "the worker held a serial to revoke"
+    );
+    let refused = tokio::time::timeout(
+        core::time::Duration::from_secs(15),
+        Connection::dial(&config),
+    )
+    .await
+    .expect("the refusal answers within its ceiling");
+    assert!(
+        refused.is_err(),
+        "a revoked worker must not register, however valid its chain still is"
+    );
 }

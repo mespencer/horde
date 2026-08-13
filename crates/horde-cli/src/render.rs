@@ -303,6 +303,63 @@ pub fn spawned(response: &horde_proto::v1::SpawnAgentResponse, format: Format) -
     }
 }
 
+/// Renders a minted enrollment code (DESIGN §3).
+///
+/// The code line is the artifact the human carries to the joining machine;
+/// everything else is context.
+#[must_use]
+pub fn minted(response: &horde_proto::v1::MintEnrollmentCodeResponse, format: Format) -> String {
+    let expires_at_unix_ms = response.expires_at.as_ref().map_or(0, |at| {
+        at.seconds.saturating_mul(1_000) + i64::from(at.nanos) / 1_000_000
+    });
+    match format {
+        Format::Json => json!({
+            "code": response.code,
+            "server_cert_fingerprint": response.server_cert_fingerprint,
+            "expires_at_unix_ms": expires_at_unix_ms,
+        })
+        .to_string(),
+        Format::Human => format!(
+            "code {}\nexpires-at-unix-ms {expires_at_unix_ms}",
+            response.code
+        ),
+    }
+}
+
+/// Renders a revocation: who, and which serials stopped working.
+#[must_use]
+pub fn revoked(name: &str, serials: &str, format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "revoked": name,
+            "serials": serials.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Format::Human if serials.is_empty() => {
+            // Nothing active is not an error, but saying "revoked" for a
+            // no-op would hide that the name held no certificate at all.
+            format!("{name} held no active certificate")
+        }
+        Format::Human => format!("revoked {name}: {serials}"),
+    }
+}
+
+/// Renders a completed join: who this machine now is, and where that lives.
+#[must_use]
+pub fn joined(principal: &str, directory: &std::path::Path, format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "principal": principal,
+            "identity_dir": directory.display().to_string(),
+        })
+        .to_string(),
+        Format::Human => format!(
+            "enrolled as {principal}; identity in {}",
+            directory.display()
+        ),
+    }
+}
+
 /// Renders an acknowledgement that carries only a log position.
 #[must_use]
 pub fn sequence(verb: &str, sequence: u64, format: Format) -> String {
