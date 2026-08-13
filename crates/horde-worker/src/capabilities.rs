@@ -42,6 +42,10 @@ pub fn advertise<'a>(adapters: impl IntoIterator<Item = &'a dyn Adapter>) -> Wor
         warm_instances: Vec::new(),
         harnesses: adapters.into_iter().map(harness).collect(),
         max_concurrent_agents: 0,
+        // Advertised by the runtime once it is configured with a workspace
+        // root (`Runtime::with_workspaces`); a bare advertisement stays honest
+        // about a worker that would refuse a materialize command.
+        supports_workspaces: false,
     }
 }
 

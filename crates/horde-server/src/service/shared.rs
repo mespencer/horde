@@ -92,6 +92,8 @@ pub fn kind_name(kind: Option<&Kind>) -> &'static str {
         Some(Kind::SessionLifecycleChanged(_)) => "session_lifecycle_changed",
         Some(Kind::PlacementChanged(_)) => "placement_changed",
         Some(Kind::TurnInterrupted(_)) => "turn_interrupted",
+        Some(Kind::WorkspaceDefinitionChanged(_)) => "workspace_definition_changed",
+        Some(Kind::WorkspacePrewarmRequested(_)) => "workspace_prewarm_requested",
         None => "empty",
     }
 }
@@ -272,6 +274,8 @@ mod tests {
             Kind::SessionLifecycleChanged(SessionLifecycleChanged::default()),
             Kind::PlacementChanged(PlacementChanged::default()),
             Kind::TurnInterrupted(TurnInterrupted::default()),
+            Kind::WorkspaceDefinitionChanged(WorkspaceDefinitionChanged::default()),
+            Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested::default()),
         ];
 
         let mut seen = std::collections::BTreeSet::new();

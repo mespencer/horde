@@ -150,6 +150,8 @@ fn kind_name(kind: &Kind) -> &'static str {
         Kind::SessionLifecycleChanged(_) => "session_lifecycle_changed",
         Kind::PlacementChanged(_) => "placement_changed",
         Kind::TurnInterrupted(_) => "turn_interrupted",
+        Kind::WorkspaceDefinitionChanged(_) => "workspace_definition_changed",
+        Kind::WorkspacePrewarmRequested(_) => "workspace_prewarm_requested",
     }
 }
 
@@ -444,7 +446,8 @@ mod tests {
         use horde_proto::v1::{
             AgentLifecycleChanged, AgentSpawned, AssignmentSent, NoteSent, PermissionDecided,
             PermissionRequested, ResultReported, SessionLifecycleChanged, TurnInterrupted,
-            UsageRecorded, WorkspaceInstanceChanged,
+            UsageRecorded, WorkspaceDefinitionChanged, WorkspaceInstanceChanged,
+            WorkspacePrewarmRequested,
         };
 
         let cases: Vec<(Kind, &str)> = vec![
@@ -493,6 +496,14 @@ mod tests {
             (
                 Kind::TurnInterrupted(TurnInterrupted::default()),
                 "turn_interrupted",
+            ),
+            (
+                Kind::WorkspaceDefinitionChanged(WorkspaceDefinitionChanged::default()),
+                "workspace_definition_changed",
+            ),
+            (
+                Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested::default()),
+                "workspace_prewarm_requested",
             ),
         ];
 
