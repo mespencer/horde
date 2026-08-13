@@ -993,6 +993,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-relay"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "horde-server"
 version = "0.1.0"
 dependencies = [
