@@ -15,7 +15,9 @@
 use std::collections::BTreeMap;
 
 use horde_proto::v1::{EventEnvelope, SessionSummary};
-use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 
 use crate::state::{PendingPermission, SessionState};
 
@@ -189,11 +191,14 @@ impl App {
         self.sessions
             .values()
             .flat_map(|session| {
-                session.pending_in_order().into_iter().map(|permission| InboxEntry {
-                    session_id: session.session_id.clone(),
-                    title: session.title.clone(),
-                    permission: permission.clone(),
-                })
+                session
+                    .pending_in_order()
+                    .into_iter()
+                    .map(|permission| InboxEntry {
+                        session_id: session.session_id.clone(),
+                        title: session.title.clone(),
+                        permission: permission.clone(),
+                    })
             })
             .collect()
     }
@@ -344,7 +349,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.inbox_selected = step_forward(self.inbox_selected, entries.len());
             }
-            KeyCode::Char('y') => return answer(selected_entry(&entries, self.inbox_selected), true),
+            KeyCode::Char('y') => {
+                return answer(selected_entry(&entries, self.inbox_selected), true);
+            }
             KeyCode::Char('n') => {
                 return answer(selected_entry(&entries, self.inbox_selected), false);
             }
@@ -456,7 +463,11 @@ impl App {
 ///
 /// Session-root attachment (`agent_id: None`) sees everything in the session;
 /// agent attachment sees the agent's subtree only.
-fn in_scope(session: &SessionState, attachment: &Attachment, permission: &PendingPermission) -> bool {
+fn in_scope(
+    session: &SessionState,
+    attachment: &Attachment,
+    permission: &PendingPermission,
+) -> bool {
     match attachment.agent_id.as_ref() {
         None => true,
         Some(root) => session.in_subtree(root, &permission.agent_id),
@@ -507,4 +518,433 @@ fn has_control(key: &KeyEvent) -> bool {
 /// escape hatch that must never be captured as text.
 fn is_quit_combo(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && has_control(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use horde_proto::v1::{
+        AgentId, AgentSpawned, Event, EventEnvelope, PermissionRequest, PermissionRequestId,
+        PermissionRequested, SessionId, SessionSummary, event::Kind,
+    };
+    use ratatui::crossterm::event::{
+        Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    };
+
+    use super::{App, Directive, Screen, Update};
+
+    fn key(code: KeyCode) -> TermEvent {
+        TermEvent::Key(KeyEvent::from(code))
+    }
+
+    fn ctrl(c: char) -> TermEvent {
+        TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn chars(app: &mut App, text: &str) -> Vec<Directive> {
+        text.chars()
+            .flat_map(|c| app.on_input(&key(KeyCode::Char(c))))
+            .collect()
+    }
+
+    fn summary(session_id: &str, title: &str, root: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: Some(SessionId::new(session_id)),
+            title: title.to_owned(),
+            root_agent_id: Some(AgentId::new(root)),
+            ..SessionSummary::default()
+        }
+    }
+
+    fn event_in(session_id: &str, sequence: u64, agent: &str, kind: Kind) -> Update {
+        Update::Event(Box::new(EventEnvelope {
+            session_id: Some(SessionId::new(session_id)),
+            sequence,
+            recorded_at: None,
+            event: Some(Event {
+                agent_id: Some(AgentId::new(agent)),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(kind),
+            }),
+        }))
+    }
+
+    fn spawn_kind(parent: Option<&str>) -> Kind {
+        Kind::AgentSpawned(AgentSpawned {
+            parent_agent_id: parent.map(AgentId::new),
+            spawned_by: None,
+            spec: None,
+            tree_path: Vec::new(),
+        })
+    }
+
+    fn request_kind(request_id: &str) -> Kind {
+        Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                ..PermissionRequest::default()
+            }),
+        })
+    }
+
+    /// An app watching two sessions, the second holding one escalation.
+    fn two_sessions() -> App {
+        let mut app = App::overview();
+        app.apply(Update::Sessions(vec![
+            summary("s1", "ci-fix", "root-1"),
+            summary("s2", "docs", "root-2"),
+        ]));
+        app.apply(event_in("s2", 1, "root-2", request_kind("req-1")));
+        app
+    }
+
+    #[test]
+    fn navigation_moves_between_screens_without_crossing_the_wire() {
+        let mut app = App::overview();
+        assert_eq!(app.screen(), Screen::Overview);
+
+        assert!(app.on_input(&key(KeyCode::Char('i'))).is_empty());
+        assert_eq!(app.screen(), Screen::Inbox);
+
+        assert!(app.on_input(&key(KeyCode::Char('o'))).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+
+        assert!(app.on_input(&key(KeyCode::Char('q'))).is_empty());
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_screen_even_mid_compose() {
+        for setup in [
+            App::overview,
+            || {
+                let mut app = App::overview();
+                app.on_input(&key(KeyCode::Char('i')));
+                app
+            },
+            || {
+                let mut app = App::attached("s1", None);
+                app.on_input(&key(KeyCode::Char('h')));
+                app
+            },
+        ] {
+            let mut app = setup();
+            app.on_input(&ctrl('c'));
+            assert!(app.should_quit());
+        }
+    }
+
+    /// Acting on key releases too would double every keystroke on terminals
+    /// that report them.
+    #[test]
+    fn a_key_release_is_ignored() {
+        let mut app = App::overview();
+        let release = TermEvent::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+        assert!(app.on_input(&release).is_empty());
+        assert!(!app.should_quit(), "a release must not act");
+    }
+
+    #[test]
+    fn refresh_is_asked_for_rather_than_performed() {
+        let mut app = App::overview();
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('r'))),
+            vec![Directive::RefreshSessions]
+        );
+    }
+
+    #[test]
+    fn overview_selection_clamps_at_both_ends() {
+        let mut app = two_sessions();
+        assert_eq!(app.overview_selected(), 0);
+        app.on_input(&key(KeyCode::Up));
+        assert_eq!(app.overview_selected(), 0, "the top is the top");
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.overview_selected(), 1);
+        app.on_input(&key(KeyCode::Char('j')));
+        assert_eq!(app.overview_selected(), 1, "the bottom is the bottom");
+        app.on_input(&key(KeyCode::Char('k')));
+        assert_eq!(app.overview_selected(), 0);
+    }
+
+    #[test]
+    fn enter_attaches_to_the_selected_session_at_its_root() {
+        let mut app = two_sessions();
+        app.on_input(&key(KeyCode::Down));
+        app.on_input(&key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::Session);
+        let attachment = app.attachment().expect("attached");
+        assert_eq!(attachment.session_id, "s2");
+        assert_eq!(attachment.agent_id, None, "overview attach is session-root");
+    }
+
+    #[test]
+    fn enter_on_an_empty_overview_stays_put() {
+        let mut app = App::overview();
+        app.on_input(&key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::Overview);
+        assert!(app.attachment().is_none());
+    }
+
+    #[test]
+    fn a_summary_without_an_id_is_not_folded_in() {
+        let mut app = App::overview();
+        app.apply(Update::Sessions(vec![SessionSummary::default()]));
+        assert!(app.sessions_in_order().is_empty());
+    }
+
+    #[test]
+    fn caught_up_marks_the_session_and_never_rewinds_its_head() {
+        let mut app = App::attached("s1", None);
+        app.apply(event_in("s1", 9, "root-1", spawn_kind(None)));
+        app.apply(Update::CaughtUp {
+            session_id: "s1".to_owned(),
+            head: 4,
+        });
+        let session = app.session("s1").expect("attached session exists");
+        assert!(session.caught_up);
+        assert_eq!(session.head, 9);
+    }
+
+    #[test]
+    fn typing_composes_and_enter_sends_to_the_session_root() {
+        let mut app = App::attached("s1", None);
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+
+        assert!(chars(&mut app, "fix it").is_empty());
+        assert_eq!(app.input(), "fix it");
+
+        app.on_input(&key(KeyCode::Backspace));
+        assert_eq!(app.input(), "fix i");
+
+        assert_eq!(
+            app.on_input(&key(KeyCode::Enter)),
+            vec![Directive::SendAssignment {
+                agent_id: "root-1".to_owned(),
+                text: "fix i".to_owned(),
+            }]
+        );
+        assert_eq!(app.input(), "", "a sent line leaves the compose box empty");
+    }
+
+    #[test]
+    fn enter_with_nothing_typed_sends_nothing() {
+        let mut app = App::attached("s1", None);
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        assert!(app.on_input(&key(KeyCode::Enter)).is_empty());
+    }
+
+    #[test]
+    fn a_send_with_no_known_root_is_refused_with_a_status_line() {
+        let mut app = App::attached("s1", None);
+        chars(&mut app, "hello");
+        assert!(app.on_input(&key(KeyCode::Enter)).is_empty());
+        assert!(
+            app.status().contains("no root agent"),
+            "the refusal must say why: {:?}",
+            app.status()
+        );
+    }
+
+    #[test]
+    fn attachment_to_an_agent_steers_that_agent_not_the_root() {
+        let mut app = App::attached("s1", Some("child-1".to_owned()));
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        chars(&mut app, "go");
+        assert_eq!(
+            app.on_input(&key(KeyCode::Enter)),
+            vec![Directive::SendAssignment {
+                agent_id: "child-1".to_owned(),
+                text: "go".to_owned(),
+            }]
+        );
+        assert_eq!(
+            app.on_input(&ctrl('x')),
+            vec![Directive::Interrupt {
+                agent_id: "child-1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_x_interrupts_without_disturbing_the_compose_line() {
+        let mut app = App::attached("s1", None);
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        chars(&mut app, "dra");
+        assert_eq!(
+            app.on_input(&ctrl('x')),
+            vec![Directive::Interrupt {
+                agent_id: "root-1".to_owned(),
+            }]
+        );
+        assert_eq!(app.input(), "dra", "an interrupt is not a send");
+    }
+
+    #[test]
+    fn escape_clears_the_compose_line_before_it_detaches() {
+        let mut app = App::attached("s1", None);
+        chars(&mut app, "oops");
+        app.on_input(&key(KeyCode::Esc));
+        assert_eq!(app.input(), "");
+        assert_eq!(app.screen(), Screen::Session, "typed text costs one escape");
+
+        app.on_input(&key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Overview);
+        assert!(app.attachment().is_none());
+    }
+
+    #[test]
+    fn y_and_n_answer_the_frontmost_prompt_only_when_composing_nothing() {
+        let mut app = App::attached("s2", None);
+        app.apply(event_in("s2", 1, "root-2", request_kind("req-1")));
+        app.apply(event_in("s2", 2, "root-2", request_kind("req-2")));
+
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('y'))),
+            vec![Directive::Approve {
+                request_id: "req-1".to_owned(),
+            }],
+            "the frontmost prompt is the oldest"
+        );
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('n'))),
+            vec![Directive::Deny {
+                request_id: "req-1".to_owned(),
+            }],
+            "pending stays until the decision event arrives"
+        );
+
+        chars(&mut app, "sa");
+        assert!(
+            app.on_input(&key(KeyCode::Char('y'))).is_empty(),
+            "mid-compose, y is a letter"
+        );
+        assert_eq!(app.input(), "say");
+    }
+
+    #[test]
+    fn with_nothing_pending_y_and_n_are_ordinary_letters() {
+        let mut app = App::attached("s1", None);
+        app.on_input(&key(KeyCode::Char('y')));
+        app.on_input(&key(KeyCode::Char('n')));
+        assert_eq!(app.input(), "yn");
+    }
+
+    #[test]
+    fn scroll_walks_back_through_the_feed_and_clamps() {
+        let mut app = App::attached("s1", None);
+        for sequence in 1..=3 {
+            app.apply(event_in("s1", sequence, "root-1", spawn_kind(None)));
+        }
+        assert_eq!(app.scroll(), 0);
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.scroll(), 0, "the tail is the floor");
+        for _ in 0..5 {
+            app.on_input(&key(KeyCode::Up));
+        }
+        assert_eq!(app.scroll(), 2, "the first line is the ceiling");
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.scroll(), 1);
+    }
+
+    #[test]
+    fn the_inbox_lists_every_session_and_answers_the_selected_row() {
+        let mut app = two_sessions();
+        app.apply(event_in("s1", 2, "root-1", request_kind("req-0")));
+        app.on_input(&key(KeyCode::Char('i')));
+
+        let entries = app.inbox_entries();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.session_id.as_str(),
+                    entry.permission.request_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("s1", "req-0"), ("s2", "req-1")],
+            "session order then arrival order"
+        );
+        assert_eq!(entries[0].title, "ci-fix");
+
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('y'))),
+            vec![Directive::Approve {
+                request_id: "req-0".to_owned(),
+            }]
+        );
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('n'))),
+            vec![Directive::Deny {
+                request_id: "req-1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_inbox_attaches_to_the_selected_escalations_session() {
+        let mut app = two_sessions();
+        app.on_input(&key(KeyCode::Char('i')));
+        app.on_input(&key(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::Session);
+        assert_eq!(
+            app.attachment()
+                .map(|attachment| attachment.session_id.as_str()),
+            Some("s2"),
+            "the only escalation lives in s2"
+        );
+    }
+
+    #[test]
+    fn an_empty_inbox_answers_nothing() {
+        let mut app = App::overview();
+        app.on_input(&key(KeyCode::Char('i')));
+        assert!(app.on_input(&key(KeyCode::Char('y'))).is_empty());
+        assert!(app.on_input(&key(KeyCode::Enter)).is_empty());
+    }
+
+    #[test]
+    fn escalations_scope_to_the_attached_subtree() {
+        let mut app = App::attached("s1", Some("child-1".to_owned()));
+        app.apply(event_in("s1", 1, "root-1", spawn_kind(None)));
+        app.apply(event_in("s1", 2, "child-1", spawn_kind(Some("root-1"))));
+        app.apply(event_in("s1", 3, "child-2", spawn_kind(Some("root-1"))));
+        app.apply(event_in("s1", 4, "child-1", request_kind("req-mine")));
+        app.apply(event_in("s1", 5, "child-2", request_kind("req-elsewhere")));
+
+        assert_eq!(
+            app.scoped_pending()
+                .iter()
+                .map(|permission| permission.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-mine"],
+            "a sibling's prompt must not bubble into this scope"
+        );
+        assert_eq!(app.waiting_elsewhere(), 1);
+        assert_eq!(app.waiting_total(), 2);
+    }
+
+    #[test]
+    fn session_root_attachment_sees_the_whole_session() {
+        let mut app = App::attached("s1", None);
+        app.apply(event_in("s1", 1, "root-1", spawn_kind(None)));
+        app.apply(event_in("s1", 2, "child-1", spawn_kind(Some("root-1"))));
+        app.apply(event_in("s1", 3, "child-1", request_kind("req-1")));
+
+        assert_eq!(app.scoped_pending().len(), 1);
+        assert_eq!(app.waiting_elsewhere(), 0);
+    }
+
+    #[test]
+    fn a_reported_error_lands_in_the_status_line() {
+        let mut app = App::overview();
+        app.report_error("the server said no");
+        assert_eq!(app.status(), "the server said no");
+    }
 }

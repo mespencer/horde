@@ -1,0 +1,28 @@
+---
+source: crates/horde-tui/tests/render.rs
+expression: drawn(&app)
+---
+" s1  ci-fix  attached: session root                                             "
+"    1  spawned     root-1         ci-fix                                        "
+"    2  assign      root-1         make the tests green                          "
+"    3  assistant   root-1         Looking at the failures now.                  "
+"    4  spawned     reviewer-1     ci-fix > reviewer                             "
+"    5  spawned     test-runner-1  ci-fix > reviewer > test-runner               "
+"    6  needs you   test-runner-1  docker rm horde-test                          "
+"    7  result      reviewer-1     success: review posted                        "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" needs you: ci-fix > reviewer > test-runner wants `docker rm horde-test`  (mode "
+"> also check clippy                                                             "
+"[y] allow  [n] deny  [enter] send  [ctrl-x] interrupt  [esc] detach  [ctrl-c] qu"

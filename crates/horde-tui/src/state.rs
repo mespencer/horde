@@ -192,7 +192,11 @@ impl SessionState {
             if current == root {
                 return true;
             }
-            match self.agents.get(&current).and_then(|node| node.parent.clone()) {
+            match self
+                .agents
+                .get(&current)
+                .and_then(|node| node.parent.clone())
+            {
                 Some(parent) => current = parent,
                 None => return false,
             }
@@ -253,9 +257,12 @@ fn describe(kind: Option<&Kind>) -> (&'static str, String) {
         ),
         Some(Kind::PermissionDecided(decided)) => (
             "decided",
-            decided.decision.as_ref().map_or_else(String::new, |decision| {
-                joined(permission_outcome_name(decision.outcome), &decision.reason)
-            }),
+            decided
+                .decision
+                .as_ref()
+                .map_or_else(String::new, |decision| {
+                    joined(permission_outcome_name(decision.outcome), &decision.reason)
+                }),
         ),
         Some(Kind::UsageRecorded(_)) => ("usage", String::new()),
         Some(Kind::WorkspaceInstanceChanged(changed)) => (
@@ -275,9 +282,12 @@ fn describe(kind: Option<&Kind>) -> (&'static str, String) {
         ),
         Some(Kind::PlacementChanged(changed)) => (
             "placement",
-            changed.placement.as_ref().map_or_else(String::new, |placement| {
-                joined(placement_state_name(placement.state), &placement.reason)
-            }),
+            changed
+                .placement
+                .as_ref()
+                .map_or_else(String::new, |placement| {
+                    joined(placement_state_name(placement.state), &placement.reason)
+                }),
         ),
         Some(Kind::TurnInterrupted(interrupted)) => ("interrupt", interrupted.reason.clone()),
         None => ("unknown", String::new()),
@@ -350,5 +360,493 @@ fn placement_state_name(state: i32) -> &'static str {
         Ok(PlacementState::Expired) => "expired",
         Ok(PlacementState::Cancelled) => "cancelled",
         _ => "unspecified",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use horde_proto::v1::{
+        AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
+        AgentResult, AgentSpawned, Assignment, AssignmentSent, Event, EventEnvelope, Note,
+        NoteSent, PermissionDecided, PermissionDecision, PermissionOutcome, PermissionRequest,
+        PermissionRequestId, PermissionRequested, Placement, PlacementChanged, PlacementState,
+        ProposedToolCall, ResultReported, ResultStatus, SessionId, SessionLifecycleChanged,
+        SessionLifecycleState, SessionSummary, TurnInterrupted, UsageRecorded,
+        WorkspaceInstanceChanged, WorkspaceInstanceReport, event::Kind,
+    };
+
+    use super::{AgentNode, SessionState};
+
+    /// One event at a log position, about one agent.
+    fn envelope(sequence: u64, agent: &str, kind: Kind) -> EventEnvelope {
+        EventEnvelope {
+            session_id: Some(SessionId::new("s1")),
+            sequence,
+            recorded_at: None,
+            event: Some(Event {
+                agent_id: (!agent.is_empty()).then(|| AgentId::new(agent)),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(kind),
+            }),
+        }
+    }
+
+    fn spawned(parent: Option<&str>, tree_path: &[&str]) -> Kind {
+        Kind::AgentSpawned(AgentSpawned {
+            parent_agent_id: parent.map(AgentId::new),
+            spawned_by: None,
+            spec: None,
+            tree_path: tree_path.iter().map(ToString::to_string).collect(),
+        })
+    }
+
+    fn requested(request_id: &str, rendered: &str) -> Kind {
+        Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                agent_id: None,
+                tool_call: Some(ProposedToolCall {
+                    tool_name: String::new(),
+                    input: None,
+                    rendered: rendered.to_owned(),
+                }),
+                tree_path: vec!["ci-fix".to_owned(), "reviewer".to_owned()],
+                permission_mode: "manual".to_owned(),
+                escalated_from: 0,
+                expires_at: None,
+            }),
+        })
+    }
+
+    fn decided(request_id: &str, outcome: PermissionOutcome, reason: &str) -> Kind {
+        Kind::PermissionDecided(PermissionDecided {
+            decision: Some(PermissionDecision {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                outcome: outcome as i32,
+                decided_by: 0,
+                decided_by_actor: None,
+                reason: reason.to_owned(),
+                remember_for_session: false,
+                updated_input: None,
+            }),
+        })
+    }
+
+    #[test]
+    fn every_event_kind_renders_a_feed_line_with_its_text() {
+        let cases: Vec<(Kind, &str, &str)> = vec![
+            (
+                Kind::AgentOutputChunk(AgentOutputChunk {
+                    channel: AgentOutputChannel::Assistant as i32,
+                    text: "hello there".to_owned(),
+                    turn_id: String::new(),
+                    chunk_index: 0,
+                }),
+                "assistant",
+                "hello there",
+            ),
+            (
+                spawned(None, &["ci-fix", "reviewer"]),
+                "spawned",
+                "ci-fix > reviewer",
+            ),
+            (
+                Kind::AssignmentSent(AssignmentSent {
+                    from: None,
+                    assignment: Some(Assignment {
+                        assignment_id: None,
+                        text: "fix the build".to_owned(),
+                        payload: None,
+                    }),
+                    delivery: 0,
+                }),
+                "assign",
+                "fix the build",
+            ),
+            (
+                Kind::NoteSent(NoteSent {
+                    from: None,
+                    note: Some(Note {
+                        text: "fyi".to_owned(),
+                        payload: None,
+                    }),
+                    delivery: 0,
+                }),
+                "note",
+                "fyi",
+            ),
+            (
+                Kind::ResultReported(ResultReported {
+                    result: Some(AgentResult {
+                        assignment_id: None,
+                        status: ResultStatus::Partial as i32,
+                        summary: "half done".to_owned(),
+                        payload: None,
+                    }),
+                }),
+                "result",
+                "partial: half done",
+            ),
+            (
+                requested("req-1", "docker rm x"),
+                "needs you",
+                "docker rm x",
+            ),
+            (
+                decided("req-1", PermissionOutcome::Deny, "too risky"),
+                "decided",
+                "denied: too risky",
+            ),
+            (Kind::UsageRecorded(UsageRecorded::default()), "usage", ""),
+            (
+                Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged {
+                    report: Some(WorkspaceInstanceReport {
+                        detail: "disk is gone".to_owned(),
+                        ..WorkspaceInstanceReport::default()
+                    }),
+                    progress: None,
+                }),
+                "workspace",
+                "disk is gone",
+            ),
+            (
+                Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                    previous_state: 0,
+                    state: AgentLifecycleState::Idle as i32,
+                    reason: "result reported".to_owned(),
+                }),
+                "lifecycle",
+                "idle: result reported",
+            ),
+            (
+                Kind::SessionLifecycleChanged(SessionLifecycleChanged {
+                    previous_state: 0,
+                    state: SessionLifecycleState::Archived as i32,
+                    reason: String::new(),
+                }),
+                "session",
+                "archived",
+            ),
+            (
+                Kind::PlacementChanged(PlacementChanged {
+                    placement: Some(Placement {
+                        agent_id: None,
+                        state: PlacementState::Queued as i32,
+                        worker_id: None,
+                        reason: "no worker".to_owned(),
+                    }),
+                }),
+                "placement",
+                "queued: no worker",
+            ),
+            (
+                Kind::TurnInterrupted(TurnInterrupted {
+                    requested_by: None,
+                    turn_id: String::new(),
+                    reason: "changed my mind".to_owned(),
+                }),
+                "interrupt",
+                "changed my mind",
+            ),
+        ];
+
+        for (kind, label, text) in cases {
+            let mut state = SessionState::new("s1");
+            state.apply(&envelope(3, "agent-1", kind));
+            let line = state.feed.last().expect("a feed line per event");
+            assert_eq!(line.label, label);
+            assert_eq!(line.text, text, "for label {label}");
+            assert_eq!(line.sequence, 3);
+            assert_eq!(line.agent_id, "agent-1");
+        }
+    }
+
+    /// A message whose body failed to arrive renders empty rather than
+    /// panicking or inventing text.
+    #[test]
+    fn bodyless_messages_render_as_empty_text() {
+        for (kind, label) in [
+            (Kind::AssignmentSent(AssignmentSent::default()), "assign"),
+            (Kind::NoteSent(NoteSent::default()), "note"),
+            (Kind::ResultReported(ResultReported::default()), "result"),
+            (
+                Kind::PermissionRequested(PermissionRequested::default()),
+                "needs you",
+            ),
+            (
+                Kind::PermissionDecided(PermissionDecided::default()),
+                "decided",
+            ),
+            (
+                Kind::PlacementChanged(PlacementChanged::default()),
+                "placement",
+            ),
+            (
+                Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged::default()),
+                "workspace",
+            ),
+        ] {
+            let mut state = SessionState::new("s1");
+            state.apply(&envelope(1, "", kind));
+            let line = state.feed.last().expect("a feed line");
+            assert_eq!(line.label, label);
+            assert_eq!(line.text, "");
+        }
+    }
+
+    /// An event with no body is still a position in the log; hiding it would
+    /// make the feed's sequence column look gapped.
+    #[test]
+    fn an_event_with_no_body_still_takes_its_position() {
+        let mut state = SessionState::new("s1");
+        state.apply(&EventEnvelope {
+            session_id: Some(SessionId::new("s1")),
+            sequence: 9,
+            recorded_at: None,
+            event: None,
+        });
+        assert_eq!(state.head, 9);
+        let line = state.feed.last().expect("a line for the position");
+        assert_eq!((line.label, line.sequence), ("unknown", 9));
+    }
+
+    #[test]
+    fn the_head_never_rewinds() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(
+            7,
+            "a",
+            Kind::UsageRecorded(UsageRecorded::default()),
+        ));
+        state.apply(&envelope(
+            3,
+            "a",
+            Kind::UsageRecorded(UsageRecorded::default()),
+        ));
+        assert_eq!(
+            state.head, 7,
+            "an out-of-order replay must not rewind the head"
+        );
+    }
+
+    #[test]
+    fn a_summary_fills_in_what_the_stream_has_not_said_yet() {
+        let mut state = SessionState::new("s1");
+        state.head = 40;
+        state.absorb_summary(&SessionSummary {
+            session_id: Some(SessionId::new("s1")),
+            title: "ci-fix".to_owned(),
+            root_agent_id: Some(AgentId::new("root-1")),
+            workspace_definition_id: None,
+            state: SessionLifecycleState::Active as i32,
+            created_at: None,
+            head_sequence: 12,
+            agent_count: 1,
+        });
+        assert_eq!(state.title, "ci-fix");
+        assert_eq!(state.lifecycle, "active");
+        assert_eq!(state.root_agent_id.as_deref(), Some("root-1"));
+        assert_eq!(
+            state.head, 40,
+            "a stale summary must not rewind a live head"
+        );
+    }
+
+    #[test]
+    fn the_first_parentless_spawn_is_the_root() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(1, "root-1", spawned(None, &["ci-fix"])));
+        state.apply(&envelope(
+            2,
+            "child-1",
+            spawned(Some("root-1"), &["ci-fix", "reviewer"]),
+        ));
+        assert_eq!(state.root_agent_id.as_deref(), Some("root-1"));
+        assert_eq!(state.agents.len(), 2);
+        assert_eq!(
+            state
+                .agents
+                .get("child-1")
+                .and_then(|node| node.parent.as_deref()),
+            Some("root-1")
+        );
+    }
+
+    #[test]
+    fn a_request_waits_until_its_decision_arrives() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(1, "agent-1", requested("req-1", "docker rm x")));
+        state.apply(&envelope(2, "agent-1", requested("req-2", "rm -rf /tmp/x")));
+        assert_eq!(
+            state
+                .pending_in_order()
+                .iter()
+                .map(|permission| permission.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-1", "req-2"],
+            "oldest first: the inbox answers in arrival order"
+        );
+        let front = state.pending.get("req-1").expect("req-1 pends");
+        assert_eq!(front.rendered, "docker rm x");
+        assert_eq!(front.mode, "manual");
+        assert_eq!(front.tree_path, vec!["ci-fix", "reviewer"]);
+        assert_eq!(front.agent_id, "agent-1");
+        assert_eq!(front.sequence, 1);
+
+        state.apply(&envelope(
+            3,
+            "agent-1",
+            decided("req-1", PermissionOutcome::Allow, ""),
+        ));
+        assert_eq!(
+            state
+                .pending_in_order()
+                .iter()
+                .map(|permission| permission.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-2"],
+            "a decision retires exactly the request it names"
+        );
+    }
+
+    #[test]
+    fn an_archive_event_flips_the_lifecycle() {
+        let mut state = SessionState::new("s1");
+        state.absorb_summary(&SessionSummary {
+            state: SessionLifecycleState::Active as i32,
+            ..SessionSummary::default()
+        });
+        assert_eq!(state.lifecycle, "active");
+        state.apply(&envelope(
+            5,
+            "",
+            Kind::SessionLifecycleChanged(SessionLifecycleChanged {
+                previous_state: SessionLifecycleState::Active as i32,
+                state: SessionLifecycleState::Archived as i32,
+                reason: "done".to_owned(),
+            }),
+        ));
+        assert_eq!(state.lifecycle, "archived");
+    }
+
+    #[test]
+    fn subtree_membership_follows_parent_links_and_nothing_else() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(1, "root-1", spawned(None, &["ci-fix"])));
+        state.apply(&envelope(2, "child-1", spawned(Some("root-1"), &[])));
+        state.apply(&envelope(3, "grandchild-1", spawned(Some("child-1"), &[])));
+        state.apply(&envelope(4, "child-2", spawned(Some("root-1"), &[])));
+
+        assert!(
+            state.in_subtree("child-1", "child-1"),
+            "a subtree contains its root"
+        );
+        assert!(state.in_subtree("child-1", "grandchild-1"));
+        assert!(state.in_subtree("root-1", "child-2"));
+        assert!(
+            !state.in_subtree("child-1", "child-2"),
+            "a sibling is not a descendant"
+        );
+        assert!(
+            !state.in_subtree("child-1", "root-1"),
+            "membership goes down the tree, never up"
+        );
+        assert!(
+            !state.in_subtree("child-1", "agent-nobody-spawned"),
+            "an agent with no spawn record must not be claimed by any scope"
+        );
+    }
+
+    /// A malformed parent chain must terminate the walk rather than hang it —
+    /// the counted ceiling, exercised.
+    #[test]
+    fn a_parent_cycle_cannot_hang_the_membership_walk() {
+        let mut state = SessionState::new("s1");
+        state.agents.insert(
+            "a".to_owned(),
+            AgentNode {
+                parent: Some("b".to_owned()),
+                tree_path: Vec::new(),
+            },
+        );
+        state.agents.insert(
+            "b".to_owned(),
+            AgentNode {
+                parent: Some("a".to_owned()),
+                tree_path: Vec::new(),
+            },
+        );
+        assert!(!state.in_subtree("root-1", "a"));
+    }
+
+    #[test]
+    fn every_channel_and_state_name_is_pinned() {
+        for (channel, expected) in [
+            (AgentOutputChannel::Assistant as i32, "assistant"),
+            (AgentOutputChannel::Reasoning as i32, "reasoning"),
+            (AgentOutputChannel::ToolCall as i32, "tool call"),
+            (AgentOutputChannel::ToolResult as i32, "tool result"),
+            (AgentOutputChannel::HarnessDiagnostic as i32, "harness"),
+            (887, "output"),
+        ] {
+            assert_eq!(super::channel_name(channel), expected);
+        }
+        for (status, expected) in [
+            (ResultStatus::Success as i32, "success"),
+            (ResultStatus::Partial as i32, "partial"),
+            (ResultStatus::Blocked as i32, "blocked"),
+            (887, "unspecified"),
+        ] {
+            assert_eq!(super::result_status_name(status), expected);
+        }
+        for (outcome, expected) in [
+            (PermissionOutcome::Allow as i32, "allowed"),
+            (PermissionOutcome::Deny as i32, "denied"),
+            (887, "unspecified"),
+        ] {
+            assert_eq!(super::permission_outcome_name(outcome), expected);
+        }
+        for (state, expected) in [
+            (AgentLifecycleState::Queued as i32, "queued"),
+            (AgentLifecycleState::Starting as i32, "starting"),
+            (AgentLifecycleState::Running as i32, "running"),
+            (
+                AgentLifecycleState::WaitingOnChild as i32,
+                "waiting on child",
+            ),
+            (
+                AgentLifecycleState::WaitingOnHuman as i32,
+                "waiting on human",
+            ),
+            (AgentLifecycleState::Idle as i32, "idle"),
+            (AgentLifecycleState::Archived as i32, "archived"),
+            (AgentLifecycleState::Failed as i32, "failed"),
+            (887, "unspecified"),
+        ] {
+            assert_eq!(super::agent_lifecycle_name(state), expected);
+        }
+        for (state, expected) in [
+            (SessionLifecycleState::Active as i32, "active"),
+            (SessionLifecycleState::Archived as i32, "archived"),
+            (887, "unspecified"),
+        ] {
+            assert_eq!(super::session_lifecycle_name(state), expected);
+        }
+        for (state, expected) in [
+            (PlacementState::Placed as i32, "placed"),
+            (PlacementState::Queued as i32, "queued"),
+            (PlacementState::Expired as i32, "expired"),
+            (PlacementState::Cancelled as i32, "cancelled"),
+            (887, "unspecified"),
+        ] {
+            assert_eq!(super::placement_state_name(state), expected);
+        }
+    }
+
+    #[test]
+    fn a_reason_joins_its_state_only_when_there_is_one() {
+        assert_eq!(super::joined("idle", ""), "idle");
+        assert_eq!(super::joined("idle", "reaped"), "idle: reaped");
     }
 }

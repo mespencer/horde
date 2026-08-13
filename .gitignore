@@ -10,3 +10,7 @@
 # so the debris of a hand-run comes in pairs.
 /mutants.out.old/
 **/mutants.out.old/
+# insta writes pending snapshots beside the committed ones; only the
+# accepted .snap files belong in the tree.
+*.snap.new
+*.pending-snap
