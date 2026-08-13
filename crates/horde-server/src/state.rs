@@ -384,13 +384,14 @@ mod tests {
         })
     }
 
+    /// [`spawned`], with ancestry display names — the field the title fold
+    /// reads.
     fn spawned_named(parent: Option<&str>, tree_path: &[&str]) -> Kind {
-        Kind::AgentSpawned(AgentSpawned {
-            parent_agent_id: parent.map(AgentId::new),
-            spawned_by: None,
-            spec: None,
-            tree_path: tree_path.iter().map(ToString::to_string).collect(),
-        })
+        let mut kind = spawned(parent, "");
+        if let Kind::AgentSpawned(inner) = &mut kind {
+            inner.tree_path = tree_path.iter().map(ToString::to_string).collect();
+        }
+        kind
     }
 
     /// The root spawn's first tree-path element names the session; a child's

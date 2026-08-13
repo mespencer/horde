@@ -26,23 +26,21 @@ mod suite {
     const CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
     async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-        let Ok(value) = tokio::time::timeout(CEILING, future).await else {
-            panic!("{what} did not finish within {CEILING:?}");
-        };
-        value
+        match tokio::time::timeout(CEILING, future).await {
+            Ok(value) => value,
+            Err(elapsed) => panic!("{what} stalled: {elapsed} past {CEILING:?}"),
+        }
     }
 
     /// The test's own git, for arranging repos and inspecting results —
     /// production git runs live inside `horde-relay`.
     async fn git(dir: &Path, args: &[&str]) -> String {
-        let output = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.email=a@t", "-c", "user.name=a"])
-            .args(args)
-            .output()
-            .await
-            .expect("git spawns");
+        let mut command = tokio::process::Command::new("git");
+        command.current_dir(dir);
+        for pin in ["user.email=a@t", "user.name=a"] {
+            command.arg("-c").arg(pin);
+        }
+        let output = command.args(args).output().await.expect("git spawns");
         assert!(
             output.status.success(),
             "git {args:?} in {}: {}",
@@ -120,19 +118,33 @@ mod suite {
     }
 
     fn definition(origin: &Path) -> horde_proto::v1::WorkspaceDefinition {
-        horde_proto::v1::WorkspaceDefinition {
+        let mut definition = horde_proto::v1::WorkspaceDefinition {
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
             name: "atlas-workspace".to_owned(),
-            repos: vec![horde_proto::v1::WorkspaceRepo {
-                name: "atlas".to_owned(),
-                remote_url: origin.display().to_string(),
-                default_branch: "main".to_owned(),
-                layout_path: String::new(),
-            }],
-            unmanaged_paths: Vec::new(),
-            created_at: None,
             etag: "1".to_owned(),
-        }
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        };
+        definition.repos.push(horde_proto::v1::WorkspaceRepo {
+            name: "atlas".to_owned(),
+            remote_url: origin.display().to_string(),
+            default_branch: "main".to_owned(),
+            layout_path: String::new(),
+        });
+        definition
+    }
+
+    /// A fresh origin under `scratch` with one seed commit — what the two
+    /// Workers' mirrors and clones all descend from.
+    async fn seeded_origin(scratch: &Path) -> PathBuf {
+        let origin = scratch.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        within("origin init", git(&origin, &["init", "-q", "-b", "main"])).await;
+        within(
+            "seed commit",
+            git(&origin, &["commit", "-qm", "seed", "--allow-empty"]),
+        )
+        .await;
+        origin
     }
 
     fn command(sequence: u64, command: Command) -> StreamCommandsResponse {
@@ -252,14 +264,7 @@ mod suite {
     #[tokio::test]
     async fn a_result_stamped_on_one_worker_is_obtainable_on_another() {
         let scratch = tempfile::tempdir().expect("a scratch dir");
-        let origin = scratch.path().join("origin");
-        std::fs::create_dir_all(&origin).expect("mkdir");
-        within("origin init", git(&origin, &["init", "-q", "-b", "main"])).await;
-        within(
-            "seed commit",
-            git(&origin, &["commit", "-qm", "seed", "--allow-empty"]),
-        )
-        .await;
+        let origin = seeded_origin(scratch.path()).await;
 
         let (server, store) = serve_relay(&origin, scratch.path()).await;
         let relay = server.location();
@@ -367,14 +372,7 @@ mod suite {
     #[tokio::test]
     async fn an_unobtainable_payload_fails_the_receiving_agent_loudly() {
         let scratch = tempfile::tempdir().expect("a scratch dir");
-        let origin = scratch.path().join("origin");
-        std::fs::create_dir_all(&origin).expect("mkdir");
-        within("origin init", git(&origin, &["init", "-q", "-b", "main"])).await;
-        within(
-            "seed commit",
-            git(&origin, &["commit", "-qm", "seed", "--allow-empty"]),
-        )
-        .await;
+        let origin = seeded_origin(scratch.path()).await;
 
         let mut lonely = Worker::new("w3", scratch.path(), None);
         within(
@@ -402,15 +400,25 @@ mod suite {
             0,
             "an agent that cannot see the work its message names is retired"
         );
-        let failed = lonely.journaled().await.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentLifecycleChanged(changed))
-                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
-                        && changed.reason.contains("payload")
-            )
-        });
-        assert!(failed, "the failure and its reason must be journaled");
+        let failures: Vec<String> = lonely
+            .journaled()
+            .await
+            .iter()
+            .filter_map(|journaled| {
+                let Kind::AgentLifecycleChanged(changed) =
+                    journaled.event.as_ref()?.kind.as_ref()?
+                else {
+                    return None;
+                };
+                let failed =
+                    changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed);
+                failed.then(|| changed.reason.clone())
+            })
+            .collect();
+        assert!(
+            failures.iter().any(|reason| reason.contains("payload")),
+            "the failure and its reason must be journaled: {failures:?}"
+        );
         lonely.runtime.shutdown().await;
     }
 }

@@ -377,44 +377,37 @@ mod tests {
         );
     }
 
+    /// One enveloped event, the way the stream would hand it to the filter.
+    fn envelope_of(session: &str, sequence: u64, agent: Option<&str>, kind: Kind) -> EventEnvelope {
+        let event = Event {
+            agent_id: agent.map(AgentId::new),
+            kind: Some(kind),
+            ..Event::default()
+        };
+        EventEnvelope {
+            session_id: Some(SessionId::new(session)),
+            sequence,
+            recorded_at: None,
+            event: Some(event),
+        }
+    }
+
     fn spawn_envelope(
         session: &str,
         sequence: u64,
         agent: &str,
         parent: Option<&str>,
     ) -> EventEnvelope {
-        EventEnvelope {
-            session_id: Some(SessionId::new(session)),
-            sequence,
-            recorded_at: None,
-            event: Some(Event {
-                agent_id: Some(AgentId::new(agent)),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(Kind::AgentSpawned(AgentSpawned {
-                    parent_agent_id: parent.map(AgentId::new),
-                    spawned_by: None,
-                    spec: None,
-                    tree_path: Vec::new(),
-                })),
-            }),
-        }
+        let spawned = AgentSpawned {
+            parent_agent_id: parent.map(AgentId::new),
+            ..AgentSpawned::default()
+        };
+        envelope_of(session, sequence, Some(agent), Kind::AgentSpawned(spawned))
     }
 
     fn output_envelope(session: &str, sequence: u64, agent: Option<&str>) -> EventEnvelope {
-        EventEnvelope {
-            session_id: Some(SessionId::new(session)),
-            sequence,
-            recorded_at: None,
-            event: Some(Event {
-                agent_id: agent.map(AgentId::new),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(Kind::AgentOutputChunk(
-                    horde_proto::v1::AgentOutputChunk::default(),
-                )),
-            }),
-        }
+        let chunk = horde_proto::v1::AgentOutputChunk::default();
+        envelope_of(session, sequence, agent, Kind::AgentOutputChunk(chunk))
     }
 
     fn sequences(envelopes: &[EventEnvelope]) -> Vec<u64> {
