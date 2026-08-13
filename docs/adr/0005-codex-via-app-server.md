@@ -102,3 +102,36 @@ per provider. That measurement was taken against **0.145.0** and has not been
 repeated since; the spike ran **0.147.0** and did not touch it. The "re-check the two
 feature flags on each Codex upgrade" consequence above is two releases overdue, and
 re-probing exec/shell approvals at 0.147.0 is the outstanding debt.
+
+## Implementation note, 2026-08-13 (W5b): measured, captured, and built
+
+The production adapter (`crates/horde-worker/src/codex.rs` over the
+`horde-adapter-codex` codec) implements this ADR as amended. What W5b measured
+while building it, against **codex-cli 0.147.0**:
+
+- **The lost elicitation captures are restored.** Transcripts 17–18
+  (`docs/spikes/codex-app-server/transcripts/`, recorded by `drive_mcp.py`
+  against the committed `mcp_stub.py` MCP server) preserve the accept and
+  decline flows in bytes, including the stub's own wire log proving no byte of
+  a declined call ever reaches the MCP server and an accepted call reaches it
+  only after the answer.
+- **Granular `mcp_elicitations: true` is required, not optional.** Under plain
+  `approvalPolicy: "on-request"` no elicitation is routed and the thread parks
+  at `status: active, activeFlags: ["waitingOnApproval"]` forever
+  (transcript 19). The adapter therefore always starts threads with the
+  granular policy the captures verified.
+- **`exec_permission_approvals` and `request_permissions_tool` are still
+  "under development, false" at 0.147.0** (`codex features list`, 2026-08-13),
+  so the shell/exec half of this ADR stands. This discharges the flag
+  re-check; a full six-configuration exec re-probe at 0.147.0 remains open.
+- **The capability is now worded per call kind**, as this ADR asked:
+  `Capability::PreAuthorizeMcpToolCalls` and
+  `Capabilities::permission_enforcement_for(ToolCallKind)`. The kind-blind
+  answer stays `SandboxAtSpawn` — the floor — and codex deliberately does not
+  advertise the wire's blanket `TOOL_CALL_GATING`, so placement cannot land
+  high-trust exec on it. A per-kind wire advertisement is left for the
+  placement seam that would read it.
+- Sandbox tiers are derived from the agent's permission mode by worker-side
+  `SandboxPolicy` (unknown or absent modes fail closed to `read-only`;
+  `danger-full-access` is unrepresentable), and the chosen tier plus its
+  reason is journaled on the agent's first turn.
