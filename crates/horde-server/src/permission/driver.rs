@@ -91,7 +91,14 @@ impl std::fmt::Debug for ChainDriver {
     }
 }
 
-/// Starts the chain on its own task. It ends when the log is dropped.
+/// Starts the chain on its own task.
+///
+/// Stopped by aborting the returned handle. The driver holds its own clone of
+/// the log — it has to, to append decisions — so it can never observe "every
+/// other handle is gone" from inside its own wait; an explicit abort is the
+/// honest shutdown. Aborting mid-pass loses nothing: every append is keyed,
+/// and a restarted driver re-reads the log and deduplicates into the same
+/// decisions.
 pub fn spawn(
     log: &EventLog,
     modes: Arc<PermissionModes>,
@@ -131,7 +138,9 @@ impl ChainDriver {
         self.parks.load(Ordering::Relaxed)
     }
 
-    /// Runs until the log is dropped.
+    /// Runs until aborted, or until the notification channel closes — which a
+    /// spawned driver never sees from inside (it holds a log clone itself),
+    /// but a driver built over a receiver it does not feed still honors.
     pub async fn run(mut self) {
         while self.step().await {}
     }
@@ -452,5 +461,805 @@ fn escalated_event(
                 ..request.clone()
             }),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
+    use horde_proto::v1::{
+        AgentSpawned, AgentSpec, PermissionRequestId, ProposedToolCall, event::Kind,
+    };
+
+    use super::*;
+    use crate::log::PendingEvent;
+    use crate::permission::modes::{PermissionMode, PermissionModes};
+    use crate::permission::rules::Rule;
+
+    // -- arranging the log ---------------------------------------------------
+
+    async fn append(log: &EventLog, session: &str, key: &str, event: Event) {
+        log.append(PendingEvent {
+            session_id: session.to_owned(),
+            idempotency_key: key.to_owned(),
+            payload: event.encode_to_vec(),
+            ..PendingEvent::default()
+        })
+        .await
+        .expect("append");
+    }
+
+    fn agent_event(agent: &str, kind: Kind) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(kind),
+        }
+    }
+
+    fn spawned(agent: &str, parent: Option<&str>, mode: &str, tree_path: &[&str]) -> Event {
+        agent_event(
+            agent,
+            Kind::AgentSpawned(AgentSpawned {
+                parent_agent_id: parent.map(AgentId::new),
+                spawned_by: None,
+                spec: Some(AgentSpec {
+                    agent_type: format!("{agent}-type"),
+                    permission_mode: mode.to_owned(),
+                    ..AgentSpec::default()
+                }),
+                tree_path: tree_path.iter().map(|s| (*s).to_owned()).collect(),
+            }),
+        )
+    }
+
+    fn arguments(path: &str) -> Struct {
+        let mut input = Struct::default();
+        input.fields.insert(
+            "file_path".to_owned(),
+            Value {
+                kind: Some(ValueKind::StringValue(path.to_owned())),
+            },
+        );
+        input
+    }
+
+    fn call(tool: &str, path: &str) -> ProposedToolCall {
+        ProposedToolCall {
+            tool_name: tool.to_owned(),
+            input: Some(arguments(path)),
+            rendered: format!("{tool} {path}"),
+        }
+    }
+
+    fn requested(agent: &str, request_id: &str, tool_call: Option<ProposedToolCall>) -> Event {
+        agent_event(
+            agent,
+            Kind::PermissionRequested(PermissionRequested {
+                request: Some(PermissionRequest {
+                    request_id: Some(PermissionRequestId::new(request_id)),
+                    agent_id: Some(AgentId::new(agent)),
+                    tool_call,
+                    ..PermissionRequest::default()
+                }),
+            }),
+        )
+    }
+
+    fn human_decided(agent: &str, request_id: &str, remember: bool) -> Event {
+        agent_event(
+            agent,
+            Kind::PermissionDecided(PermissionDecided {
+                decision: Some(PermissionDecision {
+                    request_id: Some(PermissionRequestId::new(request_id)),
+                    outcome: PermissionOutcome::Allow as i32,
+                    decided_by: PermissionLayer::Human as i32,
+                    remember_for_session: remember,
+                    ..PermissionDecision::default()
+                }),
+            }),
+        )
+    }
+
+    // -- reading back what the chain wrote ----------------------------------
+
+    async fn decisions_in(log: &EventLog, session: &str) -> Vec<PermissionDecision> {
+        events_in(log, session)
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                Some(Kind::PermissionDecided(decided)) => decided.decision,
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn requests_in(log: &EventLog, session: &str) -> Vec<PermissionRequest> {
+        events_in(log, session)
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                Some(Kind::PermissionRequested(requested)) => requested.request,
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn events_in(log: &EventLog, session: &str) -> Vec<Event> {
+        log.read_all(session)
+            .await
+            .expect("read")
+            .iter()
+            .map(|stored| Event::decode(stored.payload.as_slice()).expect("decode"))
+            .collect()
+    }
+
+    fn driver_over(
+        log: &EventLog,
+        modes: PermissionModes,
+        judge: Option<Arc<dyn PolicyJudge>>,
+    ) -> ChainDriver {
+        ChainDriver::open(log, Arc::new(modes), judge)
+    }
+
+    /// A mode registry whose one named mode allows `Read` and denies `Bash`.
+    fn cautious() -> PermissionModes {
+        PermissionModes::default().with_mode(
+            "cautious",
+            PermissionMode::escalate_everything()
+                .deny(Rule::tool("Bash"), "no shell in cautious mode")
+                .allow(Rule::tool("Read")),
+        )
+    }
+
+    /// One session: a root agent under `cautious`, and one pending request.
+    async fn one_request(log: &EventLog, tool_call: Option<ProposedToolCall>) {
+        append(
+            log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "cautious", &["ci-fix"]),
+        )
+        .await;
+        append(log, "s1", "req-1", requested("root", "req-1", tool_call)).await;
+    }
+
+    // -- the deterministic layers, through the whole driver ------------------
+
+    #[tokio::test]
+    async fn an_allow_rule_settles_the_request_and_names_its_layer() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Read", "/workspace/a"))).await;
+
+        let mut driver = driver_over(&log, cautious(), None);
+        let appended = driver.catch_up().await.expect("catch up");
+        assert_eq!(appended, 1, "one request, one decision");
+
+        let decisions = decisions_in(&log, "s1").await;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].request_id.as_ref().map(ToString::to_string),
+            Some("req-1".to_owned())
+        );
+        assert_eq!(decisions[0].outcome, PermissionOutcome::Allow as i32);
+        assert_eq!(
+            decisions[0].decided_by,
+            PermissionLayer::DeterministicAllow as i32,
+            "the journal must say which layer decided"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deny_rule_settles_the_request_with_its_reason() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Bash", "/x"))).await;
+
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        let decisions = decisions_in(&log, "s1").await;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, PermissionOutcome::Deny as i32);
+        assert_eq!(
+            decisions[0].decided_by,
+            PermissionLayer::DeterministicDeny as i32
+        );
+        assert_eq!(
+            decisions[0].reason, "no shell in cautious mode",
+            "a denial without its reason teaches the agent nothing"
+        );
+    }
+
+    // -- escalation ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_unsettled_request_is_re_raised_with_context_for_the_approver() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Write", "/etc/hosts"))).await;
+
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        assert!(
+            decisions_in(&log, "s1").await.is_empty(),
+            "escalation is a human's question, never the chain's answer"
+        );
+        let requests = requests_in(&log, "s1").await;
+        assert_eq!(requests.len(), 2, "the original, then one enriched re-raise");
+
+        let enriched = &requests[1];
+        assert_eq!(
+            enriched.tree_path,
+            vec!["ci-fix".to_owned()],
+            "the approver reads the tree path"
+        );
+        assert_eq!(enriched.permission_mode, "cautious");
+        assert_eq!(
+            enriched.escalated_from,
+            PermissionLayer::DeterministicAllow as i32,
+            "the layer that gave up is named"
+        );
+        assert_eq!(
+            enriched.tool_call.as_ref().map(|c| c.tool_name.clone()),
+            Some("Write".to_owned()),
+            "the proposal itself must survive the enrichment"
+        );
+    }
+
+    /// The structural loop-guard: the re-raise is itself a `PermissionRequested`
+    /// row, and processing it again would re-raise forever. Two full passes by
+    /// two fresh drivers must leave exactly one enrichment.
+    #[tokio::test]
+    async fn an_escalation_is_enriched_exactly_once_across_restarts() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Write", "/etc/hosts"))).await;
+
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("first pass");
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("a restart re-reads the whole log");
+
+        assert_eq!(
+            requests_in(&log, "s1").await.len(),
+            2,
+            "re-processing the log must not stack enrichments"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_already_decided_is_left_alone() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Read", "/x"))).await;
+        append(&log, "s1", "human-1", human_decided("root", "req-1", false)).await;
+
+        let appended = driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        assert_eq!(appended, 0, "a settled request is nobody's to re-answer");
+        assert_eq!(decisions_in(&log, "s1").await.len(), 1);
+    }
+
+    /// A chain decision must also be final across a restart: the driver's own
+    /// `PermissionDecided` projects the request as settled, so a fresh pass
+    /// appends nothing more.
+    #[tokio::test]
+    async fn a_chain_decision_is_not_re_made_on_a_restart() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Read", "/x"))).await;
+
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("first pass");
+        let second = driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("second pass");
+
+        assert_eq!(second, 0);
+        assert_eq!(decisions_in(&log, "s1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_mode_escalates_rather_than_guessing() {
+        let log = EventLog::in_memory().expect("log");
+        append(
+            &log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "typo-mode", &["ci-fix"]),
+        )
+        .await;
+        append(
+            &log,
+            "s1",
+            "req-1",
+            requested("root", "req-1", Some(call("Read", "/x"))),
+        )
+        .await;
+
+        // The registry has no "typo-mode" — resolve must not fall back to the
+        // default, whose rules nobody chose for this agent.
+        let modes = PermissionModes::default()
+            .with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()));
+        driver_over(&log, modes, None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        assert!(decisions_in(&log, "s1").await.is_empty());
+        assert_eq!(requests_in(&log, "s1").await.len(), 2, "escalated instead");
+    }
+
+    #[tokio::test]
+    async fn a_request_without_its_proposed_call_escalates() {
+        let log = EventLog::in_memory().expect("log");
+        append(
+            &log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "", &["ci-fix"]),
+        )
+        .await;
+        append(&log, "s1", "req-1", requested("root", "req-1", None)).await;
+
+        let modes =
+            PermissionModes::default().with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()));
+        driver_over(&log, modes, None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        assert!(
+            decisions_in(&log, "s1").await.is_empty(),
+            "a call the rules never saw must not be allowed by them"
+        );
+    }
+
+    // -- the judge -----------------------------------------------------------
+
+    /// A scripted judge: a real implementation of the seam that answers from a
+    /// script and records what it was asked, in the FakeAdapter sense.
+    #[derive(Debug)]
+    struct ScriptedJudge {
+        ruling: JudgeRuling,
+        asked: Mutex<Vec<(String, String, Vec<String>)>>,
+    }
+
+    impl ScriptedJudge {
+        fn ruling(ruling: JudgeRuling) -> Arc<Self> {
+            Arc::new(Self {
+                ruling,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PolicyJudge for ScriptedJudge {
+        async fn rule(&self, consultation: Consultation<'_>) -> JudgeRuling {
+            if let Ok(mut asked) = self.asked.lock() {
+                asked.push((
+                    consultation.instructions.to_owned(),
+                    consultation.call.tool_name.clone(),
+                    consultation.ancestry.to_vec(),
+                ));
+            }
+            self.ruling.clone()
+        }
+    }
+
+    fn judged() -> PermissionModes {
+        PermissionModes::default().with_mode(
+            "judged",
+            PermissionMode::escalate_everything()
+                .deny(Rule::tool("Bash"), "never a shell")
+                .judged_by("allow reads under /workspace"),
+        )
+    }
+
+    async fn one_judged_request(log: &EventLog, tool_call: ProposedToolCall) {
+        append(
+            log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "judged", &["ci-fix"]),
+        )
+        .await;
+        append(log, "s1", "req-1", requested("root", "req-1", Some(tool_call))).await;
+    }
+
+    #[tokio::test]
+    async fn the_judge_rules_what_the_deterministic_layers_left_unsettled() {
+        let log = EventLog::in_memory().expect("log");
+        one_judged_request(&log, call("Read", "/workspace/a")).await;
+
+        let judge = ScriptedJudge::ruling(JudgeRuling::Allow {
+            rationale: "a read under the workspace".to_owned(),
+        });
+        driver_over(&log, judged(), Some(judge.clone()))
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        let decisions = decisions_in(&log, "s1").await;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, PermissionOutcome::Allow as i32);
+        assert_eq!(decisions[0].decided_by, PermissionLayer::PolicyJudge as i32);
+        assert_eq!(
+            decisions[0].reason, "a read under the workspace",
+            "the judge's rationale is the decision's reason"
+        );
+
+        let asked = judge.asked.lock().expect("lock");
+        assert_eq!(
+            asked.as_slice(),
+            &[(
+                "allow reads under /workspace".to_owned(),
+                "Read".to_owned(),
+                vec!["ci-fix".to_owned()],
+            )],
+            "the judge reads the mode's instructions, the call, and the ancestry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judge_denial_reaches_the_journal_as_the_judges() {
+        let log = EventLog::in_memory().expect("log");
+        one_judged_request(&log, call("WebFetch", "https://example.com")).await;
+
+        let judge = ScriptedJudge::ruling(JudgeRuling::Deny {
+            rationale: "the policy says never the network".to_owned(),
+        });
+        driver_over(&log, judged(), Some(judge))
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        let decisions = decisions_in(&log, "s1").await;
+        assert_eq!(decisions[0].outcome, PermissionOutcome::Deny as i32);
+        assert_eq!(decisions[0].decided_by, PermissionLayer::PolicyJudge as i32);
+        assert_eq!(decisions[0].reason, "the policy says never the network");
+    }
+
+    #[tokio::test]
+    async fn a_deny_rule_runs_before_the_judge_is_ever_asked() {
+        let log = EventLog::in_memory().expect("log");
+        one_judged_request(&log, call("Bash", "/x")).await;
+
+        let judge = ScriptedJudge::ruling(JudgeRuling::Allow {
+            rationale: "would have allowed".to_owned(),
+        });
+        driver_over(&log, judged(), Some(judge.clone()))
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        let decisions = decisions_in(&log, "s1").await;
+        assert_eq!(decisions[0].outcome, PermissionOutcome::Deny as i32);
+        assert_eq!(
+            decisions[0].decided_by,
+            PermissionLayer::DeterministicDeny as i32
+        );
+        assert!(
+            judge.asked.lock().expect("lock").is_empty(),
+            "layer order is the security property: deny is final"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abstaining_judge_escalates_to_the_human() {
+        let log = EventLog::in_memory().expect("log");
+        one_judged_request(&log, call("Write", "/etc/hosts")).await;
+
+        let judge = ScriptedJudge::ruling(JudgeRuling::Abstain {
+            rationale: "the instructions do not cover writes".to_owned(),
+        });
+        driver_over(&log, judged(), Some(judge))
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        assert!(decisions_in(&log, "s1").await.is_empty());
+        let requests = requests_in(&log, "s1").await;
+        assert_eq!(
+            requests[1].escalated_from,
+            PermissionLayer::PolicyJudge as i32,
+            "the approver is told the judge already looked and passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mode_that_wants_a_judge_nobody_configured_escalates() {
+        let log = EventLog::in_memory().expect("log");
+        one_judged_request(&log, call("Write", "/etc/hosts")).await;
+
+        driver_over(&log, judged(), None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        assert!(
+            decisions_in(&log, "s1").await.is_empty(),
+            "an unrunnable judge stage must not resolve to either outcome"
+        );
+        assert_eq!(
+            requests_in(&log, "s1").await[1].escalated_from,
+            PermissionLayer::PolicyJudge as i32
+        );
+    }
+
+    // -- remember-for-session ------------------------------------------------
+
+    /// The full remember loop: escalate, a human allows with remember, and the
+    /// identical proposal is then settled by the widened allow layer.
+    #[tokio::test]
+    async fn a_remembered_allow_settles_the_repeat_without_a_human() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Write", "/tmp/notes"))).await;
+        append(&log, "s1", "human-1", human_decided("root", "req-1", true)).await;
+        append(
+            &log,
+            "s1",
+            "req-2",
+            requested("root", "req-2", Some(call("Write", "/tmp/notes"))),
+        )
+        .await;
+
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        let decisions = decisions_in(&log, "s1").await;
+        let repeat: Vec<_> = decisions
+            .iter()
+            .filter(|decision| {
+                decision.request_id.as_ref().map(ToString::to_string)
+                    == Some("req-2".to_owned())
+            })
+            .collect();
+        assert_eq!(repeat.len(), 1, "the repeat is settled by the chain");
+        assert_eq!(repeat[0].outcome, PermissionOutcome::Allow as i32);
+        assert_eq!(
+            repeat[0].decided_by,
+            PermissionLayer::DeterministicAllow as i32,
+            "remember-for-session widens the deterministic-allow layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_different_call_is_not_covered_by_what_was_remembered() {
+        let log = EventLog::in_memory().expect("log");
+        one_request(&log, Some(call("Write", "/tmp/notes"))).await;
+        append(&log, "s1", "human-1", human_decided("root", "req-1", true)).await;
+        append(
+            &log,
+            "s1",
+            "req-2",
+            requested("root", "req-2", Some(call("Write", "/etc/hosts"))),
+        )
+        .await;
+
+        driver_over(&log, cautious(), None)
+            .catch_up()
+            .await
+            .expect("catch up");
+
+        let decisions = decisions_in(&log, "s1").await;
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.decided_by == PermissionLayer::Human as i32),
+            "a different argument re-escalates; only req-1's human decision exists"
+        );
+    }
+
+    // -- liveness ------------------------------------------------------------
+
+    /// The driver must park, not spin. Same instrument as `CommandStream`: a
+    /// hot loop answers every request correctly and burns a core, and only
+    /// this number tells the two apart.
+    #[tokio::test]
+    async fn an_idle_driver_parks_instead_of_spinning() {
+        let log = EventLog::in_memory().expect("log");
+        let mut driver = driver_over(&log, PermissionModes::default(), None);
+        assert_eq!(driver.parks(), 0);
+
+        let idle =
+            tokio::time::timeout(std::time::Duration::from_millis(200), driver.step()).await;
+        assert!(idle.is_err(), "nothing will ever arrive on an empty log");
+        assert_eq!(
+            driver.parks(),
+            1,
+            "0 means it never waited; a spin drives this into the thousands"
+        );
+    }
+
+    /// The whole loop, live: a request appended after the driver started must
+    /// come back decided, and dropping the log must end the task.
+    #[tokio::test]
+    async fn a_running_driver_answers_a_request_appended_later() {
+        let log = EventLog::in_memory().expect("log");
+        let task = spawn(&log, Arc::new(cautious()), None);
+
+        one_request(&log, Some(call("Read", "/workspace/a"))).await;
+
+        // History and tail both matter: the chain may decide before or after
+        // the tail opens, and only the race decides which side carries it.
+        let (history, mut tail) = log.tail("s1", 1).await.expect("tail");
+        let decision_in = |batch: Vec<crate::log::StoredEvent>| {
+            batch.into_iter().find_map(|stored| {
+                match Event::decode(stored.payload.as_slice()).ok()?.kind {
+                    Some(Kind::PermissionDecided(decided)) => decided.decision,
+                    _ => None,
+                }
+            })
+        };
+        let decided = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if let Some(found) = decision_in(history) {
+                return Some(found);
+            }
+            loop {
+                let batch = match tail.next_batch().await {
+                    Some(Ok(batch)) => batch,
+                    _ => return None,
+                };
+                if let Some(found) = decision_in(batch) {
+                    return Some(found);
+                }
+            }
+        })
+        .await
+        .expect("the chain must decide while the suite watches")
+        .expect("a decision, not a closed stream");
+
+        assert_eq!(decided.outcome, PermissionOutcome::Allow as i32);
+        assert_eq!(
+            decided.decided_by,
+            PermissionLayer::DeterministicAllow as i32
+        );
+
+        // Abort is the shutdown contract: the driver holds its own log clone,
+        // so no drop from outside can close its channel.
+        task.abort();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("an aborted driver must end");
+        assert!(
+            ended.is_err_and(|error| error.is_cancelled()),
+            "the driver ends by cancellation, not by panic"
+        );
+    }
+
+    // -- the pure pieces -----------------------------------------------------
+
+    #[test]
+    fn a_wake_up_is_only_fatal_when_the_channel_closed() {
+        let notification = Notification {
+            session_id: "s1".to_owned(),
+            sequence: 1,
+        };
+        assert!(woken(Ok(notification)));
+        assert!(
+            woken(Err(broadcast::error::RecvError::Lagged(7))),
+            "lagging re-reads from the cursor; the log is the truth"
+        );
+        assert!(!woken(Err(broadcast::error::RecvError::Closed)));
+    }
+
+    #[test]
+    fn the_request_mode_outranks_the_agents_only_when_stamped() {
+        assert_eq!(mode_in_force("stamped", "spec"), "stamped");
+        assert_eq!(mode_in_force("", "spec"), "spec");
+        assert_eq!(mode_in_force("stamped", ""), "stamped");
+        assert_eq!(mode_in_force("", ""), "");
+    }
+
+    #[test]
+    fn only_an_enriched_request_counts_as_already_escalated() {
+        let bare = PermissionRequest::default();
+        assert!(!already_escalated(&bare));
+
+        let enriched = PermissionRequest {
+            escalated_from: PermissionLayer::PolicyJudge as i32,
+            ..PermissionRequest::default()
+        };
+        assert!(already_escalated(&enriched));
+    }
+
+    fn projected(events: &[Event]) -> SessionState {
+        let stored: Vec<crate::log::StoredEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| crate::log::StoredEvent {
+                session_id: "s1".to_owned(),
+                sequence: index as u64 + 1,
+                recorded_at_unix_ms: 0,
+                payload: event.encode_to_vec(),
+            })
+            .collect();
+        SessionState::project("s1", &stored).expect("project")
+    }
+
+    #[test]
+    fn ancestry_prefers_the_recorded_tree_path() {
+        let state = projected(&[spawned("root", None, "", &["ci-fix"])]);
+        assert_eq!(ancestry(&state, "root"), vec!["ci-fix".to_owned()]);
+    }
+
+    /// A child spawned without a recorded path splices onto the nearest
+    /// ancestor that has one — the shape `spawn_agent` writes today.
+    #[test]
+    fn ancestry_walks_parents_and_splices_onto_a_recorded_path() {
+        let state = projected(&[
+            spawned("root", None, "", &["ci-fix"]),
+            spawned("child", Some("root"), "", &[]),
+            spawned("grandchild", Some("child"), "", &[]),
+        ]);
+        assert_eq!(
+            ancestry(&state, "grandchild"),
+            vec![
+                "ci-fix".to_owned(),
+                "child-type".to_owned(),
+                "grandchild-type".to_owned(),
+            ],
+            "root first, then the walked names in tree order"
+        );
+    }
+
+    #[test]
+    fn ancestry_of_an_unknown_agent_is_empty_not_invented() {
+        let state = projected(&[]);
+        assert!(ancestry(&state, "ghost").is_empty());
+    }
+
+    /// Malformed history can make an agent its own ancestor. The walk is
+    /// bounded by the visited set — by structure, not by a clock — so it must
+    /// terminate and keep what it saw on the way in.
+    #[test]
+    fn a_parent_cycle_cannot_spin_the_ancestry_walk() {
+        let state = projected(&[
+            spawned("a", Some("b"), "", &[]),
+            spawned("b", Some("a"), "", &[]),
+        ]);
+        assert_eq!(
+            ancestry(&state, "a"),
+            vec!["b-type".to_owned(), "a-type".to_owned()],
+            "each agent contributes once, and the walk ends"
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_type_is_named_by_its_id() {
+        let typed = AgentState {
+            agent_id: "a1".to_owned(),
+            parent_agent_id: None,
+            lifecycle: horde_proto::v1::AgentLifecycleState::Queued,
+            tree_path: Vec::new(),
+            agent_type: "reviewer".to_owned(),
+            permission_mode: String::new(),
+            worker_id: None,
+        };
+        assert_eq!(display_name(&typed), "reviewer");
+
+        let untyped = AgentState {
+            agent_type: String::new(),
+            ..typed
+        };
+        assert_eq!(display_name(&untyped), "a1");
     }
 }
