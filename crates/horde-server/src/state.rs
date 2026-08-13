@@ -325,6 +325,71 @@ mod tests {
         ];
         let state = SessionState::project("s1", &events).expect("project");
         assert_eq!(state.agents["root"].worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(state.agents["root"].placement_state, PlacementState::Placed);
+        assert_eq!(
+            state.agents["root"].queued_at_unix_ms, None,
+            "a placed agent is not waiting, so nothing can expire it"
+        );
+    }
+
+    /// A queued placement stamps *when* from the event's recorded time —
+    /// that stamp is the whole basis of queue-timeout expiry — and any later
+    /// outcome clears it.
+    #[test]
+    fn a_queued_placement_remembers_when_and_a_later_one_forgets() {
+        let queued = |sequence: u64, at_ms: i64| StoredEvent {
+            recorded_at_unix_ms: at_ms,
+            ..stored(
+                sequence,
+                Some("root"),
+                Kind::PlacementChanged(PlacementChanged {
+                    placement: Some(Placement {
+                        agent_id: Some(AgentId::new("root")),
+                        state: PlacementState::Queued as i32,
+                        worker_id: None,
+                        reason: "no worker is connected".to_owned(),
+                    }),
+                }),
+            )
+        };
+
+        let events = vec![
+            stored(1, Some("root"), spawned(None, "o")),
+            queued(2, 1_234),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.agents["root"].placement_state, PlacementState::Queued);
+        assert_eq!(
+            state.agents["root"].queued_at_unix_ms,
+            Some(1_234),
+            "expiry is measured from the queued event's own clock"
+        );
+
+        // A later queued event moves the stamp; it does not accumulate.
+        let requeued = vec![
+            stored(1, Some("root"), spawned(None, "o")),
+            queued(2, 1_234),
+            queued(3, 9_999),
+        ];
+        let state = SessionState::project("s1", &requeued).expect("project");
+        assert_eq!(state.agents["root"].queued_at_unix_ms, Some(9_999));
+    }
+
+    /// The spec survives into the projection whole: re-placing a queued agent
+    /// asks the same question the original spawn did, and a projection that
+    /// dropped the constraints would make the scheduler guess.
+    #[test]
+    fn the_spawn_spec_is_retained_for_re_placement() {
+        let events = vec![stored(1, Some("root"), spawned(None, "orchestrator"))];
+        let state = SessionState::project("s1", &events).expect("project");
+
+        let spec = state.agents["root"].spec.as_ref().expect("the spec");
+        assert_eq!(spec.agent_type, "orchestrator");
+        assert_eq!(
+            state.agents["root"].placement_state,
+            PlacementState::Unspecified,
+            "no placement event has answered this spawn yet"
+        );
     }
 
     #[test]

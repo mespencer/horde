@@ -749,6 +749,198 @@ mod tests {
         assert!(fold(&orphan).is_empty());
     }
 
+    /// A re-placement moves the spawn and settles the loser: the old worker is
+    /// cancelled with its own command id, the new one gets the spawn, and both
+    /// stay independently numbered.
+    #[test]
+    fn a_re_placement_cancels_the_old_worker_and_spawns_on_the_new() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            placement_event("agent-1", None, PlacementState::Queued),
+        ));
+        rows.push(row(
+            4,
+            "s1",
+            4,
+            placement_event("agent-1", Some("worker-b"), PlacementState::Placed),
+        ));
+
+        let issued = fold(&rows);
+        let summary: Vec<(&str, &str, u64)> = issued
+            .iter()
+            .map(|(worker, response)| {
+                let kind = match response.command.as_ref() {
+                    Some(Command::SpawnAgent(_)) => "spawn",
+                    Some(Command::CancelPlacement(_)) => "cancel",
+                    other => panic!("unexpected command {other:?}"),
+                };
+                (worker.as_str(), kind, response.command_sequence)
+            })
+            .collect();
+
+        assert_eq!(
+            summary,
+            vec![
+                ("worker-a", "spawn", 1),
+                ("worker-a", "cancel", 2),
+                ("worker-b", "spawn", 1),
+            ],
+            "the queued transition cancels worker-a; the new placement spawns \
+             on worker-b under its own numbering"
+        );
+        assert_eq!(
+            issued[1].1.command_id, "s1:3:cancel",
+            "the cancel carries its own identity beside the event's main id"
+        );
+    }
+
+    /// A placement event that re-states the standing worker is not a new
+    /// spawn: at-least-once redelivery of the *event* must not become an
+    /// at-least-twice delivery of the agent.
+    #[test]
+    fn a_placement_restating_the_same_worker_issues_nothing() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
+        ));
+
+        let issued = fold(&rows);
+        assert_eq!(issued.len(), 1, "one spawn, not two: {issued:?}");
+    }
+
+    /// An unseating with no new home still cancels: the lost worker may
+    /// reconnect and replay a spawn it never applied, and the cancel is what
+    /// makes that replay harmless.
+    #[test]
+    fn an_unseated_agent_is_cancelled_even_before_it_is_replaced() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            placement_event("agent-1", None, PlacementState::Queued),
+        ));
+
+        let issued = fold(&rows);
+        assert_eq!(issued.len(), 2);
+        let (worker, response) = &issued[1];
+        assert_eq!(worker, "worker-a");
+        assert!(matches!(
+            response.command.as_ref(),
+            Some(Command::CancelPlacement(_))
+        ));
+    }
+
+    fn definition(id: &str) -> horde_proto::v1::WorkspaceDefinition {
+        horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(id)),
+            name: format!("{id}-name"),
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        }
+    }
+
+    fn definition_event(id: &str, deleted: bool) -> Event {
+        Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::WorkspaceDefinitionChanged(
+                horde_proto::v1::WorkspaceDefinitionChanged {
+                    definition: Some(definition(id)),
+                    deleted,
+                },
+            )),
+        }
+    }
+
+    fn prewarm_event(id: &str, worker: &str) -> Event {
+        Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::WorkspacePrewarmRequested(
+                horde_proto::v1::WorkspacePrewarmRequested {
+                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(id)),
+                    worker_id: Some(WorkerId::new(worker)),
+                },
+            )),
+        }
+    }
+
+    /// The materialize command must carry the *full* definition, folded from
+    /// the catalog event that precedes every prewarm in append order — a
+    /// worker must be able to materialize without a round trip.
+    #[test]
+    fn a_prewarm_for_a_known_definition_commands_a_materialization() {
+        let rows = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(2, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued = fold(&rows);
+
+        assert_eq!(issued.len(), 1);
+        let (worker, response) = &issued[0];
+        assert_eq!(worker, "worker-a");
+        match response.command.as_ref().expect("a command") {
+            Command::MaterializeWorkspace(materialize) => {
+                assert_eq!(
+                    materialize
+                        .definition
+                        .as_ref()
+                        .map(|definition| definition.name.as_str()),
+                    Some("ws-1-name"),
+                    "the full definition rides the command"
+                );
+                assert_eq!(
+                    materialize.session_id.as_ref().map(ToString::to_string),
+                    Some("s1".to_owned()),
+                    "progress events belong to the session that asked"
+                );
+            }
+            other => panic!("expected a materialize command, got {other:?}"),
+        }
+    }
+
+    /// A prewarm naming a definition the fold has not seen — or one that was
+    /// deleted — yields nothing: a worker told to materialize an empty
+    /// definition would create an instance of nothing.
+    #[test]
+    fn a_prewarm_without_a_live_definition_commands_nothing() {
+        let unknown = vec![row(1, "s1", 1, prewarm_event("ws-ghost", "worker-a"))];
+        assert!(fold(&unknown).is_empty());
+
+        let deleted = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(
+                2,
+                "horde-workspace-catalog",
+                2,
+                definition_event("ws-1", true),
+            ),
+            row(3, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        assert!(
+            fold(&deleted).is_empty(),
+            "a deleted definition is not materializable"
+        );
+    }
+
     #[test]
     fn events_that_command_nothing_are_folded_without_issuing() {
         let rows = vec![row(

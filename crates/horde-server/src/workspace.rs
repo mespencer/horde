@@ -395,6 +395,85 @@ mod tests {
         assert!(!is_catalog_stream(""));
     }
 
+    // -- Validation --------------------------------------------------------
+
+    fn repo(name: &str, remote: &str) -> WorkspaceRepo {
+        WorkspaceRepo {
+            name: name.to_owned(),
+            remote_url: remote.to_owned(),
+            default_branch: "main".to_owned(),
+            layout_path: String::new(),
+        }
+    }
+
+    /// Each refusal names its shortfall; the message is what a caller fixes.
+    #[test]
+    fn an_ill_formed_definition_is_refused_with_the_shortfall_named() {
+        let refusal = |name: &str, repos: &[WorkspaceRepo]| {
+            validate_definition(name, repos)
+                .expect_err("must refuse")
+                .to_string()
+        };
+
+        assert!(refusal("", &[repo("a", "url")]).contains("name"));
+        assert!(refusal("  ", &[repo("a", "url")]).contains("name"));
+        assert!(refusal("ws", &[]).contains("at least one repo"));
+        assert!(refusal("ws", &[repo("", "url")]).contains("name"));
+        assert!(refusal("ws", &[repo("a", "")]).contains("remote"));
+        assert!(
+            refusal("ws", &[repo("a", "u1"), repo("a", "u2")]).contains("twice"),
+            "two repos under one name would make GitRef ambiguous"
+        );
+
+        validate_definition("ws", &[repo("a", "u1"), repo("b", "u2")]).expect("a sound definition");
+    }
+
+    #[test]
+    fn normalization_defaults_layout_to_the_repo_name_and_keeps_explicit_layouts() {
+        let mut explicit = repo("atlas", "url");
+        explicit.layout_path = "code/atlas".to_owned();
+        let normalized = normalized_repos(vec![repo("docs", "url"), explicit]);
+        assert_eq!(normalized[0].layout_path, "docs");
+        assert_eq!(normalized[1].layout_path, "code/atlas");
+    }
+
+    /// Layout is the one thing an update's repos may change; everything else
+    /// is an add/remove/repoint and goes through the ceremonial verbs.
+    #[test]
+    fn an_update_may_relayout_but_not_reshape_the_repo_set() {
+        let current = vec![repo("a", "u1"), repo("b", "u2")];
+
+        let mut relaid = current.clone();
+        relaid[0].layout_path = "elsewhere/a".to_owned();
+        same_repo_set(&current, &relaid).expect("layout changes are the point of update");
+
+        let widened = vec![repo("a", "u1"), repo("b", "u2"), repo("c", "u3")];
+        assert!(same_repo_set(&current, &widened).is_err(), "no additions");
+
+        let narrowed = vec![repo("a", "u1")];
+        assert!(same_repo_set(&current, &narrowed).is_err(), "no removals");
+
+        let repointed = vec![repo("a", "u1"), repo("b", "somewhere-else")];
+        assert!(
+            same_repo_set(&current, &repointed).is_err(),
+            "repointing a remote is not a layout change"
+        );
+    }
+
+    #[test]
+    fn the_etag_gate_admits_only_the_current_token() {
+        let mut held = definition("ws-1", "atlas");
+        held.etag = "7".to_owned();
+
+        check_etag(&held, "7").expect("the current token passes");
+        let stale = check_etag(&held, "3").expect_err("a stale token aborts");
+        assert!(matches!(stale, ServerError::StaleEtag { .. }));
+        assert!(
+            check_etag(&held, "").is_err(),
+            "an empty token is not a skeleton key"
+        );
+    }
+
     #[test]
     fn a_created_definition_is_live_with_its_sequence_as_etag() {
         let catalog =

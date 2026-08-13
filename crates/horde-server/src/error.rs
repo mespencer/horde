@@ -169,6 +169,36 @@ mod tests {
         assert!(message.contains('3') && message.contains('9'));
     }
 
+    /// The three workspace refusals map to three different retry strategies,
+    /// so each needs its own code: re-ask (NotFound), re-name
+    /// (AlreadyExists), re-read-and-retry (Aborted).
+    #[test]
+    fn workspace_refusals_are_distinguishable_by_code() {
+        let missing = tonic::Status::from(ServerError::NoSuchWorkspace {
+            wanted: "ws-9".to_owned(),
+        });
+        assert_eq!(missing.code(), Code::NotFound);
+        assert!(missing.message().contains("ws-9"));
+
+        let taken = tonic::Status::from(ServerError::WorkspaceNameTaken {
+            name: "atlas".to_owned(),
+        });
+        assert_eq!(taken.code(), Code::AlreadyExists);
+        assert!(taken.message().contains("atlas"));
+
+        let stale = tonic::Status::from(ServerError::StaleEtag {
+            workspace_definition_id: "ws-1".to_owned(),
+            current: "7".to_owned(),
+            supplied: "3".to_owned(),
+        });
+        assert_eq!(stale.code(), Code::Aborted, "the proto promises ABORTED");
+        assert!(
+            stale.message().contains('7') && stale.message().contains('3'),
+            "both tokens are needed to see what raced: {}",
+            stale.message()
+        );
+    }
+
     #[test]
     fn storage_failures_are_internal() {
         let status = tonic::Status::from(ServerError::Storage {
