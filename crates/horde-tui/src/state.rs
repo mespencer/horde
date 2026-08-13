@@ -82,9 +82,14 @@ impl SessionState {
     /// Folds in a `ListSessions` summary.
     ///
     /// The summary's head is a lower bound, never a rewind: the stream may
-    /// already be ahead of the snapshot the list answer was built from.
+    /// already be ahead of the snapshot the list answer was built from. The
+    /// title is likewise never blanked: the server does not project titles
+    /// into summaries yet, and a name learned from the root agent's spawn
+    /// event must survive the next refresh.
     pub fn absorb_summary(&mut self, summary: &SessionSummary) {
-        self.title = summary.title.clone();
+        if !summary.title.is_empty() {
+            self.title = summary.title.clone();
+        }
         self.lifecycle = session_lifecycle_name(summary.state);
         self.head = self.head.max(summary.head_sequence);
         if let Some(root) = summary.root_agent_id.as_ref() {
@@ -122,6 +127,14 @@ impl SessionState {
                 let parent = spawned.parent_agent_id.as_ref().map(ToString::to_string);
                 if parent.is_none() && self.root_agent_id.is_none() {
                     self.root_agent_id = Some(agent_id.clone());
+                }
+                // The root's first tree-path element is the session's display
+                // name — the only place the wire carries it today, since
+                // summaries come back untitled.
+                if self.takes_title_from(parent.as_deref())
+                    && let Some(name) = spawned.tree_path.first()
+                {
+                    self.title = name.clone();
                 }
                 self.agents.insert(
                     agent_id,
@@ -167,6 +180,16 @@ impl SessionState {
             }
             _ => {}
         }
+    }
+
+    /// Whether a spawn event is the one a session may take its display name
+    /// from: a root spawn, seen while the session is still nameless.
+    ///
+    /// A named predicate rather than an inline `&&` in the fold: the truth
+    /// table is assertable here and unreachable there
+    /// (docs/QUALITY_GATES.md on compound conditions).
+    fn takes_title_from(&self, parent: Option<&str>) -> bool {
+        parent.is_none() && self.title.is_empty()
     }
 
     /// The pending escalations, oldest first — the order an inbox lists them.
@@ -651,6 +674,38 @@ mod tests {
             state.head, 40,
             "a stale summary must not rewind a live head"
         );
+    }
+
+    /// Summaries come back untitled today (the server does not project
+    /// titles), so the name learned from the root spawn must not be blanked
+    /// by the next refresh.
+    #[test]
+    fn the_root_spawn_names_the_session_and_a_blank_summary_cannot_unname_it() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(1, "root-1", spawned(None, &["ci-fix"])));
+        assert_eq!(state.title, "ci-fix");
+
+        state.absorb_summary(&SessionSummary::default());
+        assert_eq!(state.title, "ci-fix", "an empty summary title is no title");
+
+        // A child's spawn, and a second root-shaped spawn, must not rename.
+        state.apply(&envelope(2, "child-1", spawned(Some("root-1"), &["other"])));
+        state.apply(&envelope(3, "impostor", spawned(None, &["impostor"])));
+        assert_eq!(state.title, "ci-fix");
+
+        // A summary that does carry a title wins: it is the server's word.
+        state.absorb_summary(&SessionSummary {
+            title: "renamed".to_owned(),
+            ..SessionSummary::default()
+        });
+        assert_eq!(state.title, "renamed");
+    }
+
+    #[test]
+    fn a_root_spawn_with_no_tree_path_leaves_the_session_nameless() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(1, "root-1", spawned(None, &[])));
+        assert_eq!(state.title, "");
     }
 
     #[test]
