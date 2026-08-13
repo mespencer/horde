@@ -200,10 +200,50 @@ directory it was recorded under, and `is_resumable_under` refuses a mismatch
 instead of surfacing an authentication error that looks like an outage. Journal
 both halves together.
 
+The Worker journals a third fact beside those two: **how many turns the
+conversation has taken.** Turn ids are `{session}#{ordinal}` and journal
+idempotency keys derive from them, so a revived session whose assembler
+restarted at zero would re-mint keys the Server has already seen — and the
+Server's dedupe would then discard the revived turns' events *while acking
+them*. `AgentSpec::with_turns_taken` (the `turns-taken` provider option)
+carries the count into `Adapter::resume`; every resumable adapter numbers its
+next turn after it. The Worker passes one **past** the recorded count, because
+a turn that died half-journaled has already spent its ordinal; turn ids need
+uniqueness, not density, so the skipped ordinal costs nothing.
+
+Usage needs no such reconciliation: a `--resume`d process reports cumulative
+usage for *its own lifetime* (transcript `05-resume.jsonl` — the resumed turn
+reports 51 output tokens, not the prior process's 713), so a fresh
+`UsageAccumulator` per incarnation counts each turn exactly once.
+
+## Steering and interrupt at the Worker
+
+Steering is a delivery mode, not a message kind (DESIGN.md §11). The Worker's
+pump holds a turn-boundary message that arrives mid-turn and sends it when the
+turn ends — orchestrator-side queueing is the one mechanism that works against
+every provider, which is why there is no boundary-steering capability to ask
+for. An interrupt-mode message never waits: `AgentSession::send` aborts the
+turn in flight first (for Claude, the control message — the only abort that
+leaves the session usable), and the aborted turn still closes with its own
+`TurnEnded(Interrupted)` ahead of the new turn's events.
+
+## Failure taxonomy
+
+`AgentLifecycleChanged.reason` is free text, so the Worker classifies every
+agent failure under a stable prefix (`horde_worker::translate`): **process
+death** (retry or revive here), **refusal** (rebind to another account or
+provider), **malformed stream** (the protocol moved; fix the adapter). A live
+Claude session reports EOF as the death it always is — reaping the child for
+its exit status and keeping stderr — because the Worker never closes a live
+agent's stdin.
+
 ## Not here yet
 
-Process supervision — spawning the binary, wiring stdio, isolating
-`CLAUDE_CONFIG_DIR` per account, and merging stdout with the MCP endpoint's
-permission requests — belongs to the Worker (wave 3) and the productionized
-Claude adapter (wave 5). Keeping the protocol layer pure is what lets the
-conformance suite replay recordings and mean something.
+The MCP endpoint that carries permission prompts is still to be wired into
+the spawn (`permission_prompt_tool` is a constructor seam). When it is, the
+Claude adapter already passes `--settings` with empty allow/deny lists and
+`--permission-mode manual` alongside it, because ambient settings allowlists
+decide a call before the permission tool ever sees it (ADR-0003, re-verified
+2026-08-11). Whether the pump should ever use `AmendActiveTurn` (deliver into
+a running turn on providers that support it) instead of boundary queueing is
+deliberately left to the Codex adapter's productionization.
