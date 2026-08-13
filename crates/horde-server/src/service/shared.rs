@@ -115,33 +115,16 @@ pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";
 /// A human-readable name for an event kind.
 ///
 /// Only for diagnostics, which is why it is a `&'static str` rather than
-/// anything the wire carries. `event_contract.rs` owns the canonical names; a
-/// drift between the two would cost a slightly worse error message and nothing
-/// else, which is the right amount of coupling for a string that exists to be
-/// read by a person.
+/// anything the wire carries. The names come from the compiled schema through
+/// [`horde_proto::kind_field_name`], so they cannot drift from `event.proto`
+/// and no hand-kept match has to grow with the oneof. `empty` covers both a
+/// kindless event and a kind the descriptor cannot name — either way, an
+/// event this build cannot describe must not collide under a neighbour's
+/// name.
 #[must_use]
 pub fn kind_name(kind: Option<&Kind>) -> &'static str {
-    // Exhaustive rather than wildcarded, matching `event_contract.rs`: a new
-    // arm on the oneof should stop compiling here too, so a kind added later
-    // cannot collide under a name nobody chose for it.
-    match kind {
-        Some(Kind::AgentOutputChunk(_)) => "agent_output_chunk",
-        Some(Kind::AgentSpawned(_)) => "agent_spawned",
-        Some(Kind::AssignmentSent(_)) => "assignment_sent",
-        Some(Kind::NoteSent(_)) => "note_sent",
-        Some(Kind::ResultReported(_)) => "result_reported",
-        Some(Kind::PermissionRequested(_)) => "permission_requested",
-        Some(Kind::PermissionDecided(_)) => "permission_decided",
-        Some(Kind::UsageRecorded(_)) => "usage_recorded",
-        Some(Kind::WorkspaceInstanceChanged(_)) => "workspace_instance_changed",
-        Some(Kind::AgentLifecycleChanged(_)) => "agent_lifecycle_changed",
-        Some(Kind::SessionLifecycleChanged(_)) => "session_lifecycle_changed",
-        Some(Kind::PlacementChanged(_)) => "placement_changed",
-        Some(Kind::TurnInterrupted(_)) => "turn_interrupted",
-        Some(Kind::WorkspaceDefinitionChanged(_)) => "workspace_definition_changed",
-        Some(Kind::WorkspacePrewarmRequested(_)) => "workspace_prewarm_requested",
-        None => "empty",
-    }
+    kind.and_then(horde_proto::kind_field_name)
+        .unwrap_or("empty")
 }
 
 /// Refuses a deduplication that silently swallowed a *different* kind of event.

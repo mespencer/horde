@@ -145,25 +145,10 @@ impl WorkerService for WorkerFacing {
         .await
         .map_err(Status::from)?;
 
-        // Both watermarks are derived from the log rather than remembered, so a
-        // restarted server answers a reconnecting worker with the same numbers
-        // it would have given before the restart. The journal one comes from
-        // the events actually stored; the command one from folding the command
-        // stream. Neither survives in memory, and neither needs to.
-        let resume_from_journal_sequence = self
-            .core
-            .log
-            .worker_journal_watermark(&worker_id)
-            .await
-            .map_err(Status::from)?
-            .saturating_add(1);
-
-        // What the server has ever issued this worker. The worker corrects this
-        // downwards on StreamCommands if it applied fewer; it is a ceiling, not
-        // an instruction, and saying "everything" would replay the world.
-        let issued = commands::issued_to(&self.core.log, &worker_id)
-            .await
-            .map_err(Status::from)?;
+        let (resume_from_journal_sequence, resume_from_command_sequence) =
+            resume_positions(&self.core, &worker_id)
+                .await
+                .map_err(Status::from)?;
 
         tracing::info!(worker_id, resume_from_journal_sequence, "worker registered");
 
@@ -171,7 +156,7 @@ impl WorkerService for WorkerFacing {
             worker_id: Some(WorkerId::new(worker_id.clone())),
             server: Some(Self::server_hello()),
             resume_from_journal_sequence,
-            resume_from_command_sequence: issued.saturating_add(1),
+            resume_from_command_sequence,
         }))
     }
 
@@ -365,6 +350,24 @@ impl WorkerService for WorkerFacing {
     }
 }
 
+/// Where a registering worker resumes both streams: `(journal, command)`.
+///
+/// Both watermarks are derived from the log rather than remembered, so a
+/// restarted server answers a reconnecting worker with the same numbers it
+/// would have given before the restart. The journal one comes from the events
+/// actually stored; the command one from folding the command stream — a
+/// ceiling the worker corrects downwards on `StreamCommands` if it applied
+/// fewer, because saying "everything" would replay the world.
+async fn resume_positions(core: &ServerCore, worker_id: &str) -> Result<(u64, u64), ServerError> {
+    let journal = core
+        .log
+        .worker_journal_watermark(worker_id)
+        .await?
+        .saturating_add(1);
+    let issued = commands::issued_to(&core.log, worker_id).await?;
+    Ok((journal, issued.saturating_add(1)))
+}
+
 /// Registers a worker's capabilities, refreshes the instance cache from its
 /// advertised warm instances, and runs a placement pass — a worker appearing
 /// (or changing) is exactly the moment a queued agent may become placeable.
@@ -527,6 +530,25 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(error, ServerError::Invalid(_)));
+    }
+
+    /// Both resume positions come from the log, so a fresh worker starts both
+    /// streams at one, and a worker with stored history resumes after it.
+    #[tokio::test]
+    async fn resume_positions_are_folded_from_the_log_not_remembered() {
+        let core = core();
+        let (journal, command) = super::resume_positions(&core, "worker-a")
+            .await
+            .expect("positions");
+        assert_eq!((journal, command), (1, 1), "a fresh worker starts at one");
+
+        ingest_batch(&core, "worker-a", vec![journaled("s1", 1, "k1")])
+            .await
+            .expect("ingest");
+        let (journal, _) = super::resume_positions(&core, "worker-a")
+            .await
+            .expect("positions");
+        assert_eq!(journal, 2, "the journal resumes after what is stored");
     }
 
     #[tokio::test]

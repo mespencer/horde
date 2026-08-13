@@ -9,15 +9,14 @@
 
 use horde_proto::v1::{
     AgentSpec, CreateWorkspaceDefinitionRequest, PlacementConstraints, PlacementState,
-    RegisterWorkerRequest, SessionCursor, SessionId, SpawnAgentRequest, StreamCommandsRequest,
-    SyncEventsRequest, WorkerCapabilities, WorkerId, event::Kind, stream_commands_response,
-    sync_events_response,
+    RegisterWorkerRequest, SessionId, SpawnAgentRequest, StreamCommandsRequest, WorkerCapabilities,
+    WorkerId, event::Kind, stream_commands_response, sync_events_response,
 };
 use tokio_stream::StreamExt;
 
 mod common;
 
-use common::{Harness, Setup, connect, seed};
+use common::{Harness, Setup, connect, open_sync, seed};
 
 /// One placement fact, as read back from the log.
 #[derive(Debug, PartialEq)]
@@ -35,20 +34,7 @@ async fn placements_until(
     session_id: &str,
     minimum: usize,
 ) -> Setup<Vec<Observed>> {
-    let mut stream = harness
-        .control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow: true,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(&mut harness.control, session_id, 0, true).await?;
 
     let mut observed = Vec::new();
     for _ in 0_u32..256 {

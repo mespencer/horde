@@ -12,10 +12,10 @@
 use horde_proto::v1::{
     AgentId, AgentOutputChannel, AgentOutputChunk, AgentSpec, CreateSessionRequest, Event,
     GetSessionRequest, JournaledEvent, JournaledEventBatch, ListSessionsRequest, PermissionOutcome,
-    PushEventsRequest, RegisterWorkerRequest, SessionCursor, SessionId, SpawnAgentRequest,
-    StreamCommandsRequest, SyncEventsRequest, WorkerCapabilities, WorkerId,
-    control_plane_service_client::ControlPlaneServiceClient, event::Kind, push_events_request,
-    push_events_response, stream_commands_response, sync_events_response,
+    PushEventsRequest, RegisterWorkerRequest, SessionId, SpawnAgentRequest, StreamCommandsRequest,
+    WorkerCapabilities, WorkerId, control_plane_service_client::ControlPlaneServiceClient,
+    event::Kind, push_events_request, push_events_response, stream_commands_response,
+    sync_events_response,
 };
 use tokio::io::DuplexStream;
 use tokio_stream::StreamExt;
@@ -23,7 +23,7 @@ use tonic::Code;
 
 mod common;
 
-use common::{Harness, Setup, connect_to, core, seed};
+use common::{Harness, Setup, connect_to, core, open_sync, seed};
 use horde_server::service::ServerCore;
 
 /// Opens a journal stream and announces the worker's journal position.
@@ -661,28 +661,6 @@ async fn an_agent_is_found_by_id_without_being_told_its_session() {
         .await
         .expect_err("an unknown agent must not resolve to some other session");
     assert_eq!(status.code(), Code::NotFound);
-}
-
-/// Opens a sync stream over one session from its beginning.
-async fn open_sync(
-    control: &mut ControlPlaneServiceClient<tonic::transport::Channel>,
-    session_id: &str,
-    from_sequence: u64,
-    follow: bool,
-) -> Setup<tonic::Streaming<horde_proto::v1::SyncEventsResponse>> {
-    Ok(control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner())
 }
 
 /// The reason on every `TurnInterrupted` recorded for a session.

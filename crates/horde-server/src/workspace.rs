@@ -184,6 +184,28 @@ pub fn normalized_repos(
         .collect()
 }
 
+/// One definition widened by one repo — `AddWorkspaceRepo`'s deliberate
+/// ceremony, as a pure function.
+///
+/// # Errors
+///
+/// [`ServerError::Invalid`] when no repo was supplied or the widened set does
+/// not validate (a duplicate name, a repo without a remote).
+pub fn widened_with(
+    current: WorkspaceDefinition,
+    repo: Option<horde_proto::v1::WorkspaceRepo>,
+) -> Result<WorkspaceDefinition, ServerError> {
+    let repo = repo.ok_or_else(|| ServerError::Invalid("a repo to add is required".to_owned()))?;
+    let mut repos = current.repos.clone();
+    repos.extend(normalized_repos(vec![repo]));
+    validate_definition(&current.name, &repos)?;
+    Ok(WorkspaceDefinition {
+        repos,
+        etag: String::new(),
+        ..current
+    })
+}
+
 /// Refuses an update whose repos add, remove, or repoint — the repo set is
 /// fixed at definition time and only `AddWorkspaceRepo` widens it. Layout
 /// paths are the one thing an update's repos may change.
@@ -457,6 +479,35 @@ mod tests {
         assert!(
             same_repo_set(&current, &repointed).is_err(),
             "repointing a remote is not a layout change"
+        );
+    }
+
+    /// Widening is the one sanctioned way the repo set grows, and it holds
+    /// the same bar creation does.
+    #[test]
+    fn widening_adds_one_valid_repo_and_refuses_the_rest() {
+        let current = WorkspaceDefinition {
+            name: "ws".to_owned(),
+            repos: vec![repo("a", "u1")],
+            ..definition("ws-1", "ws")
+        };
+
+        let widened =
+            widened_with(current.clone(), Some(repo("b", "u2"))).expect("a valid widening");
+        assert_eq!(widened.repos.len(), 2);
+        assert_eq!(
+            widened.repos[1].layout_path, "b",
+            "the added repo is normalized like any other"
+        );
+        assert_eq!(widened.etag, "", "the append stamps the fresh etag");
+
+        assert!(
+            widened_with(current.clone(), None).is_err(),
+            "no repo is not a widening"
+        );
+        assert!(
+            widened_with(current, Some(repo("a", "u3"))).is_err(),
+            "a duplicate name would make GitRef ambiguous"
         );
     }
 

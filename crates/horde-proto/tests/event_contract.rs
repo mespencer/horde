@@ -233,6 +233,21 @@ fn generated_event_kinds_are_exactly_the_context_vocabulary() {
     assert_eq!(sorted(from_rust.collect()), vocabulary());
 }
 
+/// The production name lookup reads the descriptor; this exhaustive match is
+/// the hand-written oracle it is held against, kind by kind. A drift between
+/// schema and lookup — a misdecoded tag, a missed oneof field — shows up here
+/// as the exact kind that misnamed itself.
+#[test]
+fn the_descriptor_lookup_names_every_kind_like_the_schema_does() {
+    for kind in every_kind() {
+        assert_eq!(
+            horde_proto::kind_field_name(&kind),
+            Some(kind_field_name(&kind)),
+            "the descriptor-derived name must match the declared field"
+        );
+    }
+}
+
 #[test]
 fn every_event_kind_survives_an_envelope_round_trip() {
     for kind in every_kind() {

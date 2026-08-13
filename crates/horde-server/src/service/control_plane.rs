@@ -44,7 +44,7 @@ use crate::scheduler::PlacementRequest;
 use crate::state::SessionState;
 use crate::workspace::{
     CATALOG_STREAM, WorkspaceCatalog, check_etag, is_catalog_stream, normalized_repos,
-    same_repo_set, validate_definition,
+    same_repo_set, validate_definition, widened_with,
 };
 
 /// Implements `horde.v1.ControlPlaneService`.
@@ -137,6 +137,22 @@ impl ControlPlane {
             .ok_or_else(|| ServerError::NoSuchWorkspace {
                 wanted: workspace_definition_id.to_owned(),
             })
+    }
+
+    /// The preamble every workspace mutation shares: resolve the id, fetch the
+    /// live definition, and enforce the optimistic-concurrency token. One
+    /// copy, so no mutation can forget the etag check.
+    async fn mutable_definition(
+        &self,
+        workspace_definition_id: Option<&horde_proto::v1::WorkspaceDefinitionId>,
+        etag: &str,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ServerError> {
+        let id = workspace_definition_id
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let current = self.required_definition(&id).await?;
+        check_etag(&current, etag)?;
+        Ok(current)
     }
 
     /// Projects a session, refusing one that has no events.
@@ -864,13 +880,10 @@ impl ControlPlaneService for ControlPlane {
         request: Request<UpdateWorkspaceDefinitionRequest>,
     ) -> Result<Response<UpdateWorkspaceDefinitionResponse>, Status> {
         let request = request.into_inner();
-        let id = request
-            .workspace_definition_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let current = self.required_definition(&id).await.map_err(Status::from)?;
-        check_etag(&current, &request.etag).map_err(Status::from)?;
+        let current = self
+            .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
+            .await
+            .map_err(Status::from)?;
 
         // Layout changes only: the update's repos may not add or remove.
         // An empty list means "unchanged" — proto3 cannot tell an omitted
@@ -922,30 +935,14 @@ impl ControlPlaneService for ControlPlane {
         request: Request<AddWorkspaceRepoRequest>,
     ) -> Result<Response<AddWorkspaceRepoResponse>, Status> {
         let request = request.into_inner();
-        let id = request
-            .workspace_definition_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let current = self.required_definition(&id).await.map_err(Status::from)?;
-        check_etag(&current, &request.etag).map_err(Status::from)?;
+        let current = self
+            .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
+            .await
+            .map_err(Status::from)?;
 
-        let repo = request.repo.ok_or_else(|| {
-            Status::from(ServerError::Invalid("a repo to add is required".to_owned()))
-        })?;
-        let mut repos = current.repos.clone();
-        repos.extend(normalized_repos(vec![repo]));
-        validate_definition(&current.name, &repos).map_err(Status::from)?;
-
+        let widened = widened_with(current, request.repo).map_err(Status::from)?;
         let stamped = self
-            .append_definition(
-                horde_proto::v1::WorkspaceDefinition {
-                    repos,
-                    etag: String::new(),
-                    ..current
-                },
-                false,
-            )
+            .append_definition(widened, false)
             .await
             .map_err(Status::from)?;
 
@@ -960,13 +957,10 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DeleteWorkspaceDefinitionRequest>,
     ) -> Result<Response<DeleteWorkspaceDefinitionResponse>, Status> {
         let request = request.into_inner();
-        let id = request
-            .workspace_definition_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let current = self.required_definition(&id).await.map_err(Status::from)?;
-        check_etag(&current, &request.etag).map_err(Status::from)?;
+        let current = self
+            .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
+            .await
+            .map_err(Status::from)?;
 
         self.append_definition(current, true)
             .await

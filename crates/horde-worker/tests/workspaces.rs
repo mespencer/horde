@@ -68,21 +68,51 @@ mod harness {
             etag: String::new(),
         }
     }
+
+    /// A manager whose root lives under this test's tempdir.
+    pub(crate) fn manager_under(temp: &Path) -> super::WorkspaceManager {
+        super::WorkspaceManager::new("worker-a", temp.join("workspaces"))
+    }
+
+    /// The `atlas`+`docs` definition most multi-repo tests want, with the
+    /// origins it points at.
+    pub(crate) fn two_repo_definition(temp: &Path) -> (WorkspaceDefinition, PathBuf, PathBuf) {
+        let atlas = origin(temp, "atlas");
+        let docs = origin(temp, "docs");
+        let definition = definition("ws-1", vec![repo("atlas", &atlas), repo("docs", &docs)]);
+        (definition, atlas, docs)
+    }
+
+    /// One already-materialized single-repo instance: the arrangement every
+    /// checkout-policy test starts from.
+    pub(crate) async fn materialized_atlas(
+        temp: &Path,
+    ) -> (
+        super::WorkspaceManager,
+        WorkspaceDefinition,
+        horde_proto::v1::WorkspaceInstanceReport,
+    ) {
+        let atlas = origin(temp, "atlas");
+        let manager = manager_under(temp);
+        let definition = definition("ws-1", vec![repo("atlas", &atlas)]);
+        let report = manager.materialize(&definition).await;
+        assert_eq!(
+            report.state,
+            super::WorkspaceInstanceState::Ready as i32,
+            "setup: {}",
+            report.detail
+        );
+        (manager, definition, report)
+    }
 }
 
 #[tokio::test]
 async fn materialize_clones_every_repo_and_reports_ready() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let docs = harness::origin(temp.path(), "docs");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
+    let (definition, atlas, _docs) = harness::two_repo_definition(temp.path());
+    let manager = harness::manager_under(temp.path());
 
-    let report = manager
-        .materialize(&harness::definition(
-            "ws-1",
-            vec![harness::repo("atlas", &atlas), harness::repo("docs", &docs)],
-        ))
-        .await;
+    let report = manager.materialize(&definition).await;
 
     assert_eq!(
         report.state,
@@ -128,12 +158,7 @@ async fn materialize_clones_every_repo_and_reports_ready() {
 #[tokio::test]
 async fn materializing_again_repairs_rather_than_erroring() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-
-    let first = manager.materialize(&definition).await;
-    assert_eq!(first.state, WorkspaceInstanceState::Ready as i32);
+    let (manager, definition, _first) = harness::materialized_atlas(temp.path()).await;
 
     let second = manager.materialize(&definition).await;
     assert_eq!(
@@ -152,7 +177,7 @@ async fn a_failing_repo_degrades_the_report_and_names_itself() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let atlas = harness::origin(temp.path(), "atlas");
     let missing = temp.path().join("no-such-origin");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
+    let manager = harness::manager_under(temp.path());
 
     let report = manager
         .materialize(&harness::definition(
@@ -184,13 +209,8 @@ async fn a_failing_repo_degrades_the_report_and_names_itself() {
 #[tokio::test]
 async fn a_worktree_checkout_composes_an_agent_private_root() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let docs = harness::origin(temp.path(), "docs");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
-    let definition = harness::definition(
-        "ws-1",
-        vec![harness::repo("atlas", &atlas), harness::repo("docs", &docs)],
-    );
+    let (definition, _atlas, _docs) = harness::two_repo_definition(temp.path());
+    let manager = harness::manager_under(temp.path());
     let instance = manager.materialize(&definition).await;
     assert_eq!(instance.state, WorkspaceInstanceState::Ready as i32);
 
@@ -231,10 +251,7 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
 #[tokio::test]
 async fn a_fresh_clone_checkout_is_a_full_clone() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    manager.materialize(&definition).await;
+    let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
     let checkout = manager
         .checkout("ws-1", "agent-1", CheckoutPolicy::FreshClone)
@@ -250,10 +267,7 @@ async fn a_fresh_clone_checkout_is_a_full_clone() {
 #[tokio::test]
 async fn a_shared_checkout_is_the_instance_itself() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let instance = manager.materialize(&definition).await;
+    let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
 
     let checkout = manager
         .checkout("ws-1", "agent-1", CheckoutPolicy::Shared)
@@ -267,7 +281,7 @@ async fn a_shared_checkout_is_the_instance_itself() {
 #[tokio::test]
 async fn a_checkout_without_a_materialized_instance_is_refused() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
+    let manager = harness::manager_under(temp.path());
 
     let refused = manager
         .checkout("ws-none", "agent-1", CheckoutPolicy::Worktree)
@@ -282,18 +296,17 @@ async fn a_checkout_without_a_materialized_instance_is_refused() {
 #[tokio::test]
 async fn warm_instances_report_what_is_actually_on_disk() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
     let root = temp.path().join("workspaces");
-    let manager = WorkspaceManager::new("worker-a", root.clone());
 
     assert!(
-        manager.warm_instances().await.is_empty(),
+        harness::manager_under(temp.path())
+            .warm_instances()
+            .await
+            .is_empty(),
         "an empty root advertises nothing"
     );
 
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    manager.materialize(&definition).await;
-
+    let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
     let warm = manager.warm_instances().await;
     assert_eq!(warm.len(), 1);
     assert_eq!(warm[0].state, WorkspaceInstanceState::Ready as i32);
@@ -326,10 +339,7 @@ async fn warm_instances_report_what_is_actually_on_disk() {
 #[tokio::test]
 async fn worktree_agents_share_history_but_not_working_trees() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let manager = WorkspaceManager::new("worker-a", temp.path().join("workspaces"));
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    manager.materialize(&definition).await;
+    let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
     let first = manager
         .checkout("ws-1", "agent-1", CheckoutPolicy::Worktree)

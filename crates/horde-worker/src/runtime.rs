@@ -1626,14 +1626,7 @@ mod tests {
             other => panic!("expected a workspace instance report, got {other:?}"),
         }
 
-        let mut spawn = spawn_command(2, "agent-1", "hello");
-        if let Some(Command::SpawnAgent(command)) = &mut spawn.command
-            && let Some(spec) = &mut command.spec
-        {
-            spec.workspace_definition_id =
-                Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1"));
-            spec.checkout_policy = horde_proto::v1::CheckoutPolicy::Worktree as i32;
-        }
+        let spawn = workspace_spawn(2, "agent-1", "ws-1");
         runtime.apply(spawn).await.expect("the spawn applies");
 
         assert_eq!(runtime.running_agents(), 1);
@@ -1650,26 +1643,30 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A spawn naming a workspace on a Worker with no workspace root fails
-    /// the *agent* honestly rather than the command loop.
-    #[tokio::test]
-    async fn a_workspace_spawn_without_support_fails_the_agent_honestly() {
-        let mut runtime = runtime_with(Script::echoing());
-        let mut spawn = spawn_command(1, "agent-1", "hello");
+    /// A spawn command whose spec names `workspace`, under the worktree
+    /// policy — the shape the server sends once placement chose this worker.
+    fn workspace_spawn(sequence: u64, agent: &str, workspace: &str) -> StreamCommandsResponse {
+        let mut spawn = spawn_command(sequence, agent, "hello");
         if let Some(Command::SpawnAgent(command)) = &mut spawn.command
             && let Some(spec) = &mut command.spec
         {
             spec.workspace_definition_id =
-                Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1"));
+                Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace));
+            spec.checkout_policy = horde_proto::v1::CheckoutPolicy::Worktree as i32;
         }
+        spawn
+    }
 
+    /// Applies a spawn that must fail the *agent* and not the command loop,
+    /// returning the journaled failure's reason for the caller to inspect.
+    async fn failed_spawn_reason(runtime: &mut Runtime, command: StreamCommandsResponse) -> String {
         runtime
-            .apply(spawn)
+            .apply(command)
             .await
             .expect("the command applies; the agent is what failed");
 
         assert_eq!(runtime.running_agents(), 0);
-        let events = journal_at_least(&runtime, 1).await;
+        let events = journal_at_least(runtime, 1).await;
         match events[0]
             .event
             .as_ref()
@@ -1680,14 +1677,22 @@ mod tests {
                     changed.state,
                     i32::from(horde_proto::v1::AgentLifecycleState::Failed)
                 );
-                assert!(
-                    changed.reason.contains("workspace"),
-                    "the reason names the missing half: {}",
-                    changed.reason
-                );
+                changed.reason.clone()
             }
             other => panic!("expected a failed lifecycle, got {other:?}"),
         }
+    }
+
+    /// A spawn naming a workspace on a Worker with no workspace root fails
+    /// the *agent* honestly rather than the command loop.
+    #[tokio::test]
+    async fn a_workspace_spawn_without_support_fails_the_agent_honestly() {
+        let mut runtime = runtime_with(Script::echoing());
+        let reason = failed_spawn_reason(&mut runtime, workspace_spawn(1, "agent-1", "ws-1")).await;
+        assert!(
+            reason.contains("workspace"),
+            "the reason names the missing half: {reason}"
+        );
     }
 
     /// A spawn that cannot start fails the *agent*, not the command loop: the
@@ -1703,30 +1708,10 @@ mod tests {
             });
         }
 
-        runtime
-            .apply(command)
-            .await
-            .expect("the command applies; the agent is what failed");
-
-        assert_eq!(runtime.running_agents(), 0);
-        let events = journal_at_least(&runtime, 1).await;
-        match events[0]
-            .event
-            .as_ref()
-            .and_then(|event| event.kind.as_ref())
-        {
-            Some(Kind::AgentLifecycleChanged(changed)) => {
-                assert_eq!(
-                    changed.state,
-                    i32::from(horde_proto::v1::AgentLifecycleState::Failed)
-                );
-                assert!(
-                    changed.reason.contains("codex"),
-                    "the reason names the missing adapter: {}",
-                    changed.reason
-                );
-            }
-            other => panic!("expected a failed lifecycle, got {other:?}"),
-        }
+        let reason = failed_spawn_reason(&mut runtime, command).await;
+        assert!(
+            reason.contains("codex"),
+            "the reason names the missing adapter: {reason}"
+        );
     }
 }

@@ -11,16 +11,16 @@ use horde_proto::v1::{
     GetWorkspaceDefinitionRequest, HelloRequest, ListSessionsRequest, ListWorkersRequest,
     ListWorkspaceDefinitionsRequest, MintEnrollmentCodeRequest, PrewarmWorkspaceRequest,
     QueryUsageRequest, RegisterWorkerRequest, ReportCapabilitiesRequest,
-    ReportWorkspaceInstancesRequest, RevokeEnrollmentRequest, SendMessageRequest, SessionCursor,
-    SessionId, SyncEventsRequest, UpdateWorkspaceDefinitionRequest, WorkerCapabilities, WorkerId,
-    send_message_request, sync_events_response,
+    ReportWorkspaceInstancesRequest, RevokeEnrollmentRequest, SendMessageRequest, SessionId,
+    UpdateWorkspaceDefinitionRequest, WorkerCapabilities, WorkerId, send_message_request,
+    sync_events_response,
 };
 use tokio_stream::StreamExt;
 use tonic::Code;
 
 mod common;
 
-use common::{Harness, Setup, connect, seed};
+use common::{Harness, Setup, connect, open_sync, seed};
 
 /// Every sequence in a session, read back through SyncEvents.
 async fn sequences(harness: &mut Harness, session_id: &str) -> Setup<Vec<u64>> {
@@ -40,20 +40,7 @@ async fn drain_sync<T>(
     session_id: &str,
     mut collect: impl FnMut(&horde_proto::v1::EventBatch, &mut Vec<T>),
 ) -> Setup<Vec<T>> {
-    let mut stream = harness
-        .control
-        .sync_events(SyncEventsRequest {
-            cursors: vec![SessionCursor {
-                session_id: Some(SessionId::new(session_id)),
-                from_sequence: 0,
-            }],
-            all_sessions: false,
-            subtree_root: None,
-            follow: false,
-            max_batch_events: 0,
-        })
-        .await?
-        .into_inner();
+    let mut stream = open_sync(&mut harness.control, session_id, 0, false).await?;
 
     let mut out = Vec::new();
     while let Some(message) = stream.next().await {
@@ -174,6 +161,21 @@ fn atlas_repo() -> horde_proto::v1::WorkspaceRepo {
     }
 }
 
+/// Fetches a definition by id, returning the whole response — the read every
+/// workspace assertion goes through.
+async fn get_by_id(
+    h: &mut Harness,
+    id: Option<&horde_proto::v1::WorkspaceDefinitionId>,
+) -> Result<horde_proto::v1::GetWorkspaceDefinitionResponse, tonic::Status> {
+    h.control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: id.cloned(),
+            name: String::new(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
 async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinition> {
     let created = h
         .control
@@ -189,6 +191,14 @@ async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefini
     Ok(created)
 }
 
+/// [`create_atlas`], returning the id the instance-facing tests key on.
+async fn created_atlas_id(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinitionId> {
+    create_atlas(h)
+        .await?
+        .workspace_definition_id
+        .ok_or_else(|| "a definition id".into())
+}
+
 #[tokio::test]
 async fn a_workspace_definition_round_trips_through_the_catalog() {
     let mut h = connect().await.expect("a harness");
@@ -200,15 +210,9 @@ async fn a_workspace_definition_round_trips_through_the_catalog() {
         "an unset layout path defaults to the repo's name"
     );
 
-    let fetched = h
-        .control
-        .get_workspace_definition(GetWorkspaceDefinitionRequest {
-            workspace_definition_id: created.workspace_definition_id.clone(),
-            name: String::new(),
-        })
+    let fetched = get_by_id(&mut h, created.workspace_definition_id.as_ref())
         .await
         .expect("get by id")
-        .into_inner()
         .definition
         .expect("a definition");
     assert_eq!(fetched, created, "the catalog returns what was created");
@@ -345,12 +349,7 @@ async fn workspace_mutations_enforce_the_etag() {
         .await
         .expect("delete with the fresh etag");
 
-    let gone = h
-        .control
-        .get_workspace_definition(GetWorkspaceDefinitionRequest {
-            workspace_definition_id: created.workspace_definition_id.clone(),
-            name: String::new(),
-        })
+    let gone = get_by_id(&mut h, created.workspace_definition_id.as_ref())
         .await
         .expect_err("a deleted definition is not found");
     assert_eq!(gone.code(), Code::NotFound);
@@ -361,11 +360,7 @@ async fn workspace_mutations_enforce_the_etag() {
 #[tokio::test]
 async fn reported_instances_appear_on_the_definition_they_materialize() {
     let mut h = connect().await.expect("a harness");
-    let created = create_atlas(&mut h).await.expect("create");
-    let definition_id = created
-        .workspace_definition_id
-        .clone()
-        .expect("a definition id");
+    let definition_id = created_atlas_id(&mut h).await.expect("create");
 
     let report = horde_proto::v1::WorkspaceInstanceReport {
         workspace_definition_id: Some(definition_id.clone()),
@@ -385,15 +380,9 @@ async fn reported_instances_appear_on_the_definition_they_materialize() {
         .await
         .expect("reporting instances is built now");
 
-    let instances = h
-        .control
-        .get_workspace_definition(GetWorkspaceDefinitionRequest {
-            workspace_definition_id: Some(definition_id.clone()),
-            name: String::new(),
-        })
+    let instances = get_by_id(&mut h, Some(&definition_id))
         .await
         .expect("get")
-        .into_inner()
         .instances;
     assert_eq!(instances, vec![report]);
 
@@ -406,15 +395,9 @@ async fn reported_instances_appear_on_the_definition_they_materialize() {
         })
         .await
         .expect("authoritative replacement");
-    let instances = h
-        .control
-        .get_workspace_definition(GetWorkspaceDefinitionRequest {
-            workspace_definition_id: Some(definition_id),
-            name: String::new(),
-        })
+    let instances = get_by_id(&mut h, Some(&definition_id))
         .await
         .expect("get")
-        .into_inner()
         .instances;
     assert!(
         instances.is_empty(),
@@ -427,11 +410,7 @@ async fn reported_instances_appear_on_the_definition_they_materialize() {
 #[tokio::test]
 async fn prewarm_targets_a_connected_worker_and_reports_materializing() {
     let mut h = connect().await.expect("a harness");
-    let created = create_atlas(&mut h).await.expect("create");
-    let definition_id = created
-        .workspace_definition_id
-        .clone()
-        .expect("a definition id");
+    let definition_id = created_atlas_id(&mut h).await.expect("create");
 
     let unplaced = h
         .control
