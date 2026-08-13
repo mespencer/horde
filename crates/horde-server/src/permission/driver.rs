@@ -141,8 +141,19 @@ impl ChainDriver {
     /// Runs until aborted, or until the notification channel closes — which a
     /// spawned driver never sees from inside (it holds a log clone itself),
     /// but a driver built over a receiver it does not feed still honors.
+    ///
+    /// The explicit yield is load-bearing, not politeness. `step` is where
+    /// this loop awaits, and a `step` that stops awaiting — a bug, or its
+    /// mutant — turns `run` into a poll that never returns, which nothing in
+    /// tokio can cancel: abort cannot preempt it and runtime shutdown blocks
+    /// on it. One yield per iteration keeps the loop cancellable no matter
+    /// what `step` degenerates into, which is what turns that mutant from a
+    /// suite-wide hang into an ordinary fast failure (QUALITY_GATES: a clock
+    /// cannot bound a loop that never yields).
     pub async fn run(mut self) {
-        while self.step().await {}
+        while self.step().await {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// One catch-up plus one park. `false` means the log is gone.
@@ -1111,7 +1122,14 @@ mod tests {
 
     /// The whole loop, live: a request appended after the driver started must
     /// come back decided, and dropping the log must end the task.
-    #[tokio::test]
+    ///
+    /// Multi-threaded on purpose. A mutant that hollows `step` out to `true`
+    /// turns `run` into a loop that never awaits, and on the current-thread
+    /// runtime that starves the very timer bounding this test — the mutant
+    /// records a timeout instead of a kill (QUALITY_GATES: a clock cannot
+    /// bound a loop that never yields). On a worker thread the spin keeps its
+    /// core, the timer fires, and the same mutant fails in seconds.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_running_driver_answers_a_request_appended_later() {
         let log = EventLog::in_memory().expect("log");
         let task = spawn(&log, Arc::new(cautious()), None);
