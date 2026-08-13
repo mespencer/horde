@@ -1042,11 +1042,16 @@ mod tests {
         // And it is still alive: the next real event arrives, exactly once.
         log.append(pending("s1", b"real")).await.expect("append");
         let batch = merged_batch_within(&mut tail).await;
-        let seen: Vec<(&str, u64)> = batch
+        assert_eq!(rows(&batch), vec![("s1".to_owned(), 2)]);
+    }
+
+    /// The `(session, sequence)` rows of one batch — what the lag tests
+    /// compare against.
+    fn rows(batch: &[super::StoredEvent]) -> Vec<(String, u64)> {
+        batch
             .iter()
-            .map(|event| (event.session_id.as_str(), event.sequence))
-            .collect();
-        assert_eq!(seen, vec![("s1", 2)]);
+            .map(|event| (event.session_id.clone(), event.sequence))
+            .collect()
     }
 
     /// Lag recovery must neither adopt the excluded stream nor rewind a
@@ -1074,13 +1079,9 @@ mod tests {
         log.append(pending("s1", b"b")).await.expect("append");
 
         let batch = merged_batch_within(&mut tail).await;
-        let seen: Vec<(&str, u64)> = batch
-            .iter()
-            .map(|event| (event.session_id.as_str(), event.sequence))
-            .collect();
         assert_eq!(
-            seen,
-            vec![("s1", 2)],
+            rows(&batch),
+            vec![("s1".to_owned(), 2)],
             "recovery must deliver only the new followed event — no catalog \
              adoption, and no re-delivery of event 1"
         );
