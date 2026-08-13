@@ -1,0 +1,23 @@
+[package]
+name = "horde-relay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The git backbone: the Server's bare-mirror Relay served over smart-HTTP, and share resolution — how a committed ref actually moves between two Agents' checkouts."
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
