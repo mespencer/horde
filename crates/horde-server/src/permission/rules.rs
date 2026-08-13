@@ -295,7 +295,10 @@ mod tests {
 
         assert!(rule.matches(&good, &ancestry));
         assert!(
-            !rule.matches(&call("Write", &[("command", text("git status"))]), &ancestry),
+            !rule.matches(
+                &call("Write", &[("command", text("git status"))]),
+                &ancestry
+            ),
             "wrong tool"
         );
         assert!(

@@ -198,9 +198,7 @@ async fn an_escalated_request_reaches_the_approver_enriched_and_still_answerable
             serde_json::json!({"file_path": "/etc/hosts", "content": "x"}),
             "toolu_escalated",
         )?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-            broker.respond(&identity, &prompt).await?,
-        )
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(broker.respond(&identity, &prompt).await?)
     });
 
     // The approver's view: the enriched re-raise, found by watching the log.
@@ -284,11 +282,10 @@ async fn a_remembered_answer_settles_the_repeat_without_a_human() {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         };
 
-        let (response, answered) =
-            within("the first ask is answered by the human", async move {
-                tokio::join!(respond, answer)
-            })
-            .await;
+        let (response, answered) = within("the first ask is answered by the human", async move {
+            tokio::join!(respond, answer)
+        })
+        .await;
         answered.expect("the answering side must succeed");
         response.expect("the agent must be unblocked")
     };

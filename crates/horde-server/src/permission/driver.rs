@@ -692,7 +692,11 @@ mod tests {
             "escalation is a human's question, never the chain's answer"
         );
         let requests = requests_in(&log, "s1").await;
-        assert_eq!(requests.len(), 2, "the original, then one enriched re-raise");
+        assert_eq!(
+            requests.len(),
+            2,
+            "the original, then one enriched re-raise"
+        );
 
         let enriched = &requests[1];
         assert_eq!(
@@ -816,8 +820,8 @@ mod tests {
         .await;
         append(&log, "s1", "req-1", requested("root", "req-1", None)).await;
 
-        let modes =
-            PermissionModes::default().with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()));
+        let modes = PermissionModes::default()
+            .with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()));
         driver_over(&log, modes, None)
             .catch_up()
             .await
@@ -879,7 +883,13 @@ mod tests {
             spawned("root", None, "judged", &["ci-fix"]),
         )
         .await;
-        append(log, "s1", "req-1", requested("root", "req-1", Some(tool_call))).await;
+        append(
+            log,
+            "s1",
+            "req-1",
+            requested("root", "req-1", Some(tool_call)),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1034,8 +1044,7 @@ mod tests {
         let repeat: Vec<_> = decisions
             .iter()
             .filter(|decision| {
-                decision.request_id.as_ref().map(ToString::to_string)
-                    == Some("req-2".to_owned())
+                decision.request_id.as_ref().map(ToString::to_string) == Some("req-2".to_owned())
             })
             .collect();
         assert_eq!(repeat.len(), 1, "the repeat is settled by the chain");
@@ -1085,15 +1094,23 @@ mod tests {
     async fn an_idle_driver_parks_instead_of_spinning() {
         let log = EventLog::in_memory().expect("log");
         append(&log, "s1", "spawn", spawned("root", None, "", &["ci-fix"])).await;
-        append(&log, "s1", "req", requested("root", "req-1", Some(call("Read", "/x")))).await;
+        append(
+            &log,
+            "s1",
+            "req",
+            requested("root", "req-1", Some(call("Read", "/x"))),
+        )
+        .await;
         append(&log, "s1", "human", human_decided("root", "req-1", false)).await;
 
         let mut driver = driver_over(&log, PermissionModes::default(), None);
         assert_eq!(driver.parks(), 0);
 
-        let idle =
-            tokio::time::timeout(std::time::Duration::from_millis(200), driver.step()).await;
-        assert!(idle.is_err(), "everything is settled, so nothing may arrive");
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(200), driver.step()).await;
+        assert!(
+            idle.is_err(),
+            "everything is settled, so nothing may arrive"
+        );
         assert_eq!(
             driver.parks(),
             1,

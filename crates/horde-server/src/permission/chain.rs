@@ -99,10 +99,16 @@ pub struct Consultation<'a> {
 /// either outcome — both defaults are wrong in a way that hides itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JudgeRuling {
-    Allow { rationale: String },
-    Deny { rationale: String },
+    Allow {
+        rationale: String,
+    },
+    Deny {
+        rationale: String,
+    },
     /// The instructions do not settle this call, or the judge could not run.
-    Abstain { rationale: String },
+    Abstain {
+        rationale: String,
+    },
 }
 
 /// The Policy Judge seam: a cheap model applying a mode's plain-text

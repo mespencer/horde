@@ -480,8 +480,7 @@ mod permission_fold_tests {
     use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
     use horde_proto::v1::{
         AgentId, Event, PermissionDecided, PermissionDecision, PermissionOutcome,
-        PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall,
-        event::Kind,
+        PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall, event::Kind,
     };
     use prost::Message;
 

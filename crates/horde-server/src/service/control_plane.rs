@@ -84,8 +84,13 @@ impl ControlPlane {
     ) -> Result<u64, ServerError> {
         // Shared with the permission chain: one append shape, one place the
         // kind-collision refusal lives.
-        crate::service::shared::append_server_event(&self.core.log, session_id, idempotency_key, event)
-            .await
+        crate::service::shared::append_server_event(
+            &self.core.log,
+            session_id,
+            idempotency_key,
+            event,
+        )
+        .await
     }
 
     /// Projects a session, refusing one that has no events.
