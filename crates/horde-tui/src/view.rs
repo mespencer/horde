@@ -238,3 +238,44 @@ fn session_footer(pending: &[PendingPermission]) -> String {
 fn clipped(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::state::PendingPermission;
+
+    use super::prompt_panel;
+
+    fn pending(request_id: &str) -> PendingPermission {
+        PendingPermission {
+            request_id: request_id.to_owned(),
+            agent_id: "agent-1".to_owned(),
+            tree_path: Vec::new(),
+            rendered: "ls".to_owned(),
+            mode: String::new(),
+            sequence: 1,
+        }
+    }
+
+    /// Asserted here rather than left to the screen snapshots, because on an
+    /// 80-column screen a long prompt pushes the suffix past the right edge —
+    /// where every miscounted variant clips to the same pixels.
+    #[test]
+    fn the_prompt_panel_counts_only_what_it_hides() {
+        assert!(
+            prompt_panel(&[]).is_empty(),
+            "no panel row when nothing waits"
+        );
+
+        let one = prompt_panel(&[pending("a")]);
+        assert!(
+            !one.concat().contains("more"),
+            "a lone prompt hides nothing, so it counts nothing: {one:?}"
+        );
+
+        let two = prompt_panel(&[pending("a"), pending("b")]);
+        assert!(
+            two.concat().contains("(+1 more)"),
+            "two waiting means one hidden: {two:?}"
+        );
+    }
+}

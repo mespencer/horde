@@ -701,6 +701,26 @@ mod tests {
         assert_eq!(state.title, "renamed");
     }
 
+    /// Both halves of the root rule, separately: a child arriving first must
+    /// not claim the slot, and a second parentless spawn must not steal it.
+    #[test]
+    fn the_root_slot_takes_only_the_first_parentless_spawn() {
+        let mut state = SessionState::new("s1");
+        spawn_into(&mut state, 1, "child-early", Some("root-later"), &[]);
+        assert_eq!(
+            state.root_agent_id, None,
+            "a child seen before any root is not the root"
+        );
+        spawn_into(&mut state, 2, "root-1", None, &["ci-fix"]);
+        assert_eq!(state.root_agent_id.as_deref(), Some("root-1"));
+        spawn_into(&mut state, 3, "impostor", None, &["impostor"]);
+        assert_eq!(
+            state.root_agent_id.as_deref(),
+            Some("root-1"),
+            "the root slot is not reassigned"
+        );
+    }
+
     #[test]
     fn a_root_spawn_with_no_tree_path_leaves_the_session_nameless() {
         let mut state = SessionState::new("s1");

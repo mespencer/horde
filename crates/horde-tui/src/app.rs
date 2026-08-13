@@ -887,6 +887,45 @@ mod tests {
         );
     }
 
+    /// Three rows, because two cannot tell "step forward" from "always 1".
+    #[test]
+    fn inbox_selection_moves_both_ways_and_clamps_at_both_ends() {
+        let mut app = two_sessions();
+        app.apply(event_in("s1", 2, "root-1", request_kind("req-a")));
+        app.apply(event_in("s1", 3, "root-1", request_kind("req-b")));
+        app.on_input(&key(KeyCode::Char('i')));
+
+        assert_eq!(app.inbox_selected(), 0, "selection starts at the oldest");
+        app.on_input(&key(KeyCode::Down));
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.inbox_selected(), 2);
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.inbox_selected(), 2, "the last row is the floor");
+        app.on_input(&key(KeyCode::Up));
+        assert_eq!(app.inbox_selected(), 1);
+        app.on_input(&key(KeyCode::Char('k')));
+        assert_eq!(app.inbox_selected(), 0);
+        app.on_input(&key(KeyCode::Char('k')));
+        assert_eq!(app.inbox_selected(), 0, "the top is the top");
+    }
+
+    #[test]
+    fn q_quits_from_the_inbox_too() {
+        let mut app = App::overview();
+        app.on_input(&key(KeyCode::Char('i')));
+        app.on_input(&key(KeyCode::Char('q')));
+        assert!(app.should_quit());
+    }
+
+    /// A control chord that is not one of the bound ones must do nothing at
+    /// all — in particular it must not shed its modifier and type its letter.
+    #[test]
+    fn an_unbound_control_chord_is_not_text() {
+        let mut app = App::attached("s1", None);
+        assert!(app.on_input(&ctrl('a')).is_empty());
+        assert_eq!(app.input(), "", "ctrl-a must not type an a");
+    }
+
     #[test]
     fn the_inbox_attaches_to_the_selected_escalations_session() {
         let mut app = two_sessions();
