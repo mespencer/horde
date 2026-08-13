@@ -177,3 +177,98 @@ async fn plaintext_and_missing_identities_are_refused_not_degraded() -> Setup<()
     );
     Ok(())
 }
+
+/// How many mints and revocations the enrollment stream holds.
+async fn enrollment_counts(client: &mut horde_cli::Client) -> Setup<(u32, u32)> {
+    let mut counts = (0_u32, 0_u32);
+    client
+        .sync(
+            &horde_cli::client::SyncOptions::new(horde_server::enrollment::ENROLLMENT_STREAM),
+            |envelope| {
+                let kind = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                    .and_then(horde_proto::kind_field_name);
+                match kind {
+                    Some("enrollment_code_minted") => counts.0 += 1,
+                    Some("enrollment_revoked") => counts.1 += 1,
+                    _ => {}
+                }
+            },
+            |_| {},
+        )
+        .await?;
+    Ok(counts)
+}
+
+/// Every enrollment verb, through the same `cli::run` dispatch the binary
+/// uses, asserted by its effect on the enrollment stream — a verb that
+/// quietly did nothing also returns `Ok`, and only the log can tell.
+#[tokio::test]
+async fn the_enrollment_verbs_dispatch_with_real_effects() -> Setup<()> {
+    let harness = serve_secured().await?;
+
+    // An enrolled client identity on disk, for the --identity flag.
+    let identity_dir = tempfile::tempdir()?;
+    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    identity.save(identity_dir.path())?;
+    let identity_flag = identity_dir.path().to_string_lossy().into_owned();
+    let base = [
+        "--endpoint",
+        &harness.main_endpoint(),
+        "--identity",
+        &identity_flag,
+    ];
+
+    let mut reader = harness.client(&identity).await?;
+    let (minted_before, _) = enrollment_counts(&mut reader).await?;
+
+    // `horde worker enroll` mints a worker code.
+    within(
+        "the worker enroll verb",
+        invoke(&[&base[..], &["worker", "enroll", "gpu-box"]].concat()),
+    )
+    .await??;
+    // `horde enroll client` mints a client code.
+    within(
+        "the enroll client verb",
+        invoke(&[&base[..], &["enroll", "client", "other-laptop"]].concat()),
+    )
+    .await??;
+    let (minted_after, revoked_before) = enrollment_counts(&mut reader).await?;
+    assert_eq!(
+        minted_after,
+        minted_before + 2,
+        "each mint verb journals exactly one code"
+    );
+
+    // Enroll a worker for real, then `horde worker revoke` it.
+    harness.enroll(PrincipalRole::Worker, "gpu-box").await?;
+    within(
+        "the worker revoke verb",
+        invoke(
+            &[
+                &base[..],
+                &["worker", "revoke", "gpu-box", "--reason", "test"],
+            ]
+            .concat(),
+        ),
+    )
+    .await??;
+    // `horde enroll revoke-client` on a name with nothing active: a no-op
+    // that still runs its arm and journals nothing.
+    within(
+        "the revoke-client verb",
+        invoke(&[&base[..], &["enroll", "revoke-client", "never-joined"]].concat()),
+    )
+    .await??;
+
+    let (_, revoked_after) = enrollment_counts(&mut reader).await?;
+    assert_eq!(
+        revoked_after,
+        revoked_before + 1,
+        "revoking an enrolled worker journals; revoking nobody journals nothing"
+    );
+    Ok(())
+}

@@ -82,6 +82,94 @@ pub enum Invocation {
     Serve(Box<ServeConfig>),
 }
 
+/// What the flags said, before the shape rules are applied.
+#[derive(Debug, Default)]
+struct ParsedFlags {
+    database: Option<String>,
+    serve: bool,
+    state_dir: Option<PathBuf>,
+    bind: Option<SocketAddr>,
+    enrollment_bind: Option<SocketAddr>,
+    subject_names: Vec<String>,
+}
+
+impl ParsedFlags {
+    /// Folds one argument (consuming its value from `arguments` if it takes
+    /// one) into the parse.
+    fn apply(
+        &mut self,
+        argument: &str,
+        arguments: &mut impl Iterator<Item = String>,
+    ) -> Result<(), String> {
+        let mut value_of = |flag: &str| {
+            arguments
+                .next()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match argument {
+            "--serve" => self.serve = true,
+            "--state-dir" => self.state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
+            "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
+            "--enrollment-bind" => {
+                self.enrollment_bind = Some(parse_bind(
+                    "--enrollment-bind",
+                    &value_of("--enrollment-bind")?,
+                )?);
+            }
+            "--san" => self.subject_names.push(value_of("--san")?),
+            other => return self.apply_bare(other),
+        }
+        Ok(())
+    }
+
+    /// An argument that is not a known flag: the one positional (the
+    /// database path), or a refusal naming what it was.
+    fn apply_bare(&mut self, argument: &str) -> Result<(), String> {
+        if argument.starts_with("--") {
+            return Err(format!("unknown flag {argument}"));
+        }
+        if self.database.is_none() && !argument.trim().is_empty() {
+            self.database = Some(argument.to_owned());
+            return Ok(());
+        }
+        Err(format!("unexpected argument {argument}"))
+    }
+
+    /// Applies the shape rules and defaults, yielding the invocation.
+    fn conclude(self) -> Result<Invocation, String> {
+        let database = self.database.unwrap_or_else(|| DEFAULT_DATABASE.to_owned());
+        if !self.serve {
+            if self.bind.is_some() || self.enrollment_bind.is_some() || self.state_dir.is_some() {
+                return Err("--bind, --enrollment-bind and --state-dir need --serve".to_owned());
+            }
+            return Ok(Invocation::CheckOnly { database });
+        }
+        Ok(Invocation::Serve(Box::new(ServeConfig {
+            database,
+            state_dir: self
+                .state_dir
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
+            // Loopback defaults: binding wider is a deliberate act, exactly
+            // as before mTLS existed — the difference is that now it works.
+            bind: self
+                .bind
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7777))),
+            enrollment_bind: self
+                .enrollment_bind
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7778))),
+            subject_names: self.subject_names,
+        })))
+    }
+}
+
+/// A bind flag's value as an address, refused with the flag's own name.
+fn parse_bind(flag: &str, value: &str) -> Result<SocketAddr, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} {value} is not an address:port"))
+}
+
 /// Parses the command line.
 ///
 /// Pure so every flag combination is testable without a process. Unknown
@@ -92,68 +180,12 @@ pub enum Invocation {
 ///
 /// A human-readable refusal naming the flag that was wrong.
 pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
-    let mut database: Option<String> = None;
-    let mut serve = false;
-    let mut state_dir: Option<PathBuf> = None;
-    let mut bind: Option<SocketAddr> = None;
-    let mut enrollment_bind: Option<SocketAddr> = None;
-    let mut subject_names = Vec::new();
-
+    let mut flags = ParsedFlags::default();
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
-        let mut value_of = |flag: &str| {
-            arguments
-                .next()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| format!("{flag} needs a value"))
-        };
-        match argument.as_str() {
-            "--serve" => serve = true,
-            "--state-dir" => state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
-            "--bind" => {
-                let value = value_of("--bind")?;
-                bind = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("--bind {value} is not an address:port"))?,
-                );
-            }
-            "--enrollment-bind" => {
-                let value = value_of("--enrollment-bind")?;
-                enrollment_bind =
-                    Some(value.parse().map_err(|_| {
-                        format!("--enrollment-bind {value} is not an address:port")
-                    })?);
-            }
-            "--san" => subject_names.push(value_of("--san")?),
-            flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag {flag}"));
-            }
-            positional if database.is_none() && !positional.trim().is_empty() => {
-                database = Some(positional.to_owned());
-            }
-            _ => return Err(format!("unexpected argument {argument}")),
-        }
+        flags.apply(&argument, &mut arguments)?;
     }
-
-    let database = database.unwrap_or_else(|| DEFAULT_DATABASE.to_owned());
-    if !serve {
-        if bind.is_some() || enrollment_bind.is_some() || state_dir.is_some() {
-            return Err("--bind, --enrollment-bind and --state-dir need --serve".to_owned());
-        }
-        return Ok(Invocation::CheckOnly { database });
-    }
-
-    Ok(Invocation::Serve(Box::new(ServeConfig {
-        database,
-        state_dir: state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
-        // Loopback defaults: binding wider is a deliberate act, exactly as
-        // it was before mTLS existed — the difference is that now it works.
-        bind: bind.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7777))),
-        enrollment_bind: enrollment_bind
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7778))),
-        subject_names,
-    })))
+    flags.conclude()
 }
 
 /// The listener credential's names: the defaults plus whatever the operator
@@ -201,28 +233,13 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let log = open_log(&config.database)?;
     let now = wall_clock_ms();
 
-    let ca_dir = config.state_dir.join("ca");
-    let ca = if CertificateAuthority::exists(&ca_dir) {
-        CertificateAuthority::load(&ca_dir).map_err(identity_startup)?
-    } else {
-        let ca = CertificateAuthority::generate(now).map_err(identity_startup)?;
-        ca.persist(&ca_dir).map_err(identity_startup)?;
-        ca
-    };
-
+    let ca = ca_for(&config.state_dir.join("ca"), now)?;
     let (dns, ips) = credential_names(&config.subject_names);
     let credential = ca.issue_server(now, &dns, &ips).map_err(identity_startup)?;
     let server_fingerprint = credential.fingerprint().map_err(identity_startup)?;
 
     let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
-
-    let bootstrap_code = if authority.any_client_enrolled().await? {
-        None
-    } else {
-        let operator = Principal::new(PrincipalRole::Client, BOOTSTRAP_CLIENT_NAME)
-            .map_err(identity_startup)?;
-        Some(authority.mint(&operator, 0, now).await?)
-    };
+    let bootstrap_code = bootstrap_code_if_unclaimed(&authority, now).await?;
 
     let core = ServerCore::new(log);
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
@@ -234,6 +251,46 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         server_fingerprint,
         bootstrap_code,
     })
+}
+
+/// The persisted CA, or a fresh one persisted on first start.
+fn ca_for(ca_dir: &std::path::Path, now: i64) -> Result<CertificateAuthority, ServerError> {
+    if CertificateAuthority::exists(ca_dir) {
+        return CertificateAuthority::load(ca_dir).map_err(identity_startup);
+    }
+    let ca = CertificateAuthority::generate(now).map_err(identity_startup)?;
+    ca.persist(ca_dir).map_err(identity_startup)?;
+    Ok(ca)
+}
+
+/// The bootstrap answer (DESIGN §3 gap, decided here): a first client code,
+/// minted exactly when no client holds an active certificate.
+async fn bootstrap_code_if_unclaimed(
+    authority: &EnrollmentAuthority,
+    now: i64,
+) -> Result<Option<MintedCode>, ServerError> {
+    if authority.any_client_enrolled().await? {
+        return Ok(None);
+    }
+    let operator =
+        Principal::new(PrincipalRole::Client, BOOTSTRAP_CLIENT_NAME).map_err(identity_startup)?;
+    Ok(Some(authority.mint(&operator, 0, now).await?))
+}
+
+/// The stdout lines `--serve` owes the operator: stable, greppable keys —
+/// the addresses, the fingerprint every join pins, and the bootstrap code
+/// when one was minted.
+#[must_use]
+pub fn operator_lines(running: &RunningServer) -> Vec<String> {
+    let mut lines = vec![
+        format!("listening main={}", running.main.addr),
+        format!("listening enrollment={}", running.enrollment.addr),
+        format!("server-fingerprint {}", running.server_fingerprint),
+    ];
+    if let Some(code) = &running.bootstrap_code {
+        lines.push(format!("bootstrap-client-code {}", code.join_code()));
+    }
+    lines
 }
 
 fn identity_startup(error: horde_identity::IdentityError) -> ServerError {
@@ -429,6 +486,23 @@ mod tests {
         assert!(
             horde_identity::CertificateAuthority::exists(&config.state_dir.join("ca")),
             "the CA must persist, or a restart orphans every certificate"
+        );
+
+        // The operator interface, exactly as the binary will print it.
+        let lines = super::operator_lines(&running);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], format!("listening main={}", running.main.addr));
+        assert_eq!(
+            lines[1],
+            format!("listening enrollment={}", running.enrollment.addr)
+        );
+        assert_eq!(
+            lines[2],
+            format!("server-fingerprint {}", running.server_fingerprint)
+        );
+        assert_eq!(
+            lines[3],
+            format!("bootstrap-client-code {}", code.join_code())
         );
         drop(running);
 

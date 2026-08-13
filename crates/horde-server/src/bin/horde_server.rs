@@ -52,25 +52,29 @@ fn main() -> ExitCode {
     }
 }
 
-/// Serves until ctrl-c. The stdout lines are the operator interface: stable,
-/// greppable keys — the addresses, the fingerprint every join pins, and the
-/// bootstrap code when one was minted.
+/// Serves until ctrl-c. What is printed is decided in
+/// [`horde_server::startup::operator_lines`], where it is tested; this stays
+/// plumbing an exit code, like `main`.
 async fn serve_until_interrupted(config: &horde_server::startup::ServeConfig) -> ExitCode {
-    let running = match serve(config).await {
-        Ok(running) => running,
+    match serve(config).await {
         Err(error) => {
             tracing::error!(%error, "horde-server failed to start");
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-    };
-
-    println!("listening main={}", running.main.addr);
-    println!("listening enrollment={}", running.enrollment.addr);
-    println!("server-fingerprint {}", running.server_fingerprint);
-    if let Some(code) = &running.bootstrap_code {
-        println!("bootstrap-client-code {}", code.join_code());
+        Ok(running) => announce_and_wait(running).await,
     }
+}
 
+/// Prints the operator interface, then holds the server up until shutdown.
+async fn announce_and_wait(running: horde_server::startup::RunningServer) -> ExitCode {
+    for line in horde_server::startup::operator_lines(&running) {
+        println!("{line}");
+    }
+    wait_for_shutdown().await
+}
+
+/// Blocks on ctrl-c; the running server lives exactly as long as this does.
+async fn wait_for_shutdown() -> ExitCode {
     match tokio::signal::ctrl_c().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
