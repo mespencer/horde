@@ -124,32 +124,18 @@ mod suite {
     /// machine boundary, over a real served Relay.
     #[tokio::test]
     async fn a_cross_worker_share_travels_through_the_relay() {
-        let scratch = tempfile::tempdir().expect("a scratch dir");
-        let origin = within("origin init", init_repo(scratch.path(), "origin")).await;
-        let origin_url = origin.display().to_string();
-        // Each "Worker" has its own clone; the ids differ, the disk does not
-        // — which is exactly why resolution keys on the Worker, not the path.
-        let sender_repo = within(
-            "w1 clone",
-            crate::common::harness::clone_to(scratch.path(), &origin_url, "w1"),
+        let workers = within(
+            "the two-worker arrangement",
+            crate::common::harness::two_workers(),
         )
         .await;
-        let receiver_repo = within(
-            "w2 clone",
-            crate::common::harness::clone_to(scratch.path(), &origin_url, "w2"),
-        )
-        .await;
+        let (sender_repo, receiver_repo) = (&workers.sender_repo, &workers.receiver_repo);
+        let shared = workers.senders_commit.clone();
 
-        let shared = within(
-            "the sender commits",
-            commit_file(&sender_repo, "relay.rs", "pub mod relay;", "add relay"),
-        )
-        .await;
-
-        let sender = within("sender view", CheckoutView::observe("w1", &sender_repo))
+        let sender = within("sender view", CheckoutView::observe("w1", sender_repo))
             .await
             .expect("a checkout");
-        let receiver = within("receiver view", CheckoutView::observe("w2", &receiver_repo))
+        let receiver = within("receiver view", CheckoutView::observe("w2", receiver_repo))
             .await
             .expect("a checkout");
         let route = resolve_route("atlas", &sender, &receiver);
@@ -160,12 +146,12 @@ mod suite {
             }
         );
 
-        let (server, store, _mirrors) = serve_relay(&[("atlas", &origin)]).await;
+        let (server, store, _mirrors) = serve_relay(&[("atlas", &workers.origin)]).await;
         let relay = server.location();
 
         within(
             "stage",
-            stage_share(&sender_repo, &route, Some(&relay), &shared),
+            stage_share(sender_repo, &route, Some(&relay), &shared),
         )
         .await
         .expect("the push through the relay");
@@ -181,12 +167,12 @@ mod suite {
 
         within(
             "obtain",
-            obtain_share(&receiver_repo, &route, Some(&relay), &shared),
+            obtain_share(receiver_repo, &route, Some(&relay), &shared),
         )
         .await
         .expect("the fetch through the relay");
         assert!(
-            within("w2 now has it", has_commit(&receiver_repo, &shared)).await,
+            within("w2 now has it", has_commit(receiver_repo, &shared)).await,
             "the commit must arrive on the other Worker"
         );
     }
@@ -217,26 +203,15 @@ mod suite {
     /// somebody else's work as this share.
     #[tokio::test]
     async fn a_share_ref_naming_the_wrong_commit_is_refused() {
-        let scratch = tempfile::tempdir().expect("a scratch dir");
-        let origin = within("origin init", init_repo(scratch.path(), "origin")).await;
-        let origin_url = origin.display().to_string();
-        let sender_repo = within(
-            "w1 clone",
-            crate::common::harness::clone_to(scratch.path(), &origin_url, "w1"),
+        let workers = within(
+            "the two-worker arrangement",
+            crate::common::harness::two_workers(),
         )
         .await;
-        let receiver_repo = within(
-            "w2 clone",
-            crate::common::harness::clone_to(scratch.path(), &origin_url, "w2"),
-        )
-        .await;
-
-        let decoy = within(
-            "a decoy commit",
-            commit_file(&sender_repo, "decoy.rs", "// decoy", "decoy"),
-        )
-        .await;
-        let (server, _store, _mirrors) = serve_relay(&[("atlas", &origin)]).await;
+        // The sender's real commit becomes the decoy: it exists, it travels,
+        // and it is not the commit the share ref will claim to hold.
+        let decoy = workers.senders_commit.clone();
+        let (server, _store, _mirrors) = serve_relay(&[("atlas", &workers.origin)]).await;
         let relay = server.location();
 
         // Poison the ref by hand: push the decoy under the ABSENT commit's
@@ -245,7 +220,7 @@ mod suite {
         within(
             "the poisoned push",
             git_in(
-                &sender_repo,
+                &workers.sender_repo,
                 &["push", &url, &format!("{decoy}:refs/horde/share/{ABSENT}")],
             ),
         )
@@ -256,7 +231,7 @@ mod suite {
         };
         let obtained = within(
             "obtain notices",
-            obtain_share(&receiver_repo, &route, Some(&relay), ABSENT),
+            obtain_share(&workers.receiver_repo, &route, Some(&relay), ABSENT),
         )
         .await;
         assert!(

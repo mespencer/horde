@@ -274,6 +274,14 @@ mod tests {
         );
     }
 
+    /// The boundary itself: a status line with no path after the `XY ` prefix
+    /// must yield nothing, not an empty path. Porcelain never writes such a
+    /// line, which is exactly why only a boundary test can hold the `>`.
+    #[test]
+    fn a_line_too_short_to_carry_a_path_yields_no_path() {
+        assert_eq!(uncommitted_paths(" M "), Vec::<String>::new());
+    }
+
     /// The message is the feature: it must carry the rule and the paths.
     #[test]
     fn the_uncommitted_error_says_commit_then_share_and_names_the_paths() {

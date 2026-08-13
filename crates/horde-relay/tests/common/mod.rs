@@ -20,10 +20,10 @@ pub(crate) mod harness {
 
     /// Runs `future` with a ceiling, failing the test if it does not finish.
     pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-        match tokio::time::timeout(CEILING, future).await {
-            Ok(value) => value,
-            Err(_) => panic!("{what} must finish rather than hang"),
-        }
+        let Ok(value) = tokio::time::timeout(CEILING, future).await else {
+            panic!("{what} did not finish within {CEILING:?} — a hang, not a slow machine");
+        };
+        value
     }
 
     /// Runs git in `dir` for fixture-building, requiring success.
@@ -112,6 +112,77 @@ pub(crate) mod harness {
             .await
             .expect("git spawns")
             .success()
+    }
+
+    /// The cross-Worker arrangement: an upstream, one clone per "Worker",
+    /// and a commit only the sender has.
+    ///
+    /// The two clones sit on one real disk; what makes them different
+    /// Workers is the id their `CheckoutView` is observed under — which is
+    /// exactly why resolution keys on the Worker, not the path.
+    pub(crate) struct TwoWorkers {
+        /// Holds every repo below; dropping it deletes them.
+        pub(crate) scratch: tempfile::TempDir,
+        pub(crate) origin: PathBuf,
+        pub(crate) sender_repo: PathBuf,
+        pub(crate) receiver_repo: PathBuf,
+        /// Committed in the sender's clone and pushed nowhere.
+        pub(crate) senders_commit: String,
+    }
+
+    pub(crate) async fn two_workers() -> TwoWorkers {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let origin = init_repo(scratch.path(), "origin").await;
+        let origin_url = origin.display().to_string();
+        let sender_repo = clone_to(scratch.path(), &origin_url, "w1").await;
+        let receiver_repo = clone_to(scratch.path(), &origin_url, "w2").await;
+        let senders_commit = commit_file(
+            &sender_repo,
+            "shared.rs",
+            "pub struct Shared;",
+            "the sender's work",
+        )
+        .await;
+        TwoWorkers {
+            scratch,
+            origin,
+            sender_repo,
+            receiver_repo,
+            senders_commit,
+        }
+    }
+
+    /// A served Relay for `atlas` over a fresh upstream, plus one clone made
+    /// through it — the arrangement every write-path relay test starts from.
+    pub(crate) struct RelayedClone {
+        /// Holds the upstream and the clone.
+        pub(crate) scratch: tempfile::TempDir,
+        /// Holds the mirrors; dropped last of the two tempdirs.
+        pub(crate) mirrors: tempfile::TempDir,
+        pub(crate) origin: PathBuf,
+        pub(crate) server: horde_relay::RelayServer,
+        pub(crate) store: std::sync::Arc<horde_relay::MirrorStore>,
+        /// `origin` cloned through the relay, so the mirror is materialized.
+        pub(crate) clone: PathBuf,
+        /// The relay-side URL of `atlas`.
+        pub(crate) url: String,
+    }
+
+    pub(crate) async fn relay_with_clone() -> RelayedClone {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let origin = init_repo(scratch.path(), "origin").await;
+        let (server, store, mirrors) = serve_relay(&[("atlas", &origin)]).await;
+        let url = server.location().repo_url("atlas");
+        let clone = clone_to(scratch.path(), &url, "clone").await;
+        RelayedClone {
+            scratch,
+            mirrors,
+            origin,
+            server,
+            store,
+            clone,
+            url,
+        }
     }
 
     /// A served Relay over a fresh store, with `repos` registered.

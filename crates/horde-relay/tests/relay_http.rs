@@ -54,27 +54,26 @@ mod suite {
     /// clone sees it — the Relay is a real remote, not a read-only cache.
     #[tokio::test]
     async fn a_push_through_the_relay_reaches_the_mirror_and_later_clones() {
-        let scratch = tempfile::tempdir().expect("a scratch dir");
-        let origin = within("origin init", init_repo(scratch.path(), "origin")).await;
-        let (server, store, _mirrors) = serve_relay(&[("atlas", &origin)]).await;
-        let url = server.location().repo_url("atlas");
-
-        let clone = within("clone via relay", clone_to(scratch.path(), &url, "writer")).await;
+        let fixture = within(
+            "the relayed arrangement",
+            crate::common::harness::relay_with_clone(),
+        )
+        .await;
         let pushed = within(
             "a commit lands in the clone",
-            commit_file(&clone, "feature.rs", "pub fn f() {}", "add feature"),
+            commit_file(&fixture.clone, "feature.rs", "pub fn f() {}", "add feature"),
         )
         .await;
         within(
             "push via relay",
-            git_in(&clone, &["push", "origin", "main"]),
+            git_in(&fixture.clone, &["push", "origin", "main"]),
         )
         .await;
 
         assert!(
             within(
                 "the mirror holds the push",
-                has_commit(&store.path("atlas"), &pushed),
+                has_commit(&fixture.store.path("atlas"), &pushed),
             )
             .await,
             "the pushed commit must be in the bare mirror"
@@ -82,13 +81,103 @@ mod suite {
 
         let reader = within(
             "second clone via relay",
-            clone_to(scratch.path(), &url, "reader"),
+            clone_to(fixture.scratch.path(), &fixture.url, "reader"),
         )
         .await;
         assert!(
             within("the second clone sees it", has_commit(&reader, &pushed)).await,
             "a later clone must receive what was pushed"
         );
+    }
+
+    /// The mirror is a clone cache: a refresh fetches what the upstream
+    /// gained — and deliberately does not prune, because `refs/horde/share/*`
+    /// live only on the mirror and a pruning refresh would garbage-collect
+    /// every cross-Worker share the upstream has never heard of.
+    #[tokio::test]
+    async fn a_refresh_updates_the_mirror_without_pruning_share_refs() {
+        let fixture = within(
+            "the relayed arrangement",
+            crate::common::harness::relay_with_clone(),
+        )
+        .await;
+        let mirror = fixture.store.path("atlas");
+        let head = within("head", git_in(&fixture.clone, &["rev-parse", "HEAD"])).await;
+        within(
+            "a share ref lands on the mirror",
+            git_in(
+                &fixture.clone,
+                &["push", "origin", &format!("{head}:refs/horde/share/{head}")],
+            ),
+        )
+        .await;
+
+        // The upstream moves on without the mirror hearing about it.
+        let upstream = within(
+            "the upstream gains a commit",
+            commit_file(
+                &fixture.origin,
+                "upstream.rs",
+                "// upstream",
+                "upstream moves",
+            ),
+        )
+        .await;
+        assert!(
+            !within("the mirror is stale", has_commit(&mirror, &upstream)).await,
+            "before the refresh, the mirror must not have it yet"
+        );
+
+        within("refresh", fixture.store.refresh("atlas"))
+            .await
+            .expect("the refresh");
+        assert!(
+            within("the mirror caught up", has_commit(&mirror, &upstream)).await,
+            "the refresh must fetch what the upstream gained"
+        );
+        let refs = within("the mirror lists refs", git_in(&mirror, &["show-ref"])).await;
+        assert!(
+            refs.contains(&format!("refs/horde/share/{head}")),
+            "the refresh must not prune the share ref: {refs}"
+        );
+    }
+
+    /// Dropping the server closes the listener. A dropped Relay that kept
+    /// serving would leak a live socket — and every port it was ever given —
+    /// into the rest of the Server's life.
+    #[tokio::test]
+    async fn dropping_the_server_closes_the_listener() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let origin = within("origin init", init_repo(scratch.path(), "origin")).await;
+        let (server, _store, _mirrors) = serve_relay(&[("atlas", &origin)]).await;
+        let addr = server.addr();
+
+        let alive = within(
+            "a request while alive",
+            raw_status_of(addr, "GET / HTTP/1.1"),
+        )
+        .await;
+        assert!(
+            alive.contains("404"),
+            "the live server must answer (with a refusal): {alive:?}"
+        );
+
+        drop(server);
+
+        // Abort lands asynchronously, so the check is bounded by attempts —
+        // progress by count, not by clock (docs/QUALITY_GATES.md).
+        within("the listener closes", async {
+            let mut attempts = 0_u32;
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                attempts += 1;
+                assert!(
+                    attempts < 100,
+                    "the listener must stop accepting once the server is dropped"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
     }
 
     /// Unregistered names are refused. The Relay serves registered repos
