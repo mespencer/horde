@@ -67,7 +67,7 @@ pub mod replay;
 pub mod spec;
 pub mod usage;
 
-pub use capability::{Capabilities, Capability, PermissionEnforcement};
+pub use capability::{Capabilities, Capability, PermissionEnforcement, ToolCallKind};
 pub use error::AdapterError;
 pub use event::{AgentEvent, OutputChannel, TurnOutcome, TurnStatus};
 pub use identity::RevivalIdentity;

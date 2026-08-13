@@ -78,6 +78,18 @@ pub enum Capability {
     /// See [`Capabilities::permission_enforcement`].
     PreAuthorizeToolCalls,
 
+    /// Horde sees a proposed **MCP** tool call before it runs — and only those.
+    ///
+    /// The per-call-kind wording ADR-0005's 2026-08-11 amendment calls for.
+    /// Codex routes every MCP tool call through a client-facing
+    /// `mcpServer/elicitation/request` *before* a byte reaches the MCP server
+    /// (transcripts 17–18, re-verified live at codex-cli 0.147.0), while its
+    /// shell/exec calls remain adjudicated internally against the sandbox tier.
+    /// One flag could not say both truths, so this one claims exactly the MCP
+    /// half; a provider with [`Self::PreAuthorizeToolCalls`] does not also need
+    /// this, because the broader claim covers every call kind.
+    PreAuthorizeMcpToolCalls,
+
     /// A permission decision may replace the tool's arguments, not just permit
     /// or refuse the call. Implies [`Self::PreAuthorizeToolCalls`] in practice.
     RewritesToolInput,
@@ -107,11 +119,12 @@ pub enum Capability {
 
 impl Capability {
     /// Every capability, for exhaustiveness checks in tests and reports.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Resumable,
         Self::InterruptibleTurn,
         Self::AmendActiveTurn,
         Self::PreAuthorizeToolCalls,
+        Self::PreAuthorizeMcpToolCalls,
         Self::RewritesToolInput,
         Self::SandboxTierAtSpawn,
         Self::ReportsHeadroom,
@@ -119,6 +132,20 @@ impl Capability {
         Self::ModelSelection,
         Self::AccountIsolation,
     ];
+}
+
+/// Which kind of tool call is being asked about.
+///
+/// Exists because enforcement is no longer uniform per provider: ADR-0005's
+/// amendment scoped Codex's "cannot pre-authorize" to shell/exec, leaving MCP
+/// calls fully interceptable. A per-provider answer would have to pick one of
+/// those truths and lie about the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallKind {
+    /// A call to an MCP server's tool.
+    Mcp,
+    /// Everything the harness runs itself: shell, exec, file edits.
+    Exec,
 }
 
 /// How much control Horde's permission chain actually has over a provider.
@@ -207,7 +234,48 @@ impl Capabilities {
     /// ```
     #[must_use]
     pub fn permission_enforcement(&self) -> PermissionEnforcement {
-        if self.supports(Capability::PreAuthorizeToolCalls) {
+        // The floor across call kinds, deliberately: a caller that does not
+        // say which kind it is asking about must get the weakest answer, so a
+        // provider gated for MCP but not for exec can never be treated as
+        // per-call gated overall.
+        self.permission_enforcement_for(ToolCallKind::Exec)
+    }
+
+    /// What the permission chain can do with this provider **for one kind of
+    /// tool call** — the per-call-kind answer ADR-0005's amendment requires.
+    ///
+    /// ```
+    /// use horde_adapter::{Capabilities, Capability, PermissionEnforcement, ToolCallKind};
+    ///
+    /// // Codex: MCP calls are intercepted via elicitation; exec is not.
+    /// let codex = Capabilities::none()
+    ///     .with(Capability::PreAuthorizeMcpToolCalls)
+    ///     .with(Capability::SandboxTierAtSpawn);
+    /// assert_eq!(
+    ///     codex.permission_enforcement_for(ToolCallKind::Mcp),
+    ///     PermissionEnforcement::PerCall
+    /// );
+    /// assert_eq!(
+    ///     codex.permission_enforcement_for(ToolCallKind::Exec),
+    ///     PermissionEnforcement::SandboxAtSpawn
+    /// );
+    /// // And the kind-blind answer stays the floor.
+    /// assert_eq!(
+    ///     codex.permission_enforcement(),
+    ///     PermissionEnforcement::SandboxAtSpawn
+    /// );
+    /// ```
+    #[must_use]
+    pub fn permission_enforcement_for(&self, kind: ToolCallKind) -> PermissionEnforcement {
+        let gated = match kind {
+            // The broad claim covers every kind; the scoped claim only MCP.
+            ToolCallKind::Mcp => {
+                self.supports(Capability::PreAuthorizeToolCalls)
+                    || self.supports(Capability::PreAuthorizeMcpToolCalls)
+            }
+            ToolCallKind::Exec => self.supports(Capability::PreAuthorizeToolCalls),
+        };
+        if gated {
             PermissionEnforcement::PerCall
         } else if self.supports(Capability::SandboxTierAtSpawn) {
             PermissionEnforcement::SandboxAtSpawn
@@ -290,6 +358,58 @@ mod tests {
         assert!(
             !bare.permission_enforcement().can_gate_individual_calls(),
             "an unenforced provider must never look gateable"
+        );
+    }
+
+    /// The per-kind answers ADR-0005's amendment requires, all four ways:
+    /// the scoped MCP claim gates MCP and only MCP, and the broad claim
+    /// gates both without needing the scoped one.
+    #[test]
+    fn mcp_gating_is_scoped_to_mcp_calls_and_the_broad_claim_covers_both() {
+        use super::ToolCallKind;
+
+        let codex_shaped = Capabilities::none()
+            .with(Capability::PreAuthorizeMcpToolCalls)
+            .with(Capability::SandboxTierAtSpawn);
+        assert_eq!(
+            codex_shaped.permission_enforcement_for(ToolCallKind::Mcp),
+            PermissionEnforcement::PerCall,
+            "an MCP call is offered to Horde before it runs (transcripts 17-18)"
+        );
+        assert_eq!(
+            codex_shaped.permission_enforcement_for(ToolCallKind::Exec),
+            PermissionEnforcement::SandboxAtSpawn,
+            "shell/exec stays adjudicated by the sandbox tier (ADR-0005)"
+        );
+
+        let claude_shaped = Capabilities::none().with(Capability::PreAuthorizeToolCalls);
+        for kind in [ToolCallKind::Mcp, ToolCallKind::Exec] {
+            assert_eq!(
+                claude_shaped.permission_enforcement_for(kind),
+                PermissionEnforcement::PerCall,
+                "the broad claim covers every call kind"
+            );
+        }
+    }
+
+    /// The kind-blind answer must be the floor across kinds, never the best
+    /// case — a provider gated only for MCP read as per-call overall would
+    /// let placement put a high-trust assignment on ungated exec.
+    #[test]
+    fn the_kind_blind_answer_is_the_floor_not_the_best_case() {
+        let codex_shaped = Capabilities::none()
+            .with(Capability::PreAuthorizeMcpToolCalls)
+            .with(Capability::SandboxTierAtSpawn);
+        assert_eq!(
+            codex_shaped.permission_enforcement(),
+            PermissionEnforcement::SandboxAtSpawn
+        );
+
+        let mcp_only = Capabilities::none().with(Capability::PreAuthorizeMcpToolCalls);
+        assert_eq!(
+            mcp_only.permission_enforcement(),
+            PermissionEnforcement::Unenforced,
+            "without even a sandbox, the floor is unenforced"
         );
     }
 
