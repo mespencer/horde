@@ -679,6 +679,19 @@ that does not happen to read back what it wrote. Prefer an error at the write �
 even a noisy one, even one that costs a caller a rename — over a silence that
 someone else will pay for later, somewhere else, with no thread back to here.
 
+**A faster test tool is a measurement, not an assumption.** Switching cargo-mutants
+to `--test-tool=nextest` (stop at the first failing test) read like a free 2× —
+most mutants are caught, so most suites should end early. Measured on the identical
+2,439-mutant tree, it was **1.8× slower**: 17,681s against 9,680s. nextest pays a
+fixed per-mutant cost (about 3s here — its own build/list/run cycle in every
+scratch tree), and fail-fast can only refund *test* time, which these suites
+barely spend; the per-mutant floor is the incremental build, and no test tool
+touches that. The experiment still bought one fact worth keeping: every one of
+the 2,438 evaluated mutants dies without doctests, so nextest's inability to run
+them would have cost this tree nothing. If the sweep needs to be faster, the
+levers that match the physics are a shared compiler cache for the build floor
+and `--shard` across machines for the wave boundary — not a different test tool.
+
 ## Adding a gate
 
 1. **Write the gate.** One module under `crates/horde-gauntlet/src/gates/`. Split it into
