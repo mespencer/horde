@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 /// A binary cargo built alongside the running test.
-pub fn built_binary(name: &str) -> PathBuf {
+pub(crate) fn built_binary(name: &str) -> PathBuf {
     let mut path = std::env::current_exe().unwrap_or_default();
     path.pop();
     if path.ends_with("deps") {
@@ -20,7 +20,7 @@ pub fn built_binary(name: &str) -> PathBuf {
 ///
 /// Generous against a loaded machine, and still three orders of magnitude
 /// below the point where cargo-mutants gives up.
-pub const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Runs `future` with a ceiling, failing the test if it does not finish.
 ///
@@ -30,7 +30,7 @@ pub const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 /// `send` that sends nothing leaves a test waiting for something that never
 /// arrives, records a TIMEOUT, and protects nothing. With a ceiling the same
 /// mutants fail in seconds and are caught.
-pub async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
     match tokio::time::timeout(CEILING, future).await {
         Ok(value) => value,
         Err(_) => panic!("{what} must finish rather than hang"),

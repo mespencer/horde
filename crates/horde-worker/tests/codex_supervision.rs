@@ -206,6 +206,7 @@ mod harness {
     }
 }
 
+#[cfg(test)]
 mod support;
 
 use harness::{
