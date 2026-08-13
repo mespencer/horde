@@ -109,7 +109,7 @@ impl FakeAdapter {
             current: None,
             waiting_on: None,
             denials: Vec::new(),
-            chunk_counters: Vec::new(),
+            chunk_counters: horde_adapter::ChunkCounters::new(),
             cumulative_tokens: TokenUsage::default(),
             cumulative_cost: 0.0,
             usage: UsageAccumulator::new(),
@@ -183,7 +183,7 @@ pub struct FakeSession {
     current: Option<CurrentTurn>,
     waiting_on: Option<ToolCallId>,
     denials: Vec<PermissionDenial>,
-    chunk_counters: Vec<(OutputChannel, u64)>,
+    chunk_counters: horde_adapter::ChunkCounters,
     cumulative_tokens: TokenUsage,
     cumulative_cost: f64,
     usage: UsageAccumulator,
@@ -199,21 +199,7 @@ impl FakeSession {
         if self.misbehaviour == Some(Misbehaviour::RepeatChunkIndex) {
             return 0;
         }
-        match self
-            .chunk_counters
-            .iter_mut()
-            .find(|(known, _)| *known == channel)
-        {
-            Some((_, next)) => {
-                let index = *next;
-                *next = next.saturating_add(1);
-                index
-            }
-            None => {
-                self.chunk_counters.push((channel, 1));
-                0
-            }
-        }
+        self.chunk_counters.next(channel)
     }
 
     fn emit_output(&mut self, channel: OutputChannel, text: String) {
@@ -390,7 +376,7 @@ impl AgentSession for FakeSession {
         }
 
         self.turns_taken = self.turns_taken.saturating_add(1);
-        self.chunk_counters.clear();
+        self.chunk_counters.reset();
         self.steps = turn.steps.into();
         self.current = Some(CurrentTurn {
             turn_id: self.turn_id(),
@@ -903,6 +889,17 @@ mod steering_tests {
     use super::harness::started_on;
     use crate::{Script, ScriptedTurn};
 
+    /// The turn endings among `events`, in order.
+    fn endings(events: &[AgentEvent]) -> Vec<&horde_adapter::TurnOutcome> {
+        let mut endings = Vec::new();
+        for event in events {
+            if let AgentEvent::TurnEnded(outcome) = event {
+                endings.push(outcome);
+            }
+        }
+        endings
+    }
+
     /// Drains everything currently available without blocking on a stall.
     async fn drain(session: &mut Box<dyn horde_adapter::AgentSession>) -> Vec<AgentEvent> {
         let mut events = Vec::new();
@@ -933,13 +930,7 @@ mod steering_tests {
             .expect("an amending provider accepts a mid-turn send");
 
         let events = drain(&mut session).await;
-        let endings: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::TurnEnded(outcome) => Some(outcome),
-                _ => None,
-            })
-            .collect();
+        let endings = endings(&events);
         assert_eq!(
             endings.len(),
             1,
@@ -1009,13 +1000,7 @@ mod steering_tests {
             .expect("an interrupting send is accepted");
 
         let events = drain(&mut session).await;
-        let endings: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::TurnEnded(outcome) => Some(outcome),
-                _ => None,
-            })
-            .collect();
+        let endings = endings(&events);
         assert_eq!(
             endings.len(),
             2,

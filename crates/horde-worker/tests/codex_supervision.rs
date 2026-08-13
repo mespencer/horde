@@ -11,34 +11,79 @@
 mod harness {
     use std::path::PathBuf;
 
-    use horde_adapter::{Adapter, AgentEvent, AgentSession, AgentSpec, TurnOutcome};
+    use horde_adapter::{Adapter, AgentEvent, AgentSession, AgentSpec, TurnInput, TurnOutcome};
     use horde_worker::CodexAdapter;
+    use serde_json::json;
 
     /// The stub binary cargo built alongside this test.
     pub(crate) fn stub_binary() -> PathBuf {
-        let mut path = std::env::current_exe().unwrap_or_default();
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        path.join("codex-stub-harness")
+        crate::support::built_binary("codex-stub-harness")
+    }
+
+    // -- Script lines, one builder per frame kind ------------------------------
+    //
+    // The scripts differ per test in which frames they replay and in what
+    // order; the frames themselves are the same recorded shapes. Builders keep
+    // each test's script an explicit composition instead of twenty copies of
+    // the same JSON.
+
+    pub(crate) fn thread_started() -> String {
+        json!({"method":"thread/started",
+               "params":{"thread":{"id":"stub-thread","model":"stub-model"}}})
+        .to_string()
+    }
+
+    pub(crate) fn turn_started(id: &str) -> String {
+        json!({"method":"turn/started","params":{"turn":{"id":id}}}).to_string()
+    }
+
+    pub(crate) fn delta(turn: &str, text: &str) -> String {
+        json!({"method":"item/agentMessage/delta",
+               "params":{"turnId":turn,"itemId":"i1","delta":text}})
+        .to_string()
+    }
+
+    pub(crate) fn usage(turn: &str, input_tokens: u64, output_tokens: u64) -> String {
+        json!({"method":"thread/tokenUsage/updated",
+               "params":{"threadId":"stub-thread","turnId":turn,
+                          "tokenUsage":{"last":{"inputTokens":input_tokens,
+                                                 "outputTokens":output_tokens}}}})
+        .to_string()
+    }
+
+    pub(crate) fn final_answer(turn: &str, item: &str, text: &str) -> String {
+        json!({"method":"item/completed",
+               "params":{"turnId":turn,
+                          "item":{"type":"agentMessage","id":item,"text":text,
+                                  "phase":"final_answer"}}})
+        .to_string()
+    }
+
+    pub(crate) fn turn_completed(id: &str) -> String {
+        json!({"method":"turn/completed",
+               "params":{"turn":{"id":id,"status":"completed","durationMs":5}}})
+        .to_string()
+    }
+
+    pub(crate) fn idle() -> String {
+        json!({"method":"thread/status/changed",
+               "params":{"threadId":"stub-thread","status":{"type":"idle"}}})
+        .to_string()
     }
 
     /// One scripted turn: the thread announces itself, a turn opens, streams
     /// one delta, reports usage, and completes.
-    pub(crate) const BASIC_TURN: &str = concat!(
-        r#"{"method":"thread/started","params":{"thread":{"id":"stub-thread","model":"stub-model"}}}"#,
-        "\n",
-        r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#,
-        "\n",
-        r#"{"method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"i1","delta":"HORDE_OK"}}"#,
-        "\n",
-        r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"stub-thread","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"outputTokens":2}}}}"#,
-        "\n",
-        r#"{"method":"item/completed","params":{"turnId":"turn-1","item":{"type":"agentMessage","id":"i1","text":"HORDE_OK","phase":"final_answer"}}}"#,
-        "\n",
-        r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed","durationMs":5}}}"#,
-    );
+    pub(crate) fn basic_turn() -> String {
+        [
+            thread_started(),
+            turn_started("turn-1"),
+            delta("turn-1", "HORDE_OK"),
+            usage("turn-1", 10, 2),
+            final_answer("turn-1", "i1", "HORDE_OK"),
+            turn_completed("turn-1"),
+        ]
+        .join("\n")
+    }
 
     /// An adapter pointed at the stub, with `script` and `extra` env riding to
     /// the child. The `TempDir` must travel with the session: dropping it
@@ -51,7 +96,7 @@ mod harness {
         let file = dir.path().join("script.jsonl");
         std::fs::write(&file, script).expect("writes");
 
-        let mut adapter = CodexAdapter::with_program(stub_binary().to_string_lossy());
+        let mut adapter = CodexAdapter::new().with_program(stub_binary().to_string_lossy());
         adapter.extra_env = vec![(
             "HORDE_CODEX_STUB_SCRIPT".to_owned(),
             file.to_string_lossy().into_owned(),
@@ -77,18 +122,8 @@ mod harness {
         (session, dir)
     }
 
-    /// How long any wait in this file may take before it is a failure.
-    pub(crate) const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// Runs `future` with a ceiling, failing the test if it does not finish —
-    /// an unbounded await turns a defect into a hang, and a hang into a
-    /// mutant nobody evaluated (docs/QUALITY_GATES.md).
-    pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-        match tokio::time::timeout(CEILING, future).await {
-            Ok(value) => value,
-            Err(_) => panic!("{what} must finish rather than hang"),
-        }
-    }
+    /// Bounded waiting, shared with the claude suite — see `support::within`.
+    pub(crate) use crate::support::within;
 
     /// Drains `session` until its turn ends, under the ceiling, returning the
     /// outcome and everything that preceded it.
@@ -125,6 +160,35 @@ mod harness {
         .await;
     }
 
+    /// A session already mid-turn: spawned on `script` (whose first block must
+    /// stream a delta), its opening message sent, and drained until output
+    /// proved the turn open — the precondition every steering-shaped test
+    /// shares. Returns the control-log path the stub records to; the tempdirs
+    /// ride along because dropping them deletes the files under the child.
+    pub(crate) async fn mid_turn(
+        script: &str,
+        steer_mode: Option<&str>,
+    ) -> (
+        Box<dyn AgentSession>,
+        std::path::PathBuf,
+        (tempfile::TempDir, tempfile::TempDir),
+    ) {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let log_value = log_path.to_string_lossy().into_owned();
+        let mut extra: Vec<(&str, &str)> = vec![("HORDE_CODEX_STUB_CONTROL_LOG", &log_value)];
+        if let Some(mode) = steer_mode {
+            extra.push(("HORDE_CODEX_STUB_STEER", mode));
+        }
+        let (mut session, dir) = session_on(script, &extra).await;
+        session
+            .send(TurnInput::queued("start"))
+            .await
+            .expect("sends");
+        drain_until_output(&mut session).await;
+        (session, log_path, (log, dir))
+    }
+
     /// Polls the control log, bounded by count, until `expected` holds.
     pub(crate) async fn control_log_shows(
         log_path: &std::path::Path,
@@ -142,8 +206,11 @@ mod harness {
     }
 }
 
+mod support;
+
 use harness::{
-    BASIC_TURN, adapter_for, control_log_shows, events_through_turn_end, session_on, within,
+    adapter_for, basic_turn, control_log_shows, events_through_turn_end, mid_turn, session_on,
+    within,
 };
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSpec, OutputChannel, PermissionDecision,
@@ -155,7 +222,7 @@ use serde_json::json;
 /// real child process.
 #[tokio::test]
 async fn a_turn_round_trips_through_the_handshake_and_a_real_child() {
-    let (mut session, _dir) = session_on(BASIC_TURN, &[]).await;
+    let (mut session, _dir) = session_on(&basic_turn(), &[]).await;
 
     assert_eq!(
         session.provider_session_id().map(ToString::to_string),
@@ -174,17 +241,17 @@ async fn a_turn_round_trips_through_the_handshake_and_a_real_child() {
         established_first,
         "SessionEstablished precedes any output: {events:?}"
     );
-    let streamed: String = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::Output {
-                channel: OutputChannel::Assistant,
-                text,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let mut streamed = String::new();
+    for event in &events {
+        if let AgentEvent::Output {
+            channel: OutputChannel::Assistant,
+            text,
+            ..
+        } = event
+        {
+            streamed.push_str(text);
+        }
+    }
     assert_eq!(streamed, "HORDE_OK");
 
     let outcome = outcome.expect("the turn ends");
@@ -199,7 +266,7 @@ async fn a_turn_round_trips_through_the_handshake_and_a_real_child() {
 /// tier is the enforcement, so its choice must be auditable (ADR-0005).
 #[tokio::test]
 async fn the_sandbox_tier_choice_is_journaled_on_the_first_turn() {
-    let (mut adapter, dir) = adapter_for(BASIC_TURN, &[]);
+    let (mut adapter, dir) = adapter_for(&basic_turn(), &[]);
     adapter.sandbox_policy = horde_adapter_codex::SandboxPolicy::read_only()
         .with_mode("builder", horde_adapter_codex::SandboxTier::WorkspaceWrite);
     let spec = AgentSpec {
@@ -236,33 +303,35 @@ async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
     let log = tempfile::tempdir().expect("a scratch dir");
     let log_path = log.path().join("control.log");
 
-    let script = format!(
-        concat!(
-            r#"{{"method":"thread/started","params":{{"thread":{{"id":"stub-thread","model":"stub-model"}}}}}}"#,
-            "\n",
-            r#"{{"method":"turn/started","params":{{"turn":{{"id":"turn-1"}}}}}}"#,
-            "\n",
-            r#"{{"method":"item/started","params":{{"turnId":"turn-1","item":{{"type":"mcpToolCall","id":"exec-1","server":"horde","tool":"spawn_agent","status":"inProgress","arguments":{{"task":"review"}}}}}}}}"#,
-            "\n",
-            "!ELICIT {}",
-            "\n",
-            r#"{{"method":"item/completed","params":{{"turnId":"turn-1","item":{{"type":"mcpToolCall","id":"exec-1","server":"horde","tool":"spawn_agent","status":"completed","arguments":{{"task":"review"}}}}}}}}"#,
-            "\n",
-            r#"{{"method":"turn/completed","params":{{"turn":{{"id":"turn-1","status":"completed"}}}}}}"#,
-        ),
-        json!({
-            "threadId": "stub-thread",
-            "turnId": "turn-1",
-            "serverName": "horde",
-            "mode": "form",
-            "_meta": {
-                "codex_approval_kind": "mcp_tool_call",
-                "tool_params": {"task": "review"}
-            },
-            "message": "Allow?",
-            "requestedSchema": {"type": "object", "properties": {}}
-        })
-    );
+    let elicitation = json!({
+        "threadId": "stub-thread",
+        "turnId": "turn-1",
+        "serverName": "horde",
+        "mode": "form",
+        "_meta": {
+            "codex_approval_kind": "mcp_tool_call",
+            "tool_params": {"task": "review"}
+        },
+        "message": "Allow?",
+        "requestedSchema": {"type": "object", "properties": {}}
+    });
+    let mcp_item = |status: &str| {
+        json!({"method": if status == "inProgress" { "item/started" } else { "item/completed" },
+               "params":{"turnId":"turn-1",
+                          "item":{"type":"mcpToolCall","id":"exec-1","server":"horde",
+                                  "tool":"spawn_agent","status":status,
+                                  "arguments":{"task":"review"}}}})
+        .to_string()
+    };
+    let script = [
+        harness::thread_started(),
+        harness::turn_started("turn-1"),
+        mcp_item("inProgress"),
+        format!("!ELICIT {elicitation}"),
+        mcp_item("completed"),
+        harness::turn_completed("turn-1"),
+    ]
+    .join("\n");
 
     let (mut session, _dir) = session_on(
         &script,
@@ -315,7 +384,7 @@ async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
 /// plain allow is the failure the capability advertisement exists to prevent.
 #[tokio::test]
 async fn a_narrowing_decision_is_refused_not_widened() {
-    let (mut session, _dir) = session_on(BASIC_TURN, &[]).await;
+    let (mut session, _dir) = session_on(&basic_turn(), &[]).await;
 
     let refused = session
         .answer_permission(
@@ -343,36 +412,26 @@ async fn a_narrowing_decision_is_refused_not_widened() {
 /// active turn as its precondition, and the amended turn still ends once.
 #[tokio::test]
 async fn a_mid_turn_message_steers_the_active_turn() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
     // Block 1 opens a turn and stalls (no terminal frame); block 2 — played on
     // the steer — carries the second final answer and the turn's end, the
     // transcript-15 shape.
-    let script = concat!(
-        r#"{"method":"thread/started","params":{"thread":{"id":"stub-thread","model":"stub-model"}}}"#,
-        "\n",
-        r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#,
-        "\n",
-        r#"{"method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"i1","delta":"FIRST"}}"#,
-        "\n",
-        r#"{"method":"item/completed","params":{"turnId":"turn-1","item":{"type":"agentMessage","id":"i1","text":"FIRST","phase":"final_answer"}}}"#,
-        "\n\n",
-        r#"{"method":"item/completed","params":{"turnId":"turn-1","item":{"type":"agentMessage","id":"i2","text":"STEERED","phase":"final_answer"}}}"#,
-        "\n",
-        r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
-    );
+    let script = [
+        [
+            harness::thread_started(),
+            harness::turn_started("turn-1"),
+            harness::delta("turn-1", "FIRST"),
+            harness::final_answer("turn-1", "i1", "FIRST"),
+        ]
+        .join("\n"),
+        [
+            harness::final_answer("turn-1", "i2", "STEERED"),
+            harness::turn_completed("turn-1"),
+        ]
+        .join("\n"),
+    ]
+    .join("\n\n");
 
-    let (mut session, _dir) = session_on(
-        script,
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session
-        .send(TurnInput::queued("start"))
-        .await
-        .expect("sends");
-    harness::drain_until_output(&mut session).await;
+    let (mut session, log_path, _dirs) = mid_turn(&script, None).await;
 
     session
         .send(TurnInput::queued("actually, do this instead"))
@@ -400,36 +459,24 @@ async fn a_mid_turn_message_steers_the_active_turn() {
 /// rather than being dropped.
 #[tokio::test]
 async fn a_steer_that_lost_its_race_falls_back_to_a_fresh_turn() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
     // Block 1: a turn that opens and never closes on its own (the steer will
     // be sent against it). Block 2: the fresh turn the fallback starts.
-    let script = concat!(
-        r#"{"method":"thread/started","params":{"thread":{"id":"stub-thread","model":"stub-model"}}}"#,
-        "\n",
-        r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#,
-        "\n",
-        r#"{"method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"i1","delta":"working"}}"#,
-        "\n\n",
-        r#"{"method":"turn/started","params":{"turn":{"id":"turn-2"}}}"#,
-        "\n",
-        r#"{"method":"turn/completed","params":{"turn":{"id":"turn-2","status":"completed"}}}"#,
-    );
+    let script = [
+        [
+            harness::thread_started(),
+            harness::turn_started("turn-1"),
+            harness::delta("turn-1", "working"),
+        ]
+        .join("\n"),
+        [
+            harness::turn_started("turn-2"),
+            harness::turn_completed("turn-2"),
+        ]
+        .join("\n"),
+    ]
+    .join("\n\n");
 
-    let (mut session, _dir) = session_on(
-        script,
-        &[
-            ("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy()),
-            ("HORDE_CODEX_STUB_STEER", "stale"),
-        ],
-    )
-    .await;
-    session
-        .send(TurnInput::queued("start"))
-        .await
-        .expect("sends");
-    harness::drain_until_output(&mut session).await;
+    let (mut session, log_path, _dirs) = mid_turn(&script, Some("stale")).await;
 
     session
         .send(TurnInput::queued("the raced message"))
@@ -455,41 +502,28 @@ async fn a_steer_that_lost_its_race_falls_back_to_a_fresh_turn() {
 /// idle that ends the old turn.
 #[tokio::test]
 async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
     // Block 1: a turn that opens and stalls. Block 2 — played on the
     // interrupt — the delta tail and the idle that closes the turn
     // (transcript 11's shape). Block 3 — played on the deferred turn/start —
     // the replacement turn.
-    let script = concat!(
-        r#"{"method":"thread/started","params":{"thread":{"id":"stub-thread","model":"stub-model"}}}"#,
-        "\n",
-        r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#,
-        "\n",
-        r#"{"method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"i1","delta":"working"}}"#,
-        "\n\n",
-        r#"{"method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"i1","delta":"tail"}}"#,
-        "\n",
-        r#"{"method":"thread/status/changed","params":{"threadId":"stub-thread","status":{"type":"idle"}}}"#,
-        "\n\n",
-        r#"{"method":"turn/started","params":{"turn":{"id":"turn-2"}}}"#,
-        "\n",
-        r#"{"method":"item/completed","params":{"turnId":"turn-2","item":{"type":"agentMessage","id":"i2","text":"REPLACEMENT","phase":"final_answer"}}}"#,
-        "\n",
-        r#"{"method":"turn/completed","params":{"turn":{"id":"turn-2","status":"completed"}}}"#,
-    );
+    let script = [
+        [
+            harness::thread_started(),
+            harness::turn_started("turn-1"),
+            harness::delta("turn-1", "working"),
+        ]
+        .join("\n"),
+        [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
+        [
+            harness::turn_started("turn-2"),
+            harness::final_answer("turn-2", "i2", "REPLACEMENT"),
+            harness::turn_completed("turn-2"),
+        ]
+        .join("\n"),
+    ]
+    .join("\n\n");
 
-    let (mut session, _dir) = session_on(
-        script,
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session
-        .send(TurnInput::queued("start"))
-        .await
-        .expect("sends");
-    harness::drain_until_output(&mut session).await;
+    let (mut session, log_path, _dirs) = mid_turn(&script, None).await;
 
     session
         .send(TurnInput::interrupting("do this instead"))
@@ -527,7 +561,7 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
 #[tokio::test]
 async fn an_unauthenticated_thread_start_names_the_account_problem() {
     let (adapter, _dir) = adapter_for(
-        BASIC_TURN,
+        &basic_turn(),
         &[(
             "HORDE_CODEX_STUB_FAIL_THREAD",
             "401 Unauthorized: not logged in",
@@ -561,7 +595,7 @@ async fn an_unauthenticated_thread_start_names_the_account_problem() {
 #[tokio::test]
 async fn an_ordinary_thread_refusal_is_a_spawn_failure() {
     let (adapter, _dir) = adapter_for(
-        BASIC_TURN,
+        &basic_turn(),
         &[("HORDE_CODEX_STUB_FAIL_THREAD", "rollout file is corrupt")],
     );
     let error = adapter
@@ -580,7 +614,7 @@ async fn an_ordinary_thread_refusal_is_a_spawn_failure() {
 #[tokio::test]
 async fn a_refused_turn_start_fails_loudly_instead_of_hanging() {
     let (mut session, _dir) = session_on(
-        BASIC_TURN,
+        &basic_turn(),
         &[("HORDE_CODEX_STUB_FAIL_TURN_START", "thread is archived")],
     )
     .await;
@@ -616,7 +650,7 @@ async fn a_thread_id_from_one_process_revives_in_the_next() {
     let log_path = log.path().join("control.log");
 
     let (adapter, _dir) = adapter_for(
-        BASIC_TURN,
+        &basic_turn(),
         &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
     );
 
@@ -650,7 +684,7 @@ async fn a_thread_id_from_one_process_revives_in_the_next() {
 #[tokio::test]
 async fn reviving_an_unknown_thread_does_not_silently_start_fresh() {
     let (adapter, _dir) = adapter_for(
-        BASIC_TURN,
+        &basic_turn(),
         &[(
             "HORDE_CODEX_STUB_FAIL_THREAD",
             "no rollout found for thread",
@@ -668,7 +702,7 @@ async fn reviving_an_unknown_thread_does_not_silently_start_fresh() {
 /// A dead harness reads as end-of-stream and a refused send, never a hang.
 #[tokio::test]
 async fn a_dead_harness_surfaces_instead_of_hanging() {
-    let (mut session, _dir) = session_on(BASIC_TURN, &[]).await;
+    let (mut session, _dir) = session_on(&basic_turn(), &[]).await;
     session.shutdown().await.expect("shuts down");
 
     assert!(

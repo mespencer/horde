@@ -124,17 +124,9 @@ fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u
 /// wedging the test suite.
 fn await_reply(id: u64, stdin: &mut impl BufRead) {
     for _ in 0..1024 {
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        log_control(line);
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some(line) = next_line(stdin) else { return };
+        log_control(&line);
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         let is_reply_to_us = message.get("id").and_then(serde_json::Value::as_u64) == Some(id)
@@ -150,6 +142,21 @@ fn await_reply(id: u64, stdin: &mut impl BufRead) {
     }
 }
 
+/// One trimmed, non-empty stdin line, or `None` at EOF.
+fn next_line(stdin: &mut impl BufRead) -> Option<String> {
+    loop {
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let line = line.trim();
+        if !line.is_empty() {
+            return Some(line.to_owned());
+        }
+    }
+}
+
 fn run(blocks: &[Vec<String>]) -> std::process::ExitCode {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -157,17 +164,11 @@ fn run(blocks: &[Vec<String>]) -> std::process::ExitCode {
     let mut next_server_id = 1000_u64;
 
     loop {
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) | Err(_) => return std::process::ExitCode::SUCCESS,
-            Ok(_) => {}
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        log_control(line);
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some(line) = next_line(&mut stdin) else {
+            return std::process::ExitCode::SUCCESS;
+        };
+        log_control(&line);
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         let (Some(id), Some(method)) = (

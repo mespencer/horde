@@ -13,8 +13,30 @@
 //! It costs a few hundred tokens per provider. Run it when bumping a supported
 //! CLI version, or when a stub-backed test starts disagreeing with reality.
 
-use horde_adapter::{Adapter, AgentEvent, AgentSpec, TurnInput, TurnStatus};
+use horde_adapter::{Adapter, AgentEvent, AgentSession, AgentSpec, TurnInput, TurnStatus};
 use horde_worker::{ClaudeAdapter, CodexAdapter};
+
+/// Drains one turn: everything streamed (assistant and diagnostics apart),
+/// and the outcome that closed it.
+async fn stream_turn(
+    session: &mut Box<dyn AgentSession>,
+) -> (String, String, Option<horde_adapter::TurnOutcome>) {
+    let mut streamed = String::new();
+    let mut diagnostics = String::new();
+    while let Ok(Some(event)) = session.next_event().await {
+        match event {
+            AgentEvent::Output {
+                channel: horde_adapter::OutputChannel::HarnessDiagnostic,
+                text,
+                ..
+            } => diagnostics.push_str(&text),
+            AgentEvent::Output { text, .. } => streamed.push_str(&text),
+            AgentEvent::TurnEnded(ended) => return (streamed, diagnostics, Some(ended)),
+            _ => {}
+        }
+    }
+    (streamed, diagnostics, None)
+}
 
 #[tokio::test]
 #[ignore = "spends real tokens and needs a claude login"]
@@ -34,18 +56,7 @@ async fn the_real_binary_still_streams_a_turn_through_the_supervisor() {
         .await
         .expect("sends");
 
-    let mut streamed = String::new();
-    let mut outcome = None;
-    while let Ok(Some(event)) = session.next_event().await {
-        match event {
-            AgentEvent::Output { text, .. } => streamed.push_str(&text),
-            AgentEvent::TurnEnded(ended) => {
-                outcome = Some(ended);
-                break;
-            }
-            _ => {}
-        }
-    }
+    let (_streamed, _diagnostics, outcome) = stream_turn(&mut session).await;
 
     let outcome = outcome.expect("the turn must end with a TurnEnded");
     assert_eq!(outcome.status, TurnStatus::Completed);
@@ -89,24 +100,7 @@ async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
         .await
         .expect("sends");
 
-    let mut streamed = String::new();
-    let mut diagnostics = String::new();
-    let mut outcome = None;
-    while let Ok(Some(event)) = session.next_event().await {
-        match event {
-            AgentEvent::Output {
-                channel: horde_adapter::OutputChannel::HarnessDiagnostic,
-                text,
-                ..
-            } => diagnostics.push_str(&text),
-            AgentEvent::Output { text, .. } => streamed.push_str(&text),
-            AgentEvent::TurnEnded(ended) => {
-                outcome = Some(ended);
-                break;
-            }
-            _ => {}
-        }
-    }
+    let (streamed, diagnostics, outcome) = stream_turn(&mut session).await;
 
     let outcome = outcome.expect("the turn must end with a TurnEnded");
     assert_eq!(outcome.status, TurnStatus::Completed);

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use horde_worker::process::HarnessSpec;
 use horde_worker::{SupervisedHarness, SupervisorError};
 
+mod support;
+
 /// Test-only fixtures.
 ///
 /// Wrapped in `#[cfg(test)]` so the workspace's `expect_used` exemption applies:
@@ -22,12 +24,7 @@ mod harness {
 
     /// The stub binary cargo built alongside this test.
     pub(crate) fn stub_binary() -> PathBuf {
-        let mut path = std::env::current_exe().unwrap_or_default();
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        path.join("stub-harness")
+        crate::support::built_binary("stub-harness")
     }
 
     /// A spec whose child gets extra environment, for scripting the stub.
@@ -87,29 +84,8 @@ mod harness {
     pub(crate) const RESULT_ONLY: &str = "{\"type\":\"result\",\"subtype\":\"success\",\
          \"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
 
-    /// How long any wait in this file may take before it is a failure.
-    ///
-    /// Generous against a loaded machine, and still three orders of magnitude
-    /// below the point where cargo-mutants gives up.
-    pub(crate) const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// Runs `future` with a ceiling, failing the test if it does not finish.
-    ///
-    /// Every wait against a child process goes through here, because an
-    /// unbounded await turns a defect into a hang. A `write_line` that writes
-    /// nothing, a `read_line` that returns empty lines forever, a `kill` that
-    /// kills nothing, a `send` that sends nothing — each leaves a test waiting
-    /// for something that will never arrive, and cargo-mutants then records a
-    /// TIMEOUT. A timeout is a mutant nobody evaluated (docs/QUALITY_GATES.md),
-    /// so it protects nothing. With a ceiling the same mutants fail in seconds
-    /// and are caught, which is the difference between a test that watches the
-    /// clock and a test that watches the behaviour.
-    pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-        match tokio::time::timeout(CEILING, future).await {
-            Ok(value) => value,
-            Err(_) => panic!("{what} must finish rather than hang"),
-        }
-    }
+    /// Bounded waiting, shared with the codex suite — see `support::within`.
+    pub(crate) use crate::support::within;
 
     /// Drains `session` until its turn ends, under the ceiling.
     ///

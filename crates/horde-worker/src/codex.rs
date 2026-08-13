@@ -73,14 +73,13 @@ impl CodexAdapter {
         }
     }
 
-    /// An adapter pointed at an explicit binary — how the process tests reach
+    /// Points the adapter at an explicit binary — how the process tests reach
     /// the stub harness without ever risking the operator's real CLI.
+    /// Builder-style, like [`SandboxPolicy::with_mode`].
     #[must_use]
-    pub fn with_program(program: impl Into<String>) -> Self {
-        Self {
-            program: program.into(),
-            ..Self::new()
-        }
+    pub fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program = program.into();
+        self
     }
 
     fn harness_spec(&self, spec: &AgentSpec) -> HarnessSpec {
@@ -414,6 +413,28 @@ impl LiveCodexSession {
         }
     }
 
+    /// Refuses work on a session whose harness is gone — a named predicate,
+    /// because "may this session still be driven?" is one question asked from
+    /// several places.
+    fn refuse_if_ended(&self) -> Result<()> {
+        if self.ended {
+            return Err(AdapterError::HarnessExited { exit_code: None });
+        }
+        Ok(())
+    }
+
+    /// Writes a `turn/interrupt`, telling the assembler first: the turn will
+    /// close on thread/status → idle with no terminal frame while
+    /// already-generated deltas keep arriving (transcript 11), and only a
+    /// noted interrupt lets that idle be read as a cancellation.
+    async fn request_interrupt(&mut self) -> Result<()> {
+        self.assembler.note_interrupt_requested();
+        let thread = self.thread_id.clone().unwrap_or_default();
+        let id = self.next_request_id();
+        self.in_flight.push((id, OutstandingRequest::Interrupt));
+        self.write(&encode_interrupt(id, &thread)).await
+    }
+
     /// Starts a fresh turn with `text`.
     async fn start_turn(&mut self, text: &str) -> Result<()> {
         let thread = self.thread_id.clone().unwrap_or_default();
@@ -545,9 +566,7 @@ impl AgentSession for LiveCodexSession {
     }
 
     async fn send(&mut self, input: TurnInput) -> Result<()> {
-        if self.ended {
-            return Err(AdapterError::HarnessExited { exit_code: None });
-        }
+        self.refuse_if_ended()?;
 
         match (input.delivery, self.assembler.active_turn_id().cloned()) {
             (Delivery::Interrupt, Some(_)) => {
@@ -555,12 +574,8 @@ impl AgentSession for LiveCodexSession {
                 // interrupted turn ends on idle while deltas keep arriving
                 // (transcript 11), and a turn/start racing that idle would
                 // hand the assembler a new turn while the old one is open.
-                self.assembler.note_interrupt_requested();
                 self.deferred_input = Some(input.text);
-                let thread = self.thread_id.clone().unwrap_or_default();
-                let id = self.next_request_id();
-                self.in_flight.push((id, OutstandingRequest::Interrupt));
-                self.write(&encode_interrupt(id, &thread)).await
+                self.request_interrupt().await
             }
             (Delivery::TurnBoundary, Some(expected)) => {
                 // Steering: the message amends the ACTIVE turn (transcript
@@ -586,19 +601,17 @@ impl AgentSession for LiveCodexSession {
     }
 
     async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(Some(event));
-            }
+        while self.pending.is_empty() {
             if self.ended {
                 return Ok(None);
             }
-            let Some(frame) = self.read_frame().await? else {
+            match self.read_frame().await? {
+                Some(frame) => self.route_frame(frame).await?,
                 // EOF: the harness is gone. Reported, never waited on.
-                return Ok(None);
-            };
-            self.route_frame(frame).await?;
+                None => return Ok(None),
+            }
         }
+        Ok(self.pending.pop_front())
     }
 
     async fn answer_permission(
@@ -628,17 +641,8 @@ impl AgentSession for LiveCodexSession {
     }
 
     async fn interrupt(&mut self) -> Result<()> {
-        if self.ended {
-            return Err(AdapterError::HarnessExited { exit_code: None });
-        }
-        // The turn will close on thread/status → idle with no terminal frame,
-        // while already-generated deltas keep arriving (transcript 11); the
-        // assembler is told so it can read that idle as a cancellation.
-        self.assembler.note_interrupt_requested();
-        let thread = self.thread_id.clone().unwrap_or_default();
-        let id = self.next_request_id();
-        self.in_flight.push((id, OutstandingRequest::Interrupt));
-        self.write(&encode_interrupt(id, &thread)).await
+        self.refuse_if_ended()?;
+        self.request_interrupt().await
     }
 
     async fn shutdown(&mut self) -> Result<()> {
@@ -646,6 +650,8 @@ impl AgentSession for LiveCodexSession {
         let _ = self.harness.kill().await;
         self.ended = true;
         self.pending.clear();
+        self.in_flight.clear();
+        self.deferred_input = None;
         Ok(())
     }
 }

@@ -72,8 +72,8 @@ struct StartedMcpCall {
 #[derive(Debug)]
 struct OpenTurn {
     id: TurnId,
-    /// Next chunk index per channel, for gap detection downstream.
-    chunks: Vec<(OutputChannel, u64)>,
+    /// Per-channel chunk numbering, for gap detection downstream.
+    chunks: horde_adapter::ChunkCounters,
     /// Final-answer texts. A steered turn produces more than one (transcript
     /// 15); the last is the answer to the steer, which is what a Result should
     /// carry.
@@ -91,7 +91,7 @@ impl OpenTurn {
     fn new(id: TurnId) -> Self {
         Self {
             id,
-            chunks: Vec::new(),
+            chunks: horde_adapter::ChunkCounters::new(),
             final_answers: Vec::new(),
             usage: TokenUsage::default(),
             interrupt_requested: false,
@@ -102,17 +102,7 @@ impl OpenTurn {
     }
 
     fn next_chunk_index(&mut self, channel: OutputChannel) -> u64 {
-        match self.chunks.iter_mut().find(|(known, _)| *known == channel) {
-            Some((_, next)) => {
-                let index = *next;
-                *next = next.saturating_add(1);
-                index
-            }
-            None => {
-                self.chunks.push((channel, 1));
-                0
-            }
-        }
+        self.chunks.next(channel)
     }
 }
 
@@ -694,6 +684,26 @@ mod tests {
         );
     }
 
+    /// The permission request among `events`, or a panic naming `what`.
+    fn requested(events: &[AgentEvent], what: &str) -> horde_adapter::ProposedToolCall {
+        for event in events {
+            if let AgentEvent::PermissionRequested { request, .. } = event {
+                return request.clone();
+            }
+        }
+        panic!("{what}: no PermissionRequested in {events:?}");
+    }
+
+    /// The turn ending among `events`, or a panic naming `what`.
+    fn closed(events: Vec<AgentEvent>, what: &str) -> horde_adapter::TurnOutcome {
+        for event in events {
+            if let AgentEvent::TurnEnded(outcome) = event {
+                return outcome;
+            }
+        }
+        panic!("{what}: no TurnEnded arrived");
+    }
+
     fn mcp_started(id: &str) -> serde_json::Value {
         json!({"method":"item/started","params":{"item":{
             "type":"mcpToolCall","id":id,"server":"spike","tool":"horde_probe",
@@ -718,13 +728,7 @@ mod tests {
         feed(&mut assembler, mcp_started("exec-45"));
 
         let events = feed(&mut assembler, elicitation_request(7));
-        let request = events
-            .iter()
-            .find_map(|event| match event {
-                AgentEvent::PermissionRequested { request, .. } => Some(request.clone()),
-                _ => None,
-            })
-            .expect("the elicitation must surface as a permission request");
+        let request = requested(&events, "the elicitation must surface");
 
         assert_eq!(request.tool_call_id.as_str(), "exec-45");
         assert_eq!(
@@ -758,15 +762,7 @@ mod tests {
         open_turn(&mut assembler);
         feed(&mut assembler, mcp_started("exec-45"));
         let events = feed(&mut assembler, elicitation_request(3));
-        let tool_call_id = events
-            .iter()
-            .find_map(|event| match event {
-                AgentEvent::PermissionRequested { request, .. } => {
-                    Some(request.tool_call_id.clone())
-                }
-                _ => None,
-            })
-            .expect("the request surfaces");
+        let tool_call_id = requested(&events, "the request surfaces").tool_call_id;
 
         assert_eq!(assembler.resolve_elicitation(&tool_call_id, false), Some(3));
 
@@ -775,13 +771,7 @@ mod tests {
             json!({"method":"turn/completed",
                    "params":{"turn":{"id":"turn-1","status":"completed","durationMs":5}}}),
         );
-        let outcome = events
-            .into_iter()
-            .find_map(|event| match event {
-                AgentEvent::TurnEnded(outcome) => Some(outcome),
-                _ => None,
-            })
-            .expect("the turn closes");
+        let outcome = closed(events, "the turn closes");
         assert_eq!(outcome.denials.len(), 1);
         assert_eq!(outcome.denials[0].tool_name, "spike/horde_probe");
         assert_eq!(
@@ -798,28 +788,14 @@ mod tests {
         open_turn(&mut clean);
         feed(&mut clean, mcp_started("exec-1"));
         let events = feed(&mut clean, elicitation_request(4));
-        let id = events
-            .iter()
-            .find_map(|event| match event {
-                AgentEvent::PermissionRequested { request, .. } => {
-                    Some(request.tool_call_id.clone())
-                }
-                _ => None,
-            })
-            .expect("surfaces");
+        let id = requested(&events, "surfaces").tool_call_id;
         clean.resolve_elicitation(&id, true);
         let events = feed(
             &mut clean,
             json!({"method":"turn/completed",
                    "params":{"turn":{"id":"turn-1","status":"completed"}}}),
         );
-        let outcome = events
-            .into_iter()
-            .find_map(|event| match event {
-                AgentEvent::TurnEnded(outcome) => Some(outcome),
-                _ => None,
-            })
-            .expect("closes");
+        let outcome = closed(events, "closes");
         assert!(outcome.denials.is_empty(), "an allow is not a refusal");
     }
 
@@ -832,13 +808,7 @@ mod tests {
         open_turn(&mut assembler);
 
         let events = feed(&mut assembler, elicitation_request(9));
-        let request = events
-            .iter()
-            .find_map(|event| match event {
-                AgentEvent::PermissionRequested { request, .. } => Some(request.clone()),
-                _ => None,
-            })
-            .expect("must surface without the join");
+        let request = requested(&events, "must surface without the join");
         assert_eq!(request.tool_call_id.as_str(), "elicitation-9");
         assert_eq!(request.tool_name, "spike");
         assert_eq!(request.input, json!({"token":"HORDE_MCP_OK"}));
@@ -926,13 +896,7 @@ mod tests {
                 "error":{"message":"401 Unauthorized","codexErrorInfo":"unauthorized"},
                 "threadId":"t1","turnId":"turn-1","willRetry":false}}),
         );
-        let outcome = events
-            .into_iter()
-            .find_map(|event| match event {
-                AgentEvent::TurnEnded(outcome) => Some(outcome),
-                _ => None,
-            })
-            .expect("a terminal error ends the turn");
+        let outcome = closed(events, "a terminal error ends the turn");
         match outcome.status {
             TurnStatus::Failed { message } => {
                 assert!(
@@ -958,13 +922,7 @@ mod tests {
                 "error":{"message":"context window exceeded",
                          "codexErrorInfo":"contextWindowExceeded"}}}}),
         );
-        let outcome = events
-            .into_iter()
-            .find_map(|event| match event {
-                AgentEvent::TurnEnded(outcome) => Some(outcome),
-                _ => None,
-            })
-            .expect("closes");
+        let outcome = closed(events, "closes");
         assert!(
             matches!(
                 &outcome.status,
@@ -1050,11 +1008,7 @@ mod tests {
             json!({"method":"turn/completed",
                    "params":{"turn":{"id":"turn-1","durationMs":6101}}}),
         );
-        let ended = events.into_iter().find_map(|event| match event {
-            AgentEvent::TurnEnded(outcome) => Some(outcome),
-            _ => None,
-        });
-        let ended = ended.expect("turn/completed closes the turn");
+        let ended = closed(events, "turn/completed closes the turn");
         assert_eq!(ended.status, TurnStatus::Completed);
         assert_eq!(ended.duration.as_millis(), 6101);
     }

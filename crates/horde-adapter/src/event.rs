@@ -30,6 +30,42 @@ pub enum OutputChannel {
     HarnessDiagnostic,
 }
 
+/// Per-channel chunk numbering for one turn.
+///
+/// Chunk indices exist so a client can detect a gap; they only do that if they
+/// start at zero and advance by one within each turn and channel
+/// (`horde-testkit`'s conformance suite enforces it). Every adapter needs the
+/// same counter, so it lives here once instead of drifting apart per codec.
+#[derive(Debug, Default)]
+pub struct ChunkCounters(Vec<(OutputChannel, u64)>);
+
+impl ChunkCounters {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The next index for `channel`, advancing it.
+    pub fn next(&mut self, channel: OutputChannel) -> u64 {
+        match self.0.iter_mut().find(|(known, _)| *known == channel) {
+            Some((_, next)) => {
+                let index = *next;
+                *next = next.saturating_add(1);
+                index
+            }
+            None => {
+                self.0.push((channel, 1));
+                0
+            }
+        }
+    }
+
+    /// Starts every channel's numbering again — a new turn, a new count.
+    pub fn reset(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// One event from a running agent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
@@ -149,6 +185,30 @@ mod tests {
             denials,
             duration: Duration::from_secs(1),
         }
+    }
+
+    /// The counter's whole contract: zero first, plus one each time, per
+    /// channel independently, and reset starts everything again.
+    #[test]
+    fn chunk_counters_number_each_channel_independently_from_zero() {
+        use super::{ChunkCounters, OutputChannel};
+
+        let mut counters = ChunkCounters::new();
+        assert_eq!(counters.next(OutputChannel::Assistant), 0);
+        assert_eq!(counters.next(OutputChannel::Assistant), 1);
+        assert_eq!(
+            counters.next(OutputChannel::Reasoning),
+            0,
+            "channels do not share a counter"
+        );
+        assert_eq!(counters.next(OutputChannel::Assistant), 2);
+
+        counters.reset();
+        assert_eq!(
+            counters.next(OutputChannel::Assistant),
+            0,
+            "a new turn starts its numbering again"
+        );
     }
 
     #[test]

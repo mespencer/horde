@@ -308,15 +308,26 @@ fn an_mcp_tool_call_is_offered_before_it_runs_with_its_full_arguments() {
     assert!(!is_error, "the accepted call succeeded");
 }
 
+/// Replays a recording through the whole session seam under the shared
+/// conformance checks, answering every permission request with `policy`.
+async fn checked_replay(
+    name: &str,
+    policy: horde_testkit::conformance::Policy<'_>,
+) -> Result<
+    Vec<horde_testkit::conformance::TurnRecord>,
+    horde_testkit::conformance::ConformanceFailure,
+> {
+    let turns = codex_turns(name);
+    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
+    let mut session = replay_session(turns);
+    horde_testkit::conformance::check_session_with(&mut session, &messages, policy).await
+}
+
 /// Transcript 18 — the decline path: the call fails without a byte reaching
 /// the MCP server, and the denial rides the turn's outcome.
 #[tokio::test]
 async fn a_declined_mcp_call_fails_the_tool_and_records_the_denial() {
-    let turns = codex_turns("18-mcp-elicitation-decline.jsonl");
-    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
-    let mut session = replay_session(turns);
-
-    let records = horde_testkit::conformance::check_session_with(&mut session, &messages, &|_| {
+    let records = checked_replay("18-mcp-elicitation-decline.jsonl", &|_| {
         horde_adapter::PermissionDecision::deny("blocked by policy")
     })
     .await
@@ -346,11 +357,10 @@ async fn a_declined_mcp_call_fails_the_tool_and_records_the_denial() {
 /// answer it.
 #[tokio::test]
 async fn the_elicitation_recording_satisfies_the_adapter_contract() {
-    let turns = codex_turns("17-mcp-elicitation-accept.jsonl");
-    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
-    let mut session = replay_session(turns);
-
-    let records = horde_testkit::conformance::check_session(&mut session, &messages).await;
+    let records = checked_replay("17-mcp-elicitation-accept.jsonl", &|_| {
+        horde_testkit::conformance::allow_all()
+    })
+    .await;
     assert!(
         records.is_ok(),
         "the recorded session violated the adapter contract: {:?}",
