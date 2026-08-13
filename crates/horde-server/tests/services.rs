@@ -315,6 +315,11 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         .expect("list must succeed")
         .into_inner();
     assert_eq!(listed.sessions.len(), 1);
+    assert_eq!(
+        listed.sessions[0].title, "first",
+        "the summary carries the title the root spawn recorded, so clients \
+         do not have to reconstruct it from the spawn event"
+    );
 
     let fetched = harness
         .control

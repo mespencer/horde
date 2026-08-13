@@ -90,6 +90,12 @@ impl RememberedCall {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SessionState {
     pub session_id: String,
+    /// The session's display name, from the root spawn's first tree-path
+    /// element — the only place the log carries it. Empty until a root spawn
+    /// names it. This is the same rule the TUI folds client-side, projected
+    /// here so `ListSessions` summaries carry the title instead of every
+    /// client re-deriving it.
+    pub title: String,
     pub lifecycle: SessionLifecycleState,
     /// Highest sequence folded so far — the client's resume point.
     pub head_sequence: u64,
@@ -171,6 +177,12 @@ impl SessionState {
         let parent = spawned.parent_agent_id.as_ref().map(ToString::to_string);
         if parent.is_none() {
             self.root_agent_id.get_or_insert_with(|| agent_id.clone());
+        }
+        // The root's first tree-path element is the session's display name.
+        if names_the_session(parent.as_deref(), &self.title)
+            && let Some(name) = spawned.tree_path.first()
+        {
+            self.title = name.clone();
         }
         self.agents.insert(
             agent_id.clone(),
@@ -309,6 +321,18 @@ impl SessionState {
     }
 }
 
+/// Whether a spawn event is the one a session may take its display name
+/// from: a root spawn, seen while the session is still nameless.
+///
+/// A named predicate rather than an inline `&&` in the fold: the second
+/// parentless spawn racing the first is not reachable through the RPCs, so
+/// inline the operator would be untestable (docs/QUALITY_GATES.md on
+/// compound conditions). Mirrors the TUI's `takes_title_from` on purpose —
+/// two frontends, one naming rule.
+fn names_the_session(parent: Option<&str>, title: &str) -> bool {
+    parent.is_none() && title.is_empty()
+}
+
 /// Whether a decision widens the deterministic-allow layer for the session.
 ///
 /// Both halves matter and are not separately reachable inline: humans answer
@@ -358,6 +382,57 @@ mod tests {
             }),
             tree_path: Vec::new(),
         })
+    }
+
+    fn spawned_named(parent: Option<&str>, tree_path: &[&str]) -> Kind {
+        Kind::AgentSpawned(AgentSpawned {
+            parent_agent_id: parent.map(AgentId::new),
+            spawned_by: None,
+            spec: None,
+            tree_path: tree_path.iter().map(ToString::to_string).collect(),
+        })
+    }
+
+    /// The root spawn's first tree-path element names the session; a child's
+    /// spawn and a later parentless impostor must not rename it.
+    #[test]
+    fn the_root_spawn_names_the_session_and_nothing_renames_it() {
+        let events = vec![
+            stored(1, Some("root"), spawned_named(None, &["ci-fix"])),
+            stored(2, Some("child"), spawned_named(Some("root"), &["other"])),
+            stored(3, Some("impostor"), spawned_named(None, &["impostor"])),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.title, "ci-fix");
+    }
+
+    /// A child arriving first must not claim the name: the naming rule is
+    /// "root spawn", not "first spawn".
+    #[test]
+    fn a_childs_spawn_never_names_the_session() {
+        let events = vec![
+            stored(1, Some("child"), spawned_named(Some("root"), &["early"])),
+            stored(2, Some("root"), spawned_named(None, &["ci-fix"])),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.title, "ci-fix");
+    }
+
+    #[test]
+    fn a_root_spawn_with_no_tree_path_leaves_the_session_nameless() {
+        let events = vec![stored(1, Some("root"), spawned_named(None, &[]))];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.title, "");
+    }
+
+    /// All four corners of the naming predicate; the mixed rows are the ones
+    /// an `||` and an `&&` disagree on, and neither is reachable end-to-end.
+    #[test]
+    fn only_a_root_spawn_of_a_nameless_session_names_it() {
+        assert!(super::names_the_session(None, ""));
+        assert!(!super::names_the_session(Some("root"), ""));
+        assert!(!super::names_the_session(None, "already named"));
+        assert!(!super::names_the_session(Some("root"), "already named"));
     }
 
     #[test]

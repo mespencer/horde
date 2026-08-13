@@ -207,7 +207,10 @@ impl ControlPlane {
     fn summary(state: &SessionState) -> SessionSummary {
         SessionSummary {
             session_id: Some(SessionId::new(state.session_id.clone())),
-            title: String::new(),
+            // Projected from the root spawn's tree path — the same rule the
+            // TUI used to reconstruct titles client-side before summaries
+            // carried them.
+            title: state.title.clone(),
             root_agent_id: state.root_agent_id.clone().map(AgentId::new),
             workspace_definition_id: None,
             state: state.lifecycle as i32,
