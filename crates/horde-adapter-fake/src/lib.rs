@@ -103,6 +103,7 @@ impl FakeAdapter {
             provider_session_id,
             announced: false,
             turns_taken: 0,
+            script_cursor: 0,
             pending: VecDeque::new(),
             steps: VecDeque::new(),
             current: None,
@@ -171,6 +172,12 @@ pub struct FakeSession {
     provider_session_id: ProviderSessionId,
     announced: bool,
     turns_taken: u64,
+    /// Which scripted turn the next send consumes. Distinct from
+    /// [`Self::turns_taken`] because an *amending* send (steering) consumes a
+    /// script entry without opening a new turn — the real providers that
+    /// steer (Codex, transcript 15) keep the turn id and Horde's turn-id
+    /// contract holds the fake to the same shape.
+    script_cursor: u64,
     pending: VecDeque<AgentEvent>,
     steps: VecDeque<Step>,
     current: Option<CurrentTurn>,
@@ -323,7 +330,7 @@ impl AgentSession for FakeSession {
             return Err(AdapterError::HarnessExited { exit_code: Some(0) });
         }
 
-        let scripted = usize::try_from(self.turns_taken)
+        let scripted = usize::try_from(self.script_cursor)
             .ok()
             .and_then(|index| self.script.turns.get(index))
             .cloned();
@@ -338,6 +345,49 @@ impl AgentSession for FakeSession {
                 }
             },
         };
+        self.script_cursor = self.script_cursor.saturating_add(1);
+
+        if self.current.is_some() {
+            match input.delivery {
+                // Steering: the message amends the ACTIVE turn, exactly as
+                // `turn/steer` does (transcript 15) — same turn id, more
+                // steps, and the amendment's text becomes the turn's answer.
+                // The chunk counters deliberately keep running: one turn, one
+                // numbering.
+                horde_adapter::Delivery::TurnBoundary => {
+                    if !self.capabilities.supports(Capability::AmendActiveTurn) {
+                        // A provider without the capability never sees a
+                        // mid-turn send — the orchestrator holds the message —
+                        // so receiving one is a caller bug to refuse, never a
+                        // turn to silently clobber.
+                        return Err(AdapterError::Unsupported {
+                            provider: self.provider.clone(),
+                            capability: Capability::AmendActiveTurn,
+                        });
+                    }
+                    if let Some(current) = self.current.as_mut() {
+                        current.text = turn.text;
+                        current.tokens += turn.usage;
+                        current.cost_usd += turn.cost_usd;
+                    }
+                    self.steps.extend(turn.steps);
+                    return Ok(());
+                }
+                // An interrupt delivery ends the turn in flight first — with
+                // no answer, because the work was cancelled — and the message
+                // then runs as its own turn, the codex deferred-delivery
+                // shape.
+                horde_adapter::Delivery::Interrupt => {
+                    self.steps.clear();
+                    self.waiting_on = None;
+                    if let Some(current) = self.current.as_mut() {
+                        current.status = TurnStatus::Interrupted;
+                        current.text = None;
+                    }
+                    self.end_turn();
+                }
+            }
+        }
 
         self.turns_taken = self.turns_taken.saturating_add(1);
         self.chunk_counters.clear();
@@ -841,6 +891,146 @@ mod permission_path_tests {
         assert!(
             matches!(after, Some(AgentEvent::ToolCompleted { .. })),
             "then the call completes, got {after:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steering_tests {
+    use horde_adapter::{AgentEvent, Capabilities, Capability, TurnInput, TurnStatus};
+
+    use super::FakeAdapter;
+    use super::harness::started_on;
+    use crate::{Script, ScriptedTurn};
+
+    /// Drains everything currently available without blocking on a stall.
+    async fn drain(session: &mut Box<dyn horde_adapter::AgentSession>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = session.next_event().await {
+            events.push(event);
+            if events.len() > 64 {
+                break;
+            }
+        }
+        events
+    }
+
+    /// A mid-turn send on an amending provider is a steer: one turn, one
+    /// ending, and the answer is the answer to the steer — the same shape
+    /// codex's transcript 15 pins on the real adapter.
+    #[tokio::test]
+    async fn a_mid_turn_send_amends_the_active_turn() {
+        let mut session = started_on(FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("FIRST"),
+            ScriptedTurn::saying("STEERED"),
+        ])))
+        .await;
+
+        // The first turn is open (its steps unplayed); steer into it.
+        session
+            .send(TurnInput::queued("actually, do this instead"))
+            .await
+            .expect("an amending provider accepts a mid-turn send");
+
+        let events = drain(&mut session).await;
+        let endings: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnEnded(outcome) => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            endings.len(),
+            1,
+            "steering amends the turn; it must not open a second one: {events:?}"
+        );
+        assert_eq!(
+            endings[0].text.as_deref(),
+            Some("STEERED"),
+            "the turn's answer is the answer to the steer"
+        );
+
+        // And every event of the amended turn carries one turn id.
+        let mut ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Output { turn_id, .. } => Some(turn_id.clone()),
+                AgentEvent::TurnEnded(outcome) => Some(outcome.turn_id.clone()),
+                _ => None,
+            })
+            .collect();
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "one turn, one id: {ids:?}");
+    }
+
+    /// A provider without `AmendActiveTurn` never legitimately receives a
+    /// mid-turn send — the orchestrator holds the message — so the fake must
+    /// refuse rather than silently clobber the open turn.
+    #[tokio::test]
+    async fn a_mid_turn_send_without_the_capability_is_refused() {
+        let mut session = started_on(
+            FakeAdapter::new(Script::of(vec![
+                ScriptedTurn::saying("open"),
+                ScriptedTurn::saying("never reached"),
+            ]))
+            .with_capabilities(Capabilities::none().with(Capability::InterruptibleTurn)),
+        )
+        .await;
+
+        let refused = session.send(TurnInput::queued("mid-turn")).await;
+        assert!(
+            refused.is_err(),
+            "an open turn must not be silently replaced"
+        );
+        assert!(
+            refused
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+                .contains("AmendActiveTurn"),
+            "the refusal names what is missing"
+        );
+    }
+
+    /// An interrupt delivery mid-turn ends the cancelled turn first — with no
+    /// answer — and the message then runs as its own turn.
+    #[tokio::test]
+    async fn an_interrupt_delivery_closes_the_turn_then_runs_its_own() {
+        let mut session = started_on(FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("doomed work"),
+            ScriptedTurn::saying("REPLACEMENT"),
+        ])))
+        .await;
+
+        session
+            .send(TurnInput::interrupting("stop, do this"))
+            .await
+            .expect("an interrupting send is accepted");
+
+        let events = drain(&mut session).await;
+        let endings: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnEnded(outcome) => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            endings.len(),
+            2,
+            "the cancelled turn and the new one both end"
+        );
+        assert_eq!(endings[0].status, TurnStatus::Interrupted);
+        assert_eq!(
+            endings[0].text, None,
+            "a cancelled turn has no answer, even though one was scripted"
+        );
+        assert_eq!(endings[1].status, TurnStatus::Completed);
+        assert_eq!(endings[1].text.as_deref(), Some("REPLACEMENT"));
+        assert_ne!(
+            endings[0].turn_id, endings[1].turn_id,
+            "the replacement is its own turn"
         );
     }
 }
