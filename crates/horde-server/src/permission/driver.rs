@@ -968,7 +968,7 @@ mod tests {
         let judge = ScriptedJudge::ruling(JudgeRuling::Abstain {
             rationale: "the instructions do not cover writes".to_owned(),
         });
-        driver_over(&log, judged(), Some(judge))
+        driver_over(&log, judged(), Some(judge.clone()))
             .catch_up()
             .await
             .expect("catch up");
@@ -979,6 +979,12 @@ mod tests {
             requests[1].escalated_from,
             PermissionLayer::PolicyJudge as i32,
             "the approver is told the judge already looked and passed"
+        );
+        assert_eq!(
+            judge.asked.lock().expect("lock").len(),
+            1,
+            "the enriched re-raise is skipped, so the judge is asked exactly \
+             once — twice means the chain is re-evaluating its own escalation"
         );
     }
 
@@ -1070,22 +1076,53 @@ mod tests {
 
     // -- liveness ------------------------------------------------------------
 
-    /// The driver must park, not spin. Same instrument as `CommandStream`: a
-    /// hot loop answers every request correctly and burns a core, and only
-    /// this number tells the two apart.
+    /// The driver must park, not spin — over a log that *has* rows, none of
+    /// which need it. Same instrument as `CommandStream`, and the non-empty
+    /// log matters for a second reason: a catch-up whose cursor stops moving
+    /// re-reads one page forever, and a driver that never finishes catching up
+    /// never parks at all. Zero here is either failure; one is the only pass.
     #[tokio::test]
     async fn an_idle_driver_parks_instead_of_spinning() {
         let log = EventLog::in_memory().expect("log");
+        append(&log, "s1", "spawn", spawned("root", None, "", &["ci-fix"])).await;
+        append(&log, "s1", "req", requested("root", "req-1", Some(call("Read", "/x")))).await;
+        append(&log, "s1", "human", human_decided("root", "req-1", false)).await;
+
         let mut driver = driver_over(&log, PermissionModes::default(), None);
         assert_eq!(driver.parks(), 0);
 
         let idle =
             tokio::time::timeout(std::time::Duration::from_millis(200), driver.step()).await;
-        assert!(idle.is_err(), "nothing will ever arrive on an empty log");
+        assert!(idle.is_err(), "everything is settled, so nothing may arrive");
         assert_eq!(
             driver.parks(),
             1,
-            "0 means it never waited; a spin drives this into the thousands"
+            "0 means it never waited (or never finished catching up); a spin \
+             drives this into the thousands"
+        );
+    }
+
+    /// `Debug` on a driver is what an operator reads when the chain looks
+    /// stuck, and the two facts that diagnose it are how far it has folded and
+    /// whether it is parking.
+    #[tokio::test]
+    async fn the_debug_view_shows_how_far_the_chain_has_read() {
+        let log = EventLog::in_memory().expect("log");
+        let mut driver = driver_over(&log, PermissionModes::default(), None);
+
+        let fresh = format!("{driver:?}");
+        assert!(fresh.contains("ChainDriver"), "got {fresh}");
+        assert!(
+            fresh.contains("row: 0") && fresh.contains("parks: 0"),
+            "a driver that has done nothing must say so: {fresh}"
+        );
+
+        one_request(&log, Some(call("Read", "/x"))).await;
+        driver.catch_up().await.expect("catch up");
+        let read = format!("{driver:?}");
+        assert!(
+            !read.contains("row: 0"),
+            "the cursor is the whole diagnosis of a stuck chain: {read}"
         );
     }
 

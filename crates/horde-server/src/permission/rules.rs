@@ -32,7 +32,11 @@ pub struct FieldPrefix {
 /// The same shape serves both layers; a deny rule wraps it with a reason
 /// ([`DenyRule`]) because a denial without one teaches the agent nothing and
 /// it retries the same call forever.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// Deliberately no `Default`: "the rule that matches everything" should be
+/// spelled [`Rule::any_tool`], and a derived default would also hand
+/// cargo-mutants a provably equivalent rewrite of that constructor.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     /// Tool this rule speaks to. `None` means every tool.
     pub tool_name: Option<String>,
@@ -48,7 +52,11 @@ impl Rule {
     /// allow-all mode; useful mostly with [`Rule::under`] scoping.
     #[must_use]
     pub fn any_tool() -> Self {
-        Self::default()
+        Self {
+            tool_name: None,
+            where_input: Vec::new(),
+            under: Vec::new(),
+        }
     }
 
     /// A rule matching one tool by exact name.
@@ -56,7 +64,7 @@ impl Rule {
     pub fn tool(name: impl Into<String>) -> Self {
         Self {
             tool_name: Some(name.into()),
-            ..Self::default()
+            ..Self::any_tool()
         }
     }
 

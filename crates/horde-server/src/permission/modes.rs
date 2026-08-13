@@ -17,7 +17,11 @@ use super::rules::{DenyRule, Rule};
 
 /// One named mode: what it refuses, what it waves through, and what it asks a
 /// judge about.
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// Deliberately no `Default`: the empty mode has a name and a meaning —
+/// [`PermissionMode::escalate_everything`] — and a derived default would also
+/// hand cargo-mutants a provably equivalent rewrite of that constructor.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PermissionMode {
     /// Evaluated first. A matching deny is final — nothing later in the chain,
     /// including a remembered allow, can override "never Y".
@@ -34,7 +38,11 @@ impl PermissionMode {
     /// The mode that decides nothing itself: every call goes to a human.
     #[must_use]
     pub fn escalate_everything() -> Self {
-        Self::default()
+        Self {
+            deny: Vec::new(),
+            allow: Vec::new(),
+            judge_instructions: None,
+        }
     }
 
     /// Adds a deny rule with the reason the refused agent will read.

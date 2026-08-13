@@ -274,7 +274,7 @@ async fn a_remembered_answer_settles_the_repeat_without_a_human() {
         let answer = async move {
             let mut stream = watcher.follow(&SyncOptions::new(session)).await?;
             stream
-                .next_matching(|envelope| common::escalation_request_id(envelope))
+                .next_matching(common::escalation_request_id)
                 .await?
                 .ok_or("the escalation must be raised")?;
             let mut answering = Client::connect(&endpoint).await?;
