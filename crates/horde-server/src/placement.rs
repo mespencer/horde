@@ -657,6 +657,65 @@ mod tests {
         assert_eq!(queued.reason, "no worker is connected");
     }
 
+    /// The drain pass carries the parent's worker into the scheduler: a
+    /// re-placed child prefers where its parent runs even when another worker
+    /// is less loaded. The parent fact has to come from the projection —
+    /// a pass that loses it falls back to the load tiebreak and lands the
+    /// child on the idle worker instead.
+    #[tokio::test]
+    async fn a_drained_child_prefers_its_parents_worker_over_the_idle_one() {
+        use crate::service::shared::{ServerCore, append_event};
+        use horde_proto::v1::{AgentId, AgentSpawned, Event, WorkerCapabilities, event::Kind};
+
+        let core = ServerCore::new(crate::EventLog::in_memory().expect("an in-memory log"));
+        core.workers
+            .register("alpha", WorkerCapabilities::default());
+        core.workers.register("beta", WorkerCapabilities::default());
+
+        let spawn = |agent: &str, parent: Option<&str>| Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::AgentSpawned(AgentSpawned {
+                parent_agent_id: parent.map(AgentId::new),
+                spawned_by: None,
+                spec: Some(AgentSpec::default()),
+                tree_path: Vec::new(),
+            })),
+        };
+
+        // The parent already runs on beta; the child has no placement yet.
+        append_event(&core, "s1", "", spawn("parent", None))
+            .await
+            .expect("append the parent");
+        append_placement(
+            &core,
+            "s1",
+            wire_placement(
+                "parent",
+                &Placement::Placed {
+                    worker_id: "beta".to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("place the parent");
+        append_event(&core, "s1", "", spawn("child", Some("parent")))
+            .await
+            .expect("append the child");
+
+        place_queued(&core).await.expect("the drain pass");
+
+        let events = core.log.read_all("s1").await.expect("a readable log");
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(
+            state.agents["child"].worker_id.as_deref(),
+            Some("beta"),
+            "beta holds the parent and one agent; idle alpha would win the \
+             load tiebreak if the parent fact were dropped"
+        );
+    }
+
     #[test]
     fn a_spec_names_a_workspace_only_when_the_id_is_non_empty() {
         assert_eq!(workspace_of(&AgentSpec::default()), None);
