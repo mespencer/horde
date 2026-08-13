@@ -268,6 +268,86 @@ impl EventLog {
         ))
     }
 
+    /// Replays several sessions and follows them all through one channel —
+    /// the merged tail the multi-session overview and the global inbox read,
+    /// so a client holds one stream instead of one per session.
+    ///
+    /// `cursors` name the sessions to replay and from where; those get the
+    /// same no-loss guarantee as [`EventLog::tail`] (subscribe, replay,
+    /// sweep). With `all_sessions`, every other session — including ones that
+    /// do not exist yet — is followed from its current head: no history is
+    /// replayed for them, because "the overview wants the tail" is exactly
+    /// what the flag means (`control_plane.proto`). `excluded` names streams
+    /// the all-sessions net must not catch (the workspace catalog lives in
+    /// the log but is not a session); an excluded stream can still be
+    /// followed by naming it in a cursor.
+    ///
+    /// History is returned per cursor session, in cursor order. There is no
+    /// global order across sessions to preserve — sequences are per-session —
+    /// and every consumer folds per-session state.
+    pub async fn tail_merged(
+        &self,
+        cursors: &[(String, u64)],
+        all_sessions: bool,
+        excluded: &[String],
+    ) -> Result<(Vec<StoredEvent>, MultiTail), ServerError> {
+        // Subscribe before reading, for the same reason `tail` does.
+        let notifications = self.subscribe();
+
+        let mut delivered = std::collections::BTreeMap::new();
+        let mut history = Vec::new();
+        for (session_id, from_sequence) in cursors {
+            let events = self.read_all_from(session_id, *from_sequence).await?;
+            let last = events
+                .last()
+                .map_or((*from_sequence).max(1).saturating_sub(1), |event| {
+                    event.sequence
+                });
+            history.extend(events);
+            delivered.insert(session_id.clone(), last);
+        }
+
+        if all_sessions {
+            for session_id in self.session_ids().await? {
+                if delivered.contains_key(&session_id)
+                    || excluded.contains(&session_id)
+                {
+                    continue;
+                }
+                // From the current head: the overview wants the live tail,
+                // not a replay of every session it can see.
+                let head = self.head(&session_id).await?;
+                delivered.insert(session_id, head);
+            }
+        }
+
+        // Sweep the cursor sessions, exactly as `tail` does: anything that
+        // landed during the replay is folded into the history rather than
+        // left to a notification that may have raced the subscription.
+        for (session_id, _) in cursors {
+            let head_after_replay = self.head(session_id).await?;
+            let already = delivered.get(session_id).copied().unwrap_or(0);
+            if needs_sweep(head_after_replay, already) {
+                let missed = self.read_all_from(session_id, sweep_from(already)).await?;
+                if let Some(last) = missed.last() {
+                    delivered.insert(session_id.clone(), last.sequence);
+                    history.extend(missed);
+                }
+            }
+        }
+
+        Ok((
+            history,
+            MultiTail {
+                log: self.clone(),
+                notifications,
+                delivered,
+                all_sessions,
+                excluded: excluded.iter().cloned().collect(),
+            },
+        ))
+    }
+
     /// Reads every event from an offset, paging so one enormous session cannot
     /// be pulled into memory by a single unbounded query.
     /// Terminates on an empty page rather than on a short one.
@@ -390,6 +470,124 @@ impl Tail {
                 Err(error) => return Some(Err(error)),
             }
         }
+    }
+}
+
+/// Whether a notification tells a merged tail nothing.
+///
+/// A followed session skips what was already delivered — the same boundary
+/// [`is_stale`] pins. An *unfollowed* session is news only when the tail
+/// follows all sessions and the stream is not excluded; that arm is how a
+/// session created after the subscription joins the merge. Extracted for the
+/// same reason as `is_stale`: the corners are not separately reachable
+/// through a live stream, and as a predicate all six rows are assertable.
+fn merged_skip(delivered: Option<u64>, all_sessions: bool, excluded: bool, sequence: u64) -> bool {
+    match delivered {
+        Some(delivered) => sequence <= delivered,
+        None => !all_sessions || excluded,
+    }
+}
+
+/// A live follow of several sessions through one channel.
+///
+/// The merged counterpart of [`Tail`], built by [`EventLog::tail_merged`].
+/// One receiver, one `delivered` watermark per session; a batch never mixes
+/// sessions, because each wake reads exactly the session its notification
+/// named.
+pub struct MultiTail {
+    log: EventLog,
+    notifications: broadcast::Receiver<Notification>,
+    /// Highest sequence handed out, per followed session.
+    delivered: std::collections::BTreeMap<String, u64>,
+    /// Adopt sessions this map has never seen, from their current position.
+    all_sessions: bool,
+    /// Streams the all-sessions net must not catch.
+    excluded: std::collections::BTreeSet<String>,
+}
+
+impl MultiTail {
+    /// Every followed session and the highest sequence delivered for it —
+    /// the per-session heads a catch-up marker reports.
+    #[must_use]
+    pub fn heads(&self) -> Vec<(String, u64)> {
+        self.delivered
+            .iter()
+            .map(|(session_id, delivered)| (session_id.clone(), *delivered))
+            .collect()
+    }
+
+    /// Waits for the next batch of events from any followed session.
+    ///
+    /// `None` means the log was dropped. Same contract as [`Tail`]: the
+    /// channel is a hint, the log is the truth, and a lagged subscriber
+    /// re-reads every followed session rather than giving up.
+    pub async fn next_batch(&mut self) -> Option<Result<Vec<StoredEvent>, ServerError>> {
+        loop {
+            let woken_for = match self.notifications.recv().await {
+                Ok(notification) => {
+                    let delivered = self.delivered.get(&notification.session_id).copied();
+                    let excluded = self.excluded.contains(&notification.session_id);
+                    if merged_skip(
+                        delivered,
+                        self.all_sessions,
+                        excluded,
+                        notification.sequence,
+                    ) {
+                        continue;
+                    }
+                    Some(notification.session_id)
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(missed, "merged tail fell behind; re-reading every session");
+                    None
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            };
+
+            let read = match woken_for {
+                Some(session_id) => self.read_session(&session_id).await,
+                None => self.read_everything().await,
+            };
+            match read {
+                Ok(batch) if batch.is_empty() => {
+                    // A deduplicated append, or a session-mate already read.
+                }
+                Ok(batch) => return Some(Ok(batch)),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+
+    /// Reads one session forward from its watermark.
+    async fn read_session(&mut self, session_id: &str) -> Result<Vec<StoredEvent>, ServerError> {
+        let from = sweep_from(self.delivered.get(session_id).copied().unwrap_or(0));
+        let batch = self.log.read_from(session_id, from, 512).await?;
+        if let Some(last) = batch.last() {
+            self.delivered.insert(session_id.to_owned(), last.sequence);
+        }
+        Ok(batch)
+    }
+
+    /// The lag recovery: rediscover sessions, then read every followed one
+    /// forward. Notifications were dropped, so nothing narrower is safe.
+    async fn read_everything(&mut self) -> Result<Vec<StoredEvent>, ServerError> {
+        if self.all_sessions {
+            for session_id in self.log.session_ids().await? {
+                if !self.delivered.contains_key(&session_id)
+                    && !self.excluded.contains(&session_id)
+                {
+                    // Never seen and the notification that would have
+                    // announced it is gone: adopt it from the start.
+                    self.delivered.insert(session_id, 0);
+                }
+            }
+        }
+        let sessions: Vec<String> = self.delivered.keys().cloned().collect();
+        let mut batch = Vec::new();
+        for session_id in sessions {
+            batch.extend(self.read_session(&session_id).await?);
+        }
+        Ok(batch)
     }
 }
 
@@ -599,6 +797,211 @@ mod tests {
             super::sweep_from(u64::MAX),
             u64::MAX,
             "saturating, so an absurd head cannot wrap the window back to zero"
+        );
+    }
+
+    /// All six rows of the merged-skip table. The unfollowed arms are the
+    /// ones a live stream cannot reach separately: an unfollowed session
+    /// only ever notifies while `all_sessions` streams are also receiving
+    /// their own traffic, so a flipped `!` or a dropped `||` passes
+    /// end-to-end.
+    #[test]
+    fn a_merged_tail_skips_delivered_events_and_unfollowed_sessions_it_must_not_adopt() {
+        // Followed: only the watermark decides; the flags must not matter.
+        assert!(!super::merged_skip(Some(4), false, false, 5));
+        assert!(super::merged_skip(Some(4), false, false, 4));
+        assert!(super::merged_skip(Some(4), true, true, 3));
+
+        // Unfollowed: adopted only under all_sessions, and never an excluded
+        // stream.
+        assert!(!super::merged_skip(None, true, false, 1));
+        assert!(super::merged_skip(None, false, false, 1));
+        assert!(super::merged_skip(None, true, true, 1));
+    }
+
+    /// Bounded wait for a merged tail's next batch — same rationale as
+    /// [`next_batch_within`].
+    async fn merged_batch_within(tail: &mut super::MultiTail) -> Vec<super::StoredEvent> {
+        tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
+            .await
+            .expect("the merged tail must produce a batch rather than hang")
+            .expect("the log outlives the tail")
+            .expect("read")
+    }
+
+    /// The merged replay: cursor sessions get history from their offsets and
+    /// the per-session heads say where the live tail begins.
+    #[tokio::test]
+    async fn a_merged_tail_replays_each_cursor_from_its_own_offset() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for _ in 0..3 {
+            log.append(pending("s1", b"a")).await.expect("append");
+        }
+        log.append(pending("s2", b"b")).await.expect("append");
+
+        let cursors = vec![("s1".to_owned(), 2), ("s2".to_owned(), 1)];
+        let (history, tail) = log
+            .tail_merged(&cursors, false, &[])
+            .await
+            .expect("merged tail");
+
+        let seen: Vec<(String, u64)> = history
+            .iter()
+            .map(|event| (event.session_id.clone(), event.sequence))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("s1".to_owned(), 2),
+                ("s1".to_owned(), 3),
+                ("s2".to_owned(), 1),
+            ],
+            "each cursor replays from its own offset, per session in cursor order"
+        );
+        assert_eq!(
+            tail.heads(),
+            vec![("s1".to_owned(), 3), ("s2".to_owned(), 1)],
+            "the heads are per-session resume points"
+        );
+    }
+
+    /// One stream serves them all: events landing in either followed session
+    /// come out of the same tail, positioned after each session's replay.
+    #[tokio::test]
+    async fn a_merged_tail_follows_every_cursor_session_live() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"a")).await.expect("append");
+        log.append(pending("s2", b"b")).await.expect("append");
+
+        let cursors = vec![("s1".to_owned(), 1), ("s2".to_owned(), 1)];
+        let (history, mut tail) = log
+            .tail_merged(&cursors, false, &[])
+            .await
+            .expect("merged tail");
+        assert_eq!(history.len(), 2);
+
+        log.append(pending("s2", b"x")).await.expect("append");
+        let batch = merged_batch_within(&mut tail).await;
+        assert_eq!(batch.len(), 1);
+        assert_eq!((batch[0].session_id.as_str(), batch[0].sequence), ("s2", 2));
+
+        log.append(pending("s1", b"y")).await.expect("append");
+        let batch = merged_batch_within(&mut tail).await;
+        assert_eq!((batch[0].session_id.as_str(), batch[0].sequence), ("s1", 2));
+    }
+
+    /// The all-sessions net: an unnamed session is followed from its current
+    /// head (no replay), and a session born after the subscription is adopted
+    /// from its start — the overview hears about sessions it never asked for.
+    #[tokio::test]
+    async fn an_all_sessions_tail_adopts_existing_heads_and_newborn_sessions() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("veteran", b"old")).await.expect("append");
+
+        let (history, mut tail) = log
+            .tail_merged(&[], true, &[])
+            .await
+            .expect("merged tail");
+        assert!(
+            history.is_empty(),
+            "an unnamed session is followed from its head, not replayed"
+        );
+        assert_eq!(tail.heads(), vec![("veteran".to_owned(), 1)]);
+
+        // The veteran moves: only the new event arrives.
+        log.append(pending("veteran", b"new")).await.expect("append");
+        let batch = merged_batch_within(&mut tail).await;
+        assert_eq!(
+            (batch[0].session_id.as_str(), batch[0].sequence),
+            ("veteran", 2)
+        );
+
+        // A session created after the subscription arrives from its start.
+        log.append(pending("newborn", b"first")).await.expect("append");
+        let batch = merged_batch_within(&mut tail).await;
+        assert_eq!(
+            (batch[0].session_id.as_str(), batch[0].sequence),
+            ("newborn", 1)
+        );
+    }
+
+    /// The exclusion: an excluded stream is invisible to the all-sessions
+    /// net, but an explicit cursor for it still works — the catalog can be
+    /// synced by name, never by accident.
+    #[tokio::test]
+    async fn an_excluded_stream_is_not_adopted_but_can_be_named() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("catalog", b"defn")).await.expect("append");
+        log.append(pending("s1", b"a")).await.expect("append");
+
+        let excluded = vec!["catalog".to_owned()];
+        let (_, mut tail) = log
+            .tail_merged(&[], true, &excluded)
+            .await
+            .expect("merged tail");
+        assert_eq!(
+            tail.heads(),
+            vec![("s1".to_owned(), 1)],
+            "the excluded stream must not be adopted"
+        );
+
+        log.append(pending("catalog", b"more")).await.expect("append");
+        log.append(pending("s1", b"b")).await.expect("append");
+        let batch = merged_batch_within(&mut tail).await;
+        assert_eq!(
+            (batch[0].session_id.as_str(), batch[0].sequence),
+            ("s1", 2),
+            "the catalog append must not wake the merge with catalog events"
+        );
+
+        // Named explicitly, the same stream replays fine.
+        let (history, _) = log
+            .tail_merged(&[("catalog".to_owned(), 1)], false, &excluded)
+            .await
+            .expect("merged tail");
+        assert_eq!(history.len(), 2, "an explicit cursor beats the exclusion");
+    }
+
+    /// The lag path re-reads from the log rather than trusting the channel:
+    /// force a lag by filling the notification buffer while the tail is not
+    /// reading, then require every event to arrive anyway.
+    #[tokio::test]
+    async fn a_lagged_merged_tail_recovers_everything_from_the_log() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"seed")).await.expect("append");
+
+        let (_, mut tail) = log
+            .tail_merged(&[("s1".to_owned(), 1)], true, &[])
+            .await
+            .expect("merged tail");
+
+        // NOTIFY_CAPACITY is 1024; overflow it so the receiver lags, with a
+        // newborn session hidden inside the dropped window.
+        log.append(pending("newborn", b"x")).await.expect("append");
+        for _ in 0..1100 {
+            log.append(pending("s1", b"x")).await.expect("append");
+        }
+
+        let mut seen_s1 = 1_u64;
+        let mut seen_newborn = 0_u64;
+        // Counted ceiling: everything is already in the log, so the batches
+        // must arrive without waiting on further appends.
+        for _ in 0..40 {
+            if seen_s1 >= 1101 && seen_newborn >= 1 {
+                break;
+            }
+            for event in merged_batch_within(&mut tail).await {
+                match event.session_id.as_str() {
+                    "s1" => seen_s1 = seen_s1.max(event.sequence),
+                    "newborn" => seen_newborn = seen_newborn.max(event.sequence),
+                    other => panic!("unexpected session {other}"),
+                }
+            }
+        }
+        assert_eq!(seen_s1, 1101, "the lag must not lose cursor-session events");
+        assert_eq!(
+            seen_newborn, 1,
+            "a session born inside the dropped window must still be adopted"
         );
     }
 
