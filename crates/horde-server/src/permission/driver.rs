@@ -516,21 +516,15 @@ mod tests {
         )
     }
 
-    fn arguments(path: &str) -> Struct {
-        let mut input = Struct::default();
-        input.fields.insert(
-            "file_path".to_owned(),
-            Value {
-                kind: Some(ValueKind::StringValue(path.to_owned())),
-            },
-        );
-        input
-    }
-
     fn call(tool: &str, path: &str) -> ProposedToolCall {
+        let file_path = Value {
+            kind: Some(ValueKind::StringValue(path.to_owned())),
+        };
         ProposedToolCall {
             tool_name: tool.to_owned(),
-            input: Some(arguments(path)),
+            input: Some(Struct {
+                fields: [("file_path".to_owned(), file_path)].into(),
+            }),
             rendered: format!("{tool} {path}"),
         }
     }
@@ -605,6 +599,26 @@ mod tests {
         ChainDriver::open(log, Arc::new(modes), judge)
     }
 
+    /// One full pass of the chain over the log, returning how many events it
+    /// appended.
+    async fn run_chain(
+        log: &EventLog,
+        modes: PermissionModes,
+        judge: Option<Arc<dyn PolicyJudge>>,
+    ) -> u64 {
+        driver_over(log, modes, judge)
+            .catch_up()
+            .await
+            .expect("the chain must be able to read and write the log")
+    }
+
+    /// A registry whose *default* mode allows everything — the arrangement the
+    /// escalate-anyway tests use to prove the default was never consulted.
+    fn allow_all_by_default() -> PermissionModes {
+        PermissionModes::default()
+            .with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()))
+    }
+
     /// A mode registry whose one named mode allows `Read` and denies `Bash`.
     fn cautious() -> PermissionModes {
         PermissionModes::default().with_mode(
@@ -634,8 +648,7 @@ mod tests {
         let log = EventLog::in_memory().expect("log");
         one_request(&log, Some(call("Read", "/workspace/a"))).await;
 
-        let mut driver = driver_over(&log, cautious(), None);
-        let appended = driver.catch_up().await.expect("catch up");
+        let appended = run_chain(&log, cautious(), None).await;
         assert_eq!(appended, 1, "one request, one decision");
 
         let decisions = decisions_in(&log, "s1").await;
@@ -657,10 +670,7 @@ mod tests {
         let log = EventLog::in_memory().expect("log");
         one_request(&log, Some(call("Bash", "/x"))).await;
 
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        run_chain(&log, cautious(), None).await;
 
         let decisions = decisions_in(&log, "s1").await;
         assert_eq!(decisions.len(), 1);
@@ -682,10 +692,7 @@ mod tests {
         let log = EventLog::in_memory().expect("log");
         one_request(&log, Some(call("Write", "/etc/hosts"))).await;
 
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        run_chain(&log, cautious(), None).await;
 
         assert!(
             decisions_in(&log, "s1").await.is_empty(),
@@ -725,14 +732,9 @@ mod tests {
         let log = EventLog::in_memory().expect("log");
         one_request(&log, Some(call("Write", "/etc/hosts"))).await;
 
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("first pass");
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("a restart re-reads the whole log");
+        run_chain(&log, cautious(), None).await;
+        // A restart re-reads the whole log through a fresh driver.
+        run_chain(&log, cautious(), None).await;
 
         assert_eq!(
             requests_in(&log, "s1").await.len(),
@@ -747,10 +749,7 @@ mod tests {
         one_request(&log, Some(call("Read", "/x"))).await;
         append(&log, "s1", "human-1", human_decided("root", "req-1", false)).await;
 
-        let appended = driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        let appended = run_chain(&log, cautious(), None).await;
 
         assert_eq!(appended, 0, "a settled request is nobody's to re-answer");
         assert_eq!(decisions_in(&log, "s1").await.len(), 1);
@@ -764,14 +763,8 @@ mod tests {
         let log = EventLog::in_memory().expect("log");
         one_request(&log, Some(call("Read", "/x"))).await;
 
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("first pass");
-        let second = driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("second pass");
+        run_chain(&log, cautious(), None).await;
+        let second = run_chain(&log, cautious(), None).await;
 
         assert_eq!(second, 0);
         assert_eq!(decisions_in(&log, "s1").await.len(), 1);
@@ -797,12 +790,7 @@ mod tests {
 
         // The registry has no "typo-mode" — resolve must not fall back to the
         // default, whose rules nobody chose for this agent.
-        let modes = PermissionModes::default()
-            .with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()));
-        driver_over(&log, modes, None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        run_chain(&log, allow_all_by_default(), None).await;
 
         assert!(decisions_in(&log, "s1").await.is_empty());
         assert_eq!(requests_in(&log, "s1").await.len(), 2, "escalated instead");
@@ -820,12 +808,7 @@ mod tests {
         .await;
         append(&log, "s1", "req-1", requested("root", "req-1", None)).await;
 
-        let modes = PermissionModes::default()
-            .with_default(PermissionMode::escalate_everything().allow(Rule::any_tool()));
-        driver_over(&log, modes, None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        run_chain(&log, allow_all_by_default(), None).await;
 
         assert!(
             decisions_in(&log, "s1").await.is_empty(),
@@ -892,18 +875,28 @@ mod tests {
         .await;
     }
 
+    /// One judged request driven through the chain: builds the log, scripts
+    /// the judge, runs one pass, and hands both back for assertions.
+    async fn judged_run(
+        tool_call: ProposedToolCall,
+        ruling: JudgeRuling,
+    ) -> (EventLog, Arc<ScriptedJudge>) {
+        let log = EventLog::in_memory().expect("log");
+        one_judged_request(&log, tool_call).await;
+        let judge = ScriptedJudge::ruling(ruling);
+        run_chain(&log, judged(), Some(judge.clone())).await;
+        (log, judge)
+    }
+
     #[tokio::test]
     async fn the_judge_rules_what_the_deterministic_layers_left_unsettled() {
-        let log = EventLog::in_memory().expect("log");
-        one_judged_request(&log, call("Read", "/workspace/a")).await;
-
-        let judge = ScriptedJudge::ruling(JudgeRuling::Allow {
-            rationale: "a read under the workspace".to_owned(),
-        });
-        driver_over(&log, judged(), Some(judge.clone()))
-            .catch_up()
-            .await
-            .expect("catch up");
+        let (log, judge) = judged_run(
+            call("Read", "/workspace/a"),
+            JudgeRuling::Allow {
+                rationale: "a read under the workspace".to_owned(),
+            },
+        )
+        .await;
 
         let decisions = decisions_in(&log, "s1").await;
         assert_eq!(decisions.len(), 1);
@@ -928,16 +921,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_judge_denial_reaches_the_journal_as_the_judges() {
-        let log = EventLog::in_memory().expect("log");
-        one_judged_request(&log, call("WebFetch", "https://example.com")).await;
-
-        let judge = ScriptedJudge::ruling(JudgeRuling::Deny {
-            rationale: "the policy says never the network".to_owned(),
-        });
-        driver_over(&log, judged(), Some(judge))
-            .catch_up()
-            .await
-            .expect("catch up");
+        let (log, _judge) = judged_run(
+            call("WebFetch", "https://example.com"),
+            JudgeRuling::Deny {
+                rationale: "the policy says never the network".to_owned(),
+            },
+        )
+        .await;
 
         let decisions = decisions_in(&log, "s1").await;
         assert_eq!(decisions[0].outcome, PermissionOutcome::Deny as i32);
@@ -947,23 +937,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_deny_rule_runs_before_the_judge_is_ever_asked() {
-        let log = EventLog::in_memory().expect("log");
-        one_judged_request(&log, call("Bash", "/x")).await;
-
-        let judge = ScriptedJudge::ruling(JudgeRuling::Allow {
+        // A judge that would allow, behind a rule that denies: the rule wins.
+        let never_reached = JudgeRuling::Allow {
             rationale: "would have allowed".to_owned(),
-        });
-        driver_over(&log, judged(), Some(judge.clone()))
-            .catch_up()
-            .await
-            .expect("catch up");
+        };
+        let (log, judge) = judged_run(call("Bash", "/x"), never_reached).await;
 
-        let decisions = decisions_in(&log, "s1").await;
-        assert_eq!(decisions[0].outcome, PermissionOutcome::Deny as i32);
-        assert_eq!(
-            decisions[0].decided_by,
-            PermissionLayer::DeterministicDeny as i32
-        );
+        let sole = decisions_in(&log, "s1").await.remove(0);
+        assert_eq!(sole.outcome, PermissionOutcome::Deny as i32);
+        assert_eq!(sole.decided_by, PermissionLayer::DeterministicDeny as i32);
         assert!(
             judge.asked.lock().expect("lock").is_empty(),
             "layer order is the security property: deny is final"
@@ -972,16 +954,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_abstaining_judge_escalates_to_the_human() {
-        let log = EventLog::in_memory().expect("log");
-        one_judged_request(&log, call("Write", "/etc/hosts")).await;
-
-        let judge = ScriptedJudge::ruling(JudgeRuling::Abstain {
-            rationale: "the instructions do not cover writes".to_owned(),
-        });
-        driver_over(&log, judged(), Some(judge.clone()))
-            .catch_up()
-            .await
-            .expect("catch up");
+        let (log, judge) = judged_run(
+            call("Write", "/etc/hosts"),
+            JudgeRuling::Abstain {
+                rationale: "the instructions do not cover writes".to_owned(),
+            },
+        )
+        .await;
 
         assert!(decisions_in(&log, "s1").await.is_empty());
         let requests = requests_in(&log, "s1").await;
@@ -1003,10 +982,7 @@ mod tests {
         let log = EventLog::in_memory().expect("log");
         one_judged_request(&log, call("Write", "/etc/hosts")).await;
 
-        driver_over(&log, judged(), None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        run_chain(&log, judged(), None).await;
 
         assert!(
             decisions_in(&log, "s1").await.is_empty(),
@@ -1020,10 +996,10 @@ mod tests {
 
     // -- remember-for-session ------------------------------------------------
 
-    /// The full remember loop: escalate, a human allows with remember, and the
-    /// identical proposal is then settled by the widened allow layer.
-    #[tokio::test]
-    async fn a_remembered_allow_settles_the_repeat_without_a_human() {
+    /// The remember arrangement: a `Write /tmp/notes` a human allowed with
+    /// remember-for-session, then `second` raised as `req-2`, then one chain
+    /// pass over all of it.
+    async fn remembered_write_then(second: ProposedToolCall) -> EventLog {
         let log = EventLog::in_memory().expect("log");
         one_request(&log, Some(call("Write", "/tmp/notes"))).await;
         append(&log, "s1", "human-1", human_decided("root", "req-1", true)).await;
@@ -1031,14 +1007,18 @@ mod tests {
             &log,
             "s1",
             "req-2",
-            requested("root", "req-2", Some(call("Write", "/tmp/notes"))),
+            requested("root", "req-2", Some(second)),
         )
         .await;
+        run_chain(&log, cautious(), None).await;
+        log
+    }
 
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("catch up");
+    /// The full remember loop: escalate, a human allows with remember, and the
+    /// identical proposal is then settled by the widened allow layer.
+    #[tokio::test]
+    async fn a_remembered_allow_settles_the_repeat_without_a_human() {
+        let log = remembered_write_then(call("Write", "/tmp/notes")).await;
 
         let decisions = decisions_in(&log, "s1").await;
         let repeat: Vec<_> = decisions
@@ -1058,21 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_different_call_is_not_covered_by_what_was_remembered() {
-        let log = EventLog::in_memory().expect("log");
-        one_request(&log, Some(call("Write", "/tmp/notes"))).await;
-        append(&log, "s1", "human-1", human_decided("root", "req-1", true)).await;
-        append(
-            &log,
-            "s1",
-            "req-2",
-            requested("root", "req-2", Some(call("Write", "/etc/hosts"))),
-        )
-        .await;
-
-        driver_over(&log, cautious(), None)
-            .catch_up()
-            .await
-            .expect("catch up");
+        let log = remembered_write_then(call("Write", "/etc/hosts")).await;
 
         let decisions = decisions_in(&log, "s1").await;
         assert!(
