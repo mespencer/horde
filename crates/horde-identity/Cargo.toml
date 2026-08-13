@@ -1,0 +1,33 @@
+[package]
+name = "horde-identity"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Identity and mTLS: the Server's internal CA, the Enrollment code flow, and the rustls configuration every channel shares."
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom = { workspace = true }
+hex = { workspace = true }
+# The enrollment client flow (`Join` with a fingerprint-pinned verifier) lives
+# here so the Worker and the CLI redeem codes through the same code path.
+horde-proto = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+# The hyper-served channels (Relay, MCP endpoint) terminate TLS themselves;
+# the tonic channels use tonic's own rustls integration. Both configurations
+# are built here so "what a Horde listener accepts" has one owner.
+tokio-rustls = { workspace = true }
+tonic = { version = "0.14.6", features = ["channel", "server", "tls-ring"] }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

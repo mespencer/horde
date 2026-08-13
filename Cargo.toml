@@ -12,16 +12,31 @@ publish = false
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+# The TLS stack is pinned exactly (`=`): certificate issuance and verification
+# are calibration-sensitive the same way gate tool versions are — a silently
+# moved rustls default is how a security property changes between two builds.
+# All of it is rustls-on-ring; nothing here may enable aws-lc, because two
+# enabled crypto providers make `rustls::ServerConfig::builder()` ambiguous.
+getrandom = "=0.3.4"
+hex = "=0.4.3"
+rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "=0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
+time = "=0.3.55"
 tokio = { version = "1.53.1", default-features = false }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+x509-parser = "=0.18.1"
 
 horde-adapter = { path = "crates/horde-adapter" }
 horde-adapter-claude = { path = "crates/horde-adapter-claude" }
 horde-adapter-fake = { path = "crates/horde-adapter-fake" }
 horde-cli = { path = "crates/horde-cli" }
+horde-identity = { path = "crates/horde-identity" }
 horde-proto = { path = "crates/horde-proto" }
 horde-server = { path = "crates/horde-server" }
 horde-server-testkit = { path = "crates/horde-server-testkit" }
