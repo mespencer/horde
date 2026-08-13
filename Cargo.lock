@@ -1002,7 +1002,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
