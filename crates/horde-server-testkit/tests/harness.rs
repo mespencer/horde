@@ -170,3 +170,76 @@ async fn open_journal_leaves_the_first_ack_for_the_caller() {
         "a fresh worker announcing position 0 is accepted, and the caller sees it"
     );
 }
+
+/// `serve_with_permissions` really runs the chain: a request journaled the way
+/// a worker journals one comes back decided by the configured mode, with no
+/// human attached anywhere. Observed through the log rather than trusted from
+/// the endpoint string, which is exactly what a mutant of the wiring fakes.
+#[tokio::test]
+async fn a_permission_server_answers_from_the_configured_mode() {
+    use horde_server::permission::{PermissionMode, PermissionModes, Rule};
+
+    let modes = PermissionModes::default()
+        .with_default(PermissionMode::escalate_everything().allow(Rule::tool("Read")));
+    let endpoint = horde_server_testkit::serve_with_permissions(modes, None)
+        .await
+        .expect("the permission harness must serve");
+    let (mut client, session_id, root) = seeded(&endpoint, "chain")
+        .await
+        .expect("seeding must succeed");
+
+    let request = Event {
+        agent_id: Some(AgentId::new(root.clone())),
+        occurred_at: None,
+        idempotency_key: "req-chain".to_owned(),
+        kind: Some(Kind::PermissionRequested(
+            horde_proto::v1::PermissionRequested {
+                request: Some(horde_proto::v1::PermissionRequest {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new("req-chain")),
+                    agent_id: Some(AgentId::new(root)),
+                    tool_call: Some(horde_proto::v1::ProposedToolCall {
+                        tool_name: "Read".to_owned(),
+                        input: None,
+                        rendered: "Read".to_owned(),
+                    }),
+                    ..horde_proto::v1::PermissionRequest::default()
+                }),
+            },
+        )),
+    };
+    journal_event(&endpoint, &session_id, request)
+        .await
+        .expect("the request must be acked");
+
+    let mut stream = client
+        .follow(&SyncOptions::new(session_id))
+        .await
+        .expect("the log must be followable");
+    let decided = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.next_matching(|envelope| {
+            let Some(Kind::PermissionDecided(decided)) = envelope
+                .event
+                .as_ref()
+                .and_then(|event| event.kind.as_ref())
+            else {
+                return None;
+            };
+            decided.decision.clone()
+        }),
+    )
+    .await
+    .expect("the chain must decide while the suite watches")
+    .expect("the stream must not fail")
+    .expect("the stream must not end undecided");
+
+    assert_eq!(
+        decided.outcome,
+        horde_proto::v1::PermissionOutcome::Allow as i32
+    );
+    assert_eq!(
+        decided.decided_by,
+        horde_proto::v1::PermissionLayer::DeterministicAllow as i32,
+        "the decision must come from the chain the harness was told to run"
+    );
+}
