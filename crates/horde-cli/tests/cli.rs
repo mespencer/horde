@@ -122,11 +122,20 @@ async fn sync_replays_a_session_to_stdout_and_exits() {
     assert!(run.success, "stderr was: {}", run.stderr);
 
     let lines: Vec<&str> = run.stdout.lines().collect();
-    assert_eq!(lines.len(), 1, "one event so far: {lines:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "the root's spawn and its placement answer: {lines:?}"
+    );
     assert!(
         lines[0].contains("agent_spawned"),
         "the session's first event is its root agent: {:?}",
         lines[0]
+    );
+    assert!(
+        lines[1].contains("placement_changed"),
+        "and the second is where that agent landed (or why nowhere): {:?}",
+        lines[1]
     );
 }
 
@@ -157,10 +166,10 @@ async fn sync_from_an_offset_skips_what_came_before() {
 
     let full = sequences(&all.stdout);
     let partial = sequences(&tail.stdout);
-    assert_eq!(full, vec![1, 2, 3, 4]);
+    assert_eq!(full, vec![1, 2, 3, 4, 5]);
     assert_eq!(
         partial,
-        vec![3, 4],
+        vec![3, 4, 5],
         "--from must reach the server rather than being parsed and ignored"
     );
 }

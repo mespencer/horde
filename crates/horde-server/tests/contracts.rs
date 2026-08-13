@@ -149,41 +149,6 @@ async fn every_unbuilt_control_plane_rpc_refuses_rather_than_fabricating_success
 
     refuses!(
         h.control
-            .create_workspace_definition(CreateWorkspaceDefinitionRequest::default()),
-        "create_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .get_workspace_definition(GetWorkspaceDefinitionRequest::default()),
-        "get_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .list_workspace_definitions(ListWorkspaceDefinitionsRequest::default()),
-        "list_workspace_definitions"
-    );
-    refuses!(
-        h.control
-            .update_workspace_definition(UpdateWorkspaceDefinitionRequest::default()),
-        "update_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .add_workspace_repo(AddWorkspaceRepoRequest::default()),
-        "add_workspace_repo"
-    );
-    refuses!(
-        h.control
-            .delete_workspace_definition(DeleteWorkspaceDefinitionRequest::default()),
-        "delete_workspace_definition"
-    );
-    refuses!(
-        h.control
-            .prewarm_workspace(PrewarmWorkspaceRequest::default()),
-        "prewarm_workspace"
-    );
-    refuses!(
-        h.control
             .mint_enrollment_code(MintEnrollmentCodeRequest::default()),
         "mint_enrollment_code"
     );
@@ -198,17 +163,305 @@ async fn every_unbuilt_control_plane_rpc_refuses_rather_than_fabricating_success
     );
 }
 
-#[tokio::test]
-async fn reporting_workspace_instances_refuses_rather_than_pretending_to_record_them() {
-    let mut h = connect().await.expect("a harness");
+// -- Workspaces --------------------------------------------------------------
 
-    let status = h
-        .worker
-        .report_workspace_instances(ReportWorkspaceInstancesRequest::default())
+fn atlas_repo() -> horde_proto::v1::WorkspaceRepo {
+    horde_proto::v1::WorkspaceRepo {
+        name: "atlas".to_owned(),
+        remote_url: "https://example.com/atlas.git".to_owned(),
+        default_branch: "main".to_owned(),
+        layout_path: String::new(),
+    }
+}
+
+async fn create_atlas(h: &mut Harness) -> Setup<horde_proto::v1::WorkspaceDefinition> {
+    let created = h
+        .control
+        .create_workspace_definition(CreateWorkspaceDefinitionRequest {
+            name: "atlas".to_owned(),
+            repos: vec![atlas_repo()],
+            unmanaged_paths: vec!["datasets".to_owned()],
+        })
+        .await?
+        .into_inner()
+        .definition
+        .ok_or("a created definition")?;
+    Ok(created)
+}
+
+#[tokio::test]
+async fn a_workspace_definition_round_trips_through_the_catalog() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+
+    assert!(!created.etag.is_empty(), "an etag is minted at creation");
+    assert_eq!(
+        created.repos[0].layout_path, "atlas",
+        "an unset layout path defaults to the repo's name"
+    );
+
+    let fetched = h
+        .control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            name: String::new(),
+        })
         .await
-        .expect_err("workspace instances are not built");
-    assert_eq!(status.code(), Code::Unimplemented);
-    assert!(status.message().contains("workspace instance"));
+        .expect("get by id")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    assert_eq!(fetched, created, "the catalog returns what was created");
+
+    let by_name = h
+        .control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: None,
+            name: "atlas".to_owned(),
+        })
+        .await
+        .expect("get by name")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    assert_eq!(by_name, created);
+
+    let listed = h
+        .control
+        .list_workspace_definitions(ListWorkspaceDefinitionsRequest::default())
+        .await
+        .expect("list")
+        .into_inner()
+        .definitions;
+    assert_eq!(listed, vec![created]);
+}
+
+#[tokio::test]
+async fn a_second_definition_may_not_take_a_live_name() {
+    let mut h = connect().await.expect("a harness");
+    create_atlas(&mut h).await.expect("create");
+
+    let status = create_atlas(&mut h)
+        .await
+        .expect_err("the name is taken")
+        .downcast::<tonic::Status>()
+        .expect("a status");
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert!(status.message().contains("atlas"));
+}
+
+/// The etag is the whole optimistic-concurrency story: a stale one must be
+/// refused as ABORTED, and every successful mutation mints a fresh one.
+#[tokio::test]
+async fn workspace_mutations_enforce_the_etag() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+
+    let stale = h
+        .control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: "stale".to_owned(),
+            name: String::new(),
+            unmanaged_paths: vec![],
+            repos: vec![],
+        })
+        .await
+        .expect_err("a stale etag is refused");
+    assert_eq!(stale.code(), Code::Aborted);
+    assert!(
+        stale.message().contains("stale"),
+        "the refusal names the supplied token: {}",
+        stale.message()
+    );
+
+    let renamed = h
+        .control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: created.etag.clone(),
+            name: "atlas-v2".to_owned(),
+            unmanaged_paths: vec!["datasets".to_owned()],
+            repos: vec![],
+        })
+        .await
+        .expect("a fresh etag updates")
+        .into_inner()
+        .definition
+        .expect("the updated definition");
+    assert_eq!(renamed.name, "atlas-v2");
+    assert_ne!(renamed.etag, created.etag, "a mutation mints a fresh etag");
+    assert_eq!(
+        renamed.repos, created.repos,
+        "an update with no repos leaves the repo set alone"
+    );
+
+    // Widening the repo set is AddWorkspaceRepo's job, and Update refuses it.
+    let widened = h
+        .control
+        .update_workspace_definition(UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: renamed.etag.clone(),
+            name: String::new(),
+            unmanaged_paths: vec![],
+            repos: vec![
+                atlas_repo(),
+                horde_proto::v1::WorkspaceRepo {
+                    name: "extra".to_owned(),
+                    remote_url: "https://example.com/extra.git".to_owned(),
+                    default_branch: String::new(),
+                    layout_path: String::new(),
+                },
+            ],
+        })
+        .await
+        .expect_err("update may not widen the repo set");
+    assert_eq!(widened.code(), Code::InvalidArgument);
+
+    let added = h
+        .control
+        .add_workspace_repo(AddWorkspaceRepoRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            repo: Some(horde_proto::v1::WorkspaceRepo {
+                name: "docs".to_owned(),
+                remote_url: "https://example.com/docs.git".to_owned(),
+                default_branch: "main".to_owned(),
+                layout_path: String::new(),
+            }),
+            etag: renamed.etag.clone(),
+        })
+        .await
+        .expect("add repo")
+        .into_inner()
+        .definition
+        .expect("the widened definition");
+    assert_eq!(added.repos.len(), 2, "the deliberate ceremony widens it");
+
+    h.control
+        .delete_workspace_definition(DeleteWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag: added.etag.clone(),
+        })
+        .await
+        .expect("delete with the fresh etag");
+
+    let gone = h
+        .control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            name: String::new(),
+        })
+        .await
+        .expect_err("a deleted definition is not found");
+    assert_eq!(gone.code(), Code::NotFound);
+}
+
+/// The worker-local state file is the truth; a report corrects the server's
+/// cache, and the cached view is what `GetWorkspaceDefinition` returns.
+#[tokio::test]
+async fn reported_instances_appear_on_the_definition_they_materialize() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+    let definition_id = created
+        .workspace_definition_id
+        .clone()
+        .expect("a definition id");
+
+    let report = horde_proto::v1::WorkspaceInstanceReport {
+        workspace_definition_id: Some(definition_id.clone()),
+        worker_id: Some(WorkerId::new("worker-a")),
+        state: horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+        root_path: "/workspaces/atlas".to_owned(),
+        repos: vec![],
+        detail: String::new(),
+        observed_at: None,
+    };
+    h.worker
+        .report_workspace_instances(ReportWorkspaceInstancesRequest {
+            worker_id: Some(WorkerId::new("worker-a")),
+            reports: vec![report.clone()],
+            authoritative: false,
+        })
+        .await
+        .expect("reporting instances is built now");
+
+    let instances = h
+        .control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: Some(definition_id.clone()),
+            name: String::new(),
+        })
+        .await
+        .expect("get")
+        .into_inner()
+        .instances;
+    assert_eq!(instances, vec![report]);
+
+    // An authoritative empty set means the worker no longer has it.
+    h.worker
+        .report_workspace_instances(ReportWorkspaceInstancesRequest {
+            worker_id: Some(WorkerId::new("worker-a")),
+            reports: vec![],
+            authoritative: true,
+        })
+        .await
+        .expect("authoritative replacement");
+    let instances = h
+        .control
+        .get_workspace_definition(GetWorkspaceDefinitionRequest {
+            workspace_definition_id: Some(definition_id),
+            name: String::new(),
+        })
+        .await
+        .expect("get")
+        .into_inner()
+        .instances;
+    assert!(
+        instances.is_empty(),
+        "the cache dropped what the worker lost"
+    );
+}
+
+/// Prewarm requires a live definition and a connected worker, and answers
+/// with the materializing report placement colocates onto.
+#[tokio::test]
+async fn prewarm_targets_a_connected_worker_and_reports_materializing() {
+    let mut h = connect().await.expect("a harness");
+    let created = create_atlas(&mut h).await.expect("create");
+    let definition_id = created
+        .workspace_definition_id
+        .clone()
+        .expect("a definition id");
+
+    let unplaced = h
+        .control
+        .prewarm_workspace(PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(definition_id.clone()),
+            worker_id: Some(WorkerId::new("nobody")),
+            session_id: None,
+        })
+        .await
+        .expect_err("no such worker is connected");
+    assert_eq!(unplaced.code(), Code::FailedPrecondition);
+
+    register(&mut h, "worker-a", &[]).await.expect("register");
+    let report = h
+        .control
+        .prewarm_workspace(PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(definition_id),
+            worker_id: Some(WorkerId::new("worker-a")),
+            session_id: None,
+        })
+        .await
+        .expect("prewarm")
+        .into_inner()
+        .report
+        .expect("a report at acceptance");
+    assert_eq!(
+        report.state,
+        horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
+        "acceptance is materializing; completion arrives as events"
+    );
 }
 
 // -- Handshake ---------------------------------------------------------------

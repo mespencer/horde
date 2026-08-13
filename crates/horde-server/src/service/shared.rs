@@ -10,9 +10,10 @@ use horde_proto::v1::{Event, event::Kind};
 use prost::Message;
 
 use crate::error::ServerError;
-use crate::log::EventLog;
 use crate::log::store::Appended;
-use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
+use crate::log::{EventLog, PendingEvent};
+use crate::scheduler::{CapabilityScheduler, Scheduler, WorkerRegistry};
+use crate::workspace::InstanceCache;
 
 /// Everything the two services share.
 ///
@@ -22,24 +23,37 @@ use crate::scheduler::{Scheduler, SingleWorkerScheduler, WorkerRegistry};
 /// There is no command queue here any more. Commands are folded out of `log`
 /// on demand by `service::commands`, so the only thing to share is the log
 /// they are derived from — which is also the only thing that survives a
-/// restart.
+/// restart. The instance cache is the one exception, and it is allowed to be:
+/// instances are worker-owned truth the workers re-report on connect, so the
+/// cache is honestly a cache and never a second store.
 #[derive(Clone)]
 pub struct ServerCore {
     pub log: EventLog,
     pub workers: WorkerRegistry,
+    pub instances: InstanceCache,
     pub scheduler: Arc<dyn Scheduler>,
+    /// Serializes placement decisions against their appends. Two concurrent
+    /// passes — a spawn and a drain woken by a registration — each project the
+    /// log and then write placements; unserialized, both can place the same
+    /// agent and the fold would command two spawns. The lock makes
+    /// project-then-append atomic per decision. It guards no data, so a
+    /// restart losing it loses nothing.
+    pub placement_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ServerCore {
-    /// Builds a core around a log, with the bootstrap single-worker scheduler.
+    /// Builds a core around a log, with the capability scheduler.
     #[must_use]
     pub fn new(log: EventLog) -> Self {
         let workers = WorkerRegistry::new();
-        let scheduler = Arc::new(SingleWorkerScheduler::new(workers.clone()));
+        let instances = InstanceCache::new();
+        let scheduler = Arc::new(CapabilityScheduler::new(workers.clone(), instances.clone()));
         Self {
             log,
             workers,
+            instances,
             scheduler,
+            placement_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -58,6 +72,38 @@ impl std::fmt::Debug for ServerCore {
             .field("workers", &self.workers.connected().len())
             .finish_non_exhaustive()
     }
+}
+
+/// Appends one server-originated event, refusing idempotency-key collisions.
+///
+/// The single append path for everything the server itself writes — the
+/// control plane's verbs and the placement passes — so the collision refusal
+/// below cannot be forgotten by a new write site.
+///
+/// # Errors
+///
+/// Storage failures, and [`ServerError::IdempotencyKeyCollision`] when the key
+/// already holds a different kind of event.
+pub async fn append_event(
+    core: &ServerCore,
+    session_id: &str,
+    idempotency_key: &str,
+    event: Event,
+) -> Result<u64, ServerError> {
+    let appended = core
+        .log
+        .append(PendingEvent {
+            session_id: session_id.to_owned(),
+            origin_worker_id: String::new(),
+            journal_sequence: None,
+            idempotency_key: idempotency_key.to_owned(),
+            payload: event.encode_to_vec(),
+        })
+        .await?;
+
+    refuse_kind_collision(&appended, session_id, idempotency_key, &event)?;
+
+    Ok(appended.sequence)
 }
 
 /// This build's semver, echoed in every handshake.

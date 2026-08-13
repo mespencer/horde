@@ -27,6 +27,26 @@ pub enum ServerError {
     #[error("no agent {agent_id}")]
     NoSuchAgent { agent_id: String },
 
+    #[error("no workspace definition {wanted}")]
+    NoSuchWorkspace { wanted: String },
+
+    /// A create would shadow a live definition's name.
+    #[error("a workspace definition named {name} already exists")]
+    WorkspaceNameTaken { name: String },
+
+    /// The optimistic-concurrency token did not match: someone else changed
+    /// the definition since the caller read it. ABORTED per the proto, so the
+    /// caller re-reads and retries rather than blindly re-sending.
+    #[error(
+        "workspace definition {workspace_definition_id} is at etag {current}, \
+         but the request supplied {supplied:?}; re-read and retry"
+    )]
+    StaleEtag {
+        workspace_definition_id: String,
+        current: String,
+        supplied: String,
+    },
+
     #[error("no worker is registered, so {what} cannot be placed")]
     NoWorkerAvailable { what: String },
 
@@ -93,7 +113,11 @@ impl From<ServerError> for Status {
     fn from(error: ServerError) -> Self {
         let message = error.to_string();
         let code = match &error {
-            ServerError::NoSuchSession { .. } | ServerError::NoSuchAgent { .. } => Code::NotFound,
+            ServerError::NoSuchSession { .. }
+            | ServerError::NoSuchAgent { .. }
+            | ServerError::NoSuchWorkspace { .. } => Code::NotFound,
+            ServerError::WorkspaceNameTaken { .. } => Code::AlreadyExists,
+            ServerError::StaleEtag { .. } => Code::Aborted,
             ServerError::Invalid(_) => Code::InvalidArgument,
             ServerError::NoWorkerAvailable { .. } => Code::FailedPrecondition,
             ServerError::JournalRegressed { .. } => Code::FailedPrecondition,

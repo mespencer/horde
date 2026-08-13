@@ -14,7 +14,8 @@
 use std::collections::BTreeMap;
 
 use horde_proto::v1::{
-    AgentLifecycleState, Event, SessionLifecycleState, event::Kind as EventKind,
+    AgentLifecycleState, AgentSpec, Event, PlacementState, SessionLifecycleState,
+    event::Kind as EventKind,
 };
 use prost::Message;
 
@@ -33,6 +34,18 @@ pub struct AgentState {
     pub agent_type: String,
     /// The worker this agent was placed on, once it has been placed.
     pub worker_id: Option<String>,
+    /// What the spawn asked for — constraints, workspace, checkout policy.
+    /// Kept whole because re-placing a queued agent asks the same question
+    /// the original spawn did, and a projection that dropped the spec would
+    /// force the scheduler to guess.
+    pub spec: Option<AgentSpec>,
+    /// The latest placement outcome. `Unspecified` means no placement event
+    /// has been folded yet, which the placement pass treats as awaiting
+    /// placement — a spawn is incomplete until some placement answers it.
+    pub placement_state: PlacementState,
+    /// When the latest `Queued` placement was recorded, for queue-timeout
+    /// expiry. Cleared by any other placement outcome.
+    pub queued_at_unix_ms: Option<i64>,
 }
 
 /// One session's derived state.
@@ -85,7 +98,9 @@ impl SessionState {
             EventKind::AgentLifecycleChanged(changed) => {
                 self.agent_lifecycle_changed(agent_id, &changed);
             }
-            EventKind::PlacementChanged(changed) => self.placement_changed(changed),
+            EventKind::PlacementChanged(changed) => {
+                self.placement_changed(changed, stored.recorded_at_unix_ms);
+            }
             EventKind::SessionLifecycleChanged(changed) => {
                 self.session_lifecycle_changed(&changed);
             }
@@ -117,8 +132,15 @@ impl SessionState {
                 parent_agent_id: parent,
                 lifecycle: AgentLifecycleState::Queued,
                 tree_path: spawned.tree_path,
-                agent_type: spawned.spec.map(|spec| spec.agent_type).unwrap_or_default(),
+                agent_type: spawned
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.agent_type.clone())
+                    .unwrap_or_default(),
                 worker_id: None,
+                spec: spawned.spec,
+                placement_state: PlacementState::Unspecified,
+                queued_at_unix_ms: None,
             },
         );
     }
@@ -137,13 +159,23 @@ impl SessionState {
         }
     }
 
-    /// Records which worker an agent landed on.
-    fn placement_changed(&mut self, changed: horde_proto::v1::PlacementChanged) {
+    /// Records the latest placement outcome: the worker (when placed), the
+    /// state, and — for a queued outcome — when it queued, which is what the
+    /// queue timeout is measured from.
+    fn placement_changed(
+        &mut self,
+        changed: horde_proto::v1::PlacementChanged,
+        recorded_at_unix_ms: i64,
+    ) {
         if let Some(placement) = changed.placement
             && let Some(id) = placement.agent_id.as_ref().map(ToString::to_string)
             && let Some(agent) = self.agents.get_mut(&id)
         {
             agent.worker_id = placement.worker_id.as_ref().map(ToString::to_string);
+            agent.placement_state =
+                PlacementState::try_from(placement.state).unwrap_or(PlacementState::Unspecified);
+            agent.queued_at_unix_ms =
+                (agent.placement_state == PlacementState::Queued).then_some(recorded_at_unix_ms);
         }
     }
 

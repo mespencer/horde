@@ -136,8 +136,11 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         "a fresh worker starts at the first journal position"
     );
 
-    // 2. A client creates a session and spawns an agent under it.
-    let (session_id, _) = seed(&mut harness, "ci-fix", "key-1")
+    // 2. A client creates a session and spawns an agent under it. The root
+    //    agent is placed at creation — a session's first prompt needs a
+    //    worker like any other spawn — so the explicit spawn is the second
+    //    placement this server makes.
+    let (session_id, root_agent_id) = seed(&mut harness, "ci-fix", "key-1")
         .await
         .expect("a session must be creatable");
 
@@ -150,7 +153,7 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         "with one worker registered the agent is placed: {}",
         placement.reason
     );
-    // 3. The worker receives the spawn command.
+    // 3. The worker receives both spawn commands, root first.
     let mut commands = harness
         .worker
         .stream_commands(StreamCommandsRequest {
@@ -167,6 +170,23 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         .expect("a command must arrive")
         .expect("the command must not be an error");
     assert_eq!(command.command_sequence, 1);
+    match command.command {
+        Some(stream_commands_response::Command::SpawnAgent(spawn)) => {
+            assert_eq!(
+                spawn.agent_id.map(|id| id.to_string()).as_deref(),
+                Some(root_agent_id.as_str()),
+                "the session's root agent is the first thing this worker runs"
+            );
+        }
+        other => panic!("expected a spawn command, got {other:?}"),
+    }
+
+    let command = commands
+        .next()
+        .await
+        .expect("a second command must arrive")
+        .expect("the command must not be an error");
+    assert_eq!(command.command_sequence, 2);
     match command.command {
         Some(stream_commands_response::Command::SpawnAgent(spawn)) => {
             assert_eq!(
@@ -308,7 +328,10 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         .session
         .expect("a summary");
     assert_eq!(fetched.agent_count, 1, "the root agent is in the tree");
-    assert_eq!(fetched.head_sequence, 1);
+    assert_eq!(
+        fetched.head_sequence, 2,
+        "creation writes the root's spawn and its placement answer"
+    );
 }
 
 #[tokio::test]
@@ -346,8 +369,9 @@ async fn creating_a_session_twice_with_one_key_creates_one_session() {
         "a retried create must not produce a second session"
     );
     assert_eq!(
-        listed.sessions[0].head_sequence, 1,
-        "nor a second event in the one it did create"
+        listed.sessions[0].head_sequence, 2,
+        "nor further events beyond the first create's spawn and placement: \
+         the retried root is still queued with the same answer"
     );
 }
 
@@ -386,11 +410,11 @@ async fn unbuilt_rpcs_report_unimplemented_rather_than_a_fabricated_success() {
 
     let status = harness
         .control
-        .list_workspace_definitions(ListWorkspaceDefinitionsRequest::default())
+        .mint_enrollment_code(horde_proto::v1::MintEnrollmentCodeRequest::default())
         .await
-        .expect_err("workspaces are not built");
+        .expect_err("enrollment is not built");
     assert_eq!(status.code(), Code::Unimplemented);
-    assert!(status.message().contains("workspace"));
+    assert!(status.message().contains("enrollment"));
 }
 
 #[tokio::test]
@@ -722,8 +746,9 @@ async fn a_sync_that_is_not_following_ends_at_the_caught_up_marker() {
 
     assert_eq!(
         updates,
-        vec!["batch:1".to_owned(), "caught-up".to_owned()],
-        "history arrives before the marker, and nothing arrives after it"
+        vec!["batch:2".to_owned(), "caught-up".to_owned()],
+        "history — the root's spawn and its queued placement — arrives \
+         before the marker, and nothing arrives after it"
     );
 }
 
@@ -864,10 +889,11 @@ async fn a_command_issued_before_a_restart_is_still_delivered_after_it() {
         .await
         .expect("register");
 
-    let command = first_command(&mut restarted, "worker-a", 1)
+    // Command 1 is the root agent's spawn; the spawn under test is command 2.
+    let command = first_command(&mut restarted, "worker-a", 2)
         .await
         .expect("the command must survive the restart");
-    assert_eq!(command.command_sequence, 1);
+    assert_eq!(command.command_sequence, 2);
     match command.command {
         Some(stream_commands_response::Command::SpawnAgent(spawn)) => {
             assert_eq!(
@@ -932,8 +958,9 @@ async fn a_restarted_server_still_knows_what_it_issued_a_worker() {
         .resume_from_command_sequence;
 
     assert_eq!(
-        resume, 3,
-        "two commands were issued, so the next one is the third"
+        resume, 4,
+        "three commands were issued — the root's spawn and two more — so \
+         the next one is the fourth"
     );
 }
 

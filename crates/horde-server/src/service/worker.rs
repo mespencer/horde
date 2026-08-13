@@ -27,6 +27,7 @@ use super::commands::{self, CommandStream};
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
 use crate::log::PendingEvent;
+use crate::placement;
 
 /// Implements `horde.v1.WorkerService`.
 #[derive(Clone, Debug)]
@@ -103,6 +104,14 @@ async fn ingest_batch(
             &event,
         )?;
 
+        // A journaled instance report is also the freshest fact about that
+        // worker's disk, so the cache placement reads hears it too.
+        if let Some(horde_proto::v1::event::Kind::WorkspaceInstanceChanged(changed)) = &event.kind
+            && let Some(report) = &changed.report
+        {
+            core.instances.record(report);
+        }
+
         highest = highest.max(journaled.journal_sequence);
     }
 
@@ -128,9 +137,13 @@ impl WorkerService for WorkerFacing {
                 ))
             })?;
 
-        self.core
-            .workers
-            .register(&worker_id, request.capabilities.unwrap_or_default());
+        register_and_replace(
+            &self.core,
+            &worker_id,
+            request.capabilities.unwrap_or_default(),
+        )
+        .await
+        .map_err(Status::from)?;
 
         // Both watermarks are derived from the log rather than remembered, so a
         // restarted server answers a reconnecting worker with the same numbers
@@ -190,20 +203,43 @@ impl WorkerService for WorkerFacing {
         );
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let core = self.core.clone();
+        // Captured now, checked at disconnect: by the time this stream
+        // notices its peer is gone, the worker may have re-registered, and a
+        // stale stream must not knock the fresh registration out of placement.
+        let epoch = core.workers.epoch_of(&worker_id);
         tokio::spawn(async move {
-            while let Some(batch) = stream.next_batch().await {
+            'stream: while let Some(batch) = stream.next_batch().await {
                 let batch = match batch {
                     Ok(batch) => batch,
                     Err(error) => {
                         let _ = sender.send(Err(Status::from(error))).await;
-                        return;
+                        break 'stream;
                     }
                 };
                 for command in batch {
                     if sender.send(Ok(command)).await.is_err() {
-                        return; // The worker hung up.
+                        break 'stream; // The worker hung up.
                     }
                 }
+            }
+
+            // The command stream is the worker's lifeline: once it is gone the
+            // server cannot command this worker, so it leaves placement and
+            // the agents it never started are re-queued — unless the worker
+            // has re-registered since, in which case this stream is stale and
+            // the disconnect is not its to declare. This is a background
+            // task, so a failed re-queue can only be logged — the next
+            // placement pass will see the same queued agents anyway.
+            if !worker_id.is_empty()
+                && core.workers.deregister_if_current(&worker_id, epoch)
+                && let Err(error) = worker_lost(&core, &worker_id).await
+            {
+                tracing::warn!(
+                    %error,
+                    worker_id,
+                    "re-queueing a disconnected worker's agents failed"
+                );
             }
         });
 
@@ -291,24 +327,64 @@ impl WorkerService for WorkerFacing {
 
         // Wholesale replacement, per the proto: a partial update is how a
         // scheduler ends up matching on facts that stopped being true.
-        self.core
-            .workers
-            .register(&worker_id, request.capabilities.unwrap_or_default());
+        register_and_replace(
+            &self.core,
+            &worker_id,
+            request.capabilities.unwrap_or_default(),
+        )
+        .await
+        .map_err(Status::from)?;
         Ok(Response::new(ReportCapabilitiesResponse {}))
     }
 
     #[instrument(skip_all)]
     async fn report_workspace_instances(
         &self,
-        _request: Request<ReportWorkspaceInstancesRequest>,
+        request: Request<ReportWorkspaceInstancesRequest>,
     ) -> Result<Response<ReportWorkspaceInstancesResponse>, Status> {
-        // Workspace instances land with workspaces in wave 4. Accepting and
-        // discarding would make a worker believe the server knows about its
-        // checkouts.
-        Err(Status::from(ServerError::Unimplemented(
-            "workspace instance reporting",
-        )))
+        let request = request.into_inner();
+        let worker_id = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+
+        // The worker-local state file is the truth; this call corrects the
+        // server's cache. An authoritative report is the worker's complete
+        // set, so cached instances absent from it are dropped.
+        if request.authoritative {
+            self.core
+                .instances
+                .replace_worker(&worker_id, &request.reports);
+        } else {
+            for report in &request.reports {
+                self.core.instances.record(report);
+            }
+        }
+        Ok(Response::new(ReportWorkspaceInstancesResponse {}))
     }
+}
+
+/// Registers a worker's capabilities, refreshes the instance cache from its
+/// advertised warm instances, and runs a placement pass — a worker appearing
+/// (or changing) is exactly the moment a queued agent may become placeable.
+async fn register_and_replace(
+    core: &ServerCore,
+    worker_id: &str,
+    capabilities: horde_proto::v1::WorkerCapabilities,
+) -> Result<(), ServerError> {
+    core.instances
+        .replace_worker(worker_id, &capabilities.warm_instances);
+    core.workers.register(worker_id, capabilities);
+    placement::place_queued(core).await
+}
+
+/// What losing a worker means once it has left the registry: the agents it
+/// never started are re-queued and re-placed elsewhere. Agents mid-turn stay
+/// placed — a disconnect is a partition, not a death.
+async fn worker_lost(core: &ServerCore, worker_id: &str) -> Result<(), ServerError> {
+    placement::queue_lost_worker(core, worker_id).await?;
+    placement::place_queued(core).await
 }
 
 /// Whether the ingest loop should stop after this reply.

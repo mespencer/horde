@@ -135,14 +135,15 @@ mod harness {
     }
 
     /// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
-    /// writes when the scheduler places an agent — the two events the server's
+    /// writes when the scheduler answers a spawn: placed on a worker when one
+    /// is given, queued when `None`. The placed pair is what the server's
     /// command fold turns into this worker's `SpawnAgentCommand`, with the
     /// implicit first assignment riding the spec.
-    pub(crate) async fn place_agent(
+    pub(crate) async fn seed_agent(
         log: &EventLog,
         session: &str,
         agent: &str,
-        worker: &str,
+        worker: Option<&str>,
         first_message: &str,
     ) {
         let spawned = Event {
@@ -163,6 +164,10 @@ mod harness {
                 tree_path: Vec::new(),
             })),
         };
+        let state = match worker {
+            Some(_) => PlacementState::Placed,
+            None => PlacementState::Queued,
+        };
         let placed = Event {
             agent_id: Some(AgentId::new(agent)),
             occurred_at: None,
@@ -170,8 +175,8 @@ mod harness {
             kind: Some(Kind::PlacementChanged(PlacementChanged {
                 placement: Some(Placement {
                     agent_id: Some(AgentId::new(agent)),
-                    state: PlacementState::Placed.into(),
-                    worker_id: Some(WorkerId::new(worker)),
+                    state: state.into(),
+                    worker_id: worker.map(WorkerId::new),
                     reason: String::new(),
                 }),
             })),
@@ -186,6 +191,17 @@ mod harness {
             .await
             .expect("the seed event appends");
         }
+    }
+
+    /// [`seed_agent`], placed on `worker` — the common case.
+    pub(crate) async fn place_agent(
+        log: &EventLog,
+        session: &str,
+        agent: &str,
+        worker: &str,
+        first_message: &str,
+    ) {
+        seed_agent(log, session, agent, Some(worker), first_message).await;
     }
 
     /// Dials as `config` and runs the connection over `journal`, driving
@@ -358,8 +374,10 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
         run.abort();
     }
 
-    // While the worker was down, the scheduler placed a second agent on it.
-    harness::place_agent(&core.log, "s1", "agent-2", "worker-a", "say more").await;
+    // While the worker was down, a second spawn arrived. The scheduler no
+    // longer places onto a worker it cannot command, so the spawn queues —
+    // and the second life's registration is what places it here.
+    harness::seed_agent(&core.log, "s1", "agent-2", None, "say more").await;
 
     // Second life, over the same journal file and nothing else.
     let journal = Journal::open(&journal_path).expect("the same journal");
@@ -388,10 +406,11 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
         "the server remembered everything the first life pushed"
     );
 
-    // Only agent-2's spawn is replayed: its two seed events plus its four
-    // worker events, on top of the six already there.
-    let head = harness::server_log_at_least(&core.log, "s1", 12).await;
-    assert_eq!(head, 12, "nothing about agent-1 was re-run or re-pushed");
+    // Only agent-2's spawn is replayed: its three seed events (spawn, queued,
+    // and the placement the registration pass wrote) plus its four worker
+    // events, on top of the six already there.
+    let head = harness::server_log_at_least(&core.log, "s1", 13).await;
+    assert_eq!(head, 13, "nothing about agent-1 was re-run or re-pushed");
 
     assert_eq!(
         journal
