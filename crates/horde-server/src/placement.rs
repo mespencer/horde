@@ -360,9 +360,7 @@ pub async fn queue_lost_worker(core: &ServerCore, worker_id: &str) -> Result<(),
     let _serialized = core.placement_lock.lock().await;
     for state in session_states(core).await? {
         for agent in state.agents.values() {
-            let placed_here = agent.placement_state == PlacementState::Placed
-                && agent.worker_id.as_deref() == Some(worker_id);
-            if !placed_here || survives_only_as_placed(agent.lifecycle) {
+            if !lost_with_worker(agent, worker_id) {
                 continue;
             }
 
@@ -380,6 +378,20 @@ pub async fn queue_lost_worker(core: &ServerCore, worker_id: &str) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// Whether the loss of `worker_id` returns this agent to the queue.
+///
+/// Three facts, and each disqualifies alone: the agent must be *placed*, it
+/// must be placed on *this* worker, and it must not have started running.
+/// Inline in the loss loop the combinations are not separately reachable —
+/// every agent a staged loss test holds is placed on the lost worker, so a
+/// flipped operator re-queues a neighbour's agents and still passes. As a
+/// predicate the eight corners are an ordinary table.
+fn lost_with_worker(agent: &AgentState, worker_id: &str) -> bool {
+    agent.placement_state == PlacementState::Placed
+        && agent.worker_id.as_deref() == Some(worker_id)
+        && !survives_only_as_placed(agent.lifecycle)
 }
 
 /// The workspace a spec names, when it names one.
@@ -655,6 +667,57 @@ mod tests {
         assert_eq!(queued.state, PlacementState::Queued as i32);
         assert_eq!(queued.worker_id, None);
         assert_eq!(queued.reason, "no worker is connected");
+    }
+
+    /// The whole table for what a worker's loss re-queues. Every staged loss
+    /// test holds only agents placed on the lost worker, so an operator
+    /// flipped inside the loop re-queues a neighbour's agents and passes —
+    /// which is exactly why this is a predicate and not an inline condition.
+    #[test]
+    fn a_loss_requeues_only_this_workers_placed_unstarted_agents() {
+        let with = |placement: PlacementState, worker: Option<&str>, lifecycle| AgentState {
+            placement_state: placement,
+            worker_id: worker.map(ToString::to_string),
+            lifecycle,
+            ..agent(placement, None)
+        };
+        let queued_lc = AgentLifecycleState::Queued;
+
+        assert!(lost_with_worker(
+            &with(PlacementState::Placed, Some("w1"), queued_lc),
+            "w1"
+        ));
+        assert!(lost_with_worker(
+            &with(
+                PlacementState::Placed,
+                Some("w1"),
+                AgentLifecycleState::Starting
+            ),
+            "w1"
+        ));
+        assert!(
+            !lost_with_worker(&with(PlacementState::Placed, Some("w2"), queued_lc), "w1"),
+            "a neighbour's agent is not this loss's business"
+        );
+        assert!(
+            !lost_with_worker(&with(PlacementState::Queued, None, queued_lc), "w1"),
+            "an agent already queued has nothing to lose"
+        );
+        assert!(
+            !lost_with_worker(&with(PlacementState::Queued, Some("w1"), queued_lc), "w1"),
+            "a queued placement that still mentions the worker is not placed on it"
+        );
+        assert!(
+            !lost_with_worker(
+                &with(
+                    PlacementState::Placed,
+                    Some("w1"),
+                    AgentLifecycleState::Running
+                ),
+                "w1"
+            ),
+            "a running agent rides out the partition where it is"
+        );
     }
 
     /// The drain pass carries the parent's worker into the scheduler: a
