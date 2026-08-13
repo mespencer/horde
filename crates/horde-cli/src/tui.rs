@@ -119,23 +119,13 @@ where
 
     let sessions = refresh_sessions(&mut client, &mut app).await?;
 
-    // One merged stream serves the whole TUI: every listed session replays
-    // from its start, the attach target is named too in case it is archived
-    // and missing from the list, and the server's all-sessions net carries
-    // any session created while we watch. This used to be a fan-in of one
-    // stream per session; the server grew `all_sessions`, so it collapsed.
-    let mut cursors: Vec<(String, u64)> = sessions
-        .iter()
-        .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
-        .map(|session_id| (session_id, 0))
-        .collect();
-    if let Some(attachment) = app.attachment()
-        && !cursors
-            .iter()
-            .any(|(session_id, _)| session_id == &attachment.session_id)
-    {
-        cursors.push((attachment.session_id.clone(), 0));
-    }
+    // One merged stream serves the whole TUI. This used to be a fan-in of
+    // one stream per session; the server grew `all_sessions`, so it
+    // collapsed.
+    let attachment = app
+        .attachment()
+        .map(|attachment| attachment.session_id.clone());
+    let cursors = overview_cursors(&sessions, attachment.as_deref());
     tokio::spawn(pump(client.clone(), cursors, updates));
 
     while !app.should_quit() {
@@ -214,6 +204,31 @@ async fn refresh_sessions(
     Ok(sessions)
 }
 
+/// The cursors the TUI's one merged stream opens with: every listed session
+/// replayed from its start, plus the attach target when the list omits it —
+/// an archived session is attachable but unlisted. The server's all-sessions
+/// net carries everything born later, so nothing else needs naming.
+///
+/// Extracted as a pure function because the deduplication condition inside
+/// `drive` is a compound predicate in an event loop — unreachable as a truth
+/// table there, ordinary here (docs/QUALITY_GATES.md).
+fn overview_cursors(
+    sessions: &[horde_proto::v1::SessionSummary],
+    attachment: Option<&str>,
+) -> Vec<(String, u64)> {
+    let mut cursors: Vec<(String, u64)> = sessions
+        .iter()
+        .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
+        .map(|session_id| (session_id, 0))
+        .collect();
+    if let Some(target) = attachment
+        && !cursors.iter().any(|(session_id, _)| session_id == target)
+    {
+        cursors.push((target.to_owned(), 0));
+    }
+    cursors
+}
+
 /// The TUI's one stream: replays the named sessions from their cursors,
 /// follows everything else live, and forwards it all onto the shared
 /// channel. Ends silently when the receiver goes away (the loop exited) or
@@ -239,4 +254,55 @@ async fn follow_into(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use horde_proto::v1::{SessionId, SessionSummary};
+
+    use super::overview_cursors;
+
+    fn listed(session_id: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: Some(SessionId::new(session_id)),
+            ..SessionSummary::default()
+        }
+    }
+
+    /// The truth table the drive loop cannot exercise: an attach target
+    /// already in the list must not be named twice (a duplicate cursor
+    /// replays the session's history twice into the feed), and one the list
+    /// omits — archived, say — is still owed its replay.
+    #[test]
+    fn the_attach_target_is_named_exactly_once() {
+        let sessions = [listed("s1"), listed("s2")];
+
+        assert_eq!(
+            overview_cursors(&sessions, Some("s2")),
+            vec![("s1".to_owned(), 0), ("s2".to_owned(), 0)],
+            "a listed attach target must not become a duplicate cursor"
+        );
+        assert_eq!(
+            overview_cursors(&sessions, Some("archived-one")),
+            vec![
+                ("s1".to_owned(), 0),
+                ("s2".to_owned(), 0),
+                ("archived-one".to_owned(), 0),
+            ],
+            "an unlisted attach target is still owed its replay"
+        );
+        assert_eq!(
+            overview_cursors(&sessions, None),
+            vec![("s1".to_owned(), 0), ("s2".to_owned(), 0)],
+            "no attachment adds nothing"
+        );
+    }
+
+    /// A summary with no id is unaddressable and yields no cursor — same
+    /// rule the App applies when folding summaries.
+    #[test]
+    fn a_summary_without_an_id_yields_no_cursor() {
+        let cursors = overview_cursors(&[SessionSummary::default()], Some("s9"));
+        assert_eq!(cursors, vec![("s9".to_owned(), 0)]);
+    }
 }

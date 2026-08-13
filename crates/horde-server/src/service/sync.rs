@@ -500,6 +500,11 @@ mod tests {
     /// The seed is what lets a mid-log cursor judge membership: the spawns
     /// lie before the offset, so without seeding every event would be
     /// dropped as unproven.
+    ///
+    /// The probe is deliberately a *descendant* of the scope root, never the
+    /// root itself: the root passes on identity with an empty tree, so a
+    /// root-probing version of this test held a no-op seed green — which is
+    /// exactly the surviving mutant that taught this lesson.
     #[test]
     fn seeding_from_history_proves_membership_for_a_mid_log_cursor() {
         let spawn = |agent: &str, parent: Option<&str>| {
@@ -514,13 +519,23 @@ mod tests {
         let mut filter = SubtreeFilter::scoped("child-1");
         filter.seed(
             "s1",
-            &[spawn("root-1", None), spawn("child-1", Some("root-1"))],
+            &[
+                spawn("root-1", None),
+                spawn("child-1", Some("root-1")),
+                spawn("grandchild-1", Some("child-1")),
+            ],
         );
 
         assert_eq!(
-            sequences(&filter.retain(vec![output_envelope("s1", 9, Some("child-1"))])),
+            sequences(&filter.retain(vec![output_envelope("s1", 9, Some("grandchild-1"))])),
             vec![9],
-            "membership learned from the seed, not from the streamed events"
+            "the descendant's membership is provable only through the seeded chain"
+        );
+        // And the seeded root also anchors the session-scoped arm.
+        assert_eq!(
+            sequences(&filter.retain(vec![output_envelope("s1", 10, None)])),
+            vec![10],
+            "the seed also proves the session holds the root"
         );
     }
 }

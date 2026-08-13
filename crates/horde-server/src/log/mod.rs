@@ -1009,6 +1009,83 @@ mod tests {
         );
     }
 
+    /// A lag caused entirely by *unfollowed* traffic finds nothing to read,
+    /// and that wake must be swallowed: yielding an empty batch would have
+    /// every consumer see phantom wakes — and with more skipped
+    /// notifications buffered behind it, a busy loop of them. The follow-up
+    /// append proves the tail is still live after swallowing the wake, so
+    /// the first assertion is not a bare "it blocked".
+    #[tokio::test]
+    async fn a_lag_with_nothing_new_yields_no_empty_batch() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"seed")).await.expect("append");
+
+        // Follow s1 only; the noise stays unfollowed (all_sessions false).
+        let (_, mut tail) = log
+            .tail_merged(&[("s1".to_owned(), 1)], false, &[])
+            .await
+            .expect("merged tail");
+        for _ in 0..1100 {
+            log.append(pending("noise", b"x")).await.expect("append");
+        }
+
+        // The lag wake reads every followed session, finds nothing, and must
+        // keep waiting rather than hand back an empty vector.
+        let woken =
+            tokio::time::timeout(std::time::Duration::from_millis(300), tail.next_batch()).await;
+        assert!(
+            woken.is_err(),
+            "with nothing new in any followed session the tail must keep \
+             waiting, not yield: {woken:?}"
+        );
+
+        // And it is still alive: the next real event arrives, exactly once.
+        log.append(pending("s1", b"real")).await.expect("append");
+        let batch = merged_batch_within(&mut tail).await;
+        let seen: Vec<(&str, u64)> = batch
+            .iter()
+            .map(|event| (event.session_id.as_str(), event.sequence))
+            .collect();
+        assert_eq!(seen, vec![("s1", 2)]);
+    }
+
+    /// Lag recovery must neither adopt the excluded stream nor rewind a
+    /// followed session to zero — the two halves of the rediscovery
+    /// condition, which only a lag can reach.
+    #[tokio::test]
+    async fn lag_recovery_neither_adopts_the_excluded_nor_rewinds_the_followed() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        log.append(pending("s1", b"a")).await.expect("append");
+
+        let excluded = vec!["catalog".to_owned()];
+        let (history, mut tail) = log
+            .tail_merged(&[("s1".to_owned(), 1)], true, &excluded)
+            .await
+            .expect("merged tail");
+        assert_eq!(history.len(), 1, "event 1 was already delivered as history");
+
+        // Overflow the buffer with excluded-stream appends, then land one
+        // real event.
+        for _ in 0..1100 {
+            log.append(pending("catalog", b"defn"))
+                .await
+                .expect("append");
+        }
+        log.append(pending("s1", b"b")).await.expect("append");
+
+        let batch = merged_batch_within(&mut tail).await;
+        let seen: Vec<(&str, u64)> = batch
+            .iter()
+            .map(|event| (event.session_id.as_str(), event.sequence))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("s1", 2)],
+            "recovery must deliver only the new followed event — no catalog \
+             adoption, and no re-delivery of event 1"
+        );
+    }
+
     /// Waits for the next batch, bounded.
     ///
     /// An unbounded `next_batch().await` turns a defect into a hang: a mutation
