@@ -95,14 +95,14 @@ impl FakeAdapter {
         ProviderSessionId::new(format!("fake-session-{ordinal}"))
     }
 
-    fn session(&self, provider_session_id: ProviderSessionId) -> FakeSession {
+    fn session(&self, provider_session_id: ProviderSessionId, turns_taken: u64) -> FakeSession {
         FakeSession {
             script: self.script.clone(),
             capabilities: self.capabilities.clone(),
             provider: self.provider.clone(),
             provider_session_id,
             announced: false,
-            turns_taken: 0,
+            turns_taken,
             pending: VecDeque::new(),
             steps: VecDeque::new(),
             current: None,
@@ -136,12 +136,12 @@ impl Adapter for FakeAdapter {
     }
 
     async fn spawn(&self, _spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
-        Ok(Box::new(self.session(self.mint_session_id())))
+        Ok(Box::new(self.session(self.mint_session_id(), 0)))
     }
 
     async fn resume(
         &self,
-        _spec: &AgentSpec,
+        spec: &AgentSpec,
         provider_session_id: &ProviderSessionId,
     ) -> Result<Box<dyn AgentSession>> {
         if !self.capabilities.supports(Capability::Resumable) {
@@ -150,7 +150,18 @@ impl Adapter for FakeAdapter {
                 capability: Capability::Resumable,
             });
         }
-        Ok(Box::new(self.session(provider_session_id.clone())))
+        // Turn numbering continues where the previous incarnation stopped —
+        // the same reconciliation a real harness's adapter performs, so the
+        // orchestration tests measured against this fake exercise it. The
+        // consumed turns also consume their scripted entries: a script models
+        // the whole conversation, not one process's slice of it.
+        let turns_taken = spec.turns_taken().map_err(|message| AdapterError::Spawn {
+            provider: self.provider.clone(),
+            message,
+        })?;
+        Ok(Box::new(
+            self.session(provider_session_id.clone(), turns_taken),
+        ))
     }
 }
 
@@ -272,6 +283,19 @@ impl FakeSession {
         }
     }
 
+    /// Cuts the rest of the turn in flight, leaving it to end as
+    /// [`TurnStatus::Interrupted`] — an interrupt is a way for a turn to end,
+    /// not a way to skip ending it.
+    fn cut_turn(&mut self) {
+        self.steps.clear();
+        self.waiting_on = None;
+        self.stall = None;
+        if let Some(current) = self.current.as_mut() {
+            current.status = TurnStatus::Interrupted;
+            current.text = None;
+        }
+    }
+
     fn end_turn(&mut self) {
         let Some(current) = self.current.take() else {
             return;
@@ -321,6 +345,16 @@ impl AgentSession for FakeSession {
         }
         if self.finished {
             return Err(AdapterError::HarnessExited { exit_code: Some(0) });
+        }
+
+        // An interrupting message aborts any turn in flight *first*, and that
+        // turn still closes: exactly one `TurnEnded`, carrying `Interrupted`,
+        // queued ahead of the new turn's events. This is what the live Claude
+        // adapter's control message does, so the fake must do it too or every
+        // steering test measured against it exercises nothing.
+        if input.delivery == horde_adapter::Delivery::Interrupt && self.current.is_some() {
+            self.cut_turn();
+            self.end_turn();
         }
 
         let scripted = usize::try_from(self.turns_taken)
@@ -469,14 +503,7 @@ impl AgentSession for FakeSession {
             });
         }
 
-        // Drop the rest of the turn, but still close it — an interrupt is a way
-        // for a turn to end, not a way to skip ending it.
-        self.steps.clear();
-        self.waiting_on = None;
-        if let Some(current) = self.current.as_mut() {
-            current.status = TurnStatus::Interrupted;
-            current.text = None;
-        }
+        self.cut_turn();
         Ok(())
     }
 
@@ -848,6 +875,128 @@ mod permission_path_tests {
         assert!(
             matches!(after, Some(AgentEvent::ToolCompleted { .. })),
             "then the call completes, got {after:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steering_and_revival_tests {
+    use horde_adapter::{Adapter, AgentEvent, AgentSpec, ProviderSessionId, TurnInput, TurnStatus};
+
+    use super::FakeAdapter;
+    use super::harness::spec;
+    use crate::{Script, ScriptedTurn, Step};
+
+    /// An interrupting message aborts the turn in flight, and that turn still
+    /// closes — `Interrupted`, queued ahead of anything the new turn emits.
+    #[tokio::test]
+    async fn an_interrupting_message_closes_the_turn_in_flight_first() {
+        let adapter = FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("one")
+                .with_step(Step::Say("never played".to_owned()))
+                .with_step(Step::Say("nor this".to_owned())),
+            ScriptedTurn::saying("the steered answer"),
+        ]));
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        // Take one event, leaving the turn genuinely in flight.
+        assert!(session.next_event().await.expect("no error").is_some());
+
+        session
+            .send(TurnInput::interrupting("change of plan"))
+            .await
+            .expect("an interrupting send is accepted");
+
+        // The very next turn ending must be the aborted turn's, and it must
+        // be Interrupted — a fake that dropped the old turn silently would
+        // hide a missing TurnEnded from every runtime test.
+        let mut endings = Vec::new();
+        let mut said = Vec::new();
+        while let Ok(Some(event)) = session.next_event().await {
+            match event {
+                AgentEvent::TurnEnded(outcome) => endings.push(outcome.status),
+                AgentEvent::Output { text, .. } => said.push(text),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            endings,
+            vec![TurnStatus::Interrupted, TurnStatus::Completed],
+            "the aborted turn ends first, then the steered turn runs"
+        );
+        assert!(
+            said.iter().any(|text| text == "the steered answer"),
+            "the interrupting message starts its own turn: {said:?}"
+        );
+        assert!(
+            !said.iter().any(|text| text == "never played"),
+            "the aborted turn's remaining steps must not play: {said:?}"
+        );
+    }
+
+    /// Revival continues the turn numbering and the script position, so a
+    /// revived fake behaves like a revived harness rather than a fresh one.
+    #[tokio::test]
+    async fn a_resumed_session_continues_numbering_and_script_position() {
+        let adapter = FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("turn one"),
+            ScriptedTurn::saying("turn two"),
+            ScriptedTurn::saying("turn three"),
+        ]));
+
+        let mut revived = adapter
+            .resume(
+                &spec().with_turns_taken(2),
+                &ProviderSessionId::new("fake-session-1"),
+            )
+            .await
+            .expect("resumes");
+        revived
+            .send(TurnInput::queued("continue"))
+            .await
+            .expect("sends");
+
+        let mut turn_ids = Vec::new();
+        let mut said = Vec::new();
+        while let Ok(Some(event)) = revived.next_event().await {
+            match event {
+                AgentEvent::TurnEnded(outcome) => turn_ids.push(outcome.turn_id.to_string()),
+                AgentEvent::Output { text, .. } => said.push(text),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            turn_ids,
+            vec!["fake-session-1#3".to_owned()],
+            "a revived session must not re-mint turn ids the journal already keyed"
+        );
+        assert_eq!(
+            said,
+            vec!["turn three".to_owned()],
+            "the consumed turns consumed their scripted entries too"
+        );
+    }
+
+    /// A malformed turn count is refused at resume, never read as zero — zero
+    /// would silently re-key turns the journal already holds.
+    #[tokio::test]
+    async fn a_malformed_turn_count_fails_the_resume_loudly() {
+        let adapter = FakeAdapter::default();
+        let mut bad = spec();
+        bad.provider_options.insert(
+            horde_adapter::TURNS_TAKEN_OPTION.to_owned(),
+            "many".to_owned(),
+        );
+
+        let refused = adapter
+            .resume(&bad, &ProviderSessionId::new("fake-session-1"))
+            .await;
+        assert!(
+            refused.is_err(),
+            "a count that cannot be read must refuse the revival"
         );
     }
 }
