@@ -2177,7 +2177,7 @@ mod tests {
         let settled = journal_at_least(&first, 5).await.len();
         first.shutdown().await;
 
-        let mut second = restarted_runtime_delivering(&journal, 3).await;
+        let second = restarted_runtime_delivering(&journal, 3).await;
 
         assert_eq!(
             second.running_agents(),
@@ -2216,7 +2216,7 @@ mod tests {
         let settled = journal_at_least(&first, 3).await.len();
         first.shutdown().await;
 
-        let mut second = restarted_runtime_delivering(&journal, 2).await;
+        let second = restarted_runtime_delivering(&journal, 2).await;
 
         let events = journal_at_least(&second, settled + 1).await;
         assert!(
