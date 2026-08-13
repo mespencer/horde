@@ -1080,6 +1080,7 @@ dependencies = [
  "horde-adapter-claude",
  "horde-adapter-fake",
  "horde-proto",
+ "horde-relay",
  "horde-server",
  "horde-wire",
  "rusqlite",
