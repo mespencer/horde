@@ -31,7 +31,7 @@
 //!   back — minting anything else would force a translation table someone has
 //!   to persist.
 
-use horde_adapter::{AgentEvent, OutputChannel, TurnOutcome, TurnStatus};
+use horde_adapter::{AdapterError, AgentEvent, OutputChannel, TurnOutcome, TurnStatus};
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
@@ -42,6 +42,47 @@ use horde_wire::{proposed_tool_call_to_wire, rate_window_to_wire, token_usage_to
 
 use crate::error::WorkerError;
 use crate::journal::JournalEntry;
+
+/// Failure-reason category: the harness process is gone.
+///
+/// The scheduler's answer is a retry (or a revival) on this Worker — the
+/// binding is fine, the process is not.
+pub const PROCESS_DEATH: &str = "the harness process died";
+
+/// Failure-reason category: the provider refused the work.
+///
+/// Bad credentials, an unclaimed capability, a turn the API errored — the
+/// scheduler's answer is a different account or a different provider, and
+/// retrying here only burns time.
+pub const REFUSAL: &str = "the provider refused";
+
+/// Failure-reason category: the harness's output could not be understood.
+///
+/// The protocol moved, or the stream is corrupt. Diagnosed from the raw line
+/// the error carries; retrying may work, upgrading the adapter may be due.
+pub const MALFORMED_STREAM: &str = "the harness stream was malformed";
+
+/// Classifies an adapter error into the lifecycle-reason taxonomy.
+///
+/// `AgentLifecycleChanged.reason` is free text on the wire, so the taxonomy
+/// lives in a stable prefix: process death, refusal, and malformed stream ask
+/// for three different responses (retry here, rebind elsewhere, fix the
+/// adapter), and a reason that does not say which it is leaves the reader
+/// rediagnosing from scratch.
+#[must_use]
+pub fn failure_reason(error: &AdapterError) -> String {
+    let category = match error {
+        AdapterError::Spawn { .. } | AdapterError::HarnessExited { .. } | AdapterError::Io(_) => {
+            PROCESS_DEATH
+        }
+        AdapterError::Protocol { .. } => MALFORMED_STREAM,
+        AdapterError::Unauthenticated { .. }
+        | AdapterError::Unsupported { .. }
+        | AdapterError::UnknownPermissionRequest { .. }
+        | AdapterError::AwaitingDecision { .. } => REFUSAL,
+    };
+    format!("{category}: {error}")
+}
 
 /// The standing facts about one agent that its events are journaled under.
 ///
@@ -92,7 +133,11 @@ pub fn journal_entries(
             provider_session_id,
             model,
         } => vec![context.entry(
-            format!("{}:{provider_session_id}:established", context.agent_id),
+            // Minted, not derived: a revived agent re-establishes the SAME
+            // provider session, and a key derived from it would make the
+            // server dedupe the second incarnation's Running transition away —
+            // the agent would read as forever Starting after every revival.
+            String::new(),
             Kind::AgentLifecycleChanged(AgentLifecycleChanged {
                 previous_state: AgentLifecycleState::Starting.into(),
                 state: AgentLifecycleState::Running.into(),
@@ -176,7 +221,10 @@ fn turn_ended_entries(context: &AgentContext, outcome: &TurnOutcome) -> Vec<Jour
             Kind::AgentLifecycleChanged(AgentLifecycleChanged {
                 previous_state: AgentLifecycleState::Running.into(),
                 state: AgentLifecycleState::Failed.into(),
-                reason: message.clone(),
+                // A failed turn is the provider refusing the work — the
+                // process is alive and the stream decoded; what broke is the
+                // turn itself. Prefixed so the taxonomy holds here too.
+                reason: format!("{REFUSAL}: {message}"),
             }),
         ));
     }
@@ -274,6 +322,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, "s1");
         assert_eq!(entries[0].agent_id.as_deref(), Some("agent-1"));
+        assert!(
+            entries[0].idempotency_key.is_empty(),
+            "minted per incarnation: a key derived from the session id would \
+             make the server dedupe a revival's Running transition away"
+        );
         match &entries[0].kind {
             Kind::AgentLifecycleChanged(changed) => {
                 assert_eq!(
@@ -526,9 +579,98 @@ mod tests {
         match &entries[1].kind {
             Kind::AgentLifecycleChanged(changed) => {
                 assert_eq!(changed.state, i32::from(AgentLifecycleState::Failed));
-                assert_eq!(changed.reason, "harness exited with status 1");
+                assert_eq!(
+                    changed.reason,
+                    format!("{}: harness exited with status 1", super::REFUSAL),
+                    "a failed turn is the provider refusing the work"
+                );
             }
             other => panic!("expected a lifecycle change, got {other:?}"),
+        }
+    }
+
+    /// The taxonomy, one variant per row: process death, refusal, and
+    /// malformed stream ask for three different responses, so an error landing
+    /// in the wrong category sends the scheduler to the wrong repair.
+    #[test]
+    fn each_adapter_failure_lands_in_its_own_category() {
+        use horde_adapter::AdapterError;
+
+        let expectations: Vec<(AdapterError, &str, &str)> = vec![
+            (
+                AdapterError::HarnessExited { exit_code: Some(3) },
+                super::PROCESS_DEATH,
+                "code 3",
+            ),
+            (
+                AdapterError::Io(std::io::Error::other("pipe broke")),
+                super::PROCESS_DEATH,
+                "pipe broke",
+            ),
+            (
+                AdapterError::Spawn {
+                    provider: "claude".to_owned(),
+                    message: "no such binary".to_owned(),
+                },
+                super::PROCESS_DEATH,
+                "no such binary",
+            ),
+            (
+                AdapterError::Protocol {
+                    message: "not json".to_owned(),
+                    raw: "{oops".to_owned(),
+                },
+                super::MALFORMED_STREAM,
+                "{oops",
+            ),
+            (
+                AdapterError::Unauthenticated {
+                    provider: "claude".to_owned(),
+                    account: Some("work".to_owned()),
+                    message: "Not logged in".to_owned(),
+                },
+                super::REFUSAL,
+                "Not logged in",
+            ),
+            (
+                AdapterError::Unsupported {
+                    provider: "fake".to_owned(),
+                    capability: horde_adapter::Capability::InterruptibleTurn,
+                },
+                super::REFUSAL,
+                "InterruptibleTurn",
+            ),
+        ];
+
+        for (error, category, detail) in expectations {
+            let reason = super::failure_reason(&error);
+            assert!(
+                reason.starts_with(category),
+                "{error} must classify as {category}, got {reason}"
+            );
+            assert!(
+                reason.contains(detail),
+                "the category must not eat the diagnosis: {reason}"
+            );
+        }
+    }
+
+    /// The three categories must stay distinguishable — two sharing a prefix
+    /// would silently merge in every reader that branches on them.
+    #[test]
+    fn the_categories_are_distinct() {
+        let categories = [
+            super::PROCESS_DEATH,
+            super::REFUSAL,
+            super::MALFORMED_STREAM,
+        ];
+        for (index, category) in categories.iter().enumerate() {
+            for other in categories.iter().skip(index + 1) {
+                assert!(
+                    !category.starts_with(other) && !other.starts_with(category),
+                    "{category:?} and {other:?} must not shadow each other"
+                );
+            }
         }
     }
 

@@ -881,7 +881,7 @@ mod permission_path_tests {
 
 #[cfg(test)]
 mod steering_and_revival_tests {
-    use horde_adapter::{Adapter, AgentEvent, AgentSpec, ProviderSessionId, TurnInput, TurnStatus};
+    use horde_adapter::{Adapter, AgentEvent, ProviderSessionId, TurnInput, TurnStatus};
 
     use super::FakeAdapter;
     use super::harness::spec;

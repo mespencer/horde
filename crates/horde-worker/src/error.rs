@@ -44,6 +44,17 @@ pub enum WorkerError {
         source: horde_proto::prost::DecodeError,
     },
 
+    /// A remembered spawn command no longer decodes.
+    ///
+    /// This Worker encoded it itself when the spawn applied, so it is
+    /// corruption rather than peer input — same standing as
+    /// [`Self::CorruptJournalEntry`], scoped to the agent it strands.
+    #[error("the remembered spawn for agent {agent_id} is not decodable: {source}")]
+    CorruptAgentRecord {
+        agent_id: String,
+        source: horde_proto::prost::DecodeError,
+    },
+
     /// The Server asked the Worker to replay from a position it has truncated.
     ///
     /// The mirror image of the Server's own `JournalRegressed`. Sending only the

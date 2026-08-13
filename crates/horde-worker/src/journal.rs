@@ -37,8 +37,8 @@ use std::sync::{Arc, Mutex};
 use horde_proto::prost::Message;
 use horde_proto::prost_types::Timestamp;
 use horde_proto::v1::event::Kind;
-use horde_proto::v1::{AgentId, Event, JournaledEvent, SessionId};
-use rusqlite::{Connection, params};
+use horde_proto::v1::{AgentId, Event, JournaledEvent, SessionId, SpawnAgentCommand};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::watch;
 
 use crate::error::WorkerError;
@@ -77,6 +77,66 @@ pub enum CommandApplication {
     Applied,
     /// A redelivery. Nothing was appended and nothing was re-run.
     AlreadyApplied,
+}
+
+/// Agent bookkeeping riding a command's transaction.
+///
+/// Revival identity is Worker-local by design — the Worker, not the Server,
+/// revives agents — so the journal is where "how do I rebuild this agent"
+/// lives. It commits *with* the command that established or destroyed the
+/// fact: a spawn remembered outside the spawn's transaction could be lost
+/// between the two, leaving an agent the Server believes in and this Worker
+/// can never revive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentBookkeeping {
+    /// The command touches no agent bookkeeping.
+    None,
+    /// A spawn: remember how to rebuild the agent. The provider session id
+    /// arrives later, through [`AgentProgress::Established`].
+    Remember {
+        agent_id: String,
+        session_id: String,
+        spawn: Box<SpawnAgentCommand>,
+    },
+    /// An archive (or cancelled placement): context dies at archive, so the
+    /// revival identity dies with it.
+    Forget { agent_id: String },
+}
+
+/// Agent bookkeeping riding an event append's transaction.
+///
+/// Both facts must commit atomically with the event that carries them. The
+/// turn counter is the sharp one: turn ids are `{session}#{n}` and journal
+/// keys derive from them, so a counter that lagged its usage record by one
+/// crash would make the next revival re-mint keys the Server has already
+/// seen — and the revived turns' events would be acked and silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentProgress {
+    /// The events carry no agent progress.
+    None,
+    /// The harness named its conversation: the missing half of the revival
+    /// identity.
+    Established {
+        agent_id: String,
+        provider_session_id: String,
+    },
+    /// A turn ended; the agent's turn count advances with its usage record.
+    TurnTaken { agent_id: String },
+}
+
+/// Everything this journal knows about reviving one agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivableAgent {
+    pub agent_id: String,
+    pub session_id: String,
+    /// The spawn command that created the agent, kept whole so revival can
+    /// rebuild the spec, binding and context without a Server round trip.
+    pub spawn: SpawnAgentCommand,
+    /// `None` until the harness first named its conversation — an agent that
+    /// never established has nothing to resume.
+    pub provider_session_id: Option<String>,
+    /// Turns completed across every incarnation.
+    pub turns_taken: u64,
 }
 
 /// The append-only half of the journal, for components that only produce
@@ -167,6 +227,13 @@ impl Journal {
                      command_id       TEXT PRIMARY KEY,
                      command_sequence INTEGER NOT NULL
                  ) STRICT;
+                 CREATE TABLE IF NOT EXISTS agent (
+                     agent_id            TEXT PRIMARY KEY,
+                     session_id          TEXT NOT NULL,
+                     spawn               BLOB NOT NULL,
+                     provider_session_id TEXT,
+                     turns_taken         INTEGER NOT NULL DEFAULT 0
+                 ) STRICT;
                  CREATE TABLE IF NOT EXISTS meta (
                      key   TEXT PRIMARY KEY,
                      value INTEGER NOT NULL
@@ -220,11 +287,32 @@ impl Journal {
     ///
     /// [`WorkerError::Journal`] when the database refuses the append.
     pub async fn record(&self, entry: JournalEntry) -> Result<u64, WorkerError> {
+        self.record_batch(vec![entry], AgentProgress::None).await
+    }
+
+    /// Journals a batch of events and the agent progress they carry, in one
+    /// transaction, returning the last journal sequence assigned.
+    ///
+    /// One transaction is the point: a turn's usage record and its turn-count
+    /// advance must land together, or a crash between them makes the next
+    /// revival re-mint turn ids the Server has already keyed — acked and
+    /// silently discarded, the worst failure shape there is.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the transaction cannot commit.
+    pub async fn record_batch(
+        &self,
+        entries: Vec<JournalEntry>,
+        progress: AgentProgress,
+    ) -> Result<u64, WorkerError> {
         const CONTEXT: &str = "appending to the journal";
         let sequence = self
             .with_connection(CONTEXT, move |connection| {
                 in_transaction(connection, CONTEXT, |transaction| {
-                    append_all(transaction, &[entry])
+                    let last = append_all(transaction, &entries)?;
+                    apply_progress(transaction, &progress)?;
+                    Ok(last)
                 })
             })
             .await?;
@@ -232,7 +320,63 @@ impl Journal {
         Ok(sequence)
     }
 
-    /// Marks a command applied and journals its effects, in one transaction.
+    /// Everything needed to revive `agent_id`, if this journal remembers it.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the lookup fails, and
+    /// [`WorkerError::CorruptJournalEntry`]-shaped decode failures surface as
+    /// a journal error naming the read — the row was encoded by this Worker,
+    /// so a spawn that no longer decodes is corruption, not peer input.
+    pub async fn revivable_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<RevivableAgent>, WorkerError> {
+        const CONTEXT: &str = "reading an agent's revival identity";
+        let agent_id = agent_id.to_owned();
+        self.with_connection(CONTEXT, move |connection| {
+            let row = connection
+                .query_row(
+                    "SELECT session_id, spawn, provider_session_id, turns_taken
+                         FROM agent WHERE agent_id = ?1",
+                    params![agent_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, u64>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|source| WorkerError::Journal {
+                    context: CONTEXT,
+                    source,
+                })?;
+
+            let Some((session_id, spawn, provider_session_id, turns_taken)) = row else {
+                return Ok(None);
+            };
+            let spawn = SpawnAgentCommand::decode(spawn.as_slice()).map_err(|source| {
+                WorkerError::CorruptAgentRecord {
+                    agent_id: agent_id.clone(),
+                    source,
+                }
+            })?;
+            Ok(Some(RevivableAgent {
+                agent_id,
+                session_id,
+                spawn,
+                provider_session_id,
+                turns_taken,
+            }))
+        })
+        .await
+    }
+
+    /// Marks a command applied, journals its effects, and applies its agent
+    /// bookkeeping, in one transaction.
     ///
     /// Dedupes on `command_id`: a redelivered command appends nothing and
     /// reports [`CommandApplication::AlreadyApplied`], so the caller knows not
@@ -248,6 +392,7 @@ impl Journal {
         command_id: &str,
         command_sequence: u64,
         effects: Vec<JournalEntry>,
+        bookkeeping: AgentBookkeeping,
     ) -> Result<CommandApplication, WorkerError> {
         const CONTEXT: &str = "recording an applied command";
         let command_id = command_id.to_owned();
@@ -278,6 +423,7 @@ impl Journal {
                     set_meta(transaction, APPLIED_COMMAND, acked.max(command_sequence))?;
 
                     let last = append_all(transaction, &effects)?;
+                    apply_bookkeeping(transaction, &bookkeeping)?;
                     Ok((CommandApplication::Applied, Some(last)))
                 })
             })
@@ -532,6 +678,67 @@ fn append_all(
     Ok(next.saturating_sub(1))
 }
 
+/// Applies a command's agent bookkeeping inside its transaction.
+///
+/// `Remember` upserts: a redelivered spawn after a partial crash must land on
+/// the same row, not fail on it. `Forget` tolerates an absent row for the same
+/// reason an archive for an unknown agent applies — the fact it removes is
+/// already gone.
+fn apply_bookkeeping(
+    transaction: &rusqlite::Transaction<'_>,
+    bookkeeping: &AgentBookkeeping,
+) -> Result<(), rusqlite::Error> {
+    match bookkeeping {
+        AgentBookkeeping::None => {}
+        AgentBookkeeping::Remember {
+            agent_id,
+            session_id,
+            spawn,
+        } => {
+            transaction.execute(
+                "INSERT INTO agent (agent_id, session_id, spawn) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(agent_id) DO UPDATE SET
+                         session_id = excluded.session_id, spawn = excluded.spawn",
+                params![agent_id, session_id, spawn.encode_to_vec()],
+            )?;
+        }
+        AgentBookkeeping::Forget { agent_id } => {
+            transaction.execute("DELETE FROM agent WHERE agent_id = ?1", params![agent_id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies an event batch's agent progress inside its transaction.
+///
+/// An `UPDATE` that matches no row is deliberate silence: an agent this
+/// journal was never asked to remember (or was told to forget) has no revival
+/// identity to advance, and the event itself still landed.
+fn apply_progress(
+    transaction: &rusqlite::Transaction<'_>,
+    progress: &AgentProgress,
+) -> Result<(), rusqlite::Error> {
+    match progress {
+        AgentProgress::None => {}
+        AgentProgress::Established {
+            agent_id,
+            provider_session_id,
+        } => {
+            transaction.execute(
+                "UPDATE agent SET provider_session_id = ?2 WHERE agent_id = ?1",
+                params![agent_id, provider_session_id],
+            )?;
+        }
+        AgentProgress::TurnTaken { agent_id } => {
+            transaction.execute(
+                "UPDATE agent SET turns_taken = turns_taken + 1 WHERE agent_id = ?1",
+                params![agent_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn meta(connection: &Connection, key: &str) -> Result<u64, rusqlite::Error> {
     connection.query_row(
         "SELECT value FROM meta WHERE key = ?1",
@@ -604,7 +811,7 @@ mod tests {
     use horde_proto::v1::TurnInterrupted;
     use horde_proto::v1::event::Kind;
 
-    use super::{CommandApplication, Journal, JournalEntry};
+    use super::{AgentBookkeeping, CommandApplication, Journal, JournalEntry};
     use crate::error::WorkerError;
 
     fn entry(session: &str, key: &str) -> JournalEntry {
@@ -762,13 +969,18 @@ mod tests {
         let journal = journal();
 
         let first = journal
-            .apply_command("s1:2", 1, vec![entry("s1", "k1")])
+            .apply_command("s1:2", 1, vec![entry("s1", "k1")], AgentBookkeeping::None)
             .await
             .expect("the first delivery applies");
         assert_eq!(first, CommandApplication::Applied);
 
         let second = journal
-            .apply_command("s1:2", 1, vec![entry("s1", "k1-again")])
+            .apply_command(
+                "s1:2",
+                1,
+                vec![entry("s1", "k1-again")],
+                AgentBookkeeping::None,
+            )
             .await
             .expect("a redelivery is not an error");
         assert_eq!(second, CommandApplication::AlreadyApplied);
@@ -788,17 +1000,17 @@ mod tests {
     async fn the_ack_watermark_ratchets_and_never_regresses() {
         let journal = journal();
         journal
-            .apply_command("s1:2", 1, Vec::new())
+            .apply_command("s1:2", 1, Vec::new(), AgentBookkeeping::None)
             .await
             .expect("apply");
         journal
-            .apply_command("s1:4", 2, Vec::new())
+            .apply_command("s1:4", 2, Vec::new(), AgentBookkeeping::None)
             .await
             .expect("apply");
 
         // An old command redelivered after a newer one was applied.
         journal
-            .apply_command("s1:2", 1, Vec::new())
+            .apply_command("s1:2", 1, Vec::new(), AgentBookkeeping::None)
             .await
             .expect("redelivery");
 
@@ -817,7 +1029,12 @@ mod tests {
         let journal = journal();
         journal.record(entry("s1", "k1")).await.expect("append");
         journal
-            .apply_command("s1:2", 1, vec![entry("s1", "k2"), entry("s2", "k3")])
+            .apply_command(
+                "s1:2",
+                1,
+                vec![entry("s1", "k2"), entry("s2", "k3")],
+                AgentBookkeeping::None,
+            )
             .await
             .expect("apply");
         journal.record(entry("s2", "k4")).await.expect("append");
@@ -947,7 +1164,7 @@ mod tests {
         );
 
         journal
-            .apply_command("s1:2", 1, Vec::new())
+            .apply_command("s1:2", 1, Vec::new(), AgentBookkeeping::None)
             .await
             .expect("apply");
 
@@ -957,6 +1174,180 @@ mod tests {
                 .await
                 .expect("a readable journal"),
             "the pre-execution check is what stops a harness spawning twice"
+        );
+    }
+
+    /// The `Remember` half of a spawn's transaction, read back whole.
+    #[tokio::test]
+    async fn a_remembered_agent_is_revivable_with_everything_the_spawn_said() {
+        let journal = journal();
+        let spawn = horde_proto::v1::SpawnAgentCommand {
+            session_id: Some(horde_proto::v1::SessionId::new("s1")),
+            agent_id: Some(horde_proto::v1::AgentId::new("agent-1")),
+            prompt_overlay: "be brief".to_owned(),
+            ..horde_proto::v1::SpawnAgentCommand::default()
+        };
+        journal
+            .apply_command(
+                "s1:1",
+                1,
+                Vec::new(),
+                super::AgentBookkeeping::Remember {
+                    agent_id: "agent-1".to_owned(),
+                    session_id: "s1".to_owned(),
+                    spawn: Box::new(spawn.clone()),
+                },
+            )
+            .await
+            .expect("the spawn applies");
+
+        let record = journal
+            .revivable_agent("agent-1")
+            .await
+            .expect("readable")
+            .expect("the agent is remembered");
+        assert_eq!(record.session_id, "s1");
+        assert_eq!(record.spawn, spawn, "revival rebuilds from the whole spawn");
+        assert_eq!(
+            record.provider_session_id, None,
+            "nothing established yet means nothing to resume"
+        );
+        assert_eq!(record.turns_taken, 0);
+
+        assert!(
+            journal
+                .revivable_agent("nobody")
+                .await
+                .expect("readable")
+                .is_none(),
+            "an agent never remembered is not revivable"
+        );
+    }
+
+    /// The two progress facts, committed with the events that carry them.
+    #[tokio::test]
+    async fn progress_advances_the_identity_and_the_turn_count_atomically() {
+        let journal = journal();
+        journal
+            .apply_command(
+                "s1:1",
+                1,
+                Vec::new(),
+                super::AgentBookkeeping::Remember {
+                    agent_id: "agent-1".to_owned(),
+                    session_id: "s1".to_owned(),
+                    spawn: Box::default(),
+                },
+            )
+            .await
+            .expect("the spawn applies");
+
+        journal
+            .record_batch(
+                vec![entry("s1", "established")],
+                super::AgentProgress::Established {
+                    agent_id: "agent-1".to_owned(),
+                    provider_session_id: "sess-42".to_owned(),
+                },
+            )
+            .await
+            .expect("appends");
+        for key in ["t1", "t2"] {
+            journal
+                .record_batch(
+                    vec![entry("s1", key)],
+                    super::AgentProgress::TurnTaken {
+                        agent_id: "agent-1".to_owned(),
+                    },
+                )
+                .await
+                .expect("appends");
+        }
+
+        let record = journal
+            .revivable_agent("agent-1")
+            .await
+            .expect("readable")
+            .expect("remembered");
+        assert_eq!(record.provider_session_id.as_deref(), Some("sess-42"));
+        assert_eq!(
+            record.turns_taken, 2,
+            "the count advances with each turn's own transaction"
+        );
+
+        // And the events themselves landed: progress rides the append, it
+        // does not replace it.
+        assert_eq!(
+            journal.read_from(1, 10).await.expect("readable").len(),
+            3,
+            "every batch's events must land alongside its progress"
+        );
+    }
+
+    /// Context dies at archive, and the revival identity dies with it.
+    #[tokio::test]
+    async fn forgetting_an_agent_ends_its_revivability() {
+        let journal = journal();
+        journal
+            .apply_command(
+                "s1:1",
+                1,
+                Vec::new(),
+                super::AgentBookkeeping::Remember {
+                    agent_id: "agent-1".to_owned(),
+                    session_id: "s1".to_owned(),
+                    spawn: Box::default(),
+                },
+            )
+            .await
+            .expect("the spawn applies");
+        journal
+            .apply_command(
+                "s1:2",
+                2,
+                Vec::new(),
+                super::AgentBookkeeping::Forget {
+                    agent_id: "agent-1".to_owned(),
+                },
+            )
+            .await
+            .expect("the archive applies");
+
+        assert!(
+            journal
+                .revivable_agent("agent-1")
+                .await
+                .expect("readable")
+                .is_none(),
+            "an archived agent's context is gone and must not look revivable"
+        );
+    }
+
+    /// A redelivered spawn lands on the same row rather than failing on it.
+    #[tokio::test]
+    async fn a_redelivered_remember_does_not_conflict_with_itself() {
+        let journal = journal();
+        for command_id in ["s1:1", "s1:1-again"] {
+            journal
+                .apply_command(
+                    command_id,
+                    1,
+                    Vec::new(),
+                    super::AgentBookkeeping::Remember {
+                        agent_id: "agent-1".to_owned(),
+                        session_id: "s1".to_owned(),
+                        spawn: Box::default(),
+                    },
+                )
+                .await
+                .expect("both applications succeed");
+        }
+        assert!(
+            journal
+                .revivable_agent("agent-1")
+                .await
+                .expect("readable")
+                .is_some()
         );
     }
 
