@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use horde_adapter::{
-    Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, Capabilities, PermissionDecision,
-    ProviderSessionId, Result, ToolCallId, TurnInput,
+    Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, Capabilities, Delivery,
+    PermissionDecision, ProviderSessionId, Result, ToolCallId, TurnInput,
 };
 use horde_adapter_claude::codec::{decode_line, encode_interrupt, encode_user_message};
 use horde_adapter_claude::turn::TurnAssembler;
@@ -84,6 +84,16 @@ impl ClaudeAdapter {
         if let Some(tool) = &self.permission_prompt_tool {
             args.push("--permission-prompt-tool".to_owned());
             args.push(tool.clone());
+            // ADR-0003 (re-verified 2026-08-11): ambient settings allowlists
+            // decide a tool call BEFORE the permission tool ever sees it — an
+            // allowed call executes with no prompt, no denial, and no event.
+            // For the §10 chain to be the real authority, the Worker must own
+            // the permission settings the harness reads: explicit empty
+            // allow/deny lists, and never the operator's ~/.claude/settings.
+            args.push("--settings".to_owned());
+            args.push(r#"{"permissions":{"allow":[],"deny":[]}}"#.to_owned());
+            args.push("--permission-mode".to_owned());
+            args.push("manual".to_owned());
         }
         args
     }
@@ -125,7 +135,7 @@ impl Adapter for ClaudeAdapter {
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
-        self.start(spec, Vec::new())
+        self.start(spec, Vec::new(), TurnAssembler::new())
     }
 
     async fn resume(
@@ -133,12 +143,19 @@ impl Adapter for ClaudeAdapter {
         spec: &AgentSpec,
         provider_session_id: &ProviderSessionId,
     ) -> Result<Box<dyn AgentSession>> {
+        // Turn numbering continues where the previous processes stopped, or the
+        // revived turns would re-mint journal keys and be silently dropped.
+        let turns_taken = spec.turns_taken().map_err(|message| AdapterError::Spawn {
+            provider: horde_adapter_claude::PROVIDER.to_owned(),
+            message,
+        })?;
         // Under the SAME config dir: a session recorded under one account does
         // not exist under another, and an unauthenticated directory fails loudly
         // rather than starting a silently fresh conversation.
         self.start(
             spec,
             vec!["--resume".to_owned(), provider_session_id.to_string()],
+            TurnAssembler::resuming_after(turns_taken),
         )
     }
 }
@@ -146,10 +163,15 @@ impl Adapter for ClaudeAdapter {
 impl ClaudeAdapter {
     /// Starts a supervised `claude` and wraps it as a session.
     ///
-    /// Spawning and reviving differ only in the extra flags, so they share the
-    /// launch: a second copy is a second place for the provider to go missing
-    /// from a spawn failure.
-    fn start(&self, spec: &AgentSpec, extra: Vec<String>) -> Result<Box<dyn AgentSession>> {
+    /// Spawning and reviving differ only in the extra flags and where the turn
+    /// numbering starts, so they share the launch: a second copy is a second
+    /// place for the provider to go missing from a spawn failure.
+    fn start(
+        &self,
+        spec: &AgentSpec,
+        extra: Vec<String>,
+        assembler: TurnAssembler,
+    ) -> Result<Box<dyn AgentSession>> {
         let harness =
             SupervisedHarness::spawn(&self.harness_spec(spec, extra)).map_err(|error| {
                 AdapterError::Spawn {
@@ -157,7 +179,7 @@ impl ClaudeAdapter {
                     message: error.to_string(),
                 }
             })?;
-        Ok(Box::new(LiveClaudeSession::new(harness)))
+        Ok(Box::new(LiveClaudeSession::new(harness, assembler)))
     }
 }
 
@@ -173,14 +195,44 @@ pub struct LiveClaudeSession {
 }
 
 impl LiveClaudeSession {
-    fn new(harness: SupervisedHarness) -> Self {
+    fn new(harness: SupervisedHarness, assembler: TurnAssembler) -> Self {
         Self {
             harness,
-            assembler: TurnAssembler::new(),
+            assembler,
             pending: VecDeque::new(),
             session_id: None,
             ended: false,
         }
+    }
+
+    /// The child's stdout closed while a conversation was open: the harness is
+    /// dead. Reap it for the exit status — the one fact that distinguishes a
+    /// crash from a refusal-to-start — and keep its stderr where an operator
+    /// can find it, because that is the only explanation a dead harness leaves.
+    async fn report_death(&mut self) -> AdapterError {
+        self.ended = true;
+        let exit_code = self.harness.wait().await.ok().flatten();
+        if let Some(stderr) = death_diagnostics(&self.harness.diagnostics().await) {
+            tracing::warn!(
+                ?exit_code,
+                %stderr,
+                "the claude harness died; its stderr is the only explanation it left"
+            );
+        }
+        AdapterError::HarnessExited { exit_code }
+    }
+}
+
+/// What a dead harness left on stderr, or `None` when it left nothing.
+///
+/// Pure so the distinction is testable: a death that logs an empty stderr
+/// drowns the real explanation in noise, and one that drops a non-empty
+/// stderr discards the only explanation there is.
+fn death_diagnostics(diagnostics: &[String]) -> Option<String> {
+    if diagnostics.is_empty() {
+        None
+    } else {
+        Some(diagnostics.join("\n"))
     }
 }
 
@@ -193,6 +245,13 @@ impl AgentSession for LiveClaudeSession {
     async fn send(&mut self, input: TurnInput) -> Result<()> {
         if self.ended {
             return Err(AdapterError::HarnessExited { exit_code: None });
+        }
+        // An interrupting message aborts any turn in flight first (the trait's
+        // contract for Delivery::Interrupt). The control message is the only
+        // mechanism that does that and leaves the session usable; the harness
+        // then closes the aborted turn with its own `aborted_streaming` result.
+        if input.delivery == Delivery::Interrupt {
+            self.interrupt().await?;
         }
         self.harness
             .write_line(&encode_user_message(&input.text))
@@ -222,9 +281,11 @@ impl AgentSession for LiveClaudeSession {
                 })?;
 
             let Some(line) = line else {
-                // EOF: the harness is gone. Reported, never waited on.
-                self.ended = true;
-                return Ok(None);
+                // EOF: the harness is gone. The Worker never closes stdin on a
+                // live agent, so an EOF here is always a death, never a normal
+                // end — reported as one, with the exit status attached, and
+                // never waited on. (`shutdown` returns before this is reached.)
+                return Err(self.report_death().await);
             };
 
             let envelope = decode_line(&line)?;
@@ -332,6 +393,52 @@ mod tests {
         wired.permission_prompt_tool = Some("mcp__horde__approve".to_owned());
         let args = wired.base_args(&AgentSpec::default());
         assert!(args.iter().any(|a| a == "mcp__horde__approve"));
+    }
+
+    /// ADR-0003's re-verified finding: ambient settings allowlists decide a
+    /// tool call *before* the permission tool sees it — a silent bypass of the
+    /// whole §10 chain. A wired permission tool therefore always travels with
+    /// explicit empty allow/deny lists and manual mode, so the harness reads
+    /// permission settings this Worker owns, never the operator's.
+    #[test]
+    fn a_wired_permission_tool_brings_its_own_empty_settings() {
+        let mut wired = ClaudeAdapter::new();
+        wired.permission_prompt_tool = Some("mcp__horde__approve".to_owned());
+        let args = wired.base_args(&AgentSpec::default());
+        let joined = args.join(" ");
+
+        assert!(
+            joined.contains(r#"--settings {"permissions":{"allow":[],"deny":[]}}"#),
+            "the worker must own the settings the harness reads: {joined}"
+        );
+        assert!(
+            joined.contains("--permission-mode manual"),
+            "anything but manual lets a mode allowlist bypass the chain: {joined}"
+        );
+
+        // And without the tool there is no settings override either: an agent
+        // with no permission chain runs the harness as configured.
+        let plain = ClaudeAdapter::new().base_args(&AgentSpec::default());
+        assert!(
+            !plain.iter().any(|a| a == "--settings"),
+            "no chain means no override, not an empty one"
+        );
+    }
+
+    /// Both directions of the stderr distinction: a silent death reports no
+    /// diagnostics, a noisy one reports exactly what was said.
+    #[test]
+    fn death_diagnostics_report_what_was_said_and_only_that() {
+        assert_eq!(
+            super::death_diagnostics(&[]),
+            None,
+            "a silent death must not log an empty explanation"
+        );
+        assert_eq!(
+            super::death_diagnostics(&["boom".to_owned(), "trace".to_owned()]).as_deref(),
+            Some("boom\ntrace"),
+            "the harness's own words are the only explanation it left"
+        );
     }
 
     #[test]

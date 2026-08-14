@@ -1081,6 +1081,7 @@ dependencies = [
  "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-proto",
+ "horde-relay",
  "horde-server",
  "horde-wire",
  "rusqlite",

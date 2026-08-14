@@ -74,7 +74,7 @@ pub use identity::RevivalIdentity;
 pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId, account_dir};
 pub use permission::{PermissionDecision, PermissionDenial, ProposedToolCall};
 pub use replay::{LineDecoder, ReplaySession};
-pub use spec::{AgentSpec, Delivery, McpEndpoint, TurnInput};
+pub use spec::{AgentSpec, Delivery, McpEndpoint, TURNS_TAKEN_OPTION, TurnInput};
 pub use usage::{
     HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
 };
