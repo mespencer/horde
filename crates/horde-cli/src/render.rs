@@ -452,6 +452,223 @@ pub fn sequence(verb: &str, sequence: u64, format: Format) -> String {
     }
 }
 
+/// How a usage answer's rows are grouped, in this renderer's own words.
+///
+/// Render-owned rather than imported from `cli` (which would close a module
+/// cycle) and richer than the bare wire enum: the wire key cannot say which
+/// grouping produced it — an empty model and an empty account are both empty
+/// strings — so labelling a row needs the grouping stated alongside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGrouping {
+    Agent,
+    Session,
+    Tree,
+    Account,
+    Model,
+}
+
+impl UsageGrouping {
+    /// The heading word: "usage by {word}".
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Session => "session",
+            Self::Tree => "tree path",
+            Self::Account => "provider account",
+            Self::Model => "model",
+        }
+    }
+}
+
+/// Renders a usage answer: aggregate rows (measured from journaled events)
+/// and per-account standing (measured window and sums beside the derived
+/// headroom, labelled with its basis so the two are never mistaken).
+#[must_use]
+pub fn usage(
+    response: &horde_proto::v1::QueryUsageResponse,
+    grouping: UsageGrouping,
+    format: Format,
+) -> String {
+    match format {
+        Format::Json => json!({
+            "grouping": grouping.word(),
+            "aggregates": response
+                .aggregates
+                .iter()
+                .map(|aggregate| aggregate_json(aggregate, grouping))
+                .collect::<Vec<Value>>(),
+            "accounts": response
+                .accounts
+                .iter()
+                .map(account_json)
+                .collect::<Vec<Value>>(),
+        })
+        .to_string(),
+        Format::Human => {
+            let mut lines = vec![format!("usage by {} (measured)", grouping.word())];
+            if response.aggregates.is_empty() {
+                // Said rather than blank: an empty result and a swallowed
+                // error look identical otherwise.
+                lines.push("  no usage recorded".to_owned());
+            }
+            for aggregate in &response.aggregates {
+                lines.push(aggregate_row(aggregate, grouping));
+            }
+            if !response.accounts.is_empty() {
+                lines.push("provider accounts".to_owned());
+                for account in &response.accounts {
+                    lines.push(account_row(account));
+                }
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+fn aggregate_row(aggregate: &horde_proto::v1::UsageAggregate, grouping: UsageGrouping) -> String {
+    let tokens = aggregate.tokens.unwrap_or_default();
+    format!(
+        "  {}  {}  agents {}",
+        group_label(grouping, &aggregate.key.clone().unwrap_or_default()),
+        tokens_human(&tokens),
+        aggregate.agent_count,
+    )
+}
+
+/// One account's standing on one line: name, derived headroom, and the basis
+/// naming where the derivation came from — "(derived …)" versus the plainly
+/// measured token columns is the measured/derived distinction, spelled out.
+fn account_row(account: &horde_proto::v1::AccountHeadroom) -> String {
+    let name = pair(&account.provider, &account.account, "(none)");
+    let standing = account_standing(account.exhausted, account.remaining_fraction);
+    let tokens = account.tokens.unwrap_or_default();
+    format!(
+        "  {name}  {standing} ({})  spent {}",
+        account.basis,
+        tokens_human(&tokens)
+    )
+}
+
+/// The derived half of an account row, in words.
+fn account_standing(exhausted: bool, remaining_fraction: Option<f64>) -> String {
+    match (exhausted, remaining_fraction) {
+        (true, _) => "EXHAUSTED".to_owned(),
+        (false, Some(remaining)) => format!("{:.0}% left", remaining * 100.0),
+        (false, None) => "headroom unknown".to_owned(),
+    }
+}
+
+/// The measured token columns, in one fixed order.
+fn tokens_human(tokens: &horde_proto::v1::TokenUsage) -> String {
+    format!(
+        "in {}  out {}  cache r/w {}/{}  reasoning {}",
+        tokens.input_tokens,
+        tokens.output_tokens,
+        tokens.cache_read_input_tokens,
+        tokens.cache_write_input_tokens,
+        tokens.reasoning_output_tokens,
+    )
+}
+
+/// The row label a group key renders as, under the grouping that made it.
+fn group_label(grouping: UsageGrouping, key: &horde_proto::v1::UsageGroupKey) -> String {
+    let name = |value: Option<String>| value.unwrap_or_else(|| "-".to_owned());
+    match grouping {
+        UsageGrouping::Agent => format!(
+            "{} {}",
+            name(key.session_id.as_ref().map(ToString::to_string)),
+            name(key.agent_id.as_ref().map(ToString::to_string)),
+        ),
+        UsageGrouping::Session => name(key.session_id.as_ref().map(ToString::to_string)),
+        UsageGrouping::Tree => {
+            if key.tree_path.is_empty() {
+                "(no tree path)".to_owned()
+            } else {
+                key.tree_path.join(" > ")
+            }
+        }
+        UsageGrouping::Account => pair(&key.provider, &key.provider_account, "(none)"),
+        UsageGrouping::Model => pair(&key.provider, &key.model, "(default)"),
+    }
+}
+
+/// `provider/name`, with the empties named rather than rendered as bare
+/// slashes: a record journaled with no binding is "(unattributed)", and an
+/// empty second half gets the word the grouping gives it — "(default)" for a
+/// model (the harness's own default model is a real state), "(none)" for an
+/// account.
+fn pair(provider: &str, name: &str, empty_name: &str) -> String {
+    let unattributed = provider.is_empty() && name.is_empty();
+    if unattributed {
+        return "(unattributed)".to_owned();
+    }
+    let name = if name.is_empty() { empty_name } else { name };
+    format!("{provider}/{name}")
+}
+
+fn aggregate_json(aggregate: &horde_proto::v1::UsageAggregate, grouping: UsageGrouping) -> Value {
+    let key = aggregate.key.clone().unwrap_or_default();
+    json!({
+        "label": group_label(grouping, &key),
+        "key": {
+            "session_id": id(key.session_id.as_ref().map(ToString::to_string)),
+            "agent_id": id(key.agent_id.as_ref().map(ToString::to_string)),
+            "tree_path": key.tree_path,
+            "provider": key.provider,
+            "provider_account": key.provider_account,
+            "model": key.model,
+        },
+        "measured": {
+            "tokens": tokens_json(&aggregate.tokens.unwrap_or_default()),
+            "agent_count": aggregate.agent_count,
+        },
+    })
+}
+
+/// Measured facts and derived arithmetic are separate objects in the JSON,
+/// so a script cannot read Horde's arithmetic as the provider's number.
+fn account_json(account: &horde_proto::v1::AccountHeadroom) -> Value {
+    json!({
+        "provider": account.provider,
+        "account": account.account,
+        "measured": {
+            "tokens": tokens_json(&account.tokens.unwrap_or_default()),
+            "window": account.window.as_ref().map_or(Value::Null, window_json),
+        },
+        "derived": {
+            "remaining_fraction": account.remaining_fraction,
+            "exhausted": account.exhausted,
+            "basis": account.basis,
+        },
+    })
+}
+
+fn window_json(window: &horde_proto::v1::RateWindow) -> Value {
+    let source = match horde_proto::v1::HeadroomSource::try_from(window.source) {
+        Ok(horde_proto::v1::HeadroomSource::ProviderReported) => "provider-reported",
+        Ok(horde_proto::v1::HeadroomSource::HordeMetered) => "horde-metered",
+        _ => "unspecified",
+    };
+    json!({
+        "source": source,
+        "used": window.used,
+        "limit": window.limit,
+        "used_fraction": window.used_fraction,
+        "allowed": window.allowed,
+    })
+}
+
+fn tokens_json(tokens: &horde_proto::v1::TokenUsage) -> Value {
+    json!({
+        "input_tokens": tokens.input_tokens,
+        "output_tokens": tokens.output_tokens,
+        "cache_read_input_tokens": tokens.cache_read_input_tokens,
+        "cache_write_input_tokens": tokens.cache_write_input_tokens,
+        "reasoning_output_tokens": tokens.reasoning_output_tokens,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use horde_proto::v1::{
@@ -957,5 +1174,229 @@ mod enrollment_render_tests {
                 .expect("json mode emits json");
         assert_eq!(json["principal"], "client:laptop");
         assert_eq!(json["identity_dir"], "/tmp/id");
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use horde_proto::v1::{
+        AccountHeadroom, AgentId, HeadroomSource, QueryUsageResponse, RateWindow, SessionId,
+        TokenUsage, UsageAggregate, UsageGroupKey,
+    };
+
+    use super::{Format, UsageGrouping, account_standing, group_label, pair, usage};
+
+    fn tokens(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            ..TokenUsage::default()
+        }
+    }
+
+    fn account_aggregate() -> UsageAggregate {
+        UsageAggregate {
+            key: Some(UsageGroupKey {
+                provider: "claude".to_owned(),
+                provider_account: "personal".to_owned(),
+                ..UsageGroupKey::default()
+            }),
+            tokens: Some(tokens(110, 45)),
+            agent_count: 2,
+        }
+    }
+
+    fn healthy_account() -> AccountHeadroom {
+        AccountHeadroom {
+            provider: "claude".to_owned(),
+            account: "personal".to_owned(),
+            window: Some(RateWindow {
+                source: HeadroomSource::ProviderReported as i32,
+                used: Some(75),
+                limit: Some(100),
+                ..RateWindow::default()
+            }),
+            remaining_fraction: Some(0.25),
+            exhausted: false,
+            tokens: Some(tokens(110, 45)),
+            basis: "derived from provider-reported counts".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_human_answer_keeps_measured_and_derived_apart() {
+        let response = QueryUsageResponse {
+            aggregates: vec![account_aggregate()],
+            accounts: vec![healthy_account()],
+        };
+        let rendered = usage(&response, UsageGrouping::Account, Format::Human);
+        assert_eq!(
+            rendered,
+            "usage by provider account (measured)\n  \
+             claude/personal  in 110  out 45  cache r/w 0/0  reasoning 0  agents 2\n\
+             provider accounts\n  \
+             claude/personal  25% left (derived from provider-reported counts)  \
+             spent in 110  out 45  cache r/w 0/0  reasoning 0"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_says_so_rather_than_printing_nothing() {
+        let empty = QueryUsageResponse::default();
+        let rendered = usage(&empty, UsageGrouping::Session, Format::Human);
+        assert_eq!(rendered, "usage by session (measured)\n  no usage recorded");
+    }
+
+    #[test]
+    fn the_json_answer_separates_measured_from_derived() {
+        let response = QueryUsageResponse {
+            aggregates: vec![account_aggregate()],
+            accounts: vec![healthy_account()],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&usage(&response, UsageGrouping::Account, Format::Json))
+                .expect("--json must emit valid JSON");
+
+        assert_eq!(parsed["grouping"], "provider account");
+        let row = &parsed["aggregates"][0];
+        assert_eq!(row["label"], "claude/personal");
+        assert_eq!(row["measured"]["tokens"]["input_tokens"], 110);
+        assert_eq!(row["measured"]["agent_count"], 2);
+
+        let account = &parsed["accounts"][0];
+        assert_eq!(account["measured"]["window"]["used"], 75);
+        assert_eq!(account["measured"]["window"]["source"], "provider-reported");
+        assert_eq!(account["measured"]["tokens"]["output_tokens"], 45);
+        assert_eq!(account["derived"]["remaining_fraction"], 0.25);
+        assert_eq!(account["derived"]["exhausted"], false);
+        assert_eq!(
+            account["derived"]["basis"],
+            "derived from provider-reported counts"
+        );
+        assert!(
+            account["measured"]["remaining_fraction"].is_null(),
+            "the derived number must not also appear as a measurement"
+        );
+    }
+
+    /// Every source the wire can carry keeps its own JSON word — the
+    /// measured/derived split depends on a script being able to see *whose*
+    /// number a window is, so "horde-metered" collapsing into "unspecified"
+    /// would misattribute Horde's own metering to nobody.
+    #[test]
+    fn every_window_source_keeps_its_own_name_in_json() {
+        let with_source = |source: i32| {
+            let response = QueryUsageResponse {
+                aggregates: Vec::new(),
+                accounts: vec![AccountHeadroom {
+                    window: Some(RateWindow {
+                        source,
+                        ..RateWindow::default()
+                    }),
+                    ..healthy_account()
+                }],
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&usage(&response, UsageGrouping::Account, Format::Json))
+                    .expect("json");
+            parsed["accounts"][0]["measured"]["window"]["source"].clone()
+        };
+
+        assert_eq!(
+            with_source(HeadroomSource::ProviderReported as i32),
+            "provider-reported"
+        );
+        assert_eq!(
+            with_source(HeadroomSource::HordeMetered as i32),
+            "horde-metered"
+        );
+        assert_eq!(
+            with_source(HeadroomSource::Unspecified as i32),
+            "unspecified"
+        );
+        assert_eq!(with_source(887), "unspecified");
+    }
+
+    #[test]
+    fn an_account_with_no_window_renders_null_rather_than_a_fabricated_one() {
+        let response = QueryUsageResponse {
+            aggregates: Vec::new(),
+            accounts: vec![AccountHeadroom {
+                provider: "codex".to_owned(),
+                account: "team".to_owned(),
+                window: None,
+                remaining_fraction: None,
+                exhausted: false,
+                tokens: Some(tokens(1, 0)),
+                basis: "no rate window journaled".to_owned(),
+            }],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&usage(&response, UsageGrouping::Account, Format::Json))
+                .expect("json");
+        assert!(parsed["accounts"][0]["measured"]["window"].is_null());
+        assert!(parsed["accounts"][0]["derived"]["remaining_fraction"].is_null());
+    }
+
+    /// The three standings a derived account row can have. EXHAUSTED wins
+    /// over any fraction, because it also folds in the reset clock.
+    #[test]
+    fn account_standing_words_cover_all_three_states() {
+        assert_eq!(account_standing(true, Some(0.0)), "EXHAUSTED");
+        assert_eq!(account_standing(true, None), "EXHAUSTED");
+        assert_eq!(account_standing(false, Some(0.25)), "25% left");
+        assert_eq!(account_standing(false, Some(1.0)), "100% left");
+        assert_eq!(account_standing(false, None), "headroom unknown");
+    }
+
+    #[test]
+    fn labels_follow_the_grouping_not_the_populated_fields() {
+        let key = UsageGroupKey {
+            session_id: Some(SessionId::new("s1")),
+            agent_id: Some(AgentId::new("agent-9")),
+            tree_path: vec!["ci-fix".to_owned(), "reviewer".to_owned()],
+            provider: "claude".to_owned(),
+            provider_account: "personal".to_owned(),
+            model: "sonnet".to_owned(),
+        };
+        assert_eq!(group_label(UsageGrouping::Agent, &key), "s1 agent-9");
+        assert_eq!(group_label(UsageGrouping::Session, &key), "s1");
+        assert_eq!(group_label(UsageGrouping::Tree, &key), "ci-fix > reviewer");
+        assert_eq!(group_label(UsageGrouping::Account, &key), "claude/personal");
+        assert_eq!(group_label(UsageGrouping::Model, &key), "claude/sonnet");
+
+        let empty = UsageGroupKey::default();
+        assert_eq!(group_label(UsageGrouping::Agent, &empty), "- -");
+        assert_eq!(group_label(UsageGrouping::Session, &empty), "-");
+        assert_eq!(group_label(UsageGrouping::Tree, &empty), "(no tree path)");
+        assert_eq!(
+            group_label(UsageGrouping::Account, &empty),
+            "(unattributed)"
+        );
+        assert_eq!(group_label(UsageGrouping::Model, &empty), "(unattributed)");
+    }
+
+    /// The empty halves are named, not rendered as bare slashes — and the
+    /// word depends on which half of which grouping is empty.
+    #[test]
+    fn the_pair_label_names_its_empties() {
+        assert_eq!(pair("claude", "personal", "(none)"), "claude/personal");
+        assert_eq!(pair("codex", "", "(default)"), "codex/(default)");
+        assert_eq!(pair("codex", "", "(none)"), "codex/(none)");
+        assert_eq!(pair("", "", "(none)"), "(unattributed)");
+        assert_eq!(
+            pair("", "orphan", "(none)"),
+            "/orphan",
+            "a name with no provider still shows the name"
+        );
+    }
+
+    #[test]
+    fn every_grouping_has_its_heading_word() {
+        assert_eq!(UsageGrouping::Agent.word(), "agent");
+        assert_eq!(UsageGrouping::Session.word(), "session");
+        assert_eq!(UsageGrouping::Tree.word(), "tree path");
+        assert_eq!(UsageGrouping::Account.word(), "provider account");
+        assert_eq!(UsageGrouping::Model.word(), "model");
     }
 }

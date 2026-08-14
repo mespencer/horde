@@ -67,6 +67,8 @@ pub enum Command {
     /// endpoint (ADR-0004).
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Usage and headroom, folded from the journaled usage events.
+    Usage(UsageArgs),
     /// Worker administration: enrollment codes and revocation (DESIGN §3).
     #[command(subcommand)]
     Worker(WorkerCommand),
@@ -256,6 +258,58 @@ pub struct AttachArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct UsageArgs {
+    /// Restrict to this session; repeatable. Default: every session.
+    #[arg(long = "session")]
+    pub sessions: Vec<String>,
+    /// Restrict to this agent's subtree — tree-level attribution.
+    #[arg(long)]
+    pub subtree: Option<String>,
+    /// How to group the rows.
+    #[arg(long, value_enum, default_value_t = GroupChoice::Account)]
+    pub by: GroupChoice,
+}
+
+/// The groupings `--by` offers, in CLI words.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupChoice {
+    Agent,
+    Session,
+    Tree,
+    Account,
+    Model,
+}
+
+/// The wire grouping one CLI choice asks for.
+///
+/// Extracted so the mapping is testable without a server: a swapped arm here
+/// would silently answer a different question than the flag named.
+#[must_use]
+pub fn group_by_for(choice: GroupChoice) -> horde_proto::v1::UsageGroupBy {
+    match choice {
+        GroupChoice::Agent => horde_proto::v1::UsageGroupBy::Agent,
+        GroupChoice::Session => horde_proto::v1::UsageGroupBy::Session,
+        GroupChoice::Tree => horde_proto::v1::UsageGroupBy::TreePath,
+        GroupChoice::Account => horde_proto::v1::UsageGroupBy::ProviderAccount,
+        GroupChoice::Model => horde_proto::v1::UsageGroupBy::Model,
+    }
+}
+
+/// The renderer's grouping for the same choice — the renderer owns its own
+/// vocabulary rather than importing this module's (which would close a
+/// module cycle), so the flag maps into both, here, testably.
+#[must_use]
+pub fn rendering_for(choice: GroupChoice) -> render::UsageGrouping {
+    match choice {
+        GroupChoice::Agent => render::UsageGrouping::Agent,
+        GroupChoice::Session => render::UsageGrouping::Session,
+        GroupChoice::Tree => render::UsageGrouping::Tree,
+        GroupChoice::Account => render::UsageGrouping::Account,
+        GroupChoice::Model => render::UsageGrouping::Model,
+    }
+}
+
+#[derive(Args, Debug)]
 pub struct SpawnArgs {
     pub session_id: String,
     /// The spawner. Defaults to the session's top-level agent.
@@ -306,6 +360,7 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
         Some(Command::Mcp(command)) => run_mcp(client, command, format).await,
+        Some(Command::Usage(args)) => run_usage(client, args, format).await,
         Some(Command::Worker(command)) => run_worker(client, command, format).await,
         Some(Command::Enroll(command)) => run_enroll(client, command, format).await,
     }
@@ -582,6 +637,22 @@ async fn run_spawn(
     Ok(())
 }
 
+async fn run_usage(
+    client: &mut Client,
+    args: &UsageArgs,
+    format: Format,
+) -> Result<(), ClientError> {
+    let options = crate::client::UsageOptions::grouped_by(group_by_for(args.by))
+        .sessions(args.sessions.clone())
+        .scoped_to_subtree(args.subtree.clone());
+    let response = client.query_usage(&options).await?;
+    println!(
+        "{}",
+        render::usage(&response, rendering_for(args.by), format)
+    );
+    Ok(())
+}
+
 async fn run_session(
     client: &mut Client,
     command: &SessionCommand,
@@ -854,6 +925,98 @@ mod tests {
             Some(Command::Send(args)) => assert!(args.note && args.interrupt),
             other => panic!("expected send, got {other:?}"),
         }
+    }
+
+    /// Both halves of the flag's meaning, since the flag maps twice: the wire
+    /// grouping the server folds by, and the renderer's label vocabulary. A
+    /// swapped arm in either would answer a different question than the flag
+    /// named.
+    #[test]
+    fn every_group_choice_maps_to_its_wire_and_render_groupings() {
+        use super::{GroupChoice, group_by_for, rendering_for};
+        use horde_proto::v1::UsageGroupBy;
+
+        let cases = [
+            (
+                GroupChoice::Agent,
+                UsageGroupBy::Agent,
+                crate::render::UsageGrouping::Agent,
+            ),
+            (
+                GroupChoice::Session,
+                UsageGroupBy::Session,
+                crate::render::UsageGrouping::Session,
+            ),
+            (
+                GroupChoice::Tree,
+                UsageGroupBy::TreePath,
+                crate::render::UsageGrouping::Tree,
+            ),
+            (
+                GroupChoice::Account,
+                UsageGroupBy::ProviderAccount,
+                crate::render::UsageGrouping::Account,
+            ),
+            (
+                GroupChoice::Model,
+                UsageGroupBy::Model,
+                crate::render::UsageGrouping::Model,
+            ),
+        ];
+        for (choice, wire, rendering) in cases {
+            assert_eq!(group_by_for(choice), wire, "wire mapping for {choice:?}");
+            assert_eq!(
+                rendering_for(choice),
+                rendering,
+                "render mapping for {choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_defaults_to_accounts_and_carries_its_filters() {
+        use super::GroupChoice;
+
+        let bare = Cli::try_parse_from(["horde", "usage"]).expect("bare usage parses");
+        match bare.command {
+            Some(Command::Usage(args)) => {
+                assert_eq!(
+                    args.by,
+                    GroupChoice::Account,
+                    "accounts are the default view"
+                );
+                assert!(args.sessions.is_empty(), "default is every session");
+                assert_eq!(args.subtree, None);
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+
+        let scoped = Cli::try_parse_from([
+            "horde",
+            "usage",
+            "--by",
+            "tree",
+            "--session",
+            "s1",
+            "--session",
+            "s2",
+            "--subtree",
+            "agent-9",
+        ])
+        .expect("a scoped usage parses");
+        match scoped.command {
+            Some(Command::Usage(args)) => {
+                assert_eq!(args.by, GroupChoice::Tree);
+                assert_eq!(args.sessions, vec!["s1".to_owned(), "s2".to_owned()]);
+                assert_eq!(args.subtree.as_deref(), Some("agent-9"));
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["horde", "usage", "--by", "bogus"]).is_err(),
+            "an unknown grouping is a parse error, not a guess"
+        );
     }
 
     #[test]

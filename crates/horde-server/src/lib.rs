@@ -20,7 +20,9 @@ pub mod scheduler;
 pub mod service;
 pub mod startup;
 pub mod state;
+pub mod tiers;
 pub mod transport;
+pub mod usage;
 pub mod workspace;
 
 pub use enrollment::EnrollmentRoster;

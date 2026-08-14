@@ -479,6 +479,25 @@ impl Client {
             .into_inner())
     }
 
+    /// Usage and headroom, folded server-side from the journaled usage
+    /// events (DESIGN §12).
+    pub async fn query_usage(
+        &mut self,
+        options: &UsageOptions,
+    ) -> Result<horde_proto::v1::QueryUsageResponse, ClientError> {
+        Ok(self
+            .inner
+            .query_usage(horde_proto::v1::QueryUsageRequest {
+                session_ids: options.session_ids.iter().map(SessionId::new).collect(),
+                subtree_root: options.subtree_root.clone().map(AgentId::new),
+                group_by: options.group_by as i32,
+                since: None,
+                until: None,
+            })
+            .await?
+            .into_inner())
+    }
+
     /// Opens a follow stream and hands it back before reading anything.
     ///
     /// The subscribe half of subscribe-before-write. See [`EventStream`] for
@@ -809,6 +828,39 @@ impl<'a> PermissionAnswer<'a> {
     #[must_use]
     pub fn because(mut self, reason: &'a str) -> Self {
         self.reason = reason;
+        self
+    }
+}
+
+/// What a usage query covers, and how its rows group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageOptions {
+    /// Empty means every session.
+    pub session_ids: Vec<String>,
+    /// Restrict to one agent's subtree — tree-level attribution.
+    pub subtree_root: Option<String>,
+    pub group_by: horde_proto::v1::UsageGroupBy,
+}
+
+impl UsageOptions {
+    #[must_use]
+    pub fn grouped_by(group_by: horde_proto::v1::UsageGroupBy) -> Self {
+        Self {
+            session_ids: Vec::new(),
+            subtree_root: None,
+            group_by,
+        }
+    }
+
+    #[must_use]
+    pub fn sessions(mut self, session_ids: Vec<String>) -> Self {
+        self.session_ids = session_ids;
+        self
+    }
+
+    #[must_use]
+    pub fn scoped_to_subtree(mut self, root: Option<String>) -> Self {
+        self.subtree_root = root;
         self
     }
 }

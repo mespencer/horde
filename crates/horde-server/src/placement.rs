@@ -119,7 +119,10 @@ pub fn queue_expired(queued_at_unix_ms: i64, timeout_ms: i64, now_unix_ms: i64) 
     now_unix_ms >= queued_at_unix_ms.saturating_add(timeout_ms)
 }
 
-fn now_unix_ms() -> i64 {
+/// The wall clock, for queue-timeout expiry and account-exhaustion checks.
+/// `pub(crate)` because the spawn path in `service::control_plane` judges its
+/// placement request against the same clock this module's passes use.
+pub(crate) fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -303,6 +306,7 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
                 parent_worker_id: parent_worker.as_deref(),
                 workspace_definition_id: workspace,
                 load: &load,
+                now_unix_ms: now,
             });
 
             match disposition(agent, placement, now) {
