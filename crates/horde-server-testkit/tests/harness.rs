@@ -171,6 +171,45 @@ async fn open_journal_leaves_the_first_ack_for_the_caller() {
     );
 }
 
+/// `serve_with_blob_store` really wires the store, rooted where the caller
+/// said: bytes uploaded through the endpoint land as a file under the
+/// caller's directory, and download hands them back. The on-disk effect is
+/// the assertion, because the returned endpoint string is exactly what a
+/// mutant of the wiring fakes.
+#[tokio::test]
+async fn a_blob_store_server_moves_bytes_under_the_callers_root() {
+    let blob_root = tempfile::tempdir().expect("a temp dir");
+    let endpoint = horde_server_testkit::serve_with_blob_store(blob_root.path())
+        .await
+        .expect("the blob harness must serve");
+    let mut blobs = horde_proto::v1::blob_service_client::BlobServiceClient::connect(
+        tonic::transport::Endpoint::try_from(endpoint).expect("the endpoint must parse"),
+    )
+    .await
+    .expect("the blob client must connect");
+
+    let stored = horde_proto::blob::upload_blob(&mut blobs, b"testkit blob")
+        .await
+        .expect("the upload must be accepted");
+    let digest =
+        horde_proto::blob::BlobDigest::parse(&stored.blob_digest).expect("the answer parses");
+
+    let (fan, rest) = digest.hex().split_at(2);
+    assert!(
+        blob_root
+            .path()
+            .join("sha256")
+            .join(fan)
+            .join(rest)
+            .is_file(),
+        "the blob must land under the directory the caller rooted the store at"
+    );
+    let fetched = horde_proto::blob::download_blob(&mut blobs, &digest)
+        .await
+        .expect("the download must verify");
+    assert_eq!(fetched, b"testkit blob");
+}
+
 /// `serve_with_permissions` really runs the chain: a request journaled the way
 /// a worker journals one comes back decided by the configured mode, with no
 /// human attached anywhere. Observed through the log rather than trusted from

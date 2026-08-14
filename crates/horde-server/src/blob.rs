@@ -526,6 +526,29 @@ mod tests {
         let mut write = store.begin(&digest, 8).await.expect("begins");
         let error = write.chunk(b"123456789").await.expect_err("must refuse");
         assert!(matches!(error, BlobError::TooLarge { limit: 8, .. }));
+
+        // The boundary itself: a blob exactly at the cap is accepted whole.
+        // An off-by-one here silently shrinks the documented limit.
+        let at_cap = BlobDigest::of(b"12345678");
+        let mut write = store.begin(&at_cap, 8).await.expect("begins at the cap");
+        write.chunk(b"12345678").await.expect("fills to the cap");
+        let stored = write.finish().await.expect("at the cap is within it");
+        assert_eq!(stored.size_bytes, 8);
+    }
+
+    /// The cap is enforced against the running total, not any single chunk:
+    /// two honest-sized chunks whose sum crosses the limit are refused at
+    /// the chunk that crosses.
+    #[tokio::test]
+    async fn the_cap_counts_accumulated_chunks_not_each_alone() {
+        let (_dir, store) = store();
+        let store = store.with_max_blob_bytes(10);
+        let digest = BlobDigest::of(b"123456123456");
+
+        let mut write = store.begin(&digest, 10).await.expect("begins");
+        write.chunk(b"123456").await.expect("the first chunk fits");
+        let error = write.chunk(b"123456").await.expect_err("the sum crosses");
+        assert!(matches!(error, BlobError::TooLarge { limit: 10, .. }));
     }
 
     #[tokio::test]

@@ -1158,6 +1158,7 @@ dependencies = [
  "horde-identity",
  "horde-proto",
  "horde-server",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

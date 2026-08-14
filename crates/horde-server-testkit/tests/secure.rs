@@ -8,9 +8,53 @@
 //! enrollment suite; this file holds the harness itself to its promises.
 
 use horde_identity::PrincipalRole;
-use horde_server_testkit::secure::{hello, serve_secured, within};
+use horde_server_testkit::secure::{hello, serve_secured, serve_secured_with_blob_store, within};
 
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The blob-serving variant keeps every promise of [`serve_secured`] and
+/// adds a live store on the caller's directory: an enrolled principal moves
+/// bytes over mTLS and they land on the disk the caller named. Asserted by
+/// the on-disk effect, which is what a mutant of the wiring cannot fake.
+#[tokio::test]
+async fn the_secured_blob_harness_moves_bytes_for_an_enrolled_principal() -> Setup<()> {
+    let blob_root = tempfile::tempdir()?;
+    let harness = serve_secured_with_blob_store(blob_root.path()).await?;
+    let identity = within(
+        "the worker join",
+        harness.enroll(PrincipalRole::Worker, "blob-box"),
+    )
+    .await??;
+
+    let channel = harness.main_endpoint_as(&identity)?.connect().await?;
+    let mut blobs = horde_proto::v1::blob_service_client::BlobServiceClient::new(channel);
+
+    let stored = within(
+        "the upload",
+        horde_proto::blob::upload_blob(&mut blobs, b"secured testkit blob"),
+    )
+    .await??;
+    let digest = horde_proto::blob::BlobDigest::parse(&stored.blob_digest)
+        .ok_or("the answer must be a well-formed address")?;
+
+    let (fan, rest) = digest.hex().split_at(2);
+    assert!(
+        blob_root
+            .path()
+            .join("sha256")
+            .join(fan)
+            .join(rest)
+            .is_file(),
+        "the blob must land under the directory the caller rooted the store at"
+    );
+    let fetched = within(
+        "the download",
+        horde_proto::blob::download_blob(&mut blobs, &digest),
+    )
+    .await??;
+    assert_eq!(fetched, b"secured testkit blob");
+    Ok(())
+}
 
 #[tokio::test]
 async fn the_harness_issues_identities_that_open_the_spines_they_are_for() -> Setup<()> {
