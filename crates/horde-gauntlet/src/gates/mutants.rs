@@ -34,8 +34,33 @@ pub const TRUNK: &str = "main";
 /// into spurious ones.
 pub const JOBS: &str = "4";
 
+/// The cargo profile mutation builds use, defined in the workspace manifest.
+///
+/// `[profile.mutants]` inherits `test` and turns debuginfo off. Every mutant
+/// pays an incremental rebuild and relink of the mutated package's test
+/// binaries, debuginfo is the bulk of that link cost, and nothing in a
+/// mutation run reads it. Measured on one horde-server shard
+/// (`--shard 0/32 --jobs 4`, idle machine): 116.1s wall without the profile,
+/// 97.0s with it — a 1.20x speed-up, with an identical verdict both ways
+/// (23 caught, 1 unviable). This changes only how long the measurement
+/// takes, never what it measures.
+pub const PROFILE: &str = "mutants";
+
 /// Where cargo-mutants' configuration, and so its exclusions, live.
 pub const CONFIG: &str = ".cargo/mutants.toml";
+
+/// One binary GiB, in bytes.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Free space below which a mutation run is refused rather than started.
+///
+/// A run at `--jobs 4` clones a ~2–3 GB scratch tree per job under the system
+/// temp directory and grows each clone's incremental `target/` from there; two
+/// full sweeps have died of disk exhaustion mid-run, and a near-full APFS
+/// volume also silently serialized a jobs=4 run to ~1.1× parallelism before
+/// anything failed. Below this line the measurement cannot safely run, so the
+/// gate reports a broken instrument instead of starting it.
+pub const MIN_FREE_BYTES: u64 = 40 * GIB;
 
 /// Which mutants a run covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +92,9 @@ pub fn gate() -> PinnedGate {
 
 /// Scopes the run, then mutates.
 fn mutate(ctx: &GateContext, runner: &dyn CommandRunner) -> GateOutcome {
+    if let Err(reason) = check_disk(ctx, runner) {
+        return GateOutcome::error(reason);
+    }
     if let Err(reason) = check_exclusions(ctx, runner) {
         return GateOutcome::error(reason);
     }
@@ -161,6 +189,87 @@ pub fn nothing_to_mutate(text: &str, scope: &Scope) -> Option<String> {
         .iter()
         .find(|nothing| text.contains(nothing.marker))
         .map(|nothing| format!("{} {}{}", nothing.reason, scope.label(), nothing.note))
+}
+
+/// Refuses to start a mutation run on a volume too full to hold one.
+///
+/// This pre-flight belongs to the mutants gate alone: the fast gates neither
+/// clone the tree nor build anything a normal `cargo test` would not, so a
+/// guard there would only teach people that gates red for reasons unrelated to
+/// their measurement. A failure here is an `error`, never a `fail` — the code
+/// was not judged; the instrument had nowhere to run.
+fn check_disk(ctx: &GateContext, runner: &dyn CommandRunner) -> Result<(), String> {
+    let spec = free_space_spec(&ctx.workspace_root);
+    let output = runner.run(&spec).map_err(|error| error.to_string())?;
+    if !output.success() {
+        return Err(format!(
+            "`{}` failed, so free space could not be checked before mutating: {}",
+            spec.display(),
+            output.combined().trim()
+        ));
+    }
+    enough_disk(parse_free_bytes(&output.stdout)?)
+}
+
+/// The command that reports free space on the workspace's volume.
+///
+/// `-P` is POSIX portable format — one line per filesystem, fixed columns —
+/// and `-k` fixes the unit at 1024-byte blocks, so the output parses the same
+/// on macOS and Linux.
+pub fn free_space_spec(root: &Path) -> CommandSpec {
+    CommandSpec::new("df", &["-P", "-k", "."], root)
+}
+
+/// Free bytes on the volume, read from `df -P -k` output.
+///
+/// # Errors
+///
+/// Returns a message when the output does not carry an `Available` column this
+/// gate can read. An unreadable measurement is refused rather than assumed
+/// healthy: a guard that shrugs is a guard that is not there.
+pub fn parse_free_bytes(text: &str) -> Result<u64, String> {
+    let line = text
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .ok_or_else(|| "`df` printed nothing, so free space could not be checked".to_owned())?;
+    let kib: u64 = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| format!("`df` printed no Available column to read: `{line}`"))?
+        .parse()
+        .map_err(|_| format!("`df`'s Available column is not a number: `{line}`"))?;
+    Ok(kib * 1024)
+}
+
+/// Whether `free` bytes of disk is enough to start a mutation run.
+///
+/// The decision is a pure function of one number so the threshold can be
+/// exercised exactly — at the line, one byte under it, and well clear of it —
+/// without a nearly-full volume to stage it on.
+///
+/// # Errors
+///
+/// Returns a message naming the threshold, the observed free space, and the
+/// usual places the missing gigabytes are hiding.
+pub fn enough_disk(free: u64) -> Result<(), String> {
+    if free >= MIN_FREE_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "only {} GiB free on the workspace's volume, below the {} GiB a mutation run needs. \
+         Each of the {JOBS} parallel jobs clones a ~2-3 GB scratch tree (cargo-mutants-* under \
+         the system temp directory, /var/folders on macOS) and grows its own incremental \
+         target/ from there; a near-full volume has also silently serialized a --jobs {JOBS} \
+         run to ~1.1x parallelism. The usual culprits: worktree target/ directories, \
+         target/llvm-cov-target, and stale cargo-mutants-* scratch trees",
+        gib(free),
+        MIN_FREE_BYTES / GIB
+    ))
+}
+
+/// Bytes rendered as GiB, to one decimal place.
+fn gib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / GIB as f64)
 }
 
 /// Confirms the configured exclusions are real and took effect.
@@ -324,6 +433,7 @@ pub fn spec(ctx: &GateContext, scope: &Scope) -> CommandSpec {
         "never".to_owned(),
         "--jobs".to_owned(),
         JOBS.to_owned(),
+        format!("--profile={PROFILE}"),
         "--output".to_owned(),
         ctx.log_dir.display().to_string(),
     ];
@@ -797,8 +907,22 @@ mod tests {
 
     const CLEAN: &str = include_str!("../../fixtures/cargo-mutants-clean.txt");
 
+    /// Real `df -P -k` output from the machine this gate was written on, with
+    /// 75 GiB available — comfortably over the threshold.
+    const DF: &str = include_str!("../../fixtures/df-portable.txt");
+
+    /// The same shape with 5 GiB available. A genuinely full volume cannot be
+    /// captured without filling one, so the dirty case varies only the number.
+    const DF_NEARLY_FULL: &str = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n\
+         /dev/disk3s5   971350180 966107300   5242880    99%    /System/Volumes/Data\n";
+
     fn version() -> CommandOutput {
         exited(0, "cargo-mutants 27.1.0")
+    }
+
+    /// The disk pre-flight finding plenty of room.
+    fn roomy_disk() -> CommandOutput {
+        exited(0, DF)
     }
 
     /// The patterns a config configures, with their comments set aside.
@@ -1161,10 +1285,11 @@ mod tests {
         (dir, ctx)
     }
 
-    /// A run with no trunk to compare against: the version probe, any extra
-    /// responses the test needs first, then the git probes and a clean result.
+    /// A run with no trunk to compare against: the version probe, the disk
+    /// pre-flight, any extra responses the test needs first, then the git
+    /// probes and a clean result.
     fn whole_tree_run(after_version: Vec<CommandOutput>) -> Vec<CommandOutput> {
-        let mut script = vec![version()];
+        let mut script = vec![version(), roomy_disk()];
         script.extend(after_version);
         script.extend([
             failed(128, "fatal: no main"),
@@ -1216,9 +1341,9 @@ mod tests {
         ]));
         assert_eq!(run_gate(&gate(), &ctx, &runner).label(), "pass");
         let lines = runner.command_lines();
-        assert!(lines[1].contains("--list"), "{lines:?}");
+        assert!(lines[2].contains("--list"), "{lines:?}");
         assert!(
-            lines[2].contains("--no-config"),
+            lines[3].contains("--no-config"),
             "the difference between the listings is the measurement: {lines:?}"
         );
     }
@@ -1240,13 +1365,18 @@ mod tests {
     /// between these tests, which is which lie was told.
     fn refusal(config: &str, listed: &str, unexcluded: &str) -> String {
         let (_dir, ctx) = root_configured(config);
-        let runner = ScriptedRunner::new(vec![version(), exited(0, listed), exited(0, unexcluded)]);
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            roomy_disk(),
+            exited(0, listed),
+            exited(0, unexcluded),
+        ]);
         let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
             panic!("an exclusion the gate cannot vouch for must stop it");
         };
         assert_eq!(
             runner.calls().len(),
-            3,
+            4,
             "no mutation run should start on an unverifiable configuration"
         );
         reason
@@ -1318,7 +1448,11 @@ mod tests {
     #[test]
     fn a_listing_that_fails_is_an_instrument_error() {
         let (_dir, ctx) = root_configured(EXCLUDING_THE_CONFIG);
-        let runner = ScriptedRunner::new(vec![version(), failed(1, "error: bad config")]);
+        let runner = ScriptedRunner::new(vec![
+            version(),
+            roomy_disk(),
+            failed(1, "error: bad config"),
+        ]);
         let GateOutcome::Error { reason } = run_gate(&gate(), &ctx, &runner) else {
             panic!("exclusions that could not be checked were not checked");
         };
@@ -1330,6 +1464,7 @@ mod tests {
         let (_dir, ctx) = root_configured(EXCLUDING_THE_CONFIG);
         let runner = ScriptedRunner::new(vec![
             version(),
+            roomy_disk(),
             exited(0, ELSEWHERE),
             failed(1, "error: no such option --no-config"),
         ]);
@@ -1369,7 +1504,8 @@ mod tests {
         let spec = spec(&repo_ctx(), &Scope::FullTree);
         assert_eq!(
             spec.display(),
-            "cargo mutants --no-shuffle --colors never --jobs 4 --output /repo/target/quality"
+            "cargo mutants --no-shuffle --colors never --jobs 4 --profile=mutants \
+             --output /repo/target/quality"
         );
     }
 
@@ -1654,7 +1790,7 @@ mod tests {
     fn run_after_with(git: Vec<CommandOutput>, result: CommandOutput) -> Run {
         let dir = tempfile::tempdir().expect("temp dir");
         let ctx = ctx_at(dir.path());
-        let mut script = vec![version()];
+        let mut script = vec![version(), roomy_disk()];
         script.extend(git);
         script.push(result);
         let runner = ScriptedRunner::new(script);
@@ -1680,7 +1816,7 @@ mod tests {
             "{:?}",
             run.lines
         );
-        assert_eq!(run.lines[1], "git merge-base HEAD main");
+        assert_eq!(run.lines[2], "git merge-base HEAD main");
     }
 
     #[test]
@@ -1695,7 +1831,7 @@ mod tests {
             exited(0, "diff --git a/x b/x\n"),
         ]);
         assert_eq!(run.outcome.label(), "pass");
-        assert_eq!(run.lines[3], "git rev-parse HEAD^1");
+        assert_eq!(run.lines[4], "git rev-parse HEAD^1");
         assert!(
             run.mutation_command().contains("--in-diff"),
             "{:?}",
@@ -1727,7 +1863,7 @@ mod tests {
     fn asking_for_everything_skips_the_scoping_entirely() {
         let dir = tempfile::tempdir().expect("temp dir");
         let ctx = ctx_at(dir.path()).measuring_everything(true);
-        let runner = ScriptedRunner::new(vec![version(), exited(0, CLEAN)]);
+        let runner = ScriptedRunner::new(vec![version(), roomy_disk(), exited(0, CLEAN)]);
         let outcome = run_gate(&gate(), &ctx, &runner);
 
         assert_eq!(outcome.label(), "pass");
@@ -1800,6 +1936,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let runner = ScriptedRunner::new(vec![
             version(),
+            roomy_disk(),
             failed(128, "fatal: no main"),
             exited(0, "tip\n"),
             failed(4, "error: build failed in an unmutated tree"),
@@ -1814,5 +1951,108 @@ mod tests {
     fn the_gate_is_pinned_to_the_calibrated_cargo_mutants() {
         assert_eq!(gate().pin, &PIN);
         assert_eq!(PIN.expected, "27.1.0");
+    }
+
+    #[test]
+    fn the_profile_the_gate_passes_is_defined_in_the_workspace_manifest() {
+        // The gate passes `--profile=mutants` on every run, so the manifest
+        // losing the profile would turn every mutation run into an error.
+        let manifest = include_str!("../../../../Cargo.toml");
+        assert!(
+            manifest.contains(&format!("[profile.{PROFILE}]")),
+            "the workspace manifest must define the profile the gate builds with"
+        );
+        assert!(
+            manifest.contains("debug = false"),
+            "the profile exists to drop debuginfo from mutation builds"
+        );
+    }
+
+    #[test]
+    fn the_disk_probe_asks_df_for_portable_kilobyte_output() {
+        let spec = free_space_spec(Path::new("/repo"));
+        assert_eq!(spec.display(), "df -P -k .");
+        assert_eq!(spec.cwd, Path::new("/repo"));
+    }
+
+    #[test]
+    fn free_space_is_read_from_real_df_output_in_bytes() {
+        // 78666364 KiB available, exactly as captured in the fixture.
+        assert_eq!(parse_free_bytes(DF), Ok(78_666_364 * 1024));
+    }
+
+    #[test]
+    fn df_output_the_gate_cannot_read_is_refused_not_assumed_healthy() {
+        for text in [
+            "",
+            "\n   \n",
+            "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n",
+            "/dev/disk3s5 mounted\n",
+            "/dev/disk3s5   971350180 966107300   lots    99%   /\n",
+        ] {
+            assert!(
+                parse_free_bytes(text).is_err(),
+                "a guard that shrugs at unreadable output is not a guard: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_threshold_is_forty_gib() {
+        assert_eq!(MIN_FREE_BYTES, 40 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn free_space_at_or_above_the_threshold_is_enough() {
+        assert_eq!(enough_disk(MIN_FREE_BYTES), Ok(()));
+        assert_eq!(enough_disk(u64::MAX), Ok(()));
+    }
+
+    #[test]
+    fn one_byte_under_the_threshold_is_not() {
+        assert!(
+            enough_disk(MIN_FREE_BYTES - 1).is_err(),
+            "the line is the line"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_threshold_the_observed_space_and_the_culprits() {
+        let message = enough_disk(5 * GIB).expect_err("5 GiB is far under the line");
+        assert!(message.contains("only 5.0 GiB free"), "{message}");
+        assert!(message.contains("40 GiB"), "{message}");
+        assert!(message.contains("worktree target/"), "{message}");
+        assert!(message.contains("target/llvm-cov-target"), "{message}");
+        assert!(message.contains("cargo-mutants-*"), "{message}");
+    }
+
+    #[test]
+    fn a_nearly_full_volume_stops_the_gate_before_anything_builds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runner = ScriptedRunner::new(vec![version(), exited(0, DF_NEARLY_FULL)]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx_at(dir.path()), &runner) else {
+            panic!("a volume too full to hold the run is a broken instrument, not a verdict");
+        };
+        assert!(reason.contains("only 5.0 GiB free"), "{reason}");
+        assert!(reason.contains("40 GiB"), "{reason}");
+        assert_eq!(
+            runner.calls().len(),
+            2,
+            "nothing else may run once the volume is known to be too full"
+        );
+    }
+
+    #[test]
+    fn a_disk_probe_that_fails_is_an_instrument_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runner = ScriptedRunner::new(vec![version(), failed(1, "df: cannot stat")]);
+        let GateOutcome::Error { reason } = run_gate(&gate(), &ctx_at(dir.path()), &runner) else {
+            panic!("free space that could not be checked was not checked");
+        };
+        assert!(
+            reason.contains("free space could not be checked"),
+            "{reason}"
+        );
+        assert!(reason.contains("df: cannot stat"), "{reason}");
     }
 }
