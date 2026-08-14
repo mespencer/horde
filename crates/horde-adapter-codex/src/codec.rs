@@ -325,6 +325,21 @@ mod tests {
         }
     }
 
+    /// `initialized` is the notification that completes the handshake; a
+    /// wrong or empty line here leaves the server considering the client
+    /// uninitialized, which fails silently much later.
+    #[test]
+    fn the_initialized_notification_is_the_protocols_own() {
+        let value: Value =
+            serde_json::from_str(&super::encode_initialized()).expect("we produced this");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], "initialized");
+        assert!(
+            value.get("id").is_none(),
+            "a notification carries no id — an id would make it a request"
+        );
+    }
+
     /// The approval policy is the one measured to route elicitations, always.
     /// Plain "on-request" parks the thread at waitingOnApproval forever
     /// (transcript 19), so sending anything else here is a hang in waiting.

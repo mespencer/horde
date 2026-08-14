@@ -59,6 +59,10 @@ pub struct CodexAdapter {
     /// Extra environment for every child this adapter spawns. Per-child,
     /// never process-wide.
     pub extra_env: Vec<(String, String)>,
+    /// How long a handshake request may go unanswered before the spawn is
+    /// declared broken. Generous for a real harness; tests shrink it so a
+    /// child that answers nothing fails in seconds.
+    pub response_ceiling: std::time::Duration,
 }
 
 impl CodexAdapter {
@@ -68,8 +72,9 @@ impl CodexAdapter {
         Self {
             program: "codex".to_owned(),
             accounts_root: None,
-            sandbox_policy: SandboxPolicy::read_only(),
+            sandbox_policy: SandboxPolicy::default(),
             extra_env: Vec::new(),
+            response_ceiling: std::time::Duration::from_secs(30),
         }
     }
 
@@ -130,6 +135,7 @@ impl CodexAdapter {
         };
 
         let mut session = LiveCodexSession::new(harness);
+        session.response_ceiling = self.response_ceiling;
         session.assembler.note_startup_diagnostic(format!(
             "codex sandbox {}: {}",
             tier.tier.wire_name(),
@@ -139,12 +145,12 @@ impl CodexAdapter {
         // initialize → initialized → thread/start|thread/resume. Awaiting is
         // safe here: no turn is running, so nothing the pump must answer can
         // arrive before the thread response.
-        let id = session.next_request_id();
+        let id = session.ids.next();
         session.write(&encode_initialize(id)).await?;
         session.await_response(id).await?.map_err(spawn_failure)?;
         session.write(&encode_initialized()).await?;
 
-        let id = session.next_request_id();
+        let id = session.ids.next();
         let request = match resume_thread {
             Some(thread) => encode_thread_resume(id, thread.as_str(), &config),
             None => encode_thread_start(id, &config),
@@ -295,6 +301,19 @@ fn thread_failure(spec: &AgentSpec, error: RpcError) -> AdapterError {
     }
 }
 
+/// Mints the session's JSON-RPC request ids: distinct, increasing, never
+/// zero (zero would collide with nothing, but an id repeated once is a reply
+/// mis-correlated forever — so the property is pinned by its own test).
+#[derive(Debug, Default)]
+struct RequestIds(u64);
+
+impl RequestIds {
+    fn next(&mut self) -> u64 {
+        self.0 += 1;
+        self.0
+    }
+}
+
 /// What the session still owes an answer for on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutstandingRequest {
@@ -314,13 +333,15 @@ pub struct LiveCodexSession {
     pending: VecDeque<AgentEvent>,
     session_id: Option<ProviderSessionId>,
     thread_id: Option<String>,
-    next_id: u64,
+    ids: RequestIds,
     /// Client requests whose replies are still in flight, by JSON-RPC id.
     in_flight: Vec<(u64, OutstandingRequest)>,
     /// Input parked behind an interrupt: delivered as a fresh `turn/start`
     /// once the interrupted turn actually closes. Starting it earlier would
     /// race the idle that ends the old turn (transcript 11).
     deferred_input: Option<String>,
+    /// See [`CodexAdapter::response_ceiling`].
+    response_ceiling: std::time::Duration,
     /// Set once the child's stdout has closed, so later reads report the exit
     /// instead of blocking on a pipe nobody will write to again.
     ended: bool,
@@ -334,16 +355,12 @@ impl LiveCodexSession {
             pending: VecDeque::new(),
             session_id: None,
             thread_id: None,
-            next_id: 0,
+            ids: RequestIds::default(),
             in_flight: Vec::new(),
             deferred_input: None,
+            response_ceiling: std::time::Duration::from_secs(30),
             ended: false,
         }
-    }
-
-    fn next_request_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id
     }
 
     async fn write(&mut self, line: &str) -> Result<()> {
@@ -376,26 +393,34 @@ impl LiveCodexSession {
     }
 
     /// Handshake-only: reads until the reply to `id`, routing everything else
-    /// through the ordinary frame handling. Bounded by frame count.
+    /// through the ordinary frame handling.
+    ///
+    /// Bounded twice, per QUALITY_GATES "bound every wait": by structure (a
+    /// for-range over the frame budget — every iteration consumes a frame, so
+    /// there is no counter whose arithmetic could quietly stop counting) and
+    /// by a clock on each read (each read genuinely awaits the pipe, which is
+    /// exactly the case a ceiling is legitimate for — a harness that writes
+    /// nothing must become an error, not a hang).
     async fn await_response(
         &mut self,
         id: u64,
     ) -> Result<core::result::Result<serde_json::Value, RpcError>> {
-        let mut frames = 0_u32;
-        loop {
-            frames += 1;
-            if frames > MAX_FRAMES_AWAITING_RESPONSE {
+        for _ in 0..MAX_FRAMES_AWAITING_RESPONSE {
+            let read = tokio::time::timeout(self.response_ceiling, self.read_frame());
+            let Ok(frame) = read.await else {
                 return Err(AdapterError::Protocol {
                     message: format!(
-                        "no reply to request {id} within {MAX_FRAMES_AWAITING_RESPONSE} frames"
+                        "no reply to request {id} within {:?}",
+                        self.response_ceiling
                     ),
                     raw: String::new(),
                 });
-            }
-            let Some(frame) = self.read_frame().await? else {
-                return Err(AdapterError::HarnessExited {
-                    exit_code: self.harness.wait().await.ok().flatten(),
-                });
+            };
+            let Some(frame) = frame? else {
+                // EOF: the child is gone. Reported without reaping — waiting
+                // on a child that might not have exited yet is a hang wearing
+                // an error's clothes.
+                return Err(AdapterError::HarnessExited { exit_code: None });
             };
             if let Frame::Response {
                 id: got,
@@ -411,6 +436,12 @@ impl LiveCodexSession {
             }
             self.route_frame(frame).await?;
         }
+        Err(AdapterError::Protocol {
+            message: format!(
+                "no reply to request {id} within {MAX_FRAMES_AWAITING_RESPONSE} frames"
+            ),
+            raw: String::new(),
+        })
     }
 
     /// Refuses work on a session whose harness is gone — a named predicate,
@@ -430,7 +461,7 @@ impl LiveCodexSession {
     async fn request_interrupt(&mut self) -> Result<()> {
         self.assembler.note_interrupt_requested();
         let thread = self.thread_id.clone().unwrap_or_default();
-        let id = self.next_request_id();
+        let id = self.ids.next();
         self.in_flight.push((id, OutstandingRequest::Interrupt));
         self.write(&encode_interrupt(id, &thread)).await
     }
@@ -438,7 +469,7 @@ impl LiveCodexSession {
     /// Starts a fresh turn with `text`.
     async fn start_turn(&mut self, text: &str) -> Result<()> {
         let thread = self.thread_id.clone().unwrap_or_default();
-        let id = self.next_request_id();
+        let id = self.ids.next();
         self.in_flight.push((id, OutstandingRequest::TurnStart));
         self.write(&encode_turn_start(id, &thread, text)).await
     }
@@ -583,7 +614,7 @@ impl AgentSession for LiveCodexSession {
                 // racing a turn that ended while the request was in flight —
                 // the error reply falls back to an ordinary turn/start.
                 let thread = self.thread_id.clone().unwrap_or_default();
-                let id = self.next_request_id();
+                let id = self.ids.next();
                 self.in_flight.push((
                     id,
                     OutstandingRequest::Steer {
@@ -721,14 +752,54 @@ mod tests {
     }
 
     /// Misclassifying auth strands work: the scheduler's answer to
-    /// Unauthenticated is another account, to Spawn another day.
+    /// Unauthenticated is another account, to Spawn another day. Each
+    /// disjunct gets a message only *it* matches, so no `||` can quietly
+    /// become an `&&`.
     #[test]
     fn auth_failures_are_recognized_and_ordinary_failures_are_not() {
-        assert!(is_auth_failure("401 Unauthorized"));
+        assert!(is_auth_failure("unauthorized"), "the code alone");
+        assert!(
+            is_auth_failure("HTTP 401 from provider"),
+            "the status alone"
+        );
         assert!(is_auth_failure("You are not logged in"));
         assert!(is_auth_failure("please run codex login"));
+        assert!(is_auth_failure("401 Unauthorized"), "and both together");
         assert!(!is_auth_failure("thread not found"));
         assert!(!is_auth_failure("internal server error"));
+    }
+
+    /// Request ids must be distinct and increasing, and never zero — a
+    /// repeated id is a reply mis-correlated forever.
+    #[test]
+    fn request_ids_are_distinct_increasing_and_never_zero() {
+        let mut ids = super::RequestIds::default();
+        let minted = [ids.next(), ids.next(), ids.next()];
+        assert_eq!(minted, [1, 2, 3]);
+    }
+
+    /// The refusal an unanswerable server request gets, in the right
+    /// vocabulary for each family — the wrong shape deserializes to nothing
+    /// and answers nobody (the waitingOnApproval hang, transcript 19).
+    #[test]
+    fn refusals_speak_each_familys_own_vocabulary() {
+        let approval: serde_json::Value =
+            serde_json::from_str(&super::refusal_for(4, "execCommandApproval"))
+                .expect("we produced this");
+        assert_eq!(approval["id"], 4);
+        assert_eq!(approval["result"]["decision"], "decline");
+
+        let unknown: serde_json::Value =
+            serde_json::from_str(&super::refusal_for(9, "attestation/generate"))
+                .expect("we produced this");
+        assert_eq!(unknown["id"], 9);
+        assert_eq!(unknown["error"]["code"], -32601);
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("attestation/generate")),
+            "the refusal names the method so the log is actionable"
+        );
     }
 
     /// The refusal vocabulary split: approval-shaped requests speak

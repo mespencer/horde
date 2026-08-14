@@ -270,156 +270,129 @@ impl TurnAssembler {
 
     fn feed_notification(&mut self, notification: &Notification) -> Vec<AgentEvent> {
         match notification {
-            Notification::ThreadStarted(started) => {
-                let id = started
-                    .thread
-                    .as_ref()
-                    .map(|t| t.id.clone())
-                    .or_else(|| started.thread_id.clone());
-                let model = started.thread.as_ref().and_then(|t| t.model.clone());
-
-                match id {
-                    Some(id) => {
-                        self.thread_id = Some(id.clone());
-                        self.model.clone_from(&model);
-                        vec![AgentEvent::SessionEstablished {
-                            provider_session_id: ProviderSessionId::new(id),
-                            model: model.unwrap_or_default(),
-                        }]
-                    }
-                    None => Vec::new(),
-                }
-            }
-
-            Notification::TurnStarted(started) => {
-                let mut turn = OpenTurn::new(TurnId::new(&started.turn.id));
-                // Consume any interrupt that arrived before this turn existed.
-                turn.interrupt_requested = std::mem::take(&mut self.interrupt_pending);
-                // Spawn-time facts owed to the journal ride the first turn as
-                // harness diagnostics: an Output event needs a turn to belong
-                // to, and this is the first moment one exists.
-                let events = std::mem::take(&mut self.startup_diagnostics)
-                    .into_iter()
-                    .map(|text| AgentEvent::Output {
-                        turn_id: turn.id.clone(),
-                        channel: OutputChannel::HarnessDiagnostic,
-                        chunk_index: turn.next_chunk_index(OutputChannel::HarnessDiagnostic),
-                        text,
-                    })
-                    .collect();
-                self.turn = Some(turn);
-                events
-            }
-
-            Notification::AgentMessageDelta(delta) => {
-                let Some(turn) = self.turn.as_mut() else {
-                    return Vec::new();
-                };
-                let chunk_index = turn.next_chunk_index(OutputChannel::Assistant);
-                vec![AgentEvent::Output {
-                    turn_id: turn.id.clone(),
-                    channel: OutputChannel::Assistant,
-                    text: delta.delta.clone(),
-                    chunk_index,
-                }]
-            }
-
-            Notification::ItemStarted(started) => {
-                // Only mcpToolCall starts matter: they carry the tool identity
-                // the elicitation that follows will not repeat.
-                if started.item.is_mcp_tool_call()
-                    && let Some(turn) = self.turn.as_mut()
-                {
-                    turn.started_mcp_calls.push_back(StartedMcpCall {
-                        item_id: started.item.id.clone().unwrap_or_default(),
-                        server: started.item.server.clone().unwrap_or_default(),
-                        tool: started.item.tool.clone().unwrap_or_default(),
-                        arguments: started
-                            .item
-                            .arguments
-                            .clone()
-                            .unwrap_or(serde_json::Value::Null),
-                    });
-                }
-                Vec::new()
-            }
-
+            Notification::ThreadStarted(started) => self.thread_started(started),
+            Notification::TurnStarted(started) => self.turn_started(started),
+            Notification::AgentMessageDelta(delta) => self.message_delta(delta),
+            Notification::ItemStarted(started) => self.item_started(&started.item),
             Notification::ItemCompleted(completed) => self.item_completed(&completed.item),
-
             Notification::Error(error) => self.error_notified(error),
-
             Notification::TokenUsageUpdated(update) => {
                 self.record_usage(update.turn_id.as_deref(), update.token_usage.last.as_ref());
                 Vec::new()
             }
+            Notification::RateLimitsUpdated(limits) => headroom_reported(limits),
+            Notification::TurnCompleted(completed) => self.turn_completed(completed),
+            Notification::ThreadStatusChanged(status) => self.status_changed(status),
+            Notification::Other { .. } => Vec::new(),
+        }
+    }
 
-            Notification::RateLimitsUpdated(limits) => limits
-                .rate_limits
-                .primary
-                .map(|primary| {
-                    vec![AgentEvent::HeadroomReported {
-                        window: RateWindow {
-                            source: HeadroomSource::ProviderReported,
-                            window: limits
-                                .rate_limits
-                                .limit_id
-                                .clone()
-                                .unwrap_or_else(|| "primary".to_owned()),
-                            // Codex reports a percentage and never counts, so
-                            // this is the Fraction arm by construction.
-                            utilization: Utilization::Fraction(
-                                (primary.used_percent / 100.0).clamp(0.0, 1.0),
-                            ),
-                            window_duration: primary
-                                .window_duration_mins
-                                .map(|mins| Duration::from_secs(mins.saturating_mul(60))),
-                            resets_at_unix: primary.resets_at,
-                        },
-                    }]
-                })
-                .unwrap_or_default(),
+    fn thread_started(&mut self, started: &crate::wire::ThreadStarted) -> Vec<AgentEvent> {
+        let id = started
+            .thread
+            .as_ref()
+            .map(|t| t.id.clone())
+            .or_else(|| started.thread_id.clone());
+        let model = started.thread.as_ref().and_then(|t| t.model.clone());
 
-            Notification::TurnCompleted(completed) => {
-                let duration = completed.turn.duration_ms.map(Duration::from_millis);
-                // `turn/completed` is a framing terminal, not a verdict: the
-                // 0.147.0 schema gives the turn itself a status of completed,
-                // interrupted, or failed, and reporting a failed turn as
-                // Completed would hand the orchestrator a Result built from
-                // an error.
-                let status = match completed.turn.status.as_deref() {
-                    Some("failed") => TurnStatus::Failed {
-                        message: completed
-                            .turn
-                            .error
-                            .as_ref()
-                            .map_or_else(|| "the harness failed the turn".to_owned(), turn_error),
-                    },
-                    Some("interrupted") => TurnStatus::Interrupted,
-                    _ => TurnStatus::Completed,
-                };
-                self.close_turn(status, duration)
+        match id {
+            Some(id) => {
+                self.thread_id = Some(id.clone());
+                self.model.clone_from(&model);
+                vec![AgentEvent::SessionEstablished {
+                    provider_session_id: ProviderSessionId::new(id),
+                    model: model.unwrap_or_default(),
+                }]
             }
+            None => Vec::new(),
+        }
+    }
 
-            // The interrupt trap. `turn/interrupt` produces no terminal frame at
-            // all — transcript 11 has the thread go idle with no
-            // `turn/completed` and no `turn/aborted`, while 394 already-
-            // generated deltas keep arriving. Keying on idle is the only way
-            // the turn ever closes; an assembler waiting for a terminal frame
-            // hangs forever.
-            Notification::ThreadStatusChanged(status) if status.is_idle() => {
-                let interrupted = self
+    fn turn_started(&mut self, started: &crate::wire::TurnRef) -> Vec<AgentEvent> {
+        let mut turn = OpenTurn::new(TurnId::new(&started.turn.id));
+        // Consume any interrupt that arrived before this turn existed.
+        turn.interrupt_requested = std::mem::take(&mut self.interrupt_pending);
+        // Spawn-time facts owed to the journal ride the first turn as
+        // harness diagnostics: an Output event needs a turn to belong
+        // to, and this is the first moment one exists.
+        let events = std::mem::take(&mut self.startup_diagnostics)
+            .into_iter()
+            .map(|text| AgentEvent::Output {
+                turn_id: turn.id.clone(),
+                channel: OutputChannel::HarnessDiagnostic,
+                chunk_index: turn.next_chunk_index(OutputChannel::HarnessDiagnostic),
+                text,
+            })
+            .collect();
+        self.turn = Some(turn);
+        events
+    }
+
+    fn message_delta(&mut self, delta: &crate::wire::AgentMessageDelta) -> Vec<AgentEvent> {
+        let Some(turn) = self.turn.as_mut() else {
+            return Vec::new();
+        };
+        let chunk_index = turn.next_chunk_index(OutputChannel::Assistant);
+        vec![AgentEvent::Output {
+            turn_id: turn.id.clone(),
+            channel: OutputChannel::Assistant,
+            text: delta.delta.clone(),
+            chunk_index,
+        }]
+    }
+
+    /// Only mcpToolCall starts matter: they carry the tool identity the
+    /// elicitation that follows will not repeat.
+    fn item_started(&mut self, item: &Item) -> Vec<AgentEvent> {
+        if item.is_mcp_tool_call()
+            && let Some(turn) = self.turn.as_mut()
+        {
+            turn.started_mcp_calls.push_back(StartedMcpCall {
+                item_id: item.id.clone().unwrap_or_default(),
+                server: item.server.clone().unwrap_or_default(),
+                tool: item.tool.clone().unwrap_or_default(),
+                arguments: item.arguments.clone().unwrap_or(serde_json::Value::Null),
+            });
+        }
+        Vec::new()
+    }
+
+    /// `turn/completed` is a framing terminal, not a verdict: the 0.147.0
+    /// schema gives the turn itself a status of completed, interrupted, or
+    /// failed, and reporting a failed turn as Completed would hand the
+    /// orchestrator a Result built from an error.
+    fn turn_completed(&mut self, completed: &crate::wire::TurnCompleted) -> Vec<AgentEvent> {
+        let duration = completed.turn.duration_ms.map(Duration::from_millis);
+        let status = match completed.turn.status.as_deref() {
+            Some("failed") => TurnStatus::Failed {
+                message: completed
                     .turn
+                    .error
                     .as_ref()
-                    .is_some_and(|turn| turn.interrupt_requested);
-                if interrupted {
-                    self.close_turn(TurnStatus::Interrupted, None)
-                } else {
-                    // Idle between turns is ordinary and closes nothing.
-                    Vec::new()
-                }
-            }
+                    .map_or_else(|| "the harness failed the turn".to_owned(), turn_error),
+            },
+            Some("interrupted") => TurnStatus::Interrupted,
+            _ => TurnStatus::Completed,
+        };
+        self.close_turn(status, duration)
+    }
 
-            Notification::ThreadStatusChanged(_) | Notification::Other { .. } => Vec::new(),
+    /// The interrupt trap. `turn/interrupt` produces no terminal frame at
+    /// all — transcript 11 has the thread go idle with no `turn/completed`
+    /// and no `turn/aborted`, while 394 already-generated deltas keep
+    /// arriving. Keying on idle is the only way the turn ever closes; an
+    /// assembler waiting for a terminal frame hangs forever.
+    fn status_changed(&mut self, status: &crate::wire::ThreadStatus) -> Vec<AgentEvent> {
+        let interrupted = self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.interrupt_requested);
+        if status.is_idle() && interrupted {
+            self.close_turn(TurnStatus::Interrupted, None)
+        } else {
+            // Idle between turns is ordinary and closes nothing; non-idle
+            // statuses close nothing either way.
+            Vec::new()
         }
     }
 
@@ -554,6 +527,35 @@ impl TurnAssembler {
             duration: duration.unwrap_or(turn.duration),
         })]
     }
+}
+
+/// The provider-reported rate window, when the frame carries one.
+fn headroom_reported(limits: &crate::wire::RateLimits) -> Vec<AgentEvent> {
+    limits
+        .rate_limits
+        .primary
+        .map(|primary| {
+            vec![AgentEvent::HeadroomReported {
+                window: RateWindow {
+                    source: HeadroomSource::ProviderReported,
+                    window: limits
+                        .rate_limits
+                        .limit_id
+                        .clone()
+                        .unwrap_or_else(|| "primary".to_owned()),
+                    // Codex reports a percentage and never counts, so this is
+                    // the Fraction arm by construction.
+                    utilization: Utilization::Fraction(
+                        (primary.used_percent / 100.0).clamp(0.0, 1.0),
+                    ),
+                    window_duration: primary
+                        .window_duration_mins
+                        .map(|mins| Duration::from_secs(mins.saturating_mul(60))),
+                    resets_at_unix: primary.resets_at,
+                },
+            }]
+        })
+        .unwrap_or_default()
 }
 
 /// One line for a turn failure, code first when codex named one.
@@ -953,6 +955,99 @@ mod tests {
         assert!(
             assembler.active_turn_id().is_none(),
             "a closed turn cannot be steered"
+        );
+    }
+
+    /// A `turn/completed` whose own status is "interrupted" closes the turn
+    /// as Interrupted even when nobody noted an interrupt — the harness's
+    /// verdict, not the client's request, is what the frame carries.
+    #[test]
+    fn a_completed_frame_with_an_interrupted_status_reports_the_interruption() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"turn/completed",
+                   "params":{"turn":{"id":"turn-1","status":"interrupted"}}}),
+        );
+        let outcome = closed(events, "an interrupted status still closes the turn");
+        assert_eq!(outcome.status, TurnStatus::Interrupted);
+        assert_eq!(outcome.text, None, "a cancelled turn has no answer");
+    }
+
+    /// A call that completed without eliciting must stop being a join
+    /// candidate — and *only* that call: the next elicitation joins the still
+    /// -open one, not the finished one and not nothing.
+    #[test]
+    fn a_completed_call_stops_being_a_join_candidate_but_others_remain() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        feed(&mut assembler, mcp_started("exec-1"));
+        feed(&mut assembler, mcp_started("exec-2"));
+
+        // exec-1 completes without ever eliciting (pre-approved, say).
+        feed(
+            &mut assembler,
+            json!({"method":"item/completed","params":{"item":{
+                "type":"mcpToolCall","id":"exec-1","server":"spike","tool":"horde_probe",
+                "status":"completed","arguments":{}}}}),
+        );
+
+        let events = feed(&mut assembler, elicitation_request(5));
+        let request = requested(&events, "the elicitation joins the open call");
+        assert_eq!(
+            request.tool_call_id.as_str(),
+            "exec-2",
+            "the finished call must not absorb the next elicitation"
+        );
+    }
+
+    /// `awaiting_decision` is the session's stall signal: present exactly
+    /// while an elicitation is outstanding.
+    #[test]
+    fn awaiting_decision_tracks_the_outstanding_elicitation() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        assert_eq!(assembler.awaiting_decision(), None, "nothing asked yet");
+
+        feed(&mut assembler, mcp_started("exec-1"));
+        let events = feed(&mut assembler, elicitation_request(5));
+        let id = requested(&events, "surfaces").tool_call_id;
+        assert_eq!(
+            assembler.awaiting_decision(),
+            Some(id.clone()),
+            "the outstanding request is the stall"
+        );
+
+        assembler.resolve_elicitation(&id, true);
+        assert_eq!(
+            assembler.awaiting_decision(),
+            None,
+            "an answered request stalls nothing"
+        );
+    }
+
+    /// The method is the discriminator: a request that merely *looks* like an
+    /// elicitation (right params, wrong method) must not become a permission
+    /// event — it is some other protocol surface the session must refuse.
+    #[test]
+    fn an_elicitation_shaped_request_on_another_method_is_not_an_approval() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        feed(&mut assembler, mcp_started("exec-1"));
+
+        let mut frame = elicitation_request(7);
+        frame["method"] = json!("item/tool/requestUserInput");
+        let events = feed(&mut assembler, frame);
+        assert!(
+            events.is_empty(),
+            "only mcpServer/elicitation/request is the approval seam: {events:?}"
+        );
+        assert_eq!(
+            assembler.awaiting_decision(),
+            None,
+            "and nothing may be left outstanding for it"
         );
     }
 

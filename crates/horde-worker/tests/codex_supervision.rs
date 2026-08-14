@@ -97,6 +97,9 @@ mod harness {
         std::fs::write(&file, script).expect("writes");
 
         let mut adapter = CodexAdapter::new().with_program(stub_binary().to_string_lossy());
+        // A stub that answers nothing must fail the test in seconds, not
+        // stall the suite until a mutants timeout nobody evaluates.
+        adapter.response_ceiling = std::time::Duration::from_secs(2);
         adapter.extra_env = vec![(
             "HORDE_CODEX_STUB_SCRIPT".to_owned(),
             file.to_string_lossy().into_owned(),
@@ -256,7 +259,7 @@ async fn a_turn_round_trips_through_the_handshake_and_a_real_child() {
 #[tokio::test]
 async fn the_sandbox_tier_choice_is_journaled_on_the_first_turn() {
     let (mut adapter, dir) = adapter_for(&basic_turn(), &[]);
-    adapter.sandbox_policy = horde_adapter_codex::SandboxPolicy::read_only()
+    adapter.sandbox_policy = horde_adapter_codex::SandboxPolicy::default()
         .with_mode("builder", horde_adapter_codex::SandboxTier::WorkspaceWrite);
     let spec = AgentSpec {
         permission_mode: Some("builder".to_owned()),
@@ -472,11 +475,14 @@ async fn a_steer_that_lost_its_race_falls_back_to_a_fresh_turn() {
         .await
         .expect("the steer goes out");
 
-    // The refusal comes back interleaved; reading events is what routes it,
-    // and the fallback turn/start must then reach the wire with the text.
-    let _ = within("the fallback settles", session.next_event()).await;
+    // The refusal comes back interleaved; reading events is what routes it.
+    // Only the fallback turn/start can make turn-2 run, so draining to a turn
+    // ending IS the proof the fallback happened — a session that dropped the
+    // raced message would stall here and fail on the ceiling.
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    assert!(outcome.is_some(), "the fallback turn must run to its end");
     let recorded = control_log_shows(&log_path, |log| {
-        log.contains("turn/steer") && log.matches("turn/start").count() >= 2
+        log.contains("turn/steer") && log.matches("\"method\":\"turn/start\"").count() >= 2
     })
     .await;
     assert!(
@@ -541,6 +547,39 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
         ),
         other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
     }
+    session.shutdown().await.expect("shuts down");
+}
+
+/// `interrupt()` itself — not just interrupt-delivery — must put
+/// `turn/interrupt` on the wire and read the idle that follows as the
+/// cancellation. An interrupt that silently does nothing is indistinguishable
+/// from one that worked, right up until a user cannot stop a runaway agent.
+#[tokio::test]
+async fn interrupt_puts_the_cancel_on_the_wire_and_idle_closes_the_turn() {
+    let script = [
+        [
+            harness::thread_started(),
+            harness::turn_started("turn-1"),
+            harness::delta("turn-1", "working"),
+        ]
+        .join("\n"),
+        [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
+    ]
+    .join("\n\n");
+
+    let (mut session, log_path, _dirs) = mid_turn(&script, None).await;
+    session.interrupt().await.expect("the cancel is writable");
+
+    let recorded = control_log_shows(&log_path, |log| log.contains("turn/interrupt")).await;
+    assert!(
+        recorded.contains("turn/interrupt"),
+        "the cancel must actually reach the child: {recorded}"
+    );
+
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    let outcome = outcome.expect("idle closes the interrupted turn");
+    assert_eq!(outcome.status, TurnStatus::Interrupted);
+    assert_eq!(outcome.text, None, "a cancelled turn has no answer");
     session.shutdown().await.expect("shuts down");
 }
 

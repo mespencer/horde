@@ -166,20 +166,23 @@ impl<D: LineDecoder> AgentSession for ReplaySession<D> {
     }
 
     async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(Some(event));
-            }
+        // Bounded by structure, not delegation: every pass consumes one line
+        // directly, so the loop cannot outlive the recording no matter what
+        // any helper does.
+        while self.pending.is_empty() {
             // A live harness would not write another frame while blocked on a
             // decision; refusing to decode past one keeps the stall real.
             if let Some(tool_call_id) = self.decoder.awaiting_decision() {
                 return Err(AdapterError::AwaitingDecision { tool_call_id });
             }
-            if self.lines.is_empty() {
+            let Some(line) = self.lines.pop_front() else {
                 return Ok(None);
-            }
-            self.advance()?;
+            };
+            let events = self.decoder.decode(&line)?;
+            self.pending.extend(events);
+            self.session_id = self.decoder.provider_session_id();
         }
+        Ok(self.pending.pop_front())
     }
 
     async fn answer_permission(

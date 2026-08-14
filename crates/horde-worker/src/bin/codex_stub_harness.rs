@@ -24,6 +24,9 @@
 //! * `HORDE_CODEX_STUB_FAIL_TURN_START` — answer `turn/start` with this error.
 //! * `HORDE_CODEX_STUB_STEER=stale` — answer `turn/steer` with the
 //!   turn-no-longer-active error, the race `expectedTurnId` exists to detect.
+//!
+//! The decision logic is pure and unit-tested in this file; only `main`,
+//! `run`, and the two byte-shovels touch real stdio.
 
 use std::io::{BufRead, Write};
 
@@ -31,7 +34,7 @@ fn main() -> std::process::ExitCode {
     let Some(contents) = script() else {
         return std::process::ExitCode::FAILURE;
     };
-    run(&blocks(&contents))
+    run(&blocks(&contents), &StubConfig::from_env())
 }
 
 /// The script this run replays, or `None` having said why on stderr.
@@ -64,6 +67,115 @@ fn blocks(contents: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// The scenario switches, read from the environment once.
+#[derive(Debug, Default)]
+struct StubConfig {
+    fail_thread: Option<String>,
+    fail_turn_start: Option<String>,
+    steer_stale: bool,
+}
+
+impl StubConfig {
+    fn from_env() -> Self {
+        Self {
+            fail_thread: std::env::var("HORDE_CODEX_STUB_FAIL_THREAD").ok(),
+            fail_turn_start: std::env::var("HORDE_CODEX_STUB_FAIL_TURN_START").ok(),
+            steer_stale: std::env::var("HORDE_CODEX_STUB_STEER").as_deref() == Ok("stale"),
+        }
+    }
+}
+
+/// What one client request gets back.
+#[derive(Debug, PartialEq)]
+struct Reply {
+    /// The JSON-RPC reply line to emit.
+    line: String,
+    /// Whether the next scripted block plays after the reply.
+    plays_block: bool,
+}
+
+fn ok_line(id: &serde_json::Value, result: serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string()
+}
+
+fn error_line(id: &serde_json::Value, message: &str) -> String {
+    serde_json::json!({
+        "jsonrpc":"2.0","id":id,
+        "error":{"code":-32000,"message":message}
+    })
+    .to_string()
+}
+
+/// The whole request->reply decision, pure so its truth table is testable.
+fn reply_for(message: &serde_json::Value, config: &StubConfig) -> Option<Reply> {
+    let id = message.get("id")?.clone();
+    let method = message.get("method")?.as_str()?;
+
+    let reply = match method {
+        "initialize" => Reply {
+            line: ok_line(&id, serde_json::json!({"userAgent":"codex-stub"})),
+            plays_block: false,
+        },
+        "thread/start" | "thread/resume" => thread_reply(&id, message, config),
+        "turn/start" => match &config.fail_turn_start {
+            Some(refusal) => Reply {
+                line: error_line(&id, refusal),
+                plays_block: false,
+            },
+            None => Reply {
+                line: ok_line(&id, serde_json::json!({"turn":{"id":"turn-accepted"}})),
+                plays_block: true,
+            },
+        },
+        "turn/steer" if config.steer_stale => Reply {
+            line: error_line(&id, "expectedTurnId does not match the active turn"),
+            plays_block: false,
+        },
+        "turn/steer" => Reply {
+            line: ok_line(&id, serde_json::json!({"turnId":"turn-steered"})),
+            plays_block: true,
+        },
+        "turn/interrupt" => Reply {
+            line: ok_line(&id, serde_json::json!({})),
+            plays_block: true,
+        },
+        _ => Reply {
+            line: ok_line(&id, serde_json::json!({})),
+            plays_block: false,
+        },
+    };
+    Some(reply)
+}
+
+/// `thread/start` and `thread/resume` share a reply: the resumed thread keeps
+/// the id the client asked for, so revival identity is observable end to end.
+fn thread_reply(id: &serde_json::Value, message: &serde_json::Value, config: &StubConfig) -> Reply {
+    if let Some(refusal) = &config.fail_thread {
+        return Reply {
+            line: error_line(id, refusal),
+            plays_block: false,
+        };
+    }
+    let thread_id = message
+        .pointer("/params/threadId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("stub-thread");
+    Reply {
+        line: ok_line(
+            id,
+            serde_json::json!({"thread":{"id":thread_id},"model":"stub-model"}),
+        ),
+        plays_block: false,
+    }
+}
+
+/// Whether `message` is the reply to server request `id` (as opposed to a new
+/// client request or something unparseable).
+fn is_reply_to(message: &serde_json::Value, id: u64) -> bool {
+    message.get("id").and_then(serde_json::Value::as_u64) == Some(id)
+        && message.get("method").is_none()
+}
+
 fn log_control(line: &str) {
     if let Ok(path) = std::env::var("HORDE_CODEX_STUB_CONTROL_LOG")
         && let Ok(mut file) = std::fs::OpenOptions::new()
@@ -81,147 +193,286 @@ fn emit(line: &str) {
     let _ = stdout.flush();
 }
 
-fn respond_ok(id: &serde_json::Value, result: serde_json::Value) {
-    emit(&serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string());
-}
-
-fn respond_error(id: &serde_json::Value, message: &str) {
-    emit(
-        &serde_json::json!({
-            "jsonrpc":"2.0","id":id,
-            "error":{"code":-32000,"message":message}
-        })
-        .to_string(),
-    );
+/// One trimmed, non-empty, logged stdin line as JSON, or `None` at EOF.
+/// Unparseable lines are skipped — they were logged, which is all a test
+/// needs from them.
+fn next_message(stdin: &mut impl BufRead) -> Option<serde_json::Value> {
+    loop {
+        let mut line = String::new();
+        let read = stdin.read_line(&mut line).ok()?;
+        if read == 0 {
+            return None;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        log_control(line);
+        if let Ok(message) = serde_json::from_str::<serde_json::Value>(line) {
+            return Some(message);
+        }
+    }
 }
 
 /// Plays one block: raw lines are emitted; an `!ELICIT` marker sends a server
 /// request and blocks until the client answers it.
 fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u64) {
     for line in block {
-        if let Some(params) = line.strip_prefix("!ELICIT ") {
-            *next_server_id += 1;
-            let id = *next_server_id;
-            let params: serde_json::Value =
-                serde_json::from_str(params).unwrap_or(serde_json::Value::Null);
-            emit(
-                &serde_json::json!({
-                    "jsonrpc":"2.0","id":id,
-                    "method":"mcpServer/elicitation/request","params":params
-                })
-                .to_string(),
-            );
-            await_reply(id, stdin);
-        } else {
-            emit(line);
+        match line.strip_prefix("!ELICIT ") {
+            Some(params) => {
+                *next_server_id += 1;
+                emit(&elicitation_line(*next_server_id, params));
+                await_reply(*next_server_id, stdin);
+            }
+            None => emit(line),
         }
     }
 }
 
-/// Reads stdin until the reply to `id` arrives, logging everything and
-/// acknowledging any interleaved client request so nothing deadlocks.
-/// Bounded by count: a client that never answers ends the stub instead of
-/// wedging the test suite.
+fn elicitation_line(id: u64, params: &str) -> String {
+    let params: serde_json::Value = serde_json::from_str(params).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "jsonrpc":"2.0","id":id,
+        "method":"mcpServer/elicitation/request","params":params
+    })
+    .to_string()
+}
+
+/// Reads stdin until the reply to `id` arrives, acknowledging any interleaved
+/// client request so nothing deadlocks. Bounded by count: a client that never
+/// answers ends the stub instead of wedging the test suite.
 fn await_reply(id: u64, stdin: &mut impl BufRead) {
     for _ in 0..1024 {
-        let Some(line) = next_line(stdin) else { return };
-        log_control(&line);
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+        let Some(message) = next_message(stdin) else {
+            return;
         };
-        let is_reply_to_us = message.get("id").and_then(serde_json::Value::as_u64) == Some(id)
-            && message.get("method").is_none();
-        if is_reply_to_us {
+        if is_reply_to(&message, id) {
             return;
         }
-        // An interleaved client request mid-elicitation: acknowledge it so the
-        // client is never left waiting on the stub.
-        if let (Some(request_id), Some(_)) = (message.get("id"), message.get("method")) {
-            respond_ok(request_id, serde_json::json!({}));
-        }
+        acknowledge(&message);
     }
 }
 
-/// One trimmed, non-empty stdin line, or `None` at EOF.
-fn next_line(stdin: &mut impl BufRead) -> Option<String> {
-    loop {
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) | Err(_) => return None,
-            Ok(_) => {}
-        }
-        let line = line.trim();
-        if !line.is_empty() {
-            return Some(line.to_owned());
-        }
+/// Acknowledges an interleaved client request mid-elicitation, so the client
+/// is never left waiting on the stub.
+fn acknowledge(message: &serde_json::Value) {
+    if let (Some(request_id), Some(_)) = (message.get("id"), message.get("method")) {
+        emit(&ok_line(request_id, serde_json::json!({})));
     }
 }
 
-fn run(blocks: &[Vec<String>]) -> std::process::ExitCode {
+/// Answers one client message: emit the reply, play the next block when the
+/// reply calls for one. Notifications and stray replies need nothing.
+fn handle<'b>(
+    message: &serde_json::Value,
+    config: &StubConfig,
+    remaining: &mut impl Iterator<Item = &'b Vec<String>>,
+    stdin: &mut impl BufRead,
+    next_server_id: &mut u64,
+) {
+    let Some(reply) = reply_for(message, config) else {
+        return;
+    };
+    emit(&reply.line);
+    if reply.plays_block
+        && let Some(block) = remaining.next()
+    {
+        play_block(block, stdin, next_server_id);
+    }
+}
+
+fn run(blocks: &[Vec<String>], config: &StubConfig) -> std::process::ExitCode {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let mut remaining = blocks.iter();
     let mut next_server_id = 1000_u64;
 
-    loop {
-        let Some(line) = next_line(&mut stdin) else {
-            return std::process::ExitCode::SUCCESS;
-        };
-        log_control(&line);
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let (Some(id), Some(method)) = (
-            message.get("id").cloned(),
-            message.get("method").and_then(serde_json::Value::as_str),
-        ) else {
-            // Notifications (`initialized`) and stray replies need nothing.
-            continue;
-        };
+    while let Some(message) = next_message(&mut stdin) {
+        handle(
+            &message,
+            config,
+            &mut remaining,
+            &mut stdin,
+            &mut next_server_id,
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
 
-        match method {
-            "initialize" => respond_ok(&id, serde_json::json!({"userAgent":"codex-stub"})),
-            "thread/start" | "thread/resume" => {
-                if let Ok(message) = std::env::var("HORDE_CODEX_STUB_FAIL_THREAD") {
-                    respond_error(&id, &message);
-                    continue;
-                }
-                let thread_id = message
-                    .pointer("/params/threadId")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("stub-thread");
-                respond_ok(
-                    &id,
-                    serde_json::json!({"thread":{"id":thread_id},"model":"stub-model"}),
-                );
-            }
-            "turn/start" => {
-                if let Ok(message) = std::env::var("HORDE_CODEX_STUB_FAIL_TURN_START") {
-                    respond_error(&id, &message);
-                    continue;
-                }
-                respond_ok(&id, serde_json::json!({"turn":{"id":"turn-accepted"}}));
-                if let Some(block) = remaining.next() {
-                    play_block(block, &mut stdin, &mut next_server_id);
-                }
-            }
-            "turn/steer" => {
-                if std::env::var("HORDE_CODEX_STUB_STEER").as_deref() == Ok("stale") {
-                    respond_error(&id, "expectedTurnId does not match the active turn");
-                    continue;
-                }
-                respond_ok(&id, serde_json::json!({"turnId":"turn-steered"}));
-                if let Some(block) = remaining.next() {
-                    play_block(block, &mut stdin, &mut next_server_id);
-                }
-            }
-            "turn/interrupt" => {
-                respond_ok(&id, serde_json::json!({}));
-                if let Some(block) = remaining.next() {
-                    play_block(block, &mut stdin, &mut next_server_id);
-                }
-            }
-            _ => respond_ok(&id, serde_json::json!({})),
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{StubConfig, blocks, handle, is_reply_to, next_message, reply_for};
+
+    fn request(method: &str) -> serde_json::Value {
+        json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}})
+    }
+
+    /// The dispatch truth table: which method gets which reply shape, and
+    /// which replies pull the next scripted block onto the wire.
+    #[test]
+    fn each_method_gets_its_reply_and_only_turn_requests_play_blocks() {
+        let config = StubConfig::default();
+
+        for (method, plays) in [
+            ("initialize", false),
+            ("thread/start", false),
+            ("thread/resume", false),
+            ("turn/start", true),
+            ("turn/steer", true),
+            ("turn/interrupt", true),
+            ("account/rateLimits/read", false),
+        ] {
+            let reply = reply_for(&request(method), &config)
+                .unwrap_or_else(|| panic!("{method} must be answered"));
+            assert_eq!(reply.plays_block, plays, "{method}");
+            assert!(
+                reply.line.contains("\"result\""),
+                "{method}: {}",
+                reply.line
+            );
         }
+
+        assert_eq!(
+            reply_for(&json!({"jsonrpc":"2.0","method":"initialized"}), &config),
+            None,
+            "a notification needs no reply"
+        );
+        assert_eq!(
+            reply_for(&json!({"jsonrpc":"2.0","id":7,"result":{}}), &config),
+            None,
+            "a stray reply needs no reply either"
+        );
+    }
+
+    /// The failure switches: a configured refusal answers with an error and
+    /// never plays a block.
+    #[test]
+    fn configured_refusals_answer_with_errors() {
+        let failing_thread = StubConfig {
+            fail_thread: Some("not logged in".to_owned()),
+            ..StubConfig::default()
+        };
+        let refused = reply_for(&request("thread/start"), &failing_thread)
+            .unwrap_or_else(|| panic!("answered"));
+        assert!(refused.line.contains("not logged in") && refused.line.contains("error"));
+        assert!(!refused.plays_block);
+
+        let failing_turn = StubConfig {
+            fail_turn_start: Some("archived".to_owned()),
+            ..StubConfig::default()
+        };
+        let refused =
+            reply_for(&request("turn/start"), &failing_turn).unwrap_or_else(|| panic!("answered"));
+        assert!(refused.line.contains("archived"));
+        assert!(!refused.plays_block);
+
+        let stale = StubConfig {
+            steer_stale: true,
+            ..StubConfig::default()
+        };
+        let refused =
+            reply_for(&request("turn/steer"), &stale).unwrap_or_else(|| panic!("answered"));
+        assert!(refused.line.contains("expectedTurnId"));
+        assert!(!refused.plays_block);
+    }
+
+    /// The resumed thread keeps the id the client asked for — revival
+    /// identity must be observable end to end.
+    #[test]
+    fn a_resume_echoes_the_thread_it_was_asked_to_revive() {
+        let resume = json!({"jsonrpc":"2.0","id":2,"method":"thread/resume",
+                             "params":{"threadId":"t-revived"}});
+        let reply =
+            reply_for(&resume, &StubConfig::default()).unwrap_or_else(|| panic!("answered"));
+        assert!(reply.line.contains("t-revived"), "{}", reply.line);
+    }
+
+    /// Reply detection: same id without a method is the answer; anything with
+    /// a method is a new request, whatever its id.
+    #[test]
+    fn a_reply_is_the_matching_id_without_a_method() {
+        assert!(is_reply_to(&json!({"id":5,"result":{}}), 5));
+        assert!(!is_reply_to(&json!({"id":6,"result":{}}), 5));
+        assert!(!is_reply_to(&json!({"id":5,"method":"turn/interrupt"}), 5));
+        assert!(!is_reply_to(&json!({"result":{}}), 5));
+    }
+
+    /// The byte shovel: skips blanks and garbage, returns parsed JSON, `None`
+    /// at EOF.
+    #[test]
+    fn next_message_skips_noise_and_ends_at_eof() {
+        let mut input = std::io::Cursor::new("\n\nnot json\n{\"id\":1}\n");
+        let message = next_message(&mut input).unwrap_or_else(|| panic!("a message"));
+        assert_eq!(message, json!({"id":1}));
+        assert_eq!(next_message(&mut input), None, "EOF ends the stub");
+    }
+
+    /// The whole handle path with a scripted block: the reply plays the
+    /// block, an `!ELICIT` marker inside it waits for (and gets) its answer,
+    /// and an interleaved request is acknowledged rather than deadlocked on.
+    #[test]
+    fn handle_plays_a_block_and_an_elicitation_waits_for_its_answer() {
+        let blocks = [vec![
+            "{\"method\":\"turn/started\"}".to_owned(),
+            "!ELICIT {\"serverName\":\"spike\"}".to_owned(),
+            "{\"method\":\"turn/completed\"}".to_owned(),
+        ]];
+        // The client answers the elicitation (id 1001) after one interleaved
+        // request the stub must acknowledge instead of hanging on.
+        let mut client = std::io::Cursor::new(
+            "{\"id\":42,\"method\":\"turn/interrupt\"}\n{\"id\":1001,\"result\":{\"action\":\"accept\"}}\n",
+        );
+        let mut remaining = blocks.iter();
+        let mut next_server_id = 1000_u64;
+
+        handle(
+            &request("turn/start"),
+            &StubConfig::default(),
+            &mut remaining,
+            &mut client,
+            &mut next_server_id,
+        );
+
+        assert_eq!(next_server_id, 1001, "the elicitation minted a server id");
+        assert!(
+            remaining.next().is_none(),
+            "the turn request consumed its block"
+        );
+        assert_eq!(
+            client.position() as usize,
+            client.get_ref().len(),
+            "the elicitation answer (and the interleaved request before it) \
+             were both consumed"
+        );
+    }
+
+    /// A notification consumes no block — the guard the plays_block flag and
+    /// the None reply protect together.
+    #[test]
+    fn handle_ignores_notifications_without_consuming_blocks() {
+        let blocks = [vec!["never emitted".to_owned()]];
+        let mut client = std::io::Cursor::new("");
+        let mut remaining = blocks.iter();
+        let mut next_server_id = 1000_u64;
+
+        handle(
+            &json!({"jsonrpc":"2.0","method":"initialized"}),
+            &StubConfig::default(),
+            &mut remaining,
+            &mut client,
+            &mut next_server_id,
+        );
+        assert!(remaining.next().is_some(), "the block is still unplayed");
+    }
+
+    #[test]
+    fn blocks_split_on_blank_lines_and_drop_empties() {
+        let script = "a\nb\n\n\nc\n";
+        assert_eq!(
+            blocks(script),
+            vec![vec!["a".to_owned(), "b".to_owned()], vec!["c".to_owned()]]
+        );
     }
 }

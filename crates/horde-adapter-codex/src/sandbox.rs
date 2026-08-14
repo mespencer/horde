@@ -58,18 +58,16 @@ pub struct TierChoice {
 }
 
 /// The worker-configured mapping from permission-mode names to sandbox tiers.
+///
+/// The `Default` policy maps nothing, so every agent runs read-only — there
+/// is deliberately no separate constructor for that, because a second name
+/// for `default()` is a provably equivalent mutation waiting to be excluded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxPolicy {
     tiers: BTreeMap<String, SandboxTier>,
 }
 
 impl SandboxPolicy {
-    /// A policy that maps nothing: every agent runs read-only.
-    #[must_use]
-    pub fn read_only() -> Self {
-        Self::default()
-    }
-
     /// Maps one permission-mode name to a tier.
     #[must_use]
     pub fn with_mode(mut self, mode: impl Into<String>, tier: SandboxTier) -> Self {
@@ -123,7 +121,7 @@ mod tests {
 
     #[test]
     fn a_mapped_mode_gets_its_tier_and_names_the_mapping() {
-        let policy = SandboxPolicy::read_only().with_mode("builder", SandboxTier::WorkspaceWrite);
+        let policy = SandboxPolicy::default().with_mode("builder", SandboxTier::WorkspaceWrite);
         let choice = policy.tier_for("builder");
         assert_eq!(choice.tier, SandboxTier::WorkspaceWrite);
         assert!(
@@ -138,7 +136,7 @@ mod tests {
     /// a spawn that never chose.
     #[test]
     fn unmapped_and_absent_modes_both_fail_closed_with_distinct_reasons() {
-        let policy = SandboxPolicy::read_only().with_mode("builder", SandboxTier::WorkspaceWrite);
+        let policy = SandboxPolicy::default().with_mode("builder", SandboxTier::WorkspaceWrite);
 
         let unmapped = policy.tier_for("reviewer");
         assert_eq!(unmapped.tier, SandboxTier::ReadOnly);
@@ -162,7 +160,7 @@ mod tests {
     /// mode is workspace-write — fail closed is the entire point.
     #[test]
     fn an_unknown_mode_never_inherits_a_wider_mapped_tier() {
-        let policy = SandboxPolicy::read_only()
+        let policy = SandboxPolicy::default()
             .with_mode("a", SandboxTier::WorkspaceWrite)
             .with_mode("b", SandboxTier::WorkspaceWrite);
         assert_eq!(policy.tier_for("typo").tier, SandboxTier::ReadOnly);

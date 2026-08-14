@@ -282,6 +282,113 @@ impl FakeSession {
     /// Cuts the rest of the turn in flight, leaving it to end as
     /// [`TurnStatus::Interrupted`] — an interrupt is a way for a turn to end,
     /// not a way to skip ending it.
+    /// The next scripted turn, honouring the exhaustion policy.
+    fn take_scripted_turn(&mut self, input_text: &str) -> Result<ScriptedTurn> {
+        let scripted = usize::try_from(self.script_cursor)
+            .ok()
+            .and_then(|index| self.script.turns.get(index))
+            .cloned();
+
+        let turn = match scripted {
+            Some(turn) => turn,
+            None => match self.script.exhausted {
+                Exhausted::Echo => ScriptedTurn::saying(input_text.to_owned()),
+                Exhausted::Exit => {
+                    self.finished = true;
+                    return Err(AdapterError::HarnessExited { exit_code: Some(0) });
+                }
+            },
+        };
+        self.script_cursor = self.script_cursor.saturating_add(1);
+        Ok(turn)
+    }
+
+    /// What a send does about a turn already in flight.
+    ///
+    /// `Ok(None)` means the message amended the active turn (steering — the
+    /// transcript-15 shape: same turn id, more steps, the amendment's text
+    /// becomes the turn's answer, and the chunk counters keep running).
+    /// `Ok(Some(turn))` means a fresh turn should open — either nothing was
+    /// in flight, or an interrupt delivery just closed what was (the aborted
+    /// turn ends first, with no answer, ahead of the new turn's events).
+    fn settle_turn_in_flight(
+        &mut self,
+        delivery: horde_adapter::Delivery,
+        turn: ScriptedTurn,
+    ) -> Result<Option<ScriptedTurn>> {
+        if self.current.is_none() {
+            return Ok(Some(turn));
+        }
+        match delivery {
+            horde_adapter::Delivery::TurnBoundary => {
+                if !self.capabilities.supports(Capability::AmendActiveTurn) {
+                    // A provider without the capability never sees a mid-turn
+                    // send — the orchestrator holds the message — so receiving
+                    // one is a caller bug to refuse, never a turn to silently
+                    // clobber.
+                    return Err(AdapterError::Unsupported {
+                        provider: self.provider.clone(),
+                        capability: Capability::AmendActiveTurn,
+                    });
+                }
+                if let Some(current) = self.current.as_mut() {
+                    current.text = turn.text;
+                    current.tokens += turn.usage;
+                    current.cost_usd += turn.cost_usd;
+                }
+                self.steps.extend(turn.steps);
+                Ok(None)
+            }
+            horde_adapter::Delivery::Interrupt => {
+                self.cut_turn();
+                self.end_turn();
+                Ok(Some(turn))
+            }
+        }
+    }
+
+    /// Opens `turn` as the one in flight.
+    fn open_turn(&mut self, turn: ScriptedTurn) {
+        self.turns_taken = self.turns_taken.saturating_add(1);
+        self.chunk_counters.reset();
+        self.steps = turn.steps.into();
+        self.current = Some(CurrentTurn {
+            turn_id: self.turn_id(),
+            text: turn.text,
+            status: turn.status,
+            tokens: turn.usage,
+            cost_usd: turn.cost_usd,
+        });
+    }
+
+    /// Announces the session id once — or per-turn, for the misbehaviour that
+    /// checks the conformance suite notices a renamed session.
+    fn announce(&mut self) {
+        match self.misbehaviour {
+            Some(Misbehaviour::SkipSessionEstablished) => {}
+            Some(Misbehaviour::ChangeSessionIdMidConversation) => {
+                // A different name every turn, so revival would target the
+                // wrong conversation.
+                self.announced = true;
+                self.provider_session_id =
+                    ProviderSessionId::new(format!("fake-session-{}", self.turns_taken));
+                self.pending.push_back(AgentEvent::SessionEstablished {
+                    provider_session_id: self.provider_session_id.clone(),
+                    model: "fake-model".to_owned(),
+                });
+            }
+            _ => {
+                if !self.announced {
+                    self.announced = true;
+                    self.pending.push_back(AgentEvent::SessionEstablished {
+                        provider_session_id: self.provider_session_id.clone(),
+                        model: "fake-model".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
     fn cut_turn(&mut self) {
         self.steps.clear();
         self.waiting_on = None;
@@ -343,96 +450,13 @@ impl AgentSession for FakeSession {
             return Err(AdapterError::HarnessExited { exit_code: Some(0) });
         }
 
-        let scripted = usize::try_from(self.script_cursor)
-            .ok()
-            .and_then(|index| self.script.turns.get(index))
-            .cloned();
-
-        let turn = match scripted {
-            Some(turn) => turn,
-            None => match self.script.exhausted {
-                Exhausted::Echo => ScriptedTurn::saying(input.text.clone()),
-                Exhausted::Exit => {
-                    self.finished = true;
-                    return Err(AdapterError::HarnessExited { exit_code: Some(0) });
-                }
-            },
+        let turn = self.take_scripted_turn(&input.text)?;
+        let Some(turn) = self.settle_turn_in_flight(input.delivery, turn)? else {
+            // The message amended the active turn; nothing new opens.
+            return Ok(());
         };
-        self.script_cursor = self.script_cursor.saturating_add(1);
-
-        if self.current.is_some() {
-            match input.delivery {
-                // Steering: the message amends the ACTIVE turn, exactly as
-                // `turn/steer` does (transcript 15) — same turn id, more
-                // steps, and the amendment's text becomes the turn's answer.
-                // The chunk counters deliberately keep running: one turn, one
-                // numbering.
-                horde_adapter::Delivery::TurnBoundary => {
-                    if !self.capabilities.supports(Capability::AmendActiveTurn) {
-                        // A provider without the capability never sees a
-                        // mid-turn send — the orchestrator holds the message —
-                        // so receiving one is a caller bug to refuse, never a
-                        // turn to silently clobber.
-                        return Err(AdapterError::Unsupported {
-                            provider: self.provider.clone(),
-                            capability: Capability::AmendActiveTurn,
-                        });
-                    }
-                    if let Some(current) = self.current.as_mut() {
-                        current.text = turn.text;
-                        current.tokens += turn.usage;
-                        current.cost_usd += turn.cost_usd;
-                    }
-                    self.steps.extend(turn.steps);
-                    return Ok(());
-                }
-                // An interrupt delivery ends the turn in flight first — with
-                // no answer, because the work was cancelled — and the message
-                // then runs as its own turn: the codex deferred-delivery
-                // shape, and what the live Claude adapter's control message
-                // does too.
-                horde_adapter::Delivery::Interrupt => {
-                    self.cut_turn();
-                    self.end_turn();
-                }
-            }
-        }
-
-        self.turns_taken = self.turns_taken.saturating_add(1);
-        self.chunk_counters.reset();
-        self.steps = turn.steps.into();
-        self.current = Some(CurrentTurn {
-            turn_id: self.turn_id(),
-            text: turn.text,
-            status: turn.status,
-            tokens: turn.usage,
-            cost_usd: turn.cost_usd,
-        });
-
-        match self.misbehaviour {
-            Some(Misbehaviour::SkipSessionEstablished) => {}
-            Some(Misbehaviour::ChangeSessionIdMidConversation) => {
-                // A different name every turn, so revival would target the
-                // wrong conversation.
-                self.announced = true;
-                self.provider_session_id =
-                    ProviderSessionId::new(format!("fake-session-{}", self.turns_taken));
-                self.pending.push_back(AgentEvent::SessionEstablished {
-                    provider_session_id: self.provider_session_id.clone(),
-                    model: "fake-model".to_owned(),
-                });
-            }
-            _ => {
-                if !self.announced {
-                    self.announced = true;
-                    self.pending.push_back(AgentEvent::SessionEstablished {
-                        provider_session_id: self.provider_session_id.clone(),
-                        model: "fake-model".to_owned(),
-                    });
-                }
-            }
-        }
-
+        self.open_turn(turn);
+        self.announce();
         Ok(())
     }
 
@@ -934,8 +958,22 @@ mod steering_tests {
     #[tokio::test]
     async fn a_mid_turn_send_amends_the_active_turn() {
         let mut session = started_on(FakeAdapter::new(Script::of(vec![
-            ScriptedTurn::saying("FIRST"),
-            ScriptedTurn::saying("STEERED"),
+            ScriptedTurn::saying("FIRST").with_usage(
+                horde_adapter::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..horde_adapter::TokenUsage::default()
+                },
+                0.5,
+            ),
+            ScriptedTurn::saying("STEERED").with_usage(
+                horde_adapter::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                    ..horde_adapter::TokenUsage::default()
+                },
+                0.25,
+            ),
         ])))
         .await;
 
@@ -956,6 +994,16 @@ mod steering_tests {
             endings[0].text.as_deref(),
             Some("STEERED"),
             "the turn's answer is the answer to the steer"
+        );
+        assert_eq!(
+            endings[0].usage.tokens.input_tokens, 17,
+            "an amended turn consumed both halves' work, so it bills both"
+        );
+        assert_eq!(endings[0].usage.tokens.output_tokens, 5);
+        assert!(
+            (endings[0].usage.cost_usd - 0.75).abs() < f64::EPSILON,
+            "and both halves' cost: {}",
+            endings[0].usage.cost_usd
         );
 
         // And every event of the amended turn carries one turn id.

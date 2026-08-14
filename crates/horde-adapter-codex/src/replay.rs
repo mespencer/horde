@@ -183,6 +183,68 @@ mod tests {
         );
     }
 
+    /// A replayed elicitation stalls the session until it is answered — the
+    /// same block a live harness imposes — and the stall names the call.
+    #[tokio::test]
+    async fn an_unanswered_elicitation_stalls_the_replay_with_its_name() {
+        let mut session = replay(vec![vec![
+            json!({"method":"thread/started","params":{"thread":{"id":"t1"}}}).to_string(),
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-1"}}}).to_string(),
+            json!({"method":"item/started","params":{"turnId":"turn-1","item":{
+                "type":"mcpToolCall","id":"exec-9","server":"spike","tool":"horde_probe",
+                "status":"inProgress","arguments":{}}}})
+            .to_string(),
+            json!({"id":3,"method":"mcpServer/elicitation/request","params":{
+                "threadId":"t1","turnId":"turn-1","serverName":"spike","mode":"form",
+                "_meta":{"codex_approval_kind":"mcp_tool_call","tool_params":{}},
+                "message":"Allow?","requestedSchema":{"type":"object","properties":{}}}})
+            .to_string(),
+            json!({"method":"turn/completed","params":{"turn":{"id":"turn-1"}}}).to_string(),
+        ]]);
+        session
+            .send(TurnInput::queued("go"))
+            .await
+            .expect("replays");
+
+        // Drain up to the request, bounded by count.
+        let mut asked = false;
+        for _ in 0..8 {
+            match session.next_event().await {
+                Ok(Some(AgentEvent::PermissionRequested { .. })) => {
+                    asked = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(asked, "the recorded elicitation must surface");
+
+        // Polling while owing the answer must stall, naming what is owed —
+        // never read past the block into the recorded continuation.
+        let stalled = session
+            .next_event()
+            .await
+            .expect_err("an unanswered elicitation blocks the replay");
+        assert!(stalled.to_string().contains("exec-9"), "{stalled}");
+
+        // Answering releases the recorded continuation.
+        session
+            .answer_permission(
+                &ToolCallId::new("exec-9"),
+                horde_adapter::PermissionDecision::allow(),
+            )
+            .await
+            .expect("the outstanding request accepts its answer");
+        let events = drain(&mut session).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnded(_))),
+            "the turn closes once the decision landed: {events:?}"
+        );
+    }
+
     /// The interrupt path across the session boundary, not just the assembler:
     /// without `interrupt()` having been called, an `idle` closes nothing.
     #[tokio::test]
