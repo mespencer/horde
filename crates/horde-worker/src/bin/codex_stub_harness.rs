@@ -24,6 +24,9 @@
 //! * `HORDE_CODEX_STUB_FAIL_TURN_START` — answer `turn/start` with this error.
 //! * `HORDE_CODEX_STUB_STEER=stale` — answer `turn/steer` with the
 //!   turn-no-longer-active error, the race `expectedTurnId` exists to detect.
+//! * `HORDE_CODEX_STUB_MUTE=1` — read (and log) everything, answer nothing:
+//!   the wedged harness whose silence the adapter's response ceiling exists
+//!   to bound.
 //!
 //! The decision logic is pure and unit-tested in this file; only `main`,
 //! `run`, and the two byte-shovels touch real stdio.
@@ -73,6 +76,7 @@ struct StubConfig {
     fail_thread: Option<String>,
     fail_turn_start: Option<String>,
     steer_stale: bool,
+    mute: bool,
 }
 
 impl StubConfig {
@@ -81,6 +85,7 @@ impl StubConfig {
             fail_thread: std::env::var("HORDE_CODEX_STUB_FAIL_THREAD").ok(),
             fail_turn_start: std::env::var("HORDE_CODEX_STUB_FAIL_TURN_START").ok(),
             steer_stale: std::env::var("HORDE_CODEX_STUB_STEER").as_deref() == Ok("stale"),
+            mute: std::env::var("HORDE_CODEX_STUB_MUTE").is_ok(),
         }
     }
 }
@@ -108,6 +113,9 @@ fn error_line(id: &serde_json::Value, message: &str) -> String {
 
 /// The whole request->reply decision, pure so its truth table is testable.
 fn reply_for(message: &serde_json::Value, config: &StubConfig) -> Option<Reply> {
+    if config.mute {
+        return None;
+    }
     let id = message.get("id")?.clone();
     let method = message.get("method")?.as_str()?;
 
@@ -338,6 +346,15 @@ mod tests {
             reply_for(&json!({"jsonrpc":"2.0","method":"initialized"}), &config),
             None,
             "a notification needs no reply"
+        );
+        let mute = StubConfig {
+            mute: true,
+            ..StubConfig::default()
+        };
+        assert_eq!(
+            reply_for(&request("initialize"), &mute),
+            None,
+            "a muted stub answers nothing at all"
         );
         assert_eq!(
             reply_for(&json!({"jsonrpc":"2.0","id":7,"result":{}}), &config),

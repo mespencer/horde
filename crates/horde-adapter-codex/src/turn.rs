@@ -910,21 +910,27 @@ mod tests {
         }
     }
 
+    /// Opens a turn and closes it with a `turn/completed` whose turn body is
+    /// `turn`, returning the outcome — the arrangement every framing-vs-
+    /// verdict test shares.
+    fn completed_frame_outcome(turn: serde_json::Value) -> horde_adapter::TurnOutcome {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let events = feed(
+            &mut assembler,
+            json!({"method":"turn/completed","params":{"turn":turn}}),
+        );
+        closed(events, "turn/completed closes the turn")
+    }
+
     /// `turn/completed` is framing, not a verdict: a turn whose own status is
     /// failed must not be reported as Completed.
     #[test]
     fn a_completed_frame_with_a_failed_status_reports_the_failure() {
-        let mut assembler = TurnAssembler::new();
-        open_turn(&mut assembler);
-
-        let events = feed(
-            &mut assembler,
-            json!({"method":"turn/completed","params":{"turn":{
-                "id":"turn-1","status":"failed",
-                "error":{"message":"context window exceeded",
-                         "codexErrorInfo":"contextWindowExceeded"}}}}),
-        );
-        let outcome = closed(events, "closes");
+        let outcome = completed_frame_outcome(json!({
+            "id":"turn-1","status":"failed",
+            "error":{"message":"context window exceeded",
+                     "codexErrorInfo":"contextWindowExceeded"}}));
         assert!(
             matches!(
                 &outcome.status,
@@ -963,15 +969,7 @@ mod tests {
     /// verdict, not the client's request, is what the frame carries.
     #[test]
     fn a_completed_frame_with_an_interrupted_status_reports_the_interruption() {
-        let mut assembler = TurnAssembler::new();
-        open_turn(&mut assembler);
-
-        let events = feed(
-            &mut assembler,
-            json!({"method":"turn/completed",
-                   "params":{"turn":{"id":"turn-1","status":"interrupted"}}}),
-        );
-        let outcome = closed(events, "an interrupted status still closes the turn");
+        let outcome = completed_frame_outcome(json!({"id":"turn-1","status":"interrupted"}));
         assert_eq!(outcome.status, TurnStatus::Interrupted);
         assert_eq!(outcome.text, None, "a cancelled turn has no answer");
     }

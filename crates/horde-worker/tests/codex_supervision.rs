@@ -163,6 +163,17 @@ mod harness {
         .await;
     }
 
+    /// The opening block every steering-shaped script starts with: the
+    /// thread announces itself, turn-1 opens, and a delta proves it open.
+    pub(crate) fn opening_block() -> String {
+        [
+            thread_started(),
+            turn_started("turn-1"),
+            delta("turn-1", "working"),
+        ]
+        .join("\n")
+    }
+
     /// A session already mid-turn: spawned on `script` (whose first block must
     /// stream a delta), its opening message sent, and drained until output
     /// proved the turn open — the precondition every steering-shaped test
@@ -454,12 +465,7 @@ async fn a_steer_that_lost_its_race_falls_back_to_a_fresh_turn() {
     // Block 1: a turn that opens and never closes on its own (the steer will
     // be sent against it). Block 2: the fresh turn the fallback starts.
     let script = [
-        [
-            harness::thread_started(),
-            harness::turn_started("turn-1"),
-            harness::delta("turn-1", "working"),
-        ]
-        .join("\n"),
+        harness::opening_block(),
         [
             harness::turn_started("turn-2"),
             harness::turn_completed("turn-2"),
@@ -502,12 +508,7 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
     // (transcript 11's shape). Block 3 — played on the deferred turn/start —
     // the replacement turn.
     let script = [
-        [
-            harness::thread_started(),
-            harness::turn_started("turn-1"),
-            harness::delta("turn-1", "working"),
-        ]
-        .join("\n"),
+        harness::opening_block(),
         [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
         [
             harness::turn_started("turn-2"),
@@ -557,12 +558,7 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
 #[tokio::test]
 async fn interrupt_puts_the_cancel_on_the_wire_and_idle_closes_the_turn() {
     let script = [
-        [
-            harness::thread_started(),
-            harness::turn_started("turn-1"),
-            harness::delta("turn-1", "working"),
-        ]
-        .join("\n"),
+        harness::opening_block(),
         [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
     ]
     .join("\n\n");
@@ -581,6 +577,46 @@ async fn interrupt_puts_the_cancel_on_the_wire_and_idle_closes_the_turn() {
     assert_eq!(outcome.status, TurnStatus::Interrupted);
     assert_eq!(outcome.text, None, "a cancelled turn has no answer");
     session.shutdown().await.expect("shuts down");
+}
+
+/// A harness that answers nothing must become a spawn error on the response
+/// ceiling — the wedged-child case that would otherwise hang the pump
+/// forever. The ceiling is legitimate here: each read genuinely awaits the
+/// pipe, so the clock is bounding an arrival, not a loop.
+#[tokio::test]
+async fn a_mute_harness_fails_the_spawn_on_the_response_ceiling() {
+    let (mut adapter, _dir) = adapter_for(&basic_turn(), &[("HORDE_CODEX_STUB_MUTE", "1")]);
+    adapter.response_ceiling = std::time::Duration::from_millis(300);
+
+    let error = adapter
+        .spawn(&AgentSpec::default())
+        .await
+        .err()
+        .expect("silence must become an error, not a hang");
+    assert!(
+        error.to_string().contains("no reply"),
+        "the failure names what never arrived: {error}"
+    );
+}
+
+/// A harness that exits during the handshake reads as its death, not as a
+/// protocol accident — EOF is how a dead child announces itself.
+#[tokio::test]
+async fn a_harness_that_dies_mid_handshake_reads_as_its_death() {
+    // No script in the environment: the stub prints why to stderr and exits
+    // nonzero, which is exactly a binary that starts and immediately dies.
+    let adapter =
+        horde_worker::CodexAdapter::new().with_program(harness::stub_binary().to_string_lossy());
+
+    let error = adapter
+        .spawn(&AgentSpec::default())
+        .await
+        .err()
+        .expect("a dead child must fail the spawn");
+    assert!(
+        matches!(error, AdapterError::HarnessExited { .. }),
+        "EOF during the handshake is the child's death: {error:?}"
+    );
 }
 
 /// A `thread/start` refusal that names authentication maps to
@@ -733,12 +769,16 @@ async fn a_dead_harness_surfaces_instead_of_hanging() {
     let (mut session, _dir) = session_on(&basic_turn(), &[]).await;
     session.shutdown().await.expect("shuts down");
 
+    let refused = session.send(TurnInput::queued("anyone home?")).await;
     assert!(
-        session
-            .send(TurnInput::queued("anyone home?"))
-            .await
-            .is_err(),
-        "a shut-down session refuses work"
+        matches!(refused, Err(AdapterError::HarnessExited { .. })),
+        "a shut-down session refuses work as the death it is — before touching \
+         the wire, so the refusal is deterministic, never a pipe race: {refused:?}"
+    );
+    let cancel = session.interrupt().await;
+    assert!(
+        matches!(cancel, Err(AdapterError::HarnessExited { .. })),
+        "and an interrupt after the end is refused the same way: {cancel:?}"
     );
     assert!(
         within("the closed stream answers", session.next_event())
