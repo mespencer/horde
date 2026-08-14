@@ -361,8 +361,6 @@ pub fn peer_of_stream<IO>(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use super::{client_mtls_config, mtls_acceptor, peer_of_stream, pinned_verifier};
     use crate::ca::CertificateAuthority;
     use crate::enroll::generate_csr;
