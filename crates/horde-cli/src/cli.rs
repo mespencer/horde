@@ -63,12 +63,64 @@ pub enum Command {
     /// Attach to a session interactively. `sync --follow` is the headless,
     /// scriptable form of the same subscription.
     Attach(AttachArgs),
+    /// The MCP Hub catalog: user MCP servers proxied onto every agent's
+    /// endpoint (ADR-0004).
+    #[command(subcommand)]
+    Mcp(McpCommand),
     /// Worker administration: enrollment codes and revocation (DESIGN §3).
     #[command(subcommand)]
     Worker(WorkerCommand),
     /// This machine's own identity: joining, and client codes for others.
     #[command(subcommand)]
     Enroll(EnrollCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Create or update one server in the catalog. The name becomes the
+    /// namespace prefix on every proxied tool (`{name}__{tool}`), so it is
+    /// lowercase [a-z0-9-].
+    Add(McpAddArgs),
+    /// List every live server.
+    List,
+    /// Remove one server. Needs the etag `list` shows, so a concurrent edit
+    /// aborts instead of being silently deleted.
+    Remove {
+        name: String,
+        #[arg(long)]
+        etag: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct McpAddArgs {
+    pub name: String,
+    /// Run a stdio server: the command to spawn. Exactly one of this and
+    /// `--url`.
+    #[arg(long, conflicts_with = "url")]
+    pub command: Option<String>,
+    /// Argument for the stdio command; repeatable, in order. Values may
+    /// themselves start with `--` (`--arg --stdio` is the common case).
+    #[arg(long = "arg", requires = "command", allow_hyphen_values = true)]
+    pub args: Vec<String>,
+    /// Environment for the stdio child, as KEY=VALUE; repeatable. NOTE:
+    /// journaled through the event log, which attached clients replay.
+    #[arg(long = "env", requires = "command", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+    /// Reach a running server over streamable HTTP at this url.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Run worker-side, one instance per agent, instead of at the server —
+    /// the pressure valve for machine-bound or stateful servers.
+    #[arg(long)]
+    pub local: bool,
+    /// Restrict to agents of this type; repeatable. Absent means every
+    /// agent; present fails closed for untyped agents.
+    #[arg(long = "allow-agent-type")]
+    pub allowed_agent_types: Vec<String>,
+    /// Update the version this etag names, instead of creating.
+    #[arg(long, default_value = "")]
+    pub etag: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -253,6 +305,7 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
+        Some(Command::Mcp(command)) => run_mcp(client, command, format).await,
         Some(Command::Worker(command)) => run_worker(client, command, format).await,
         Some(Command::Enroll(command)) => run_enroll(client, command, format).await,
     }
@@ -327,6 +380,88 @@ async fn run_join(
         "{}",
         render::joined(&enrolled.principal.to_string(), &directory, format)
     );
+    Ok(())
+}
+
+/// The wire config an `mcp add` describes.
+///
+/// # Errors
+///
+/// A malformed `--env` entry, or neither/both transports named — refused
+/// here, where the message can talk about flags, rather than sent for the
+/// server to refuse in wire vocabulary.
+pub fn mcp_config_from(args: &McpAddArgs) -> Result<horde_proto::v1::McpServerConfig, ClientError> {
+    let transport =
+        match (&args.command, &args.url) {
+            (Some(command), None) => {
+                let mut env = std::collections::HashMap::new();
+                for pair in &args.env {
+                    let (key, value) = parse_env_pair(pair).ok_or_else(|| {
+                        ClientError::Rpc(tonic::Status::invalid_argument(format!(
+                            "--env takes KEY=VALUE, got {pair:?}"
+                        )))
+                    })?;
+                    env.insert(key.to_owned(), value.to_owned());
+                }
+                horde_proto::v1::mcp_server_config::Transport::Stdio(
+                    horde_proto::v1::McpStdioTransport {
+                        command: command.clone(),
+                        args: args.args.clone(),
+                        env,
+                    },
+                )
+            }
+            (None, Some(url)) => horde_proto::v1::mcp_server_config::Transport::Http(
+                horde_proto::v1::McpHttpTransport { url: url.clone() },
+            ),
+            _ => {
+                return Err(ClientError::Rpc(tonic::Status::invalid_argument(
+                    "name exactly one transport: --command for stdio, or --url for http",
+                )));
+            }
+        };
+
+    Ok(horde_proto::v1::McpServerConfig {
+        name: args.name.clone(),
+        transport: Some(transport),
+        local: args.local,
+        allowed_agent_types: args.allowed_agent_types.clone(),
+        etag: args.etag.clone(),
+    })
+}
+
+/// Splits one `--env` entry on its first `=`.
+///
+/// The first, because values contain `=` routinely (base64 padding, URLs);
+/// an empty key is refused, an empty value is a real value.
+#[must_use]
+pub fn parse_env_pair(pair: &str) -> Option<(&str, &str)> {
+    let (key, value) = pair.split_once('=')?;
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, value))
+}
+
+async fn run_mcp(
+    client: &mut Client,
+    command: &McpCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        McpCommand::Add(args) => {
+            let stamped = client.configure_mcp_server(mcp_config_from(args)?).await?;
+            println!("{}", render::mcp_configured(&stamped, format));
+        }
+        McpCommand::List => {
+            let servers = client.list_mcp_servers().await?;
+            println!("{}", render::mcp_servers(&servers, format));
+        }
+        McpCommand::Remove { name, etag } => {
+            client.delete_mcp_server(name, etag).await?;
+            println!("{}", render::mcp_removed(name, format));
+        }
+    }
     Ok(())
 }
 
@@ -556,6 +691,130 @@ mod tests {
     fn delivery_defaults_to_the_turn_boundary_and_flips_only_when_asked() {
         assert_eq!(delivery_for(false), DeliveryMode::TurnBoundary);
         assert_eq!(delivery_for(true), DeliveryMode::Interrupt);
+    }
+
+    /// Values contain `=` routinely (base64 padding, URLs), so the split must
+    /// be on the first — and a keyless entry is a mistake, not an empty key.
+    #[test]
+    fn env_pairs_split_on_the_first_equals_and_refuse_a_missing_key() {
+        assert_eq!(
+            super::parse_env_pair("TOKEN=abc=="),
+            Some(("TOKEN", "abc=="))
+        );
+        assert_eq!(super::parse_env_pair("EMPTY="), Some(("EMPTY", "")));
+        assert_eq!(super::parse_env_pair("=value"), None);
+        assert_eq!(super::parse_env_pair("no-equals"), None);
+    }
+
+    /// The `mcp add` flags become exactly one wire transport, with everything
+    /// they said riding along.
+    #[test]
+    fn an_mcp_add_becomes_the_wire_config_it_described() {
+        let cli = Cli::try_parse_from([
+            "horde",
+            "mcp",
+            "add",
+            "linear",
+            "--command",
+            "linear-mcp",
+            "--arg",
+            "--stdio",
+            "--env",
+            "LINEAR_TOKEN=tok",
+            "--local",
+            "--allow-agent-type",
+            "reviewer",
+            "--etag",
+            "3",
+        ])
+        .expect("valid arguments");
+        let Some(Command::Mcp(super::McpCommand::Add(args))) = &cli.command else {
+            panic!("expected mcp add, got {:?}", cli.command);
+        };
+
+        let config = super::mcp_config_from(args).expect("a valid config");
+        assert_eq!(config.name, "linear");
+        assert!(config.local);
+        assert_eq!(config.allowed_agent_types, vec!["reviewer".to_owned()]);
+        assert_eq!(config.etag, "3");
+        match config.transport {
+            Some(horde_proto::v1::mcp_server_config::Transport::Stdio(stdio)) => {
+                assert_eq!(stdio.command, "linear-mcp");
+                assert_eq!(stdio.args, vec!["--stdio".to_owned()]);
+                assert_eq!(
+                    stdio.env.get("LINEAR_TOKEN").map(String::as_str),
+                    Some("tok")
+                );
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    /// Neither transport, and a malformed env entry: refused here, in flag
+    /// vocabulary, before anything reaches the wire.
+    #[test]
+    fn an_mcp_add_without_a_transport_or_with_bad_env_is_refused_locally() {
+        let no_transport = super::McpAddArgs {
+            name: "linear".to_owned(),
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: None,
+            local: false,
+            allowed_agent_types: Vec::new(),
+            etag: String::new(),
+        };
+        let refused = super::mcp_config_from(&no_transport).expect_err("no transport");
+        assert!(
+            refused.to_string().contains("--command"),
+            "the refusal talks in flags: {refused}"
+        );
+
+        let bad_env = super::McpAddArgs {
+            command: Some("linear-mcp".to_owned()),
+            env: vec!["NOEQUALS".to_owned()],
+            ..no_transport
+        };
+        let refused = super::mcp_config_from(&bad_env).expect_err("bad env");
+        assert!(refused.to_string().contains("NOEQUALS"), "{refused}");
+    }
+
+    /// An http `mcp add` and the both-transports refusal (clap owns it: the
+    /// flags conflict, so the mistake never reaches the converter).
+    #[test]
+    fn an_http_mcp_add_converts_and_both_transports_cannot_parse() {
+        let cli = Cli::try_parse_from([
+            "horde",
+            "mcp",
+            "add",
+            "grafana",
+            "--url",
+            "http://127.0.0.1:9931/mcp",
+        ])
+        .expect("valid arguments");
+        let Some(Command::Mcp(super::McpCommand::Add(args))) = &cli.command else {
+            panic!("expected mcp add, got {:?}", cli.command);
+        };
+        let config = super::mcp_config_from(args).expect("a valid config");
+        assert!(matches!(
+            config.transport,
+            Some(horde_proto::v1::mcp_server_config::Transport::Http(_))
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "horde",
+                "mcp",
+                "add",
+                "x",
+                "--command",
+                "c",
+                "--url",
+                "http://y",
+            ])
+            .is_err(),
+            "--command and --url conflict at parse time"
+        );
     }
 
     #[test]
