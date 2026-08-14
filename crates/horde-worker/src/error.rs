@@ -107,6 +107,14 @@ pub enum WorkerError {
     #[error("the workspace checkout failed: {0}")]
     Workspace(String),
 
+    /// A Payload's attachment could not be stashed, fetched, or verified.
+    ///
+    /// The message carries the specific refusal — a missing blob service, a
+    /// malformed address, inline content that does not hash to its digest —
+    /// because "the attachment failed" names nothing anyone can fix.
+    #[error("the attachment transfer failed: {0}")]
+    Attachment(String),
+
     /// A Payload's commits could not be staged or obtained.
     ///
     /// Carries the share layer's own words — a dirty tree, a missing commit,

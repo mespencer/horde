@@ -69,6 +69,10 @@ pub struct Runtime {
     /// Tracks every running agent's checkout and executes payload shares —
     /// stamping on the way out, obtaining on the way in.
     broker: Arc<ShareBroker>,
+    /// Stashes outgoing attachment content and materializes incoming
+    /// attachments into receiving checkouts — the blob half of a Payload,
+    /// beside the broker's commit half.
+    attachments: Arc<crate::blob::AttachmentBroker>,
     agents: BTreeMap<String, AgentHandle>,
     /// Pumps whose agents were archived, kept so shutdown can wait for them.
     retired: Vec<tokio::task::JoinHandle<()>>,
@@ -158,9 +162,20 @@ impl Runtime {
             default_provider: None,
             workspaces: None,
             broker: Arc::new(ShareBroker::new(None)),
+            attachments: Arc::new(crate::blob::AttachmentBroker::new(None)),
             agents: BTreeMap::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Points attachment transfer at the Server's blob store, over the
+    /// Worker's own authenticated channel. Without one, inline attachments
+    /// still work in both directions and anything needing the store refuses
+    /// honestly.
+    #[must_use]
+    pub fn with_blob_service(mut self, channel: tonic::transport::Channel) -> Self {
+        self.attachments = Arc::new(crate::blob::AttachmentBroker::new(Some(channel)));
+        self
     }
 
     /// Points payload shares at a Relay: stamped commits are pushed to their
@@ -458,12 +473,13 @@ impl Runtime {
         };
 
         if has_live_pump(&self.agents, &agent_id) {
-            // A Payload's commits are made present in the receiving agent's
-            // checkout *before* the message text reaches it — the message
-            // names work, and handing the agent a name it cannot check out
-            // would be the transport becoming the agent's concern (DESIGN §5).
+            // A Payload's commits and attachments are made present for the
+            // receiving agent *before* the message text reaches it — the
+            // message names work, and handing the agent a name it cannot
+            // open would be the transport becoming the agent's concern
+            // (DESIGN §5).
             if let Some(payload) = carried_payload(payload.as_ref())
-                && let Err(error) = self.broker.obtain(&agent_id, payload).await
+                && let Err(error) = self.obtain_payload(&agent_id, payload).await
             {
                 return Ok(self.payload_failed(&agent_id, &error));
             }
@@ -530,7 +546,7 @@ impl Runtime {
                     self.broker.register(&agent_id, checkout);
                 }
                 if let Some(payload) = carried_payload(payload.as_ref())
-                    && let Err(error) = self.broker.obtain(&agent_id, payload).await
+                    && let Err(error) = self.obtain_payload(&agent_id, payload).await
                 {
                     // The revived checkout must not linger as a stamping
                     // target for an agent whose pump never started.
@@ -602,6 +618,38 @@ impl Runtime {
             .capabilities()
             .supports(Capability::RewritesToolInput);
         Ok((session, can_rewrite, checkout))
+    }
+
+    /// Makes one delivered Payload wholly present for its receiver: commits
+    /// into the checkout through the share broker, attachments as files
+    /// under the checkout root through the attachment broker.
+    ///
+    /// Attachments need somewhere to land, so a payload carrying them for
+    /// an agent with no checkout is refused rather than half-delivered —
+    /// the same honesty `payload_failed` gives an unobtainable commit.
+    async fn obtain_payload(
+        &self,
+        agent_id: &str,
+        payload: &horde_proto::v1::Payload,
+    ) -> Result<(), WorkerError> {
+        self.broker.obtain(agent_id, payload).await?;
+        if payload.attachments.is_empty() {
+            return Ok(());
+        }
+        let root = self
+            .broker
+            .checkout_of(agent_id)
+            .map(|checkout| checkout.root)
+            .ok_or_else(|| {
+                WorkerError::Attachment(format!(
+                    "agent {agent_id} has no checkout to receive {} attachment(s) into",
+                    payload.attachments.len()
+                ))
+            })?;
+        self.attachments
+            .materialize(&payload.attachments, &root)
+            .await?;
+        Ok(())
     }
 
     /// A delivery whose Payload could not be obtained fails the *agent*,
@@ -885,7 +933,7 @@ fn spawn_failed(context: &AgentContext, agent_id: &str, error: &WorkerError) -> 
 fn carried_payload(
     payload: Option<&horde_proto::v1::Payload>,
 ) -> Option<&horde_proto::v1::Payload> {
-    payload.filter(|payload| !payload.git_refs.is_empty())
+    payload.filter(|payload| !payload.git_refs.is_empty() || !payload.attachments.is_empty())
 }
 
 /// A lifecycle transition as a journal effect.
@@ -1323,7 +1371,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::Runtime;
+    use super::{Runtime, carried_payload};
     use crate::client::ApplyCommand;
     use crate::error::WorkerError;
     use crate::journal::Journal;
@@ -2495,6 +2543,137 @@ mod tests {
                 .is_file(),
             "the agent's worktree checkout was composed before the harness started"
         );
+        runtime.shutdown().await;
+    }
+
+    /// Only a payload carrying something is worth obtaining: git refs,
+    /// attachments, or both. An attachments-only payload skipped here would
+    /// silently deliver a message naming files that never arrive.
+    #[test]
+    fn a_payload_is_carried_when_it_holds_refs_or_attachments() {
+        use horde_proto::v1::{Attachment, GitRef, Payload};
+        let refs_only = Payload {
+            git_refs: vec![GitRef::default()],
+            attachments: Vec::new(),
+        };
+        let attachments_only = Payload {
+            git_refs: Vec::new(),
+            attachments: vec![Attachment::default()],
+        };
+        let empty = Payload::default();
+
+        assert!(carried_payload(Some(&refs_only)).is_some());
+        assert!(carried_payload(Some(&attachments_only)).is_some());
+        assert!(
+            carried_payload(Some(&empty)).is_none(),
+            "an empty payload obtains nothing"
+        );
+        assert!(carried_payload(None).is_none());
+    }
+
+    /// The receiving half of the attachment seam, through the whole
+    /// runtime: a delivered note's inline attachment becomes a verified
+    /// file under the agent's checkout root before the text reaches it.
+    #[tokio::test]
+    async fn a_delivered_attachment_is_materialized_into_the_agents_checkout() {
+        let temp = tempfile::tempdir().expect("a tempdir");
+        let origin = tiny_origin(temp.path());
+        let workspaces_root = temp.path().join("workspaces");
+        let mut runtime = runtime_with(Script::echoing()).with_workspaces(
+            crate::workspace::WorkspaceManager::new("worker-a", workspaces_root.clone()),
+        );
+        runtime
+            .apply(materialize_command(1, &origin))
+            .await
+            .expect("the materialize applies");
+        runtime
+            .apply(workspace_spawn(2, "agent-1", "ws-1"))
+            .await
+            .expect("the spawn applies");
+        assert_eq!(runtime.running_agents(), 1);
+
+        let content = b"the failing assertion".to_vec();
+        let attachment = horde_proto::v1::Attachment {
+            name: "failing-test.log".to_owned(),
+            blob_digest: horde_proto::blob::BlobDigest::of(&content).to_string(),
+            size_bytes: content.len() as u64,
+            media_type: "text/plain".to_owned(),
+            inline: content.clone(),
+        };
+        let digest_prefix: String = horde_proto::blob::BlobDigest::of(&content)
+            .hex()
+            .chars()
+            .take(12)
+            .collect();
+        runtime
+            .apply(deliver_command(
+                3,
+                "agent-1",
+                deliver_message_command::Body::Note(horde_proto::v1::Note {
+                    text: "see the attached log".to_owned(),
+                    payload: Some(horde_proto::v1::Payload {
+                        git_refs: Vec::new(),
+                        attachments: vec![attachment],
+                    }),
+                }),
+                DeliveryMode::TurnBoundary,
+            ))
+            .await
+            .expect("the delivery applies");
+
+        let materialized = workspaces_root
+            .join("ws-1")
+            .join(".horde-agents")
+            .join("agent-1")
+            .join(crate::blob::ATTACHMENTS_DIR)
+            .join(format!("{digest_prefix}-failing-test.log"));
+        assert_eq!(
+            std::fs::read(&materialized).expect("the attachment file exists"),
+            content,
+            "the file is the verified content, in place before the agent reads the note"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// An attachment for an agent with nowhere to put it fails the agent
+    /// loudly — delivering text that names files nobody materialized would
+    /// be a silent drop with a delayed symptom.
+    #[tokio::test]
+    async fn an_attachment_for_a_checkoutless_agent_fails_the_delivery_honestly() {
+        let (mut runtime, settled) = spawned_echoing_agent().await;
+
+        runtime
+            .apply(deliver_command(
+                2,
+                "agent-1",
+                deliver_message_command::Body::Note(horde_proto::v1::Note {
+                    text: "see the attachment".to_owned(),
+                    payload: Some(horde_proto::v1::Payload {
+                        git_refs: Vec::new(),
+                        attachments: vec![horde_proto::v1::Attachment {
+                            name: "shot.png".to_owned(),
+                            blob_digest: horde_proto::blob::BlobDigest::of(b"px").to_string(),
+                            size_bytes: 2,
+                            media_type: String::new(),
+                            inline: b"px".to_vec(),
+                        }],
+                    }),
+                }),
+                DeliveryMode::TurnBoundary,
+            ))
+            .await
+            .expect("the command applies; the agent is what fails");
+
+        let events = journal_at_least(&runtime, settled + 1).await;
+        let failed = events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+                        && changed.reason.contains("no checkout to receive")
+            )
+        });
+        assert!(failed, "the failure must be journaled with its reason");
         runtime.shutdown().await;
     }
 
