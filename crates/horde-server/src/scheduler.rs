@@ -828,14 +828,22 @@ mod tests {
         }
     }
 
+    /// Registers `worker` holding one spent `personal` account.
+    fn register_spent(harness: &Harness, worker: &str, resets_at_unix_ms: Option<i64>) {
+        let mut spent = capabilities(&[]);
+        spent.provider_accounts = vec![account_with(
+            "personal",
+            Some(spent_window(resets_at_unix_ms)),
+        )];
+        harness.registry.register(worker, spent);
+    }
+
     /// DESIGN §6: the queue reason names the exhausted account, so the
     /// spawner knows which login to top up rather than just "no worker".
     #[test]
     fn a_required_exhausted_account_queues_with_its_name_and_reset() {
         let harness = harness();
-        let mut spent = capabilities(&[]);
-        spent.provider_accounts = vec![account_with("personal", Some(spent_window(Some(5_000))))];
-        harness.registry.register("spent", spent);
+        register_spent(&harness, "spent", Some(5_000));
 
         let constraints = requiring("personal");
         let reason = queued_reason(
@@ -857,9 +865,7 @@ mod tests {
     #[test]
     fn an_exhausted_account_nobody_required_refuses_nothing() {
         let harness = harness();
-        let mut idle = capabilities(&[]);
-        idle.provider_accounts = vec![account_with("personal", Some(spent_window(None)))];
-        harness.registry.register("idle", idle);
+        register_spent(&harness, "idle", None);
 
         assert_eq!(
             placed_on(place_default(&harness)),
@@ -873,9 +879,7 @@ mod tests {
     #[test]
     fn an_exhausted_window_past_its_reset_no_longer_refuses() {
         let harness = harness();
-        let mut spent = capabilities(&[]);
-        spent.provider_accounts = vec![account_with("personal", Some(spent_window(Some(5_000))))];
-        harness.registry.register("spent", spent);
+        register_spent(&harness, "spent", Some(5_000));
 
         let constraints = requiring("personal");
         let request = PlacementRequest {

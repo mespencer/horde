@@ -1272,13 +1272,19 @@ async fn a_quiet_follow_stream_heartbeats_instead_of_going_silent() {
 
 // -- Usage -------------------------------------------------------------------
 
-/// A per-turn usage record as the worker's translation journals it, keyed the
-/// way the real adapter path keys it (`agent:turn:usage`).
-fn usage_event(agent: &str, turn: &str, input_tokens: u64, output_tokens: u64) -> Event {
+/// One `UsageRecorded` event bound to the claude/personal account — the one
+/// shape both the per-turn record and the headroom report share.
+fn usage_recorded(
+    agent: &str,
+    idempotency_key: String,
+    tokens: Option<horde_proto::v1::TokenUsage>,
+    rate_window: Option<horde_proto::v1::RateWindow>,
+    turn_id: &str,
+) -> Event {
     Event {
         agent_id: Some(AgentId::new(agent)),
         occurred_at: None,
-        idempotency_key: format!("{agent}:{turn}:usage"),
+        idempotency_key,
         kind: Some(Kind::UsageRecorded(horde_proto::v1::UsageRecorded {
             record: Some(horde_proto::v1::UsageRecord {
                 binding: Some(horde_proto::v1::ModelBinding {
@@ -1287,44 +1293,45 @@ fn usage_event(agent: &str, turn: &str, input_tokens: u64, output_tokens: u64) -
                     model: "sonnet".to_owned(),
                     provider_account: "personal".to_owned(),
                 }),
-                tokens: Some(horde_proto::v1::TokenUsage {
-                    input_tokens,
-                    output_tokens,
-                    ..horde_proto::v1::TokenUsage::default()
-                }),
-                rate_window: None,
-                turn_id: turn.to_owned(),
+                tokens,
+                rate_window,
+                turn_id: turn_id.to_owned(),
             }),
         })),
     }
 }
 
+/// A per-turn usage record as the worker's translation journals it, keyed the
+/// way the real adapter path keys it (`agent:turn:usage`).
+fn usage_event(agent: &str, turn: &str, input_tokens: u64, output_tokens: u64) -> Event {
+    usage_recorded(
+        agent,
+        format!("{agent}:{turn}:usage"),
+        Some(horde_proto::v1::TokenUsage {
+            input_tokens,
+            output_tokens,
+            ..horde_proto::v1::TokenUsage::default()
+        }),
+        None,
+        turn,
+    )
+}
+
 /// A headroom report: rate-window only, no tokens — the shape the adapters
 /// journal when the provider reports rate-limit state between turns.
 fn headroom_event(agent: &str, used: u64, limit: u64) -> Event {
-    Event {
-        agent_id: Some(AgentId::new(agent)),
-        occurred_at: None,
-        idempotency_key: String::new(),
-        kind: Some(Kind::UsageRecorded(horde_proto::v1::UsageRecorded {
-            record: Some(horde_proto::v1::UsageRecord {
-                binding: Some(horde_proto::v1::ModelBinding {
-                    tier: "standard".to_owned(),
-                    provider: "claude".to_owned(),
-                    model: "sonnet".to_owned(),
-                    provider_account: "personal".to_owned(),
-                }),
-                tokens: None,
-                rate_window: Some(horde_proto::v1::RateWindow {
-                    source: horde_proto::v1::HeadroomSource::ProviderReported as i32,
-                    used: Some(used),
-                    limit: Some(limit),
-                    ..horde_proto::v1::RateWindow::default()
-                }),
-                turn_id: String::new(),
-            }),
-        })),
-    }
+    usage_recorded(
+        agent,
+        String::new(),
+        None,
+        Some(horde_proto::v1::RateWindow {
+            source: horde_proto::v1::HeadroomSource::ProviderReported as i32,
+            used: Some(used),
+            limit: Some(limit),
+            ..horde_proto::v1::RateWindow::default()
+        }),
+        "",
+    )
 }
 
 async fn query_usage_grouped(

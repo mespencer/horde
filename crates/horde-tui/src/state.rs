@@ -1159,30 +1159,23 @@ mod tests {
             super::usage_text(&horde_proto::v1::UsageRecorded::default()),
             ""
         );
-        let unattributed = super::usage_text(&recorded(horde_proto::v1::UsageRecord {
-            binding: None,
-            tokens: Some(horde_proto::v1::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                ..horde_proto::v1::TokenUsage::default()
-            }),
-            rate_window: None,
-            turn_id: String::new(),
-        }));
-        assert_eq!(unattributed, "in 1 out 2");
 
-        let empty_binding = super::usage_text(&recorded(horde_proto::v1::UsageRecord {
-            binding: bound("", ""),
-            tokens: Some(horde_proto::v1::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                ..horde_proto::v1::TokenUsage::default()
-            }),
-            rate_window: None,
-            turn_id: String::new(),
-        }));
+        let spend_under = |binding: Option<horde_proto::v1::ModelBinding>| {
+            super::usage_text(&recorded(horde_proto::v1::UsageRecord {
+                binding,
+                tokens: Some(horde_proto::v1::TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    ..horde_proto::v1::TokenUsage::default()
+                }),
+                rate_window: None,
+                turn_id: String::new(),
+            }))
+        };
+        assert_eq!(spend_under(None), "in 1 out 2");
         assert_eq!(
-            empty_binding, "in 1 out 2",
+            spend_under(bound("", "")),
+            "in 1 out 2",
             "an all-empty binding is unattributed, not `(/)`"
         );
     }

@@ -656,9 +656,8 @@ mod tests {
     fn spawned(parent: Option<&str>, tree_path: &[&str]) -> Kind {
         Kind::AgentSpawned(AgentSpawned {
             parent_agent_id: parent.map(AgentId::new),
-            spawned_by: None,
-            spec: None,
             tree_path: tree_path.iter().map(ToString::to_string).collect(),
+            ..AgentSpawned::default()
         })
     }
 
@@ -934,40 +933,35 @@ mod tests {
         assert_eq!(codex.basis, "no rate window journaled");
     }
 
+    /// Folds one headroom report per session — `(recorded_at, used)` — and
+    /// answers which `used` the account's window ended up holding.
+    fn surviving_window_used(reports: &[(i64, u64)]) -> Option<u64> {
+        let mut fold = UsageFold::new(UsageQuery::grouped_by(Grouping::ProviderAccount));
+        for (index, (recorded_at, used)) in reports.iter().enumerate() {
+            let report = headroom_report(
+                binding("claude", "personal", ""),
+                counted_window(*used, 100),
+            );
+            fold.absorb_session(
+                &format!("s{index}"),
+                &[stored(1, *recorded_at, "a", report)],
+            )
+            .expect("a clean fold");
+        }
+        fold.accounts(0, &BTreeMap::new())
+            .first()
+            .and_then(|account| account.window.as_ref().and_then(|window| window.used))
+    }
+
     #[test]
     fn the_latest_journaled_window_wins_and_ties_go_to_the_later_append() {
-        let early = headroom_report(binding("claude", "personal", ""), counted_window(10, 100));
-        let late = headroom_report(binding("claude", "personal", ""), counted_window(90, 100));
-        let tied = headroom_report(binding("claude", "personal", ""), counted_window(50, 100));
-
-        let mut fold = UsageFold::new(UsageQuery::grouped_by(Grouping::ProviderAccount));
-        fold.absorb_session("s1", &[stored(1, 100, "a", early)])
-            .expect("fold");
-        fold.absorb_session("s2", &[stored(1, 100, "a", tied)])
-            .expect("fold");
-        let accounts = fold.accounts(0, &BTreeMap::new());
         assert_eq!(
-            accounts[0].window.as_ref().and_then(|window| window.used),
+            surviving_window_used(&[(100, 10), (100, 50)]),
             Some(50),
             "same stamp: the later append wins"
         );
-
-        let mut fold = UsageFold::new(UsageQuery::grouped_by(Grouping::ProviderAccount));
-        fold.absorb_session("s1", &[stored(1, 200, "a", late)])
-            .expect("fold");
-        fold.absorb_session(
-            "s2",
-            &[stored(
-                1,
-                100,
-                "a",
-                headroom_report(binding("claude", "personal", ""), counted_window(10, 100)),
-            )],
-        )
-        .expect("fold");
-        let accounts = fold.accounts(0, &BTreeMap::new());
         assert_eq!(
-            accounts[0].window.as_ref().and_then(|window| window.used),
+            surviving_window_used(&[(200, 90), (100, 10)]),
             Some(90),
             "an older-stamped window from another session must not replace a newer one"
         );
