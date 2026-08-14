@@ -1020,6 +1020,7 @@ dependencies = [
  "clap",
  "horde-adapter",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-server",
  "horde-server-testkit",
@@ -1033,6 +1034,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
