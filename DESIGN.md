@@ -151,7 +151,9 @@ Committed to git deliberately (ADR-0002). The unit of sharing is the commit; syn
 - Relay doubles as clone cache and **credential chokepoint**. End state: only the server holds external git credentials; workers' only remote is the relay. Bootstrap phase: workers use ambient machine credentials (ssh-agent, `gh auth`) and advertise reachable remotes as capabilities.
 - Git bundles were considered and dropped entirely (ADR-0002).
 
-**Blob store (server):** content-addressed, for non-code payload attachments (screenshots, binaries, logs, checkpoints). Worker uploads on send, receiver downloads lazily. Lifetime tied to session; GC'd at session deletion; server-configurable size cap.
+**Blob store (server):** content-addressed, for non-code payload attachments (screenshots, binaries, logs, checkpoints). Worker uploads on send, receiver downloads lazily. Lifetime tied to session; GC'd at session deletion; server-configurable size cap. As built (wave 6): SHA-256-addressed files under the state dir, transfer over the mTLS listener behind the enrolled door, integrity verified on upload and on every read; attachments at or under a 64 KiB inline threshold ride in the event itself and the log refuses anything larger inline — events carry blob references and hashes, never bulk (ADR-0001). The size cap shipped as a **per-blob** cap (`--blob-max-bytes`, default 256 MiB).
+
+> **Gap (flagged, not decided): blob deletion.** "GC'd at session deletion" presumes a session-deletion operation and per-session blob ownership records; neither exists — sessions archive (retaining the log), the store records no ownership a collector could act on, and content addressing means one blob may serve many sessions. Until this section decides what may be deleted and when (ownership records, refcounts, or lifetime tied to log retention), the store exposes **no delete at all**: an unreferenced blob wastes disk, but a deleted blob a logged event still references would break replay. The store-wide (as opposed to per-blob) size cap is part of the same gap, since enforcing one requires deciding what to evict.
 
 ## 9. MCP hub
 
