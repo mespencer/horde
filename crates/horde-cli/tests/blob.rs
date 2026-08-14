@@ -6,22 +6,9 @@
 
 mod common;
 
-use clap::Parser;
-use common::Setup;
-use horde_cli::Format;
-use horde_cli::cli::{Cli, run};
+use common::{Setup, invoke};
 use horde_proto::blob::BlobDigest;
 use horde_server_testkit::serve_with_blob_store;
-
-/// Parses an argument vector against a live endpoint and runs it.
-async fn invoke(endpoint: &str, args: &[&str]) -> Setup<()> {
-    let mut argv = vec!["horde", "--endpoint", endpoint];
-    argv.extend_from_slice(args);
-    let cli = Cli::try_parse_from(argv).map_err(|error| format!("{args:?}: {error}"))?;
-    let format = Format::from_flag(cli.json);
-    run(&cli, format).await?;
-    Ok(())
-}
 
 #[tokio::test]
 async fn stash_then_fetch_round_trips_a_file_through_the_store() -> Setup<()> {

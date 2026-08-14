@@ -2303,14 +2303,13 @@ mod tests {
         assert_eq!(second.running_agents(), 1, "the agent lives again");
         let events = journal_at_least(&second, settled + 4).await;
 
-        let revived = events.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentLifecycleChanged(changed))
-                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Starting)
-                        && changed.reason.contains("revived")
-            )
-        });
+        let revived = journaled_lifecycle(
+            &second,
+            settled + 4,
+            horde_proto::v1::AgentLifecycleState::Starting,
+            "revived",
+        )
+        .await;
         assert!(
             revived,
             "the revival is journaled as a lifecycle transition"
@@ -2494,22 +2493,31 @@ mod tests {
         }
     }
 
-    /// The full workspace path through the runtime: materialize journals what
-    /// landed on disk, and the spawn that follows runs in its checkout.
-    #[tokio::test]
-    async fn a_materialize_then_spawn_runs_the_agent_in_its_checkout() {
+    /// A workspace-supporting runtime whose `ws-1` instance is already
+    /// materialized from a fresh tiny origin. The tempdir rides back so the
+    /// checkouts live as long as the test.
+    async fn materialized_runtime(
+        script: Script,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Runtime) {
         let temp = tempfile::tempdir().expect("a tempdir");
         let origin = tiny_origin(temp.path());
         let workspaces_root = temp.path().join("workspaces");
-        let mut runtime =
-            runtime_with(Script::of(vec![ScriptedTurn::saying("hi")])).with_workspaces(
-                crate::workspace::WorkspaceManager::new("worker-a", workspaces_root.clone()),
-            );
-
+        let mut runtime = runtime_with(script).with_workspaces(
+            crate::workspace::WorkspaceManager::new("worker-a", workspaces_root.clone()),
+        );
         runtime
             .apply(materialize_command(1, &origin))
             .await
             .expect("the materialize applies");
+        (temp, workspaces_root, runtime)
+    }
+
+    /// The full workspace path through the runtime: materialize journals what
+    /// landed on disk, and the spawn that follows runs in its checkout.
+    #[tokio::test]
+    async fn a_materialize_then_spawn_runs_the_agent_in_its_checkout() {
+        let (_temp, workspaces_root, mut runtime) =
+            materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
 
         let events = journal_at_least(&runtime, 1).await;
         match events[0]
@@ -2576,16 +2584,7 @@ mod tests {
     /// file under the agent's checkout root before the text reaches it.
     #[tokio::test]
     async fn a_delivered_attachment_is_materialized_into_the_agents_checkout() {
-        let temp = tempfile::tempdir().expect("a tempdir");
-        let origin = tiny_origin(temp.path());
-        let workspaces_root = temp.path().join("workspaces");
-        let mut runtime = runtime_with(Script::echoing()).with_workspaces(
-            crate::workspace::WorkspaceManager::new("worker-a", workspaces_root.clone()),
-        );
-        runtime
-            .apply(materialize_command(1, &origin))
-            .await
-            .expect("the materialize applies");
+        let (_temp, workspaces_root, mut runtime) = materialized_runtime(Script::echoing()).await;
         runtime
             .apply(workspace_spawn(2, "agent-1", "ws-1"))
             .await
@@ -2664,17 +2663,34 @@ mod tests {
             .await
             .expect("the command applies; the agent is what fails");
 
-        let events = journal_at_least(&runtime, settled + 1).await;
-        let failed = events.iter().any(|journaled| {
+        let failed = journaled_lifecycle(
+            &runtime,
+            settled + 1,
+            horde_proto::v1::AgentLifecycleState::Failed,
+            "no checkout to receive",
+        )
+        .await;
+        assert!(failed, "the failure must be journaled with its reason");
+        runtime.shutdown().await;
+    }
+
+    /// Whether the journal (grown to `at_least` events) holds a lifecycle
+    /// transition into `state` whose reason contains `needle` — the shape
+    /// every "did the runtime say why" assertion shares.
+    async fn journaled_lifecycle(
+        runtime: &Runtime,
+        at_least: usize,
+        state: horde_proto::v1::AgentLifecycleState,
+        needle: &str,
+    ) -> bool {
+        let events = journal_at_least(runtime, at_least).await;
+        events.iter().any(|journaled| {
             matches!(
                 journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
                 Some(Kind::AgentLifecycleChanged(changed))
-                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
-                        && changed.reason.contains("no checkout to receive")
+                    if changed.state == i32::from(state) && changed.reason.contains(needle)
             )
-        });
-        assert!(failed, "the failure must be journaled with its reason");
-        runtime.shutdown().await;
+        })
     }
 
     /// The advertisement builder reads workspace support from this accessor,

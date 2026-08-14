@@ -19,6 +19,23 @@ pub use horde_server_testkit::{Setup, journal_event, seed, seeded, serve};
 use horde_cli::Client;
 use horde_proto::v1::DeliveryMode;
 
+/// Parses an argument vector against a live endpoint and runs it through
+/// `cli::run` — the same code the binary runs.
+///
+/// A parse failure is returned rather than panicked: `panic!` is denied
+/// outside `#[test]` functions, and clippy's in-test allowance does not
+/// reach free helpers in an integration test file.
+pub async fn invoke(endpoint: &str, args: &[&str]) -> Setup<()> {
+    use clap::Parser as _;
+    let mut argv = vec!["horde", "--endpoint", endpoint];
+    argv.extend_from_slice(args);
+    let cli =
+        horde_cli::cli::Cli::try_parse_from(argv).map_err(|error| format!("{args:?}: {error}"))?;
+    let format = horde_cli::Format::from_flag(cli.json);
+    horde_cli::cli::run(&cli, format).await?;
+    Ok(())
+}
+
 /// A client wired to its own private server, over a channel the caller built
 /// rather than one [`Client::connect`] dialled.
 ///

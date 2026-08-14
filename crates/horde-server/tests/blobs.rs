@@ -18,6 +18,18 @@ use horde_proto::v1::{
 use horde_server_testkit::secure::{serve_secured_with_blob_store, within};
 use horde_server_testkit::{Setup, journal_event, seeded, serve, serve_with_blob_store};
 
+/// A served store and a blob client against it. The tempdir rides back so
+/// the test owns the store's files — and can corrupt them.
+async fn served_store() -> Setup<(
+    tempfile::TempDir,
+    BlobServiceClient<tonic::transport::Channel>,
+)> {
+    let blob_root = tempfile::tempdir()?;
+    let endpoint = serve_with_blob_store(blob_root.path()).await?;
+    let client = BlobServiceClient::connect(endpoint).await?;
+    Ok((blob_root, client))
+}
+
 /// An attachment carrying `content` inline, addressed honestly.
 fn inline_attachment(name: &str, content: &[u8]) -> Attachment {
     Attachment {
@@ -48,9 +60,7 @@ fn assignment_carrying(agent_id: &str, attachment: Attachment) -> SendMessageReq
 
 #[tokio::test]
 async fn a_blob_round_trips_through_the_service_and_reuploads_idempotently() -> Setup<()> {
-    let blob_root = tempfile::tempdir()?;
-    let endpoint = serve_with_blob_store(blob_root.path()).await?;
-    let mut client = BlobServiceClient::connect(endpoint).await?;
+    let (_blob_root, mut client) = served_store().await?;
 
     // Big enough to cross several chunks, odd-sized so the tail chunk is
     // partial.
@@ -72,9 +82,7 @@ async fn a_blob_round_trips_through_the_service_and_reuploads_idempotently() -> 
 
 #[tokio::test]
 async fn downloading_an_absent_blob_is_not_found() -> Setup<()> {
-    let blob_root = tempfile::tempdir()?;
-    let endpoint = serve_with_blob_store(blob_root.path()).await?;
-    let mut client = BlobServiceClient::connect(endpoint).await?;
+    let (_blob_root, mut client) = served_store().await?;
 
     let absent = BlobDigest::of(b"never uploaded");
     let status = within("the refusal", download_blob(&mut client, &absent))
@@ -87,9 +95,7 @@ async fn downloading_an_absent_blob_is_not_found() -> Setup<()> {
 
 #[tokio::test]
 async fn a_malformed_address_is_refused_before_anything_streams() -> Setup<()> {
-    let blob_root = tempfile::tempdir()?;
-    let endpoint = serve_with_blob_store(blob_root.path()).await?;
-    let mut client = BlobServiceClient::connect(endpoint).await?;
+    let (_blob_root, mut client) = served_store().await?;
 
     let status = within(
         "the refusal",
@@ -108,9 +114,7 @@ async fn a_malformed_address_is_refused_before_anything_streams() -> Setup<()> {
 /// disagree, so nothing may be stored under either name.
 #[tokio::test]
 async fn an_upload_lying_about_its_digest_is_refused_and_stores_nothing() -> Setup<()> {
-    let blob_root = tempfile::tempdir()?;
-    let endpoint = serve_with_blob_store(blob_root.path()).await?;
-    let mut client = BlobServiceClient::connect(endpoint).await?;
+    let (_blob_root, mut client) = served_store().await?;
 
     let declared = BlobDigest::of(b"what was promised");
     let frames = vec![
@@ -152,9 +156,7 @@ async fn an_upload_lying_about_its_digest_is_refused_and_stores_nothing() -> Set
 /// arrive looking whole.
 #[tokio::test]
 async fn a_corrupted_stored_blob_fails_the_download_as_data_loss() -> Setup<()> {
-    let blob_root = tempfile::tempdir()?;
-    let endpoint = serve_with_blob_store(blob_root.path()).await?;
-    let mut client = BlobServiceClient::connect(endpoint).await?;
+    let (blob_root, mut client) = served_store().await?;
 
     let content = b"trusted content".to_vec();
     let stored = within("the upload", upload_blob(&mut client, &content)).await??;

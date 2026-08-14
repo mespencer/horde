@@ -11,24 +11,7 @@
 
 mod common;
 
-use clap::Parser;
-use common::{Setup, serve};
-use horde_cli::Format;
-use horde_cli::cli::{Cli, run};
-
-/// Parses an argument vector against a live endpoint and runs it.
-///
-/// A parse failure is returned rather than panicked: `panic!` is denied outside
-/// `#[test]` functions, and clippy's in-test allowance does not reach free
-/// helpers in an integration test file.
-async fn invoke(endpoint: &str, args: &[&str]) -> Setup<()> {
-    let mut argv = vec!["horde", "--endpoint", endpoint];
-    argv.extend_from_slice(args);
-    let cli = Cli::try_parse_from(argv).map_err(|error| format!("{args:?}: {error}"))?;
-    let format = Format::from_flag(cli.json);
-    run(&cli, format).await?;
-    Ok(())
-}
+use common::{Setup, invoke, serve};
 
 /// Creates a session and returns its id and root agent id.
 async fn seed(endpoint: &str) -> Setup<(String, String)> {
