@@ -537,6 +537,51 @@ mod tests {
         );
     }
 
+    /// The weighted score itself, to the literal value: weight × remaining
+    /// and nothing else. A selection-level test alone cannot pin the
+    /// arithmetic — most wrong formulas still order this pair the same way.
+    #[test]
+    fn the_weighted_score_is_exactly_weight_times_remaining() {
+        let mut scored = option(0, "a", Some(0.25));
+        scored.weight = 2;
+        assert_eq!(super::score_weighted(&scored), 0.5);
+
+        let mut unknown = option(0, "a", None);
+        unknown.weight = 3;
+        assert_eq!(
+            super::score_weighted(&unknown),
+            3.0,
+            "unknown headroom scores as full, times the weight"
+        );
+
+        assert_eq!(
+            super::score_weighted(&option(0, "a", Some(0.7))),
+            0.7,
+            "weight one leaves the remaining fraction untouched"
+        );
+
+        let mut zero = option(0, "a", Some(0.9));
+        zero.weight = 0;
+        assert_eq!(
+            super::score_weighted(&zero),
+            0.0,
+            "a zero weight zeroes the score — multiplied, not added"
+        );
+    }
+
+    /// A pair the wrong operators all misorder: 3 × 0.1 loses to 1 × 0.8,
+    /// but under `+` (3.1 > 1.8), under `/` (30 > 1.25), and under any
+    /// constant score (tie → earlier listing) the heavy option wins instead.
+    #[test]
+    fn a_heavy_weight_cannot_buy_past_multiplied_headroom() {
+        let mut heavy = option(0, "heavy", Some(0.1));
+        heavy.weight = 3; // score 0.3
+        let light = option(1, "light", Some(0.8)); // score 0.8
+        let options = [heavy, light];
+        let picked = select(SelectionStrategy::Weighted, &options).expect("selectable options");
+        assert_eq!(picked.account, "light");
+    }
+
     #[test]
     fn no_strategy_ever_selects_an_exhausted_option() {
         let mut spent = option(0, "spent", Some(0.0));

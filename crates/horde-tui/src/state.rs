@@ -1179,4 +1179,30 @@ mod tests {
             "an all-empty binding is unattributed, not `(/)`"
         );
     }
+
+    /// All four corners of the attribution predicate. The mixed rows are the
+    /// ones `&&` and `||` disagree on, and neither arises from the adapters
+    /// today — a real binding names both halves or neither — so only the
+    /// table can hold the operator.
+    #[test]
+    fn a_half_named_binding_still_attributes() {
+        let account_of =
+            |provider: &str, account: &str| super::account_of(bound(provider, account).as_ref());
+        assert_eq!(
+            account_of("claude", "personal").as_deref(),
+            Some("(claude/personal)")
+        );
+        assert_eq!(
+            account_of("claude", "").as_deref(),
+            Some("(claude/)"),
+            "a provider with no account name is still worth attributing"
+        );
+        assert_eq!(
+            account_of("", "personal").as_deref(),
+            Some("(/personal)"),
+            "an account with no provider is still worth attributing"
+        );
+        assert_eq!(account_of("", ""), None);
+        assert_eq!(super::account_of(None), None);
+    }
 }

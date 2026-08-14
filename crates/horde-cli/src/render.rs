@@ -1194,6 +1194,44 @@ mod usage_tests {
         );
     }
 
+    /// Every source the wire can carry keeps its own JSON word — the
+    /// measured/derived split depends on a script being able to see *whose*
+    /// number a window is, so "horde-metered" collapsing into "unspecified"
+    /// would misattribute Horde's own metering to nobody.
+    #[test]
+    fn every_window_source_keeps_its_own_name_in_json() {
+        let with_source = |source: i32| {
+            let response = QueryUsageResponse {
+                aggregates: Vec::new(),
+                accounts: vec![AccountHeadroom {
+                    window: Some(RateWindow {
+                        source,
+                        ..RateWindow::default()
+                    }),
+                    ..healthy_account()
+                }],
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&usage(&response, UsageGrouping::Account, Format::Json))
+                    .expect("json");
+            parsed["accounts"][0]["measured"]["window"]["source"].clone()
+        };
+
+        assert_eq!(
+            with_source(HeadroomSource::ProviderReported as i32),
+            "provider-reported"
+        );
+        assert_eq!(
+            with_source(HeadroomSource::HordeMetered as i32),
+            "horde-metered"
+        );
+        assert_eq!(
+            with_source(HeadroomSource::Unspecified as i32),
+            "unspecified"
+        );
+        assert_eq!(with_source(887), "unspecified");
+    }
+
     #[test]
     fn an_account_with_no_window_renders_null_rather_than_a_fabricated_one() {
         let response = QueryUsageResponse {

@@ -1334,21 +1334,29 @@ fn headroom_event(agent: &str, used: u64, limit: u64) -> Event {
     )
 }
 
-async fn query_usage_grouped(
+async fn query_usage_scoped(
     harness: &mut Harness,
     group_by: horde_proto::v1::UsageGroupBy,
+    subtree_root: Option<&str>,
 ) -> Result<horde_proto::v1::QueryUsageResponse, tonic::Status> {
     harness
         .control
         .query_usage(horde_proto::v1::QueryUsageRequest {
             session_ids: Vec::new(),
-            subtree_root: None,
+            subtree_root: subtree_root.map(AgentId::new),
             group_by: group_by as i32,
             since: None,
             until: None,
         })
         .await
         .map(tonic::Response::into_inner)
+}
+
+async fn query_usage_grouped(
+    harness: &mut Harness,
+    group_by: horde_proto::v1::UsageGroupBy,
+) -> Result<horde_proto::v1::QueryUsageResponse, tonic::Status> {
+    query_usage_scoped(harness, group_by, None).await
 }
 
 /// The whole reporting path over the wire: a worker journals usage for two
@@ -1444,6 +1452,39 @@ async fn usage_is_folded_from_the_journal_and_a_replay_cannot_double_count() {
         by_agent.aggregates.len(),
         2,
         "two agents spent: {by_agent:?}"
+    );
+
+    // A subtree root narrows attribution to that agent's own spend — the
+    // whole point of tree-level attribution over the wire.
+    let scoped = query_usage_scoped(
+        &mut harness,
+        horde_proto::v1::UsageGroupBy::Session,
+        Some(&agent_id),
+    )
+    .await
+    .expect("the scoped query answers");
+    let scoped_tokens = scoped.aggregates[0].tokens.as_ref().expect("tokens");
+    assert_eq!(
+        (scoped_tokens.input_tokens, scoped_tokens.output_tokens),
+        (10, 5),
+        "the root's spend is outside the second agent's subtree"
+    );
+
+    // An *empty* subtree root means unscoped, not scoped-to-nobody: proto3
+    // cannot tell an omitted id from an empty one, and reading empty as a
+    // real root would silently zero every aggregate.
+    let empty_root = query_usage_scoped(
+        &mut harness,
+        horde_proto::v1::UsageGroupBy::Session,
+        Some(""),
+    )
+    .await
+    .expect("the empty-root query answers");
+    let all_tokens = empty_root.aggregates[0].tokens.as_ref().expect("tokens");
+    assert_eq!(
+        (all_tokens.input_tokens, all_tokens.output_tokens),
+        (110, 45),
+        "an empty root must fold everything, exactly as no root does"
     );
 }
 
