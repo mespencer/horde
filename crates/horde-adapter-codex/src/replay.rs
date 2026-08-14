@@ -10,7 +10,10 @@
 //! the conformance suite's verdict on a replayed session means something about
 //! the live one.
 
-use horde_adapter::{AdapterError, AgentEvent, LineDecoder, ProviderSessionId, Result, ToolCallId};
+use horde_adapter::{
+    AdapterError, AgentEvent, Capability, LineDecoder, PermissionDecision, ProviderSessionId,
+    Result, ToolCallId,
+};
 
 use crate::codec::decode_line;
 use crate::turn::TurnAssembler;
@@ -38,12 +41,41 @@ impl LineDecoder for AppServerFrames {
     }
 
     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {
-        // Codex 0.145.0 routes no approvals to the client at all (ADR-0005), so
-        // there is never an outstanding request to answer — on a recording or
-        // on a live session.
+        // Exec approvals never reach the client (ADR-0005), and an MCP
+        // elicitation that is not outstanding is not answerable either way.
         AdapterError::UnknownPermissionRequest {
             tool_call_id: tool_call_id.clone(),
         }
+    }
+
+    fn answer_permission(
+        &mut self,
+        tool_call_id: &ToolCallId,
+        decision: &PermissionDecision,
+    ) -> Result<()> {
+        // The same two rules a live session applies. A narrowing decision is
+        // refused — the elicitation reply is accept-or-decline with nowhere to
+        // carry replacement arguments — and an answer for a call that is not
+        // waiting is an error, never a no-op.
+        if decision.updated_input().is_some() {
+            return Err(AdapterError::Unsupported {
+                provider: crate::PROVIDER.to_owned(),
+                capability: Capability::RewritesToolInput,
+            });
+        }
+        match self
+            .assembler
+            .resolve_elicitation(tool_call_id, decision.is_allow())
+        {
+            // On a recording there is no wire to write the reply to; the
+            // recorded continuation is the harness's reaction to it.
+            Some(_rpc_id) => Ok(()),
+            None => Err(self.no_permission_channel(tool_call_id)),
+        }
+    }
+
+    fn awaiting_decision(&self) -> Option<ToolCallId> {
+        self.assembler.awaiting_decision()
     }
 }
 
@@ -148,6 +180,68 @@ mod tests {
         assert_eq!(
             session.provider_session_id().map(ToString::to_string),
             Some("t1".to_owned())
+        );
+    }
+
+    /// A replayed elicitation stalls the session until it is answered — the
+    /// same block a live harness imposes — and the stall names the call.
+    #[tokio::test]
+    async fn an_unanswered_elicitation_stalls_the_replay_with_its_name() {
+        let mut session = replay(vec![vec![
+            json!({"method":"thread/started","params":{"thread":{"id":"t1"}}}).to_string(),
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-1"}}}).to_string(),
+            json!({"method":"item/started","params":{"turnId":"turn-1","item":{
+                "type":"mcpToolCall","id":"exec-9","server":"spike","tool":"horde_probe",
+                "status":"inProgress","arguments":{}}}})
+            .to_string(),
+            json!({"id":3,"method":"mcpServer/elicitation/request","params":{
+                "threadId":"t1","turnId":"turn-1","serverName":"spike","mode":"form",
+                "_meta":{"codex_approval_kind":"mcp_tool_call","tool_params":{}},
+                "message":"Allow?","requestedSchema":{"type":"object","properties":{}}}})
+            .to_string(),
+            json!({"method":"turn/completed","params":{"turn":{"id":"turn-1"}}}).to_string(),
+        ]]);
+        session
+            .send(TurnInput::queued("go"))
+            .await
+            .expect("replays");
+
+        // Drain up to the request, bounded by count.
+        let mut asked = false;
+        for _ in 0..8 {
+            match session.next_event().await {
+                Ok(Some(AgentEvent::PermissionRequested { .. })) => {
+                    asked = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(asked, "the recorded elicitation must surface");
+
+        // Polling while owing the answer must stall, naming what is owed —
+        // never read past the block into the recorded continuation.
+        let stalled = session
+            .next_event()
+            .await
+            .expect_err("an unanswered elicitation blocks the replay");
+        assert!(stalled.to_string().contains("exec-9"), "{stalled}");
+
+        // Answering releases the recorded continuation.
+        session
+            .answer_permission(
+                &ToolCallId::new("exec-9"),
+                horde_adapter::PermissionDecision::allow(),
+            )
+            .await
+            .expect("the outstanding request accepts its answer");
+        let events = drain(&mut session).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnded(_))),
+            "the turn closes once the decision landed: {events:?}"
         );
     }
 

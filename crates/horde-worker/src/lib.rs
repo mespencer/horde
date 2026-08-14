@@ -25,6 +25,7 @@
 pub mod capabilities;
 pub mod claude;
 pub mod client;
+pub mod codex;
 pub mod error;
 pub mod journal;
 pub mod process;
@@ -35,6 +36,7 @@ pub mod workspace;
 
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use client::{ApplyCommand, Connection, DialConfig};
+pub use codex::{CodexAdapter, LiveCodexSession};
 pub use error::WorkerError;
 pub use journal::{
     AgentBookkeeping, AgentProgress, CommandApplication, Journal, JournalEntry, JournalSink,

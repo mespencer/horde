@@ -63,15 +63,53 @@ pub trait LineDecoder: Send {
             tool_call_id: tool_call_id.clone(),
         }
     }
+
+    /// Answers a permission request the recording itself surfaced.
+    ///
+    /// The default refuses via [`Self::no_permission_channel`], which is right
+    /// for providers whose approvals ride a side channel recordings never
+    /// capture. A decoder whose *own frames* carry the requests — Codex's MCP
+    /// elicitations arrive on stdout — overrides this so a replayed session
+    /// accepts the answer exactly where a live one would, and the recorded
+    /// continuation stands in for the harness's reaction to it.
+    fn answer_permission(
+        &mut self,
+        tool_call_id: &ToolCallId,
+        decision: &PermissionDecision,
+    ) -> Result<()> {
+        let _ = decision;
+        Err(self.no_permission_channel(tool_call_id))
+    }
+
+    /// The decision this decoder is blocked on, if any.
+    ///
+    /// A decoder whose frames carry permission requests reports the
+    /// outstanding one here, and [`ReplaySession`] then refuses to advance
+    /// past it — the same stall a live harness imposes, surfaced as
+    /// [`AdapterError::AwaitingDecision`] instead of a silent hang. The
+    /// default (`None`) is right for providers whose approvals ride a side
+    /// channel the recording never captures.
+    fn awaiting_decision(&self) -> Option<ToolCallId> {
+        None
+    }
 }
 
 /// An [`AgentSession`] backed by recorded output, one turn per message sent.
+///
+/// Lines are decoded **lazily**, exactly as a live session reads its child's
+/// stdout: a recorded permission request is handed to the caller before the
+/// frames behind it are decoded, so the caller's answer lands while the turn
+/// is still open — and a caller that never answers is stalled with
+/// [`AdapterError::AwaitingDecision`] rather than allowed to read past the
+/// block a live harness would impose.
 #[derive(Debug)]
 pub struct ReplaySession<D: LineDecoder> {
     /// Remaining turns, each a run of lines ending in that provider's terminal
     /// signal for a turn.
     turns: VecDeque<Vec<String>>,
-    /// Events decoded for the turn currently being drained.
+    /// Undecoded lines of the turn in progress.
+    lines: VecDeque<String>,
+    /// Events decoded and not yet handed out.
     pending: VecDeque<AgentEvent>,
     decoder: D,
     session_id: Option<ProviderSessionId>,
@@ -82,6 +120,7 @@ impl<D: LineDecoder> ReplaySession<D> {
     pub fn new(decoder: D, turns: Vec<Vec<String>>) -> Self {
         Self {
             turns: turns.into(),
+            lines: VecDeque::new(),
             pending: VecDeque::new(),
             decoder,
             session_id: None,
@@ -94,12 +133,17 @@ impl<D: LineDecoder> ReplaySession<D> {
         self.turns.len()
     }
 
-    /// Decodes one turn's lines into pending events.
-    fn drain_turn(&mut self, lines: &[String]) -> Result<()> {
-        for line in lines {
-            self.pending.extend(self.decoder.decode(line)?);
+    /// Decodes lines until at least one event is pending or the turn's lines
+    /// run out. Bounded by structure: every iteration consumes a line.
+    fn advance(&mut self) -> Result<()> {
+        while self.pending.is_empty() {
+            let Some(line) = self.lines.pop_front() else {
+                return Ok(());
+            };
+            let events = self.decoder.decode(&line)?;
+            self.pending.extend(events);
+            self.session_id = self.decoder.provider_session_id();
         }
-        self.session_id = self.decoder.provider_session_id();
         Ok(())
     }
 }
@@ -117,19 +161,36 @@ impl<D: LineDecoder> AgentSession for ReplaySession<D> {
         let Some(lines) = self.turns.pop_front() else {
             return Err(AdapterError::HarnessExited { exit_code: None });
         };
-        self.drain_turn(&lines)
+        self.lines.extend(lines);
+        self.advance()
     }
 
     async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
+        // Bounded by structure, not delegation: every pass consumes one line
+        // directly, so the loop cannot outlive the recording no matter what
+        // any helper does.
+        while self.pending.is_empty() {
+            // A live harness would not write another frame while blocked on a
+            // decision; refusing to decode past one keeps the stall real.
+            if let Some(tool_call_id) = self.decoder.awaiting_decision() {
+                return Err(AdapterError::AwaitingDecision { tool_call_id });
+            }
+            let Some(line) = self.lines.pop_front() else {
+                return Ok(None);
+            };
+            let events = self.decoder.decode(&line)?;
+            self.pending.extend(events);
+            self.session_id = self.decoder.provider_session_id();
+        }
         Ok(self.pending.pop_front())
     }
 
     async fn answer_permission(
         &mut self,
         tool_call_id: &ToolCallId,
-        _decision: PermissionDecision,
+        decision: PermissionDecision,
     ) -> Result<()> {
-        Err(self.decoder.no_permission_channel(tool_call_id))
+        self.decoder.answer_permission(tool_call_id, &decision)
     }
 
     async fn interrupt(&mut self) -> Result<()> {
@@ -141,6 +202,7 @@ impl<D: LineDecoder> AgentSession for ReplaySession<D> {
 
     async fn shutdown(&mut self) -> Result<()> {
         self.turns.clear();
+        self.lines.clear();
         self.pending.clear();
         Ok(())
     }
@@ -270,6 +332,49 @@ mod tests {
             .await
             .expect_err("a recording carries no permission channel");
         assert!(error.to_string().contains("toolu_01"), "{error}");
+    }
+
+    /// A decoder blocked on a decision stalls the session with the named
+    /// call, and events already decoded still come out first — reading past
+    /// the block would replay frames a live harness never would have written.
+    #[tokio::test]
+    async fn a_pending_decision_stalls_the_replay_after_the_decoded_events_drain() {
+        #[derive(Debug, Default)]
+        struct Blocked {
+            asked: bool,
+        }
+        impl LineDecoder for Blocked {
+            fn decode(&mut self, line: &str) -> Result<Vec<AgentEvent>> {
+                if line == "ask" {
+                    self.asked = true;
+                }
+                Ok(vec![AgentEvent::SessionEstablished {
+                    provider_session_id: ProviderSessionId::new("s1"),
+                    model: "m".to_owned(),
+                }])
+            }
+            fn provider_session_id(&self) -> Option<ProviderSessionId> {
+                Some(ProviderSessionId::new("s1"))
+            }
+            fn awaiting_decision(&self) -> Option<ToolCallId> {
+                self.asked.then(|| ToolCallId::new("call-9"))
+            }
+        }
+
+        let mut session = ReplaySession::new(
+            Blocked::default(),
+            vec![vec!["ask".to_owned(), "never-reached".to_owned()]],
+        );
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        // The event decoded alongside the request still comes out.
+        assert!(session.next_event().await.expect("an event").is_some());
+        // Then the stall, naming what is owed.
+        let stalled = session
+            .next_event()
+            .await
+            .expect_err("polling while owing an answer must not advance");
+        assert!(stalled.to_string().contains("call-9"), "{stalled}");
     }
 
     #[tokio::test]

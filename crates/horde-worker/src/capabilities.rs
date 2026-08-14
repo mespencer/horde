@@ -143,6 +143,37 @@ mod tests {
         );
     }
 
+    /// The codex advertisement must NOT carry blanket tool-call gating: its
+    /// exec calls cannot be pre-authorized (ADR-0005), and TOOL_CALL_GATING is
+    /// what placement reads as "high-trust work can land here". The MCP-only
+    /// gating stays off the wire until placement can match per call kind.
+    #[test]
+    fn a_registered_codex_adapter_advertises_without_blanket_gating() {
+        let codex = crate::codex::CodexAdapter::new();
+        let capabilities = advertise([&codex as &dyn Adapter], None);
+
+        let harnesses = &capabilities.harnesses;
+        assert_eq!(harnesses.len(), 1);
+        assert_eq!(harnesses[0].provider, "codex");
+        assert!(
+            !harnesses[0]
+                .capabilities
+                .contains(&i32::from(AdapterCapability::ToolCallGating)),
+            "advertising gating would let placement put high-trust exec here"
+        );
+        assert!(
+            harnesses[0]
+                .capabilities
+                .contains(&i32::from(AdapterCapability::Steerable)),
+            "turn/steer is real (transcript 15) and placement may rely on it"
+        );
+        assert!(
+            harnesses[0]
+                .capabilities
+                .contains(&i32::from(AdapterCapability::Resumable))
+        );
+    }
+
     #[test]
     fn the_platform_speaks_the_protos_vocabulary_not_rusts() {
         // The proto documents GOOS/GOARCH-style names; Rust's constants

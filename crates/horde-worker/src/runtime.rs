@@ -985,6 +985,15 @@ fn domain_spec(
             .map(ProviderAccount::new),
         // The MCP endpoint is the sibling increment; wired here when it lands.
         horde_endpoint: None,
+        // The named mode rides to the adapter because for a sandboxed-at-spawn
+        // provider (Codex) it is what the sandbox tier is derived from; empty
+        // means the spawn named none, which must read as absent, not as a mode
+        // called "".
+        permission_mode: spawn
+            .spec
+            .as_ref()
+            .map(|spec| spec.permission_mode.clone())
+            .filter(|mode| !mode.is_empty()),
         provider_options: BTreeMap::new(),
     }
 }
@@ -1902,7 +1911,7 @@ mod tests {
     /// spec would run every agent on the default model under the ambient
     /// account with no overlay, silently.
     #[test]
-    fn the_domain_spec_carries_binding_model_account_and_overlay() {
+    fn the_domain_spec_carries_binding_model_account_overlay_and_mode() {
         let spawn = SpawnAgentCommand {
             binding: Some(horde_proto::v1::ModelBinding {
                 tier: String::new(),
@@ -1911,6 +1920,10 @@ mod tests {
                 provider_account: "work".to_owned(),
             }),
             prompt_overlay: "be brief".to_owned(),
+            spec: Some(horde_proto::v1::AgentSpec {
+                permission_mode: "cautious".to_owned(),
+                ..horde_proto::v1::AgentSpec::default()
+            }),
             ..SpawnAgentCommand::default()
         };
 
@@ -1921,6 +1934,11 @@ mod tests {
             Some(horde_adapter::ProviderAccount::new("work"))
         );
         assert_eq!(spec.append_system_prompt.as_deref(), Some("be brief"));
+        assert_eq!(
+            spec.permission_mode.as_deref(),
+            Some("cautious"),
+            "the mode is what a sandboxed-at-spawn provider derives its tier from"
+        );
     }
 
     /// The empty-string cases are decisions, not accidents: an empty model or
@@ -1933,6 +1951,10 @@ mod tests {
         assert_eq!(
             spec.append_system_prompt, None,
             "no overlay is no flag at all, not an empty one"
+        );
+        assert_eq!(
+            spec.permission_mode, None,
+            "an empty mode name is a spawn that named none, not a mode called \"\""
         );
     }
 

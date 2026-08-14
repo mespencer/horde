@@ -1,0 +1,5 @@
+{"dir": "in", "t": 1786658391.576, "msg": {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {"form": {}, "url": {}}}, "clientInfo": {"name": "codex-mcp-client", "title": "Codex", "version": "0.147.0"}}}}
+{"dir": "out", "t": 1786658391.576, "msg": {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "horde-mcp-stub", "version": "0.1.0"}}}}
+{"dir": "in", "t": 1786658391.576, "msg": {"jsonrpc": "2.0", "method": "notifications/initialized"}}
+{"dir": "in", "t": 1786658391.577, "msg": {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {"progressToken": 0}}}}
+{"dir": "out", "t": 1786658391.577, "msg": {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "horde_probe", "description": "Echoes the token argument back, prefixed with PROBE:.", "inputSchema": {"type": "object", "properties": {"token": {"type": "string"}}, "required": ["token"]}}]}}}

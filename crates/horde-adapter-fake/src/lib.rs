@@ -103,12 +103,16 @@ impl FakeAdapter {
             provider_session_id,
             announced: false,
             turns_taken,
+            // The script resumes where the conversation left off, and turn
+            // numbering continues from the same point — the two counters only
+            // diverge when a steer amends a turn mid-script.
+            script_cursor: turns_taken,
             pending: VecDeque::new(),
             steps: VecDeque::new(),
             current: None,
             waiting_on: None,
             denials: Vec::new(),
-            chunk_counters: Vec::new(),
+            chunk_counters: horde_adapter::ChunkCounters::new(),
             cumulative_tokens: TokenUsage::default(),
             cumulative_cost: 0.0,
             usage: UsageAccumulator::new(),
@@ -182,12 +186,18 @@ pub struct FakeSession {
     provider_session_id: ProviderSessionId,
     announced: bool,
     turns_taken: u64,
+    /// Which scripted turn the next send consumes. Distinct from
+    /// [`Self::turns_taken`] because an *amending* send (steering) consumes a
+    /// script entry without opening a new turn — the real providers that
+    /// steer (Codex, transcript 15) keep the turn id and Horde's turn-id
+    /// contract holds the fake to the same shape.
+    script_cursor: u64,
     pending: VecDeque<AgentEvent>,
     steps: VecDeque<Step>,
     current: Option<CurrentTurn>,
     waiting_on: Option<ToolCallId>,
     denials: Vec<PermissionDenial>,
-    chunk_counters: Vec<(OutputChannel, u64)>,
+    chunk_counters: horde_adapter::ChunkCounters,
     cumulative_tokens: TokenUsage,
     cumulative_cost: f64,
     usage: UsageAccumulator,
@@ -203,21 +213,7 @@ impl FakeSession {
         if self.misbehaviour == Some(Misbehaviour::RepeatChunkIndex) {
             return 0;
         }
-        match self
-            .chunk_counters
-            .iter_mut()
-            .find(|(known, _)| *known == channel)
-        {
-            Some((_, next)) => {
-                let index = *next;
-                *next = next.saturating_add(1);
-                index
-            }
-            None => {
-                self.chunk_counters.push((channel, 1));
-                0
-            }
-        }
+        self.chunk_counters.next(channel)
     }
 
     fn emit_output(&mut self, channel: OutputChannel, text: String) {
@@ -286,6 +282,113 @@ impl FakeSession {
     /// Cuts the rest of the turn in flight, leaving it to end as
     /// [`TurnStatus::Interrupted`] — an interrupt is a way for a turn to end,
     /// not a way to skip ending it.
+    /// The next scripted turn, honouring the exhaustion policy.
+    fn take_scripted_turn(&mut self, input_text: &str) -> Result<ScriptedTurn> {
+        let scripted = usize::try_from(self.script_cursor)
+            .ok()
+            .and_then(|index| self.script.turns.get(index))
+            .cloned();
+
+        let turn = match scripted {
+            Some(turn) => turn,
+            None => match self.script.exhausted {
+                Exhausted::Echo => ScriptedTurn::saying(input_text.to_owned()),
+                Exhausted::Exit => {
+                    self.finished = true;
+                    return Err(AdapterError::HarnessExited { exit_code: Some(0) });
+                }
+            },
+        };
+        self.script_cursor = self.script_cursor.saturating_add(1);
+        Ok(turn)
+    }
+
+    /// What a send does about a turn already in flight.
+    ///
+    /// `Ok(None)` means the message amended the active turn (steering — the
+    /// transcript-15 shape: same turn id, more steps, the amendment's text
+    /// becomes the turn's answer, and the chunk counters keep running).
+    /// `Ok(Some(turn))` means a fresh turn should open — either nothing was
+    /// in flight, or an interrupt delivery just closed what was (the aborted
+    /// turn ends first, with no answer, ahead of the new turn's events).
+    fn settle_turn_in_flight(
+        &mut self,
+        delivery: horde_adapter::Delivery,
+        turn: ScriptedTurn,
+    ) -> Result<Option<ScriptedTurn>> {
+        if self.current.is_none() {
+            return Ok(Some(turn));
+        }
+        match delivery {
+            horde_adapter::Delivery::TurnBoundary => {
+                if !self.capabilities.supports(Capability::AmendActiveTurn) {
+                    // A provider without the capability never sees a mid-turn
+                    // send — the orchestrator holds the message — so receiving
+                    // one is a caller bug to refuse, never a turn to silently
+                    // clobber.
+                    return Err(AdapterError::Unsupported {
+                        provider: self.provider.clone(),
+                        capability: Capability::AmendActiveTurn,
+                    });
+                }
+                if let Some(current) = self.current.as_mut() {
+                    current.text = turn.text;
+                    current.tokens += turn.usage;
+                    current.cost_usd += turn.cost_usd;
+                }
+                self.steps.extend(turn.steps);
+                Ok(None)
+            }
+            horde_adapter::Delivery::Interrupt => {
+                self.cut_turn();
+                self.end_turn();
+                Ok(Some(turn))
+            }
+        }
+    }
+
+    /// Opens `turn` as the one in flight.
+    fn open_turn(&mut self, turn: ScriptedTurn) {
+        self.turns_taken = self.turns_taken.saturating_add(1);
+        self.chunk_counters.reset();
+        self.steps = turn.steps.into();
+        self.current = Some(CurrentTurn {
+            turn_id: self.turn_id(),
+            text: turn.text,
+            status: turn.status,
+            tokens: turn.usage,
+            cost_usd: turn.cost_usd,
+        });
+    }
+
+    /// Announces the session id once — or per-turn, for the misbehaviour that
+    /// checks the conformance suite notices a renamed session.
+    fn announce(&mut self) {
+        match self.misbehaviour {
+            Some(Misbehaviour::SkipSessionEstablished) => {}
+            Some(Misbehaviour::ChangeSessionIdMidConversation) => {
+                // A different name every turn, so revival would target the
+                // wrong conversation.
+                self.announced = true;
+                self.provider_session_id =
+                    ProviderSessionId::new(format!("fake-session-{}", self.turns_taken));
+                self.pending.push_back(AgentEvent::SessionEstablished {
+                    provider_session_id: self.provider_session_id.clone(),
+                    model: "fake-model".to_owned(),
+                });
+            }
+            _ => {
+                if !self.announced {
+                    self.announced = true;
+                    self.pending.push_back(AgentEvent::SessionEstablished {
+                        provider_session_id: self.provider_session_id.clone(),
+                        model: "fake-model".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
     fn cut_turn(&mut self) {
         self.steps.clear();
         self.waiting_on = None;
@@ -347,67 +450,13 @@ impl AgentSession for FakeSession {
             return Err(AdapterError::HarnessExited { exit_code: Some(0) });
         }
 
-        // An interrupting message aborts any turn in flight *first*, and that
-        // turn still closes: exactly one `TurnEnded`, carrying `Interrupted`,
-        // queued ahead of the new turn's events. This is what the live Claude
-        // adapter's control message does, so the fake must do it too or every
-        // steering test measured against it exercises nothing.
-        if input.delivery == horde_adapter::Delivery::Interrupt && self.current.is_some() {
-            self.cut_turn();
-            self.end_turn();
-        }
-
-        let scripted = usize::try_from(self.turns_taken)
-            .ok()
-            .and_then(|index| self.script.turns.get(index))
-            .cloned();
-
-        let turn = match scripted {
-            Some(turn) => turn,
-            None => match self.script.exhausted {
-                Exhausted::Echo => ScriptedTurn::saying(input.text.clone()),
-                Exhausted::Exit => {
-                    self.finished = true;
-                    return Err(AdapterError::HarnessExited { exit_code: Some(0) });
-                }
-            },
+        let turn = self.take_scripted_turn(&input.text)?;
+        let Some(turn) = self.settle_turn_in_flight(input.delivery, turn)? else {
+            // The message amended the active turn; nothing new opens.
+            return Ok(());
         };
-
-        self.turns_taken = self.turns_taken.saturating_add(1);
-        self.chunk_counters.clear();
-        self.steps = turn.steps.into();
-        self.current = Some(CurrentTurn {
-            turn_id: self.turn_id(),
-            text: turn.text,
-            status: turn.status,
-            tokens: turn.usage,
-            cost_usd: turn.cost_usd,
-        });
-
-        match self.misbehaviour {
-            Some(Misbehaviour::SkipSessionEstablished) => {}
-            Some(Misbehaviour::ChangeSessionIdMidConversation) => {
-                // A different name every turn, so revival would target the
-                // wrong conversation.
-                self.announced = true;
-                self.provider_session_id =
-                    ProviderSessionId::new(format!("fake-session-{}", self.turns_taken));
-                self.pending.push_back(AgentEvent::SessionEstablished {
-                    provider_session_id: self.provider_session_id.clone(),
-                    model: "fake-model".to_owned(),
-                });
-            }
-            _ => {
-                if !self.announced {
-                    self.announced = true;
-                    self.pending.push_back(AgentEvent::SessionEstablished {
-                        provider_session_id: self.provider_session_id.clone(),
-                        model: "fake-model".to_owned(),
-                    });
-                }
-            }
-        }
-
+        self.open_turn(turn);
+        self.announce();
         Ok(())
     }
 
@@ -533,14 +582,7 @@ mod harness {
     /// A spec with nothing configured: what a test asks for when it cares about
     /// the script rather than the spawn.
     pub(crate) fn spec() -> AgentSpec {
-        AgentSpec {
-            model: None,
-            append_system_prompt: None,
-            cwd: None,
-            account: None,
-            horde_endpoint: None,
-            provider_options: std::collections::BTreeMap::new(),
-        }
+        AgentSpec::default()
     }
 
     /// A script that asks permission for `call-1`, then takes a turn saying
@@ -875,6 +917,169 @@ mod permission_path_tests {
         assert!(
             matches!(after, Some(AgentEvent::ToolCompleted { .. })),
             "then the call completes, got {after:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steering_tests {
+    use horde_adapter::{AgentEvent, Capabilities, Capability, TurnInput, TurnStatus};
+
+    use super::FakeAdapter;
+    use super::harness::started_on;
+    use crate::{Script, ScriptedTurn};
+
+    /// The turn endings among `events`, in order.
+    fn endings(events: &[AgentEvent]) -> Vec<&horde_adapter::TurnOutcome> {
+        let mut endings = Vec::new();
+        for event in events {
+            if let AgentEvent::TurnEnded(outcome) = event {
+                endings.push(outcome);
+            }
+        }
+        endings
+    }
+
+    /// Drains everything currently available without blocking on a stall.
+    async fn drain(session: &mut Box<dyn horde_adapter::AgentSession>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = session.next_event().await {
+            events.push(event);
+            if events.len() > 64 {
+                break;
+            }
+        }
+        events
+    }
+
+    /// A mid-turn send on an amending provider is a steer: one turn, one
+    /// ending, and the answer is the answer to the steer — the same shape
+    /// codex's transcript 15 pins on the real adapter.
+    #[tokio::test]
+    async fn a_mid_turn_send_amends_the_active_turn() {
+        let mut session = started_on(FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("FIRST").with_usage(
+                horde_adapter::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..horde_adapter::TokenUsage::default()
+                },
+                0.5,
+            ),
+            ScriptedTurn::saying("STEERED").with_usage(
+                horde_adapter::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                    ..horde_adapter::TokenUsage::default()
+                },
+                0.25,
+            ),
+        ])))
+        .await;
+
+        // The first turn is open (its steps unplayed); steer into it.
+        session
+            .send(TurnInput::queued("actually, do this instead"))
+            .await
+            .expect("an amending provider accepts a mid-turn send");
+
+        let events = drain(&mut session).await;
+        let endings = endings(&events);
+        assert_eq!(
+            endings.len(),
+            1,
+            "steering amends the turn; it must not open a second one: {events:?}"
+        );
+        assert_eq!(
+            endings[0].text.as_deref(),
+            Some("STEERED"),
+            "the turn's answer is the answer to the steer"
+        );
+        assert_eq!(
+            endings[0].usage.tokens.input_tokens, 17,
+            "an amended turn consumed both halves' work, so it bills both"
+        );
+        assert_eq!(endings[0].usage.tokens.output_tokens, 5);
+        assert!(
+            (endings[0].usage.cost_usd - 0.75).abs() < f64::EPSILON,
+            "and both halves' cost: {}",
+            endings[0].usage.cost_usd
+        );
+
+        // And every event of the amended turn carries one turn id.
+        let mut ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Output { turn_id, .. } => Some(turn_id.clone()),
+                AgentEvent::TurnEnded(outcome) => Some(outcome.turn_id.clone()),
+                _ => None,
+            })
+            .collect();
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "one turn, one id: {ids:?}");
+    }
+
+    /// A provider without `AmendActiveTurn` never legitimately receives a
+    /// mid-turn send — the orchestrator holds the message — so the fake must
+    /// refuse rather than silently clobber the open turn.
+    #[tokio::test]
+    async fn a_mid_turn_send_without_the_capability_is_refused() {
+        let mut session = started_on(
+            FakeAdapter::new(Script::of(vec![
+                ScriptedTurn::saying("open"),
+                ScriptedTurn::saying("never reached"),
+            ]))
+            .with_capabilities(Capabilities::none().with(Capability::InterruptibleTurn)),
+        )
+        .await;
+
+        let refused = session.send(TurnInput::queued("mid-turn")).await;
+        assert!(
+            refused.is_err(),
+            "an open turn must not be silently replaced"
+        );
+        assert!(
+            refused
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+                .contains("AmendActiveTurn"),
+            "the refusal names what is missing"
+        );
+    }
+
+    /// An interrupt delivery mid-turn ends the cancelled turn first — with no
+    /// answer — and the message then runs as its own turn.
+    #[tokio::test]
+    async fn an_interrupt_delivery_closes_the_turn_then_runs_its_own() {
+        let mut session = started_on(FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("doomed work"),
+            ScriptedTurn::saying("REPLACEMENT"),
+        ])))
+        .await;
+
+        session
+            .send(TurnInput::interrupting("stop, do this"))
+            .await
+            .expect("an interrupting send is accepted");
+
+        let events = drain(&mut session).await;
+        let endings = endings(&events);
+        assert_eq!(
+            endings.len(),
+            2,
+            "the cancelled turn and the new one both end"
+        );
+        assert_eq!(endings[0].status, TurnStatus::Interrupted);
+        assert_eq!(
+            endings[0].text, None,
+            "a cancelled turn has no answer, even though one was scripted"
+        );
+        assert_eq!(endings[1].status, TurnStatus::Completed);
+        assert_eq!(endings[1].text.as_deref(), Some("REPLACEMENT"));
+        assert_ne!(
+            endings[0].turn_id, endings[1].turn_id,
+            "the replacement is its own turn"
         );
     }
 }

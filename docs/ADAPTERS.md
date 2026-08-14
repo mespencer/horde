@@ -10,8 +10,14 @@ to test against one without a provider login. The design rationale is
 |---|---|
 | `horde-adapter` | The `Adapter`/`AgentSession` trait pair and the domain vocabulary every provider is normalized into. No I/O, no provider knowledge. |
 | `horde-adapter-claude` | Claude Code's `stream-json` protocol as a pure codec: wire types, turn assembly, usage normalization, and the `--permission-prompt-tool` payloads. |
+| `horde-adapter-codex` | Codex's `app-server` JSON-RPC protocol as a pure codec: wire types, turn assembly, usage idempotence, the MCP-elicitation permission seam, and the sandbox-tier policy. |
 | `horde-adapter-fake` | A scripted harness — a real alternate backend, not a mock — for orchestration tests. |
 | `horde-testkit` | Golden-transcript loading and the shared conformance suite. |
+
+The live halves — process supervision, stdio, account isolation — live in
+`horde-worker` (`claude.rs`, `codex.rs` over `process.rs`), tested against the
+`stub-harness` and `codex-stub-harness` binaries so the suite spawns real
+processes without a login or a token.
 
 ## The seam
 
@@ -43,18 +49,23 @@ on someone else's phone.
 Providers differ in ways that change what Horde may safely do with them, so
 capability flags are values, not doc comments.
 
-The load-bearing one is `PreAuthorizeToolCalls`: whether Horde sees a proposed
-tool call **before** it runs. Claude Code has it (spike W1c). Codex 0.145.0 does
-**not** — spike W2c found that across six configurations no client-facing
-approval request ever arrived, because the two features that would route them
-are under development and off. Codex adjudicates against its own sandbox tiers
-and tells the client afterwards.
+The load-bearing pair is `PreAuthorizeToolCalls` and its scoped sibling
+`PreAuthorizeMcpToolCalls`: whether Horde sees a proposed tool call **before**
+it runs, and for which kinds. Claude Code has the broad claim (spike W1c).
+Codex has the scoped one — since the ADR-0005 amendment (measured again for
+W5b, transcripts 17–18), every **MCP** tool call is routed through a
+client-facing elicitation before a byte reaches the MCP server, while
+**shell/exec** remains adjudicated internally against the sandbox tier: the
+two routing feature flags are still off at 0.147.0.
 
-Ask `Capabilities::permission_enforcement()` rather than reading flags yourself:
+Ask `Capabilities::permission_enforcement_for(kind)` rather than reading flags
+yourself; the kind-blind `permission_enforcement()` answers with the **floor**
+across kinds, so a provider gated only for MCP can never be treated as safe
+for high-trust exec:
 
 | Answer | Meaning |
 |---|---|
-| `PerCall` | Every proposed call is offered to Horde first; the full chain of DESIGN.md §10 applies. |
+| `PerCall` | Every proposed call of this kind is offered to Horde first; the full chain of DESIGN.md §10 applies. |
 | `SandboxAtSpawn` | The harness polices itself against a tier Horde chose at spawn and reports afterwards. Constrainable, not adjudicable — a high-trust assignment does not belong here. |
 | `Unenforced` | Tool calls run unobserved; only placement and the workspace limit the blast radius. |
 
@@ -130,6 +141,32 @@ session merges two inbound channels. Both stdio and HTTP MCP servers work, and
 the harness will wait — a 180-second stall was answered with no timeout, which is
 what makes the human-approval layer viable.
 
+For Codex the prompts arrive **on stdout**, as `mcpServer/elicitation/request`
+server requests, and only for MCP tool calls. Three measured facts shape the
+adapter (transcripts 17–19):
+
+- The reply's field is `action` (`accept`/`decline`) — an MCP elicitation
+  result, not the `decision` shape codex's exec approvals use. There is
+  nowhere to carry a deny message (the agent sees the fixed string "user
+  rejected MCP tool call") and nowhere to carry replacement arguments, which
+  is why codex does not claim `RewritesToolInput`.
+- The elicitation names the server but **not the tool**; the
+  `item/started [mcpToolCall]` frame just before it carries the tool's name,
+  arguments, and the id everything correlates by. The assembler does that
+  join.
+- Threads must be started with the granular
+  `approvalPolicy: {granular: {mcp_elicitations: true, …}}` — under plain
+  `"on-request"` nothing is routed and the thread parks at
+  `waitingOnApproval` forever. The same finding generalizes: **every** server
+  request must be answered, so the live session refuses anything it cannot
+  adjudicate (deny-by-default) rather than leaving it pending.
+
+For exec, Codex's enforcement is the **sandbox tier chosen at spawn**. The
+worker derives it from the agent's permission-mode name through a configured
+`SandboxPolicy` — unknown and absent modes fail closed to `read-only`,
+`danger-full-access` is unrepresentable — and journals the choice and its
+reason on the agent's first turn as a `HarnessDiagnostic` chunk.
+
 ## Testing against an adapter
 
 Use `FakeAdapter` for anything about orchestration. It is a real implementation
@@ -173,32 +210,54 @@ a real harness forces), and its permission steps genuinely block the turn.
 
 ## Golden transcripts
 
-`docs/spikes/transcripts/` holds real recorded `claude` sessions from spike W1c.
-`ReplaySession` drives the Claude codec from them, so everything above the
-transport runs exactly as it would live — the production adapter swaps the line
-source for a child process's stdout and keeps the rest.
+`docs/spikes/transcripts/` holds real recorded `claude` sessions from spike
+W1c; `docs/spikes/codex-app-server/transcripts/` holds the `codex app-server`
+sessions from spike W2c plus the W5b elicitation captures (17–19).
+`ReplaySession` drives each codec from them, so everything above the transport
+runs exactly as it would live — the production adapters swap the line source
+for a child process's stdout and keep the rest. Replay is **lazy** and stalls
+on an unanswered permission request exactly as a live harness would, which is
+what lets the recorded elicitation sessions run under the conformance suite
+with real answers.
 
-Adding a transcript to that directory automatically enrols it in the conformance
-suite; nothing needs listing by hand.
+Adding a claude transcript to its directory automatically enrols it in the
+conformance suite; codex recordings are enrolled by the decode-everything test
+in `horde-adapter-codex/tests/conformance.rs`.
 
 Recordings can only prove the codec matched the CLI on the day they were taken.
-`tests/live_smoke.rs` drives the **real** binary and is `#[ignore]`d, so it never
-runs in a normal suite:
+The `live_smoke` tests drive the **real** binaries and are `#[ignore]`d, so
+they never run in a normal suite:
 
 ```sh
 cargo test -p horde-adapter-claude --test live_smoke -- --ignored --nocapture
+cargo test -p horde-adapter-codex  --test live_smoke -- --ignored --nocapture
+cargo test -p horde-worker         --test live_smoke -- --ignored --nocapture
 ```
 
-Run it when bumping the supported CLI version. If it fails, capture a fresh
+Run them when bumping a supported CLI version. If one fails, capture a fresh
 transcript rather than loosening the parser to accept both shapes.
 
 ## Revival identity
 
-A session id alone cannot revive a Claude agent. Sessions live *inside*
-`CLAUDE_CONFIG_DIR`, so `RevivalIdentity` pairs the id with the account
-directory it was recorded under, and `is_resumable_under` refuses a mismatch
-instead of surfacing an authentication error that looks like an outage. Journal
-both halves together.
+A session id alone cannot revive an agent. Sessions live *inside* the account
+directory — `CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex (which
+holds credentials *and* the rollout files threads persist in) — so
+`RevivalIdentity` pairs the id with the directory it was recorded under, and
+`is_resumable_under` refuses a mismatch instead of surfacing an authentication
+error that looks like an outage. Journal both halves together.
+
+Codex adds one revival trap the codec absorbs: `thread/resume` replays the
+prior turn's `thread/tokenUsage/updated` before the new turn's, so usage is
+deduplicated per turn or every revival double-bills (transcript 16).
+
+## The Codex MCP endpoint rides `-c`, not `config.toml`
+
+An agent's Horde MCP endpoint reaches codex as per-process
+`-c mcp_servers.horde.…` overrides on the `app-server` command line.
+Deliberately never a `config.toml` write: `CODEX_HOME` is shared by every
+agent on the same Provider Account, and a config write from one spawn would
+race every concurrent one — on top of codex already writing to that file
+outside Horde's control (project trust, ADR-0005).
 
 The Worker journals a third fact beside those two: **how many turns the
 conversation has taken.** Turn ids are `{session}#{ordinal}` and journal
@@ -239,11 +298,17 @@ agent's stdin.
 
 ## Not here yet
 
-The MCP endpoint that carries permission prompts is still to be wired into
-the spawn (`permission_prompt_tool` is a constructor seam). When it is, the
-Claude adapter already passes `--settings` with empty allow/deny lists and
-`--permission-mode manual` alongside it, because ambient settings allowlists
-decide a call before the permission tool ever sees it (ADR-0003, re-verified
-2026-08-11). Whether the pump should ever use `AmendActiveTurn` (deliver into
-a running turn on providers that support it) instead of boundary queueing is
-deliberately left to the Codex adapter's productionization.
+The MCP endpoint that carries Claude's permission prompts is still to be
+wired into the spawn (`permission_prompt_tool` is a constructor seam). When it
+is, the Claude adapter already passes `--settings` with empty allow/deny lists
+and `--permission-mode manual` alongside it, because ambient settings
+allowlists decide a call before the permission tool ever sees it (ADR-0003,
+re-verified 2026-08-11). The Codex adapter needs no such merge: its permission
+requests arrive on stdout as elicitations.
+
+The AmendActiveTurn question that was left to the Codex productionization is
+now answered inside the adapter rather than the pump: a `LiveCodexSession`
+that receives a turn-boundary send while a turn is active steers it
+(`turn/steer`, falling back to `turn/start` when the steer loses its race),
+so the pump's boundary queueing remains the provider-agnostic default and
+codex simply does something better with the same call.

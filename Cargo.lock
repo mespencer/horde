@@ -1198,6 +1198,7 @@ dependencies = [
  "async-trait",
  "horde-adapter",
  "horde-adapter-claude",
+ "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-identity",
  "horde-proto",

@@ -47,6 +47,15 @@ pub struct AgentSpec {
     /// and permission prompts (DESIGN.md §5).
     pub horde_endpoint: Option<McpEndpoint>,
 
+    /// The named permission mode the agent runs under (DESIGN.md §10).
+    ///
+    /// Provider-agnostic on purpose, but providers consume it differently:
+    /// the chain itself is evaluated server-side, while an adapter whose
+    /// enforcement is a spawn-time sandbox tier (Codex, ADR-0005) derives the
+    /// tier from this name. `None` means the spawn named no mode, which every
+    /// consumer must treat as its most conservative case.
+    pub permission_mode: Option<String>,
+
     /// Escape hatch for provider-specific settings. Adapters ignore keys they
     /// do not understand.
     pub provider_options: BTreeMap<String, String>,

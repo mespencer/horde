@@ -47,12 +47,18 @@
 pub mod codec;
 pub mod identity;
 pub mod replay;
+pub mod sandbox;
 pub mod turn;
 pub mod wire;
 
-pub use codec::{decode_line, encode_interrupt, encode_steer, encode_turn_start};
+pub use codec::{
+    ThreadConfig, decode_line, encode_decision_decline, encode_elicitation_response,
+    encode_initialize, encode_initialized, encode_interrupt, encode_method_not_found, encode_steer,
+    encode_thread_resume, encode_thread_start, encode_turn_start,
+};
 pub use identity::RevivalIdentity;
 pub use replay::{ReplaySession, replay};
+pub use sandbox::{SandboxPolicy, SandboxTier, TierChoice};
 pub use turn::TurnAssembler;
 
 use horde_adapter::{Capabilities, Capability};
@@ -60,19 +66,27 @@ use horde_adapter::{Capabilities, Capability};
 /// The adapter key for Codex, matching `horde.v1.ConcreteModel.provider`.
 pub const PROVIDER: &str = "codex";
 
-/// What Codex supports, as measured by spike W2c against codex-cli 0.145.0.
+/// What Codex supports, as measured by spike W2c against codex-cli 0.145.0 and
+/// re-measured for MCP interception at 0.147.0 (transcripts 17–19).
 ///
 /// The absence of [`Capability::PreAuthorizeToolCalls`] is the load-bearing
-/// claim, not an oversight. Six configurations — including explicitly enabling
-/// `exec_permission_approvals` and `request_permissions_tool` — produced zero
-/// client-facing approval requests, because both features are under development
-/// and off by default. Codex adjudicates against its own sandbox tiers and
-/// tells the client afterwards, which is why
-/// [`Capability::SandboxTierAtSpawn`] is claimed instead: that is the honest
-/// description of what containment Codex actually offers (ADR-0005).
+/// claim, not an oversight. For **shell/exec**, six configurations — including
+/// explicitly enabling `exec_permission_approvals` and
+/// `request_permissions_tool` — produced zero client-facing approval requests
+/// (both flags re-checked, still off at 0.147.0). Codex adjudicates those
+/// against its own sandbox tiers and tells the client afterwards, which is why
+/// [`Capability::SandboxTierAtSpawn`] is claimed instead.
 ///
-/// Consequently [`Capability::RewritesToolInput`] is absent too — arguments
-/// cannot be rewritten by a chain that never sees the call.
+/// For **MCP tool calls** the ADR-0005 amendment reversed that finding:
+/// every one is routed through `mcpServer/elicitation/request` *before* a byte
+/// reaches the MCP server, so [`Capability::PreAuthorizeMcpToolCalls`] — the
+/// per-call-kind claim — is honestly held. The broad claim still is not, and
+/// `permission_enforcement()` (the kind-blind floor) still reads
+/// `SandboxAtSpawn`.
+///
+/// [`Capability::RewritesToolInput`] stays absent: the elicitation reply is
+/// accept-or-decline, with nowhere to carry replacement arguments, so a
+/// narrowing decision must be refused rather than silently widened.
 #[must_use]
 pub fn capabilities() -> Capabilities {
     Capabilities::none()
@@ -83,6 +97,7 @@ pub fn capabilities() -> Capabilities {
         // Transcript 15 is the evidence — same turn id start to finish, two
         // final answers inside it.
         .with(Capability::AmendActiveTurn)
+        .with(Capability::PreAuthorizeMcpToolCalls)
         .with(Capability::SandboxTierAtSpawn)
         .with(Capability::ReportsHeadroom)
         .with(Capability::SystemPromptOverlay)
@@ -101,33 +116,50 @@ mod tests {
         assert_eq!(PROVIDER, "codex");
     }
 
-    /// The claim ADR-0005 turns on. Stated as a refusal rather than an omission
-    /// so that anyone widening this set has to argue with the spike.
+    /// The claim ADR-0005 turns on, per call kind since the amendment. Stated
+    /// as a refusal rather than an omission so that anyone widening this set
+    /// has to argue with the spikes.
     #[test]
-    fn codex_does_not_claim_to_gate_tool_calls() {
+    fn codex_gates_mcp_calls_and_only_mcp_calls() {
         let claimed = capabilities();
 
         assert!(
             !claimed.supports(Capability::PreAuthorizeToolCalls),
-            "W2c found no client-facing approval request in six configurations"
+            "W2c found no client-facing exec approval in six configurations, \
+             and both feature flags are still off at 0.147.0"
+        );
+        assert!(
+            claimed.supports(Capability::PreAuthorizeMcpToolCalls),
+            "every MCP call elicits before it runs (transcripts 17-18)"
         );
         assert!(
             !claimed.supports(Capability::RewritesToolInput),
-            "arguments cannot be rewritten by a chain that never sees the call"
+            "the elicitation reply is accept-or-decline; there is nowhere to \
+             carry replacement arguments"
         );
         assert!(
             claimed.supports(Capability::SandboxTierAtSpawn),
-            "the sandbox tier is what Codex offers instead of interception"
+            "the sandbox tier is what Codex offers instead of exec interception"
         );
     }
 
-    /// The single answer the permission layer asks for must come out
-    /// `SandboxAtSpawn` — not `Unenforced`, which would understate what Codex
-    /// does, and not `PerCall`, which would overstate it.
+    /// The kind-blind answer must stay `SandboxAtSpawn` — not `Unenforced`,
+    /// which would understate what Codex does, and not `PerCall`, which the
+    /// MCP-only claim must never inflate into. Per kind, MCP is `PerCall`.
     #[test]
-    fn permission_enforcement_reads_as_sandbox_at_spawn() {
+    fn permission_enforcement_reads_as_sandbox_at_spawn_with_mcp_gated() {
+        use horde_adapter::ToolCallKind;
+
         assert_eq!(
             capabilities().permission_enforcement(),
+            PermissionEnforcement::SandboxAtSpawn
+        );
+        assert_eq!(
+            capabilities().permission_enforcement_for(ToolCallKind::Mcp),
+            PermissionEnforcement::PerCall
+        );
+        assert_eq!(
+            capabilities().permission_enforcement_for(ToolCallKind::Exec),
             PermissionEnforcement::SandboxAtSpawn
         );
     }

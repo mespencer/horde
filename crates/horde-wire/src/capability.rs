@@ -53,7 +53,15 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
         // an ungateable provider offers *instead* of interception, so a
         // scheduler that learns to place high-trust work will want to see it.
         // It stays off the wire until something reads it.
-        Capability::SandboxTierAtSpawn
+        //
+        // `PreAuthorizeMcpToolCalls` (ADR-0005 amendment: Codex intercepts MCP
+        // calls but not exec) stays off the wire for the same reason and one
+        // more: mapping it to TOOL_CALL_GATING would overstate it — placement
+        // reads that flag as "high-trust work can land here", which is exactly
+        // what ungated exec forbids. It graduates as its own wire value when
+        // placement learns to match per call kind (W5d's seam), not before.
+        Capability::PreAuthorizeMcpToolCalls
+        | Capability::SandboxTierAtSpawn
         | Capability::ReportsHeadroom
         | Capability::SystemPromptOverlay
         | Capability::ModelSelection
@@ -125,7 +133,18 @@ mod tests {
         for capability in Capability::ALL {
             let _ = capability_to_wire(capability);
         }
-        assert_eq!(Capability::ALL.len(), 10);
+        assert_eq!(Capability::ALL.len(), 11);
+    }
+
+    /// The scoped MCP-gating claim must never widen into the wire's blanket
+    /// gating flag: placement reads TOOL_CALL_GATING as "high-trust work can
+    /// land here", which ungated exec forbids.
+    #[test]
+    fn scoped_mcp_gating_does_not_advertise_as_blanket_gating() {
+        assert_eq!(
+            capability_to_wire(Capability::PreAuthorizeMcpToolCalls),
+            None
+        );
     }
 
     #[test]
