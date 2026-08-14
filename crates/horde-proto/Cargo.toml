@@ -12,7 +12,11 @@ workspace = true
 [dependencies]
 prost = "0.14.4"
 prost-types = "0.14.4"
-tonic = "0.14.6"
+# The blob transfer helpers (`blob.rs`) drive the generated BlobService
+# client over a concrete `tonic::transport::Channel`, hence "channel".
+sha2 = { workspace = true }
+tokio-stream = "0.1.19"
+tonic = { version = "0.14.6", features = ["channel"] }
 # Referenced by the generated service stubs (ProstCodec), not by handwritten
 # code, so it is a direct dependency without a direct `use`.
 tonic-prost = "0.14.6"

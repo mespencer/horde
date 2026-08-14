@@ -1,0 +1,72 @@
+// The Blob Store's transfer surface (DESIGN §8).
+//
+// Content-addressed: a blob's identity is the SHA-256 of its bytes, written
+// `sha256:<64 lowercase hex>`. The address is the integrity check — both ends
+// of every transfer recompute it, and a mismatch is a refusal, never a
+// warning. Events carry blob references and hashes, never bulk (ADR-0001):
+// this service is how the bulk itself moves, over the same authenticated
+// channel the rest of the control plane rides.
+//
+// Uploads declare their digest and size up front. That order is deliberate:
+// the uploader has the bytes locally, so hashing before sending costs one
+// cheap pass, and it turns the server's verification into a refusal of a
+// corrupted or mislabeled transfer rather than a silent re-address.
+syntax = "proto3";
+
+package horde.v1;
+
+service BlobService {
+  // Streams one blob into the store. The first message must be the open
+  // frame; the chunks follow. The server verifies the declared digest and
+  // size against what actually arrived and refuses a mismatch — an accepted
+  // upload is one whose reference can be trusted.
+  //
+  // Idempotent: uploading a blob the store already holds succeeds without
+  // rewriting it.
+  rpc UploadBlob(stream UploadBlobRequest) returns (UploadBlobResponse);
+
+  // Streams one blob out of the store. The server re-hashes while it reads
+  // and ends the stream with an error if the bytes on disk no longer match
+  // their address; the receiver verifies again on its side. DATA_LOSS from
+  // this call means the store's copy is corrupt, not that the caller asked
+  // wrongly.
+  rpc DownloadBlob(DownloadBlobRequest) returns (stream DownloadBlobResponse);
+}
+
+// One run of bytes in transit. Bounded well below tonic's default 4 MiB
+// message ceiling by both sides (the shared chunking helpers use 1 MiB).
+message BlobChunk {
+  bytes data = 1;
+}
+
+// What an upload promises before its first byte: the address the bytes must
+// hash to, and how many of them there are.
+message UploadBlobOpen {
+  // `sha256:<64 lowercase hex>`. Malformed addresses are refused before any
+  // byte is written.
+  string blob_digest = 1;
+
+  uint64 size_bytes = 2;
+}
+
+message UploadBlobRequest {
+  oneof body {
+    UploadBlobOpen open = 1;
+    BlobChunk chunk = 2;
+  }
+}
+
+message UploadBlobResponse {
+  // Echoed from the verified upload — what an Attachment should carry.
+  string blob_digest = 1;
+
+  uint64 size_bytes = 2;
+}
+
+message DownloadBlobRequest {
+  string blob_digest = 1;
+}
+
+message DownloadBlobResponse {
+  BlobChunk chunk = 1;
+}

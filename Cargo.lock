@@ -1103,6 +1103,8 @@ dependencies = [
  "prost-build",
  "prost-types",
  "protoc-bin-vendored",
+ "sha2",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
