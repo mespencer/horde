@@ -306,7 +306,7 @@ fn conversation_line(kind: &Kind) -> Option<(&'static str, String)> {
 /// The machinery kinds: usage, workspaces, lifecycles, placement, interrupts.
 fn machinery_line(kind: &Kind) -> (&'static str, String) {
     match kind {
-        Kind::UsageRecorded(_) => ("usage", String::new()),
+        Kind::UsageRecorded(recorded) => ("usage", usage_text(recorded)),
         Kind::WorkspaceInstanceChanged(changed) => (
             "workspace",
             changed
@@ -336,6 +336,61 @@ fn machinery_line(kind: &Kind) -> (&'static str, String) {
         // dispatcher never does, but a total answer beats a panic.
         _ => ("unknown", String::new()),
     }
+}
+
+/// One journaled usage record as feed text: the *measured* facts only —
+/// token counts as journaled, and a rate-window statement as the provider
+/// made it. Derived headroom arithmetic is `horde usage`'s job; a feed line
+/// repeats what the log says, never what Horde computes from it.
+fn usage_text(recorded: &horde_proto::v1::UsageRecorded) -> String {
+    let Some(record) = recorded.record.as_ref() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(tokens) = record.tokens.as_ref() {
+        parts.push(format!(
+            "in {} out {}",
+            tokens.input_tokens, tokens.output_tokens
+        ));
+    }
+    if let Some(stated) = record.rate_window.as_ref().and_then(window_statement) {
+        parts.push(stated);
+    }
+    if let Some(account) = account_of(record.binding.as_ref()) {
+        parts.push(account);
+    }
+    parts.join("  ")
+}
+
+/// A rate window's own statement, in whichever shape the provider reported:
+/// counts, a fraction, or bare serving state. `None` when it stated nothing.
+fn window_statement(window: &horde_proto::v1::RateWindow) -> Option<String> {
+    if let (Some(used), Some(limit)) = (window.used, window.limit) {
+        return Some(format!("window {used}/{limit} used"));
+    }
+    if let Some(fraction) = window.used_fraction {
+        return Some(format!("window {:.0}% used", fraction * 100.0));
+    }
+    window.allowed.map(|allowed| {
+        if allowed {
+            "window serving".to_owned()
+        } else {
+            "window not serving".to_owned()
+        }
+    })
+}
+
+/// `(provider/account)` for attribution, when the binding names one.
+fn account_of(binding: Option<&horde_proto::v1::ModelBinding>) -> Option<String> {
+    let binding = binding?;
+    let unattributed = binding.provider.is_empty() && binding.provider_account.is_empty();
+    if unattributed {
+        return None;
+    }
+    Some(format!(
+        "({}/{})",
+        binding.provider, binding.provider_account
+    ))
 }
 
 /// `state` alone, or `state: reason` when there is a reason to give.
@@ -1004,5 +1059,131 @@ mod tests {
     fn the_machinery_half_answers_unknown_for_a_conversational_kind() {
         let (label, text) = super::machinery_line(&Kind::NoteSent(NoteSent::default()));
         assert_eq!((label, text.as_str()), ("unknown", ""));
+    }
+
+    // -- Usage feed lines --------------------------------------------------
+
+    fn recorded(record: horde_proto::v1::UsageRecord) -> horde_proto::v1::UsageRecorded {
+        horde_proto::v1::UsageRecorded {
+            record: Some(record),
+        }
+    }
+
+    fn bound(provider: &str, account: &str) -> Option<horde_proto::v1::ModelBinding> {
+        Some(horde_proto::v1::ModelBinding {
+            tier: String::new(),
+            provider: provider.to_owned(),
+            model: String::new(),
+            provider_account: account.to_owned(),
+        })
+    }
+
+    /// A turn's usage record shows its measured token counts, attributed to
+    /// the account that spent them.
+    #[test]
+    fn a_usage_record_shows_its_tokens_and_its_account() {
+        let text = super::usage_text(&recorded(horde_proto::v1::UsageRecord {
+            binding: bound("claude", "personal"),
+            tokens: Some(horde_proto::v1::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                ..horde_proto::v1::TokenUsage::default()
+            }),
+            rate_window: None,
+            turn_id: String::new(),
+        }));
+        assert_eq!(text, "in 100 out 40  (claude/personal)");
+    }
+
+    /// A headroom-only record repeats the provider's own statement — counts,
+    /// fraction, or serving state — never Horde's arithmetic over it.
+    #[test]
+    fn a_headroom_report_repeats_the_providers_statement() {
+        let with_window = |window| {
+            super::usage_text(&recorded(horde_proto::v1::UsageRecord {
+                binding: bound("claude", "personal"),
+                tokens: None,
+                rate_window: Some(window),
+                turn_id: String::new(),
+            }))
+        };
+
+        let counted = horde_proto::v1::RateWindow {
+            used: Some(75),
+            limit: Some(100),
+            ..horde_proto::v1::RateWindow::default()
+        };
+        assert_eq!(
+            with_window(counted),
+            "window 75/100 used  (claude/personal)"
+        );
+
+        let fractional = horde_proto::v1::RateWindow {
+            used_fraction: Some(0.6),
+            ..horde_proto::v1::RateWindow::default()
+        };
+        assert_eq!(
+            with_window(fractional),
+            "window 60% used  (claude/personal)"
+        );
+
+        let serving = horde_proto::v1::RateWindow {
+            allowed: Some(true),
+            ..horde_proto::v1::RateWindow::default()
+        };
+        assert_eq!(with_window(serving), "window serving  (claude/personal)");
+
+        let refusing = horde_proto::v1::RateWindow {
+            allowed: Some(false),
+            ..horde_proto::v1::RateWindow::default()
+        };
+        assert_eq!(
+            with_window(refusing),
+            "window not serving  (claude/personal)"
+        );
+
+        let silent = horde_proto::v1::RateWindow::default();
+        assert_eq!(
+            with_window(silent),
+            "(claude/personal)",
+            "a window that stated nothing adds nothing"
+        );
+    }
+
+    /// The empties stay empty rather than inventing punctuation: a default
+    /// event still renders (the feed is total), and an unattributed record
+    /// carries no `(/)`.
+    #[test]
+    fn usage_lines_degrade_without_inventing_content() {
+        assert_eq!(
+            super::usage_text(&horde_proto::v1::UsageRecorded::default()),
+            ""
+        );
+        let unattributed = super::usage_text(&recorded(horde_proto::v1::UsageRecord {
+            binding: None,
+            tokens: Some(horde_proto::v1::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                ..horde_proto::v1::TokenUsage::default()
+            }),
+            rate_window: None,
+            turn_id: String::new(),
+        }));
+        assert_eq!(unattributed, "in 1 out 2");
+
+        let empty_binding = super::usage_text(&recorded(horde_proto::v1::UsageRecord {
+            binding: bound("", ""),
+            tokens: Some(horde_proto::v1::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                ..horde_proto::v1::TokenUsage::default()
+            }),
+            rate_window: None,
+            turn_id: String::new(),
+        }));
+        assert_eq!(
+            empty_binding, "in 1 out 2",
+            "an all-empty binding is unattributed, not `(/)`"
+        );
     }
 }
