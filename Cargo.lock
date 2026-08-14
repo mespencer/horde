@@ -1148,6 +1148,7 @@ dependencies = [
  "async-trait",
  "horde-cli",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-server-testkit",
  "hyper-util",

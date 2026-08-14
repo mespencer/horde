@@ -15,11 +15,26 @@ type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// Async because a blocking `std::process::Command::output` would stall the
 /// runtime this test is running on.
 async fn horde_server(argument: Option<&str>) -> Setup<std::process::ExitStatus> {
+    Ok(horde_server_with_env(argument, &[]).await?.status)
+}
+
+/// Same, with OTLP environment set and the whole output kept: the telemetry
+/// tests read the refusal off stderr, not just the exit code.
+async fn horde_server_with_env(
+    argument: Option<&str>,
+    environment: &[(&str, &str)],
+) -> Setup<std::process::Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_horde-server"));
     if let Some(argument) = argument {
         command.arg(argument);
     }
-    Ok(command.output().await?.status)
+    // The variables under test never leak in from the harness's own shell.
+    command.env_remove("HORDE_OTLP_ENDPOINT");
+    command.env_remove("HORDE_OTLP_SAMPLE");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    Ok(command.output().await?)
 }
 
 #[tokio::test]
@@ -55,6 +70,74 @@ async fn a_database_that_cannot_be_opened_exits_nonzero() {
     assert!(
         !status.success(),
         "a server that cannot open its log must not report success"
+    );
+}
+
+/// OTLP misconfiguration is a startup refusal (DESIGN §12 wiring): a sample
+/// ratio with no endpoint is the shape a mistyped variable takes, and a
+/// server that silently exported nothing would be worse than one that says
+/// which variable to fix.
+#[tokio::test]
+async fn a_sample_ratio_without_an_endpoint_refuses_startup() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let path = directory.path().join("horde.db");
+
+    let output = horde_server_with_env(
+        Some(&path.to_string_lossy()),
+        &[("HORDE_OTLP_SAMPLE", "0.5")],
+    )
+    .await
+    .expect("the binary must run");
+
+    assert!(!output.status.success(), "misconfiguration must refuse");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HORDE_OTLP_SAMPLE"),
+        "the refusal must name the variable to fix: {stderr}"
+    );
+}
+
+/// An endpoint the exporter cannot even parse is the same kind of refusal.
+#[tokio::test]
+async fn an_unparseable_otlp_endpoint_refuses_startup() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let path = directory.path().join("horde.db");
+
+    let output = horde_server_with_env(
+        Some(&path.to_string_lossy()),
+        &[("HORDE_OTLP_ENDPOINT", "not a uri")],
+    )
+    .await
+    .expect("the binary must run");
+
+    assert!(!output.status.success(), "an unusable endpoint must refuse");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a uri"),
+        "the refusal must show what it could not use: {stderr}"
+    );
+}
+
+/// The graceful-degradation contract at the binary boundary: a well-formed
+/// endpoint nobody listens on costs telemetry, never the server. Same
+/// invocation as `opening_a_usable_database_exits_successfully`, plus a dead
+/// collector — the exit code must not change.
+#[tokio::test]
+async fn a_dead_collector_does_not_change_the_exit_code() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let path = directory.path().join("horde.db");
+
+    let output = horde_server_with_env(
+        Some(&path.to_string_lossy()),
+        &[("HORDE_OTLP_ENDPOINT", "http://127.0.0.1:1")],
+    )
+    .await
+    .expect("the binary must run");
+
+    assert!(
+        output.status.success(),
+        "an unreachable collector must never take the server down with it: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

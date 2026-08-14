@@ -12,6 +12,9 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 horde-identity = { workspace = true }
+# The binary's OTLP opt-in (DESIGN §12): subscriber composition and the
+# export pipeline both live there, where they are testable.
+horde-observe = { workspace = true }
 horde-proto = { workspace = true }
 prost = "0.14.4"
 prost-types = "0.14.4"
