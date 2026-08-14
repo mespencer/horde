@@ -85,6 +85,20 @@ mod harness {
         format!("http://{address}")
     }
 
+    /// A full-sampling pipeline aimed at a [`dead_endpoint`], shared (in an
+    /// `Arc`, for `spawn_blocking`) by both degradation tests.
+    pub(crate) async fn doomed_telemetry() -> std::sync::Arc<horde_observe::Telemetry> {
+        let config = horde_observe::OtlpConfig {
+            endpoint: dead_endpoint().await,
+            sample_ratio: 1.0,
+        };
+        let identity = horde_observe::ServiceIdentity::new("horde-observe-smoke");
+        std::sync::Arc::new(
+            horde_observe::pipeline(&config, &identity)
+                .expect("the pipeline builds without connecting"),
+        )
+    }
+
     /// Every span name in one export request, in wire order.
     pub(crate) fn span_names(request: &ExportTraceServiceRequest) -> Vec<String> {
         request
@@ -117,20 +131,30 @@ mod harness {
         panic!("{sentinel:?} must arrive within 64 batches; saw {names:?}");
     }
 
+    /// The wire value under `key`, whichever variant it holds — the shared
+    /// digging the typed accessors below sit on.
+    fn attribute_value<'a>(
+        attributes: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
+        key: &str,
+    ) -> Option<&'a any_value::Value> {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key == key)?
+            .value
+            .as_ref()?
+            .value
+            .as_ref()
+    }
+
     /// The string value of an attribute list's `key`, wherever it appears.
     pub(crate) fn string_attribute(
         attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
         key: &str,
     ) -> Option<String> {
-        attributes
-            .iter()
-            .find(|attribute| attribute.key == key)
-            .and_then(|attribute| attribute.value.as_ref())
-            .and_then(|value| value.value.as_ref())
-            .and_then(|value| match value {
-                any_value::Value::StringValue(string) => Some(string.clone()),
-                _ => None,
-            })
+        match attribute_value(attributes, key)? {
+            any_value::Value::StringValue(string) => Some(string.clone()),
+            _ => None,
+        }
     }
 
     /// The integer value of an attribute list's `key`, wherever it appears.
@@ -138,15 +162,10 @@ mod harness {
         attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
         key: &str,
     ) -> Option<i64> {
-        attributes
-            .iter()
-            .find(|attribute| attribute.key == key)
-            .and_then(|attribute| attribute.value.as_ref())
-            .and_then(|value| value.value.as_ref())
-            .and_then(|value| match value {
-                any_value::Value::IntValue(int) => Some(*int),
-                _ => None,
-            })
+        match attribute_value(attributes, key)? {
+            any_value::Value::IntValue(int) => Some(*int),
+            _ => None,
+        }
     }
 }
 
@@ -280,17 +299,7 @@ async fn a_zero_ratio_exports_nothing_where_one_exports_everything() {
 /// counted as dropped rather than silently gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_collector_costs_spans_and_never_blocks() {
-    let endpoint = harness::dead_endpoint().await;
-    let telemetry = std::sync::Arc::new(
-        pipeline(
-            &OtlpConfig {
-                endpoint,
-                sample_ratio: 1.0,
-            },
-            &ServiceIdentity::new("horde-observe-smoke"),
-        )
-        .expect("the pipeline builds without connecting"),
-    );
+    let telemetry = harness::doomed_telemetry().await;
 
     let dispatch = silent_subscriber(&telemetry);
     tracing::dispatcher::with_default(&dispatch, || {
@@ -323,17 +332,7 @@ async fn an_unreachable_collector_costs_spans_and_never_blocks() {
 /// counter — which is why `shutdown` borrows instead of consuming.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_drains_the_queue_and_accounts_for_what_it_could_not_deliver() {
-    let endpoint = harness::dead_endpoint().await;
-    let telemetry = std::sync::Arc::new(
-        pipeline(
-            &OtlpConfig {
-                endpoint,
-                sample_ratio: 1.0,
-            },
-            &ServiceIdentity::new("horde-observe-smoke"),
-        )
-        .expect("the pipeline builds without connecting"),
-    );
+    let telemetry = harness::doomed_telemetry().await;
 
     let dispatch = silent_subscriber(&telemetry);
     tracing::dispatcher::with_default(&dispatch, || {

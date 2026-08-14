@@ -1174,6 +1174,7 @@ version = "0.1.0"
 dependencies = [
  "horde-cli",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-server",
  "tokio",

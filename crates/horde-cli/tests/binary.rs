@@ -6,24 +6,18 @@
 
 #[cfg(test)]
 mod harness {
-    pub(crate) type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Runs `horde hello` against a dead server with the given OTLP
-    /// environment, capturing everything. `hello` because it is the verb
-    /// with no verb-side state: whatever happens is startup wiring plus one
-    /// refused connection.
+    /// Runs `horde hello` against a dead server through the testkit's
+    /// scrubbed runner. `hello` because it is the verb with no verb-side
+    /// state: whatever happens is startup wiring plus one refused connection.
     pub(crate) async fn hello_with_env(
         environment: &[(&str, &str)],
-    ) -> Setup<std::process::Output> {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_horde"));
-        command.args(["hello", "--endpoint", "http://127.0.0.1:1"]);
-        // The variables under test never leak in from the harness's shell.
-        command.env_remove("HORDE_OTLP_ENDPOINT");
-        command.env_remove("HORDE_OTLP_SAMPLE");
-        for (name, value) in environment {
-            command.env(name, value);
-        }
-        Ok(command.output().await?)
+    ) -> horde_server_testkit::Setup<std::process::Output> {
+        horde_server_testkit::otlp_scrubbed_run(
+            env!("CARGO_BIN_EXE_horde"),
+            &["hello", "--endpoint", "http://127.0.0.1:1"],
+            environment,
+        )
+        .await
     }
 }
 
@@ -35,15 +29,18 @@ async fn a_sample_ratio_without_an_endpoint_refuses_startup() {
         .await
         .expect("the binary must run");
 
-    assert!(!output.status.success(), "misconfiguration must refuse");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let refusal = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("HORDE_OTLP_SAMPLE"),
-        "the refusal must name the variable to fix: {stderr}"
+        !output.status.success(),
+        "misconfiguration must exit nonzero"
     );
     assert!(
-        !stderr.contains("error:"),
-        "the refusal must come before the verb ever runs: {stderr}"
+        refusal.contains("HORDE_OTLP_SAMPLE"),
+        "the refusal names the variable to fix: {refusal}"
+    );
+    assert!(
+        !refusal.contains("error:"),
+        "the refusal must come before the verb ever runs: {refusal}"
     );
 }
 
