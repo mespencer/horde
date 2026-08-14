@@ -344,6 +344,87 @@ pub fn revoked(name: &str, serials: &str, format: Format) -> String {
     }
 }
 
+/// One MCP server config as JSON — the same fields both `mcp` renders show,
+/// so the human and JSON forms cannot disagree about what a server is.
+fn mcp_server_json(config: &horde_proto::v1::McpServerConfig) -> serde_json::Value {
+    let transport = match &config.transport {
+        Some(horde_proto::v1::mcp_server_config::Transport::Stdio(stdio)) => json!({
+            "stdio": { "command": stdio.command, "args": stdio.args },
+        }),
+        Some(horde_proto::v1::mcp_server_config::Transport::Http(http)) => {
+            json!({ "http": { "url": http.url } })
+        }
+        None => serde_json::Value::Null,
+    };
+    json!({
+        "name": config.name,
+        "transport": transport,
+        "local": config.local,
+        "allowed_agent_types": config.allowed_agent_types,
+        "etag": config.etag,
+    })
+}
+
+/// One human line per server: name, placement, transport, scope, etag.
+fn mcp_server_line(config: &horde_proto::v1::McpServerConfig) -> String {
+    let placement = if config.local { "local" } else { "hub" };
+    let transport = match &config.transport {
+        Some(horde_proto::v1::mcp_server_config::Transport::Stdio(stdio)) => {
+            format!("stdio {}", stdio.command)
+        }
+        Some(horde_proto::v1::mcp_server_config::Transport::Http(http)) => {
+            format!("http {}", http.url)
+        }
+        None => "no transport".to_owned(),
+    };
+    let scope = if config.allowed_agent_types.is_empty() {
+        "all agents".to_owned()
+    } else {
+        config.allowed_agent_types.join(",")
+    };
+    format!(
+        "{} [{placement}] {transport} ({scope}) etag {}",
+        config.name, config.etag
+    )
+}
+
+/// Renders the config a `mcp add` produced, etag included — the token the
+/// next update or removal must quote.
+#[must_use]
+pub fn mcp_configured(config: &horde_proto::v1::McpServerConfig, format: Format) -> String {
+    match format {
+        Format::Json => mcp_server_json(config).to_string(),
+        Format::Human => format!("configured {}", mcp_server_line(config)),
+    }
+}
+
+/// Renders the catalog. An empty catalog says so rather than printing
+/// nothing a script or a human could misread as an error.
+#[must_use]
+pub fn mcp_servers(servers: &[horde_proto::v1::McpServerConfig], format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "servers": servers.iter().map(mcp_server_json).collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Format::Human if servers.is_empty() => "no MCP servers configured".to_owned(),
+        Format::Human => servers
+            .iter()
+            .map(mcp_server_line)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Renders a removal.
+#[must_use]
+pub fn mcp_removed(name: &str, format: Format) -> String {
+    match format {
+        Format::Json => json!({ "removed": name }).to_string(),
+        Format::Human => format!("removed {name}"),
+    }
+}
+
 /// Renders a completed join: who this machine now is, and where that lives.
 #[must_use]
 pub fn joined(principal: &str, directory: &std::path::Path, format: Format) -> String {
@@ -598,6 +679,57 @@ mod tests {
 
     use super::{Format, created, event, hello, sent, sequence, session, sessions, spawned};
 
+    /// The `mcp` renders: the empty catalog says so in words (a script or a
+    /// human reading nothing cannot tell it from a swallowed error), a
+    /// populated one carries the fields a follow-up command needs, and a
+    /// removal names what was removed.
+    #[test]
+    fn the_mcp_renders_say_what_happened_in_both_formats() {
+        let config = horde_proto::v1::McpServerConfig {
+            name: "linear".to_owned(),
+            transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+                horde_proto::v1::McpStdioTransport {
+                    command: "linear-mcp".to_owned(),
+                    ..horde_proto::v1::McpStdioTransport::default()
+                },
+            )),
+            local: true,
+            etag: "3".to_owned(),
+            ..horde_proto::v1::McpServerConfig::default()
+        };
+
+        assert_eq!(
+            super::mcp_servers(&[], Format::Human),
+            "no MCP servers configured"
+        );
+        let listed = super::mcp_servers(std::slice::from_ref(&config), Format::Human);
+        assert_eq!(
+            listed, "linear [local] stdio linear-mcp (all agents) etag 3",
+            "the one line carries name, placement, transport, scope, and the \
+             etag the next mutation must quote"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&super::mcp_servers(
+            std::slice::from_ref(&config),
+            Format::Json,
+        ))
+        .expect("valid JSON");
+        assert_eq!(json["servers"][0]["name"], "linear");
+        assert_eq!(json["servers"][0]["etag"], "3");
+
+        assert_eq!(
+            super::mcp_configured(&config, Format::Human),
+            "configured linear [local] stdio linear-mcp (all agents) etag 3"
+        );
+        assert_eq!(
+            super::mcp_removed("linear", Format::Human),
+            "removed linear"
+        );
+        let removed: serde_json::Value =
+            serde_json::from_str(&super::mcp_removed("linear", Format::Json)).expect("valid JSON");
+        assert_eq!(removed["removed"], "linear");
+    }
+
     fn summary() -> SessionSummary {
         SessionSummary {
             session_id: Some(SessionId::new("s1")),
@@ -769,6 +901,10 @@ mod tests {
             (
                 Kind::EnrollmentRevoked(EnrollmentRevoked::default()),
                 "enrollment_revoked",
+            ),
+            (
+                Kind::McpServerConfigChanged(horde_proto::v1::McpServerConfigChanged::default()),
+                "mcp_server_config_changed",
             ),
         ];
 

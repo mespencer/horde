@@ -224,3 +224,55 @@ async fn a_malformed_endpoint_is_refused_before_anything_is_attempted() {
         run.stderr
     );
 }
+
+/// The MCP Hub verbs, through the real binary: add, list (both formats),
+/// remove — the catalog round trip a user actually types (ADR-0004).
+#[tokio::test]
+async fn the_mcp_verbs_round_trip_the_hub_catalog() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let added = horde(
+        &endpoint,
+        &[
+            "mcp",
+            "add",
+            "linear",
+            "--command",
+            "linear-mcp",
+            "--arg",
+            "--stdio",
+        ],
+    )
+    .await
+    .expect("run");
+    assert!(added.success, "stderr was: {}", added.stderr);
+    assert!(
+        added.stdout.contains("configured linear"),
+        "got {:?}",
+        added.stdout
+    );
+
+    let listed = horde(&endpoint, &["--json", "mcp", "list"])
+        .await
+        .expect("run");
+    assert!(listed.success, "stderr was: {}", listed.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(listed.stdout.trim()).expect("JSON out");
+    assert_eq!(parsed["servers"][0]["name"], "linear");
+    let etag = parsed["servers"][0]["etag"]
+        .as_str()
+        .expect("an etag rides the listing")
+        .to_owned();
+
+    let removed = horde(&endpoint, &["mcp", "remove", "linear", "--etag", &etag])
+        .await
+        .expect("run");
+    assert!(removed.success, "stderr was: {}", removed.stderr);
+
+    let empty = horde(&endpoint, &["mcp", "list"]).await.expect("run");
+    assert!(empty.success, "stderr was: {}", empty.stderr);
+    assert_eq!(
+        empty.stdout.trim(),
+        "no MCP servers configured",
+        "an empty catalog says so"
+    );
+}

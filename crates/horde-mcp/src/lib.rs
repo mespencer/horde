@@ -39,6 +39,7 @@
 
 pub mod context;
 pub mod endpoint;
+pub mod hub;
 pub mod identity;
 pub mod journal;
 pub mod permission;
