@@ -32,6 +32,7 @@
 pub mod secure;
 
 use horde_cli::Client;
+use horde_proto::v1::blob_service_server::BlobServiceServer;
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::worker_service_server::WorkerServiceServer;
@@ -72,6 +73,21 @@ pub async fn serve() -> Setup<String> {
     serve_core(ServerCore::new(EventLog::in_memory()?)).await
 }
 
+/// [`serve`], with a real blob store rooted at `blob_root` — for suites
+/// whose subject is attachment transfer. The caller owns the directory
+/// (usually a `tempfile::TempDir` it keeps alive), so the testkit does not
+/// grow a tempdir dependency and the test can inspect or corrupt the
+/// store's files directly.
+///
+/// # Errors
+///
+/// As [`serve`], plus the store refusing to open.
+pub async fn serve_with_blob_store(blob_root: &std::path::Path) -> Setup<String> {
+    let store = horde_server::blob::BlobStore::open(blob_root)?;
+    serve_core(ServerCore::new(EventLog::in_memory()?).with_blob_store(std::sync::Arc::new(store)))
+        .await
+}
+
 /// [`serve`], with the permission chain (DESIGN §10) running against the same
 /// log, configured with `modes` and an optional judge.
 ///
@@ -104,6 +120,11 @@ async fn serve_core(core: ServerCore) -> Setup<String> {
         let _ = tonic::transport::Server::builder()
             .add_service(ControlPlaneServiceServer::new(ControlPlane::new(
                 core.clone(),
+            )))
+            // Blobs ride the same endpoint they share in production; a core
+            // without a store answers the verbs `Unimplemented`, honestly.
+            .add_service(BlobServiceServer::new(horde_server::service::Blobs::new(
+                core.blobs.clone(),
             )))
             .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
             .serve_with_incoming(TcpListenerStream::new(listener))

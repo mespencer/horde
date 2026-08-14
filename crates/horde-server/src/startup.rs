@@ -71,6 +71,10 @@ pub struct ServeConfig {
     /// Extra names the listener credential must answer to, beyond
     /// `localhost` and the loopback addresses — the names remote peers dial.
     pub subject_names: Vec<String>,
+    /// The blob store's per-blob cap; `None` takes the documented default
+    /// ([`crate::blob::DEFAULT_MAX_BLOB_BYTES`]). This is DESIGN §8's
+    /// "server-configurable size cap".
+    pub blob_max_bytes: Option<u64>,
 }
 
 /// What one command line asks for.
@@ -91,6 +95,7 @@ struct ParsedFlags {
     bind: Option<SocketAddr>,
     enrollment_bind: Option<SocketAddr>,
     subject_names: Vec<String>,
+    blob_max_bytes: Option<u64>,
 }
 
 impl ParsedFlags {
@@ -118,6 +123,14 @@ impl ParsedFlags {
                 )?);
             }
             "--san" => self.subject_names.push(value_of("--san")?),
+            "--blob-max-bytes" => {
+                let value = value_of("--blob-max-bytes")?;
+                self.blob_max_bytes = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--blob-max-bytes {value} is not a byte count"))?,
+                );
+            }
             other => return self.apply_bare(other),
         }
         Ok(())
@@ -140,8 +153,15 @@ impl ParsedFlags {
     fn conclude(self) -> Result<Invocation, String> {
         let database = self.database.unwrap_or_else(|| DEFAULT_DATABASE.to_owned());
         if !self.serve {
-            if self.bind.is_some() || self.enrollment_bind.is_some() || self.state_dir.is_some() {
-                return Err("--bind, --enrollment-bind and --state-dir need --serve".to_owned());
+            if self.bind.is_some()
+                || self.enrollment_bind.is_some()
+                || self.state_dir.is_some()
+                || self.blob_max_bytes.is_some()
+            {
+                return Err(
+                    "--bind, --enrollment-bind, --state-dir and --blob-max-bytes need --serve"
+                        .to_owned(),
+                );
             }
             return Ok(Invocation::CheckOnly { database });
         }
@@ -159,6 +179,7 @@ impl ParsedFlags {
                 .enrollment_bind
                 .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7778))),
             subject_names: self.subject_names,
+            blob_max_bytes: self.blob_max_bytes,
         })))
     }
 }
@@ -241,7 +262,16 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
     let bootstrap_code = bootstrap_code_if_unclaimed(&authority, now).await?;
 
-    let core = ServerCore::new(log);
+    // The blob store lives beside the CA in the state directory. Failing
+    // here rather than on the first upload matches the log's own rule: an
+    // unusable store must fail at startup, not mid-payload.
+    let mut blobs = crate::blob::BlobStore::open(&config.state_dir.join("blobs"))
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    if let Some(max) = config.blob_max_bytes {
+        blobs = blobs.with_max_blob_bytes(max);
+    }
+
+    let core = ServerCore::new(log).with_blob_store(Arc::new(blobs));
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
 
@@ -385,6 +415,8 @@ mod tests {
             "horde.example",
             "--san",
             "10.0.0.7",
+            "--blob-max-bytes",
+            "1048576",
         ]) else {
             panic!("a full serve line must parse");
         };
@@ -393,6 +425,7 @@ mod tests {
         assert_eq!(config.enrollment_bind.to_string(), "0.0.0.0:9001");
         assert_eq!(config.state_dir, std::path::PathBuf::from("/tmp/state"));
         assert_eq!(config.subject_names, vec!["horde.example", "10.0.0.7"]);
+        assert_eq!(config.blob_max_bytes, Some(1_048_576));
 
         let Ok(super::Invocation::Serve(defaulted)) = parsed(&["--serve"]) else {
             panic!("--serve alone must parse");
@@ -407,6 +440,10 @@ mod tests {
         assert_eq!(
             defaulted.state_dir,
             std::path::PathBuf::from(super::DEFAULT_STATE_DIR)
+        );
+        assert_eq!(
+            defaulted.blob_max_bytes, None,
+            "unset lets the store keep its documented default"
         );
     }
 
@@ -430,6 +467,12 @@ mod tests {
             // refusal is an OR over them, not a conjunction.
             (&["--enrollment-bind", "127.0.0.1:1"][..], "--serve"),
             (&["--state-dir", "/tmp/x"][..], "--serve"),
+            (&["--blob-max-bytes", "1"][..], "--serve"),
+            (
+                &["--serve", "--blob-max-bytes", "lots"][..],
+                "--blob-max-bytes lots",
+            ),
+            (&["--serve", "--blob-max-bytes"][..], "--blob-max-bytes"),
             (&["a.db", "b.db"][..], "b.db"),
         ] {
             let refused = parsed(arguments).expect_err("must refuse");
@@ -473,6 +516,7 @@ mod tests {
             bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             enrollment_bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             subject_names: Vec::new(),
+            blob_max_bytes: None,
         };
 
         let running = super::serve(&config).await.expect("the server comes up");
@@ -490,6 +534,10 @@ mod tests {
         assert!(
             horde_identity::CertificateAuthority::exists(&config.state_dir.join("ca")),
             "the CA must persist, or a restart orphans every certificate"
+        );
+        assert!(
+            config.state_dir.join("blobs").join("sha256").is_dir(),
+            "the blob store must come up beside the CA, not on the first upload"
         );
 
         // The operator interface, exactly as the binary will print it.

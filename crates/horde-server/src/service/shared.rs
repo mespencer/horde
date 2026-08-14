@@ -32,6 +32,10 @@ pub struct ServerCore {
     pub workers: WorkerRegistry,
     pub instances: InstanceCache,
     pub scheduler: Arc<dyn Scheduler>,
+    /// The content-addressed attachment store, when this server has a state
+    /// directory to keep one in. `None` makes the blob verbs answer
+    /// `Unimplemented` honestly.
+    pub blobs: Option<Arc<crate::blob::BlobStore>>,
     /// Serializes placement decisions against their appends. Two concurrent
     /// passes — a spawn and a drain woken by a registration — each project the
     /// log and then write placements; unserialized, both can place the same
@@ -53,6 +57,7 @@ impl ServerCore {
             workers,
             instances,
             scheduler,
+            blobs: None,
             placement_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -61,6 +66,14 @@ impl ServerCore {
     #[must_use]
     pub fn with_scheduler(mut self, scheduler: Arc<dyn Scheduler>) -> Self {
         self.scheduler = scheduler;
+        self
+    }
+
+    /// Attaches the blob store — the serving path does, and any test that
+    /// wants real attachment transfer.
+    #[must_use]
+    pub fn with_blob_store(mut self, blobs: Arc<crate::blob::BlobStore>) -> Self {
+        self.blobs = Some(blobs);
         self
     }
 }
@@ -106,13 +119,15 @@ pub fn kind_name(kind: Option<&Kind>) -> &'static str {
 ///
 /// Whatever the log refuses, plus
 /// [`ServerError::IdempotencyKeyCollision`] when the key already holds a
-/// different kind of event.
+/// different kind of event, and [`ServerError::InlineBulk`] when the event
+/// smuggles attachment content past the inline threshold.
 pub async fn append_server_event(
     log: &EventLog,
     session_id: &str,
     idempotency_key: &str,
     event: Event,
 ) -> Result<u64, ServerError> {
+    refuse_inline_bulk(&event)?;
     let appended = log
         .append(PendingEvent {
             session_id: session_id.to_owned(),
@@ -125,6 +140,31 @@ pub async fn append_server_event(
 
     refuse_kind_collision(&appended, session_id, idempotency_key, &event)?;
     Ok(appended.sequence)
+}
+
+/// Refuses an event that smuggles attachment bulk past the inline threshold.
+///
+/// Events carry blob references and hashes, never bulk (ADR-0001): the log
+/// is replayed to every attached client for the life of the session, so an
+/// event's size is paid over and over, and the Blob Store exists precisely
+/// so that large content is fetched once, lazily, by whoever wants it. Both
+/// append chokepoints — server-originated events and the worker journal
+/// ingest — run this before anything is stored, because a refusal at the
+/// write is diagnosable where a bloated log is a tax nobody traces back.
+///
+/// # Errors
+///
+/// [`ServerError::InlineBulk`], naming the attachment, its size, and the
+/// remedy.
+pub fn refuse_inline_bulk(event: &Event) -> Result<(), ServerError> {
+    match horde_proto::blob::smuggled_bulk(event) {
+        None => Ok(()),
+        Some(attachment) => Err(ServerError::InlineBulk {
+            name: attachment.name.clone(),
+            inline_bytes: attachment.inline.len() as u64,
+            threshold: horde_proto::blob::INLINE_THRESHOLD_BYTES,
+        }),
+    }
 }
 
 /// Refuses a deduplication that silently swallowed a *different* kind of event.

@@ -82,6 +82,9 @@ async fn ingest_batch(
         let event = journaled.event.ok_or_else(|| {
             ServerError::Invalid("a journaled event must carry an event".to_owned())
         })?;
+        // The other append chokepoint: the worker journal must not carry
+        // bulk into the log any more than a client verb may.
+        crate::service::shared::refuse_inline_bulk(&event)?;
 
         let appended = core
             .log
