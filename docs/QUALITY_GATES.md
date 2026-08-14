@@ -404,7 +404,35 @@ than a good intention, and it is the strongest thing available here.
 
 Falling back to the whole tree when there is no baseline is deliberate: an absent branch
 or a root commit must never quietly shrink the gate to nothing. Timeouts live in
-`.cargo/mutants.toml`; `--jobs` and `--full` live in the gate.
+`.cargo/mutants.toml`; `--jobs`, `--profile` and `--full` live in the gate.
+
+**The build profile: `--profile=mutants`.** Every mutant pays an incremental rebuild and
+relink of the mutated package's test binaries, debuginfo is the bulk of that link cost,
+and nothing in a mutation run reads it — no debugger attaches, and the verdict is read
+from the harness's tally, never a backtrace. The workspace manifest therefore defines
+`[profile.mutants]` (`inherits = "test"`, `debug = false`) and the gate passes
+`--profile=mutants`. Per the "faster test tool" lesson below, this is a measurement, not
+an assumption: on one horde-server shard (`--shard 0/32 --jobs 4`, idle machine) the same
+24 mutants took **116.1s** wall without the profile and **97.0s** with it — a **1.20×**
+speed-up, with an identical verdict both ways (23 caught, 1 unviable). Unlike the nextest
+experiment, this lever matches the physics: the per-mutant floor *is* the incremental
+build-and-link, and debuginfo is the part of it nothing consumes. A test in the gate
+holds the manifest and the flag together, so the profile cannot be dropped from
+`Cargo.toml` while the gate still asks for it.
+
+**The disk pre-flight: 40 GiB free, or the run does not start.** Before launching
+cargo-mutants — and only for this gate; the fast gates neither clone the tree nor build
+anything a plain `cargo test` would not — the gate reads `df -P -k` on the workspace's
+volume and reports `error` below **40 GiB** free. An `error`, not a `fail`: the code was
+never judged, the instrument had nowhere to run. The message names the threshold, the
+observed free space, and where the missing gigabytes usually are: worktree `target/`
+directories, `target/llvm-cov-target`, and stale `cargo-mutants-*` scratch trees under
+the system temp directory (`/var/folders` on macOS). The evidence behind the number: a
+run at `--jobs 4` clones a ~2–3 GB scratch tree per job and grows each clone's
+incremental `target/` from there; two full sweeps died of disk exhaustion in a single
+week, and a near-full APFS volume also silently *serialized* a jobs=4 run to ~1.1×
+parallelism — the run degrades before it fails, so a guard that waited for the failure
+would still let the slow lie through.
 
 **Two kinds of exclusion, and nothing else.** Skipping a function because its mutants
 survive is how a mutation gate becomes decorative. If a function cannot be
