@@ -58,15 +58,55 @@ pub trait ApplyCommand: Send {
 /// Everything needed to dial one Server as one Worker.
 #[derive(Debug, Clone)]
 pub struct DialConfig {
-    /// The Server's endpoint, e.g. `http://127.0.0.1:50051`.
+    /// The Server's endpoint: `https://host:port` for an enrolled dial,
+    /// `http://127.0.0.1:port` only for in-process test servers.
     pub endpoint: String,
     /// The Worker's own view of its identity. The Server may correct it from
-    /// the mTLS certificate once enrollment exists.
+    /// the mTLS certificate.
     pub worker_id: String,
     /// Version and capability-flag handshake, sent at registration.
     pub hello: Hello,
     /// The full capability advertisement placement matches on.
     pub capabilities: WorkerCapabilities,
+    /// The enrolled identity to dial with (DESIGN §3: mTLS for every
+    /// principal). `None` dials plaintext, which only a loopback test server
+    /// accepts — the real Server's listener requires the certificate.
+    pub identity: Option<horde_identity::StoredIdentity>,
+}
+
+impl DialConfig {
+    /// A plaintext loopback dial — the in-process-test shape.
+    #[must_use]
+    pub fn insecure(
+        endpoint: String,
+        worker_id: String,
+        hello: Hello,
+        capabilities: WorkerCapabilities,
+    ) -> Self {
+        Self {
+            endpoint,
+            worker_id,
+            hello,
+            capabilities,
+            identity: None,
+        }
+    }
+
+    /// The channel this configuration dials.
+    ///
+    /// The TLS domain is the endpoint's own host: the name the operator
+    /// dialed is the name the Server's credential must answer for.
+    async fn channel(&self) -> Result<Channel, WorkerError> {
+        let endpoint = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?;
+        let endpoint = match &self.identity {
+            Some(identity) => {
+                let domain = endpoint.uri().host().unwrap_or("localhost").to_owned();
+                endpoint.tls_config(horde_identity::tls::grpc_client_mtls(identity, &domain))?
+            }
+            None => endpoint,
+        };
+        Ok(endpoint.connect().await?)
+    }
 }
 
 /// One registered connection to the Server.
@@ -87,7 +127,7 @@ impl Connection {
     /// [`WorkerError::Incomplete`] when the response is missing a field the
     /// protocol requires.
     pub async fn dial(config: &DialConfig) -> Result<(Self, RegisterWorkerResponse), WorkerError> {
-        let mut client = WorkerServiceClient::connect(config.endpoint.clone()).await?;
+        let mut client = WorkerServiceClient::new(config.channel().await?);
 
         let response = client
             .register_worker(horde_proto::v1::RegisterWorkerRequest {

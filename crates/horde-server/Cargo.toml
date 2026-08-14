@@ -11,14 +11,15 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+horde-identity = { workspace = true }
 horde-proto = { workspace = true }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "process"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "process"] }
 tokio-stream = "0.1.19"
-tonic = { version = "0.14.6", features = ["server", "channel"] }
+tonic = { version = "0.14.6", features = ["server", "channel", "tls-ring"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
@@ -27,6 +28,9 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 # cycle — dev-dependencies are outside the package's own build graph — and it
 # is what lets the server's tests share the harness its clients test against.
 horde-server-testkit = { workspace = true }
+# The enrollment e2e replays the enrollment stream the way an attached
+# client does; the typed client is the production read path being claimed.
+horde-cli = { workspace = true }
 tempfile = "3.24.0"
 hyper-util = { version = "0.1", features = ["tokio"] }
 proptest = "1.9.0"

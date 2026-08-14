@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 horde-adapter = { workspace = true }
+horde-identity = { workspace = true }
 horde-adapter-claude = { workspace = true }
 horde-adapter-codex = { workspace = true }
 horde-proto = { workspace = true }
@@ -24,11 +25,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1.19"
-tonic = { version = "0.14.6", features = ["channel"] }
+tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
 horde-adapter-fake = { workspace = true }
+# The mTLS dial test enrolls through the shared secured harness, so the
+# certificate it dials with came off the production issuance path.
+# (serde_json is already an ordinary dependency of this crate.)
+horde-server-testkit = { workspace = true }
 # The dial tests run the real server over a real socket. The dependency points
 # this way only — horde-server knows nothing about the worker — so there is no
 # cycle, and it is the shape horde-cli already uses to test its client against a

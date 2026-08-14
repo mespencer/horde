@@ -65,6 +65,23 @@ pub enum ClientError {
         source: serde_json::Error,
     },
 
+    /// The identity directory did not yield a usable identity.
+    ///
+    /// Distinct from a connection failure because the remedy is local:
+    /// enroll (or point `--identity` at where the enrollment landed) rather
+    /// than chase the server.
+    #[error("no usable identity at {directory}: {source}")]
+    Identity {
+        directory: std::path::PathBuf,
+        #[source]
+        source: horde_identity::IdentityError,
+    },
+
+    /// Enrollment failed: a malformed code, a refused join, or the identity
+    /// failing to persist.
+    #[error("enrollment failed: {0}")]
+    Enrollment(String),
+
     /// The terminal itself failed the TUI — raw mode refused, a draw failed.
     ///
     /// Its own variant because the remedy is different in kind: every other
@@ -93,41 +110,83 @@ pub struct Client {
 }
 
 impl Client {
-    /// Dials a server.
+    /// Dials a server in plaintext — the in-process and loopback-test shape.
     ///
-    /// Plaintext: mTLS arrives with enrollment in wave 5, and DESIGN.md §3
-    /// forbids binding beyond localhost until it does, so there is nothing to
-    /// secure yet and pretending otherwise would be theatre.
+    /// The secured server refuses this: its listener requires the client
+    /// certificate [`Self::connect_with_identity`] presents (DESIGN §3).
     pub async fn connect(endpoint: &str) -> Result<Self, ClientError> {
-        // A bare word like `localhost:7777` or `not-a-uri` parses happily as a
-        // path-only URI, so `from_shared` alone would accept it and the failure
-        // would surface as "could not reach the server" — sending the user to
-        // look for a server that was never addressed. Requiring a scheme and an
-        // authority puts the complaint where the mistake is.
-        let parsed: tonic::codegen::http::Uri =
-            endpoint.parse().map_err(|_| ClientError::Endpoint {
-                endpoint: endpoint.to_owned(),
-            })?;
-        if parsed.scheme().is_none() || parsed.authority().is_none() {
-            return Err(ClientError::Endpoint {
-                endpoint: endpoint.to_owned(),
-            });
-        }
+        let endpoint = validated_endpoint(endpoint)?;
+        Self::connect_endpoint(endpoint).await
+    }
 
-        let channel = Channel::from_shared(endpoint.to_owned())
-            .map_err(|_| ClientError::Endpoint {
-                endpoint: endpoint.to_owned(),
-            })?
-            .connect()
-            .await
+    /// Dials a server over mTLS as an enrolled identity (DESIGN §3).
+    ///
+    /// The TLS name is the endpoint's own host: what the user dialed is what
+    /// the Server's credential must answer for.
+    pub async fn connect_with_identity(
+        endpoint: &str,
+        identity: &horde_identity::StoredIdentity,
+    ) -> Result<Self, ClientError> {
+        let channel = validated_endpoint(endpoint)?;
+        let domain = channel.uri().host().unwrap_or("localhost").to_owned();
+        let channel = channel
+            .tls_config(horde_identity::tls::grpc_client_mtls(identity, &domain))
             .map_err(|source| ClientError::Connect {
                 endpoint: endpoint.to_owned(),
                 source,
             })?;
+        Self::connect_endpoint(channel).await
+    }
 
+    async fn connect_endpoint(endpoint: tonic::transport::Endpoint) -> Result<Self, ClientError> {
+        let described = endpoint.uri().to_string();
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|source| ClientError::Connect {
+                endpoint: described,
+                source,
+            })?;
         Ok(Self {
             inner: ControlPlaneServiceClient::new(channel),
         })
+    }
+
+    /// Mints a one-time enrollment code (DESIGN §3). Requires an enrolled,
+    /// connected client — the server refuses this verb on any other channel.
+    pub async fn mint_enrollment_code(
+        &mut self,
+        role: horde_proto::v1::Role,
+        name: &str,
+        ttl_minutes: Option<u32>,
+    ) -> Result<horde_proto::v1::MintEnrollmentCodeResponse, ClientError> {
+        Ok(self
+            .inner
+            .mint_enrollment_code(horde_proto::v1::MintEnrollmentCodeRequest {
+                role: role as i32,
+                name: name.to_owned(),
+                ttl: ttl_of(ttl_minutes),
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Revokes every active certificate a principal holds. Returns the
+    /// revoked serials, comma-joined as the server reports them.
+    pub async fn revoke_enrollment(
+        &mut self,
+        principal: horde_proto::v1::revoke_enrollment_request::Principal,
+        reason: &str,
+    ) -> Result<String, ClientError> {
+        Ok(self
+            .inner
+            .revoke_enrollment(horde_proto::v1::RevokeEnrollmentRequest {
+                principal: Some(principal),
+                reason: reason.to_owned(),
+            })
+            .await?
+            .into_inner()
+            .revoked_serial)
     }
 
     /// Builds a client over a channel the caller already has.
@@ -472,6 +531,34 @@ impl Client {
     }
 }
 
+/// A minutes flag as the wire duration a mint carries; `None` lets the
+/// server choose.
+fn ttl_of(ttl_minutes: Option<u32>) -> Option<horde_proto::prost_types::Duration> {
+    ttl_minutes.map(|minutes| horde_proto::prost_types::Duration {
+        seconds: i64::from(minutes) * 60,
+        nanos: 0,
+    })
+}
+
+/// An endpoint string that names a scheme and an authority, as a dialable
+/// endpoint.
+///
+/// A bare word like `localhost:7777` or `not-a-uri` parses happily as a
+/// path-only URI, so `from_shared` alone would accept it and the failure
+/// would surface as "could not reach the server" — sending the user to look
+/// for a server that was never addressed. Requiring a scheme and an
+/// authority puts the complaint where the mistake is.
+fn validated_endpoint(endpoint: &str) -> Result<tonic::transport::Endpoint, ClientError> {
+    let refused = || ClientError::Endpoint {
+        endpoint: endpoint.to_owned(),
+    };
+    let parsed: tonic::codegen::http::Uri = endpoint.parse().map_err(|_| refused())?;
+    if parsed.scheme().is_none() || parsed.authority().is_none() {
+        return Err(refused());
+    }
+    Channel::from_shared(endpoint.to_owned()).map_err(|_| refused())
+}
+
 /// The request one set of options asks for.
 ///
 /// Shared by [`Client::sync`] and [`Client::follow`] because the cursor is the
@@ -717,6 +804,15 @@ impl SyncOptions {
 #[cfg(test)]
 mod tests {
     use super::{ClientError, SyncOptions};
+
+    /// Minutes to wire seconds, exactly: a ttl silently divided or offset
+    /// would mint codes that die early or linger.
+    #[test]
+    fn the_mint_ttl_flag_is_minutes_of_sixty_seconds() {
+        assert_eq!(super::ttl_of(None), None, "unset lets the server choose");
+        let five = super::ttl_of(Some(5)).expect("five minutes");
+        assert_eq!((five.seconds, five.nanos), (300, 0));
+    }
 
     #[test]
     fn sync_options_default_to_a_full_scriptable_replay() {

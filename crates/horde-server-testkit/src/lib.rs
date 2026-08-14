@@ -29,6 +29,8 @@
 //! server — a session fetched back, an event replayed — rather than trusting a
 //! returned value.
 
+pub mod secure;
+
 use horde_cli::Client;
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;

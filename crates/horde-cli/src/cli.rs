@@ -27,6 +27,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_ENDPOINT, env = "HORDE_ENDPOINT")]
     pub endpoint: String,
 
+    /// Directory holding this machine's enrolled identity (DESIGN §3).
+    /// When set, every connection is mTLS; `enroll join` writes here.
+    #[arg(long, global = true, env = "HORDE_IDENTITY")]
+    pub identity: Option<std::path::PathBuf>,
+
     /// Emit JSON instead of prose.
     #[arg(long, global = true)]
     pub json: bool,
@@ -58,6 +63,57 @@ pub enum Command {
     /// Attach to a session interactively. `sync --follow` is the headless,
     /// scriptable form of the same subscription.
     Attach(AttachArgs),
+    /// Worker administration: enrollment codes and revocation (DESIGN §3).
+    #[command(subcommand)]
+    Worker(WorkerCommand),
+    /// This machine's own identity: joining, and client codes for others.
+    #[command(subcommand)]
+    Enroll(EnrollCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkerCommand {
+    /// Mint a one-time enrollment code for a new worker. Run
+    /// `horde-worker`'s join (or `horde enroll join`) with it on the new
+    /// machine before it expires.
+    Enroll {
+        /// The worker's principal name, fixed here at mint time.
+        name: String,
+        /// Code lifetime; the server clamps it (default 10, cap 60).
+        #[arg(long)]
+        ttl_minutes: Option<u32>,
+    },
+    /// Revoke every certificate a worker holds, by name.
+    Revoke {
+        name: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EnrollCommand {
+    /// Redeem a one-time code against a server's enrollment listener and
+    /// store the identity in the `--identity` directory. The code embeds the
+    /// server fingerprint this machine pins — nothing else is trusted yet.
+    Join {
+        /// The enrollment listener, e.g. `https://host:7778`.
+        enrollment_endpoint: String,
+        /// The code exactly as the server printed it: `secret.fingerprint`.
+        code: String,
+    },
+    /// Mint a one-time enrollment code for another client machine.
+    Client {
+        name: String,
+        #[arg(long)]
+        ttl_minutes: Option<u32>,
+    },
+    /// Revoke every certificate a client holds, by name.
+    RevokeClient {
+        name: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -164,7 +220,18 @@ pub struct SpawnArgs {
 /// inlined each verb's body and scored 164 on CRAP — readable enough in a diff,
 /// impossible to bring under the complexity bar however well it was covered.
 pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
-    let mut client = Client::connect(&cli.endpoint).await?;
+    // The one verb that must work *before* any identity exists: joining is
+    // how this machine gets one, so it dials the enrollment listener rather
+    // than the control plane.
+    if let Some(Command::Enroll(EnrollCommand::Join {
+        enrollment_endpoint,
+        code,
+    })) = &cli.command
+    {
+        return run_join(cli, enrollment_endpoint, code, format).await;
+    }
+
+    let mut client = connect(cli).await?;
     let client = &mut client;
 
     match &cli.command {
@@ -186,6 +253,142 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
+        Some(Command::Worker(command)) => run_worker(client, command, format).await,
+        Some(Command::Enroll(command)) => run_enroll(client, command, format).await,
+    }
+}
+
+/// Connects as the configured identity, or plaintext when none is set.
+///
+/// No silent fallback in either direction: `--identity` that does not load
+/// is an error naming the directory, never a plaintext connection wearing an
+/// enrolled flag.
+async fn connect(cli: &Cli) -> Result<Client, ClientError> {
+    match &cli.identity {
+        Some(directory) => {
+            let identity = horde_identity::StoredIdentity::load(directory).map_err(|source| {
+                ClientError::Identity {
+                    directory: directory.clone(),
+                    source,
+                }
+            })?;
+            Client::connect_with_identity(&cli.endpoint, &identity).await
+        }
+        None => Client::connect(&cli.endpoint).await,
+    }
+}
+
+/// Where this machine's identity lives when `--identity` does not say.
+#[must_use]
+pub fn default_identity_dir(home: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    home.map_or_else(
+        || std::path::PathBuf::from(".horde-identity"),
+        |home| home.join(".horde").join("identity"),
+    )
+}
+
+async fn run_join(
+    cli: &Cli,
+    enrollment_endpoint: &str,
+    code: &str,
+    format: Format,
+) -> Result<(), ClientError> {
+    let code = horde_identity::JoinCode::parse(code).ok_or_else(|| {
+        ClientError::Enrollment(
+            "the code is malformed; paste it exactly as the server printed it \
+             (secret.fingerprint)"
+                .to_owned(),
+        )
+    })?;
+
+    let enrolled = horde_identity::join(
+        enrollment_endpoint,
+        &code,
+        horde_proto::v1::Hello {
+            semver: env!("CARGO_PKG_VERSION").to_owned(),
+            capability_flags: Vec::new(),
+            role: horde_proto::v1::Role::Unspecified as i32,
+            display_name: "horde".to_owned(),
+        },
+    )
+    .await
+    .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+
+    let directory = cli
+        .identity
+        .clone()
+        .unwrap_or_else(|| default_identity_dir(std::env::var_os("HOME").map(Into::into)));
+    enrolled
+        .identity
+        .save(&directory)
+        .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+
+    println!(
+        "{}",
+        render::joined(&enrolled.principal.to_string(), &directory, format)
+    );
+    Ok(())
+}
+
+async fn run_worker(
+    client: &mut Client,
+    command: &WorkerCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        WorkerCommand::Enroll { name, ttl_minutes } => {
+            let minted = client
+                .mint_enrollment_code(horde_proto::v1::Role::Worker, name, *ttl_minutes)
+                .await?;
+            println!("{}", render::minted(&minted, format));
+        }
+        WorkerCommand::Revoke { name, reason } => {
+            let serials = client
+                .revoke_enrollment(
+                    horde_proto::v1::revoke_enrollment_request::Principal::WorkerId(
+                        horde_proto::v1::WorkerId::new(name),
+                    ),
+                    reason,
+                )
+                .await?;
+            println!("{}", render::revoked(name, &serials, format));
+        }
+    }
+    Ok(())
+}
+
+async fn run_enroll(
+    client: &mut Client,
+    command: &EnrollCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        EnrollCommand::Join { .. } => {
+            // Handled before any connection exists; reaching here is a bug in
+            // `run`'s early return, and refusing loudly beats joining twice.
+            Err(ClientError::Enrollment(
+                "join must not reach the connected dispatch".to_owned(),
+            ))
+        }
+        EnrollCommand::Client { name, ttl_minutes } => {
+            let minted = client
+                .mint_enrollment_code(horde_proto::v1::Role::Client, name, *ttl_minutes)
+                .await?;
+            println!("{}", render::minted(&minted, format));
+            Ok(())
+        }
+        EnrollCommand::RevokeClient { name, reason } => {
+            let serials = client
+                .revoke_enrollment(
+                    horde_proto::v1::revoke_enrollment_request::Principal::ClientId(
+                        horde_proto::v1::ClientId::new(name),
+                    ),
+                    reason,
+                )
+                .await?;
+            println!("{}", render::revoked(name, &serials, format));
+            Ok(())
+        }
     }
 }
 
@@ -448,6 +651,78 @@ mod tests {
         assert!(
             Cli::try_parse_from(["horde", "attach"]).is_err(),
             "attach needs a session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod enrollment_tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, EnrollCommand, WorkerCommand, default_identity_dir};
+
+    #[test]
+    fn the_worker_verbs_parse_as_design_names_them() {
+        let cli = Cli::try_parse_from(["horde", "worker", "enroll", "gpu-box"])
+            .expect("DESIGN §3 names this verb");
+        match cli.command {
+            Some(Command::Worker(WorkerCommand::Enroll { name, ttl_minutes })) => {
+                assert_eq!(name, "gpu-box");
+                assert_eq!(ttl_minutes, None, "the server owns the default ttl");
+            }
+            other => panic!("expected worker enroll, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["horde", "worker", "revoke", "gpu-box", "--reason", "stolen"])
+                .expect("DESIGN §3 names this verb");
+        match cli.command {
+            Some(Command::Worker(WorkerCommand::Revoke { name, reason })) => {
+                assert_eq!(name, "gpu-box");
+                assert_eq!(reason, "stolen");
+            }
+            other => panic!("expected worker revoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_takes_the_enrollment_endpoint_and_the_code() {
+        let cli = Cli::try_parse_from([
+            "horde",
+            "--identity",
+            "/tmp/id",
+            "enroll",
+            "join",
+            "https://host:7778",
+            "s.fp",
+        ])
+        .expect("a join line parses");
+        assert_eq!(
+            cli.identity.as_deref(),
+            Some(std::path::Path::new("/tmp/id"))
+        );
+        match cli.command {
+            Some(Command::Enroll(EnrollCommand::Join {
+                enrollment_endpoint,
+                code,
+            })) => {
+                assert_eq!(enrollment_endpoint, "https://host:7778");
+                assert_eq!(code, "s.fp");
+            }
+            other => panic!("expected enroll join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_default_identity_dir_is_under_home_when_there_is_one() {
+        assert_eq!(
+            default_identity_dir(Some(std::path::PathBuf::from("/Users/me"))),
+            std::path::PathBuf::from("/Users/me/.horde/identity")
+        );
+        assert_eq!(
+            default_identity_dir(None),
+            std::path::PathBuf::from(".horde-identity"),
+            "no HOME still yields a deterministic, local place"
         );
     }
 }
