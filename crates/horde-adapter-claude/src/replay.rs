@@ -50,6 +50,19 @@ pub fn replay(turns: Vec<Vec<String>>) -> ReplaySession {
     ReplaySession::new(StreamJsonLines::default(), turns)
 }
 
+/// Builds a session replaying a `--resume`d recording: turn numbering
+/// continues after the `turns_taken` a previous process consumed, exactly as
+/// the live adapter's revival path arranges it.
+#[must_use]
+pub fn replay_resuming(turns: Vec<Vec<String>>, turns_taken: u64) -> ReplaySession {
+    ReplaySession::new(
+        StreamJsonLines {
+            assembler: TurnAssembler::resuming_after(turns_taken),
+        },
+        turns,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use horde_adapter::{AgentSession, ToolCallId, TurnInput};
