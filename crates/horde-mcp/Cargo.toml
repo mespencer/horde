@@ -22,6 +22,17 @@ rmcp = { version = "=3.1.2", features = [
     "macros",
     "schemars",
     "transport-streamable-http-server",
+    # The hub half (ADR-0004): Horde-as-MCP-client consuming user servers.
+    # `transport-child-process` spawns stdio servers (hub-side once, or
+    # worker-side per agent for `local` configs) and kills the child by
+    # handle on drop; the reqwest streamable-HTTP client is both the dial
+    # tone for http upstreams and the worker's link to the hub endpoint.
+    # `reqwest` (not reqwest-native-tls) keeps the TLS stack rustls, like
+    # every other channel in the workspace.
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
 ] }
 
 # The endpoint reads per-request identity off the HTTP parts rmcp injects into
@@ -29,6 +40,11 @@ rmcp = { version = "=3.1.2", features = [
 # rather than an implementation detail of the transport.
 http = "1"
 hyper = { version = "1", features = ["server", "http1"] }
+# The hub link's HTTP client, handed to rmcp's streamable-http transport.
+# rustls, not native-tls, like every other channel in the workspace.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+] }
 hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
 tower-service = "0.3"
 
