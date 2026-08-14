@@ -13,6 +13,7 @@ import "horde/v1/agent.proto";
 import "horde/v1/event.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
+import "horde/v1/mcp.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/usage.proto";
 import "horde/v1/worker.proto";
@@ -65,6 +66,16 @@ service ControlPlaneService {
   // Materialize a Workspace Instance on a chosen Worker ahead of need.
   // Progress streams as Session events, not in this response.
   rpc PrewarmWorkspace(PrewarmWorkspaceRequest) returns (PrewarmWorkspaceResponse);
+
+  // -- MCP Hub ---------------------------------------------------------------
+
+  // Create or update one MCP server in the Hub catalog (ADR-0004). Journaled
+  // as an McpServerConfigChanged event in the reserved catalog stream.
+  rpc ConfigureMcpServer(ConfigureMcpServerRequest) returns (ConfigureMcpServerResponse);
+
+  rpc ListMcpServers(ListMcpServersRequest) returns (ListMcpServersResponse);
+
+  rpc DeleteMcpServer(DeleteMcpServerRequest) returns (DeleteMcpServerResponse);
 
   // -- Workers and enrollment ----------------------------------------------
 
@@ -394,6 +405,37 @@ message PrewarmWorkspaceResponse {
   // State at acceptance, normally MATERIALIZING. Completion arrives as events.
   WorkspaceInstanceReport report = 1;
 }
+
+// ---------------------------------------------------------------------------
+// MCP Hub
+// ---------------------------------------------------------------------------
+
+message ConfigureMcpServerRequest {
+  // The full desired config. Creating and updating are one verb because the
+  // catalog fold is last-writer-wins either way; what distinguishes them is
+  // the etag: empty creates (and an existing name is refused), non-empty
+  // updates (and must match, or the call fails ABORTED).
+  McpServerConfig config = 1;
+}
+
+message ConfigureMcpServerResponse {
+  // The config as journaled, with the etag its change produced.
+  McpServerConfig config = 1;
+}
+
+message ListMcpServersRequest {}
+
+message ListMcpServersResponse {
+  repeated McpServerConfig servers = 1;
+}
+
+message DeleteMcpServerRequest {
+  string name = 1;
+
+  string etag = 2;
+}
+
+message DeleteMcpServerResponse {}
 
 // ---------------------------------------------------------------------------
 // Workers and enrollment

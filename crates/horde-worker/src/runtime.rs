@@ -1361,6 +1361,8 @@ mod tests {
                 binding: None,
                 tree_path: Vec::new(),
                 prompt_overlay: String::new(),
+                local_mcp_servers: Vec::new(),
+                visible_hub_mcp_servers: Vec::new(),
             })),
         }
     }

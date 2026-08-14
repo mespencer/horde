@@ -9,12 +9,14 @@ use horde_proto::prost_types::{DescriptorProto, FileDescriptorSet};
 use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
     AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, EnrollmentCodeMinted,
-    EnrollmentRevoked, Event, EventEnvelope, IdentityEnrolled, Note, NoteSent, Payload,
-    PermissionDecided, PermissionDecision, PermissionRequest, PermissionRequested, Placement,
-    PlacementChanged, PlacementState, ResultReported, ResultStatus, Role, SessionId,
-    SessionLifecycleChanged, SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded,
-    WorkerId, WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
+    EnrollmentRevoked, Event, EventEnvelope, IdentityEnrolled, McpServerConfig,
+    McpServerConfigChanged, McpStdioTransport, Note, NoteSent, Payload, PermissionDecided,
+    PermissionDecision, PermissionRequest, PermissionRequested, Placement, PlacementChanged,
+    PlacementState, ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged,
+    SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded, WorkerId,
+    WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
     WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
+    mcp_server_config,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:
@@ -52,6 +54,7 @@ const EVENT_VOCABULARY: &[&str] = &[
     "enrollment_code_minted",
     "identity_enrolled",
     "enrollment_revoked",
+    "mcp_server_config_changed",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -78,6 +81,7 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::EnrollmentCodeMinted(_) => "enrollment_code_minted",
         event::Kind::IdentityEnrolled(_) => "identity_enrolled",
         event::Kind::EnrollmentRevoked(_) => "enrollment_revoked",
+        event::Kind::McpServerConfigChanged(_) => "mcp_server_config_changed",
     }
 }
 
@@ -195,6 +199,20 @@ fn every_kind() -> Vec<event::Kind> {
             certificate_serial: "0a1b2c3d".to_owned(),
             reason: "laptop stolen".to_owned(),
         }),
+        event::Kind::McpServerConfigChanged(McpServerConfigChanged {
+            config: Some(McpServerConfig {
+                name: "linear".to_owned(),
+                transport: Some(mcp_server_config::Transport::Stdio(McpStdioTransport {
+                    command: "linear-mcp".to_owned(),
+                    args: vec!["--stdio".to_owned()],
+                    env: std::collections::HashMap::new(),
+                })),
+                local: false,
+                allowed_agent_types: vec!["reviewer".to_owned()],
+                etag: String::new(),
+            }),
+            deleted: false,
+        }),
     ]
 }
 
@@ -305,7 +323,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 18] = [
+    let expected: [(&str, i32); 19] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -324,6 +342,7 @@ fn event_kind_tags_are_stable() {
         ("enrollment_code_minted", 25),
         ("identity_enrolled", 26),
         ("enrollment_revoked", 27),
+        ("mcp_server_config_changed", 28),
     ];
 
     let expected: Vec<(String, i32)> = expected

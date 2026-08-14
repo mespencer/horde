@@ -15,13 +15,15 @@ use std::pin::Pin;
 use horde_proto::v1::{
     AddWorkspaceRepoRequest, AddWorkspaceRepoResponse, AgentId, AgentSpawned,
     AnswerPermissionRequest, AnswerPermissionResponse, ArchiveSessionRequest,
-    ArchiveSessionResponse, AssignmentId, AssignmentSent, CreateSessionRequest,
-    CreateSessionResponse, CreateWorkspaceDefinitionRequest, CreateWorkspaceDefinitionResponse,
-    DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse, Event, GetSessionRequest,
-    GetSessionResponse, GetWorkspaceDefinitionRequest, GetWorkspaceDefinitionResponse,
-    HelloRequest, HelloResponse, InterruptAgentRequest, InterruptAgentResponse,
-    ListSessionsRequest, ListSessionsResponse, ListWorkersRequest, ListWorkersResponse,
-    ListWorkspaceDefinitionsRequest, ListWorkspaceDefinitionsResponse, MintEnrollmentCodeRequest,
+    ArchiveSessionResponse, AssignmentId, AssignmentSent, ConfigureMcpServerRequest,
+    ConfigureMcpServerResponse, CreateSessionRequest, CreateSessionResponse,
+    CreateWorkspaceDefinitionRequest, CreateWorkspaceDefinitionResponse, DeleteMcpServerRequest,
+    DeleteMcpServerResponse, DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse,
+    Event, GetSessionRequest, GetSessionResponse, GetWorkspaceDefinitionRequest,
+    GetWorkspaceDefinitionResponse, HelloRequest, HelloResponse, InterruptAgentRequest,
+    InterruptAgentResponse, ListMcpServersRequest, ListMcpServersResponse, ListSessionsRequest,
+    ListSessionsResponse, ListWorkersRequest, ListWorkersResponse, ListWorkspaceDefinitionsRequest,
+    ListWorkspaceDefinitionsResponse, McpServerConfig, MintEnrollmentCodeRequest,
     MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest, PrewarmWorkspaceResponse,
     QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
     SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
@@ -36,6 +38,7 @@ use tracing::instrument;
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use super::sync::{self, SubtreeFilter};
 use crate::error::ServerError;
+use crate::mcp::{MCP_CATALOG_STREAM, McpServerCatalog, validate_config};
 use crate::placement;
 use crate::scheduler::PlacementRequest;
 use crate::state::SessionState;
@@ -153,6 +156,41 @@ impl ControlPlane {
                     kind: Some(Kind::WorkspaceDefinitionChanged(
                         horde_proto::v1::WorkspaceDefinitionChanged {
                             definition: Some(definition),
+                            deleted,
+                        },
+                    )),
+                },
+            )
+            .await?;
+        stamped.etag = sequence.to_string();
+        Ok(stamped)
+    }
+
+    /// The MCP Hub catalog, folded fresh from its stream.
+    async fn mcp_catalog(&self) -> Result<McpServerCatalog, ServerError> {
+        let events = self.core.log.read_all(MCP_CATALOG_STREAM).await?;
+        McpServerCatalog::project(&events)
+    }
+
+    /// Appends one MCP catalog change and returns the config with the etag
+    /// that change produced.
+    async fn append_mcp_config(
+        &self,
+        config: McpServerConfig,
+        deleted: bool,
+    ) -> Result<McpServerConfig, ServerError> {
+        let mut stamped = config.clone();
+        let sequence = self
+            .append(
+                MCP_CATALOG_STREAM,
+                "",
+                Event {
+                    agent_id: None,
+                    occurred_at: None,
+                    idempotency_key: String::new(),
+                    kind: Some(Kind::McpServerConfigChanged(
+                        horde_proto::v1::McpServerConfigChanged {
+                            config: Some(config),
                             deleted,
                         },
                     )),
@@ -1010,6 +1048,91 @@ impl ControlPlaneService for ControlPlane {
                     .unwrap_or_default(),
             ),
         }))
+    }
+
+    // -- MCP Hub ---------------------------------------------------------------
+
+    #[instrument(skip_all)]
+    async fn configure_mcp_server(
+        &self,
+        request: Request<ConfigureMcpServerRequest>,
+    ) -> Result<Response<ConfigureMcpServerResponse>, Status> {
+        let config = request
+            .into_inner()
+            .config
+            .ok_or_else(|| Status::from(ServerError::Invalid("no config supplied".to_owned())))?;
+        validate_config(&config).map_err(Status::from)?;
+
+        // The etag is what splits create from update: empty means "I believe
+        // this name is new", non-empty means "I read this version and am
+        // changing it". Both beliefs are checked rather than trusted, so a
+        // concurrent writer surfaces as AlreadyExists or Aborted instead of a
+        // silent last-writer-wins overwrite through the RPC surface.
+        let catalog = self.mcp_catalog().await.map_err(Status::from)?;
+        match (catalog.get(&config.name), config.etag.is_empty()) {
+            // A create over a live name is refused as AlreadyExists, not as a
+            // stale etag: the caller's mistake is the name, not the token.
+            (Some(_), true) => {
+                return Err(Status::from(ServerError::McpServerNameTaken {
+                    name: config.name.clone(),
+                }));
+            }
+            (Some(existing), false) => {
+                crate::mcp::check_etag(existing, &config.etag).map_err(Status::from)?;
+            }
+            (None, true) => {}
+            // An update naming a server that is not there: the etag the
+            // caller holds is for something already deleted.
+            (None, false) => {
+                return Err(Status::from(ServerError::NoSuchMcpServer {
+                    name: config.name.clone(),
+                }));
+            }
+        }
+
+        let stamped = self
+            .append_mcp_config(config, false)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(ConfigureMcpServerResponse {
+            config: Some(stamped),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_mcp_servers(
+        &self,
+        _request: Request<ListMcpServersRequest>,
+    ) -> Result<Response<ListMcpServersResponse>, Status> {
+        let catalog = self.mcp_catalog().await.map_err(Status::from)?;
+        Ok(Response::new(ListMcpServersResponse {
+            servers: catalog.live().cloned().collect(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_mcp_server(
+        &self,
+        request: Request<DeleteMcpServerRequest>,
+    ) -> Result<Response<DeleteMcpServerResponse>, Status> {
+        let request = request.into_inner();
+        let catalog = self.mcp_catalog().await.map_err(Status::from)?;
+        let current = catalog
+            .get(&request.name)
+            .ok_or_else(|| {
+                Status::from(ServerError::NoSuchMcpServer {
+                    name: request.name.clone(),
+                })
+            })?
+            .clone();
+        crate::mcp::check_etag(&current, &request.etag).map_err(Status::from)?;
+
+        // The event carries the last live state, so the log alone records
+        // what was removed.
+        self.append_mcp_config(current, true)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(DeleteMcpServerResponse {}))
     }
 
     async fn list_workers(

@@ -39,7 +39,9 @@ pub fn is_enrollment_stream(session_id: &str) -> bool {
 /// them.
 #[must_use]
 pub fn is_reserved_stream(session_id: &str) -> bool {
-    crate::workspace::is_catalog_stream(session_id) || is_enrollment_stream(session_id)
+    crate::workspace::is_catalog_stream(session_id)
+        || is_enrollment_stream(session_id)
+        || crate::mcp::is_mcp_catalog_stream(session_id)
 }
 
 /// The wire form of a principal role.

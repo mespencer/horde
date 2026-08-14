@@ -13,6 +13,7 @@
 pub mod enrollment;
 pub mod error;
 pub mod log;
+pub mod mcp;
 pub mod permission;
 pub mod placement;
 pub mod scheduler;
