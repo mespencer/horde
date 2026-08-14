@@ -78,12 +78,11 @@ impl<E: SpanExporter> SpanExporter for CountingExporter<E> {
         async move {
             let result = export.await;
             if let Err(error) = &result {
-                let total = dropped.fetch_add(spans, Ordering::Relaxed) + spans;
+                dropped.fetch_add(spans, Ordering::Relaxed);
                 tracing::warn!(
                     target: "horde_observe",
                     %error,
                     spans,
-                    total,
                     "OTLP export failed; the batch is dropped"
                 );
             }

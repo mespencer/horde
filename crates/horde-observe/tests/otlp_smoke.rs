@@ -317,3 +317,44 @@ async fn an_unreachable_collector_costs_spans_and_never_blocks() {
         "every span handed to the exporter is accounted for"
     );
 }
+
+/// Shutdown is a real drain, not a formality: what is still queued goes
+/// through one last export, and at a dead collector that loss lands on the
+/// counter — which is why `shutdown` borrows instead of consuming.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_drains_the_queue_and_accounts_for_what_it_could_not_deliver() {
+    let endpoint = harness::dead_endpoint().await;
+    let telemetry = std::sync::Arc::new(
+        pipeline(
+            &OtlpConfig {
+                endpoint,
+                sample_ratio: 1.0,
+            },
+            &ServiceIdentity::new("horde-observe-smoke"),
+        )
+        .expect("the pipeline builds without connecting"),
+    );
+
+    let dispatch = silent_subscriber(&telemetry);
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _entered = tracing::info_span!(target: "horde_smoke", "last_turn").entered();
+    });
+
+    let closer = std::sync::Arc::clone(&telemetry);
+    harness::within(
+        "a shutdown at a dead collector returns",
+        tokio::task::spawn_blocking(move || {
+            // The verdict is not asserted: which error a drained-but-refused
+            // shutdown reports is the SDK's business. The counter below is
+            // this crate's own contract.
+            let _ = closer.shutdown();
+        }),
+    )
+    .await
+    .expect("the shutdown task must not panic");
+    assert_eq!(
+        telemetry.dropped_spans(),
+        1,
+        "a span the shutdown flush could not deliver is still accounted for"
+    );
+}

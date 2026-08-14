@@ -206,12 +206,15 @@ impl Telemetry {
 
     /// Flushes what is queued (bounded by [`SHUTDOWN_TIMEOUT`]) and
     /// dismantles the pipeline. See the type docs for where to call this.
+    /// Takes `&self` so what the shutdown flush could not deliver is still
+    /// readable off [`dropped_spans`](Self::dropped_spans) afterwards; a
+    /// second call finds nothing left to do and says so.
     ///
     /// # Errors
     ///
     /// The SDK's verdict; a binary exiting anyway may reasonably discard it,
     /// because a collector that is down must not change an exit code.
-    pub fn shutdown(self) -> opentelemetry_sdk::error::OTelSdkResult {
+    pub fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
         self.provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
     }
 }
@@ -223,5 +226,48 @@ impl Drop for Telemetry {
         // fire; this one does. Second calls (after an explicit `shutdown`)
         // report AlreadyShutdown, which is exactly nothing left to do.
         let _ = self.provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InitError, ServiceIdentity, init_from_env};
+    use crate::config::{ENDPOINT_VAR, SAMPLE_VAR};
+
+    /// The whole opt-in truth table through the one call the binaries make.
+    /// (What a built pipeline *does* is the smoke suite's business; this
+    /// pins that one is or is not built, and that refusals pass through.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn init_from_env_builds_exactly_when_opted_in() {
+        let off = init_from_env(ServiceIdentity::new("probe"), |_| None);
+        assert!(
+            matches!(off, Ok(None)),
+            "no environment, no pipeline: {off:?}"
+        );
+
+        let on = init_from_env(ServiceIdentity::new("probe"), |name| {
+            (name == ENDPOINT_VAR).then(|| "http://127.0.0.1:1".to_owned())
+        });
+        assert!(
+            matches!(on, Ok(Some(_))),
+            "an endpoint must build a (lazy) pipeline: {:?}",
+            on.map(|telemetry| telemetry.is_some())
+        );
+
+        let misconfigured = init_from_env(ServiceIdentity::new("probe"), |name| {
+            (name == SAMPLE_VAR).then(|| "0.5".to_owned())
+        });
+        assert!(
+            matches!(misconfigured, Err(InitError::Config(_))),
+            "config refusals must pass through: {misconfigured:?}"
+        );
+
+        let unbuildable = init_from_env(ServiceIdentity::new("probe"), |name| {
+            (name == ENDPOINT_VAR).then(|| "not a uri".to_owned())
+        });
+        assert!(
+            matches!(unbuildable, Err(InitError::Pipeline(_))),
+            "an endpoint the exporter cannot parse must refuse: {unbuildable:?}"
+        );
     }
 }
