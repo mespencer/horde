@@ -1201,6 +1201,7 @@ dependencies = [
  "horde-adapter-fake",
  "horde-identity",
  "horde-proto",
+ "horde-relay",
  "horde-server",
  "horde-server-testkit",
  "horde-wire",

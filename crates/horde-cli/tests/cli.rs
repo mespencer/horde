@@ -89,8 +89,8 @@ async fn session_list_json_is_machine_readable() {
     let sessions = parsed["sessions"].as_array().expect("a sessions array");
     assert_eq!(sessions.len(), 1);
     assert_eq!(
-        sessions[0]["title"],
-        serde_json::Value::String(String::new())
+        sessions[0]["title"], "ci-fix",
+        "the summary carries the title the session was created with"
     );
     assert_eq!(sessions[0]["state"], "active");
 }

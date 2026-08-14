@@ -275,6 +275,43 @@ async fn headroom_is_reported_when_the_harness_volunteers_it() {
     );
 }
 
+/// The revival reconciliation, held to the real recording: `05-resume.jsonl`
+/// resumed `02-multi-turn.jsonl`'s conversation (same session id) in a fresh
+/// process after three turns. The revived turn must continue the numbering —
+/// re-minting `#1` would collide with journal keys the original turns already
+/// used, and the Server's dedupe would discard the revived events while acking
+/// them — and its usage must be the fresh process's own totals, not a delta
+/// against a process that no longer exists.
+#[tokio::test]
+async fn a_resumed_recording_continues_numbering_and_counts_usage_once() {
+    let transcript = load("05-resume.jsonl").expect("fixture must load");
+    // Three turns taken by the original process, plus one for the turn that
+    // may have died half-journaled — the Worker's revival path skips it.
+    let mut session = horde_adapter_claude::replay::replay_resuming(transcript.turns(), 4);
+
+    let records = horde_testkit::conformance::check_session(&mut session, &["replayed"])
+        .await
+        .expect("the resumed recording must conform");
+
+    assert_eq!(records.len(), 1);
+    let outcome = &records[0].outcome;
+    assert_eq!(
+        outcome.turn_id.to_string(),
+        "9f754676-44aa-4e61-9b30-6a151c29cce4#5",
+        "the revived turn continues the conversation's numbering"
+    );
+    assert_eq!(
+        outcome.usage.tokens.output_tokens, 51,
+        "the fresh process's cumulative usage IS the turn's delta; anything \
+         else double-counts or discards the revived turn"
+    );
+    assert_eq!(
+        outcome.text.as_deref(),
+        Some("4271"),
+        "the recorded resume remembered the number across processes"
+    );
+}
+
 /// Draining past the recorded turns must not invent events.
 #[tokio::test]
 async fn a_replayed_session_ends_cleanly() {

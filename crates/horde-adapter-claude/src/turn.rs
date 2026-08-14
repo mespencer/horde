@@ -45,6 +45,22 @@ impl TurnAssembler {
         Self::default()
     }
 
+    /// An assembler for a conversation revived by `--resume`, numbering its
+    /// turns after the `turns_taken` the previous processes consumed.
+    ///
+    /// Turn ids are `{session}#{ordinal}` and the Worker keys journal entries
+    /// by them, so an assembler that restarted at zero would re-mint ids the
+    /// journal has already seen — and the Server's dedupe would then discard
+    /// the revived turns' events while acking them. Continuing the numbering
+    /// is what makes a revived turn's usage count once and land once.
+    #[must_use]
+    pub fn resuming_after(turns_taken: u64) -> Self {
+        Self {
+            turn_ordinal: turns_taken,
+            ..Self::default()
+        }
+    }
+
     /// The harness conversation id seen so far.
     #[must_use]
     pub fn provider_session_id(&self) -> Option<ProviderSessionId> {
@@ -351,6 +367,53 @@ mod tests {
             _ => None,
         });
         assert_eq!(first_assistant, Some(0), "counters must reset per turn");
+    }
+
+    /// Revival continues the turn numbering instead of restarting it, and the
+    /// resumed process's usage is read whole rather than differenced against a
+    /// process that no longer exists.
+    #[test]
+    fn a_resumed_assembler_continues_the_numbering_and_counts_usage_once() {
+        let mut assembler = TurnAssembler::resuming_after(4);
+        feed(&mut assembler, &init("s1"));
+
+        let events = feed(
+            &mut assembler,
+            &result_line(
+                "s1",
+                serde_json::json!({
+                    "total_cost_usd": 0.0011,
+                    "modelUsage": { "claude-haiku-4-5": { "inputTokens": 10, "outputTokens": 51 } }
+                }),
+            ),
+        );
+
+        match events.as_slice() {
+            [AgentEvent::TurnEnded(outcome)] => {
+                assert_eq!(
+                    outcome.turn_id.to_string(),
+                    "s1#5",
+                    "the revived turn must not re-mint an id the journal already keyed"
+                );
+                assert_eq!(
+                    outcome.usage.tokens.output_tokens, 51,
+                    "a fresh process reports its own totals; they are the delta"
+                );
+            }
+            other => panic!("expected one TurnEnded, got {other:?}"),
+        }
+    }
+
+    /// A revived session announces itself again — the identifier that makes
+    /// the agent revivable must reach the journal in every incarnation.
+    #[test]
+    fn a_resumed_assembler_still_announces_the_session() {
+        let mut assembler = TurnAssembler::resuming_after(4);
+        let first = feed(&mut assembler, &init("s1"));
+        assert!(matches!(
+            first.as_slice(),
+            [AgentEvent::SessionEstablished { .. }]
+        ));
     }
 
     #[test]

@@ -48,8 +48,9 @@ use tokio::sync::mpsc;
 
 use crate::client::ApplyCommand;
 use crate::error::WorkerError;
-use crate::journal::{Journal, JournalEntry};
-use crate::translate::{AgentContext, journal_entries};
+use crate::journal::{AgentBookkeeping, AgentProgress, Journal, JournalEntry, RevivableAgent};
+use crate::share::{AgentCheckout, ShareBroker, StampingSink};
+use crate::translate::{AgentContext, failure_reason, journal_entries};
 
 /// How many control messages may queue for one agent's pump.
 const CONTROL_CAPACITY: usize = 8;
@@ -65,6 +66,9 @@ pub struct Runtime {
     /// this Worker does not advertise workspace support and refuses
     /// materialize commands loudly.
     workspaces: Option<crate::workspace::WorkspaceManager>,
+    /// Tracks every running agent's checkout and executes payload shares —
+    /// stamping on the way out, obtaining on the way in.
+    broker: Arc<ShareBroker>,
     agents: BTreeMap<String, AgentHandle>,
     /// Pumps whose agents were archived, kept so shutdown can wait for them.
     retired: Vec<tokio::task::JoinHandle<()>>,
@@ -106,7 +110,21 @@ enum AgentControl {
 /// What executing a command decided, before anything is journaled.
 struct Applied {
     effects: Vec<JournalEntry>,
+    /// Revival bookkeeping that must commit with the applied-mark.
+    bookkeeping: AgentBookkeeping,
     then: AfterCommit,
+}
+
+impl Applied {
+    /// A command that applied without effects or follow-up — the race case,
+    /// where the agent a command names is already gone.
+    fn nothing() -> Self {
+        Self {
+            effects: Vec::new(),
+            bookkeeping: AgentBookkeeping::None,
+            then: AfterCommit::Nothing,
+        }
+    }
 }
 
 /// Work that must wait for the applied-mark to commit.
@@ -139,9 +157,29 @@ impl Runtime {
             adapters: BTreeMap::new(),
             default_provider: None,
             workspaces: None,
+            broker: Arc::new(ShareBroker::new(None)),
             agents: BTreeMap::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Points payload shares at a Relay: stamped commits are pushed to their
+    /// share refs, and commits absent from this Worker are fetched through
+    /// it. Without one, only the local routes exist. Configure before any
+    /// spawn — the broker is rebuilt, not updated.
+    #[must_use]
+    pub fn with_relay(mut self, relay: horde_relay::RelayLocation) -> Self {
+        self.broker = Arc::new(ShareBroker::new(Some(relay)));
+        self
+    }
+
+    /// The journal sink the Worker hands its MCP endpoint: results reported
+    /// without a payload are stamped with the reporting agent's observed
+    /// HEAD on their way into the journal ("the Worker's to stamp",
+    /// horde-mcp's `report_result`).
+    #[must_use]
+    pub fn stamping_sink(&self) -> StampingSink {
+        StampingSink::new(self.journal.sink(), Arc::clone(&self.broker))
     }
 
     /// Enables workspace support: materialize commands are applied, spawns
@@ -210,7 +248,7 @@ impl Runtime {
     async fn execute(&mut self, command: Command) -> Result<Applied, WorkerError> {
         match command {
             Command::SpawnAgent(spawn) => self.spawn_agent(spawn).await,
-            Command::DeliverMessage(deliver) => Ok(self.deliver_message(deliver)),
+            Command::DeliverMessage(deliver) => self.deliver_message(deliver).await,
             Command::InterruptAgent(interrupt) => Ok(self.interrupt_agent(&interrupt)),
             Command::ArchiveAgent(archive) => Ok(self.archive_agent(&archive)),
             Command::CancelPlacement(cancel) => Ok(self.cancel_placement(&cancel)),
@@ -253,6 +291,7 @@ impl Runtime {
                     progress: None,
                 }),
             }],
+            bookkeeping: AgentBookkeeping::None,
             then: AfterCommit::Nothing,
         })
     }
@@ -260,43 +299,33 @@ impl Runtime {
     async fn spawn_agent(&mut self, spawn: SpawnAgentCommand) -> Result<Applied, WorkerError> {
         let agent_id = required_id(spawn.agent_id.as_ref(), "agent id")?;
         let session_id = required_id(spawn.session_id.as_ref(), "session id")?;
-
-        let context = AgentContext {
-            session_id: session_id.clone(),
-            agent_id: agent_id.clone(),
-            binding: spawn.binding.clone(),
-            permission_mode: spawn
-                .spec
-                .as_ref()
-                .map(|spec| spec.permission_mode.clone())
-                .unwrap_or_default(),
-            tree_path: spawn.tree_path.clone(),
-        };
+        let context = context_of(&spawn, &session_id, &agent_id);
 
         // A spawn that cannot start is the *agent* failing, not the command
         // loop: the command still applies, with the failure as its journaled
         // effect, and the Server hears an honest lifecycle instead of losing
         // its Worker.
-        let (session, can_rewrite) = match self.start_session(&spawn).await {
-            Ok(started) => started,
-            Err(error) => {
-                return Ok(Applied {
-                    effects: vec![lifecycle_entry(
-                        &context,
-                        format!("{agent_id}:spawn-failed"),
-                        AgentLifecycleState::Queued,
-                        AgentLifecycleState::Failed,
-                        error.to_string(),
-                    )],
-                    then: AfterCommit::Nothing,
-                });
-            }
+        let checkout = match self.agent_checkout(&spawn).await {
+            Ok(checkout) => checkout,
+            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
         };
+        let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
+        let (session, can_rewrite) = match self.start_session(&spawn, cwd).await {
+            Ok(started) => started,
+            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
+        };
+        // Registered only once the harness actually started: a checkout with
+        // no agent behind it must not become a peer-fetch source or a
+        // stamping target.
+        if let Some(checkout) = checkout {
+            self.broker.register(&agent_id, checkout);
+        }
 
         let first_input = spawn
             .spec
-            .and_then(|spec| spec.initial_assignment)
-            .map(|assignment| assignment.text)
+            .as_ref()
+            .and_then(|spec| spec.initial_assignment.as_ref())
+            .map(|assignment| assignment.text.clone())
             .filter(|text| !text.is_empty())
             .map(TurnInput::queued);
 
@@ -308,6 +337,14 @@ impl Runtime {
                 AgentLifecycleState::Starting,
                 "placed on this worker".to_owned(),
             )],
+            // Remembered in the same transaction as the applied-mark: a spawn
+            // this Worker acked but cannot rebuild is an agent the Server
+            // believes in and nobody can ever revive.
+            bookkeeping: AgentBookkeeping::Remember {
+                agent_id: agent_id.clone(),
+                session_id,
+                spawn: Box::new(spawn),
+            },
             then: AfterCommit::Start {
                 agent_id,
                 session,
@@ -318,24 +355,13 @@ impl Runtime {
         })
     }
 
-    /// Resolves the adapter and starts the harness session.
+    /// Resolves the adapter and starts the harness session in `cwd`.
     async fn start_session(
         &self,
         spawn: &SpawnAgentCommand,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<(Box<dyn AgentSession>, bool), WorkerError> {
-        let provider = spawn
-            .binding
-            .as_ref()
-            .map(|binding| binding.provider.clone())
-            .filter(|provider| !provider.is_empty())
-            .or_else(|| self.default_provider.clone())
-            .ok_or_else(|| WorkerError::UnknownProvider(String::new()))?;
-        let adapter = self
-            .adapters
-            .get(&provider)
-            .ok_or_else(|| WorkerError::UnknownProvider(provider.clone()))?;
-
-        let cwd = self.agent_checkout(spawn).await?;
+        let adapter = self.adapter_for(spawn)?;
         let spec = domain_spec(spawn, cwd);
         let session = adapter.spawn(&spec).await?;
         let can_rewrite = adapter
@@ -344,8 +370,23 @@ impl Runtime {
         Ok((session, can_rewrite))
     }
 
-    /// The working directory a spawn's workspace and Checkout Policy call
-    /// for; `None` when the spawn names no workspace and the agent runs
+    /// The adapter a spawn command binds, or the Worker's default.
+    fn adapter_for(&self, spawn: &SpawnAgentCommand) -> Result<&Arc<dyn Adapter>, WorkerError> {
+        let provider = spawn
+            .binding
+            .as_ref()
+            .map(|binding| binding.provider.clone())
+            .filter(|provider| !provider.is_empty())
+            .or_else(|| self.default_provider.clone())
+            .ok_or_else(|| WorkerError::UnknownProvider(String::new()))?;
+        self.adapters
+            .get(&provider)
+            .ok_or(WorkerError::UnknownProvider(provider))
+    }
+
+    /// The checkout a spawn's workspace and Checkout Policy call for — its
+    /// root is the agent's working directory, its repos the payload seam's
+    /// map — or `None` when the spawn names no workspace and the agent runs
     /// where the Worker runs.
     ///
     /// # Errors
@@ -356,7 +397,7 @@ impl Runtime {
     async fn agent_checkout(
         &self,
         spawn: &SpawnAgentCommand,
-    ) -> Result<Option<std::path::PathBuf>, WorkerError> {
+    ) -> Result<Option<AgentCheckout>, WorkerError> {
         let Some(spec) = spawn.spec.as_ref() else {
             return Ok(None);
         };
@@ -381,32 +422,30 @@ impl Runtime {
             .unwrap_or_default();
         let policy = horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy)
             .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified);
-        workspaces
+        let root = workspaces
             .checkout(&definition_id, &agent_id, policy)
-            .await
-            .map(Some)
+            .await?;
+        let repos = workspaces.instance_repos(&definition_id).await?;
+        Ok(Some(AgentCheckout { root, repos }))
     }
 
-    fn deliver_message(&mut self, deliver: DeliverMessageCommand) -> Applied {
-        let Some(agent_id) = known_agent(&self.agents, deliver.agent_id.as_ref()) else {
-            return Applied {
-                effects: Vec::new(),
-                then: AfterCommit::Nothing,
-            };
-        };
+    async fn deliver_message(
+        &mut self,
+        deliver: DeliverMessageCommand,
+    ) -> Result<Applied, WorkerError> {
+        let agent_id = required_id(deliver.agent_id.as_ref(), "agent id")?;
 
-        let text = match deliver.body {
-            Some(deliver_message_command::Body::Assignment(assignment)) => assignment.text,
-            Some(deliver_message_command::Body::Note(note)) => note.text,
+        let (text, payload) = match deliver.body {
+            Some(deliver_message_command::Body::Assignment(assignment)) => {
+                (assignment.text, assignment.payload)
+            }
+            Some(deliver_message_command::Body::Note(note)) => (note.text, note.payload),
             None => {
                 tracing::warn!(
                     agent_id,
                     "a deliver command carried no message; applied empty"
                 );
-                return Applied {
-                    effects: Vec::new(),
-                    then: AfterCommit::Nothing,
-                };
+                return Ok(Applied::nothing());
             }
         };
 
@@ -418,23 +457,187 @@ impl Runtime {
             _ => TurnInput::queued(text),
         };
 
-        // No journal effect: the Server wrote AssignmentSent/NoteSent when the
-        // message happened; that event is why this command exists.
-        Applied {
-            effects: Vec::new(),
-            then: AfterCommit::Control {
+        if has_live_pump(&self.agents, &agent_id) {
+            // A Payload's commits are made present in the receiving agent's
+            // checkout *before* the message text reaches it — the message
+            // names work, and handing the agent a name it cannot check out
+            // would be the transport becoming the agent's concern (DESIGN §5).
+            if let Some(payload) = carried_payload(payload.as_ref())
+                && let Err(error) = self.broker.obtain(&agent_id, payload).await
+            {
+                return Ok(self.payload_failed(&agent_id, &error));
+            }
+            // No journal effect: the Server wrote AssignmentSent/NoteSent when
+            // the message happened; that event is why this command exists.
+            return Ok(Applied {
+                effects: Vec::new(),
+                bookkeeping: AgentBookkeeping::None,
+                then: AfterCommit::Control {
+                    agent_id,
+                    control: AgentControl::Deliver(input),
+                },
+            });
+        }
+
+        // Nobody is running the agent — a dead harness, a retired pump, or a
+        // Worker that restarted. Sending an agent another message is what
+        // revives it (DESIGN.md §5), and the journal remembers how. The
+        // payload rides along: it can only be obtained once the revival has
+        // re-registered the agent's checkout.
+        self.revive_and_deliver(agent_id, input, payload).await
+    }
+
+    /// Revives a remembered agent to deliver `input`, or journals why not.
+    async fn revive_and_deliver(
+        &mut self,
+        agent_id: String,
+        input: TurnInput,
+        payload: Option<horde_proto::v1::Payload>,
+    ) -> Result<Applied, WorkerError> {
+        let Some(record) = self.journal.revivable_agent(&agent_id).await? else {
+            // Never spawned here (or long archived): the race case, applied
+            // with nobody to tell — the causing event is already in the log.
+            tracing::warn!(
                 agent_id,
-                control: AgentControl::Deliver(input),
+                "a message for an agent this worker neither runs nor remembers"
+            );
+            return Ok(Applied::nothing());
+        };
+
+        let context = context_of(&record.spawn, &record.session_id, &agent_id);
+        if record.provider_session_id.is_none() {
+            // The harness died before ever naming its conversation, so there
+            // is nothing to resume — said loudly, or the sender reads an
+            // unreachable agent as one that is merely slow.
+            return Ok(Applied {
+                effects: vec![lifecycle_entry(
+                    &context,
+                    String::new(),
+                    AgentLifecycleState::Unspecified,
+                    AgentLifecycleState::Failed,
+                    "cannot revive: no provider session was ever established".to_owned(),
+                )],
+                bookkeeping: AgentBookkeeping::None,
+                then: AfterCommit::Nothing,
+            });
+        }
+
+        match self.resume_session(&record).await {
+            Ok((session, can_rewrite, checkout)) => {
+                // Re-registered before the payload is obtained: the broker
+                // routes the obtain through the receiver's own checkout.
+                if let Some(checkout) = checkout {
+                    self.broker.register(&agent_id, checkout);
+                }
+                if let Some(payload) = carried_payload(payload.as_ref())
+                    && let Err(error) = self.broker.obtain(&agent_id, payload).await
+                {
+                    // The revived checkout must not linger as a stamping
+                    // target for an agent whose pump never started.
+                    self.broker.forget(&agent_id);
+                    return Ok(self.payload_failed(&agent_id, &error));
+                }
+                Ok(Applied {
+                    effects: vec![lifecycle_entry(
+                        &context,
+                        // Revivals can repeat; the journal mints each key.
+                        String::new(),
+                        // The Worker does not track how the last incarnation
+                        // ended; claiming one would be invention.
+                        AgentLifecycleState::Unspecified,
+                        AgentLifecycleState::Starting,
+                        "revived to deliver a message".to_owned(),
+                    )],
+                    bookkeeping: AgentBookkeeping::None,
+                    then: AfterCommit::Start {
+                        agent_id,
+                        session,
+                        context,
+                        can_rewrite,
+                        first_input: Some(input),
+                    },
+                })
+            }
+            Err(error) => Ok(Applied {
+                // The revival failing is the *agent's* failure, journaled so
+                // the sender learns the message has no one to reach — silence
+                // here would read as an agent that is merely slow.
+                effects: vec![lifecycle_entry(
+                    &context,
+                    String::new(),
+                    AgentLifecycleState::Unspecified,
+                    AgentLifecycleState::Failed,
+                    error.to_string(),
+                )],
+                bookkeeping: AgentBookkeeping::None,
+                then: AfterCommit::Nothing,
+            }),
+        }
+    }
+
+    /// Resumes the provider conversation a remembered agent names.
+    ///
+    /// The caller has already established that a provider session id exists;
+    /// an empty one here would resume nothing and is refused by the adapter.
+    async fn resume_session(
+        &self,
+        record: &RevivableAgent,
+    ) -> Result<(Box<dyn AgentSession>, bool, Option<AgentCheckout>), WorkerError> {
+        let provider_session_id = record.provider_session_id.as_deref().unwrap_or_default();
+        let adapter = self.adapter_for(&record.spawn)?;
+        let checkout = self.agent_checkout(&record.spawn).await?;
+        let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
+        // One past the recorded count: a turn that died half-journaled has
+        // already spent its ordinal, and reusing it would hand the revived
+        // turn journal keys the Server has partially seen. Turn ids need
+        // uniqueness, not density, so the skip is free.
+        let spec = domain_spec(&record.spawn, cwd).with_turns_taken(record.turns_taken + 1);
+        let session = adapter
+            .resume(
+                &spec,
+                &horde_adapter::ProviderSessionId::new(provider_session_id),
+            )
+            .await?;
+        let can_rewrite = adapter
+            .capabilities()
+            .supports(Capability::RewritesToolInput);
+        Ok((session, can_rewrite, checkout))
+    }
+
+    /// A delivery whose Payload could not be obtained fails the *agent*,
+    /// loudly: the message names work the agent cannot see, and delivering
+    /// the text anyway would have it act on a payload it cannot check out —
+    /// a silent drop with a delayed symptom. The command still applies, the
+    /// failure is its journaled effect, and the pump is retired.
+    fn payload_failed(&self, agent_id: &str, error: &WorkerError) -> Applied {
+        let session_id = self
+            .agents
+            .get(agent_id)
+            .map(|handle| handle.session_id.clone())
+            .unwrap_or_default();
+        Applied {
+            effects: vec![JournalEntry {
+                session_id,
+                agent_id: Some(agent_id.to_owned()),
+                idempotency_key: String::new(),
+                kind: Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                    previous_state: AgentLifecycleState::Running.into(),
+                    state: AgentLifecycleState::Failed.into(),
+                    reason: format!("a delivered payload could not be obtained: {error}"),
+                }),
+            }],
+            // Failed, not archived: the context survives, so another message
+            // (with an obtainable payload) may still revive the agent.
+            bookkeeping: AgentBookkeeping::None,
+            then: AfterCommit::Retire {
+                agent_id: agent_id.to_owned(),
             },
         }
     }
 
     fn interrupt_agent(&mut self, interrupt: &InterruptAgentCommand) -> Applied {
         let Some(agent_id) = known_agent(&self.agents, interrupt.agent_id.as_ref()) else {
-            return Applied {
-                effects: Vec::new(),
-                then: AfterCommit::Nothing,
-            };
+            return Applied::nothing();
         };
 
         Applied {
@@ -453,6 +656,7 @@ impl Runtime {
                     reason: interrupt.reason.clone(),
                 }),
             }],
+            bookkeeping: AgentBookkeeping::None,
             then: AfterCommit::Control {
                 agent_id,
                 control: AgentControl::Interrupt,
@@ -461,12 +665,23 @@ impl Runtime {
     }
 
     fn archive_agent(&mut self, archive: &ArchiveAgentCommand) -> Applied {
-        let Some(agent_id) = known_agent(&self.agents, archive.agent_id.as_ref()) else {
+        // Forgotten whether or not the agent is still running here: context
+        // dies at archive, so a revivable-but-idle agent must stop being
+        // revivable even though there is no pump left to tell.
+        let agent_id = archive
+            .agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if !self.agents.contains_key(&agent_id) {
             return Applied {
                 effects: Vec::new(),
+                bookkeeping: AgentBookkeeping::Forget {
+                    agent_id: agent_id.clone(),
+                },
                 then: AfterCommit::Nothing,
             };
-        };
+        }
 
         let session_id = self
             .agents
@@ -486,6 +701,9 @@ impl Runtime {
                     reason: archive.reason.clone(),
                 }),
             }],
+            bookkeeping: AgentBookkeeping::Forget {
+                agent_id: agent_id.clone(),
+            },
             then: AfterCommit::Retire { agent_id },
         }
     }
@@ -495,15 +713,24 @@ impl Runtime {
         // agent this Worker never started; one cancelled after is an archive
         // in different clothes. PlacementChanged events are Server-authored,
         // so there is nothing to journal either way.
-        let Some(agent_id) = known_agent(&self.agents, cancel.agent_id.as_ref()) else {
-            return Applied {
-                effects: Vec::new(),
-                then: AfterCommit::Nothing,
-            };
+        let agent_id = cancel
+            .agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let then = if self.agents.contains_key(&agent_id) {
+            AfterCommit::Retire {
+                agent_id: agent_id.clone(),
+            }
+        } else {
+            AfterCommit::Nothing
         };
         Applied {
             effects: Vec::new(),
-            then: AfterCommit::Retire { agent_id },
+            // The agent no longer runs here, so this Worker must not keep the
+            // power to revive it somewhere the scheduler moved it away from.
+            bookkeeping: AgentBookkeeping::Forget { agent_id },
+            then,
         }
     }
 
@@ -512,10 +739,7 @@ impl Runtime {
         deliver: DeliverPermissionDecisionCommand,
     ) -> Result<Applied, WorkerError> {
         let Some(agent_id) = known_agent(&self.agents, deliver.agent_id.as_ref()) else {
-            return Ok(Applied {
-                effects: Vec::new(),
-                then: AfterCommit::Nothing,
-            });
+            return Ok(Applied::nothing());
         };
         let decision = deliver
             .decision
@@ -540,6 +764,7 @@ impl Runtime {
         // the chain and journaled PermissionDecided before commanding us.
         Ok(Applied {
             effects: Vec::new(),
+            bookkeeping: AgentBookkeeping::None,
             then: AfterCommit::Control {
                 agent_id,
                 control: AgentControl::Answer {
@@ -572,7 +797,7 @@ impl Runtime {
                 if let Some(input) = first_input {
                     let _ = control.send(AgentControl::Deliver(input)).await;
                 }
-                self.agents.insert(
+                let previous = self.agents.insert(
                     agent_id,
                     AgentHandle {
                         control,
@@ -581,6 +806,11 @@ impl Runtime {
                         task,
                     },
                 );
+                if let Some(previous) = previous {
+                    // A revival replacing a dead pump: the old task is done or
+                    // about to be, but shutdown still owes it a join.
+                    self.retired.push(previous.task);
+                }
             }
             AfterCommit::Control { agent_id, control } => {
                 if let Some(handle) = self.agents.get(&agent_id)
@@ -590,6 +820,10 @@ impl Runtime {
                 }
             }
             AfterCommit::Retire { agent_id } => {
+                // The checkout registry must not outlive the agent: a stale
+                // entry would stamp an archived agent's HEAD, or offer its
+                // checkout as a peer-fetch source, forever.
+                self.broker.forget(&agent_id);
                 if let Some(handle) = self.agents.remove(&agent_id) {
                     let _ = handle.control.send(AgentControl::Archive).await;
                     self.retired.push(handle.task);
@@ -620,11 +854,38 @@ impl ApplyCommand for Runtime {
                 &command.command_id,
                 command.command_sequence,
                 applied.effects,
+                applied.bookkeeping,
             )
             .await?;
         self.after_commit(applied.then).await;
         Ok(())
     }
+}
+
+/// The applied form of a spawn that could not start: the command applies,
+/// with the agent's failure as its journaled effect — the Server hears an
+/// honest lifecycle instead of losing its Worker.
+fn spawn_failed(context: &AgentContext, agent_id: &str, error: &WorkerError) -> Applied {
+    Applied {
+        effects: vec![lifecycle_entry(
+            context,
+            format!("{agent_id}:spawn-failed"),
+            AgentLifecycleState::Queued,
+            AgentLifecycleState::Failed,
+            error.to_string(),
+        )],
+        // An agent that never started has nothing to revive; remembering it
+        // would promise a revival the journal cannot deliver.
+        bookkeeping: AgentBookkeeping::None,
+        then: AfterCommit::Nothing,
+    }
+}
+
+/// The payload a message actually carries, if it names any commits.
+fn carried_payload(
+    payload: Option<&horde_proto::v1::Payload>,
+) -> Option<&horde_proto::v1::Payload> {
+    payload.filter(|payload| !payload.git_refs.is_empty())
 }
 
 /// A lifecycle transition as a journal effect.
@@ -652,6 +913,37 @@ fn required_id<T: ToString>(id: Option<&T>, name: &'static str) -> Result<String
     id.map(ToString::to_string)
         .filter(|id| !id.is_empty())
         .ok_or(WorkerError::Incomplete(name))
+}
+
+/// The standing facts a spawn command carries, as the pump journals them.
+///
+/// Shared between the spawn and revival paths — a revived agent's events must
+/// journal under exactly the facts its spawn established, or attribution
+/// changes across an incarnation boundary.
+fn context_of(spawn: &SpawnAgentCommand, session_id: &str, agent_id: &str) -> AgentContext {
+    AgentContext {
+        session_id: session_id.to_owned(),
+        agent_id: agent_id.to_owned(),
+        binding: spawn.binding.clone(),
+        permission_mode: spawn
+            .spec
+            .as_ref()
+            .map(|spec| spec.permission_mode.clone())
+            .unwrap_or_default(),
+        tree_path: spawn.tree_path.clone(),
+    }
+}
+
+/// Whether a pump is actually alive to take a delivery.
+///
+/// Presence in the map is not enough: a pump whose harness died has ended,
+/// but its handle lingers until something replaces it. Both facts matter —
+/// a missing handle and a closed channel are each an agent nobody is running,
+/// and each is a revival case, never a message to drop.
+fn has_live_pump(agents: &BTreeMap<String, AgentHandle>, agent_id: &str) -> bool {
+    agents
+        .get(agent_id)
+        .is_some_and(|handle| !handle.control.is_closed())
 }
 
 /// The agent a command names, if this Runtime is actually running it.
@@ -718,33 +1010,38 @@ enum PumpState {
 
 /// One agent's event loop: owns the session, obeys control, journals events.
 async fn pump(
-    mut session: Box<dyn AgentSession>,
+    session: Box<dyn AgentSession>,
     journal: Journal,
     context: AgentContext,
     mut control: mpsc::Receiver<AgentControl>,
 ) {
-    let mut state = PumpState::Idle;
+    let mut pump = Pump {
+        session,
+        journal,
+        context,
+        state: PumpState::Idle,
+        turns_in_flight: 0,
+        queued: std::collections::VecDeque::new(),
+    };
     loop {
-        let step = if state == PumpState::Streaming {
+        let step = if pump.state == PumpState::Streaming {
             tokio::select! {
                 // Biased toward control so a shutdown or interrupt is never
                 // starved by a chatty harness.
                 biased;
                 message = control.recv() => Step::Control(message),
-                event = session.next_event() => Step::Event(event),
+                event = pump.session.next_event() => Step::Event(event),
             }
         } else {
             Step::Control(control.recv().await)
         };
 
         let flow = match step {
-            Step::Control(message) => {
-                apply_control(&mut session, &journal, &context, state, message).await
-            }
-            Step::Event(event) => apply_event(&mut session, &journal, &context, event).await,
+            Step::Control(message) => pump.apply_control(message).await,
+            Step::Event(event) => pump.apply_event(event).await,
         };
         match flow {
-            Flow::Continue(next) => state = next,
+            Flow::Continue => {}
             Flow::Stop => return,
         }
     }
@@ -752,123 +1049,252 @@ async fn pump(
 
 /// What the pump does after handling one step.
 enum Flow {
-    Continue(PumpState),
+    Continue,
     Stop,
 }
 
-/// Obeys one control message.
-async fn apply_control(
-    session: &mut Box<dyn AgentSession>,
-    journal: &Journal,
-    context: &AgentContext,
+/// One agent's pump: the session it owns, and the steering it holds.
+struct Pump {
+    session: Box<dyn AgentSession>,
+    journal: Journal,
+    context: AgentContext,
     state: PumpState,
-    message: Option<AgentControl>,
-) -> Flow {
-    match message {
-        // The Runtime dropped this agent (archive, cancel, shutdown).
-        None | Some(AgentControl::Archive) => {
-            let _ = session.shutdown().await;
-            Flow::Stop
-        }
-        Some(AgentControl::Deliver(input)) => match session.send(input).await {
-            Ok(()) => Flow::Continue(PumpState::Streaming),
-            Err(error) => {
-                record_failure(journal, context, &error.to_string()).await;
-                let _ = session.shutdown().await;
+    /// Turns sent whose `TurnEnded` has not arrived yet. Usually zero or one,
+    /// but an interrupting send makes it two for a moment: the aborted turn's
+    /// ending and the new turn's events both still owe the stream something,
+    /// and a pump that went idle on the first ending would strand the second
+    /// turn unread.
+    turns_in_flight: u32,
+    /// Steering held for the next turn boundary (DESIGN.md §11): a
+    /// turn-boundary message that arrives mid-turn waits *here*, in the
+    /// orchestrator, because holding the message is the one mechanism that
+    /// works against every provider. Interrupt-mode deliveries never queue.
+    queued: std::collections::VecDeque<TurnInput>,
+}
+
+impl Pump {
+    /// Obeys one control message.
+    async fn apply_control(&mut self, message: Option<AgentControl>) -> Flow {
+        match message {
+            // The Runtime dropped this agent (archive, cancel, shutdown).
+            None | Some(AgentControl::Archive) => {
+                let _ = self.session.shutdown().await;
                 Flow::Stop
             }
-        },
-        Some(AgentControl::Answer {
-            tool_call_id,
-            decision,
-        }) => match session.answer_permission(&tool_call_id, decision).await {
-            Ok(()) => Flow::Continue(PumpState::Streaming),
-            Err(error) => {
-                // A decision for a call that is not waiting (raced with an
-                // interrupt, or duplicated). The agent is not broken; saying
-                // so in the log is the whole handling.
-                tracing::warn!(agent_id = %context.agent_id, %error, "permission answer went nowhere");
-                Flow::Continue(state)
+            Some(AgentControl::Deliver(input)) => {
+                if should_hold_for_boundary(&input, self.state) {
+                    self.queued.push_back(input);
+                    return Flow::Continue;
+                }
+                self.deliver(input).await
             }
-        },
-        Some(AgentControl::Interrupt) => {
-            if let Err(error) = session.interrupt().await {
-                tracing::warn!(agent_id = %context.agent_id, %error, "interrupt failed");
-            }
-            // The interrupted turn still closes with TurnEnded, which arrives
-            // as an ordinary event.
-            Flow::Continue(state)
-        }
-    }
-}
-
-/// Journals one session event, or the session's end.
-async fn apply_event(
-    session: &mut Box<dyn AgentSession>,
-    journal: &Journal,
-    context: &AgentContext,
-    event: Result<Option<AgentEvent>, horde_adapter::AdapterError>,
-) -> Flow {
-    match event {
-        Ok(Some(event)) => {
-            let next = state_after(&event);
-            match journal_entries(context, &event) {
-                Ok(entries) => {
-                    for entry in entries {
-                        if let Err(error) = journal.record(entry).await {
-                            // A journal that cannot append has lost the
-                            // partition-survival property; running an agent
-                            // whose evidence is being dropped is worse than
-                            // stopping it.
-                            tracing::error!(agent_id = %context.agent_id, %error, "journal append failed; stopping the agent");
-                            let _ = session.shutdown().await;
-                            return Flow::Stop;
-                        }
-                    }
-                    Flow::Continue(next)
+            Some(AgentControl::Answer {
+                tool_call_id,
+                decision,
+            }) => match self
+                .session
+                .answer_permission(&tool_call_id, decision)
+                .await
+            {
+                Ok(()) => {
+                    self.state = PumpState::Streaming;
+                    Flow::Continue
                 }
                 Err(error) => {
-                    tracing::error!(agent_id = %context.agent_id, %error, "an event could not be translated and was not journaled");
-                    Flow::Continue(next)
+                    // A decision for a call that is not waiting (raced with an
+                    // interrupt, or duplicated). The agent is not broken;
+                    // saying so in the log is the whole handling.
+                    tracing::warn!(agent_id = %self.context.agent_id, %error, "permission answer went nowhere");
+                    Flow::Continue
                 }
+            },
+            Some(AgentControl::Interrupt) => {
+                if let Err(error) = self.session.interrupt().await {
+                    tracing::warn!(agent_id = %self.context.agent_id, %error, "interrupt failed");
+                }
+                // The interrupted turn still closes with TurnEnded, which
+                // arrives as an ordinary event — so the pump must be willing
+                // to read one even if it was parked on a decision that will
+                // now never be answered.
+                self.state = state_after_interrupt(self.state);
+                Flow::Continue
             }
         }
-        Ok(None) => {
-            // EOF mid-conversation: the harness is gone.
-            record_failure(journal, context, "the harness ended its event stream").await;
-            Flow::Stop
+    }
+
+    /// Sends one message, failing the agent loudly if the harness is gone.
+    async fn deliver(&mut self, input: TurnInput) -> Flow {
+        let interrupting = input.delivery == horde_adapter::Delivery::Interrupt;
+        match self.session.send(input).await {
+            Ok(()) => {
+                self.turns_in_flight =
+                    turns_owed_after_send(interrupting, self.state, self.turns_in_flight);
+                self.state = PumpState::Streaming;
+                Flow::Continue
+            }
+            Err(error) => {
+                self.record_failure(&failure_reason(&error)).await;
+                let _ = self.session.shutdown().await;
+                Flow::Stop
+            }
         }
-        Err(error) => {
-            record_failure(journal, context, &error.to_string()).await;
-            let _ = session.shutdown().await;
-            Flow::Stop
+    }
+
+    /// Journals one session event, or the session's end.
+    async fn apply_event(
+        &mut self,
+        event: Result<Option<AgentEvent>, horde_adapter::AdapterError>,
+    ) -> Flow {
+        match event {
+            Ok(Some(event)) => {
+                if matches!(event, AgentEvent::TurnEnded(_)) {
+                    self.turns_in_flight = self.turns_in_flight.saturating_sub(1);
+                }
+                self.state = state_after(&event, self.turns_in_flight);
+                let flow = self.journal_event(&event).await;
+                if matches!(flow, Flow::Stop) {
+                    return Flow::Stop;
+                }
+                // The turn boundary: whatever steering was held for it goes
+                // out now, before the harness can start anything else.
+                if self.state == PumpState::Idle
+                    && let Some(next) = self.queued.pop_front()
+                {
+                    return self.deliver(next).await;
+                }
+                Flow::Continue
+            }
+            Ok(None) => {
+                // EOF mid-conversation: the harness is gone.
+                self.record_failure(&format!(
+                    "{}: the harness ended its event stream",
+                    crate::translate::PROCESS_DEATH
+                ))
+                .await;
+                Flow::Stop
+            }
+            Err(error) => {
+                self.record_failure(&failure_reason(&error)).await;
+                let _ = self.session.shutdown().await;
+                Flow::Stop
+            }
+        }
+    }
+
+    /// Journals one event's entries and progress atomically.
+    async fn journal_event(&mut self, event: &AgentEvent) -> Flow {
+        match journal_entries(&self.context, event) {
+            Ok(entries) => {
+                let progress = agent_progress(&self.context.agent_id, event);
+                if entries.is_empty() && progress == AgentProgress::None {
+                    return Flow::Continue;
+                }
+                if let Err(error) = self.journal.record_batch(entries, progress).await {
+                    // A journal that cannot append has lost the
+                    // partition-survival property; running an agent whose
+                    // evidence is being dropped is worse than stopping it.
+                    tracing::error!(agent_id = %self.context.agent_id, %error, "journal append failed; stopping the agent");
+                    let _ = self.session.shutdown().await;
+                    return Flow::Stop;
+                }
+                Flow::Continue
+            }
+            Err(error) => {
+                tracing::error!(agent_id = %self.context.agent_id, %error, "an event could not be translated and was not journaled");
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Journals this agent's failure, best-effort — the pump is already dying.
+    async fn record_failure(&mut self, reason: &str) {
+        let entry = JournalEntry {
+            session_id: self.context.session_id.clone(),
+            agent_id: Some(self.context.agent_id.clone()),
+            idempotency_key: String::new(),
+            kind: Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                previous_state: AgentLifecycleState::Running.into(),
+                state: AgentLifecycleState::Failed.into(),
+                reason: reason.to_owned(),
+            }),
+        };
+        if let Err(error) = self.journal.record(entry).await {
+            tracing::error!(agent_id = %self.context.agent_id, %error, "could not journal an agent failure");
         }
     }
 }
 
-/// Where the pump stands after seeing `event`.
-fn state_after(event: &AgentEvent) -> PumpState {
+/// Whether a delivery waits for the turn boundary instead of going out now.
+///
+/// Both halves carry weight, and inline they are not separately reachable in
+/// most runs: a turn-boundary message *during* a turn is held (that is what
+/// steering means by default), while an interrupt-mode message never waits and
+/// an idle agent never makes anything wait.
+fn should_hold_for_boundary(input: &TurnInput, state: PumpState) -> bool {
+    let mid_turn = state != PumpState::Idle;
+    let boundary_delivery = input.delivery == horde_adapter::Delivery::TurnBoundary;
+    mid_turn && boundary_delivery
+}
+
+/// How many turn endings a send leaves outstanding.
+///
+/// An interrupting send into a live turn aborts it AND starts its own, so
+/// both endings are owed; every other send owes exactly one. Both halves of
+/// the condition matter and are not separately reachable through the pump —
+/// it never sends a queued message mid-turn (it queues them itself), and an
+/// idle pump has nothing in flight to add to — which is exactly the shape
+/// that hides a flipped operator from an end-to-end suite.
+fn turns_owed_after_send(interrupting: bool, state: PumpState, owed: u32) -> u32 {
+    if interrupting && state != PumpState::Idle {
+        owed.saturating_add(1)
+    } else {
+        1
+    }
+}
+
+/// Where the pump stands after asking for an interrupt.
+///
+/// A pump parked on a permission decision must go back to reading events:
+/// the interrupt ends the turn, that ending arrives as an ordinary event, and
+/// a pump still waiting for a decision nobody will ever send would hold the
+/// agent forever. A streaming pump keeps streaming, and an idle one stays
+/// idle — there is no turn whose ending it should go looking for.
+fn state_after_interrupt(state: PumpState) -> PumpState {
+    match state {
+        PumpState::AwaitingDecision => PumpState::Streaming,
+        other => other,
+    }
+}
+
+/// Where the pump stands after seeing `event`, given how many turns still
+/// owe their ending.
+///
+/// A `TurnEnded` is the boundary only when nothing else is in flight: after
+/// an interrupting send, the aborted turn's ending arrives while the new
+/// turn is still running, and a pump that went idle there would never read
+/// the new turn's events.
+fn state_after(event: &AgentEvent, turns_in_flight: u32) -> PumpState {
     match event {
         AgentEvent::PermissionRequested { .. } => PumpState::AwaitingDecision,
-        AgentEvent::TurnEnded(_) => PumpState::Idle,
+        AgentEvent::TurnEnded(_) if turns_in_flight == 0 => PumpState::Idle,
         _ => PumpState::Streaming,
     }
 }
 
-/// Journals an agent's failure, best-effort — the pump is already dying.
-async fn record_failure(journal: &Journal, context: &AgentContext, reason: &str) {
-    let entry = JournalEntry {
-        session_id: context.session_id.clone(),
-        agent_id: Some(context.agent_id.clone()),
-        idempotency_key: String::new(),
-        kind: Kind::AgentLifecycleChanged(AgentLifecycleChanged {
-            previous_state: AgentLifecycleState::Running.into(),
-            state: AgentLifecycleState::Failed.into(),
-            reason: reason.to_owned(),
-        }),
-    };
-    if let Err(error) = journal.record(entry).await {
-        tracing::error!(agent_id = %context.agent_id, %error, "could not journal an agent failure");
+/// The revival bookkeeping one event advances, keyed to commit with it.
+fn agent_progress(agent_id: &str, event: &AgentEvent) -> AgentProgress {
+    match event {
+        AgentEvent::SessionEstablished {
+            provider_session_id,
+            ..
+        } => AgentProgress::Established {
+            agent_id: agent_id.to_owned(),
+            provider_session_id: provider_session_id.to_string(),
+        },
+        AgentEvent::TurnEnded(_) => AgentProgress::TurnTaken {
+            agent_id: agent_id.to_owned(),
+        },
+        _ => AgentProgress::None,
     }
 }
 
@@ -1508,6 +1934,413 @@ mod tests {
             spec.append_system_prompt, None,
             "no overlay is no flag at all, not an empty one"
         );
+    }
+
+    // -- Steering, interrupt, and revival --------------------------------------
+
+    /// The four corners of the boundary-hold predicate. Inline as
+    /// `state != Idle && delivery == TurnBoundary` the corners are not
+    /// separately reachable in most runs, which is exactly how a flipped
+    /// operator survives an end-to-end suite.
+    #[test]
+    fn steering_holds_only_boundary_messages_during_a_turn() {
+        use super::{PumpState, should_hold_for_boundary};
+        use horde_adapter::TurnInput;
+
+        let queued = TurnInput::queued("later");
+        let interrupting = TurnInput::interrupting("now");
+
+        assert!(should_hold_for_boundary(&queued, PumpState::Streaming));
+        assert!(should_hold_for_boundary(
+            &queued,
+            PumpState::AwaitingDecision
+        ));
+        assert!(
+            !should_hold_for_boundary(&queued, PumpState::Idle),
+            "an idle agent takes its message immediately"
+        );
+        assert!(
+            !should_hold_for_boundary(&interrupting, PumpState::Streaming),
+            "an interrupting message never waits — waiting is what it exists to not do"
+        );
+    }
+
+    /// The interrupt state table. The AwaitingDecision arm is the load-bearing
+    /// one: an interrupt aborts the turn a decision was blocking, so a pump
+    /// still parked on that decision would wait forever for an answer nobody
+    /// owes — while Idle must NOT start polling a harness that owes nothing.
+    #[test]
+    fn an_interrupt_unparks_only_a_decision_wait() {
+        use super::{PumpState, state_after_interrupt};
+
+        assert_eq!(
+            state_after_interrupt(PumpState::AwaitingDecision),
+            PumpState::Streaming
+        );
+        assert_eq!(
+            state_after_interrupt(PumpState::Streaming),
+            PumpState::Streaming
+        );
+        assert_eq!(state_after_interrupt(PumpState::Idle), PumpState::Idle);
+    }
+
+    /// The send-side ledger. The unreachable corners are pinned here because
+    /// the pump's own discipline (queue mid-turn, idle means nothing owed)
+    /// keeps every live run away from them.
+    #[test]
+    fn a_send_owes_one_ending_unless_it_also_aborted_a_turn() {
+        use super::{PumpState, turns_owed_after_send};
+
+        // The interrupting-send-into-a-live-turn case: two endings owed.
+        assert_eq!(turns_owed_after_send(true, PumpState::Streaming, 1), 2);
+        assert_eq!(
+            turns_owed_after_send(true, PumpState::AwaitingDecision, 1),
+            2
+        );
+        // A queued send owes one, whatever was in flight before it.
+        assert_eq!(
+            turns_owed_after_send(false, PumpState::Streaming, 1),
+            1,
+            "a queued send aborts nothing and must not inflate the ledger"
+        );
+        // An idle interrupting send has nothing to abort.
+        assert_eq!(turns_owed_after_send(true, PumpState::Idle, 0), 1);
+    }
+
+    /// The turn-ending state table: an ending is the boundary only when no
+    /// other turn still owes its ending — the interrupting-send case, where
+    /// the aborted turn ends while the steered turn is still running.
+    #[test]
+    fn a_turn_ending_is_the_boundary_only_when_nothing_else_is_in_flight() {
+        use core::time::Duration;
+
+        use horde_adapter::{TurnId, TurnOutcome, TurnStatus, UsageDelta};
+
+        use super::{PumpState, state_after};
+
+        let ended = horde_adapter::AgentEvent::TurnEnded(TurnOutcome {
+            turn_id: TurnId::new("t1"),
+            status: TurnStatus::Interrupted,
+            text: None,
+            usage: UsageDelta::default(),
+            denials: Vec::new(),
+            duration: Duration::from_millis(1),
+        });
+
+        assert_eq!(state_after(&ended, 0), PumpState::Idle);
+        assert_eq!(
+            state_after(&ended, 1),
+            PumpState::Streaming,
+            "the steered turn is still running; going idle would strand it unread"
+        );
+    }
+
+    /// An `agent-1` blocked mid-turn on permission call `call-1`, plus the
+    /// settled journal length — the preamble every steering and interrupt
+    /// test shares.
+    async fn blocked_agent() -> (Runtime, usize) {
+        let mut runtime = runtime_with(asking_permission());
+        runtime
+            .apply(spawn_command(1, "agent-1", "go"))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&runtime, 4).await.len();
+        (runtime, settled)
+    }
+
+    /// A turn-boundary note to `agent-1` — the routine delivery the revival
+    /// and steering tests keep sending.
+    fn note_command(sequence: u64, text: &str) -> StreamCommandsResponse {
+        deliver_command(
+            sequence,
+            "agent-1",
+            deliver_message_command::Body::Note(horde_proto::v1::Note {
+                text: text.to_owned(),
+                payload: None,
+            }),
+            DeliveryMode::TurnBoundary,
+        )
+    }
+
+    /// A restarted Worker: a fresh runtime over `journal` with an echoing
+    /// adapter, that has just been asked to deliver a note to `agent-1`.
+    async fn restarted_runtime_delivering(journal: &Journal, sequence: u64) -> Runtime {
+        let mut second = Runtime::new(journal.clone())
+            .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())));
+        second
+            .apply(note_command(sequence, "hello?"))
+            .await
+            .expect("the delivery applies");
+        second
+    }
+
+    /// Steering, end to end: a turn-boundary message that arrives while the
+    /// agent is blocked mid-turn is held by the pump and delivered at the turn
+    /// boundary — after the blocked turn ends, never into the middle of it.
+    #[tokio::test]
+    async fn a_boundary_message_during_a_blocked_turn_waits_for_the_boundary() {
+        let (mut runtime, _settled) = blocked_agent().await;
+
+        // Mid-turn, blocked on the decision: steer.
+        runtime
+            .apply(note_command(2, "steered note"))
+            .await
+            .expect("the delivery applies");
+
+        // Only the decision releases the turn; then the held note plays.
+        runtime
+            .apply(decision_command(3, "agent-1", "call-1", None))
+            .await
+            .expect("the decision applies");
+
+        let events = journal_at_least(&runtime, 8).await;
+        let all = kinds(&events);
+        let first_usage = all
+            .iter()
+            .position(|kind| *kind == "usage")
+            .expect("the blocked turn must end: {all:?}");
+        let echo = events
+            .iter()
+            .position(|journaled| {
+                matches!(
+                    journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                    Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("steered note")
+                )
+            })
+            .expect("the held note must reach the agent after the boundary");
+        assert!(
+            echo > first_usage,
+            "the steered note must not enter the blocked turn: {all:?}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// The interrupt path out of a blocked turn: the turn ends (usage lands)
+    /// and the agent takes the next message — a pump still parked on the
+    /// now-dead decision would hang both.
+    #[tokio::test]
+    async fn an_interrupt_releases_an_agent_blocked_on_a_decision() {
+        let (mut runtime, settled) = blocked_agent().await;
+
+        runtime
+            .apply(StreamCommandsResponse {
+                command_sequence: 2,
+                command_id: "s1:301".to_owned(),
+                command: Some(Command::InterruptAgent(
+                    horde_proto::v1::InterruptAgentCommand {
+                        agent_id: Some(AgentId::new("agent-1")),
+                        reason: "escape".to_owned(),
+                    },
+                )),
+            })
+            .await
+            .expect("the interrupt applies");
+
+        // interrupted + usage: the aborted turn still closes.
+        let events = journal_at_least(&runtime, settled + 2).await;
+        assert!(
+            kinds(&events).contains(&"usage"),
+            "the aborted turn must end and bill: {:?}",
+            kinds(&events)
+        );
+
+        // And the agent is idle, not wedged: a follow-up message echoes.
+        runtime
+            .apply(note_command(3, "after the interrupt"))
+            .await
+            .expect("the delivery applies");
+        let events = journal_at_least(&runtime, settled + 4).await;
+        assert!(
+            events.iter().any(|journaled| matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("after the interrupt")
+            )),
+            "the interrupted agent must remain steerable"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// An interrupt-mode delivery cuts through a blocked turn immediately:
+    /// the blocked turn ends, the message starts its own.
+    #[tokio::test]
+    async fn an_interrupting_message_cuts_through_a_blocked_turn() {
+        let (mut runtime, settled) = blocked_agent().await;
+
+        runtime
+            .apply(deliver_command(
+                2,
+                "agent-1",
+                deliver_message_command::Body::Assignment(Assignment {
+                    assignment_id: None,
+                    text: "drop that and do this".to_owned(),
+                    payload: None,
+                }),
+                DeliveryMode::Interrupt,
+            ))
+            .await
+            .expect("the delivery applies");
+
+        let events = journal_at_least(&runtime, settled + 3).await;
+        let all = kinds(&events);
+        assert!(
+            all.contains(&"usage"),
+            "the aborted turn still closes: {all:?}"
+        );
+        assert!(
+            events.iter().any(|journaled| matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("drop that and do this")
+            )),
+            "the interrupting message must start its own turn: {all:?}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// Revival, the headline path: the Worker restarts, its agents map is
+    /// empty, and a message for a remembered agent revives the conversation —
+    /// with the turn numbering continued, so nothing the revived turn journals
+    /// collides with keys the first incarnation already used.
+    #[tokio::test]
+    async fn a_message_after_a_worker_restart_revives_the_agent() {
+        let journal = Journal::in_memory().expect("an in-memory journal");
+        let script = || {
+            Script::of(vec![
+                ScriptedTurn::saying("turn one"),
+                ScriptedTurn::saying("turn two"),
+                ScriptedTurn::saying("turn three"),
+            ])
+        };
+
+        let mut first =
+            Runtime::new(journal.clone()).with_adapter(Arc::new(FakeAdapter::new(script())));
+        first
+            .apply(spawn_command(1, "agent-1", "hello"))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&first, 4).await.len();
+        first.shutdown().await;
+
+        // The restarted Worker: same journal, fresh runtime, no agents.
+        let mut second =
+            Runtime::new(journal.clone()).with_adapter(Arc::new(FakeAdapter::new(script())));
+        assert_eq!(second.running_agents(), 0);
+
+        second
+            .apply(note_command(2, "are you still there?"))
+            .await
+            .expect("the delivery applies by reviving");
+
+        assert_eq!(second.running_agents(), 1, "the agent lives again");
+        let events = journal_at_least(&second, settled + 4).await;
+
+        let revived = events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Starting)
+                        && changed.reason.contains("revived")
+            )
+        });
+        assert!(
+            revived,
+            "the revival is journaled as a lifecycle transition"
+        );
+
+        let continued = events.iter().find_map(|journaled| {
+            match journaled
+                .event
+                .as_ref()
+                .and_then(|event| event.kind.as_ref())
+            {
+                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("turn three") => {
+                    Some(chunk.turn_id.clone())
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(
+            continued.as_deref(),
+            Some("fake-session-1#3"),
+            "one incarnation's turns continue the other's numbering, one \
+             ordinal skipped for the turn that may have died half-journaled"
+        );
+        second.shutdown().await;
+    }
+
+    /// Context dies at archive: an archived agent must not be revivable, even
+    /// though its spawn was once remembered.
+    #[tokio::test]
+    async fn an_archived_agent_cannot_be_revived() {
+        let journal = Journal::in_memory().expect("an in-memory journal");
+        let mut first = Runtime::new(journal.clone())
+            .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())));
+        first
+            .apply(spawn_command(1, "agent-1", "hello"))
+            .await
+            .expect("the spawn applies");
+        journal_at_least(&first, 4).await;
+        first
+            .apply(StreamCommandsResponse {
+                command_sequence: 2,
+                command_id: "s1:8".to_owned(),
+                command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
+                    agent_id: Some(AgentId::new("agent-1")),
+                    reason: "done".to_owned(),
+                })),
+            })
+            .await
+            .expect("the archive applies");
+        let settled = journal_at_least(&first, 5).await.len();
+        first.shutdown().await;
+
+        let second = restarted_runtime_delivering(&journal, 3).await;
+
+        assert_eq!(
+            second.running_agents(),
+            0,
+            "archive discarded the context; nothing may rise from it"
+        );
+        assert_eq!(
+            second
+                .journal
+                .read_from(1, 100)
+                .await
+                .expect("readable")
+                .len(),
+            settled,
+            "and nothing new is journaled for a message with no recipient"
+        );
+        second.shutdown().await;
+    }
+
+    /// A revival that cannot resume — the harness never established a provider
+    /// session — fails the agent loudly instead of leaving the sender waiting
+    /// on an agent that looks merely slow.
+    #[tokio::test]
+    async fn reviving_an_agent_that_never_established_fails_loudly() {
+        let journal = Journal::in_memory().expect("an in-memory journal");
+        // A misbehaving script that never announces its session: nothing to
+        // resume ever gets recorded.
+        let mut first = Runtime::new(journal.clone()).with_adapter(Arc::new(FakeAdapter::new(
+            Script::of(vec![ScriptedTurn::saying("hi")])
+                .misbehaving(horde_adapter_fake::Misbehaviour::SkipSessionEstablished),
+        )));
+        first
+            .apply(spawn_command(1, "agent-1", "hello"))
+            .await
+            .expect("the spawn applies");
+        let settled = journal_at_least(&first, 3).await.len();
+        first.shutdown().await;
+
+        let second = restarted_runtime_delivering(&journal, 2).await;
+
+        let events = journal_at_least(&second, settled + 1).await;
+        assert!(
+            failed_with_reason(&events, |reason| reason.contains("no provider session")),
+            "an unrevivable agent must be journaled as failed: {events:?}"
+        );
+        assert_eq!(second.running_agents(), 0);
+        second.shutdown().await;
     }
 
     /// This Worker never advertised workspace support, so the command means

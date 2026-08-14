@@ -44,6 +44,17 @@ pub enum WorkerError {
         source: horde_proto::prost::DecodeError,
     },
 
+    /// A remembered spawn command no longer decodes.
+    ///
+    /// This Worker encoded it itself when the spawn applied, so it is
+    /// corruption rather than peer input — same standing as
+    /// [`Self::CorruptJournalEntry`], scoped to the agent it strands.
+    #[error("the remembered spawn for agent {agent_id} is not decodable: {source}")]
+    CorruptAgentRecord {
+        agent_id: String,
+        source: horde_proto::prost::DecodeError,
+    },
+
     /// The Server asked the Worker to replay from a position it has truncated.
     ///
     /// The mirror image of the Server's own `JournalRegressed`. Sending only the
@@ -95,6 +106,14 @@ pub enum WorkerError {
     /// working directory, and every other agent keeps running.
     #[error("the workspace checkout failed: {0}")]
     Workspace(String),
+
+    /// A Payload's commits could not be staged or obtained.
+    ///
+    /// Carries the share layer's own words — a dirty tree, a missing commit,
+    /// a cross-Worker route with no Relay — because "the payload failed" is
+    /// not actionable and each of those is.
+    #[error("the payload share failed: {0}")]
+    Share(#[from] horde_relay::ShareError),
 
     /// A domain value could not be put on the wire, or a wire value could not
     /// be read back into the domain.

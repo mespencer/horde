@@ -17,28 +17,25 @@ use horde_proto::v1::{
     AnswerPermissionRequest, AnswerPermissionResponse, ArchiveSessionRequest,
     ArchiveSessionResponse, AssignmentId, AssignmentSent, CreateSessionRequest,
     CreateSessionResponse, CreateWorkspaceDefinitionRequest, CreateWorkspaceDefinitionResponse,
-    DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse, Event, EventBatch,
-    GetSessionRequest, GetSessionResponse, GetWorkspaceDefinitionRequest,
-    GetWorkspaceDefinitionResponse, HelloRequest, HelloResponse, InterruptAgentRequest,
-    InterruptAgentResponse, ListSessionsRequest, ListSessionsResponse, ListWorkersRequest,
-    ListWorkersResponse, ListWorkspaceDefinitionsRequest, ListWorkspaceDefinitionsResponse,
-    MintEnrollmentCodeRequest, MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest,
-    PrewarmWorkspaceResponse, QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest,
-    RevokeEnrollmentResponse, SendMessageRequest, SendMessageResponse, ServerHello, SessionId,
-    SessionSummary, SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
+    DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse, Event, GetSessionRequest,
+    GetSessionResponse, GetWorkspaceDefinitionRequest, GetWorkspaceDefinitionResponse,
+    HelloRequest, HelloResponse, InterruptAgentRequest, InterruptAgentResponse,
+    ListSessionsRequest, ListSessionsResponse, ListWorkersRequest, ListWorkersResponse,
+    ListWorkspaceDefinitionsRequest, ListWorkspaceDefinitionsResponse, MintEnrollmentCodeRequest,
+    MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest, PrewarmWorkspaceResponse,
+    QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
+    SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
+    SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
     UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
-    sync_events_response,
 };
-use prost::Message;
-use tokio::sync::mpsc::Sender;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
+use super::sync::{self, SubtreeFilter};
 use crate::error::ServerError;
-use crate::log::{StoredEvent, Tail};
 use crate::placement;
 use crate::scheduler::PlacementRequest;
 use crate::state::SessionState;
@@ -57,6 +54,8 @@ pub struct ControlPlane {
     /// `Unimplemented`: minting identities over an unauthenticated channel
     /// would be worse than not minting them.
     enrollment: Option<std::sync::Arc<super::enrollment::EnrollmentAuthority>>,
+    /// How long a follow stream may be silent before it owes a heartbeat.
+    heartbeat_period: std::time::Duration,
 }
 
 impl ControlPlane {
@@ -65,6 +64,7 @@ impl ControlPlane {
         Self {
             core,
             enrollment: None,
+            heartbeat_period: sync::DEFAULT_HEARTBEAT_PERIOD,
         }
     }
 
@@ -76,9 +76,17 @@ impl ControlPlane {
         enrollment: std::sync::Arc<super::enrollment::EnrollmentAuthority>,
     ) -> Self {
         Self {
-            core,
             enrollment: Some(enrollment),
+            ..Self::new(core)
         }
+    }
+
+    /// Overrides the heartbeat period — tests shrink it to observe a quiet
+    /// stream announcing itself without waiting fifteen seconds for it.
+    #[must_use]
+    pub fn with_heartbeat_period(mut self, period: std::time::Duration) -> Self {
+        self.heartbeat_period = period;
+        self
     }
 
     /// Appends a server-originated event to a session.
@@ -229,7 +237,10 @@ impl ControlPlane {
     fn summary(state: &SessionState) -> SessionSummary {
         SessionSummary {
             session_id: Some(SessionId::new(state.session_id.clone())),
-            title: String::new(),
+            // Projected from the root spawn's tree path — the same rule the
+            // TUI used to reconstruct titles client-side before summaries
+            // carried them.
+            title: state.title.clone(),
             root_agent_id: state.root_agent_id.clone().map(AgentId::new),
             workspace_definition_id: None,
             state: state.lifecycle as i32,
@@ -238,112 +249,6 @@ impl ControlPlane {
             agent_count: u32::try_from(state.agents.len()).unwrap_or(u32::MAX),
         }
     }
-}
-
-fn envelope(event: &StoredEvent) -> Result<horde_proto::v1::EventEnvelope, ServerError> {
-    Ok(horde_proto::v1::EventEnvelope {
-        session_id: Some(SessionId::new(event.session_id.clone())),
-        sequence: event.sequence,
-        recorded_at: Some(recorded_at(event.recorded_at_unix_ms)),
-        event: Some(Event::decode(event.payload.as_slice())?),
-    })
-}
-
-/// Converts the log's stored milliseconds into a wire timestamp.
-///
-/// The log has always recorded this; it was never put on the wire, so a client
-/// could not render when anything happened or reconcile clock skew against the
-/// server (DESIGN.md §2). Mutation testing found it: the stored value had no
-/// reader, so replacing the clock with a constant changed nothing observable.
-fn recorded_at(unix_ms: i64) -> prost_types::Timestamp {
-    // Floor division, so a pre-epoch reading yields a negative second and a
-    // non-negative nanosecond rather than a timestamp that reads as later than
-    // it was.
-    let seconds = unix_ms.div_euclid(1_000);
-    let nanos = i32::try_from(unix_ms.rem_euclid(1_000)).unwrap_or(0) * 1_000_000;
-    prost_types::Timestamp { seconds, nanos }
-}
-
-/// Whether the stream ends once history has been delivered.
-///
-/// Two independent reasons: the client hung up, or it never asked to follow.
-/// Extracted because inline they are not separately reachable — a
-/// non-following client also drops the stream immediately afterwards, so `&&`
-/// still returns in every end-to-end run, and dropping the `!` merely inverts
-/// which of two paths a passing test takes.
-fn stop_after_caught_up(send_failed: bool, follow: bool) -> bool {
-    send_failed || !follow
-}
-
-/// One sync stream: history, a caught-up marker, then the live tail.
-///
-/// Split out of `sync_events` so the RPC is only about resolving the cursor,
-/// and so history and tail deliver through one code path rather than two
-/// copies of the same envelope-and-send loop.
-async fn stream_session(
-    sender: Sender<Result<SyncEventsResponse, Status>>,
-    session_id: String,
-    history: Vec<StoredEvent>,
-    mut tail: Tail,
-    follow: bool,
-) {
-    if !send_batch(&sender, &history).await {
-        return;
-    }
-
-    // Caught up. A TUI stops showing a loading state here rather than guessing
-    // when history ended.
-    let caught_up = SyncEventsResponse {
-        update: Some(sync_events_response::Update::CaughtUp(
-            horde_proto::v1::SyncCaughtUp {
-                heads: vec![horde_proto::v1::SessionCursor {
-                    session_id: Some(SessionId::new(session_id)),
-                    from_sequence: tail.delivered(),
-                }],
-            },
-        )),
-    };
-    if stop_after_caught_up(sender.send(Ok(caught_up)).await.is_err(), follow) {
-        return;
-    }
-
-    while let Some(next) = tail.next_batch().await {
-        let events = match next {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = sender.send(Err(Status::from(error))).await;
-                return;
-            }
-        };
-        if !send_batch(&sender, &events).await {
-            return;
-        }
-    }
-}
-
-/// Envelopes and sends one batch. `false` means the stream is finished — the
-/// receiver hung up, or an event would not decode and the error has been sent.
-async fn send_batch(
-    sender: &Sender<Result<SyncEventsResponse, Status>>,
-    events: &[StoredEvent],
-) -> bool {
-    let batch: Result<Vec<_>, _> = events.iter().map(envelope).collect();
-    let batch = match batch {
-        Ok(batch) => batch,
-        Err(error) => {
-            let _ = sender.send(Err(Status::from(error))).await;
-            return false;
-        }
-    };
-    if batch.is_empty() {
-        return true;
-    }
-    let response = SyncEventsResponse {
-        update: Some(sync_events_response::Update::Batch(EventBatch {
-            events: batch,
-        })),
-    };
-    sender.send(Ok(response)).await.is_ok()
 }
 
 #[tonic::async_trait]
@@ -508,7 +413,9 @@ impl ControlPlaneService for ControlPlane {
 
     type SyncEventsStream = Pin<Box<dyn Stream<Item = Result<SyncEventsResponse, Status>> + Send>>;
 
-    /// The resilience primitive: replay from an offset, then follow.
+    /// The resilience primitive: replay from an offset, then follow. Named
+    /// cursors, the all-sessions overview, and a subtree-scoped attach are
+    /// all this one call — the merged tail serves every shape.
     #[instrument(skip_all)]
     async fn sync_events(
         &self,
@@ -516,31 +423,80 @@ impl ControlPlaneService for ControlPlane {
     ) -> Result<Response<Self::SyncEventsStream>, Status> {
         let request = request.into_inner();
 
-        // One session per call for now. Multi-cursor and `all_sessions` need a
-        // merged tail, which is worth building against a real client rather
-        // than guessing at now.
-        let cursor = request.cursors.first().cloned().ok_or_else(|| {
-            Status::from(ServerError::Invalid(
-                "sync requires at least one cursor; all_sessions is not implemented yet".to_owned(),
-            ))
-        })?;
-        let session_id = cursor
-            .session_id
+        let cursors: Vec<(String, u64)> = request
+            .cursors
+            .iter()
+            .map(|cursor| {
+                (
+                    cursor
+                        .session_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    cursor.from_sequence,
+                )
+            })
+            .collect();
+        if cursors.is_empty() && !request.all_sessions {
+            return Err(Status::from(ServerError::Invalid(
+                "sync requires a cursor to replay, or all_sessions".to_owned(),
+            )));
+        }
+
+        let subtree_root = request
+            .subtree_root
             .as_ref()
             .map(ToString::to_string)
-            .unwrap_or_default();
+            .filter(|id| !id.is_empty());
+        let filter = match subtree_root {
+            None => SubtreeFilter::unscoped(),
+            Some(root) => {
+                // A subtree scopes an *attach* — named sessions. Combined
+                // with all_sessions it would silently drop almost everything
+                // the flag promised, so the combination is refused rather
+                // than guessed at.
+                if request.all_sessions {
+                    return Err(Status::from(ServerError::Invalid(
+                        "subtree_root scopes named cursors; it cannot be combined with \
+                         all_sessions"
+                            .to_owned(),
+                    )));
+                }
+                // Seed from each session's full history: the spawns proving
+                // membership may lie before the cursor's offset.
+                let mut filter = SubtreeFilter::scoped(root);
+                for (session_id, _) in &cursors {
+                    let history = self
+                        .core
+                        .log
+                        .read_all(session_id)
+                        .await
+                        .map_err(Status::from)?;
+                    filter.seed(session_id, &history);
+                }
+                filter
+            }
+        };
 
+        // The workspace catalog lives in the log but is not a session; the
+        // all-sessions net must not catch it, while an explicit cursor for it
+        // still works.
         let (history, tail) = self
             .core
             .log
-            .tail(&session_id, cursor.from_sequence)
+            .tail_merged(&cursors, request.all_sessions, &[CATALOG_STREAM.to_owned()])
             .await
             .map_err(Status::from)?;
 
-        let follow = request.follow;
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
-
-        tokio::spawn(stream_session(sender, session_id, history, tail, follow));
+        tokio::spawn(sync::stream_merged(
+            sender,
+            history,
+            tail,
+            request.follow,
+            filter,
+            self.heartbeat_period,
+        ));
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
@@ -1192,70 +1148,4 @@ fn uuid_like() -> String {
     });
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{recorded_at, stop_after_caught_up};
-
-    #[test]
-    fn a_sync_stream_ends_after_history_unless_the_client_asked_to_follow() {
-        // The only case that keeps the stream open.
-        assert!(!stop_after_caught_up(false, true));
-
-        assert!(
-            stop_after_caught_up(false, false),
-            "a scriptable sync replays to head and completes"
-        );
-        assert!(
-            stop_after_caught_up(true, true),
-            "a client that hung up gets no tail however much it asked to follow"
-        );
-        assert!(stop_after_caught_up(true, false));
-    }
-
-    /// Asserted against known values rather than a "plausible window": a window
-    /// wide enough not to flake is also wide enough to accept `secs + 1000` and
-    /// `secs / 1000`, which is exactly how both mutants survived the
-    /// integration test that checked the clock looked about right.
-    #[test]
-    fn milliseconds_split_into_whole_seconds_and_the_remainder_as_nanoseconds() {
-        let stamp = recorded_at(1_700_000_123_456);
-        assert_eq!(stamp.seconds, 1_700_000_123);
-        assert_eq!(
-            stamp.nanos, 456_000_000,
-            "456 ms is 456 million nanoseconds; adding or dividing by a million is not the same"
-        );
-    }
-
-    #[test]
-    fn a_whole_second_has_no_remainder() {
-        let stamp = recorded_at(1_000);
-        assert_eq!(stamp.seconds, 1);
-        assert_eq!(stamp.nanos, 0);
-    }
-
-    #[test]
-    fn the_epoch_is_zero_in_both_fields() {
-        let stamp = recorded_at(0);
-        assert_eq!(stamp.seconds, 0);
-        assert_eq!(stamp.nanos, 0);
-    }
-
-    #[test]
-    fn a_sub_second_reading_is_all_remainder() {
-        let stamp = recorded_at(999);
-        assert_eq!(stamp.seconds, 0);
-        assert_eq!(stamp.nanos, 999_000_000);
-    }
-
-    /// Floor division, so a pre-epoch reading is a negative second with a
-    /// non-negative nanosecond — not a timestamp that reads as later than it
-    /// was.
-    #[test]
-    fn a_pre_epoch_reading_floors_rather_than_truncating_toward_zero() {
-        let stamp = recorded_at(-1);
-        assert_eq!(stamp.seconds, -1);
-        assert_eq!(stamp.nanos, 999_000_000);
-    }
 }

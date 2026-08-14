@@ -29,14 +29,19 @@ pub mod error;
 pub mod journal;
 pub mod process;
 pub mod runtime;
+pub mod share;
 pub mod translate;
 pub mod workspace;
 
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use client::{ApplyCommand, Connection, DialConfig};
 pub use error::WorkerError;
-pub use journal::{CommandApplication, Journal, JournalEntry, JournalSink};
+pub use journal::{
+    AgentBookkeeping, AgentProgress, CommandApplication, Journal, JournalEntry, JournalSink,
+    RevivableAgent,
+};
 pub use process::{SupervisedHarness, SupervisorError};
 pub use runtime::Runtime;
+pub use share::{AgentCheckout, ShareBroker, StampingSink};
 pub use translate::AgentContext;
 pub use workspace::WorkspaceManager;
