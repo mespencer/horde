@@ -720,6 +720,7 @@ impl ControlPlaneService for ControlPlane {
             parent_worker_id: parent_worker.as_deref(),
             workspace_definition_id: workspace.as_deref(),
             load: &load,
+            now_unix_ms: placement::now_unix_ms(),
         });
 
         self.append(

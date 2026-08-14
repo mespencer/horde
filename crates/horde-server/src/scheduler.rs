@@ -59,10 +59,17 @@ pub struct PlacementRequest<'a> {
     /// caller (`placement::worker_load`) so the scheduler stays a pure
     /// decision over facts it is handed.
     pub load: &'a BTreeMap<String, u64>,
+    /// The clock account exhaustion is judged against: a required account
+    /// whose advertised rate window is past its own reset must not keep
+    /// refusing on stale registration state. Handed in rather than read, so
+    /// the scheduler stays a pure decision that replays.
+    pub now_unix_ms: i64,
 }
 
 impl<'a> PlacementRequest<'a> {
-    /// A request with no preferences, no workspace, and no load anywhere.
+    /// A request with no preferences, no workspace, no load anywhere, and the
+    /// clock at zero — tests exercising exhaustion set the clock explicitly
+    /// with [`Self::at`].
     #[must_use]
     pub fn new(constraints: &'a PlacementConstraints, load: &'a BTreeMap<String, u64>) -> Self {
         Self {
@@ -70,7 +77,15 @@ impl<'a> PlacementRequest<'a> {
             parent_worker_id: None,
             workspace_definition_id: None,
             load,
+            now_unix_ms: 0,
         }
+    }
+
+    /// The same request, judged at this clock.
+    #[must_use]
+    pub fn at(mut self, now_unix_ms: i64) -> Self {
+        self.now_unix_ms = now_unix_ms;
+        self
     }
 }
 
@@ -341,6 +356,11 @@ fn refusals(
             missing_accounts.join(", ")
         ));
     }
+    refusals.extend(exhausted_required_accounts(
+        &request.constraints.required_provider_accounts,
+        &capabilities.provider_accounts,
+        request.now_unix_ms,
+    ));
 
     let missing_remotes = missing(
         &request.constraints.required_remotes,
@@ -383,6 +403,64 @@ fn workspace_refusal(
     } else {
         None
     }
+}
+
+/// Required accounts this worker holds but cannot serve right now: the
+/// advertised rate window says nothing is left and its own reset has not
+/// arrived. Each refusal names the account, per DESIGN §6 — a spawner told
+/// only "no worker matches" cannot know which login to go top up.
+///
+/// This is the whole of headroom's hardness in placement. Everywhere else it
+/// stays a soft signal: an account nobody required never refuses anything,
+/// and non-zero headroom never reorders eligibility — tier selection
+/// (`tiers::select`) is where headroom *ranks* choices.
+fn exhausted_required_accounts(
+    required: &[String],
+    held: &[horde_proto::v1::ProviderAccountCapability],
+    now_unix_ms: i64,
+) -> Vec<String> {
+    held.iter()
+        .filter(|account| required_but_exhausted(account, required, now_unix_ms))
+        .map(|account| {
+            format!(
+                "holds provider account `{}` but it is exhausted{}",
+                account.account,
+                reset_phrase(account.headroom.as_ref(), now_unix_ms)
+            )
+        })
+        .collect()
+}
+
+/// Whether one held account is both demanded by the spawn and out of budget.
+///
+/// A named predicate: in the live path every staged spawn either requires a
+/// healthy account or none at all, so an `&&` flipped to `||` — refusing on
+/// every exhausted account, required or not — would survive an end-to-end
+/// suite while turning a soft signal into a hard filter.
+fn required_but_exhausted(
+    account: &horde_proto::v1::ProviderAccountCapability,
+    required: &[String],
+    now_unix_ms: i64,
+) -> bool {
+    let is_required = required.contains(&account.account);
+    let is_exhausted = account
+        .headroom
+        .as_ref()
+        .is_some_and(|window| crate::usage::window_exhausted(window, now_unix_ms));
+    is_required && is_exhausted
+}
+
+/// ` (resets in Ns)` when the window names its reset, nothing when it does
+/// not. Rounded up: "resets in 0s" would read as "already reset", which an
+/// exhausted account's window is precisely not.
+fn reset_phrase(window: Option<&horde_proto::v1::RateWindow>, now_unix_ms: i64) -> String {
+    let Some(resets_at) = window.and_then(|window| window.resets_at.as_ref()) else {
+        return String::new();
+    };
+    let in_ms = crate::usage::timestamp_unix_ms(resets_at)
+        .saturating_sub(now_unix_ms)
+        .max(0);
+    format!(" (resets in {}s)", in_ms.saturating_add(999) / 1_000)
 }
 
 /// Required entries the worker does not advertise, in the order required.
@@ -715,6 +793,154 @@ mod tests {
         };
         assert_eq!(pinned_worker(&constraints), None);
         assert_eq!(pinned_worker(&PlacementConstraints::default()), None);
+    }
+
+    // -- Headroom ----------------------------------------------------------
+
+    use horde_proto::v1::RateWindow;
+
+    /// A window with nothing left, resetting at `resets_at_unix_ms` when
+    /// given one.
+    fn spent_window(resets_at_unix_ms: Option<i64>) -> RateWindow {
+        RateWindow {
+            used_fraction: Some(1.0),
+            resets_at: resets_at_unix_ms.map(|unix_ms| horde_proto::prost_types::Timestamp {
+                seconds: unix_ms / 1_000,
+                nanos: 0,
+            }),
+            ..RateWindow::default()
+        }
+    }
+
+    fn account_with(name: &str, headroom: Option<RateWindow>) -> ProviderAccountCapability {
+        ProviderAccountCapability {
+            provider: "claude".to_owned(),
+            account: name.to_owned(),
+            models: Vec::new(),
+            headroom,
+        }
+    }
+
+    fn requiring(account: &str) -> PlacementConstraints {
+        PlacementConstraints {
+            required_provider_accounts: vec![account.to_owned()],
+            ..PlacementConstraints::default()
+        }
+    }
+
+    /// DESIGN §6: the queue reason names the exhausted account, so the
+    /// spawner knows which login to top up rather than just "no worker".
+    #[test]
+    fn a_required_exhausted_account_queues_with_its_name_and_reset() {
+        let harness = harness();
+        let mut spent = capabilities(&[]);
+        spent.provider_accounts = vec![account_with("personal", Some(spent_window(Some(5_000))))];
+        harness.registry.register("spent", spent);
+
+        let constraints = requiring("personal");
+        let reason = queued_reason(
+            harness.scheduler.place(
+                &PlacementRequest {
+                    constraints: &constraints,
+                    ..request_defaults()
+                }
+                .at(1_000),
+            ),
+        );
+        assert_eq!(
+            reason,
+            "no connected worker matches: spent holds provider account \
+             `personal` but it is exhausted (resets in 4s)"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_account_nobody_required_refuses_nothing() {
+        let harness = harness();
+        let mut idle = capabilities(&[]);
+        idle.provider_accounts = vec![account_with("personal", Some(spent_window(None)))];
+        harness.registry.register("idle", idle);
+
+        assert_eq!(
+            placed_on(place_default(&harness)),
+            "idle",
+            "headroom is a soft signal unless the spawn demanded the account"
+        );
+    }
+
+    /// The clock self-heals a stale advertisement: a window past its own
+    /// reset stops refusing without waiting for the worker to re-report.
+    #[test]
+    fn an_exhausted_window_past_its_reset_no_longer_refuses() {
+        let harness = harness();
+        let mut spent = capabilities(&[]);
+        spent.provider_accounts = vec![account_with("personal", Some(spent_window(Some(5_000))))];
+        harness.registry.register("spent", spent);
+
+        let constraints = requiring("personal");
+        let request = PlacementRequest {
+            constraints: &constraints,
+            ..request_defaults()
+        };
+        assert!(
+            matches!(
+                harness.scheduler.place(&request.at(4_999)),
+                Placement::Queued { .. }
+            ),
+            "one millisecond before the reset the account is still exhausted"
+        );
+        assert_eq!(
+            placed_on(harness.scheduler.place(&request.at(5_000))),
+            "spent"
+        );
+    }
+
+    /// The predicate's four corners, plus the window-less account. The
+    /// mixed rows are the ones `&&` and `||` disagree on, and neither is
+    /// reachable through a staged spawn.
+    #[test]
+    fn only_a_required_and_exhausted_account_refuses() {
+        let required = vec!["personal".to_owned()];
+        let spent = account_with("personal", Some(spent_window(None)));
+        let healthy = account_with(
+            "personal",
+            Some(RateWindow {
+                used_fraction: Some(0.2),
+                ..RateWindow::default()
+            }),
+        );
+        let other_spent = account_with("other", Some(spent_window(None)));
+        let unmetered = account_with("personal", None);
+
+        assert!(super::required_but_exhausted(&spent, &required, 0));
+        assert!(!super::required_but_exhausted(&healthy, &required, 0));
+        assert!(!super::required_but_exhausted(&other_spent, &required, 0));
+        assert!(!super::required_but_exhausted(&spent, &[], 0));
+        assert!(
+            !super::required_but_exhausted(&unmetered, &required, 0),
+            "no advertised window is unknown headroom, never exhaustion"
+        );
+    }
+
+    /// The phrase rounds up: an exhausted account "resets in 0s" would read
+    /// as already reset, which it precisely is not.
+    #[test]
+    fn the_reset_phrase_names_the_wait_and_rounds_up() {
+        assert_eq!(super::reset_phrase(None, 0), "");
+        assert_eq!(
+            super::reset_phrase(Some(&spent_window(None)), 0),
+            "",
+            "a window that names no reset promises no wait"
+        );
+        assert_eq!(
+            super::reset_phrase(Some(&spent_window(Some(3_000))), 1_000),
+            " (resets in 2s)"
+        );
+        assert_eq!(
+            super::reset_phrase(Some(&spent_window(Some(3_000))), 1_001),
+            " (resets in 2s)",
+            "1999ms rounds up to 2s, not down to 1"
+        );
     }
 
     // -- Preference --------------------------------------------------------
