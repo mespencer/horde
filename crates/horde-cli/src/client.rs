@@ -82,6 +82,26 @@ pub enum ClientError {
     #[error("enrollment failed: {0}")]
     Enrollment(String),
 
+    /// A local file the verb needed could not be read or written.
+    ///
+    /// Names the path because the remedy is local — a typo'd filename, a
+    /// missing directory, a permissions problem — not anything the server
+    /// can explain.
+    #[error("could not use the local file {path}: {source}")]
+    File {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A blob address the user gave is not `sha256:<64 lowercase hex>`.
+    ///
+    /// Caught before the RPC, like the JSON typo above: the mistake is in
+    /// the argument, and reporting it as a server refusal would send the
+    /// user to look at a server that was never asked.
+    #[error("{given:?} is not a blob address (expected sha256:<64 lowercase hex>)")]
+    BlobAddress { given: String },
+
     /// The terminal itself failed the TUI — raw mode refused, a draw failed.
     ///
     /// Its own variant because the remedy is different in kind: every other
@@ -107,6 +127,9 @@ impl ClientError {
 #[derive(Clone, Debug)]
 pub struct Client {
     inner: ControlPlaneServiceClient<Channel>,
+    /// The same channel, kept so sibling services on the server's one
+    /// endpoint (the blob store) are reachable without a second dial.
+    channel: Channel,
 }
 
 impl Client {
@@ -147,9 +170,7 @@ impl Client {
                 endpoint: described,
                 source,
             })?;
-        Ok(Self {
-            inner: ControlPlaneServiceClient::new(channel),
-        })
+        Ok(Self::with_channel(channel))
     }
 
     /// Mints a one-time enrollment code (DESIGN §3). Requires an enrolled,
@@ -198,8 +219,44 @@ impl Client {
     #[must_use]
     pub fn with_channel(channel: Channel) -> Self {
         Self {
-            inner: ControlPlaneServiceClient::new(channel),
+            inner: ControlPlaneServiceClient::new(channel.clone()),
+            channel,
         }
+    }
+
+    /// Stashes bytes into the server's Blob Store, returning the verified
+    /// digest and size an `Attachment` (or a later fetch) would use.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] with the server's refusal — including
+    /// `Unimplemented` from a server running without a store.
+    pub async fn stash_blob(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<horde_proto::v1::UploadBlobResponse, ClientError> {
+        let mut blobs =
+            horde_proto::v1::blob_service_client::BlobServiceClient::new(self.channel.clone());
+        Ok(horde_proto::blob::upload_blob(&mut blobs, bytes).await?)
+    }
+
+    /// Fetches one blob by address, verified against it before returning.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::BlobAddress`] when `address` is malformed — a local
+    /// complaint, nothing was dialed — and [`ClientError::Rpc`] for the
+    /// server's refusals: `NotFound`, or `DataLoss` when the store's copy
+    /// no longer matches its address.
+    pub async fn fetch_blob(&mut self, address: &str) -> Result<Vec<u8>, ClientError> {
+        let digest = horde_proto::blob::BlobDigest::parse(address).ok_or_else(|| {
+            ClientError::BlobAddress {
+                given: address.to_owned(),
+            }
+        })?;
+        let mut blobs =
+            horde_proto::v1::blob_service_client::BlobServiceClient::new(self.channel.clone());
+        Ok(horde_proto::blob::download_blob(&mut blobs, &digest).await?)
     }
 
     /// Version and capability handshake.
