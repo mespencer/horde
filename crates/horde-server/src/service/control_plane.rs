@@ -720,6 +720,7 @@ impl ControlPlaneService for ControlPlane {
             parent_worker_id: parent_worker.as_deref(),
             workspace_definition_id: workspace.as_deref(),
             load: &load,
+            now_unix_ms: placement::now_unix_ms(),
         });
 
         self.append(
@@ -1121,11 +1122,85 @@ impl ControlPlaneService for ControlPlane {
         }))
     }
 
+    /// Usage reporting (DESIGN §12): a pure fold over the named sessions'
+    /// logs — no usage table exists to disagree with the events.
+    #[instrument(skip_all)]
     async fn query_usage(
         &self,
-        _request: Request<QueryUsageRequest>,
+        request: Request<QueryUsageRequest>,
     ) -> Result<Response<QueryUsageResponse>, Status> {
-        Err(ServerError::Unimplemented("usage aggregation").into())
+        let request = request.into_inner();
+        let grouping = crate::usage::Grouping::from_wire(request.group_by).ok_or_else(|| {
+            Status::from(ServerError::Invalid(
+                "a usage query must say how to group: by agent, session, \
+                 tree path, provider account, or model"
+                    .to_owned(),
+            ))
+        })?;
+
+        let mut query = crate::usage::UsageQuery::grouped_by(grouping);
+        if let Some(root) = request
+            .subtree_root
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+        {
+            query = query.scoped_to_subtree(root);
+        }
+        if let Some(since) = request.since.as_ref() {
+            query = query.since(crate::usage::timestamp_unix_ms(since));
+        }
+        if let Some(until) = request.until.as_ref() {
+            query = query.until(crate::usage::timestamp_unix_ms(until));
+        }
+
+        let named: Vec<String> = request
+            .session_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let sessions = if named.is_empty() {
+            // Empty means all sessions; the reserved streams (catalog,
+            // enrollment) live in the log but are not sessions.
+            self.core
+                .log
+                .session_ids()
+                .await
+                .map_err(Status::from)?
+                .into_iter()
+                .filter(|session_id| !crate::enrollment::is_reserved_stream(session_id))
+                .collect()
+        } else {
+            named
+        };
+
+        let mut fold = crate::usage::UsageFold::new(query);
+        for session_id in &sessions {
+            let events = self
+                .core
+                .log
+                .read_all(session_id)
+                .await
+                .map_err(Status::from)?;
+            // A *named* session that does not exist is refused rather than
+            // silently reported as zero usage — a typo must not read as
+            // thrift.
+            if events.is_empty() {
+                return Err(Status::from(ServerError::NoSuchSession {
+                    session_id: session_id.clone(),
+                }));
+            }
+            fold.absorb_session(session_id, &events)
+                .map_err(Status::from)?;
+        }
+
+        // Declared quotas (usage::DeclaredQuota) await the config layer;
+        // until it lands, only provider-reported windows produce headroom.
+        let accounts = fold.accounts(placement::now_unix_ms(), &std::collections::BTreeMap::new());
+        Ok(Response::new(QueryUsageResponse {
+            aggregates: fold.aggregates(),
+            accounts,
+        }))
     }
 }
 

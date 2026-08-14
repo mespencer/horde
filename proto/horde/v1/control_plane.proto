@@ -462,4 +462,10 @@ message QueryUsageRequest {
 
 message QueryUsageResponse {
   repeated UsageAggregate aggregates = 1;
+
+  // Per-account standing across the covered records: measured window and
+  // token sums beside the headroom derived from them. Accounts appear here
+  // whether or not the group_by named them, because headroom is a fact about
+  // the account, not about the grouping.
+  repeated AccountHeadroom accounts = 2;
 }
