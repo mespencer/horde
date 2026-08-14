@@ -74,7 +74,6 @@ pub(crate) fn listing(
 /// `is_error`, because the model is the one who must read it and adjust;
 /// protocol errors reach it as an opaque "internal error", which teaches it
 /// nothing. rmcp's own `call_tool` docs draw exactly this line.
-#[must_use]
 pub(crate) fn render_failure(error: HubError) -> Result<CallToolResult, ErrorData> {
     match error {
         HubError::UnknownTool { name } => Err(ErrorData::new(

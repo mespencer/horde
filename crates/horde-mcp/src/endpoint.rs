@@ -22,14 +22,22 @@
 //! tonic channel is cheap and shares the underlying connection, so each call
 //! gets its own handle and a blocked approval never stalls anybody else.
 
-use rmcp::handler::server::tool::ToolRouter;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, JsonObject, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, RequestMetaObject, ServerCapabilities, ServerInfo,
+    Tool,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::context::AgentContext;
+use crate::hub::ToolProxy;
 use crate::identity::AgentIdentity;
 use crate::permission::PermissionBroker;
 use crate::verbs::{MessageKind, Verbs};
@@ -153,6 +161,13 @@ pub fn message_kind_for(note: bool) -> MessageKind {
 pub struct HordeEndpoint {
     context: AgentContext,
     tool_router: ToolRouter<Self>,
+    /// The proxied half of the toolset (DESIGN §5 items 2 and 3): the hub
+    /// link and this Agent's `local` servers. Empty by default — an endpoint
+    /// with no hub configured serves exactly the verbs.
+    proxy: Arc<ToolProxy>,
+    /// Ordinal for minted permission-request ids, when a caller's `_meta`
+    /// carries no correlation id of its own.
+    minted: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for HordeEndpoint {
@@ -170,10 +185,21 @@ impl HordeEndpoint {
         Self {
             context,
             tool_router: Self::tool_router(),
+            proxy: Arc::new(ToolProxy::new()),
+            minted: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// The tool names this endpoint serves.
+    /// Attaches the proxied toolset: the hub link and the Agent's `local`
+    /// servers, already connected.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: Arc<ToolProxy>) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// The tool names this endpoint serves — the verbs and every proxied
+    /// tool under its namespaced name.
     ///
     /// Reads the router the `#[tool_handler]` macro dispatches through, so a
     /// test can assert on *this instance's* surface rather than on what the
@@ -183,6 +209,7 @@ impl HordeEndpoint {
         self.tool_router
             .list_all()
             .into_iter()
+            .chain(self.proxy.tools())
             .map(|tool| tool.name.to_string())
             .collect()
     }
@@ -369,10 +396,212 @@ impl HordeEndpoint {
             summary: result.summary,
         }))
     }
+
+    /// One proxied tool call, with the permission chain in its path.
+    ///
+    /// This is where DESIGN §10 puts the chain for hub and `local` tools:
+    /// every proxied call is raised as an ordinary `PermissionRequested` and
+    /// blocks until the chain answers — deterministically in microseconds
+    /// when a rule covers it, or from a human's phone when nothing does. The
+    /// forwarded call is the *decided* one: a narrowing that arrives with the
+    /// allow replaces the arguments, and a narrowing that cannot be applied
+    /// refuses rather than running the original, wider call.
+    ///
+    /// When a harness pre-authorizes through `approve` (Claude's
+    /// `--permission-prompt-tool`), its `_meta.claudecode/toolUseId` rides
+    /// the `tools/call` too — and using it as the request id here makes the
+    /// second raise a keyed replay of the first: the journal deduplicates it
+    /// and the wait finds the decision already written, so one human answer
+    /// covers both gates.
+    async fn call_proxied(
+        &self,
+        identity: &AgentIdentity,
+        name: &str,
+        arguments: Option<JsonObject>,
+        tool_use_id: String,
+    ) -> Result<CallToolResult, ErrorData> {
+        let prompt = horde_adapter_claude::permission::PromptRequest {
+            tool_name: name.to_owned(),
+            input: arguments_as_input(arguments.as_ref()),
+            tool_use_id,
+        };
+
+        let decision = self
+            .broker()
+            .adjudicate(identity, &prompt)
+            .await
+            .map_err(internal)?;
+
+        match decision {
+            horde_adapter::PermissionDecision::Deny { message } => {
+                // A denial the model reads, not a protocol error it cannot:
+                // the model must know the call was refused (and why) to plan
+                // around it rather than retry it.
+                Ok(CallToolResult::error(vec![
+                    rmcp::model::ContentBlock::text(format!("permission denied: {message}")),
+                ]))
+            }
+            horde_adapter::PermissionDecision::Allow { updated_input } => {
+                let forwarded = match narrowed_arguments(arguments, updated_input) {
+                    Ok(forwarded) => forwarded,
+                    Err(refusal) => {
+                        // Never downgraded to the original call: a narrowing
+                        // that could not be carried would otherwise run the
+                        // wider call it existed to prevent.
+                        return Ok(CallToolResult::error(vec![
+                            rmcp::model::ContentBlock::text(refusal),
+                        ]));
+                    }
+                };
+                self.proxy
+                    .call(name, forwarded)
+                    .await
+                    .map_or_else(crate::hub::endpoint::render_failure, Ok)
+            }
+        }
+    }
+
+    /// The permission-request id for one proxied call.
+    ///
+    /// The harness's own correlation id when it sent one — that is what lets
+    /// an `approve`-stage decision cover the call stage too — and a minted,
+    /// session-unique id otherwise. Minted from wall-clock nanos plus a
+    /// process-local ordinal: the ordinal separates calls within this
+    /// process, the nanos separate this process's ids from a predecessor's
+    /// (a restarted endpoint must not re-mint a key the journal already
+    /// holds, because the dedupe would silently swallow the new request).
+    fn request_id_for(&self, identity: &AgentIdentity, meta: Option<&RequestMetaObject>) -> String {
+        if let Some(carried) = harness_tool_use_id(meta) {
+            return carried;
+        }
+        let ordinal = self.minted.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        format!("mcp:{}:{nanos}:{ordinal}", identity.agent_id())
+    }
+}
+
+/// The harness's own id for this call, when its `_meta` carried one.
+///
+/// Claude Code stamps `claudecode/toolUseId` on every `tools/call` (measured
+/// in the dual-era spike §2) — the same id its permission prompt quotes,
+/// which is what makes the two gates one permission event.
+#[must_use]
+pub fn harness_tool_use_id(meta: Option<&RequestMetaObject>) -> Option<String> {
+    meta?
+        .0
+        .0
+        .get("claudecode/toolUseId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The proposal the chain adjudicates, from the call's arguments.
+///
+/// No arguments is an empty object rather than `null`: the chain's rules and
+/// the approver's rendering both address fields, and `null` would read as a
+/// different shape from "called with no arguments".
+#[must_use]
+pub fn arguments_as_input(arguments: Option<&JsonObject>) -> serde_json::Value {
+    match arguments {
+        Some(fields) => serde_json::Value::Object(fields.clone()),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// The arguments actually forwarded, once the chain has spoken.
+///
+/// An allow without a narrowing forwards the original arguments unchanged.
+/// A narrowing replaces them — and must be an object, because tool arguments
+/// are a named bag; anything else is refused in words rather than quietly
+/// running the original call.
+///
+/// # Errors
+///
+/// The refusal text for a narrowing that is not an object.
+pub fn narrowed_arguments(
+    original: Option<JsonObject>,
+    updated: Option<serde_json::Value>,
+) -> Result<Option<JsonObject>, String> {
+    match updated {
+        None => Ok(original),
+        Some(serde_json::Value::Object(fields)) => Ok(Some(fields)),
+        Some(other) => Err(format!(
+            "the permission decision narrowed this call to a non-object ({}), which cannot be \
+             tool arguments; refusing to run the original call instead",
+            kind_of(&other)
+        )),
+    }
+}
+
+/// The JSON kind name, for refusals that must say what arrived.
+fn kind_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for HordeEndpoint {
+    /// Verbs first, then the proxied namespace, then refusal.
+    ///
+    /// Hand-written (the `#[tool_handler]` macro generates this only when it
+    /// is absent) because the router alone no longer covers the surface: a
+    /// namespaced name routes through the proxy, and its dispatch is where
+    /// the permission chain runs.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if self.tool_router.has_route(&request.name) {
+            let tcc = ToolCallContext::new(self, request, context);
+            return self.tool_router.call(tcc).await;
+        }
+
+        if self.proxy.serves(&request.name) {
+            let identity = Self::caller(&context)?;
+            let request_id = self.request_id_for(&identity, request.meta.as_ref());
+            let result = self
+                .call_proxied(&identity, &request.name, request.arguments, request_id)
+                .await?;
+            return Ok(CallToolResponse::Complete(result));
+        }
+
+        Err(ErrorData::new(
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+            format!("no tool named {}", request.name),
+            None,
+        ))
+    }
+
+    /// The verbs plus every proxied tool this Agent may see.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.proxy.tools());
+        Ok(crate::hub::endpoint::listing(tools, &context))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned().or_else(|| {
+            self.proxy
+                .tools()
+                .into_iter()
+                .find(|tool| tool.name == name)
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo` and `Implementation` are `#[non_exhaustive]`, so they are
         // built by mutation rather than as struct expressions.
@@ -581,5 +810,106 @@ mod tests {
                 "{expected} must be served; got {names:?}"
             );
         }
+    }
+
+    /// The harness's correlation id is what lets an `approve`-stage decision
+    /// cover the call stage; a missing or non-string one falls back to
+    /// minting, never to a panic or an empty id.
+    #[test]
+    fn the_harness_tool_use_id_is_read_from_meta_when_it_is_there() {
+        assert_eq!(super::harness_tool_use_id(None), None);
+
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        meta.0.0.insert(
+            "claudecode/toolUseId".to_owned(),
+            serde_json::Value::String("toolu_01".to_owned()),
+        );
+        assert_eq!(
+            super::harness_tool_use_id(Some(&meta)),
+            Some("toolu_01".to_owned())
+        );
+
+        let mut wrong_shape = rmcp::model::RequestMetaObject::new();
+        wrong_shape.0.0.insert(
+            "claudecode/toolUseId".to_owned(),
+            serde_json::Value::from(42),
+        );
+        assert_eq!(
+            super::harness_tool_use_id(Some(&wrong_shape)),
+            None,
+            "a non-string id is not an id"
+        );
+    }
+
+    /// Two shapes of proposal, one rule: the chain always adjudicates an
+    /// object, and "no arguments" and "null" must not be conflated.
+    #[test]
+    fn the_adjudicated_input_is_always_an_object() {
+        assert_eq!(
+            super::arguments_as_input(None),
+            serde_json::json!({}),
+            "no arguments is an empty object, not null"
+        );
+
+        let mut fields = rmcp::model::JsonObject::new();
+        fields.insert("path".to_owned(), serde_json::Value::String("/x".into()));
+        assert_eq!(
+            super::arguments_as_input(Some(&fields)),
+            serde_json::json!({"path": "/x"})
+        );
+    }
+
+    /// The narrowing truth table: absent forwards the original, an object
+    /// replaces it, anything else refuses — running the original call under
+    /// a narrowing that failed to apply is the one wrong answer.
+    #[test]
+    fn a_narrowing_replaces_the_arguments_or_refuses_never_widens() {
+        let mut original = rmcp::model::JsonObject::new();
+        original.insert("path".to_owned(), serde_json::Value::String("/etc".into()));
+
+        assert_eq!(
+            super::narrowed_arguments(Some(original.clone()), None),
+            Ok(Some(original.clone())),
+            "an unmodified allow forwards the proposal"
+        );
+
+        let narrowed = super::narrowed_arguments(
+            Some(original.clone()),
+            Some(serde_json::json!({"path": "/tmp/safe"})),
+        )
+        .unwrap_or_else(|refusal| panic!("an object narrowing applies: {refusal}"))
+        .unwrap_or_else(|| panic!("the narrowing must produce arguments"));
+        assert_eq!(
+            narrowed.get("path"),
+            Some(&serde_json::Value::String("/tmp/safe".into()))
+        );
+
+        let refused = super::narrowed_arguments(Some(original), Some(serde_json::json!("rm -rf")))
+            .expect_err("a string is not tool arguments");
+        assert!(refused.contains("a string"), "{refused}");
+        assert!(
+            refused.contains("refusing"),
+            "the refusal must say the original call will not run: {refused}"
+        );
+    }
+
+    /// Minted ids must differ call to call — a repeated id is a permission
+    /// request the journal silently swallows as a duplicate.
+    #[tokio::test]
+    async fn minted_request_ids_never_repeat() {
+        let endpoint = endpoint();
+        let identity = identity();
+        let first = endpoint.request_id_for(&identity, None);
+        let second = endpoint.request_id_for(&identity, None);
+        assert_ne!(first, second);
+        assert!(first.contains("agent-42"), "{first}");
+
+        // And a carried harness id wins over minting.
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        meta.0.0.insert(
+            "claudecode/toolUseId".to_owned(),
+            serde_json::Value::String("toolu_02".to_owned()),
+        );
+        assert_eq!(endpoint.request_id_for(&identity, Some(&meta)), "toolu_02");
     }
 }

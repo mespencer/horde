@@ -33,6 +33,9 @@ rmcp = { version = "=3.1.2", features = [
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
     "reqwest",
+    # Only the stub fixture binary (`mcp_stub_server`, spawned by the hub
+    # upstream tests) serves over stdin/stdout; the endpoint itself is HTTP.
+    "transport-io",
 ] }
 
 # The endpoint reads per-request identity off the HTTP parts rmcp injects into

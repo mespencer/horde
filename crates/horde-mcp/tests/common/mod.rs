@@ -201,6 +201,272 @@ pub fn identity_for(agent_id: &str) -> Setup<AgentIdentity> {
     Ok(registry.authenticate(&headers)?)
 }
 
+/// A real in-process MCP server for the hub suites to consume as an upstream.
+///
+/// Not a mock: this is rmcp's own `ServerHandler` machinery — the same code
+/// path a user's stdio server runs — served over an in-memory duplex, so the
+/// handshake, listing, and calls are all the real protocol with no process
+/// or socket. The child-process path is covered separately by spawning the
+/// `mcp_stub_server` fixture binary.
+pub mod stub_mcp {
+    use rmcp::handler::server::tool::ToolRouter;
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerInfo};
+    use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+
+    use super::Setup;
+
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    pub struct EchoParams {
+        pub message: String,
+    }
+
+    /// Two tools: `echo` round-trips, `blocked` exists to be denied — the
+    /// test that a deny stops the call needs a tool that would answer if
+    /// reached, or the assertion is on silence.
+    #[derive(Clone)]
+    pub struct StubTools {
+        tool_router: ToolRouter<Self>,
+    }
+
+    #[tool_router]
+    impl StubTools {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                tool_router: Self::tool_router(),
+            }
+        }
+
+        #[tool(name = "echo", description = "Answer the message back verbatim.")]
+        async fn echo(
+            &self,
+            Parameters(params): Parameters<EchoParams>,
+        ) -> Result<String, ErrorData> {
+            Ok(format!("echo:{}", params.message))
+        }
+
+        #[tool(
+            name = "blocked",
+            description = "Answers only if permission let it through."
+        )]
+        async fn blocked(&self) -> Result<String, ErrorData> {
+            Ok("the chain failed to stop this".to_owned())
+        }
+    }
+
+    #[tool_handler]
+    impl ServerHandler for StubTools {
+        fn get_info(&self) -> ServerInfo {
+            let mut info = ServerInfo::default();
+            info.protocol_version = ProtocolVersion::LATEST;
+            info.capabilities = ServerCapabilities::builder().enable_tools().build();
+            info.server_info.name = "stub-tools".to_owned();
+            info
+        }
+    }
+
+    /// A connected [`Upstream`](horde_mcp::hub::Upstream) over a real rmcp
+    /// server, in memory. The serving half is parked on its own task for the
+    /// life of the test process.
+    pub async fn upstream(name: &str) -> Setup<horde_mcp::hub::Upstream> {
+        use rmcp::ServiceExt;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        // The serving half runs on its own task: `serve` completes the
+        // handshake, so awaiting it inline would deadlock against the client
+        // half of the same duplex. Parked with `waiting`, not dropped —
+        // RunningService cancels itself when dropped.
+        tokio::spawn(async move {
+            let Ok(serving) = StubTools::new().serve(server_io).await else {
+                return;
+            };
+            let _ = serving.waiting().await;
+        });
+
+        Ok(horde_mcp::hub::Upstream::over(name, client_io).await?)
+    }
+}
+
+/// A legacy-era MCP client, one identity, one session.
+///
+/// Deliberately small — the session flow the dual-era spike recorded from
+/// Claude Code 2.1.228: `initialize`, the session id riding `Mcp-Session-Id`,
+/// `notifications/initialized`, then the calls. The subject of every test
+/// driving it is the *server* side of the wire, so the client stays exactly
+/// as sophisticated as the recorded traffic and no more.
+pub mod mcp_client {
+    use super::Setup;
+
+    pub struct McpClient {
+        pub address: std::net::SocketAddr,
+        pub agent_id: String,
+        pub token: String,
+        session: Option<String>,
+    }
+
+    impl McpClient {
+        /// Initializes against the endpoint the way a legacy harness does,
+        /// and keeps the session the server assigned.
+        pub async fn connect(
+            address: std::net::SocketAddr,
+            agent_id: &str,
+            token: &str,
+        ) -> Setup<Self> {
+            let mut client = Self {
+                address,
+                agent_id: agent_id.to_owned(),
+                token: token.to_owned(),
+                session: None,
+            };
+
+            let (parts, body) = client
+                .post(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "endpoint-test", "version": "0.0.0" },
+                    },
+                }))
+                .await?;
+            if !parts.status.is_success() {
+                return Err(format!("initialize was refused {}: {body}", parts.status).into());
+            }
+            let session = parts
+                .headers
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .ok_or("a legacy-era initialize is assigned a session id")?
+                .to_owned();
+            client.session = Some(session);
+
+            // The notification the lifecycle requires between initialize and
+            // use.
+            let (parts, body) = client
+                .post(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                }))
+                .await?;
+            if !parts.status.is_success() {
+                return Err(format!("initialized was refused {}: {body}", parts.status).into());
+            }
+
+            Ok(client)
+        }
+
+        /// One JSON-RPC POST, answered with the response head and raw body.
+        pub async fn post(
+            &self,
+            body: &serde_json::Value,
+        ) -> Setup<(http::response::Parts, String)> {
+            let stream = tokio::net::TcpStream::connect(self.address).await?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
+            // The connection future drives the socket; the request below
+            // resolves through it.
+            tokio::spawn(connection);
+
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", self.address.to_string())
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("authorization", format!("Bearer {}", self.token))
+                .header("x-horde-agent", self.agent_id.clone());
+            if let Some(session) = &self.session {
+                request = request.header("mcp-session-id", session.clone());
+            }
+
+            let response =
+                sender
+                    .send_request(request.body(http_body_util::Full::new(
+                        hyper::body::Bytes::from(body.to_string()),
+                    ))?)
+                    .await?;
+            let (parts, body) = response.into_parts();
+            let bytes = http_body_util::BodyExt::collect(body).await?.to_bytes();
+            Ok((parts, String::from_utf8(bytes.to_vec())?))
+        }
+
+        /// One request, answered with the decoded JSON-RPC message.
+        ///
+        /// The session flow answers over SSE; a stateless answer is plain
+        /// JSON. Same JSON-RPC message either way.
+        pub async fn rpc(&self, body: &serde_json::Value) -> Setup<serde_json::Value> {
+            let (parts, text) = self.post(body).await?;
+            if !parts.status.is_success() {
+                return Err(format!("the endpoint answered {}: {text}", parts.status).into());
+            }
+            let payload = match text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .next_back()
+            {
+                Some(framed) => framed.to_owned(),
+                None => text,
+            };
+            Ok(serde_json::from_str(&payload)?)
+        }
+
+        /// One `tools/call`, answered with the raw JSON-RPC message — errors,
+        /// `isError` results and all. The caller asserts on the shape it
+        /// expects; refusals are answers here, not test failures.
+        pub async fn call_tool_raw(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Setup<serde_json::Value> {
+            self.rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .await
+        }
+
+        /// One `tools/call` expected to succeed, answered with the result's
+        /// text content.
+        pub async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> Setup<String> {
+            let rpc = self.call_tool_raw(name, arguments).await?;
+            if let Some(error) = rpc.get("error") {
+                return Err(format!("the call was refused: {error}").into());
+            }
+            let result = rpc.get("result").ok_or("a reply must carry a result")?;
+            if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Err(format!("the tool answered an error: {result}").into());
+            }
+            result["content"][0]["text"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "the result must carry one text content block".into())
+        }
+
+        /// The names `tools/list` advertises.
+        pub async fn list_tool_names(&self) -> Setup<Vec<String>> {
+            let rpc = self
+                .rpc(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                }))
+                .await?;
+            let tools = rpc["result"]["tools"]
+                .as_array()
+                .ok_or_else(|| format!("a listing must carry tools: {rpc}"))?;
+            Ok(tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect())
+        }
+    }
+}
+
 // Unused where a binary never waits on the log; the module-scoped `dead_code`
 // allow does not reach imports.
 #[cfg(test)]

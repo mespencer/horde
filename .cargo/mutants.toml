@@ -28,6 +28,9 @@ exclude_re = [
     # Same criterion, codex's half: a scripted app-server the codex supervision
     # tests spawn. The suite runs it; it never tests it.
     'crates/horde-worker/src/bin/codex_stub_harness\.rs',
+    # Same criterion, the hub's half: a stub MCP server the hub upstream tests
+    # spawn as a child process. The suite runs it; it never tests it.
+    'crates/horde-mcp/src/bin/mcp_stub_server\.rs',
 ]
 
 # Parallelism is not settable here — cargo-mutants takes `--jobs` on the command
