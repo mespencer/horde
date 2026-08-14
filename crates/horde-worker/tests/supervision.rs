@@ -536,24 +536,9 @@ mod side_effects {
         (session, log, dir, log_path)
     }
 
-    /// Polls the child's control log, bounded by count, until `expected`
-    /// holds. The predicate is the full expected content rather than
-    /// "non-empty" because a slow machine can expose a partially flushed
-    /// line, and reading it early is a flake, not a finding.
-    async fn control_log_reaches(
-        log_path: &std::path::Path,
-        expected: impl Fn(&str) -> bool,
-    ) -> String {
-        let mut recorded = String::new();
-        for _ in 0..250 {
-            recorded = std::fs::read_to_string(log_path).unwrap_or_default();
-            if expected(&recorded) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        recorded
-    }
+    /// Bounded control-log polling, shared with the codex suite — see
+    /// `support::control_log_reaches`.
+    use crate::support::control_log_reaches;
 
     /// `interrupt()` must actually put the control message on the wire.
     ///

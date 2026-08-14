@@ -36,3 +36,23 @@ pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::
         Err(_) => panic!("{what} must finish rather than hang"),
     }
 }
+
+/// Polls a child's control log, bounded by count, until `expected` holds.
+///
+/// The predicate is the full expected content rather than "non-empty" because
+/// a slow machine can expose a partially flushed line, and reading it early
+/// is a flake, not a finding.
+pub(crate) async fn control_log_reaches(
+    log_path: &std::path::Path,
+    expected: impl Fn(&str) -> bool,
+) -> String {
+    let mut recorded = String::new();
+    for _ in 0..250 {
+        recorded = std::fs::read_to_string(log_path).unwrap_or_default();
+        if expected(&recorded) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    recorded
+}

@@ -189,21 +189,9 @@ mod harness {
         (session, log_path, (log, dir))
     }
 
-    /// Polls the control log, bounded by count, until `expected` holds.
-    pub(crate) async fn control_log_shows(
-        log_path: &std::path::Path,
-        expected: impl Fn(&str) -> bool,
-    ) -> String {
-        let mut recorded = String::new();
-        for _ in 0..250 {
-            recorded = std::fs::read_to_string(log_path).unwrap_or_default();
-            if expected(&recorded) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        recorded
-    }
+    /// Bounded control-log polling, shared with the claude suite — see
+    /// `support::control_log_reaches`.
+    pub(crate) use crate::support::control_log_reaches as control_log_shows;
 }
 
 #[cfg(test)]
