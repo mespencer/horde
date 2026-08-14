@@ -37,6 +37,14 @@ async fn an_upstream_lists_and_calls_a_real_server() {
         .collect();
     assert!(names.contains(&"echo"), "advertised: {names:?}");
 
+    // The Debug rendering reaches logs; it must say what it is and which
+    // server it speaks for, or every log line carrying an upstream is noise.
+    let rendered = format!("{upstream:?}");
+    assert!(
+        rendered.contains("Upstream") && rendered.contains("stub"),
+        "the Debug form must name the type and the server: {rendered}"
+    );
+
     let result = within(
         "the call round-trips",
         upstream.call("echo", echo_arguments("wire")),

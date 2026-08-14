@@ -319,12 +319,12 @@ pub struct SpawnArgs {
     pub idempotency_key: String,
 }
 
-/// Dispatches to one handler per verb.
+/// Runs one invocation: the pre-connection special case, then the connected
+/// dispatch.
 ///
-/// Every arm is a single call and nothing is computed here, which keeps this
-/// function's branching equal to the number of verbs. An earlier version
-/// inlined each verb's body and scored 164 on CRAP — readable enough in a diff,
-/// impossible to bring under the complexity bar however well it was covered.
+/// Split from [`dispatch`] because the verb count only ever grows: the match
+/// alone already carries one branch per verb, and anything else in the same
+/// function walks the whole thing back over the complexity ceiling.
 pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     // The one verb that must work *before* any identity exists: joining is
     // how this machine gets one, so it dials the enrollment listener rather
@@ -338,8 +338,16 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     }
 
     let mut client = connect(cli).await?;
-    let client = &mut client;
+    dispatch(&mut client, cli, format).await
+}
 
+/// Dispatches to one handler per verb.
+///
+/// Every arm is a single call and nothing is computed here, which keeps this
+/// function's branching equal to the number of verbs. An earlier version
+/// inlined each verb's body and scored 164 on CRAP — readable enough in a diff,
+/// impossible to bring under the complexity bar however well it was covered.
+async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), ClientError> {
     match &cli.command {
         None => crate::tui::launch(client.clone(), crate::tui::Launch::Overview).await,
         Some(Command::Attach(args)) => {

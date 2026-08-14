@@ -54,17 +54,27 @@ pub(crate) fn listing(
     tools: Vec<rmcp::model::Tool>,
     context: &RequestContext<RoleServer>,
 ) -> ListToolsResult {
-    let supports_cache_hints = context
-        .protocol_version()
-        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+    let cacheable = supports_cache_hints(context.protocol_version());
     ListToolsResult {
         result_type: Some(rmcp::model::ResultType::COMPLETE),
         tools,
         meta: None,
         next_cursor: None,
-        ttl_ms: supports_cache_hints.then_some(0),
-        cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        ttl_ms: cacheable.then_some(0),
+        cache_scope: cacheable.then_some(rmcp::model::CacheScope::Public),
     }
+}
+
+/// Whether the caller's revision reads `ttl_ms`/`cache_scope` (SEP-2322,
+/// introduced at 2026-07-28).
+///
+/// A named predicate rather than a comparison inline in [`listing`]: the
+/// boundary is the whole decision, a legacy caller sent cache hints would be
+/// handed fields its schema does not admit, and arranging a `RequestContext`
+/// per revision is exactly the harness a truth table should not need.
+#[must_use]
+pub(crate) fn supports_cache_hints(version: Option<ProtocolVersion>) -> bool {
+    version.is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
 }
 
 /// Renders a proxied-call failure the way MCP distinguishes failures.
@@ -142,6 +152,25 @@ mod tests {
     fn debug_names_the_hub_rather_than_hiding_it() {
         let rendered = format!("{:?}", endpoint());
         assert!(rendered.contains("HubEndpoint"), "{rendered}");
+    }
+
+    /// The cache-hint boundary, exactly at the threshold and one step either
+    /// side: 2026-07-28 is where the fields were introduced, so the older
+    /// revision must not be handed them and the newer must be.
+    #[test]
+    fn cache_hints_start_exactly_at_the_revision_that_defined_them() {
+        use rmcp::model::ProtocolVersion;
+
+        assert!(super::supports_cache_hints(Some(
+            ProtocolVersion::V_2026_07_28
+        )));
+        assert!(!super::supports_cache_hints(Some(
+            ProtocolVersion::V_2025_11_25
+        )));
+        assert!(
+            !super::supports_cache_hints(None),
+            "no negotiated revision means the legacy shape, not the newest"
+        );
     }
 
     /// The two failure planes must not swap: an unknown name is a protocol

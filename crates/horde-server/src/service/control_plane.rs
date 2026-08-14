@@ -1064,32 +1064,11 @@ impl ControlPlaneService for ControlPlane {
             .ok_or_else(|| Status::from(ServerError::Invalid("no config supplied".to_owned())))?;
         validate_config(&config).map_err(Status::from)?;
 
-        // The etag is what splits create from update: empty means "I believe
-        // this name is new", non-empty means "I read this version and am
-        // changing it". Both beliefs are checked rather than trusted, so a
-        // concurrent writer surfaces as AlreadyExists or Aborted instead of a
-        // silent last-writer-wins overwrite through the RPC surface.
+        // Create versus update is `check_configure`'s ruling: the etag names
+        // the caller's intent, and both intents are checked against the
+        // catalog rather than trusted.
         let catalog = self.mcp_catalog().await.map_err(Status::from)?;
-        match (catalog.get(&config.name), config.etag.is_empty()) {
-            // A create over a live name is refused as AlreadyExists, not as a
-            // stale etag: the caller's mistake is the name, not the token.
-            (Some(_), true) => {
-                return Err(Status::from(ServerError::McpServerNameTaken {
-                    name: config.name.clone(),
-                }));
-            }
-            (Some(existing), false) => {
-                crate::mcp::check_etag(existing, &config.etag).map_err(Status::from)?;
-            }
-            (None, true) => {}
-            // An update naming a server that is not there: the etag the
-            // caller holds is for something already deleted.
-            (None, false) => {
-                return Err(Status::from(ServerError::NoSuchMcpServer {
-                    name: config.name.clone(),
-                }));
-            }
-        }
+        crate::mcp::check_configure(catalog.get(&config.name), &config).map_err(Status::from)?;
 
         let stamped = self
             .append_mcp_config(config, false)

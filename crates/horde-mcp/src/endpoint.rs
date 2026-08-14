@@ -893,6 +893,24 @@ mod tests {
         );
     }
 
+    /// Every JSON kind names itself in a refusal — the message is the only
+    /// diagnosis an operator gets, and "a string" where an array arrived
+    /// sends them hunting the wrong producer.
+    #[test]
+    fn every_json_kind_names_itself() {
+        let cases = [
+            (serde_json::json!(null), "null"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(7), "a number"),
+            (serde_json::json!("rm -rf"), "a string"),
+            (serde_json::json!([1, 2]), "an array"),
+            (serde_json::json!({"a": 1}), "an object"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(super::kind_of(&value), expected);
+        }
+    }
+
     /// Minted ids must differ call to call — a repeated id is a permission
     /// request the journal silently swallows as a duplicate.
     #[tokio::test]

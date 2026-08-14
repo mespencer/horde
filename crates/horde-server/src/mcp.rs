@@ -201,6 +201,40 @@ pub fn validate_config(config: &McpServerConfig) -> Result<(), ServerError> {
     }
 }
 
+/// Rules on one configure attempt: create or update, checked against what
+/// the catalog holds.
+///
+/// The etag is what splits the two intents — empty means "I believe this
+/// name is new", non-empty means "I read this version and am changing it" —
+/// and both beliefs are checked rather than trusted, so a concurrent writer
+/// surfaces as a refusal instead of a silent last-writer-wins overwrite
+/// through the RPC surface. A named decision rather than logic in the
+/// handler, for the QUALITY_GATES reason: all four corners of
+/// (exists, etag-empty) must be assertable without arranging an RPC.
+///
+/// # Errors
+///
+/// [`ServerError::McpServerNameTaken`] for a create over a live name — the
+/// caller's mistake is the name, not the token. [`ServerError::NoSuchMcpServer`]
+/// for an update naming a server that is not there — the etag the caller
+/// holds is for something already deleted. [`ServerError::StaleMcpServerEtag`]
+/// for an update whose token is not current.
+pub fn check_configure(
+    existing: Option<&McpServerConfig>,
+    attempted: &McpServerConfig,
+) -> Result<(), ServerError> {
+    match (existing, attempted.etag.is_empty()) {
+        (Some(_), true) => Err(ServerError::McpServerNameTaken {
+            name: attempted.name.clone(),
+        }),
+        (Some(current), false) => check_etag(current, &attempted.etag),
+        (None, true) => Ok(()),
+        (None, false) => Err(ServerError::NoSuchMcpServer {
+            name: attempted.name.clone(),
+        }),
+    }
+}
+
 /// Enforces the optimistic-concurrency token on a mutation.
 ///
 /// # Errors
@@ -433,6 +467,51 @@ mod tests {
             url: "http://127.0.0.1:8931/mcp".to_owned(),
         }));
         assert!(validate_config(&http).is_ok());
+    }
+
+    /// All four corners of (exists, etag-empty) — the decision the configure
+    /// RPC hangs on, exercised without an RPC.
+    #[test]
+    fn a_configure_is_ruled_by_what_exists_and_what_the_etag_claims() {
+        let mut current = stdio("linear");
+        current.etag = "3".to_owned();
+
+        let create = stdio("linear");
+        assert!(
+            super::check_configure(None, &create).is_ok(),
+            "an empty etag over an absent name creates"
+        );
+        assert!(
+            matches!(
+                super::check_configure(Some(&current), &create),
+                Err(ServerError::McpServerNameTaken { name }) if name == "linear"
+            ),
+            "a create over a live name is AlreadyExists, not a stale etag"
+        );
+
+        let mut update = stdio("linear");
+        update.etag = "3".to_owned();
+        assert!(
+            super::check_configure(Some(&current), &update).is_ok(),
+            "the current token updates"
+        );
+        assert!(
+            matches!(
+                super::check_configure(None, &update),
+                Err(ServerError::NoSuchMcpServer { name }) if name == "linear"
+            ),
+            "an update naming an absent server is NotFound"
+        );
+
+        let mut stale = stdio("linear");
+        stale.etag = "2".to_owned();
+        assert!(
+            matches!(
+                super::check_configure(Some(&current), &stale),
+                Err(ServerError::StaleMcpServerEtag { .. })
+            ),
+            "a stale token aborts"
+        );
     }
 
     #[test]

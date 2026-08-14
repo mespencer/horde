@@ -679,6 +679,57 @@ mod tests {
 
     use super::{Format, created, event, hello, sent, sequence, session, sessions, spawned};
 
+    /// The `mcp` renders: the empty catalog says so in words (a script or a
+    /// human reading nothing cannot tell it from a swallowed error), a
+    /// populated one carries the fields a follow-up command needs, and a
+    /// removal names what was removed.
+    #[test]
+    fn the_mcp_renders_say_what_happened_in_both_formats() {
+        let config = horde_proto::v1::McpServerConfig {
+            name: "linear".to_owned(),
+            transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+                horde_proto::v1::McpStdioTransport {
+                    command: "linear-mcp".to_owned(),
+                    ..horde_proto::v1::McpStdioTransport::default()
+                },
+            )),
+            local: true,
+            etag: "3".to_owned(),
+            ..horde_proto::v1::McpServerConfig::default()
+        };
+
+        assert_eq!(
+            super::mcp_servers(&[], Format::Human),
+            "no MCP servers configured"
+        );
+        let listed = super::mcp_servers(std::slice::from_ref(&config), Format::Human);
+        assert_eq!(
+            listed, "linear [local] stdio linear-mcp (all agents) etag 3",
+            "the one line carries name, placement, transport, scope, and the \
+             etag the next mutation must quote"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&super::mcp_servers(
+            std::slice::from_ref(&config),
+            Format::Json,
+        ))
+        .expect("valid JSON");
+        assert_eq!(json["servers"][0]["name"], "linear");
+        assert_eq!(json["servers"][0]["etag"], "3");
+
+        assert_eq!(
+            super::mcp_configured(&config, Format::Human),
+            "configured linear [local] stdio linear-mcp (all agents) etag 3"
+        );
+        assert_eq!(
+            super::mcp_removed("linear", Format::Human),
+            "removed linear"
+        );
+        let removed: serde_json::Value =
+            serde_json::from_str(&super::mcp_removed("linear", Format::Json)).expect("valid JSON");
+        assert_eq!(removed["removed"], "linear");
+    }
+
     fn summary() -> SessionSummary {
         SessionSummary {
             session_id: Some(SessionId::new("s1")),

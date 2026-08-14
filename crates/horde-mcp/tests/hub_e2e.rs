@@ -26,6 +26,10 @@ const HUB_TOKEN: &str = "hub-e2e-hub-token";
 struct Stack {
     horde: common::Harness,
     client: McpClient,
+    /// A clone of the served handler, for the handler-level assertions the
+    /// wire cannot make (rmcp answers `tools/call` routing itself, but
+    /// `get_tool` is consulted internally for validation).
+    endpoint: HordeEndpoint,
     _hub_serving: tokio::task::JoinHandle<()>,
     _endpoint_serving: tokio::task::JoinHandle<()>,
 }
@@ -88,13 +92,18 @@ async fn stack() -> Setup<Stack> {
 
     let mut registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, AGENT_TOKEN);
-    let (address, endpoint_serving) =
-        serve(&EndpointConfig::loopback(0), Arc::new(registry), endpoint).await?;
+    let (address, endpoint_serving) = serve(
+        &EndpointConfig::loopback(0),
+        Arc::new(registry),
+        endpoint.clone(),
+    )
+    .await?;
 
     let client = McpClient::connect(address, &horde.agent_id, AGENT_TOKEN).await?;
     Ok(Stack {
         horde,
         client,
+        endpoint,
         _hub_serving: hub_serving,
         _endpoint_serving: endpoint_serving,
     })
@@ -269,5 +278,41 @@ async fn a_local_servers_tool_rides_the_same_endpoint_and_the_same_chain() {
             .await
             .expect("the log is readable"),
         "local tools are gated by the same chain as hub tools"
+    );
+}
+
+/// `get_tool` is rmcp's own validation hook, and it must agree with the
+/// listing: a verb by name, a visible proxied tool by its namespaced name,
+/// and nothing for a name outside this agent's surface.
+#[tokio::test]
+async fn get_tool_answers_for_exactly_the_tools_this_agent_may_see() {
+    use rmcp::ServerHandler;
+
+    let stack = within("the stack stands up", stack())
+        .await
+        .expect("every hop must come up");
+
+    let verb = stack
+        .endpoint
+        .get_tool("spawn_agent")
+        .expect("the verbs answer by name");
+    assert_eq!(verb.name, "spawn_agent");
+
+    let proxied = stack
+        .endpoint
+        .get_tool("linear__echo")
+        .expect("a visible hub tool answers by its namespaced name");
+    assert_eq!(
+        proxied.name, "linear__echo",
+        "the answer is the asked-for tool, not the first one"
+    );
+
+    assert!(
+        stack.endpoint.get_tool("payments__echo").is_none(),
+        "a hub tool outside this agent's visibility must not resolve"
+    );
+    assert!(
+        stack.endpoint.get_tool("no_such_tool").is_none(),
+        "an unknown name resolves to nothing, never to a default"
     );
 }

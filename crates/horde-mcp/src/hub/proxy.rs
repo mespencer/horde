@@ -80,12 +80,6 @@ impl ToolProxy {
         self
     }
 
-    /// Whether this proxy serves anything at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.sources.is_empty()
-    }
-
     /// Every tool this proxy serves, under its endpoint-facing name.
     #[must_use]
     pub fn tools(&self) -> Vec<Tool> {
