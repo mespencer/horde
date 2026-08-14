@@ -201,6 +201,25 @@ impl ControlPlane {
         Ok(stamped)
     }
 
+    /// One configure, decided and journaled — the whole verb minus the tonic
+    /// wrapping, so every refusal here is a plain `ServerError` and the RPC
+    /// shell stays two calls.
+    ///
+    /// # Errors
+    ///
+    /// `validate_config`'s refusals for an ill-formed config,
+    /// `check_configure`'s for a create/update that contradicts the catalog,
+    /// and the log's own failures from the append.
+    async fn configure_mcp(&self, config: McpServerConfig) -> Result<McpServerConfig, ServerError> {
+        validate_config(&config)?;
+        // Create versus update is `check_configure`'s ruling: the etag names
+        // the caller's intent, and both intents are checked against the
+        // catalog rather than trusted.
+        let catalog = self.mcp_catalog().await?;
+        crate::mcp::check_configure(catalog.get(&config.name), &config)?;
+        self.append_mcp_config(config, false).await
+    }
+
     /// A live definition by id, or the error that names what was asked for.
     async fn required_definition(
         &self,
@@ -1058,22 +1077,12 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<ConfigureMcpServerRequest>,
     ) -> Result<Response<ConfigureMcpServerResponse>, Status> {
-        let config = request
-            .into_inner()
-            .config
-            .ok_or_else(|| Status::from(ServerError::Invalid("no config supplied".to_owned())))?;
-        validate_config(&config).map_err(Status::from)?;
-
-        // Create versus update is `check_configure`'s ruling: the etag names
-        // the caller's intent, and both intents are checked against the
-        // catalog rather than trusted.
-        let catalog = self.mcp_catalog().await.map_err(Status::from)?;
-        crate::mcp::check_configure(catalog.get(&config.name), &config).map_err(Status::from)?;
-
-        let stamped = self
-            .append_mcp_config(config, false)
-            .await
-            .map_err(Status::from)?;
+        // The shell is deliberately two calls: the decisions live in
+        // `crate::mcp` as truth-tabled pure functions (`validate_config`,
+        // `check_configure`, `required_config`) and the sequencing in
+        // `configure_mcp`, where every branch is a plain `?`.
+        let config = crate::mcp::required_config(request.into_inner().config)?;
+        let stamped = self.configure_mcp(config).await.map_err(Status::from)?;
         Ok(Response::new(ConfigureMcpServerResponse {
             config: Some(stamped),
         }))

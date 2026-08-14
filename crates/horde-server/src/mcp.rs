@@ -201,6 +201,18 @@ pub fn validate_config(config: &McpServerConfig) -> Result<(), ServerError> {
     }
 }
 
+/// The config a configure request must carry.
+///
+/// Protobuf makes every message field optional; this is the boundary where
+/// that stops, so the handler never reasons about an absent config.
+///
+/// # Errors
+///
+/// [`ServerError::Invalid`] when the request carried none.
+pub fn required_config(config: Option<McpServerConfig>) -> Result<McpServerConfig, ServerError> {
+    config.ok_or_else(|| ServerError::Invalid("no config supplied".to_owned()))
+}
+
 /// Rules on one configure attempt: create or update, checked against what
 /// the catalog holds.
 ///
@@ -467,6 +479,21 @@ mod tests {
             url: "http://127.0.0.1:8931/mcp".to_owned(),
         }));
         assert!(validate_config(&http).is_ok());
+    }
+
+    /// Both sides of the protobuf boundary: a carried config comes through
+    /// whole, an absent one is the caller's mistake in words.
+    #[test]
+    fn a_configure_request_must_carry_its_config() {
+        let carried = super::required_config(Some(stdio("linear")))
+            .unwrap_or_else(|error| panic!("a carried config passes: {error}"));
+        assert_eq!(carried.name, "linear");
+
+        let refused = super::required_config(None);
+        assert!(
+            matches!(&refused, Err(ServerError::Invalid(message)) if message.contains("no config")),
+            "got {refused:?}"
+        );
     }
 
     /// All four corners of (exists, etag-empty) — the decision the configure
