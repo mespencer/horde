@@ -144,10 +144,16 @@ async fn every_unbuilt_control_plane_rpc_refuses_rather_than_fabricating_success
             .revoke_enrollment(RevokeEnrollmentRequest::default()),
         "revoke_enrollment"
     );
-    refuses!(
-        h.control.query_usage(QueryUsageRequest::default()),
-        "query_usage"
-    );
+
+    // query_usage graduated from this list (W6c): it is built, so a default
+    // request is now refused for what it actually is — a query that never
+    // said how to group — rather than as unbuilt.
+    let status = h
+        .control
+        .query_usage(QueryUsageRequest::default())
+        .await
+        .expect_err("a groupless usage query is refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
 }
 
 // -- Workspaces --------------------------------------------------------------

@@ -13,13 +13,16 @@
 pub mod enrollment;
 pub mod error;
 pub mod log;
+pub mod mcp;
 pub mod permission;
 pub mod placement;
 pub mod scheduler;
 pub mod service;
 pub mod startup;
 pub mod state;
+pub mod tiers;
 pub mod transport;
+pub mod usage;
 pub mod workspace;
 
 pub use enrollment::EnrollmentRoster;

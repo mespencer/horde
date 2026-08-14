@@ -1,0 +1,69 @@
+// The MCP Hub: user MCP servers configured at the Server, proxied onto every
+// Agent's one endpoint (ADR-0004, DESIGN §9).
+//
+// A server marked `local` is the pressure valve: it runs Worker-side, spawned
+// per Agent, for anything machine-bound or misbehaving under multiplexing.
+// Either way the Agent sees the tools on the same endpoint, namespaced by the
+// server's name.
+syntax = "proto3";
+
+package horde.v1;
+
+// A child process speaking MCP over stdio, run by whoever hosts the server —
+// the Server for hub entries, the Worker (per Agent) for `local` ones.
+message McpStdioTransport {
+  string command = 1;
+
+  repeated string args = 2;
+
+  // Environment for the child. NOTE: configuration is journaled through the
+  // event log, and attached Clients replay the log — so values written here
+  // are visible to every Client. That is acceptable for a single-user server
+  // and wrong the moment the server is shared; secret redaction is an open
+  // question flagged in the W6a report rather than solved silently.
+  map<string, string> env = 3;
+}
+
+// An MCP server reached over streamable HTTP.
+message McpHttpTransport {
+  string url = 1;
+}
+
+// One configured MCP server. The catalog of these is a fold over
+// McpServerConfigChanged events in a reserved stream, exactly like the
+// Workspace Definition catalog.
+message McpServerConfig {
+  // Unique name; the namespace prefix Agents see on every proxied tool
+  // (`{name}__{tool}`). Lowercase [a-z0-9-], and never containing `__`,
+  // because the prefix must split back off unambiguously.
+  string name = 1;
+
+  oneof transport {
+    McpStdioTransport stdio = 2;
+    McpHttpTransport http = 3;
+  }
+
+  // True runs the server Worker-side, one instance per Agent (machine-bound
+  // or stateful servers). False runs it at the Server, authenticated once.
+  bool local = 4;
+
+  // Agent types (AgentSpec.agent_type) whose Agents may see this server's
+  // tools. Empty means every Agent. Non-empty fails closed: an Agent with no
+  // declared type sees only unrestricted servers.
+  repeated string allowed_agent_types = 5;
+
+  // Optimistic-concurrency token, stamped from the catalog stream sequence.
+  // Send back on Configure/Delete of an existing server; mismatch is ABORTED.
+  string etag = 6;
+}
+
+// The catalog changed: a server was configured (created or updated) or
+// removed. Carries the full post-change config rather than a delta, so the
+// catalog fold is last-writer-wins and a replay from any offset converges.
+message McpServerConfigChanged {
+  McpServerConfig config = 1;
+
+  // The server no longer exists. The event still carries its last state, so
+  // the log alone records what was removed.
+  bool deleted = 2;
+}

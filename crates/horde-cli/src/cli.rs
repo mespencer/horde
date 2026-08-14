@@ -63,12 +63,66 @@ pub enum Command {
     /// Attach to a session interactively. `sync --follow` is the headless,
     /// scriptable form of the same subscription.
     Attach(AttachArgs),
+    /// The MCP Hub catalog: user MCP servers proxied onto every agent's
+    /// endpoint (ADR-0004).
+    #[command(subcommand)]
+    Mcp(McpCommand),
+    /// Usage and headroom, folded from the journaled usage events.
+    Usage(UsageArgs),
     /// Worker administration: enrollment codes and revocation (DESIGN §3).
     #[command(subcommand)]
     Worker(WorkerCommand),
     /// This machine's own identity: joining, and client codes for others.
     #[command(subcommand)]
     Enroll(EnrollCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Create or update one server in the catalog. The name becomes the
+    /// namespace prefix on every proxied tool (`{name}__{tool}`), so it is
+    /// lowercase [a-z0-9-].
+    Add(McpAddArgs),
+    /// List every live server.
+    List,
+    /// Remove one server. Needs the etag `list` shows, so a concurrent edit
+    /// aborts instead of being silently deleted.
+    Remove {
+        name: String,
+        #[arg(long)]
+        etag: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct McpAddArgs {
+    pub name: String,
+    /// Run a stdio server: the command to spawn. Exactly one of this and
+    /// `--url`.
+    #[arg(long, conflicts_with = "url")]
+    pub command: Option<String>,
+    /// Argument for the stdio command; repeatable, in order. Values may
+    /// themselves start with `--` (`--arg --stdio` is the common case).
+    #[arg(long = "arg", requires = "command", allow_hyphen_values = true)]
+    pub args: Vec<String>,
+    /// Environment for the stdio child, as KEY=VALUE; repeatable. NOTE:
+    /// journaled through the event log, which attached clients replay.
+    #[arg(long = "env", requires = "command", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+    /// Reach a running server over streamable HTTP at this url.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Run worker-side, one instance per agent, instead of at the server —
+    /// the pressure valve for machine-bound or stateful servers.
+    #[arg(long)]
+    pub local: bool,
+    /// Restrict to agents of this type; repeatable. Absent means every
+    /// agent; present fails closed for untyped agents.
+    #[arg(long = "allow-agent-type")]
+    pub allowed_agent_types: Vec<String>,
+    /// Update the version this etag names, instead of creating.
+    #[arg(long, default_value = "")]
+    pub etag: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -204,6 +258,58 @@ pub struct AttachArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct UsageArgs {
+    /// Restrict to this session; repeatable. Default: every session.
+    #[arg(long = "session")]
+    pub sessions: Vec<String>,
+    /// Restrict to this agent's subtree — tree-level attribution.
+    #[arg(long)]
+    pub subtree: Option<String>,
+    /// How to group the rows.
+    #[arg(long, value_enum, default_value_t = GroupChoice::Account)]
+    pub by: GroupChoice,
+}
+
+/// The groupings `--by` offers, in CLI words.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupChoice {
+    Agent,
+    Session,
+    Tree,
+    Account,
+    Model,
+}
+
+/// The wire grouping one CLI choice asks for.
+///
+/// Extracted so the mapping is testable without a server: a swapped arm here
+/// would silently answer a different question than the flag named.
+#[must_use]
+pub fn group_by_for(choice: GroupChoice) -> horde_proto::v1::UsageGroupBy {
+    match choice {
+        GroupChoice::Agent => horde_proto::v1::UsageGroupBy::Agent,
+        GroupChoice::Session => horde_proto::v1::UsageGroupBy::Session,
+        GroupChoice::Tree => horde_proto::v1::UsageGroupBy::TreePath,
+        GroupChoice::Account => horde_proto::v1::UsageGroupBy::ProviderAccount,
+        GroupChoice::Model => horde_proto::v1::UsageGroupBy::Model,
+    }
+}
+
+/// The renderer's grouping for the same choice — the renderer owns its own
+/// vocabulary rather than importing this module's (which would close a
+/// module cycle), so the flag maps into both, here, testably.
+#[must_use]
+pub fn rendering_for(choice: GroupChoice) -> render::UsageGrouping {
+    match choice {
+        GroupChoice::Agent => render::UsageGrouping::Agent,
+        GroupChoice::Session => render::UsageGrouping::Session,
+        GroupChoice::Tree => render::UsageGrouping::Tree,
+        GroupChoice::Account => render::UsageGrouping::Account,
+        GroupChoice::Model => render::UsageGrouping::Model,
+    }
+}
+
+#[derive(Args, Debug)]
 pub struct SpawnArgs {
     pub session_id: String,
     /// The spawner. Defaults to the session's top-level agent.
@@ -213,12 +319,12 @@ pub struct SpawnArgs {
     pub idempotency_key: String,
 }
 
-/// Dispatches to one handler per verb.
+/// Runs one invocation: the pre-connection special case, then the connected
+/// dispatch.
 ///
-/// Every arm is a single call and nothing is computed here, which keeps this
-/// function's branching equal to the number of verbs. An earlier version
-/// inlined each verb's body and scored 164 on CRAP — readable enough in a diff,
-/// impossible to bring under the complexity bar however well it was covered.
+/// Split from [`dispatch`] because the verb count only ever grows: the match
+/// alone already carries one branch per verb, and anything else in the same
+/// function walks the whole thing back over the complexity ceiling.
 pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     // The one verb that must work *before* any identity exists: joining is
     // how this machine gets one, so it dials the enrollment listener rather
@@ -232,8 +338,16 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     }
 
     let mut client = connect(cli).await?;
-    let client = &mut client;
+    dispatch(&mut client, cli, format).await
+}
 
+/// Dispatches to one handler per verb.
+///
+/// Every arm is a single call and nothing is computed here, which keeps this
+/// function's branching equal to the number of verbs. An earlier version
+/// inlined each verb's body and scored 164 on CRAP — readable enough in a diff,
+/// impossible to bring under the complexity bar however well it was covered.
+async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), ClientError> {
     match &cli.command {
         None => crate::tui::launch(client.clone(), crate::tui::Launch::Overview).await,
         Some(Command::Attach(args)) => {
@@ -253,6 +367,8 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
+        Some(Command::Mcp(command)) => run_mcp(client, command, format).await,
+        Some(Command::Usage(args)) => run_usage(client, args, format).await,
         Some(Command::Worker(command)) => run_worker(client, command, format).await,
         Some(Command::Enroll(command)) => run_enroll(client, command, format).await,
     }
@@ -341,6 +457,88 @@ async fn run_join(
         "{}",
         render::joined(&enrolled.principal.to_string(), &directory, format)
     );
+    Ok(())
+}
+
+/// The wire config an `mcp add` describes.
+///
+/// # Errors
+///
+/// A malformed `--env` entry, or neither/both transports named — refused
+/// here, where the message can talk about flags, rather than sent for the
+/// server to refuse in wire vocabulary.
+pub fn mcp_config_from(args: &McpAddArgs) -> Result<horde_proto::v1::McpServerConfig, ClientError> {
+    let transport =
+        match (&args.command, &args.url) {
+            (Some(command), None) => {
+                let mut env = std::collections::HashMap::new();
+                for pair in &args.env {
+                    let (key, value) = parse_env_pair(pair).ok_or_else(|| {
+                        ClientError::Rpc(tonic::Status::invalid_argument(format!(
+                            "--env takes KEY=VALUE, got {pair:?}"
+                        )))
+                    })?;
+                    env.insert(key.to_owned(), value.to_owned());
+                }
+                horde_proto::v1::mcp_server_config::Transport::Stdio(
+                    horde_proto::v1::McpStdioTransport {
+                        command: command.clone(),
+                        args: args.args.clone(),
+                        env,
+                    },
+                )
+            }
+            (None, Some(url)) => horde_proto::v1::mcp_server_config::Transport::Http(
+                horde_proto::v1::McpHttpTransport { url: url.clone() },
+            ),
+            _ => {
+                return Err(ClientError::Rpc(tonic::Status::invalid_argument(
+                    "name exactly one transport: --command for stdio, or --url for http",
+                )));
+            }
+        };
+
+    Ok(horde_proto::v1::McpServerConfig {
+        name: args.name.clone(),
+        transport: Some(transport),
+        local: args.local,
+        allowed_agent_types: args.allowed_agent_types.clone(),
+        etag: args.etag.clone(),
+    })
+}
+
+/// Splits one `--env` entry on its first `=`.
+///
+/// The first, because values contain `=` routinely (base64 padding, URLs);
+/// an empty key is refused, an empty value is a real value.
+#[must_use]
+pub fn parse_env_pair(pair: &str) -> Option<(&str, &str)> {
+    let (key, value) = pair.split_once('=')?;
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, value))
+}
+
+async fn run_mcp(
+    client: &mut Client,
+    command: &McpCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        McpCommand::Add(args) => {
+            let stamped = client.configure_mcp_server(mcp_config_from(args)?).await?;
+            println!("{}", render::mcp_configured(&stamped, format));
+        }
+        McpCommand::List => {
+            let servers = client.list_mcp_servers().await?;
+            println!("{}", render::mcp_servers(&servers, format));
+        }
+        McpCommand::Remove { name, etag } => {
+            client.delete_mcp_server(name, etag).await?;
+            println!("{}", render::mcp_removed(name, format));
+        }
+    }
     Ok(())
 }
 
@@ -461,6 +659,22 @@ async fn run_spawn(
     Ok(())
 }
 
+async fn run_usage(
+    client: &mut Client,
+    args: &UsageArgs,
+    format: Format,
+) -> Result<(), ClientError> {
+    let options = crate::client::UsageOptions::grouped_by(group_by_for(args.by))
+        .sessions(args.sessions.clone())
+        .scoped_to_subtree(args.subtree.clone());
+    let response = client.query_usage(&options).await?;
+    println!(
+        "{}",
+        render::usage(&response, rendering_for(args.by), format)
+    );
+    Ok(())
+}
+
 async fn run_session(
     client: &mut Client,
     command: &SessionCommand,
@@ -572,6 +786,129 @@ mod tests {
         assert_eq!(delivery_for(true), DeliveryMode::Interrupt);
     }
 
+    /// Values contain `=` routinely (base64 padding, URLs), so the split must
+    /// be on the first — and a keyless entry is a mistake, not an empty key.
+    #[test]
+    fn env_pairs_split_on_the_first_equals_and_refuse_a_missing_key() {
+        assert_eq!(
+            super::parse_env_pair("TOKEN=abc=="),
+            Some(("TOKEN", "abc=="))
+        );
+        assert_eq!(super::parse_env_pair("EMPTY="), Some(("EMPTY", "")));
+        assert_eq!(super::parse_env_pair("=value"), None);
+        assert_eq!(super::parse_env_pair("no-equals"), None);
+    }
+
+    /// Parses one `mcp add` invocation through the real command model and
+    /// converts it — the arrangement both transport tests share.
+    fn parsed_mcp_add(argv: &[&str]) -> horde_proto::v1::McpServerConfig {
+        let cli = Cli::try_parse_from(argv).expect("valid arguments");
+        let Some(Command::Mcp(super::McpCommand::Add(args))) = &cli.command else {
+            panic!("expected mcp add, got {:?}", cli.command);
+        };
+        super::mcp_config_from(args).expect("a valid config")
+    }
+
+    /// The `mcp add` flags become exactly one wire transport, with everything
+    /// they said riding along.
+    #[test]
+    fn an_mcp_add_becomes_the_wire_config_it_described() {
+        let config = parsed_mcp_add(&[
+            "horde",
+            "mcp",
+            "add",
+            "linear",
+            "--command",
+            "linear-mcp",
+            "--arg",
+            "--stdio",
+            "--env",
+            "LINEAR_TOKEN=tok",
+            "--local",
+            "--allow-agent-type",
+            "reviewer",
+            "--etag",
+            "3",
+        ]);
+        assert_eq!(config.name, "linear");
+        assert!(config.local);
+        assert_eq!(config.allowed_agent_types, vec!["reviewer".to_owned()]);
+        assert_eq!(config.etag, "3");
+        match config.transport {
+            Some(horde_proto::v1::mcp_server_config::Transport::Stdio(stdio)) => {
+                assert_eq!(stdio.command, "linear-mcp");
+                assert_eq!(stdio.args, vec!["--stdio".to_owned()]);
+                assert_eq!(
+                    stdio.env.get("LINEAR_TOKEN").map(String::as_str),
+                    Some("tok")
+                );
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    /// Neither transport, and a malformed env entry: refused here, in flag
+    /// vocabulary, before anything reaches the wire.
+    #[test]
+    fn an_mcp_add_without_a_transport_or_with_bad_env_is_refused_locally() {
+        let no_transport = super::McpAddArgs {
+            name: "linear".to_owned(),
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: None,
+            local: false,
+            allowed_agent_types: Vec::new(),
+            etag: String::new(),
+        };
+        let refused = super::mcp_config_from(&no_transport).expect_err("no transport");
+        assert!(
+            refused.to_string().contains("--command"),
+            "the refusal talks in flags: {refused}"
+        );
+
+        let bad_env = super::McpAddArgs {
+            command: Some("linear-mcp".to_owned()),
+            env: vec!["NOEQUALS".to_owned()],
+            ..no_transport
+        };
+        let refused = super::mcp_config_from(&bad_env).expect_err("bad env");
+        assert!(refused.to_string().contains("NOEQUALS"), "{refused}");
+    }
+
+    /// An http `mcp add` and the both-transports refusal (clap owns it: the
+    /// flags conflict, so the mistake never reaches the converter).
+    #[test]
+    fn an_http_mcp_add_converts_and_both_transports_cannot_parse() {
+        let config = parsed_mcp_add(&[
+            "horde",
+            "mcp",
+            "add",
+            "grafana",
+            "--url",
+            "http://127.0.0.1:9931/mcp",
+        ]);
+        assert!(matches!(
+            config.transport,
+            Some(horde_proto::v1::mcp_server_config::Transport::Http(_))
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "horde",
+                "mcp",
+                "add",
+                "x",
+                "--command",
+                "c",
+                "--url",
+                "http://y",
+            ])
+            .is_err(),
+            "--command and --url conflict at parse time"
+        );
+    }
+
     #[test]
     fn approving_allows_and_denying_denies() {
         assert_eq!(outcome_for(false), (PermissionOutcome::Allow, "allowed"));
@@ -610,6 +947,98 @@ mod tests {
             Some(Command::Send(args)) => assert!(args.note && args.interrupt),
             other => panic!("expected send, got {other:?}"),
         }
+    }
+
+    /// Both halves of the flag's meaning, since the flag maps twice: the wire
+    /// grouping the server folds by, and the renderer's label vocabulary. A
+    /// swapped arm in either would answer a different question than the flag
+    /// named.
+    #[test]
+    fn every_group_choice_maps_to_its_wire_and_render_groupings() {
+        use super::{GroupChoice, group_by_for, rendering_for};
+        use horde_proto::v1::UsageGroupBy;
+
+        let cases = [
+            (
+                GroupChoice::Agent,
+                UsageGroupBy::Agent,
+                crate::render::UsageGrouping::Agent,
+            ),
+            (
+                GroupChoice::Session,
+                UsageGroupBy::Session,
+                crate::render::UsageGrouping::Session,
+            ),
+            (
+                GroupChoice::Tree,
+                UsageGroupBy::TreePath,
+                crate::render::UsageGrouping::Tree,
+            ),
+            (
+                GroupChoice::Account,
+                UsageGroupBy::ProviderAccount,
+                crate::render::UsageGrouping::Account,
+            ),
+            (
+                GroupChoice::Model,
+                UsageGroupBy::Model,
+                crate::render::UsageGrouping::Model,
+            ),
+        ];
+        for (choice, wire, rendering) in cases {
+            assert_eq!(group_by_for(choice), wire, "wire mapping for {choice:?}");
+            assert_eq!(
+                rendering_for(choice),
+                rendering,
+                "render mapping for {choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_defaults_to_accounts_and_carries_its_filters() {
+        use super::GroupChoice;
+
+        let bare = Cli::try_parse_from(["horde", "usage"]).expect("bare usage parses");
+        match bare.command {
+            Some(Command::Usage(args)) => {
+                assert_eq!(
+                    args.by,
+                    GroupChoice::Account,
+                    "accounts are the default view"
+                );
+                assert!(args.sessions.is_empty(), "default is every session");
+                assert_eq!(args.subtree, None);
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+
+        let scoped = Cli::try_parse_from([
+            "horde",
+            "usage",
+            "--by",
+            "tree",
+            "--session",
+            "s1",
+            "--session",
+            "s2",
+            "--subtree",
+            "agent-9",
+        ])
+        .expect("a scoped usage parses");
+        match scoped.command {
+            Some(Command::Usage(args)) => {
+                assert_eq!(args.by, GroupChoice::Tree);
+                assert_eq!(args.sessions, vec!["s1".to_owned(), "s2".to_owned()]);
+                assert_eq!(args.subtree.as_deref(), Some("agent-9"));
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["horde", "usage", "--by", "bogus"]).is_err(),
+            "an unknown grouping is a parse error, not a guess"
+        );
     }
 
     #[test]

@@ -94,6 +94,41 @@ message UsageRecord {
   string turn_id = 4;
 }
 
+// One Provider Account's standing, as a usage query reports it: the measured
+// facts beside the arithmetic derived from them, never blended. `window` and
+// `tokens` are measured — journaled rate-limit state and summed usage records.
+// `remaining_fraction` and `exhausted` are derived, and `basis` says from
+// what, so a reader can always tell a provider's own number from Horde's
+// arithmetic over it.
+message AccountHeadroom {
+  string provider = 1;
+
+  // Account name, as the Worker advertises it.
+  string account = 2;
+
+  // Measured: the latest rate-limit state journaled for this account, absent
+  // when no adapter has reported one.
+  RateWindow window = 3;
+
+  // Derived: fraction of the window remaining, 0.0–1.0. Absent when the
+  // window carries nothing it can be derived from (serving-state-only
+  // windows, or no window at all) — absent is "unknown", never zero.
+  optional double remaining_fraction = 4;
+
+  // Derived: nothing is left before the limit, and the window's own reset has
+  // not passed at query time. The scheduler names exhausted accounts in queue
+  // reasons; this is the same predicate, surfaced to clients.
+  bool exhausted = 5;
+
+  // Measured: this account's tokens summed from the journaled usage records
+  // the query covered.
+  TokenUsage tokens = 6;
+
+  // Where the derived numbers came from, in words: "derived from
+  // provider-reported counts", "no rate window journaled", ...
+  string basis = 7;
+}
+
 enum UsageGroupBy {
   USAGE_GROUP_BY_UNSPECIFIED = 0;
   USAGE_GROUP_BY_AGENT = 1;

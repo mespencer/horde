@@ -17,6 +17,7 @@ import "horde/v1/agent.proto";
 import "horde/v1/event.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
+import "horde/v1/mcp.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/worker.proto";
 import "horde/v1/workspace.proto";
@@ -103,6 +104,18 @@ message SpawnAgentCommand {
   // Prompt Overlay text to apply at spawn. Differs for top-level versus
   // spawned Agents; resolution happens Server-side, application Worker-side.
   string prompt_overlay = 7;
+
+  // `local`-flagged MCP servers this Agent's endpoint runs Worker-side, one
+  // instance per Agent (ADR-0004). Full configs, like
+  // MaterializeWorkspaceCommand carries the full definition: the Worker must
+  // be able to spawn them without a round trip. The per-agent-type allowlist
+  // is already applied Server-side; everything listed here is for this Agent.
+  repeated McpServerConfig local_mcp_servers = 8;
+
+  // Hub servers (Server-hosted) whose proxied tools this Agent may see, by
+  // name. Resolved Server-side from the catalog and the Agent's type; the
+  // endpoint filters its hub toolset to exactly these prefixes.
+  repeated string visible_hub_mcp_servers = 9;
 }
 
 message DeliverMessageCommand {

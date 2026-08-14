@@ -155,14 +155,22 @@ impl EndpointConfig {
 /// harness — a config with port 0 is resolved by the OS, and guessing at it
 /// afterwards is how two agents end up pointed at one endpoint.
 ///
+/// Generic over the handler because two surfaces ride this machinery: the
+/// per-Agent endpoint ([`crate::endpoint::HordeEndpoint`]) and the hub's own
+/// server ([`crate::hub::HubEndpoint`]). Both get the same dual-era
+/// transport, the same identity gate, and the same TLS door.
+///
 /// # Errors
 ///
 /// The bind failing, which is almost always the port already being held.
-pub async fn serve(
+pub async fn serve<H>(
     config: &EndpointConfig,
     registry: std::sync::Arc<AgentRegistry>,
-    endpoint: crate::endpoint::HordeEndpoint,
-) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    endpoint: H,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>
+where
+    H: rmcp::ServerHandler + Clone + Sync,
+{
     use rmcp::transport::streamable_http_server::{
         StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -219,9 +227,10 @@ pub async fn serve(
 }
 
 /// One HTTP/1.1 connection over whichever transport the endpoint accepted.
-async fn serve_connection<IO>(io: IO, service: RequireIdentity<RmcpService>)
+async fn serve_connection<IO, H>(io: IO, service: RequireIdentity<RmcpService<H>>)
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    H: rmcp::ServerHandler + Clone + Sync,
 {
     let _ = hyper::server::conn::http1::Builder::new()
         .serve_connection(
@@ -235,8 +244,8 @@ where
 
 /// The concrete rmcp service the gate wraps, named so the connection helper
 /// can be a function rather than a second copy of its body per transport.
-type RmcpService = rmcp::transport::streamable_http_server::StreamableHttpService<
-    crate::endpoint::HordeEndpoint,
+type RmcpService<H> = rmcp::transport::streamable_http_server::StreamableHttpService<
+    H,
     rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
 >;
 
