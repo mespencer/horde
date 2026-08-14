@@ -562,6 +562,77 @@ mod tests {
         );
     }
 
+    /// The tonic-side configurations, held to what they claim without a
+    /// cross-crate handshake (the gate runs this package's own tests): a
+    /// server config stripped of its identity cannot even become an
+    /// acceptor, and the client config's fields are inspectable.
+    #[test]
+    fn the_grpc_configs_actually_carry_their_material() {
+        let harness = harness();
+
+        // Both server shapes hold an identity: tonic refuses to build an
+        // acceptor from a config without one, which is exactly what a
+        // defaulted config would be.
+        for config in [
+            super::grpc_server_tls(&harness.credential),
+            super::grpc_server_mtls(&harness.credential, harness.ca.certificate_pem()),
+        ] {
+            assert!(
+                tonic::transport::Server::builder()
+                    .tls_config(config)
+                    .is_ok(),
+                "a server config must carry the credential"
+            );
+        }
+        // Positive control, so the assertions above are known able to go
+        // red: tonic refuses an identity-less config — which is what a
+        // defaulted config would be — by panicking in its acceptor builder.
+        let refused = std::panic::catch_unwind(|| {
+            tonic::transport::Server::builder()
+                .tls_config(tonic::transport::ServerTlsConfig::new())
+                .is_err()
+        });
+        assert!(
+            !matches!(refused, Ok(false)),
+            "an identity-less config must be refused, or the assertions above prove nothing"
+        );
+
+        // The client config names the CA, the identity, and the domain.
+        let (identity, _) = enrolled(&harness, "mac-studio");
+        let debugged = format!("{:?}", super::grpc_client_mtls(&identity, "horde.example"));
+        assert!(debugged.contains("horde.example"), "{debugged}");
+        assert!(debugged.contains("identity: Some"), "{debugged}");
+        assert!(debugged.contains("certs: [Certificate"), "{debugged}");
+    }
+
+    /// The CA's subject rides the handshake as a certificate-request hint.
+    /// Advisory to rustls clients holding one certificate — so no handshake
+    /// can miss it — but a wrapper that dropped it would break any client
+    /// that picks among several.
+    #[test]
+    fn the_revocation_aware_verifier_still_hints_its_roots() {
+        use rustls::server::danger::ClientCertVerifier;
+
+        let harness = harness();
+        let inner = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            super::ca_roots(harness.ca.certificate_pem()).expect("roots"),
+            super::provider(),
+        )
+        .build()
+        .expect("the inner verifier builds");
+        let verifier = super::RevocationAwareVerifier {
+            inner,
+            deny: RevocationList::new(),
+            provider: super::provider(),
+        };
+
+        assert_eq!(
+            verifier.root_hint_subjects().len(),
+            1,
+            "exactly the CA's subject"
+        );
+    }
+
     #[tokio::test]
     async fn the_pinned_verifier_admits_exactly_the_pinned_certificate() {
         let harness = harness();

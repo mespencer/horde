@@ -343,6 +343,18 @@ mod tests {
         }
     }
 
+    /// Wire durations to milliseconds, exactly — a mint ttl misread here
+    /// mints codes with the wrong lifetime.
+    #[test]
+    fn durations_read_as_the_milliseconds_they_are() {
+        let of = |seconds, nanos| super::duration_to_ms(&prost_types::Duration { seconds, nanos });
+        assert_eq!(of(0, 0), 0);
+        assert_eq!(of(300, 0), 300_000, "five minutes");
+        assert_eq!(of(1, 500_000_000), 1_500, "nanos contribute their millis");
+        assert_eq!(of(0, 999_999), 0, "sub-millisecond nanos truncate");
+        assert_eq!(of(i64::MAX, 0), i64::MAX, "saturates rather than wraps");
+    }
+
     #[test]
     fn a_minted_code_redeems_exactly_once_within_its_lifetime() {
         let roster = EnrollmentRoster::project(&[stored(

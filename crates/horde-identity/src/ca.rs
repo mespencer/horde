@@ -453,6 +453,59 @@ mod tests {
         assert!(CertificateAuthority::load(directory.path()).is_err());
     }
 
+    /// A half-persisted CA — the state a crashed first start leaves — is no
+    /// CA. Either file alone must not count.
+    #[test]
+    fn a_certificate_without_its_key_is_not_a_ca_and_vice_versa() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        authority().persist(directory.path()).expect("persists");
+
+        std::fs::remove_file(directory.path().join("ca.key")).expect("removes the key");
+        assert!(
+            !CertificateAuthority::exists(directory.path()),
+            "keyless is not a CA"
+        );
+
+        authority()
+            .persist(directory.path())
+            .expect("persists again");
+        std::fs::remove_file(directory.path().join("ca.pem")).expect("removes the cert");
+        assert!(
+            !CertificateAuthority::exists(directory.path()),
+            "certless is not a CA"
+        );
+    }
+
+    /// The lifetimes as literal milliseconds. The constants are policy
+    /// (flagged as DESIGN §3 gap decisions), and a policy asserted only
+    /// through its own symbols would survive any rewrite of itself.
+    #[test]
+    fn the_validity_policy_is_exactly_what_the_wave_report_says() {
+        assert_eq!(super::CA_VALIDITY_MS, 630_720_000_000, "twenty years");
+        assert_eq!(super::SERVER_VALIDITY_MS, 63_072_000_000, "two years");
+        assert_eq!(super::PRINCIPAL_VALIDITY_MS, 31_536_000_000, "one year");
+        assert_eq!(super::BACKDATE_MS, 300_000, "five minutes of skew");
+    }
+
+    /// Neither identity-bearing type may leak its key through logs; both
+    /// must still say what they are.
+    #[test]
+    fn debug_output_names_the_types_and_never_the_keys() {
+        let ca = authority();
+        let debugged = format!("{ca:?}");
+        assert!(debugged.contains("CertificateAuthority"), "{debugged}");
+        assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
+
+        let credential = ca.issue_localhost_server(NOW_MS).expect("issues");
+        let debugged = format!("{credential:?}");
+        assert!(debugged.contains("ServerCredential"), "{debugged}");
+        assert!(
+            debugged.contains("BEGIN CERTIFICATE"),
+            "the public half shows: {debugged}"
+        );
+        assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_persisted_key_is_owner_only() {

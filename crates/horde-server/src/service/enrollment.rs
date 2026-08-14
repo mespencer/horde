@@ -352,6 +352,26 @@ mod tests {
 
     use super::MintedCode;
 
+    /// The authority's Debug reaches logs; it must name itself and hold
+    /// everything secret back (it holds the CA's signing key).
+    #[tokio::test]
+    async fn the_authority_debug_names_itself_and_no_material() {
+        let now = super::wall_clock_ms();
+        let ca = horde_identity::CertificateAuthority::generate(now).expect("a CA generates");
+        let credential = ca.issue_localhost_server(now).expect("issues");
+        let authority = super::EnrollmentAuthority::new(
+            crate::EventLog::in_memory().expect("a log"),
+            ca,
+            credential,
+        )
+        .await
+        .expect("the authority builds");
+
+        let debugged = format!("{authority:?}");
+        assert!(debugged.contains("EnrollmentAuthority"), "{debugged}");
+        assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
+    }
+
     #[test]
     fn the_join_code_is_secret_dot_fingerprint() {
         let minted = MintedCode {

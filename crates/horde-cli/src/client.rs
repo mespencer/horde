@@ -165,10 +165,7 @@ impl Client {
             .mint_enrollment_code(horde_proto::v1::MintEnrollmentCodeRequest {
                 role: role as i32,
                 name: name.to_owned(),
-                ttl: ttl_minutes.map(|minutes| horde_proto::prost_types::Duration {
-                    seconds: i64::from(minutes) * 60,
-                    nanos: 0,
-                }),
+                ttl: ttl_of(ttl_minutes),
             })
             .await?
             .into_inner())
@@ -534,6 +531,15 @@ impl Client {
     }
 }
 
+/// A minutes flag as the wire duration a mint carries; `None` lets the
+/// server choose.
+fn ttl_of(ttl_minutes: Option<u32>) -> Option<horde_proto::prost_types::Duration> {
+    ttl_minutes.map(|minutes| horde_proto::prost_types::Duration {
+        seconds: i64::from(minutes) * 60,
+        nanos: 0,
+    })
+}
+
 /// An endpoint string that names a scheme and an authority, as a dialable
 /// endpoint.
 ///
@@ -798,6 +804,15 @@ impl SyncOptions {
 #[cfg(test)]
 mod tests {
     use super::{ClientError, SyncOptions};
+
+    /// Minutes to wire seconds, exactly: a ttl silently divided or offset
+    /// would mint codes that die early or linger.
+    #[test]
+    fn the_mint_ttl_flag_is_minutes_of_sixty_seconds() {
+        assert_eq!(super::ttl_of(None), None, "unset lets the server choose");
+        let five = super::ttl_of(Some(5)).expect("five minutes");
+        assert_eq!((five.seconds, five.nanos), (300, 0));
+    }
 
     #[test]
     fn sync_options_default_to_a_full_scriptable_replay() {

@@ -98,6 +98,15 @@ mod tests {
         assert!(!secret_matches("not-the-secret", &hash));
     }
 
+    /// The TTL policy as literal milliseconds, for the same reason the
+    /// validity policy is pinned in `ca.rs`: a constant asserted only
+    /// through itself survives any rewrite of itself.
+    #[test]
+    fn the_ttl_policy_is_ten_minutes_defaulted_and_an_hour_at_most() {
+        assert_eq!(DEFAULT_CODE_TTL_MS, 600_000);
+        assert_eq!(MAX_CODE_TTL_MS, 3_600_000);
+    }
+
     #[test]
     fn ttl_clamping_defaults_the_unspoken_and_caps_the_greedy() {
         assert_eq!(clamp_ttl_ms(0), DEFAULT_CODE_TTL_MS, "unset means default");

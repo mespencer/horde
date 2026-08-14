@@ -380,6 +380,54 @@ async fn revocation_shuts_the_door_at_the_next_rpc_and_is_journaled() -> Setup<(
     Ok(())
 }
 
+/// The bootstrap question, answered against the live authority: `false` on a
+/// fresh server, `true` the moment a client holds a certificate — the
+/// distinction that opens and closes the printed-code door.
+#[tokio::test]
+async fn a_client_enrollment_closes_the_bootstrap_door() -> Setup<()> {
+    let harness = serve_secured().await?;
+    assert!(
+        !harness.authority.any_client_enrolled().await?,
+        "a fresh server has no client, so bootstrap must stay open"
+    );
+
+    harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    assert!(
+        !harness.authority.any_client_enrolled().await?,
+        "workers do not close the client bootstrap"
+    );
+
+    harness.enroll(PrincipalRole::Client, "laptop").await?;
+    assert!(
+        harness.authority.any_client_enrolled().await?,
+        "an enrolled client closes it"
+    );
+    Ok(())
+}
+
+/// Dropping a listener stops it. The handle's whole contract is that its
+/// lifetime is the listener's — a drop that leaked the accept task would
+/// keep serving a plane its owner believes is down.
+#[tokio::test]
+async fn dropping_the_harness_stops_its_listeners() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let endpoint = harness.main_endpoint_as(&identity)?;
+
+    // Live while held…
+    let mut client = horde_cli::Client::with_channel(endpoint.connect().await?);
+    within("the pre-drop handshake", client.hello("0.1.0")).await??;
+
+    // …dead when dropped: a fresh dial must fail outright.
+    drop(harness);
+    let refused = within("the post-drop dial to fail", endpoint.connect()).await?;
+    assert!(
+        refused.is_err(),
+        "a dropped listener must stop accepting connections"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_enrollment_stream_is_not_a_session() -> Setup<()> {
     let harness = serve_secured().await?;

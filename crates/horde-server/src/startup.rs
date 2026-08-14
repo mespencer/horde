@@ -426,6 +426,10 @@ mod tests {
                 "--enrollment-bind 7777",
             ),
             (&["--bind", "127.0.0.1:1"][..], "--serve"),
+            // Each serve-only flag alone must trip the rule by itself: the
+            // refusal is an OR over them, not a conjunction.
+            (&["--enrollment-bind", "127.0.0.1:1"][..], "--serve"),
+            (&["--state-dir", "/tmp/x"][..], "--serve"),
             (&["a.db", "b.db"][..], "b.db"),
         ] {
             let refused = parsed(arguments).expect_err("must refuse");

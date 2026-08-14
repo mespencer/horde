@@ -74,6 +74,50 @@ async fn the_harness_issues_identities_that_open_the_spines_they_are_for() -> Se
     Ok(())
 }
 
+/// `tls_trusting_ca` must actually trust the CA it was given: a defaulted
+/// config trusts nothing, so the enrollment listener's certificate would be
+/// refused before any RPC. The garbage code proves the channel worked — the
+/// refusal comes from the server, not the transport.
+#[tokio::test]
+async fn the_ca_trusting_config_reaches_the_enrollment_listener() -> Setup<()> {
+    use horde_proto::v1::enrollment_service_client::EnrollmentServiceClient;
+
+    let harness = serve_secured().await?;
+    let channel = tonic::transport::Endpoint::from_shared(harness.enrollment_endpoint())?
+        .tls_config(horde_server_testkit::secure::tls_trusting_ca(
+            harness.authority.ca_pem(),
+        ))?
+        .connect()
+        .await?;
+
+    let refused = within(
+        "the server's own refusal",
+        EnrollmentServiceClient::new(channel).join(horde_proto::v1::JoinRequest {
+            enrollment_code: "not-a-code".to_owned(),
+            csr_pem: String::new(),
+            hello: Some(hello(PrincipalRole::Worker, "probe")),
+            name: String::new(),
+        }),
+    )
+    .await?
+    .expect_err("a garbage code is refused by the server");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unauthenticated,
+        "the refusal must be the server's verdict, proving TLS carried the call"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_harness_debug_names_its_listeners() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let debugged = format!("{harness:?}");
+    assert!(debugged.contains("SecureHarness"), "{debugged}");
+    assert!(debugged.contains("main"), "{debugged}");
+    Ok(())
+}
+
 #[test]
 fn the_hello_helper_speaks_the_role_it_was_asked_for() {
     let worker = hello(PrincipalRole::Worker, "mac-studio");

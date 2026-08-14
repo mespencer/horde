@@ -127,14 +127,14 @@ impl EndpointConfig {
         // Off by default, and the default fails *open*. See the field docs.
         config.allowed_origins = self.allowed_origins.clone();
 
-        // The `Host` default (`localhost`, `127.0.0.1`, `::1` — rmcp's
-        // empty-list special case) is already correct for loopback serving;
-        // the spike measured a forged `Host` refused `403`, so it is left
-        // alone. When this endpoint is dialed by other names,
-        // `with_allowed_hosts` *replaces* the list rather than extending it,
-        // so the loopback names are restated alongside the extras — dropping
-        // them would break every local harness the moment the endpoint also
-        // served the network.
+        // The `Host` default (rmcp's literal `localhost`, `127.0.0.1`,
+        // `::1` list) is already correct for loopback serving; the spike
+        // measured a forged `Host` refused `403`, so it is left alone. When
+        // this endpoint is dialed by other names, `with_allowed_hosts`
+        // *replaces* the list rather than extending it, so the loopback
+        // names are restated alongside the extras — dropping them would
+        // break every local harness the moment the endpoint also served the
+        // network.
         if !self.extra_hosts.is_empty() {
             let mut hosts = vec![
                 "localhost".to_owned(),
@@ -489,6 +489,28 @@ mod tests {
             "an empty allowed_origins DISABLES origin checking rather than \
              denying everything — the default fails open"
         );
+
+        assert_eq!(
+            transport.allowed_hosts,
+            vec!["localhost", "127.0.0.1", "::1"],
+            "loopback serving keeps exactly rmcp's loopback defaults"
+        );
+    }
+
+    /// Extra hosts extend the loopback names rather than replacing them —
+    /// `with_allowed_hosts` replaces, so getting this wrong breaks either
+    /// the local harnesses or the remote peers.
+    #[test]
+    fn extra_hosts_join_the_loopback_names() {
+        let mut config = EndpointConfig::loopback(8931);
+        config.extra_hosts = vec!["horde.example".to_owned()];
+        let hosts = config.transport().allowed_hosts;
+        for needed in ["localhost", "127.0.0.1", "::1", "horde.example"] {
+            assert!(
+                hosts.contains(&needed.to_owned()),
+                "{needed} missing: {hosts:?}"
+            );
+        }
     }
 
     /// `serve` stands the endpoint up behind the identity gate. The property
@@ -543,6 +565,23 @@ mod tests {
             http::StatusCode::UNAUTHORIZED,
             "an unidentified request must be refused before it reaches rmcp"
         );
+    }
+
+    /// The TLS half's Debug reaches logs; it must say what it is and hold
+    /// the key back (the credential's own Debug already withholds it, and
+    /// this pins that the wrapper keeps doing so).
+    #[test]
+    fn mutual_tls_debug_names_itself_and_never_the_key() {
+        let now = horde_identity::clock::unix_now_ms();
+        let ca = horde_identity::CertificateAuthority::generate(now).expect("a CA generates");
+        let tls = super::MutualTls {
+            credential: ca.issue_localhost_server(now).expect("issues"),
+            ca_pem: ca.certificate_pem().to_owned(),
+            deny: horde_identity::RevocationList::new(),
+        };
+        let debugged = format!("{tls:?}");
+        assert!(debugged.contains("MutualTls"), "{debugged}");
+        assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
     }
 
     #[test]

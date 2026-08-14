@@ -121,10 +121,13 @@ async fn serve_prints_the_operator_interface_and_stays_up() -> Setup<()> {
         "the code embeds the fingerprint the joiner pins: {seen:?}"
     );
 
-    // Still serving, not exited: printing the interface must not be the end.
+    // Still serving, not exited: printing the interface must not be the
+    // end. A ceilinged wait on the exit that must NOT come — a server that
+    // returns from its shutdown wait early exits here and fails loudly.
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
     assert!(
-        child.try_wait()?.is_none(),
-        "the server must keep serving after printing its interface"
+        exited.is_err(),
+        "the server must keep serving after printing its interface; it exited: {exited:?}"
     );
     child.kill().await?;
     Ok(())
