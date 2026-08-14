@@ -8,14 +8,16 @@
 //! hard — pack negotiation, gzipped request bodies, protocol v2 — stays
 //! git's problem, which is the point of using the tool the ruling names.
 //!
-//! # What is deliberately not here
+//! # Authentication
 //!
-//! Authentication. The Relay rides the Server's channel (mTLS at the end
-//! state, localhost in the bootstrap), so this listener must be bound
-//! accordingly by whoever starts it; `REMOTE_USER` is where the
-//! authenticated principal will land once enrollment (wave 5) supplies one.
-//! Bodies are buffered whole rather than streamed — honest for the repos
-//! Horde relays today, and a contained upgrade when it stops being.
+//! The Relay rides the Server's channel (DESIGN §8). [`RelayServer::bind`]
+//! is the bootstrap plaintext listener and stays loopback-only;
+//! [`RelayServer::bind_mtls`] is the wave-5 door — the peer presents a
+//! certificate from the Server's CA, revoked serials are refused at the
+//! handshake, and the certificate's principal lands in `REMOTE_USER`, the
+//! seam W4b left ready. Bodies are buffered whole rather than streamed —
+//! honest for the repos Horde relays today, and a contained upgrade when it
+//! stops being.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -218,6 +220,24 @@ impl BridgeError {
     }
 }
 
+/// The transport-level facts about one request, as CGI wants them.
+///
+/// A struct rather than six more parameters: every field rides together from
+/// the connection into [`cgi_environment`], and six positionals of mostly
+/// `Option<&str>` are indistinguishable at a call site.
+#[derive(Debug, Clone, Copy)]
+pub struct ExchangeContext<'a> {
+    pub content_type: Option<&'a str>,
+    pub content_encoding: Option<&'a str>,
+    pub git_protocol: Option<&'a str>,
+    pub content_length: usize,
+    pub peer: SocketAddr,
+    /// The authenticated principal (W4b's seam, filled by wave 5): the mTLS
+    /// door maps the peer certificate's principal into `REMOTE_USER`; the
+    /// bootstrap plaintext listener still says `horde`.
+    pub remote_user: &'a str,
+}
+
 /// The CGI environment for one routed request.
 ///
 /// A pure builder so the variables — each one load-bearing for
@@ -226,11 +246,7 @@ impl BridgeError {
 pub fn cgi_environment(
     route: &RelayRoute,
     project_root: &Path,
-    content_type: Option<&str>,
-    content_encoding: Option<&str>,
-    git_protocol: Option<&str>,
-    content_length: usize,
-    peer: SocketAddr,
+    context: &ExchangeContext<'_>,
 ) -> Vec<(String, String)> {
     let dir = MirrorStore::dir_name(route.repo());
     let mut env = vec![
@@ -244,8 +260,8 @@ pub fn cgi_environment(
         // Where the authenticated principal lands. Present unconditionally
         // because http-backend enables receive-pack for authenticated users,
         // and the Relay's authentication lives on the channel, not in HTTP.
-        ("REMOTE_USER".to_owned(), "horde".to_owned()),
-        ("REMOTE_ADDR".to_owned(), peer.ip().to_string()),
+        ("REMOTE_USER".to_owned(), context.remote_user.to_owned()),
+        ("REMOTE_ADDR".to_owned(), context.peer.ip().to_string()),
     ];
     match route {
         RelayRoute::Advertise { service, .. } => {
@@ -263,18 +279,21 @@ pub fn cgi_environment(
                 format!("/{dir}/{}", service.wire_name()),
             ));
             env.push(("QUERY_STRING".to_owned(), String::new()));
-            env.push(("CONTENT_LENGTH".to_owned(), content_length.to_string()));
+            env.push((
+                "CONTENT_LENGTH".to_owned(),
+                context.content_length.to_string(),
+            ));
         }
     }
-    if let Some(content_type) = content_type {
+    if let Some(content_type) = context.content_type {
         env.push(("CONTENT_TYPE".to_owned(), content_type.to_owned()));
     }
-    if let Some(encoding) = content_encoding {
+    if let Some(encoding) = context.content_encoding {
         // http-backend inflates gzipped request bodies itself, but only if
         // told they are gzipped.
         env.push(("HTTP_CONTENT_ENCODING".to_owned(), encoding.to_owned()));
     }
-    if let Some(protocol) = git_protocol {
+    if let Some(protocol) = context.git_protocol {
         // The `Git-Protocol` header is how a client asks for protocol v2;
         // http-backend reads it from this variable.
         env.push(("HTTP_GIT_PROTOCOL".to_owned(), protocol.to_owned()));
@@ -301,6 +320,7 @@ impl Relay {
         &self,
         request: Request<Incoming>,
         peer: SocketAddr,
+        remote_user: &str,
     ) -> Response<Full<Bytes>> {
         let (parts, body) = request.into_parts();
         let Some(route) = parse_route(&parts.method, parts.uri.path(), parts.uri.query()) else {
@@ -323,17 +343,19 @@ impl Relay {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
         };
-        match self
-            .exchange(
-                &route,
-                header("content-type").as_deref(),
-                header("content-encoding").as_deref(),
-                header("git-protocol").as_deref(),
-                body.to_bytes(),
-                peer,
-            )
-            .await
-        {
+        let content_type = header("content-type");
+        let content_encoding = header("content-encoding");
+        let git_protocol = header("git-protocol");
+        let body = body.to_bytes();
+        let context = ExchangeContext {
+            content_type: content_type.as_deref(),
+            content_encoding: content_encoding.as_deref(),
+            git_protocol: git_protocol.as_deref(),
+            content_length: body.len(),
+            peer,
+            remote_user,
+        };
+        match self.exchange(&route, &context, body).await {
             Ok(cgi) => cgi_to_http(cgi),
             Err(error) => error.into_response(),
         }
@@ -343,24 +365,13 @@ impl Relay {
     async fn exchange(
         &self,
         route: &RelayRoute,
-        content_type: Option<&str>,
-        content_encoding: Option<&str>,
-        git_protocol: Option<&str>,
+        context: &ExchangeContext<'_>,
         body: Bytes,
-        peer: SocketAddr,
     ) -> Result<CgiResponse, BridgeError> {
         // Lazy mirroring happens here: the first request for a registered
         // repo is what clones it.
         self.store.ensure(route.repo()).await?;
-        let env = cgi_environment(
-            route,
-            self.store.root(),
-            content_type,
-            content_encoding,
-            git_protocol,
-            body.len(),
-            peer,
-        );
+        let env = cgi_environment(route, self.store.root(), context);
         run_http_backend(&env, &body).await
     }
 }
@@ -451,6 +462,32 @@ impl RelayServer {
         Ok(Self { addr, task })
     }
 
+    /// Binds `addr` and serves `store` over mTLS until dropped (DESIGN §3).
+    ///
+    /// Every connection must present a certificate chaining to the CA;
+    /// revoked serials are refused at the handshake (this channel has no
+    /// per-request interceptor); and the certificate's principal becomes
+    /// `REMOTE_USER` for `git http-backend` — the credential seam W4b left.
+    ///
+    /// # Errors
+    ///
+    /// The bind failure, or unusable TLS material, as `io::Error` verbatim.
+    pub async fn bind_mtls(
+        addr: SocketAddr,
+        store: Arc<MirrorStore>,
+        credential: &horde_identity::ServerCredential,
+        ca_pem: &str,
+        deny: horde_identity::RevocationList,
+    ) -> std::io::Result<Self> {
+        let acceptor = horde_identity::tls::mtls_acceptor(credential, ca_pem, deny)
+            .map_err(std::io::Error::other)?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        let relay = Relay::new(store);
+        let task = tokio::spawn(accept_mtls_loop(listener, acceptor, relay));
+        Ok(Self { addr, task })
+    }
+
     /// Where the Relay is listening.
     #[must_use]
     pub fn addr(&self) -> SocketAddr {
@@ -485,12 +522,57 @@ async fn accept_loop(listener: tokio::net::TcpListener, relay: Relay) {
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let relay = relay.clone();
-                async move { Ok::<_, Infallible>(relay.respond(request, peer).await) }
+                async move {
+                    // The plaintext bootstrap listener has no principal to
+                    // map; `horde` is its one ambient user (DESIGN §8).
+                    Ok::<_, Infallible>(relay.respond(request, peer, "horde").await)
+                }
             });
             // A connection-level error is the client hanging up; the
             // request-level answer already happened or never will.
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
+/// Accepts mTLS connections until the listener errors.
+///
+/// A failed *handshake* only ends that connection — an unenrolled prober
+/// must not be able to stop the Relay — while a failed accept ends the loop
+/// for the same reasons as [`accept_loop`].
+async fn accept_mtls_loop(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    relay: Relay,
+) {
+    loop {
+        let Ok((stream, peer)) = listener.accept().await else {
+            return;
+        };
+        let acceptor = acceptor.clone();
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            // The refused-connection outcome: no certificate, a foreign CA,
+            // or a revoked serial dies here, before any route is parsed.
+            let Ok(tls) = acceptor.accept(stream).await else {
+                return;
+            };
+            let principal = match horde_identity::tls::peer_of_stream(&tls) {
+                Ok(identity) => identity.principal.to_string(),
+                // The acceptor requires a client certificate, so this is
+                // unreachable in practice; refusing the connection is still
+                // righter than inventing a principal.
+                Err(_) => return,
+            };
+            let service = service_fn(move |request| {
+                let relay = relay.clone();
+                let principal = principal.clone();
+                async move { Ok::<_, Infallible>(relay.respond(request, peer, &principal).await) }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(tls), service)
                 .await;
         });
     }
@@ -710,11 +792,14 @@ mod tests {
                 service: GitService::UploadPack,
             },
             std::path::Path::new("/relay"),
-            None,
-            None,
-            Some("version=2"),
-            0,
-            peer,
+            &super::ExchangeContext {
+                content_type: None,
+                content_encoding: None,
+                git_protocol: Some("version=2"),
+                content_length: 0,
+                peer,
+                remote_user: "horde",
+            },
         );
         assert_eq!(env_value(&advertise, "GIT_PROJECT_ROOT"), Some("/relay"));
         assert_eq!(env_value(&advertise, "GIT_HTTP_EXPORT_ALL"), Some("1"));
@@ -745,11 +830,14 @@ mod tests {
                 service: GitService::ReceivePack,
             },
             std::path::Path::new("/relay"),
-            Some("application/x-git-receive-pack-request"),
-            Some("gzip"),
-            None,
-            17,
-            peer,
+            &super::ExchangeContext {
+                content_type: Some("application/x-git-receive-pack-request"),
+                content_encoding: Some("gzip"),
+                git_protocol: None,
+                content_length: 17,
+                peer,
+                remote_user: "worker:mac-studio",
+            },
         );
         assert_eq!(env_value(&exchange, "REQUEST_METHOD"), Some("POST"));
         assert_eq!(
@@ -758,6 +846,11 @@ mod tests {
         );
         assert_eq!(env_value(&exchange, "QUERY_STRING"), Some(""));
         assert_eq!(env_value(&exchange, "CONTENT_LENGTH"), Some("17"));
+        assert_eq!(
+            env_value(&exchange, "REMOTE_USER"),
+            Some("worker:mac-studio"),
+            "the authenticated principal, not a constant, lands in REMOTE_USER"
+        );
         assert_eq!(
             env_value(&exchange, "CONTENT_TYPE"),
             Some("application/x-git-receive-pack-request")

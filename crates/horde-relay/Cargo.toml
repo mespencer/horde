@@ -11,13 +11,20 @@ workspace = true
 
 [dependencies]
 bytes = "1"
+# The mTLS door (DESIGN §3): acceptor, revocation-aware verifier, and the
+# principal extraction that feeds REMOTE_USER all have one owner.
+horde-identity = { workspace = true }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 thiserror = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync"] }
 
 [dev-dependencies]
+# The TLS suite is its own smart-HTTP client over rustls.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

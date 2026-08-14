@@ -18,6 +18,7 @@ package horde.v1;
 
 import "google/protobuf/timestamp.proto";
 import "horde/v1/agent.proto";
+import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/usage.proto";
@@ -156,6 +157,50 @@ message WorkspacePrewarmRequested {
   WorkerId worker_id = 2;
 }
 
+// An enrollment code was minted (DESIGN §3). Records the SHA-256 of the
+// code's one-time secret — never the secret itself, because attached clients
+// replay the log and a readable secret is a mintable identity — along with
+// the principal the code will create and when it stops working. Enrollment
+// events live in a reserved stream, like the Workspace Definition catalog.
+message EnrollmentCodeMinted {
+  // Whether the code enrolls a Worker or a Client.
+  Role role = 1;
+
+  // The principal name the code will enroll, fixed at mint time.
+  string name = 2;
+
+  // SHA-256 of the one-time secret, lowercase hex.
+  string code_hash = 3;
+
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// A machine redeemed a code and was issued its identity. The record of who
+// is enrolled; the serial is what revocation keys on.
+message IdentityEnrolled {
+  Role role = 1;
+
+  string name = 2;
+
+  // Serial of the issued certificate, lowercase hex.
+  string certificate_serial = 3;
+
+  // The hash of the code that was redeemed, which this event spends.
+  string code_hash = 4;
+}
+
+// A principal's certificate was revoked: its serial joins the per-serial
+// deny-list every channel door checks (DESIGN §3).
+message EnrollmentRevoked {
+  Role role = 1;
+
+  string name = 2;
+
+  string certificate_serial = 3;
+
+  string reason = 4;
+}
+
 // A turn in flight was cancelled. Distinct from a queued message, which is a
 // delivery mode on AssignmentSent or NoteSent.
 message TurnInterrupted {
@@ -201,6 +246,9 @@ message Event {
     TurnInterrupted turn_interrupted = 22;
     WorkspaceDefinitionChanged workspace_definition_changed = 23;
     WorkspacePrewarmRequested workspace_prewarm_requested = 24;
+    EnrollmentCodeMinted enrollment_code_minted = 25;
+    IdentityEnrolled identity_enrolled = 26;
+    EnrollmentRevoked enrollment_revoked = 27;
   }
 }
 

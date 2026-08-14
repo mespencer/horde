@@ -12,6 +12,9 @@ workspace = true
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 horde-adapter = { path = "../horde-adapter" }
+# Enrollment is a client verb (DESIGN §3: "horde worker enroll", and clients
+# enroll identically), and the mTLS channel config is the identity crate's.
+horde-identity = { workspace = true }
 horde-proto = { workspace = true }
 # The single owner of the domain↔wire correspondence. A narrowing arrives here
 # as JSON and has to reach the wire as a `Struct`, and that conversion has real
@@ -28,10 +31,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.19"
-tonic = { version = "0.14.6", features = ["channel"] }
+tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 
 [dev-dependencies]
 horde-server-testkit = { workspace = true }
+# The secured suite asserts effects on the server the harness stands up, and
+# stores joined identities in throwaway directories.
+horde-server = { workspace = true }
+tempfile = { workspace = true }
 # Only the PTY suite in tests/tui.rs: the interactive shell around the event
 # loop needs a real terminal to be tested honestly, and a pty is the only
 # terminal a test can own.

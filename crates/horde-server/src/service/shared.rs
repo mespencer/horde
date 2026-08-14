@@ -305,6 +305,9 @@ mod tests {
             Kind::TurnInterrupted(TurnInterrupted::default()),
             Kind::WorkspaceDefinitionChanged(WorkspaceDefinitionChanged::default()),
             Kind::WorkspacePrewarmRequested(WorkspacePrewarmRequested::default()),
+            Kind::EnrollmentCodeMinted(EnrollmentCodeMinted::default()),
+            Kind::IdentityEnrolled(IdentityEnrolled::default()),
+            Kind::EnrollmentRevoked(EnrollmentRevoked::default()),
         ];
 
         let mut seen = std::collections::BTreeSet::new();
