@@ -116,6 +116,8 @@ impl Upstream {
             StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
         };
 
+        ensure_crypto_provider();
+
         let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
         config.auth_header = token.map(str::to_owned);
         for (name, value) in headers {
@@ -199,6 +201,21 @@ impl Upstream {
                 message: e.to_string(),
             })
     }
+}
+
+/// Installs the workspace's crypto provider as the process default, once.
+///
+/// reqwest is built with `rustls-no-provider` — the workspace is
+/// rustls-on-ring and its root manifest forbids a second provider — and a
+/// no-provider reqwest panics building its first `Client` unless a process
+/// default exists. Losing the install race (another component installed one
+/// first) is fine: any installed provider unblocks the client, and the
+/// workspace's feature policy guarantees whichever won is ring.
+fn ensure_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// A connect-stage failure, with the upstream's own words kept.

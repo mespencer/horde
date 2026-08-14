@@ -262,8 +262,7 @@ async fn a_local_servers_tool_rides_the_same_endpoint_and_the_same_chain() {
     )
     .await
     .expect("the deterministic allow must let it through");
-    // The child fixture echoes verbatim (the in-memory stub prefixes).
-    assert_eq!(answer, "locally");
+    assert_eq!(answer, "echo:locally");
 
     assert!(
         chain_saw(&stack, "browser__echo")

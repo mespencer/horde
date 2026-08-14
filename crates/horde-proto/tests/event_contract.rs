@@ -9,14 +9,13 @@ use horde_proto::prost_types::{DescriptorProto, FileDescriptorSet};
 use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
     AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, EnrollmentCodeMinted,
-    EnrollmentRevoked, Event, EventEnvelope, IdentityEnrolled, McpServerConfig,
-    McpServerConfigChanged, McpStdioTransport, Note, NoteSent, Payload, PermissionDecided,
-    PermissionDecision, PermissionRequest, PermissionRequested, Placement, PlacementChanged,
-    PlacementState, ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged,
-    SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded, WorkerId,
-    WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
-    WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
-    mcp_server_config,
+    EnrollmentRevoked, Event, EventEnvelope, IdentityEnrolled, McpHttpTransport, McpServerConfig,
+    McpServerConfigChanged, Note, NoteSent, Payload, PermissionDecided, PermissionDecision,
+    PermissionRequest, PermissionRequested, Placement, PlacementChanged, PlacementState,
+    ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged, SessionLifecycleState,
+    TurnInterrupted, UsageRecord, UsageRecorded, WorkerId, WorkspaceDefinition,
+    WorkspaceDefinitionChanged, WorkspaceDefinitionId, WorkspaceInstanceChanged,
+    WorkspaceInstanceReport, WorkspacePrewarmRequested, event, mcp_server_config,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:
@@ -201,15 +200,12 @@ fn every_kind() -> Vec<event::Kind> {
         }),
         event::Kind::McpServerConfigChanged(McpServerConfigChanged {
             config: Some(McpServerConfig {
-                name: "linear".to_owned(),
-                transport: Some(mcp_server_config::Transport::Stdio(McpStdioTransport {
-                    command: "linear-mcp".to_owned(),
-                    args: vec!["--stdio".to_owned()],
-                    env: std::collections::HashMap::new(),
+                name: "grafana".to_owned(),
+                transport: Some(mcp_server_config::Transport::Http(McpHttpTransport {
+                    url: "http://127.0.0.1:9931/mcp".to_owned(),
                 })),
-                local: false,
                 allowed_agent_types: vec!["reviewer".to_owned()],
-                etag: String::new(),
+                ..McpServerConfig::default()
             }),
             deleted: false,
         }),

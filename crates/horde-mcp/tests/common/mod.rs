@@ -206,65 +206,22 @@ pub fn identity_for(agent_id: &str) -> Setup<AgentIdentity> {
 /// Not a mock: this is rmcp's own `ServerHandler` machinery — the same code
 /// path a user's stdio server runs — served over an in-memory duplex, so the
 /// handshake, listing, and calls are all the real protocol with no process
-/// or socket. The child-process path is covered separately by spawning the
-/// `mcp_stub_server` fixture binary.
-pub mod stub_mcp {
-    use rmcp::handler::server::tool::ToolRouter;
-    use rmcp::handler::server::wrapper::Parameters;
-    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerInfo};
-    use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+/// or socket. The toolset is the `mcp_stub_server` fixture's own, included
+/// by `#[path]` so the child-process path (which spawns that binary) and
+/// this in-memory path can never drift apart.
+// Declared here rather than inside `stub_mcp` because `#[path]` resolves
+// from the declaring module's directory, and an inline module's directory
+// (`tests/common/stub_mcp/`) does not exist on disk — the traversal through
+// it fails before `..` can walk back out.
+#[path = "../../src/bin/mcp_stub_server/tools.rs"]
+mod stub_tools;
 
+pub mod stub_mcp {
     use super::Setup;
 
-    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-    pub struct EchoParams {
-        pub message: String,
-    }
-
-    /// Two tools: `echo` round-trips, `blocked` exists to be denied — the
-    /// test that a deny stops the call needs a tool that would answer if
-    /// reached, or the assertion is on silence.
-    #[derive(Clone)]
-    pub struct StubTools {
-        tool_router: ToolRouter<Self>,
-    }
-
-    #[tool_router]
-    impl StubTools {
-        #[must_use]
-        pub fn new() -> Self {
-            Self {
-                tool_router: Self::tool_router(),
-            }
-        }
-
-        #[tool(name = "echo", description = "Answer the message back verbatim.")]
-        async fn echo(
-            &self,
-            Parameters(params): Parameters<EchoParams>,
-        ) -> Result<String, ErrorData> {
-            Ok(format!("echo:{}", params.message))
-        }
-
-        #[tool(
-            name = "blocked",
-            description = "Answers only if permission let it through."
-        )]
-        async fn blocked(&self) -> Result<String, ErrorData> {
-            Ok("the chain failed to stop this".to_owned())
-        }
-    }
-
-    #[tool_handler]
-    impl ServerHandler for StubTools {
-        fn get_info(&self) -> ServerInfo {
-            let mut info = ServerInfo::default();
-            info.protocol_version = ProtocolVersion::LATEST;
-            info.capabilities = ServerCapabilities::builder().enable_tools().build();
-            info.server_info.name = "stub-tools".to_owned();
-            info
-        }
-    }
+    // `pub(crate)` in the file (the bin host's clippy demands it), so the
+    // re-export matches rather than widening it.
+    pub(crate) use super::stub_tools::StubTools;
 
     /// A connected [`Upstream`](horde_mcp::hub::Upstream) over a real rmcp
     /// server, in memory. The serving half is parked on its own task for the

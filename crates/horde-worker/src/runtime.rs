@@ -1349,7 +1349,6 @@ mod tests {
             command: Some(Command::SpawnAgent(SpawnAgentCommand {
                 session_id: Some(SessionId::new("s1")),
                 agent_id: Some(AgentId::new(agent)),
-                parent_agent_id: None,
                 spec: Some(horde_proto::v1::AgentSpec {
                     initial_assignment: Some(Assignment {
                         assignment_id: None,
@@ -1358,11 +1357,7 @@ mod tests {
                     }),
                     ..horde_proto::v1::AgentSpec::default()
                 }),
-                binding: None,
-                tree_path: Vec::new(),
-                prompt_overlay: String::new(),
-                local_mcp_servers: Vec::new(),
-                visible_hub_mcp_servers: Vec::new(),
+                ..SpawnAgentCommand::default()
             })),
         }
     }

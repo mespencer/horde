@@ -64,20 +64,16 @@ impl McpServerCatalog {
     /// [`ServerError::Decode`] when a stored payload is not an `Event` at all,
     /// which is log corruption rather than a bad catalog entry.
     pub fn project(events: &[StoredEvent]) -> Result<Self, ServerError> {
-        let mut catalog = Self::default();
-        for stored in events {
-            catalog.apply(stored)?;
-        }
-        Ok(catalog)
-    }
-
-    fn apply(&mut self, stored: &StoredEvent) -> Result<(), ServerError> {
-        let event = Event::decode(stored.payload.as_slice())?;
-        let Some(Kind::McpServerConfigChanged(changed)) = event.kind else {
-            return Ok(());
-        };
-        self.fold_change(stored.sequence, changed);
-        Ok(())
+        events
+            .iter()
+            .try_fold(Self::default(), |mut catalog, stored| {
+                if let Some(Kind::McpServerConfigChanged(changed)) =
+                    Event::decode(stored.payload.as_slice())?.kind
+                {
+                    catalog.fold_change(stored.sequence, changed);
+                }
+                Ok(catalog)
+            })
     }
 
     /// Folds one already-decoded catalog change.
@@ -237,16 +233,14 @@ mod tests {
     use crate::log::StoredEvent;
 
     fn stdio(name: &str) -> McpServerConfig {
+        let transport = Transport::Stdio(McpStdioTransport {
+            command: "server-bin".to_owned(),
+            ..McpStdioTransport::default()
+        });
         McpServerConfig {
             name: name.to_owned(),
-            transport: Some(Transport::Stdio(McpStdioTransport {
-                command: "server-bin".to_owned(),
-                args: vec!["--stdio".to_owned()],
-                env: std::collections::HashMap::new(),
-            })),
-            local: false,
-            allowed_agent_types: Vec::new(),
-            etag: String::new(),
+            transport: Some(transport),
+            ..McpServerConfig::default()
         }
     }
 

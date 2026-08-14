@@ -171,7 +171,6 @@ mod suite {
             Command::SpawnAgent(horde_proto::v1::SpawnAgentCommand {
                 session_id: Some(SessionId::new("s1")),
                 agent_id: Some(AgentId::new(agent)),
-                parent_agent_id: None,
                 spec: Some(horde_proto::v1::AgentSpec {
                     workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
                         "ws-1",
@@ -179,11 +178,7 @@ mod suite {
                     checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
                     ..horde_proto::v1::AgentSpec::default()
                 }),
-                binding: None,
-                tree_path: Vec::new(),
-                prompt_overlay: String::new(),
-                local_mcp_servers: Vec::new(),
-                visible_hub_mcp_servers: Vec::new(),
+                ..horde_proto::v1::SpawnAgentCommand::default()
             }),
         )
     }

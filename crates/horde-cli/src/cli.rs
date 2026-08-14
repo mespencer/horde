@@ -706,11 +706,21 @@ mod tests {
         assert_eq!(super::parse_env_pair("no-equals"), None);
     }
 
+    /// Parses one `mcp add` invocation through the real command model and
+    /// converts it — the arrangement both transport tests share.
+    fn parsed_mcp_add(argv: &[&str]) -> horde_proto::v1::McpServerConfig {
+        let cli = Cli::try_parse_from(argv).expect("valid arguments");
+        let Some(Command::Mcp(super::McpCommand::Add(args))) = &cli.command else {
+            panic!("expected mcp add, got {:?}", cli.command);
+        };
+        super::mcp_config_from(args).expect("a valid config")
+    }
+
     /// The `mcp add` flags become exactly one wire transport, with everything
     /// they said riding along.
     #[test]
     fn an_mcp_add_becomes_the_wire_config_it_described() {
-        let cli = Cli::try_parse_from([
+        let config = parsed_mcp_add(&[
             "horde",
             "mcp",
             "add",
@@ -726,13 +736,7 @@ mod tests {
             "reviewer",
             "--etag",
             "3",
-        ])
-        .expect("valid arguments");
-        let Some(Command::Mcp(super::McpCommand::Add(args))) = &cli.command else {
-            panic!("expected mcp add, got {:?}", cli.command);
-        };
-
-        let config = super::mcp_config_from(args).expect("a valid config");
+        ]);
         assert_eq!(config.name, "linear");
         assert!(config.local);
         assert_eq!(config.allowed_agent_types, vec!["reviewer".to_owned()]);
@@ -783,19 +787,14 @@ mod tests {
     /// flags conflict, so the mistake never reaches the converter).
     #[test]
     fn an_http_mcp_add_converts_and_both_transports_cannot_parse() {
-        let cli = Cli::try_parse_from([
+        let config = parsed_mcp_add(&[
             "horde",
             "mcp",
             "add",
             "grafana",
             "--url",
             "http://127.0.0.1:9931/mcp",
-        ])
-        .expect("valid arguments");
-        let Some(Command::Mcp(super::McpCommand::Add(args))) = &cli.command else {
-            panic!("expected mcp add, got {:?}", cli.command);
-        };
-        let config = super::mcp_config_from(args).expect("a valid config");
+        ]);
         assert!(matches!(
             config.transport,
             Some(horde_proto::v1::mcp_server_config::Transport::Http(_))
