@@ -38,6 +38,7 @@ horde-adapter-codex = { path = "crates/horde-adapter-codex" }
 horde-adapter-fake = { path = "crates/horde-adapter-fake" }
 horde-cli = { path = "crates/horde-cli" }
 horde-identity = { path = "crates/horde-identity" }
+horde-observe = { path = "crates/horde-observe" }
 horde-proto = { path = "crates/horde-proto" }
 horde-relay = { path = "crates/horde-relay" }
 horde-server = { path = "crates/horde-server" }

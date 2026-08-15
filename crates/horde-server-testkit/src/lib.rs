@@ -264,3 +264,32 @@ pub async fn seeded(endpoint: &str, title: &str) -> Setup<(Client, String, Strin
     let (session_id, root) = seed(&mut client, title).await?;
     Ok((client, session_id, root))
 }
+
+/// Runs a product binary with the OTLP environment under the test's control:
+/// both variables scrubbed first (nothing leaks in from the harness's own
+/// shell), then `environment` injected, and everything the process wrote
+/// captured.
+///
+/// Shared here because every binary's telemetry suite needs exactly this
+/// arrangement — `horde-server`'s and `horde`'s tests must not each restate
+/// it (the duplication gate agrees). The variable names come from
+/// `horde-observe`, the crate that reads them, so the scrub list cannot
+/// drift from the config surface it scrubs.
+///
+/// # Errors
+///
+/// The process failing to spawn or be waited on.
+pub async fn otlp_scrubbed_run(
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Setup<std::process::Output> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(arguments);
+    command.env_remove(horde_observe::ENDPOINT_VAR);
+    command.env_remove(horde_observe::SAMPLE_VAR);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    Ok(command.output().await?)
+}

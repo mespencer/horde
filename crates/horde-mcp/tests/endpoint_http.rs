@@ -14,6 +14,7 @@
 
 mod common;
 
+use common::mcp_client::McpClient;
 use common::{Setup, harness, within};
 use horde_mcp::endpoint::HordeEndpoint;
 use horde_mcp::identity::AgentRegistry;
@@ -49,132 +50,6 @@ async fn served() -> Setup<Served> {
     })
 }
 
-/// A legacy-era MCP client, one identity, one session.
-struct McpClient {
-    address: std::net::SocketAddr,
-    agent_id: String,
-    session: Option<String>,
-}
-
-impl McpClient {
-    /// Initializes against the endpoint the way a legacy harness does, and
-    /// keeps the session the server assigned.
-    async fn connect(served: &Served) -> Setup<Self> {
-        let mut client = Self {
-            address: served.address,
-            agent_id: served.horde.agent_id.clone(),
-            session: None,
-        };
-
-        let (parts, body) = client
-            .post(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 0,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {},
-                    "clientInfo": { "name": "endpoint-http-test", "version": "0.0.0" },
-                },
-            }))
-            .await?;
-        if !parts.status.is_success() {
-            return Err(format!("initialize was refused {}: {body}", parts.status).into());
-        }
-        let session = parts
-            .headers
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok())
-            .ok_or("a legacy-era initialize is assigned a session id")?
-            .to_owned();
-        client.session = Some(session);
-
-        // The notification the lifecycle requires between initialize and use.
-        let (parts, body) = client
-            .post(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            }))
-            .await?;
-        if !parts.status.is_success() {
-            return Err(format!("initialized was refused {}: {body}", parts.status).into());
-        }
-
-        Ok(client)
-    }
-
-    /// One JSON-RPC POST, answered with the response head and the raw body.
-    async fn post(&self, body: &serde_json::Value) -> Setup<(http::response::Parts, String)> {
-        let stream = tokio::net::TcpStream::connect(self.address).await?;
-        let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
-        // The connection future drives the socket; the request below resolves
-        // through it.
-        tokio::spawn(connection);
-
-        let mut request = http::Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("host", self.address.to_string())
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .header("authorization", format!("Bearer {TOKEN}"))
-            .header("x-horde-agent", self.agent_id.clone());
-        if let Some(session) = &self.session {
-            request = request.header("mcp-session-id", session.clone());
-        }
-
-        let response = sender
-            .send_request(
-                request.body(http_body_util::Full::new(hyper::body::Bytes::from(
-                    body.to_string(),
-                )))?,
-            )
-            .await?;
-        let (parts, body) = response.into_parts();
-        let bytes = http_body_util::BodyExt::collect(body).await?.to_bytes();
-        Ok((parts, String::from_utf8(bytes.to_vec())?))
-    }
-
-    /// One `tools/call`, answered with the result's text content.
-    async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> Setup<String> {
-        let (parts, text) = self
-            .post(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": name, "arguments": arguments },
-            }))
-            .await?;
-        if !parts.status.is_success() {
-            return Err(format!("the endpoint answered {}: {text}", parts.status).into());
-        }
-
-        // The session flow answers over SSE; a stateless answer is plain JSON.
-        // Same JSON-RPC message either way.
-        let payload = match text
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .next_back()
-        {
-            Some(framed) => framed.to_owned(),
-            None => text,
-        };
-        let rpc: serde_json::Value = serde_json::from_str(&payload)?;
-        if let Some(error) = rpc.get("error") {
-            return Err(format!("the call was refused: {error}").into());
-        }
-        let result = rpc.get("result").ok_or("a reply must carry a result")?;
-        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
-            return Err(format!("the tool answered an error: {result}").into());
-        }
-        result["content"][0]["text"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| "the result must carry one text content block".into())
-    }
-}
-
 /// Replays the session and returns the sequence of the first event `matches`.
 async fn find_on_log<F>(served: &Served, mut matches: F) -> Setup<Option<u64>>
 where
@@ -202,7 +77,7 @@ where
 #[tokio::test]
 async fn send_message_answers_with_the_sequence_the_note_landed_at() {
     let served = served().await.expect("the endpoint must serve");
-    let mcp = McpClient::connect(&served)
+    let mcp = McpClient::connect(served.address, &served.horde.agent_id, TOKEN)
         .await
         .expect("the legacy flow must initialize");
     let to_self = served.horde.agent_id.clone();
@@ -241,7 +116,7 @@ async fn send_message_answers_with_the_sequence_the_note_landed_at() {
 #[tokio::test]
 async fn report_result_answers_recorded_and_lands_on_the_log() {
     let served = served().await.expect("the endpoint must serve");
-    let mcp = McpClient::connect(&served)
+    let mcp = McpClient::connect(served.address, &served.horde.agent_id, TOKEN)
         .await
         .expect("the legacy flow must initialize");
 
@@ -310,7 +185,7 @@ async fn deny_first_escalation(endpoint: &str, session_id: &str) -> Setup<()> {
 #[tokio::test]
 async fn approve_answers_with_the_decision_that_was_made() {
     let served = served().await.expect("the endpoint must serve");
-    let mcp = McpClient::connect(&served)
+    let mcp = McpClient::connect(served.address, &served.horde.agent_id, TOKEN)
         .await
         .expect("the legacy flow must initialize");
 

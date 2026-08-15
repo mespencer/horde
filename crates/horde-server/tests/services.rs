@@ -1270,5 +1270,258 @@ async fn a_quiet_follow_stream_heartbeats_instead_of_going_silent() {
     panic!("a quiet follow stream must announce itself with a heartbeat");
 }
 
+// -- Usage -------------------------------------------------------------------
+
+/// One `UsageRecorded` event bound to the claude/personal account — the one
+/// shape both the per-turn record and the headroom report share.
+fn usage_recorded(
+    agent: &str,
+    idempotency_key: String,
+    tokens: Option<horde_proto::v1::TokenUsage>,
+    rate_window: Option<horde_proto::v1::RateWindow>,
+    turn_id: &str,
+) -> Event {
+    Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key,
+        kind: Some(Kind::UsageRecorded(horde_proto::v1::UsageRecorded {
+            record: Some(horde_proto::v1::UsageRecord {
+                binding: Some(horde_proto::v1::ModelBinding {
+                    tier: "standard".to_owned(),
+                    provider: "claude".to_owned(),
+                    model: "sonnet".to_owned(),
+                    provider_account: "personal".to_owned(),
+                }),
+                tokens,
+                rate_window,
+                turn_id: turn_id.to_owned(),
+            }),
+        })),
+    }
+}
+
+/// A per-turn usage record as the worker's translation journals it, keyed the
+/// way the real adapter path keys it (`agent:turn:usage`).
+fn usage_event(agent: &str, turn: &str, input_tokens: u64, output_tokens: u64) -> Event {
+    usage_recorded(
+        agent,
+        format!("{agent}:{turn}:usage"),
+        Some(horde_proto::v1::TokenUsage {
+            input_tokens,
+            output_tokens,
+            ..horde_proto::v1::TokenUsage::default()
+        }),
+        None,
+        turn,
+    )
+}
+
+/// A headroom report: rate-window only, no tokens — the shape the adapters
+/// journal when the provider reports rate-limit state between turns.
+fn headroom_event(agent: &str, used: u64, limit: u64) -> Event {
+    usage_recorded(
+        agent,
+        String::new(),
+        None,
+        Some(horde_proto::v1::RateWindow {
+            source: horde_proto::v1::HeadroomSource::ProviderReported as i32,
+            used: Some(used),
+            limit: Some(limit),
+            ..horde_proto::v1::RateWindow::default()
+        }),
+        "",
+    )
+}
+
+async fn query_usage_scoped(
+    harness: &mut Harness,
+    group_by: horde_proto::v1::UsageGroupBy,
+    subtree_root: Option<&str>,
+) -> Result<horde_proto::v1::QueryUsageResponse, tonic::Status> {
+    harness
+        .control
+        .query_usage(horde_proto::v1::QueryUsageRequest {
+            session_ids: Vec::new(),
+            subtree_root: subtree_root.map(AgentId::new),
+            group_by: group_by as i32,
+            since: None,
+            until: None,
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+async fn query_usage_grouped(
+    harness: &mut Harness,
+    group_by: horde_proto::v1::UsageGroupBy,
+) -> Result<horde_proto::v1::QueryUsageResponse, tonic::Status> {
+    query_usage_scoped(harness, group_by, None).await
+}
+
+/// The whole reporting path over the wire: a worker journals usage for two
+/// agents plus a headroom report, a partition replays the identical batch,
+/// and the query still answers the sums a single delivery would have —
+/// at-least-once delivery must never inflate a bill.
+#[tokio::test]
+async fn usage_is_folded_from_the_journal_and_a_replay_cannot_double_count() {
+    let core = core().expect("an in-memory core");
+    let mut harness = connect_to(core).await.expect("the harness must connect");
+    register_worker(&mut harness, "worker-a")
+        .await
+        .expect("registration must succeed");
+    let (session_id, root_agent_id) = seed(&mut harness, "ci-fix", "key-1")
+        .await
+        .expect("a session");
+    let (agent_id, _) = spawn_agent(&mut harness, &session_id)
+        .await
+        .expect("a second agent");
+
+    let batch = |events: Vec<JournaledEvent>| PushEventsRequest {
+        body: Some(push_events_request::Body::Batch(JournaledEventBatch {
+            events,
+            acked_command_sequence: 0,
+        })),
+    };
+    let journaled: Vec<JournaledEvent> = [
+        usage_event(&root_agent_id, "turn-1", 100, 40),
+        usage_event(&agent_id, "turn-1", 10, 5),
+        headroom_event(&agent_id, 75, 100),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, event)| JournaledEvent {
+        journal_sequence: (index + 1) as u64,
+        session_id: Some(SessionId::new(session_id.clone())),
+        event: Some(event),
+    })
+    .collect();
+
+    let (to_server, mut acks) = open_journal(&mut harness, "worker-a", 0)
+        .await
+        .expect("the journal opens");
+    acks.next().await.expect("a start reply").expect("accepted");
+
+    // Delivered once, then replayed whole — the partition-reconnect shape.
+    for _ in 0..2 {
+        to_server
+            .send(batch(journaled.clone()))
+            .await
+            .expect("the batch sends");
+        acks.next().await.expect("an ack").expect("acked");
+    }
+
+    let by_account =
+        query_usage_grouped(&mut harness, horde_proto::v1::UsageGroupBy::ProviderAccount)
+            .await
+            .expect("the usage query answers");
+    assert_eq!(by_account.aggregates.len(), 1);
+    let row = &by_account.aggregates[0];
+    let key = row.key.as_ref().expect("a group key");
+    assert_eq!(
+        (key.provider.as_str(), key.provider_account.as_str()),
+        ("claude", "personal")
+    );
+    let tokens = row.tokens.as_ref().expect("measured tokens");
+    assert_eq!(
+        (tokens.input_tokens, tokens.output_tokens),
+        (110, 45),
+        "the replayed batch was deduplicated by the journal watermark"
+    );
+    assert_eq!(row.agent_count, 2);
+
+    let account = by_account
+        .accounts
+        .first()
+        .expect("the account row rides the same answer");
+    assert_eq!(account.account, "personal");
+    let window = account.window.as_ref().expect("the journaled window");
+    assert_eq!((window.used, window.limit), (Some(75), Some(100)));
+    assert_eq!(
+        account.remaining_fraction,
+        Some(0.25),
+        "derived arithmetic beside the measured window"
+    );
+    assert!(!account.exhausted);
+    assert_eq!(account.basis, "derived from provider-reported counts");
+
+    let by_agent = query_usage_grouped(&mut harness, horde_proto::v1::UsageGroupBy::Agent)
+        .await
+        .expect("the per-agent query answers");
+    assert_eq!(
+        by_agent.aggregates.len(),
+        2,
+        "two agents spent: {by_agent:?}"
+    );
+
+    // A subtree root narrows attribution to that agent's own spend — the
+    // whole point of tree-level attribution over the wire.
+    let scoped = query_usage_scoped(
+        &mut harness,
+        horde_proto::v1::UsageGroupBy::Session,
+        Some(&agent_id),
+    )
+    .await
+    .expect("the scoped query answers");
+    let scoped_tokens = scoped.aggregates[0].tokens.as_ref().expect("tokens");
+    assert_eq!(
+        (scoped_tokens.input_tokens, scoped_tokens.output_tokens),
+        (10, 5),
+        "the root's spend is outside the second agent's subtree"
+    );
+
+    // An *empty* subtree root means unscoped, not scoped-to-nobody: proto3
+    // cannot tell an omitted id from an empty one, and reading empty as a
+    // real root would silently zero every aggregate.
+    let empty_root = query_usage_scoped(
+        &mut harness,
+        horde_proto::v1::UsageGroupBy::Session,
+        Some(""),
+    )
+    .await
+    .expect("the empty-root query answers");
+    let all_tokens = empty_root.aggregates[0].tokens.as_ref().expect("tokens");
+    assert_eq!(
+        (all_tokens.input_tokens, all_tokens.output_tokens),
+        (110, 45),
+        "an empty root must fold everything, exactly as no root does"
+    );
+}
+
+/// The refusals: a query that does not say how to group, and a named session
+/// that does not exist — a typo must not read as thrift.
+#[tokio::test]
+async fn a_usage_query_must_name_a_grouping_and_a_real_session() {
+    let mut harness = connect_to(core().expect("an in-memory core"))
+        .await
+        .expect("the harness must connect");
+    seed(&mut harness, "ci-fix", "key-1")
+        .await
+        .expect("a session");
+
+    let unspecified = query_usage_grouped(&mut harness, horde_proto::v1::UsageGroupBy::Unspecified)
+        .await
+        .expect_err("an unspecified grouping is refused");
+    assert_eq!(unspecified.code(), Code::InvalidArgument);
+    assert!(
+        unspecified.message().contains("group"),
+        "the refusal says what was missing: {}",
+        unspecified.message()
+    );
+
+    let missing = harness
+        .control
+        .query_usage(horde_proto::v1::QueryUsageRequest {
+            session_ids: vec![SessionId::new("session-nobody-made")],
+            subtree_root: None,
+            group_by: horde_proto::v1::UsageGroupBy::Session as i32,
+            since: None,
+            until: None,
+        })
+        .await
+        .expect_err("an unknown named session is refused, not zero");
+    assert_eq!(missing.code(), Code::NotFound);
+}
+
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.
 const _: fn(DuplexStream) = |_stream| {};

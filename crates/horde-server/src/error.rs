@@ -47,6 +47,24 @@ pub enum ServerError {
         supplied: String,
     },
 
+    #[error("no MCP server named {name}")]
+    NoSuchMcpServer { name: String },
+
+    /// A create would shadow a live MCP server's name.
+    #[error("an MCP server named {name} already exists; supply its etag to update it")]
+    McpServerNameTaken { name: String },
+
+    /// The MCP catalog's optimistic-concurrency token did not match.
+    #[error(
+        "MCP server {name} is at etag {current}, but the request supplied \
+         {supplied:?}; re-read and retry"
+    )]
+    StaleMcpServerEtag {
+        name: String,
+        current: String,
+        supplied: String,
+    },
+
     #[error("no worker is registered, so {what} cannot be placed")]
     NoWorkerAvailable { what: String },
 
@@ -142,9 +160,12 @@ impl From<ServerError> for Status {
         let code = match &error {
             ServerError::NoSuchSession { .. }
             | ServerError::NoSuchAgent { .. }
-            | ServerError::NoSuchWorkspace { .. } => Code::NotFound,
-            ServerError::WorkspaceNameTaken { .. } => Code::AlreadyExists,
-            ServerError::StaleEtag { .. } => Code::Aborted,
+            | ServerError::NoSuchWorkspace { .. }
+            | ServerError::NoSuchMcpServer { .. } => Code::NotFound,
+            ServerError::WorkspaceNameTaken { .. } | ServerError::McpServerNameTaken { .. } => {
+                Code::AlreadyExists
+            }
+            ServerError::StaleEtag { .. } | ServerError::StaleMcpServerEtag { .. } => Code::Aborted,
             ServerError::Invalid(_) => Code::InvalidArgument,
             ServerError::NoWorkerAvailable { .. } => Code::FailedPrecondition,
             ServerError::JournalRegressed { .. } => Code::FailedPrecondition,

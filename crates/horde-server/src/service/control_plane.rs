@@ -15,13 +15,15 @@ use std::pin::Pin;
 use horde_proto::v1::{
     AddWorkspaceRepoRequest, AddWorkspaceRepoResponse, AgentId, AgentSpawned,
     AnswerPermissionRequest, AnswerPermissionResponse, ArchiveSessionRequest,
-    ArchiveSessionResponse, AssignmentId, AssignmentSent, CreateSessionRequest,
-    CreateSessionResponse, CreateWorkspaceDefinitionRequest, CreateWorkspaceDefinitionResponse,
-    DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse, Event, GetSessionRequest,
-    GetSessionResponse, GetWorkspaceDefinitionRequest, GetWorkspaceDefinitionResponse,
-    HelloRequest, HelloResponse, InterruptAgentRequest, InterruptAgentResponse,
-    ListSessionsRequest, ListSessionsResponse, ListWorkersRequest, ListWorkersResponse,
-    ListWorkspaceDefinitionsRequest, ListWorkspaceDefinitionsResponse, MintEnrollmentCodeRequest,
+    ArchiveSessionResponse, AssignmentId, AssignmentSent, ConfigureMcpServerRequest,
+    ConfigureMcpServerResponse, CreateSessionRequest, CreateSessionResponse,
+    CreateWorkspaceDefinitionRequest, CreateWorkspaceDefinitionResponse, DeleteMcpServerRequest,
+    DeleteMcpServerResponse, DeleteWorkspaceDefinitionRequest, DeleteWorkspaceDefinitionResponse,
+    Event, GetSessionRequest, GetSessionResponse, GetWorkspaceDefinitionRequest,
+    GetWorkspaceDefinitionResponse, HelloRequest, HelloResponse, InterruptAgentRequest,
+    InterruptAgentResponse, ListMcpServersRequest, ListMcpServersResponse, ListSessionsRequest,
+    ListSessionsResponse, ListWorkersRequest, ListWorkersResponse, ListWorkspaceDefinitionsRequest,
+    ListWorkspaceDefinitionsResponse, McpServerConfig, MintEnrollmentCodeRequest,
     MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest, PrewarmWorkspaceResponse,
     QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
     SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
@@ -36,6 +38,7 @@ use tracing::instrument;
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use super::sync::{self, SubtreeFilter};
 use crate::error::ServerError;
+use crate::mcp::{MCP_CATALOG_STREAM, McpServerCatalog, validate_config};
 use crate::placement;
 use crate::scheduler::PlacementRequest;
 use crate::state::SessionState;
@@ -161,6 +164,60 @@ impl ControlPlane {
             .await?;
         stamped.etag = sequence.to_string();
         Ok(stamped)
+    }
+
+    /// The MCP Hub catalog, folded fresh from its stream.
+    async fn mcp_catalog(&self) -> Result<McpServerCatalog, ServerError> {
+        let events = self.core.log.read_all(MCP_CATALOG_STREAM).await?;
+        McpServerCatalog::project(&events)
+    }
+
+    /// Appends one MCP catalog change and returns the config with the etag
+    /// that change produced.
+    async fn append_mcp_config(
+        &self,
+        config: McpServerConfig,
+        deleted: bool,
+    ) -> Result<McpServerConfig, ServerError> {
+        let mut stamped = config.clone();
+        let sequence = self
+            .append(
+                MCP_CATALOG_STREAM,
+                "",
+                Event {
+                    agent_id: None,
+                    occurred_at: None,
+                    idempotency_key: String::new(),
+                    kind: Some(Kind::McpServerConfigChanged(
+                        horde_proto::v1::McpServerConfigChanged {
+                            config: Some(config),
+                            deleted,
+                        },
+                    )),
+                },
+            )
+            .await?;
+        stamped.etag = sequence.to_string();
+        Ok(stamped)
+    }
+
+    /// One configure, decided and journaled — the whole verb minus the tonic
+    /// wrapping, so every refusal here is a plain `ServerError` and the RPC
+    /// shell stays two calls.
+    ///
+    /// # Errors
+    ///
+    /// `validate_config`'s refusals for an ill-formed config,
+    /// `check_configure`'s for a create/update that contradicts the catalog,
+    /// and the log's own failures from the append.
+    async fn configure_mcp(&self, config: McpServerConfig) -> Result<McpServerConfig, ServerError> {
+        validate_config(&config)?;
+        // Create versus update is `check_configure`'s ruling: the etag names
+        // the caller's intent, and both intents are checked against the
+        // catalog rather than trusted.
+        let catalog = self.mcp_catalog().await?;
+        crate::mcp::check_configure(catalog.get(&config.name), &config)?;
+        self.append_mcp_config(config, false).await
     }
 
     /// A live definition by id, or the error that names what was asked for.
@@ -720,6 +777,7 @@ impl ControlPlaneService for ControlPlane {
             parent_worker_id: parent_worker.as_deref(),
             workspace_definition_id: workspace.as_deref(),
             load: &load,
+            now_unix_ms: placement::now_unix_ms(),
         });
 
         self.append(
@@ -1012,6 +1070,60 @@ impl ControlPlaneService for ControlPlane {
         }))
     }
 
+    // -- MCP Hub ---------------------------------------------------------------
+
+    #[instrument(skip_all)]
+    async fn configure_mcp_server(
+        &self,
+        request: Request<ConfigureMcpServerRequest>,
+    ) -> Result<Response<ConfigureMcpServerResponse>, Status> {
+        // The shell is deliberately two calls: the decisions live in
+        // `crate::mcp` as truth-tabled pure functions (`validate_config`,
+        // `check_configure`, `required_config`) and the sequencing in
+        // `configure_mcp`, where every branch is a plain `?`.
+        let config = crate::mcp::required_config(request.into_inner().config)?;
+        let stamped = self.configure_mcp(config).await.map_err(Status::from)?;
+        Ok(Response::new(ConfigureMcpServerResponse {
+            config: Some(stamped),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_mcp_servers(
+        &self,
+        _request: Request<ListMcpServersRequest>,
+    ) -> Result<Response<ListMcpServersResponse>, Status> {
+        let catalog = self.mcp_catalog().await.map_err(Status::from)?;
+        Ok(Response::new(ListMcpServersResponse {
+            servers: catalog.live().cloned().collect(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_mcp_server(
+        &self,
+        request: Request<DeleteMcpServerRequest>,
+    ) -> Result<Response<DeleteMcpServerResponse>, Status> {
+        let request = request.into_inner();
+        let catalog = self.mcp_catalog().await.map_err(Status::from)?;
+        let current = catalog
+            .get(&request.name)
+            .ok_or_else(|| {
+                Status::from(ServerError::NoSuchMcpServer {
+                    name: request.name.clone(),
+                })
+            })?
+            .clone();
+        crate::mcp::check_etag(&current, &request.etag).map_err(Status::from)?;
+
+        // The event carries the last live state, so the log alone records
+        // what was removed.
+        self.append_mcp_config(current, true)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(DeleteMcpServerResponse {}))
+    }
+
     async fn list_workers(
         &self,
         _request: Request<ListWorkersRequest>,
@@ -1121,11 +1233,85 @@ impl ControlPlaneService for ControlPlane {
         }))
     }
 
+    /// Usage reporting (DESIGN §12): a pure fold over the named sessions'
+    /// logs — no usage table exists to disagree with the events.
+    #[instrument(skip_all)]
     async fn query_usage(
         &self,
-        _request: Request<QueryUsageRequest>,
+        request: Request<QueryUsageRequest>,
     ) -> Result<Response<QueryUsageResponse>, Status> {
-        Err(ServerError::Unimplemented("usage aggregation").into())
+        let request = request.into_inner();
+        let grouping = crate::usage::Grouping::from_wire(request.group_by).ok_or_else(|| {
+            Status::from(ServerError::Invalid(
+                "a usage query must say how to group: by agent, session, \
+                 tree path, provider account, or model"
+                    .to_owned(),
+            ))
+        })?;
+
+        let mut query = crate::usage::UsageQuery::grouped_by(grouping);
+        if let Some(root) = request
+            .subtree_root
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+        {
+            query = query.scoped_to_subtree(root);
+        }
+        if let Some(since) = request.since.as_ref() {
+            query = query.since(crate::usage::timestamp_unix_ms(since));
+        }
+        if let Some(until) = request.until.as_ref() {
+            query = query.until(crate::usage::timestamp_unix_ms(until));
+        }
+
+        let named: Vec<String> = request
+            .session_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let sessions = if named.is_empty() {
+            // Empty means all sessions; the reserved streams (catalog,
+            // enrollment) live in the log but are not sessions.
+            self.core
+                .log
+                .session_ids()
+                .await
+                .map_err(Status::from)?
+                .into_iter()
+                .filter(|session_id| !crate::enrollment::is_reserved_stream(session_id))
+                .collect()
+        } else {
+            named
+        };
+
+        let mut fold = crate::usage::UsageFold::new(query);
+        for session_id in &sessions {
+            let events = self
+                .core
+                .log
+                .read_all(session_id)
+                .await
+                .map_err(Status::from)?;
+            // A *named* session that does not exist is refused rather than
+            // silently reported as zero usage — a typo must not read as
+            // thrift.
+            if events.is_empty() {
+                return Err(Status::from(ServerError::NoSuchSession {
+                    session_id: session_id.clone(),
+                }));
+            }
+            fold.absorb_session(session_id, &events)
+                .map_err(Status::from)?;
+        }
+
+        // Declared quotas (usage::DeclaredQuota) await the config layer;
+        // until it lands, only provider-reported windows produce headroom.
+        let accounts = fold.accounts(placement::now_unix_ms(), &std::collections::BTreeMap::new());
+        Ok(Response::new(QueryUsageResponse {
+            aggregates: fold.aggregates(),
+            accounts,
+        }))
     }
 }
 

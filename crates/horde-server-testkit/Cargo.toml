@@ -12,9 +12,12 @@ workspace = true
 [dependencies]
 horde-cli = { workspace = true }
 horde-identity = { workspace = true }
+# Only for the OTLP variable names the scrubbed binary runner scrubs, so the
+# list cannot drift from the config surface it protects tests from.
+horde-observe = { workspace = true }
 horde-proto = { workspace = true }
 horde-server = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt", "sync"] }
+tokio = { workspace = true, features = ["net", "process", "rt", "sync"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ring"] }
 

@@ -6,10 +6,11 @@
 
 use horde_proto::v1::{
     AgentId, AgentSpec, AnswerPermissionRequest, ArchiveSessionRequest, Assignment,
-    CreateSessionRequest, DeliveryMode, EventEnvelope, GetSessionRequest, Hello, HelloRequest,
-    InterruptAgentRequest, ListSessionsRequest, Note, PermissionOutcome, PermissionRequestId, Role,
-    SendMessageRequest, SendMessageResponse, ServerHello, SessionCursor, SessionId, SessionSummary,
-    SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest,
+    ConfigureMcpServerRequest, CreateSessionRequest, DeleteMcpServerRequest, DeliveryMode,
+    EventEnvelope, GetSessionRequest, Hello, HelloRequest, InterruptAgentRequest,
+    ListMcpServersRequest, ListSessionsRequest, McpServerConfig, Note, PermissionOutcome,
+    PermissionRequestId, Role, SendMessageRequest, SendMessageResponse, ServerHello, SessionCursor,
+    SessionId, SessionSummary, SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest,
     control_plane_service_client::ControlPlaneServiceClient, send_message_request,
     sync_events_response,
 };
@@ -411,6 +412,61 @@ impl Client {
             .into_inner())
     }
 
+    /// Creates or updates one MCP server in the Hub catalog (ADR-0004).
+    ///
+    /// An empty `config.etag` creates; a non-empty one updates the version it
+    /// was read from. The answer is the config as journaled, carrying the etag
+    /// its change produced.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`]: `AlreadyExists` for a create over a live name,
+    /// `Aborted` for a stale etag, `InvalidArgument` for a config the server
+    /// refused.
+    pub async fn configure_mcp_server(
+        &mut self,
+        config: McpServerConfig,
+    ) -> Result<McpServerConfig, ClientError> {
+        self.inner
+            .configure_mcp_server(ConfigureMcpServerRequest {
+                config: Some(config),
+            })
+            .await?
+            .into_inner()
+            .config
+            .ok_or_else(|| ClientError::Rpc(tonic::Status::internal("no config in the response")))
+    }
+
+    /// Every live MCP server in the Hub catalog.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`] if the server refused.
+    pub async fn list_mcp_servers(&mut self) -> Result<Vec<McpServerConfig>, ClientError> {
+        Ok(self
+            .inner
+            .list_mcp_servers(ListMcpServersRequest {})
+            .await?
+            .into_inner()
+            .servers)
+    }
+
+    /// Removes one MCP server from the Hub catalog.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Rpc`]: `NotFound` for a name the catalog does not hold,
+    /// `Aborted` for a stale etag.
+    pub async fn delete_mcp_server(&mut self, name: &str, etag: &str) -> Result<(), ClientError> {
+        self.inner
+            .delete_mcp_server(DeleteMcpServerRequest {
+                name: name.to_owned(),
+                etag: etag.to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn interrupt(&mut self, agent_id: &str, reason: &str) -> Result<u64, ClientError> {
         Ok(self
             .inner
@@ -475,6 +531,25 @@ impl Client {
                 parent_agent_id: parent_agent_id.map(AgentId::new),
                 spec: Some(AgentSpec::default()),
                 idempotency_key: idempotency_key.to_owned(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Usage and headroom, folded server-side from the journaled usage
+    /// events (DESIGN §12).
+    pub async fn query_usage(
+        &mut self,
+        options: &UsageOptions,
+    ) -> Result<horde_proto::v1::QueryUsageResponse, ClientError> {
+        Ok(self
+            .inner
+            .query_usage(horde_proto::v1::QueryUsageRequest {
+                session_ids: options.session_ids.iter().map(SessionId::new).collect(),
+                subtree_root: options.subtree_root.clone().map(AgentId::new),
+                group_by: options.group_by as i32,
+                since: None,
+                until: None,
             })
             .await?
             .into_inner())
@@ -810,6 +885,39 @@ impl<'a> PermissionAnswer<'a> {
     #[must_use]
     pub fn because(mut self, reason: &'a str) -> Self {
         self.reason = reason;
+        self
+    }
+}
+
+/// What a usage query covers, and how its rows group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageOptions {
+    /// Empty means every session.
+    pub session_ids: Vec<String>,
+    /// Restrict to one agent's subtree — tree-level attribution.
+    pub subtree_root: Option<String>,
+    pub group_by: horde_proto::v1::UsageGroupBy,
+}
+
+impl UsageOptions {
+    #[must_use]
+    pub fn grouped_by(group_by: horde_proto::v1::UsageGroupBy) -> Self {
+        Self {
+            session_ids: Vec::new(),
+            subtree_root: None,
+            group_by,
+        }
+    }
+
+    #[must_use]
+    pub fn sessions(mut self, session_ids: Vec<String>) -> Self {
+        self.session_ids = session_ids;
+        self
+    }
+
+    #[must_use]
+    pub fn scoped_to_subtree(mut self, root: Option<String>) -> Self {
+        self.subtree_root = root;
         self
     }
 }

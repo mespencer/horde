@@ -106,6 +106,12 @@ pub struct CommandProjection {
     /// place a fold can get one is the `WorkspaceDefinitionChanged` events
     /// that precede every prewarm request in append order.
     definitions: BTreeMap<String, WorkspaceDefinition>,
+    /// The MCP Hub catalog as this fold has seen it, for the same reason:
+    /// a `SpawnAgentCommand` carries the agent's `local` server configs and
+    /// its visible hub server names in full, and the only place a fold can
+    /// resolve them is the `McpServerConfigChanged` events that precede the
+    /// placement in append order.
+    mcp_servers: crate::mcp::McpServerCatalog,
     /// How many commands each worker has been issued. This *is* the per-worker
     /// command sequence.
     issued: BTreeMap<String, u64>,
@@ -142,6 +148,12 @@ impl CommandProjection {
             // become a command if the definition it names has been folded.
             (Some(Kind::WorkspaceDefinitionChanged(changed)), _) => {
                 self.fold_definition(changed);
+                Vec::new()
+            }
+            // The catalog half of the MCP Hub: a spawn can only carry a
+            // server's config if the change that created it has been folded.
+            (Some(Kind::McpServerConfigChanged(changed)), _) => {
+                self.mcp_servers.fold_change(global.event.sequence, changed);
                 Vec::new()
             }
             (Some(Kind::WorkspacePrewarmRequested(prewarm)), _) => {
@@ -311,6 +323,15 @@ impl CommandProjection {
                     return commands;
                 }
                 if let Some(details) = self.spawned.get(agent_id) {
+                    // The MCP Hub surface this agent gets, resolved here from
+                    // the folded catalog and the agent's type: the worker must
+                    // spawn `local` servers without a round trip, so full
+                    // configs ride the command (the MaterializeWorkspace rule).
+                    let agent_type = details
+                        .spec
+                        .as_ref()
+                        .map(|spec| spec.agent_type.as_str())
+                        .unwrap_or_default();
                     let spawn = Command::SpawnAgent(SpawnAgentCommand {
                         session_id: Some(SessionId::new(details.session_id.clone())),
                         agent_id: Some(AgentId::new(agent_id)),
@@ -319,6 +340,10 @@ impl CommandProjection {
                         binding: None,
                         tree_path: details.tree_path.clone(),
                         prompt_overlay: String::new(),
+                        local_mcp_servers: self.mcp_servers.local_servers_for(agent_type),
+                        visible_hub_mcp_servers: self
+                            .mcp_servers
+                            .visible_hub_servers_for(agent_type),
                     });
                     let issued = self.issue(&worker_id, &global.event, spawn, MAIN);
                     commands.push((worker_id, issued));
@@ -743,6 +768,100 @@ mod tests {
                     spawn.session_id.as_ref().map(ToString::to_string),
                     Some("s1".to_owned()),
                     "the session comes from the log row, not from the placement"
+                );
+            }
+            other => panic!("expected a spawn command, got {other:?}"),
+        }
+    }
+
+    /// The MCP Hub half of a spawn: `local` configs ride the command in full
+    /// (the worker spawns them without a round trip), hub servers ride by
+    /// name, and the per-agent-type allowlist is applied here — a scoped
+    /// server reaching an agent outside its scope would be a permission
+    /// widening nobody authored.
+    #[test]
+    fn a_spawn_command_carries_the_agents_mcp_surface_from_the_folded_catalog() {
+        let mcp_config =
+            |name: &str, local: bool, allowed: &[&str]| horde_proto::v1::McpServerConfig {
+                name: name.to_owned(),
+                transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+                    horde_proto::v1::McpStdioTransport {
+                        command: "server-bin".to_owned(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                    },
+                )),
+                local,
+                allowed_agent_types: allowed.iter().map(|s| (*s).to_owned()).collect(),
+                etag: String::new(),
+            };
+        let changed = |seq: u64, config: horde_proto::v1::McpServerConfig| {
+            row(
+                seq,
+                crate::mcp::MCP_CATALOG_STREAM,
+                seq,
+                Event {
+                    agent_id: None,
+                    occurred_at: None,
+                    idempotency_key: String::new(),
+                    kind: Some(Kind::McpServerConfigChanged(
+                        horde_proto::v1::McpServerConfigChanged {
+                            config: Some(config),
+                            deleted: false,
+                        },
+                    )),
+                },
+            )
+        };
+
+        let mut typed_spawn = spawn_event("agent-1", None);
+        if let Some(Kind::AgentSpawned(spawned)) = typed_spawn.kind.as_mut()
+            && let Some(spec) = spawned.spec.as_mut()
+        {
+            spec.agent_type = "reviewer".to_owned();
+        }
+
+        let issued = fold(&[
+            changed(1, mcp_config("browser", true, &[])),
+            changed(2, mcp_config("linear", false, &["reviewer"])),
+            changed(3, mcp_config("payments", false, &["accountant"])),
+            row(4, "s1", 1, typed_spawn),
+            row(
+                5,
+                "s1",
+                2,
+                placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
+            ),
+        ]);
+
+        assert_eq!(issued.len(), 1);
+        match issued[0].1.command.as_ref().expect("a command") {
+            Command::SpawnAgent(spawn) => {
+                assert_eq!(
+                    spawn
+                        .local_mcp_servers
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["browser"],
+                    "the local config rides in full"
+                );
+                assert_eq!(
+                    spawn.local_mcp_servers[0]
+                        .transport
+                        .as_ref()
+                        .map(|t| matches!(
+                            t,
+                            horde_proto::v1::mcp_server_config::Transport::Stdio(_)
+                        )),
+                    Some(true),
+                    "in full means the transport too, or the worker cannot spawn it"
+                );
+                assert_eq!(
+                    spawn.visible_hub_mcp_servers,
+                    vec!["linear".to_owned()],
+                    "hub servers ride by name, and the allowlist holds: \
+                     `payments` is scoped to accountants"
                 );
             }
             other => panic!("expected a spawn command, got {other:?}"),

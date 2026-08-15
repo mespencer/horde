@@ -144,6 +144,11 @@ async fn every_verb_runs_against_a_real_server() {
         vec!["interrupt", &agent_id, "--reason", "changed my mind"],
         vec!["spawn", &session_id],
         vec!["spawn", &session_id, "--parent", &agent_id],
+        vec!["usage"],
+        vec!["usage", "--by", "session"],
+        vec!["usage", "--by", "agent", "--session", &session_id],
+        vec!["usage", "--by", "tree", "--subtree", &agent_id],
+        vec!["usage", "--by", "model"],
         vec!["session", "archive", &session_id, "--reason", "done"],
     ];
 
@@ -167,6 +172,7 @@ async fn every_verb_also_runs_in_json_mode() {
         vec!["--json", "send", &agent_id, "text"],
         vec!["--json", "interrupt", &agent_id],
         vec!["--json", "spawn", &session_id],
+        vec!["--json", "usage"],
     ] {
         invoke(&endpoint, &case)
             .await
@@ -204,5 +210,15 @@ async fn a_verb_against_a_missing_session_fails_rather_than_printing_nothing() {
     let error = invoke(&endpoint, &["session", "get", "session-that-never-existed"])
         .await
         .expect_err("a missing session must fail");
+    assert!(error.to_string().contains("session-that-never-existed"));
+
+    // The usage verb holds the same line: a typo'd session must not read as
+    // "no usage recorded".
+    let error = invoke(
+        &endpoint,
+        &["usage", "--session", "session-that-never-existed"],
+    )
+    .await
+    .expect_err("usage against a missing session must fail");
     assert!(error.to_string().contains("session-that-never-existed"));
 }

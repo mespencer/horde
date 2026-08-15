@@ -1,0 +1,33 @@
+[package]
+name = "horde-observe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "OTLP export for the tracing the binaries already emit: opt-in, sampled, and never in the product's way."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The OpenTelemetry stack is pinned exactly (`=`), like the TLS stack: its
+# crates move fast and in lockstep, and each release retunes the tonic/prost
+# pairing underneath it. These four upgrade together or not at all — and the
+# tonic they build against (0.14) must stay the workspace's own gRPC stack,
+# or two hyper stacks get compiled and linked into every binary.
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace"] }
+thiserror = { workspace = true }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "registry"] }
+
+[dev-dependencies]
+# The smoke suite's collector is a real OTLP/gRPC receiver: the generated
+# TraceService, served over the workspace's own tonic — not a mock of this
+# crate's exporter. Pinned exactly for the same reason as the stack above.
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "trace"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", features = ["router", "server"] }
