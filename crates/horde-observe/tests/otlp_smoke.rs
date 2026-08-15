@@ -327,6 +327,47 @@ async fn an_unreachable_collector_costs_spans_and_never_blocks() {
     );
 }
 
+/// Drop is the exit path that matters: in a binary the global subscriber
+/// (and the tracer inside it) never drops, so the SDK's own last-reference
+/// shutdown can never fire — Telemetry's `Drop` is the only thing standing
+/// between queued spans and the void. Its drain is synchronous, which is
+/// what makes it assertable without a clock: the exporter's RPC completes
+/// before `drop` returns, and the collector put the batch on this channel
+/// before answering that RPC, so `try_recv` — not a wait — must find it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_telemetry_drains_the_queue_while_the_subscriber_still_lives() {
+    let (endpoint, mut received) = harness::collector().await;
+    let telemetry = pipeline(
+        &OtlpConfig {
+            endpoint,
+            sample_ratio: 1.0,
+        },
+        &ServiceIdentity::new("horde-observe-smoke"),
+    )
+    .expect("a lazy pipeline must build");
+
+    // The dispatch stays alive across the drop, exactly like a binary's
+    // global subscriber — dropping it first would hand the flush to the
+    // SDK's last-reference shutdown and prove nothing about Drop.
+    let dispatch = silent_subscriber(&telemetry);
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _entered = tracing::info_span!(target: "horde_smoke", "flushed_turn").entered();
+    });
+
+    drop(telemetry);
+
+    let request = received
+        .try_recv()
+        .expect("Drop must drain the queue before it returns");
+    assert!(
+        harness::span_names(&request)
+            .iter()
+            .any(|name| name == "flushed_turn"),
+        "the drained batch carries the span emitted before the drop"
+    );
+    drop(dispatch);
+}
+
 /// Shutdown is a real drain, not a formality: what is still queued goes
 /// through one last export, and at a dead collector that loss lands on the
 /// counter — which is why `shutdown` borrows instead of consuming.
