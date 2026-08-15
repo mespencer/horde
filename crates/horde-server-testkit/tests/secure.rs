@@ -7,6 +7,8 @@
 //! outcomes (wrong CA, spent codes, revocation) belong to `horde-server`'s
 //! enrollment suite; this file holds the harness itself to its promises.
 
+mod common;
+
 use horde_identity::PrincipalRole;
 use horde_server_testkit::secure::{hello, serve_secured, serve_secured_with_blob_store, within};
 
@@ -29,30 +31,11 @@ async fn the_secured_blob_harness_moves_bytes_for_an_enrolled_principal() -> Set
     let channel = harness.main_endpoint_as(&identity)?.connect().await?;
     let mut blobs = horde_proto::v1::blob_service_client::BlobServiceClient::new(channel);
 
-    let stored = within(
-        "the upload",
-        horde_proto::blob::upload_blob(&mut blobs, b"secured testkit blob"),
+    within(
+        "the blob round trip",
+        common::assert_blob_lands_under_root(&mut blobs, blob_root.path(), b"secured testkit blob"),
     )
     .await??;
-    let digest = horde_proto::blob::BlobDigest::parse(&stored.blob_digest)
-        .ok_or("the answer must be a well-formed address")?;
-
-    let (fan, rest) = digest.hex().split_at(2);
-    assert!(
-        blob_root
-            .path()
-            .join("sha256")
-            .join(fan)
-            .join(rest)
-            .is_file(),
-        "the blob must land under the directory the caller rooted the store at"
-    );
-    let fetched = within(
-        "the download",
-        horde_proto::blob::download_blob(&mut blobs, &digest),
-    )
-    .await??;
-    assert_eq!(fetched, b"secured testkit blob");
     Ok(())
 }
 

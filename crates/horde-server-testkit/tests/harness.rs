@@ -7,6 +7,8 @@
 //! an event replayed after its push was acked — rather than trusting a
 //! returned value, because a returned value is exactly what a mutant fakes.
 
+mod common;
+
 use horde_cli::client::SyncOptions;
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
@@ -188,26 +190,9 @@ async fn a_blob_store_server_moves_bytes_under_the_callers_root() {
     .await
     .expect("the blob client must connect");
 
-    let stored = horde_proto::blob::upload_blob(&mut blobs, b"testkit blob")
+    common::assert_blob_lands_under_root(&mut blobs, blob_root.path(), b"testkit blob")
         .await
-        .expect("the upload must be accepted");
-    let digest =
-        horde_proto::blob::BlobDigest::parse(&stored.blob_digest).expect("the answer parses");
-
-    let (fan, rest) = digest.hex().split_at(2);
-    assert!(
-        blob_root
-            .path()
-            .join("sha256")
-            .join(fan)
-            .join(rest)
-            .is_file(),
-        "the blob must land under the directory the caller rooted the store at"
-    );
-    let fetched = horde_proto::blob::download_blob(&mut blobs, &digest)
-        .await
-        .expect("the download must verify");
-    assert_eq!(fetched, b"testkit blob");
+        .expect("the store must keep its promises");
 }
 
 /// `serve_with_permissions` really runs the chain: a request journaled the way
