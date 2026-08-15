@@ -21,6 +21,14 @@ tonic = { version = "0.14.6", features = ["channel"] }
 # code, so it is a direct dependency without a direct `use`.
 tonic-prost = "0.14.6"
 
+[dev-dependencies]
+# The transfer-loop suite serves a scripted BlobService over a real
+# loopback socket: the loops under test are chunking and verification, and
+# both only exist across a transport.
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
+
 [build-dependencies]
 prost-build = "0.14.4"
 protoc-bin-vendored = "3.2.0"

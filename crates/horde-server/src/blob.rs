@@ -93,6 +93,18 @@ pub enum BlobError {
     )]
     TooLarge { limit: u64, observed: u64 },
 
+    /// A read produced more than any accepted upload could contain: an
+    /// empty run, more bytes than the per-blob cap, or more chunks than a
+    /// cap-sized blob yields. Tampering on disk or a broken reader —
+    /// either way the read stops, because a loop whose progress nothing
+    /// bounds cannot be bounded by a clock (QUALITY_GATES: bound progress
+    /// by count or structure, never by time).
+    #[error(
+        "the read left honest bounds after {chunks} chunk(s) and {bytes} bytes \
+         against the {limit}-byte per-blob cap; refusing a runaway read"
+    )]
+    Runaway { chunks: u64, bytes: u64, limit: u64 },
+
     /// The filesystem failed underneath the store.
     #[error("the blob store could not {context}: {source}")]
     Io {
@@ -242,18 +254,58 @@ impl BlobStore {
     /// Reads one whole blob, verified — [`BlobStore::read`] drained, for
     /// callers that want the bytes in memory.
     ///
+    /// The drain is bounded by structure, not by clock: no verified blob
+    /// exceeds the cap that admitted it, so a read that yields more —
+    /// bytes or chunks — has left the space of honest stores and is
+    /// refused rather than followed.
+    ///
     /// # Errors
     ///
     /// As [`BlobStore::read`] and [`BlobRead::chunk`] — notably
-    /// [`BlobError::Corrupt`] when the stored bytes no longer match.
+    /// [`BlobError::Corrupt`] when the stored bytes no longer match — plus
+    /// [`BlobError::Runaway`] when the on-disk file outgrew the cap.
     pub async fn read_all(&self, digest: &BlobDigest) -> Result<Vec<u8>, BlobError> {
         let mut read = self.read(digest).await?;
         let mut bytes = Vec::new();
+        let mut chunks = 0_u64;
         while let Some(chunk) = read.chunk().await? {
+            if !read_stays_honest(chunk.len(), chunks, bytes.len() as u64, self.max_blob_bytes) {
+                return Err(BlobError::Runaway {
+                    chunks: chunks + 1,
+                    bytes: bytes.len() as u64 + chunk.len() as u64,
+                    limit: self.max_blob_bytes,
+                });
+            }
+            chunks += 1;
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     }
+}
+
+/// Whether one more run of bytes keeps a blob read inside what an honest
+/// store can produce: the reader never yields an empty run, a verified
+/// blob never exceeds the cap that admitted it, and a cap-sized blob
+/// yields at most `cap / TRANSFER_CHUNK_BYTES + 1` runs.
+///
+/// A named predicate rather than a condition in the loop, because the
+/// states that would exercise it in place are exactly the ones an honest
+/// store never produces (QUALITY_GATES: extract the compound condition,
+/// test the truth table). Every consumer of [`BlobRead::chunk`] — the
+/// in-memory drain above and the service's download stream — runs it, so
+/// a reader that stops making progress fails in milliseconds instead of
+/// spinning a loop no clock can bound.
+#[must_use]
+pub(crate) fn read_stays_honest(
+    chunk_len: usize,
+    chunks_before: u64,
+    bytes_before: u64,
+    cap: u64,
+) -> bool {
+    let max_chunks = cap / (TRANSFER_CHUNK_BYTES as u64) + 1;
+    chunk_len > 0
+        && bytes_before.saturating_add(chunk_len as u64) <= cap
+        && chunks_before < max_chunks
 }
 
 /// One upload in flight: bytes in, hash alongside, verified rename at the
@@ -556,6 +608,92 @@ mod tests {
         let (_dir, store) = store();
         assert_eq!(store.max_blob_bytes(), DEFAULT_MAX_BLOB_BYTES);
         assert_eq!(DEFAULT_MAX_BLOB_BYTES, 256 * 1024 * 1024);
+    }
+
+    /// The whole truth table of "one more run keeps the read honest",
+    /// each factor flipped alone: an empty run, bytes past the cap
+    /// (boundary held from both sides), and more chunks than a cap-sized
+    /// blob can yield. The states an honest store never produces are
+    /// exactly why this is a named predicate rather than a loop condition.
+    #[test]
+    fn a_read_stays_honest_only_while_every_bound_holds() {
+        use super::read_stays_honest;
+        // A small cap: one chunk suffices, so max chunks is 1.
+        assert!(read_stays_honest(5, 0, 0, 8));
+        assert!(
+            read_stays_honest(4, 0, 4, 8),
+            "exactly to the cap is honest"
+        );
+        assert!(
+            !read_stays_honest(0, 0, 0, 8),
+            "an empty run is no progress"
+        );
+        assert!(!read_stays_honest(9, 0, 0, 8), "past the cap in one run");
+        assert!(!read_stays_honest(4, 0, 5, 8), "past the cap accumulated");
+        assert!(
+            !read_stays_honest(4, 1, 0, 8),
+            "a second chunk when one suffices"
+        );
+
+        // A multi-chunk cap: 3 MiB yields at most 3 full chunks + 1 tail.
+        let cap = 3 * 1024 * 1024;
+        assert!(
+            read_stays_honest(100, 3, 0, cap),
+            "the fourth chunk is honest"
+        );
+        assert!(
+            !read_stays_honest(100, 4, 0, cap),
+            "a fifth chunk is more than a cap-sized blob yields"
+        );
+    }
+
+    /// The honest path to `Runaway`: a stored file that outgrew the cap
+    /// behind the store's back. The drain must refuse at the crossing,
+    /// naming the cap, rather than follow the file wherever it goes.
+    #[tokio::test]
+    async fn a_file_grown_past_the_cap_refuses_as_a_runaway_read() {
+        let (dir, store) = store();
+        let store = store.with_max_blob_bytes(8);
+        let stored = store.put(b"12345678").await.expect("at the cap stores");
+
+        let (fan, rest) = stored.digest.hex().split_at(2);
+        let path = dir.path().join("blobs/sha256").join(fan).join(rest);
+        std::fs::write(&path, vec![7u8; 20]).expect("outgrow the cap");
+
+        let error = store.read_all(&stored.digest).await.expect_err("refuses");
+        let rendered = error.to_string();
+        assert!(
+            matches!(error, BlobError::Runaway { limit: 8, .. }),
+            "got {rendered}"
+        );
+        assert!(
+            rendered.contains("runaway"),
+            "the refusal says why: {rendered}"
+        );
+    }
+
+    /// The guard on "missing" is exact: an unreadable blob is an I/O
+    /// failure naming the operation, never dressed up as NotFound — a
+    /// caller told "no such blob" re-uploads, and a caller told the disk
+    /// refused goes looking at the disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_blob_is_an_io_failure_not_a_missing_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = store();
+        let stored = store.put(b"present but locked").await.expect("stores");
+
+        let (fan, rest) = stored.digest.hex().split_at(2);
+        let path = dir.path().join("blobs/sha256").join(fan).join(rest);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the file");
+
+        let error = store.read_all(&stored.digest).await.expect_err("refuses");
+        assert!(
+            matches!(&error, BlobError::Io { context, .. } if *context == "open a stored blob"),
+            "an unreadable file is an I/O failure, got {error}"
+        );
     }
 
     /// Chunked reads and whole reads agree — the streaming path is the

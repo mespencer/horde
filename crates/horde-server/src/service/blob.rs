@@ -38,7 +38,9 @@ impl From<BlobError> for Status {
             | BlobError::DeclarationMismatch { .. }
             | BlobError::TooLarge { .. } => Status::invalid_argument(message),
             BlobError::NotFound { .. } => Status::not_found(message),
-            BlobError::Corrupt { .. } => Status::data_loss(message),
+            // Runaway rides with Corrupt: both mean the store's copy is not
+            // what an accepted upload could have left, and no retry helps.
+            BlobError::Corrupt { .. } | BlobError::Runaway { .. } => Status::data_loss(message),
             BlobError::Io { .. } => Status::internal(message),
         }
     }
@@ -146,12 +148,30 @@ impl BlobService for Blobs {
         // Opened before the stream exists, so "no such blob" is the call's
         // own refusal rather than a broken stream the caller must interpret.
         let mut read = store.read(&digest).await?;
+        let cap = store.max_blob_bytes();
 
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
+            let mut chunks = 0_u64;
+            let mut bytes = 0_u64;
             loop {
                 match read.chunk().await {
                     Ok(Some(chunk)) => {
+                        // The same structural bound the in-memory drain has
+                        // (`blob::read_stays_honest`): a reader that stops
+                        // making progress must fail the stream, not feed it
+                        // forever.
+                        if !crate::blob::read_stays_honest(chunk.len(), chunks, bytes, cap) {
+                            let runaway = crate::blob::BlobError::Runaway {
+                                chunks: chunks + 1,
+                                bytes: bytes + chunk.len() as u64,
+                                limit: cap,
+                            };
+                            let _ = sender.send(Err(Status::from(runaway))).await;
+                            return;
+                        }
+                        chunks += 1;
+                        bytes += chunk.len() as u64;
                         let frame = DownloadBlobResponse {
                             chunk: Some(BlobChunk { data: chunk }),
                         };
@@ -221,6 +241,14 @@ mod tests {
                     observed: 9,
                 },
                 Code::InvalidArgument,
+            ),
+            (
+                BlobError::Runaway {
+                    chunks: 259,
+                    bytes: 9,
+                    limit: 8,
+                },
+                Code::DataLoss,
             ),
             (
                 BlobError::Io {

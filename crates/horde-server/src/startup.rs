@@ -100,7 +100,8 @@ struct ParsedFlags {
 
 impl ParsedFlags {
     /// Folds one argument (consuming its value from `arguments` if it takes
-    /// one) into the parse.
+    /// one) into the parse: the mode flag, then the serve-time flags, then
+    /// whatever is left.
     fn apply(
         &mut self,
         argument: &str,
@@ -112,8 +113,24 @@ impl ParsedFlags {
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
+        if argument == "--serve" {
+            self.serve = true;
+            return Ok(());
+        }
+        if self.apply_serve_flag(argument, &mut value_of)? {
+            return Ok(());
+        }
+        self.apply_bare(argument)
+    }
+
+    /// Applies one of the flags that configure how `--serve` serves.
+    /// `Ok(false)` means the argument is not one of them.
+    fn apply_serve_flag(
+        &mut self,
+        argument: &str,
+        value_of: &mut impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<bool, String> {
         match argument {
-            "--serve" => self.serve = true,
             "--state-dir" => self.state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
             "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
             "--enrollment-bind" => {
@@ -131,9 +148,9 @@ impl ParsedFlags {
                         .map_err(|_| format!("--blob-max-bytes {value} is not a byte count"))?,
                 );
             }
-            other => return self.apply_bare(other),
+            _ => return Ok(false),
         }
-        Ok(())
+        Ok(true)
     }
 
     /// An argument that is not a known flag: the one positional (the

@@ -318,6 +318,21 @@ mod tests {
         assert!(!fits_inline(INLINE_THRESHOLD_BYTES + 1));
     }
 
+    /// The constants by value, because the values are documented promises:
+    /// `payload.proto` tells every peer the inline threshold is 64 KiB, and
+    /// the chunk size is chosen against tonic's 4 MiB message ceiling. A
+    /// mutated arithmetic here would silently move both contracts, and
+    /// every other test in this crate only uses the constants relatively.
+    #[test]
+    fn the_documented_sizes_are_the_shipped_sizes() {
+        assert_eq!(INLINE_THRESHOLD_BYTES, 65_536, "64 KiB, as documented");
+        assert_eq!(
+            super::TRANSFER_CHUNK_BYTES,
+            1_048_576,
+            "1 MiB, a quarter of tonic's default message ceiling"
+        );
+    }
+
     fn attachment(inline_len: usize) -> Attachment {
         Attachment {
             name: "big.log".to_owned(),
