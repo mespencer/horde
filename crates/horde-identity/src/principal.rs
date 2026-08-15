@@ -163,9 +163,28 @@ pub fn peer_identity(certificate_der: &[u8]) -> Result<PeerIdentity, IdentityErr
     })
 }
 
+/// Reads the principal out of a PEM-encoded certificate — an enrolled binary
+/// asking its own identity directory who it is, where [`peer_identity`] is
+/// the door reading a presented peer.
+///
+/// # Errors
+///
+/// [`IdentityError::UnreadablePem`] when the input holds no certificate, and
+/// whatever [`peer_identity`] refuses beyond that.
+pub fn principal_of_pem(certificate_pem: &str) -> Result<Principal, IdentityError> {
+    use rustls_pki_types::{CertificateDer, pem::PemObject};
+
+    let der = CertificateDer::from_pem_slice(certificate_pem.as_bytes()).map_err(|_| {
+        IdentityError::UnreadablePem {
+            what: "the identity certificate",
+        }
+    })?;
+    Ok(peer_identity(&der)?.principal)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Principal, PrincipalRole, is_valid_principal_name};
+    use super::{Principal, PrincipalRole, is_valid_principal_name, principal_of_pem};
 
     #[test]
     fn the_name_alphabet_admits_machine_names_and_nothing_hostile() {
@@ -236,4 +255,29 @@ mod tests {
     // `peer_identity` is exercised in `ca.rs`'s tests against certificates the
     // production issuance path actually signed — a hand-built DER here would be
     // a fixture that rots.
+
+    /// Same policy for `principal_of_pem`: the certificate it reads comes off
+    /// the CA's real signing path, so this is the exact PEM an enrolled
+    /// identity directory holds.
+    #[test]
+    fn an_issued_pem_names_the_principal_it_was_minted_for() {
+        let ca = crate::CertificateAuthority::generate(1_754_956_800_000).expect("a CA generates");
+        let (_key_pem, csr_pem) = crate::enroll::generate_csr().expect("a CSR generates");
+        let principal = Principal::new(PrincipalRole::Worker, "gpu-box").expect("a valid name");
+        let issued = ca
+            .sign_join(&csr_pem, &principal, 1_754_956_800_000)
+            .expect("the CA signs");
+
+        let read_back = principal_of_pem(&issued.certificate_pem).expect("its own PEM must read");
+        assert_eq!(read_back, principal);
+    }
+
+    #[test]
+    fn text_that_is_not_a_certificate_is_refused_as_pem() {
+        let refused = principal_of_pem("not a certificate");
+        assert!(
+            matches!(refused, Err(crate::IdentityError::UnreadablePem { .. })),
+            "got {refused:?}"
+        );
+    }
 }

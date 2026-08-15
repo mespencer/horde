@@ -403,6 +403,20 @@ pub fn default_identity_dir(home: Option<std::path::PathBuf>) -> std::path::Path
     )
 }
 
+/// The principal held by `--identity`'s directory, as its common name
+/// (`client:laptop`), for stamping telemetry with who this invocation is.
+///
+/// Best-effort by design, unlike [`connect`]: enrichment must never turn an
+/// absent or unreadable identity into a refusal — the connection path
+/// already refuses loudly, once, where it matters.
+#[must_use]
+pub fn enrolled_principal(identity: Option<&std::path::Path>) -> Option<String> {
+    let stored = horde_identity::StoredIdentity::load(identity?).ok()?;
+    horde_identity::principal_of_pem(&stored.certificate_pem)
+        .ok()
+        .map(|principal| principal.common_name())
+}
+
 async fn run_join(
     cli: &Cli,
     enrollment_endpoint: &str,
@@ -1152,6 +1166,46 @@ mod enrollment_tests {
             default_identity_dir(None),
             std::path::PathBuf::from(".horde-identity"),
             "no HOME still yields a deterministic, local place"
+        );
+    }
+
+    /// The identity read back for telemetry is the one enrollment wrote: a
+    /// directory holding a CA-signed certificate yields its common name, and
+    /// every failure shape yields `None` rather than a refusal.
+    #[test]
+    fn the_enrolled_principal_is_read_best_effort_from_the_identity_dir() {
+        let ca = horde_identity::CertificateAuthority::generate(1_754_956_800_000)
+            .expect("a CA generates");
+        let (key_pem, csr_pem) = horde_identity::enroll::generate_csr().expect("a CSR generates");
+        let principal =
+            horde_identity::Principal::new(horde_identity::PrincipalRole::Client, "laptop")
+                .expect("a valid name");
+        let issued = ca
+            .sign_join(&csr_pem, &principal, 1_754_956_800_000)
+            .expect("the CA signs");
+        let directory = tempfile::tempdir().expect("a temp dir");
+        horde_identity::StoredIdentity {
+            certificate_pem: issued.certificate_pem,
+            key_pem,
+            ca_pem: ca.certificate_pem().to_owned(),
+        }
+        .save(directory.path())
+        .expect("the identity saves");
+
+        assert_eq!(
+            super::enrolled_principal(Some(directory.path())).as_deref(),
+            Some("client:laptop"),
+            "an enrolled directory names its principal"
+        );
+        assert_eq!(
+            super::enrolled_principal(None),
+            None,
+            "no --identity, no principal"
+        );
+        assert_eq!(
+            super::enrolled_principal(Some(std::path::Path::new("/nonexistent/iddir"))),
+            None,
+            "an unreadable directory enriches nothing and refuses nothing"
         );
     }
 }
