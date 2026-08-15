@@ -152,26 +152,17 @@ impl BlobService for Blobs {
 
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
-            let mut chunks = 0_u64;
-            let mut bytes = 0_u64;
+            // The same structural bound the in-memory drain has: a reader
+            // that stops making progress must fail the stream, not feed it
+            // forever.
+            let mut budget = crate::blob::ReadBudget::new(cap);
             loop {
                 match read.chunk().await {
                     Ok(Some(chunk)) => {
-                        // The same structural bound the in-memory drain has
-                        // (`blob::read_stays_honest`): a reader that stops
-                        // making progress must fail the stream, not feed it
-                        // forever.
-                        if !crate::blob::read_stays_honest(chunk.len(), chunks, bytes, cap) {
-                            let runaway = crate::blob::BlobError::Runaway {
-                                chunks: chunks + 1,
-                                bytes: bytes + chunk.len() as u64,
-                                limit: cap,
-                            };
+                        if let Err(runaway) = budget.admit(chunk.len()) {
                             let _ = sender.send(Err(Status::from(runaway))).await;
                             return;
                         }
-                        chunks += 1;
-                        bytes += chunk.len() as u64;
                         let frame = DownloadBlobResponse {
                             chunk: Some(BlobChunk { data: chunk }),
                         };

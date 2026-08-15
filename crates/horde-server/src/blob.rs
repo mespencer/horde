@@ -266,46 +266,66 @@ impl BlobStore {
     /// [`BlobError::Runaway`] when the on-disk file outgrew the cap.
     pub async fn read_all(&self, digest: &BlobDigest) -> Result<Vec<u8>, BlobError> {
         let mut read = self.read(digest).await?;
+        let mut budget = ReadBudget::new(self.max_blob_bytes);
         let mut bytes = Vec::new();
-        let mut chunks = 0_u64;
         while let Some(chunk) = read.chunk().await? {
-            if !read_stays_honest(chunk.len(), chunks, bytes.len() as u64, self.max_blob_bytes) {
-                return Err(BlobError::Runaway {
-                    chunks: chunks + 1,
-                    bytes: bytes.len() as u64 + chunk.len() as u64,
-                    limit: self.max_blob_bytes,
-                });
-            }
-            chunks += 1;
+            budget.admit(chunk.len())?;
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     }
 }
 
-/// Whether one more run of bytes keeps a blob read inside what an honest
-/// store can produce: the reader never yields an empty run, a verified
-/// blob never exceeds the cap that admitted it, and a cap-sized blob
-/// yields at most `cap / TRANSFER_CHUNK_BYTES + 1` runs.
+/// The structural bound on a chunked blob read: the reader never yields an
+/// empty run, a verified blob never exceeds the cap that admitted it, and
+/// a cap-sized blob yields at most `cap / TRANSFER_CHUNK_BYTES + 1` runs.
 ///
-/// A named predicate rather than a condition in the loop, because the
-/// states that would exercise it in place are exactly the ones an honest
-/// store never produces (QUALITY_GATES: extract the compound condition,
-/// test the truth table). Every consumer of [`BlobRead::chunk`] — the
-/// in-memory drain above and the service's download stream — runs it, so
-/// a reader that stops making progress fails in milliseconds instead of
-/// spinning a loop no clock can bound.
-#[must_use]
-pub(crate) fn read_stays_honest(
-    chunk_len: usize,
-    chunks_before: u64,
-    bytes_before: u64,
+/// One owner rather than accounting inlined in each loop, because the
+/// states that would exercise the accounting in place are exactly the ones
+/// an honest store never produces (QUALITY_GATES: extract the compound
+/// condition, test the truth table). Every consumer of [`BlobRead::chunk`]
+/// — the in-memory drain above and the service's download stream — admits
+/// each run through one of these, so a reader that stops making progress
+/// fails in milliseconds instead of spinning a loop no clock can bound.
+#[derive(Debug)]
+pub(crate) struct ReadBudget {
+    chunks: u64,
+    bytes: u64,
     cap: u64,
-) -> bool {
-    let max_chunks = cap / (TRANSFER_CHUNK_BYTES as u64) + 1;
-    chunk_len > 0
-        && bytes_before.saturating_add(chunk_len as u64) <= cap
-        && chunks_before < max_chunks
+}
+
+impl ReadBudget {
+    #[must_use]
+    pub(crate) fn new(cap: u64) -> Self {
+        Self {
+            chunks: 0,
+            bytes: 0,
+            cap,
+        }
+    }
+
+    /// Accounts one run of bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::Runaway`] — naming the chunk and byte counts as they
+    /// would stand *with* this run — the moment the read leaves what an
+    /// honest store can produce.
+    pub(crate) fn admit(&mut self, chunk_len: usize) -> Result<(), BlobError> {
+        let max_chunks = self.cap / (TRANSFER_CHUNK_BYTES as u64) + 1;
+        let bytes_after = self.bytes.saturating_add(chunk_len as u64);
+        let honest = chunk_len > 0 && bytes_after <= self.cap && self.chunks < max_chunks;
+        if !honest {
+            return Err(BlobError::Runaway {
+                chunks: self.chunks + 1,
+                bytes: bytes_after,
+                limit: self.cap,
+            });
+        }
+        self.chunks += 1;
+        self.bytes = bytes_after;
+        Ok(())
+    }
 }
 
 /// One upload in flight: bytes in, hash alongside, verified rename at the
@@ -614,42 +634,77 @@ mod tests {
     /// each factor flipped alone: an empty run, bytes past the cap
     /// (boundary held from both sides), and more chunks than a cap-sized
     /// blob can yield. The states an honest store never produces are
-    /// exactly why this is a named predicate rather than a loop condition.
+    /// exactly why the accounting has one testable owner rather than
+    /// living inline in each loop.
     #[test]
-    fn a_read_stays_honest_only_while_every_bound_holds() {
-        use super::read_stays_honest;
-        // A small cap: one chunk suffices, so max chunks is 1.
-        assert!(read_stays_honest(5, 0, 0, 8));
+    fn a_read_budget_admits_exactly_the_honest_reads() {
+        use super::ReadBudget;
+
+        // A small cap: one chunk suffices, so the budget is one chunk.
+        assert!(ReadBudget::new(8).admit(5).is_ok());
         assert!(
-            read_stays_honest(4, 0, 4, 8),
+            ReadBudget::new(8).admit(8).is_ok(),
             "exactly to the cap is honest"
         );
         assert!(
-            !read_stays_honest(0, 0, 0, 8),
+            ReadBudget::new(8).admit(0).is_err(),
             "an empty run is no progress"
         );
-        assert!(!read_stays_honest(9, 0, 0, 8), "past the cap in one run");
-        assert!(!read_stays_honest(4, 0, 5, 8), "past the cap accumulated");
         assert!(
-            !read_stays_honest(4, 1, 0, 8),
+            ReadBudget::new(8).admit(9).is_err(),
+            "past the cap in one run"
+        );
+        let mut accumulated = ReadBudget::new(8);
+        accumulated.admit(5).expect("the first five fit");
+        assert!(accumulated.admit(4).is_err(), "past the cap accumulated");
+        let mut counted = ReadBudget::new(8);
+        counted.admit(4).expect("one chunk suffices for 8 bytes");
+        assert!(
+            counted.admit(4).is_err(),
             "a second chunk when one suffices"
         );
 
         // A multi-chunk cap: 3 MiB yields at most 3 full chunks + 1 tail.
-        let cap = 3 * 1024 * 1024;
+        let mut multi = ReadBudget::new(3 * 1024 * 1024);
+        for _ in 0..4 {
+            multi.admit(100).expect("four small runs are honest");
+        }
         assert!(
-            read_stays_honest(100, 3, 0, cap),
-            "the fourth chunk is honest"
-        );
-        assert!(
-            !read_stays_honest(100, 4, 0, cap),
+            multi.admit(100).is_err(),
             "a fifth chunk is more than a cap-sized blob yields"
         );
     }
 
+    /// The refusal carries true accounting — the chunk and byte counts as
+    /// they stood at the crossing — which is what makes the message a
+    /// diagnosis rather than a shrug.
+    #[test]
+    fn a_runaway_refusal_names_the_counts_at_the_crossing() {
+        use super::ReadBudget;
+        let mut budget = ReadBudget::new(1_500_000);
+        budget.admit(1_000_000).expect("the first chunk fits");
+        let error = budget.admit(1_000_000).expect_err("the second crosses");
+        let rendered = error.to_string();
+        assert!(
+            matches!(
+                error,
+                BlobError::Runaway {
+                    chunks: 2,
+                    bytes: 2_000_000,
+                    limit: 1_500_000,
+                }
+            ),
+            "got {rendered}"
+        );
+        for needed in ["2 chunk(s)", "2000000 bytes", "1500000-byte"] {
+            assert!(rendered.contains(needed), "missing {needed:?}: {rendered}");
+        }
+    }
+
     /// The honest path to `Runaway`: a stored file that outgrew the cap
     /// behind the store's back. The drain must refuse at the crossing,
-    /// naming the cap, rather than follow the file wherever it goes.
+    /// naming what it counted, rather than follow the file wherever it
+    /// goes.
     #[tokio::test]
     async fn a_file_grown_past_the_cap_refuses_as_a_runaway_read() {
         let (dir, store) = store();
@@ -663,7 +718,14 @@ mod tests {
         let error = store.read_all(&stored.digest).await.expect_err("refuses");
         let rendered = error.to_string();
         assert!(
-            matches!(error, BlobError::Runaway { limit: 8, .. }),
+            matches!(
+                error,
+                BlobError::Runaway {
+                    chunks: 1,
+                    bytes: 20,
+                    limit: 8,
+                }
+            ),
             "got {rendered}"
         );
         assert!(
