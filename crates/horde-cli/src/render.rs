@@ -441,6 +441,40 @@ pub fn joined(principal: &str, directory: &std::path::Path, format: Format) -> S
     }
 }
 
+/// Renders a stashed blob: the address is the point — it is what an
+/// attachment (or a later fetch) carries.
+#[must_use]
+pub fn stashed(stored: &horde_proto::v1::UploadBlobResponse, format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "blob_digest": stored.blob_digest,
+            "size_bytes": stored.size_bytes,
+        })
+        .to_string(),
+        Format::Human => format!(
+            "stashed {} bytes at {}",
+            stored.size_bytes, stored.blob_digest
+        ),
+    }
+}
+
+/// Renders a fetched blob: where the verified bytes landed.
+#[must_use]
+pub fn fetched(address: &str, out: &std::path::Path, size_bytes: u64, format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "blob_digest": address,
+            "out": out.display().to_string(),
+            "size_bytes": size_bytes,
+        })
+        .to_string(),
+        Format::Human => format!(
+            "fetched {address} ({size_bytes} bytes, verified) into {}",
+            out.display()
+        ),
+    }
+}
+
 /// Renders an acknowledgement that carries only a log position.
 #[must_use]
 pub fn sequence(verb: &str, sequence: u64, format: Format) -> String {
@@ -1225,6 +1259,45 @@ mod enrollment_render_tests {
                 .expect("json mode emits json");
         assert_eq!(json["principal"], "client:laptop");
         assert_eq!(json["identity_dir"], "/tmp/id");
+    }
+}
+
+#[cfg(test)]
+mod blob_render_tests {
+    use super::{Format, fetched, stashed};
+
+    /// The address is what a script pipes into the next command, so both
+    /// formats must carry it — and the size, which is the only sanity check
+    /// a caller has before fetching.
+    #[test]
+    fn a_stash_reports_the_address_and_size_in_both_formats() {
+        let stored = horde_proto::v1::UploadBlobResponse {
+            blob_digest: "sha256:abc123".to_owned(),
+            size_bytes: 4096,
+        };
+        assert_eq!(
+            stashed(&stored, Format::Human),
+            "stashed 4096 bytes at sha256:abc123"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&stashed(&stored, Format::Json)).expect("json mode emits json");
+        assert_eq!(json["blob_digest"], "sha256:abc123");
+        assert_eq!(json["size_bytes"], 4096);
+    }
+
+    #[test]
+    fn a_fetch_reports_where_the_verified_bytes_landed() {
+        let out = std::path::Path::new("/tmp/shot.png");
+        assert_eq!(
+            fetched("sha256:abc123", out, 512, Format::Human),
+            "fetched sha256:abc123 (512 bytes, verified) into /tmp/shot.png"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&fetched("sha256:abc123", out, 512, Format::Json))
+                .expect("json mode emits json");
+        assert_eq!(json["blob_digest"], "sha256:abc123");
+        assert_eq!(json["out"], "/tmp/shot.png");
+        assert_eq!(json["size_bytes"], 512);
     }
 }
 

@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use horde_proto::v1::blob_service_server::BlobServiceServer;
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::enrollment_service_server::EnrollmentServiceServer;
 use horde_proto::v1::worker_service_server::WorkerServiceServer;
@@ -64,6 +65,13 @@ pub async fn serve_main(
         ControlPlane::with_enrollment(core.clone(), authority),
         horde_identity::require_enrolled(deny.clone()),
     );
+    // Blob transfer rides the same listener and the same enrolled door:
+    // workers and clients both move attachments, so the service is
+    // principal-agnostic rather than duplicated onto each spine.
+    let blobs = BlobServiceServer::with_interceptor(
+        crate::service::Blobs::new(core.blobs.clone()),
+        horde_identity::require_enrolled(deny.clone()),
+    );
     let worker_facing = WorkerServiceServer::with_interceptor(
         WorkerFacing::new(core),
         horde_identity::require_enrolled(deny),
@@ -73,6 +81,7 @@ pub async fn serve_main(
         .tls_config(tls)
         .map_err(|e| ServerError::Internal(format!("mTLS configuration refused: {e}")))?
         .add_service(control_plane)
+        .add_service(blobs)
         .add_service(worker_facing);
 
     let task = tokio::spawn(async move {

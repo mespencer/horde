@@ -72,19 +72,38 @@ impl std::fmt::Debug for SecureHarness {
 ///
 /// Any failure to build the CA, the log, or either listener.
 pub async fn serve_secured() -> Setup<SecureHarness> {
+    serve_secured_with_blobs(None).await
+}
+
+/// [`serve_secured`], with a real blob store rooted at `blob_root` — the
+/// full wave-5 shape plus wave-6's attachment transfer, for suites proving
+/// blobs move over the authenticated channel. The caller owns the
+/// directory, exactly as [`crate::serve_with_blob_store`] has it.
+///
+/// # Errors
+///
+/// As [`serve_secured`], plus the store refusing to open.
+pub async fn serve_secured_with_blob_store(blob_root: &std::path::Path) -> Setup<SecureHarness> {
+    let store = horde_server::blob::BlobStore::open(blob_root)?;
+    serve_secured_with_blobs(Some(Arc::new(store))).await
+}
+
+async fn serve_secured_with_blobs(
+    blobs: Option<Arc<horde_server::blob::BlobStore>>,
+) -> Setup<SecureHarness> {
     let log = EventLog::in_memory()?;
     let now = wall_clock_ms();
     let ca = horde_identity::CertificateAuthority::generate(now)?;
     let credential = ca.issue_localhost_server(now)?;
     let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
 
+    let mut core = ServerCore::new(log.clone());
+    if let Some(store) = blobs {
+        core = core.with_blob_store(store);
+    }
+
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-    let main = horde_server::transport::serve_main(
-        loopback,
-        ServerCore::new(log.clone()),
-        Arc::clone(&authority),
-    )
-    .await?;
+    let main = horde_server::transport::serve_main(loopback, core, Arc::clone(&authority)).await?;
     let enrollment =
         horde_server::transport::serve_enrollment(loopback, Arc::clone(&authority)).await?;
 

@@ -35,11 +35,21 @@ message Attachment {
   // Display name, e.g. "failing-test.log". Not a path and not unique.
   string name = 1;
 
-  // Content address in the Blob Store, e.g. "sha256:abc...". The identity.
+  // Content address in the Blob Store, e.g. "sha256:abc...". The identity —
+  // always set, whether the content rides inline or in the store, so a
+  // receiver verifies what it reads either way.
   string blob_digest = 2;
 
   uint64 size_bytes = 3;
 
   // IANA media type when known, e.g. "image/png".
   string media_type = 4;
+
+  // The content itself, present only when it fits the inline threshold
+  // (64 KiB — `horde_proto::blob::INLINE_THRESHOLD_BYTES` documents why).
+  // Anything larger travels through the Blob Store and leaves this empty:
+  // events carry blob references and hashes, never bulk (ADR-0001), and the
+  // Server's log refuses an event that smuggles more than the threshold
+  // here. The stash seam picks the carrier; senders never choose.
+  bytes inline = 5;
 }

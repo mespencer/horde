@@ -7,10 +7,37 @@
 //! outcomes (wrong CA, spent codes, revocation) belong to `horde-server`'s
 //! enrollment suite; this file holds the harness itself to its promises.
 
+mod common;
+
 use horde_identity::PrincipalRole;
-use horde_server_testkit::secure::{hello, serve_secured, within};
+use horde_server_testkit::secure::{hello, serve_secured, serve_secured_with_blob_store, within};
 
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The blob-serving variant keeps every promise of [`serve_secured`] and
+/// adds a live store on the caller's directory: an enrolled principal moves
+/// bytes over mTLS and they land on the disk the caller named. Asserted by
+/// the on-disk effect, which is what a mutant of the wiring cannot fake.
+#[tokio::test]
+async fn the_secured_blob_harness_moves_bytes_for_an_enrolled_principal() -> Setup<()> {
+    let blob_root = tempfile::tempdir()?;
+    let harness = serve_secured_with_blob_store(blob_root.path()).await?;
+    let identity = within(
+        "the worker join",
+        harness.enroll(PrincipalRole::Worker, "blob-box"),
+    )
+    .await??;
+
+    let channel = harness.main_endpoint_as(&identity)?.connect().await?;
+    let mut blobs = horde_proto::v1::blob_service_client::BlobServiceClient::new(channel);
+
+    within(
+        "the blob round trip",
+        common::assert_blob_lands_under_root(&mut blobs, blob_root.path(), b"secured testkit blob"),
+    )
+    .await??;
+    Ok(())
+}
 
 #[tokio::test]
 async fn the_harness_issues_identities_that_open_the_spines_they_are_for() -> Setup<()> {

@@ -9,6 +9,7 @@
 //! depending back on their own parent — a parent that both re-exports a child
 //! and defines what that child imports is a module cycle.
 
+pub mod blob;
 pub mod commands;
 pub mod control_plane;
 pub mod enrollment;
@@ -16,6 +17,7 @@ pub mod shared;
 pub mod sync;
 pub mod worker;
 
+pub use blob::Blobs;
 pub use commands::{CommandProjection, CommandStream};
 pub use control_plane::ControlPlane;
 pub use enrollment::{Enrollment, EnrollmentAuthority, MintedCode};

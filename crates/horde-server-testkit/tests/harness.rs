@@ -7,6 +7,8 @@
 //! an event replayed after its push was acked — rather than trusting a
 //! returned value, because a returned value is exactly what a mutant fakes.
 
+mod common;
+
 use horde_cli::client::SyncOptions;
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
@@ -169,6 +171,28 @@ async fn open_journal_leaves_the_first_ack_for_the_caller() {
         matches!(first.body, Some(push_events_response::Body::Accepted(_))),
         "a fresh worker announcing position 0 is accepted, and the caller sees it"
     );
+}
+
+/// `serve_with_blob_store` really wires the store, rooted where the caller
+/// said: bytes uploaded through the endpoint land as a file under the
+/// caller's directory, and download hands them back. The on-disk effect is
+/// the assertion, because the returned endpoint string is exactly what a
+/// mutant of the wiring fakes.
+#[tokio::test]
+async fn a_blob_store_server_moves_bytes_under_the_callers_root() {
+    let blob_root = tempfile::tempdir().expect("a temp dir");
+    let endpoint = horde_server_testkit::serve_with_blob_store(blob_root.path())
+        .await
+        .expect("the blob harness must serve");
+    let mut blobs = horde_proto::v1::blob_service_client::BlobServiceClient::connect(
+        tonic::transport::Endpoint::try_from(endpoint).expect("the endpoint must parse"),
+    )
+    .await
+    .expect("the blob client must connect");
+
+    common::assert_blob_lands_under_root(&mut blobs, blob_root.path(), b"testkit blob")
+        .await
+        .expect("the store must keep its promises");
 }
 
 /// `serve_with_permissions` really runs the chain: a request journaled the way

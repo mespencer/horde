@@ -10,6 +10,7 @@
 //! and subscriber policy, and nothing in the library installs a global
 //! subscriber or decides how logs are formatted.
 
+pub mod blob;
 pub mod enrollment;
 pub mod error;
 pub mod log;
@@ -25,6 +26,7 @@ pub mod transport;
 pub mod usage;
 pub mod workspace;
 
+pub use blob::{BlobError, BlobStore};
 pub use enrollment::EnrollmentRoster;
 pub use error::ServerError;
 pub use log::EventLog;

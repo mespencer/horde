@@ -108,6 +108,21 @@ pub enum ServerError {
         incoming: &'static str,
     },
 
+    /// An event tried to carry attachment content larger than the inline
+    /// threshold in its own body. Events carry blob references and hashes,
+    /// never bulk (ADR-0001): bulk belongs in the Blob Store, and letting it
+    /// into the log would tax every replay of the session forever.
+    #[error(
+        "events carry blob references, never bulk: attachment {name:?} carries \
+         {inline_bytes} inline bytes, over the {threshold}-byte inline threshold — \
+         stash the content in the blob store and send its digest instead"
+    )]
+    InlineBulk {
+        name: String,
+        inline_bytes: u64,
+        threshold: u64,
+    },
+
     /// Reached the wire but could not be decoded.
     #[error("could not decode a stored event: {0}")]
     Decode(#[from] prost::DecodeError),
@@ -157,6 +172,9 @@ impl From<ServerError> for Status {
             // The caller must change the key, not retry: sending the same
             // bytes again produces the same collision.
             ServerError::IdempotencyKeyCollision { .. } => Code::InvalidArgument,
+            // The caller must re-shape the event (stash, then reference);
+            // retrying the same bulk produces the same refusal.
+            ServerError::InlineBulk { .. } => Code::InvalidArgument,
             ServerError::EnrollmentRefused(_) => Code::Unauthenticated,
             ServerError::Unimplemented(_) => Code::Unimplemented,
             ServerError::Storage { .. }
@@ -247,6 +265,22 @@ mod tests {
             "both tokens are needed to see what raced: {}",
             stale.message()
         );
+    }
+
+    /// The refusal must tell the caller how to fix the event, not merely
+    /// that it was refused — the remedy is a different shape, not a retry.
+    #[test]
+    fn smuggled_bulk_is_invalid_argument_and_names_the_remedy() {
+        let status = tonic::Status::from(ServerError::InlineBulk {
+            name: "trace.bin".to_owned(),
+            inline_bytes: 90_000,
+            threshold: 65_536,
+        });
+        assert_eq!(status.code(), Code::InvalidArgument);
+        let message = status.message();
+        for needed in ["trace.bin", "90000", "65536", "blob store"] {
+            assert!(message.contains(needed), "missing {needed:?}: {message}");
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! by pattern is how a supervisor reaches outside its own subtree and takes down
 //! something it did not start.
 
+pub mod blob;
 pub mod capabilities;
 pub mod claude;
 pub mod client;
@@ -34,6 +35,7 @@ pub mod share;
 pub mod translate;
 pub mod workspace;
 
+pub use blob::AttachmentBroker;
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use client::{ApplyCommand, Connection, DialConfig};
 pub use codex::{CodexAdapter, LiveCodexSession};

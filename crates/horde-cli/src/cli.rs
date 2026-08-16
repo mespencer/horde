@@ -63,6 +63,9 @@ pub enum Command {
     /// Attach to a session interactively. `sync --follow` is the headless,
     /// scriptable form of the same subscription.
     Attach(AttachArgs),
+    /// Move attachment content through the server's blob store (DESIGN §8).
+    #[command(subcommand)]
+    Blob(BlobCommand),
     /// The MCP Hub catalog: user MCP servers proxied onto every agent's
     /// endpoint (ADR-0004).
     #[command(subcommand)]
@@ -75,6 +78,25 @@ pub enum Command {
     /// This machine's own identity: joining, and client codes for others.
     #[command(subcommand)]
     Enroll(EnrollCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BlobCommand {
+    /// Upload a file to the blob store and print its content address.
+    /// Payload attachments carry this address; events never carry the bulk.
+    Stash {
+        /// The file whose bytes become the blob.
+        file: std::path::PathBuf,
+    },
+    /// Download a blob by content address into a file, verified against the
+    /// address before anything is kept.
+    Fetch {
+        /// The address `stash` printed: `sha256:<64 hex>`.
+        address: String,
+        /// Where to write the verified bytes.
+        #[arg(long, short)]
+        out: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -367,6 +389,7 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
+        Some(Command::Blob(command)) => run_blob(client, command, format).await,
         Some(Command::Mcp(command)) => run_mcp(client, command, format).await,
         Some(Command::Usage(args)) => run_usage(client, args, format).await,
         Some(Command::Worker(command)) => run_worker(client, command, format).await,
@@ -457,6 +480,33 @@ async fn run_join(
         "{}",
         render::joined(&enrolled.principal.to_string(), &directory, format)
     );
+    Ok(())
+}
+
+async fn run_blob(
+    client: &mut Client,
+    command: &BlobCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    let file_error = |path: &std::path::Path| {
+        let path = path.to_owned();
+        move |source| ClientError::File { path, source }
+    };
+    match command {
+        BlobCommand::Stash { file } => {
+            let bytes = std::fs::read(file).map_err(file_error(file))?;
+            let stored = client.stash_blob(&bytes).await?;
+            println!("{}", render::stashed(&stored, format));
+        }
+        BlobCommand::Fetch { address, out } => {
+            let bytes = client.fetch_blob(address).await?;
+            std::fs::write(out, &bytes).map_err(file_error(out))?;
+            println!(
+                "{}",
+                render::fetched(address, out, bytes.len() as u64, format)
+            );
+        }
+    }
     Ok(())
 }
 

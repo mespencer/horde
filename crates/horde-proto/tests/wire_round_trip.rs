@@ -41,6 +41,7 @@ fn payload_carries_multi_repo_refs_and_attachments() {
             blob_digest: "sha256:8f14e45fceea167a5a36dedd4bea2543".to_owned(),
             size_bytes: 4096,
             media_type: "text/plain".to_owned(),
+            inline: b"assertion failed: left == right".to_vec(),
         }],
     });
 }

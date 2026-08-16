@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 /// Proto files compiled into the crate, relative to the proto root.
 const PROTO_FILES: &[&str] = &[
     "horde/v1/agent.proto",
+    "horde/v1/blob.proto",
     "horde/v1/control_plane.proto",
     "horde/v1/enrollment.proto",
     "horde/v1/event.proto",
