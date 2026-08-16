@@ -1452,7 +1452,16 @@ mod tests {
             }
             polls += 1;
             assert!(polls < 64, "the journal never reached {minimum} events");
-            tokio::time::timeout(core::time::Duration::from_secs(5), head.changed())
+            // A positive wait: something must arrive, and the assertion is
+            // on what arrived — so a clock is legitimate here, but only as
+            // a ceiling, never as a duration anything is expected to take.
+            // The previous 5s ceiling was a clock assumption in a costume:
+            // under `cargo test`'s single-process execution with every
+            // suite's threads contending, one wake legitimately took
+            // longer, and the wait reported "stopped moving" for a journal
+            // that was merely slow. Generous on purpose; a passing run
+            // never spends it.
+            tokio::time::timeout(core::time::Duration::from_secs(60), head.changed())
                 .await
                 .expect("the journal stopped moving")
                 .expect("the journal outlives the wait");
