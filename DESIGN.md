@@ -32,7 +32,7 @@ All Rust. Shipped as three separate binaries — combining them invites designs 
 
 gRPC (tonic) everywhere. Resilience comes from state, not transport: every session has an **append-only event log** on the server (agent output chunks, spawns, messages, permission requests, usage records — all events with sequence numbers). Client and worker streams are "sync me from offset N," so reconnect, attach, replay/scrollback, crash recovery, and usage attribution are one mechanism. See ADR-0001.
 
-**Partition behavior:** a worker that loses the server keeps its agents running and journals events locally, syncing on reconnect. Anything that *requires* the server (permission escalation, cross-worker spawn, relay push) blocks only the agent that needs it.
+**Partition behavior:** a worker that loses the server keeps its agents running and journals events locally, syncing on reconnect. "Keeps running" means the live process rides out the partition; continuity across a worker *restart* is **journaled revival**, not process survival — the journal holds each agent's spawn command and provider session id, and the worker rebuilds the agent by resuming that provider session. Anything that *requires* the server (permission escalation, cross-worker spawn, relay push) blocks only the agent that needs it.
 
 ### Version skew
 
@@ -44,7 +44,10 @@ The server is remote-code-execution-as-a-service by design; the trust boundary i
 
 - **mTLS for every principal** (workers *and* clients), certs issued by the server's internal CA.
 - **Enrollment:** `horde worker enroll` on a trusted client prints a short-lived one-time code embedding the server cert fingerprint. On the new machine, `horde-worker join <server> --code <code>` verifies the server against the fingerprint, generates a keypair locally, submits a CSR, and the server signs it. Private keys never travel. Clients enroll identically.
-- **Revocation:** per-cert denylist by serial (`horde worker revoke <name>`).
+- **Revocation:** per-cert denylist by serial (`horde worker revoke <name>`), journaled as events and seeded from the log at startup. Reach (wave-7 fix): unary calls are checked per request, and revoking a principal also severs its live streams — a revoked worker does not keep pumping commands until it happens to reconnect.
+- **Minting and revoking require a Client-role principal** (wave-7 fix): enrollment alone does not confer them, so a worker cert can neither mint codes nor revoke peers.
+- **Bootstrap trust root:** at `--serve` startup, exactly when no client holds an active cert, the server mints a first client enrollment code and prints it to stdout. Whoever reads the server's stdout already owns the disk the CA key lives on — the same trust, no new surface.
+- **Rotation:** lifetimes are CA 20y, listener 2y, principal 1y. No renewal RPC and no expiry warning yet; rotation is manual re-enrollment under the same name, which the roster supports by keeping every serial a name has held.
 - No non-localhost binding before auth exists — auth ships with the first networked build, not as a follow-up.
 
 ### Worker bootstrap over ssh (sequenced later)
@@ -62,7 +65,7 @@ The server is remote-code-execution-as-a-service by design; the trust boundary i
 A per-provider **adapter** trait: `spawn / send / stream / interrupt / resume`, plus capability flags (notably `resumable`).
 
 - **Claude (first-class):** the worker drives `claude --input-format stream-json --output-format stream-json` directly as a child process — no Node sidecar. Session revival via `--resume`. Permission decisions route through `--permission-prompt-tool` pointed at the horde MCP endpoint. If stream-json proves too lossy, fallback is a thin Agent SDK shim per agent (contained, not preferred). See ADR-0003. **This is the de-risking spike to run first.**
-- **Other harnesses:** ACP where supported (Codex, etc.), each behind the same trait.
+- **Codex:** driven via its app-server JSON-RPC interface (ADR-0005); ACP was evaluated there and rejected. Other harnesses land behind the same trait.
 - **Raw/self-hosted models (Ollama etc.):** part of the end state, sequenced late. A bare endpoint brings no tool loop, so raw endpoints require a harness Horde supplies (built-in minimal loop vs. wrapped OSS harness is an open question); the adapter trait is the seam either slots into. Until then, harness-backed providers only.
 
 ### Provider accounts
@@ -76,7 +79,7 @@ A per-provider **adapter** trait: `spawn / send / stream / interrupt / resume`, 
 **One agent primitive.** No bounded/unbounded split.
 
 - An agent is spawned with a task, works, and emits a **result**; then it goes **idle with context retained** — revivable by just sending it another message (requires adapter `resumable`; non-resumable providers get honestly-terminal agents).
-- **Lifecycle states:** running → waiting-on-child / waiting-on-human → idle → archived. Context dies at archive, not at result.
+- **Lifecycle states:** queued → starting → running → waiting-on-child / waiting-on-human → idle → archived; failed is reachable from any active state. Context dies at archive, not at result.
 - **Cleanup:** reaper policy (default: archive after 60 min idle with no pending assignment; archived metadata retained until session deletion) plus explicit parent cleanup ("done with these children"). No keep-warm flag.
 - **Capabilities attenuate down the tree only.** A child asking for more than its parent has is a human-approval event, never silent.
 
@@ -87,7 +90,7 @@ Two message kinds, sender declares intent (one bit, no taxonomy):
 - **`assign`** — expects exactly one **result**: `status (success | partial | blocked) + summary + payload`. Spawning carries an implicit first assignment. A follow-up assignment ("you missed X") yields a new result.
 - **`note`** — chat/context/status. No result owed. Ongoing agents (monitors) live on notes.
 
-`wait_for_agent` waits on an assignment's result. (CC precedent: Task subagents are strict result-per-call; teammates are freeform + shared task list. This is the synthesis.)
+`wait_for_agent` waits on an assignment's result. As built, correlation is by **agent**, not assignment id: the wait wakes on that agent's next result, whichever assignment it answers. (CC precedent: Task subagents are strict result-per-call; teammates are freeform + shared task list. This is the synthesis.)
 
 ### Sharing is implicit in the verbs (payloads)
 
@@ -120,15 +123,15 @@ Every agent gets exactly one horde-controlled MCP endpoint carrying:
 2. Proxied hub MCP tools (§9).
 3. Worker-local MCP tools (config-flagged `local`).
 
-Native subagent tools (CC Task, etc.) are suppressed and substituted. Permission prompts also ride this endpoint (Claude: `--permission-prompt-tool`).
+Native subagent tools (CC Task, etc.) are suppressed and substituted — not yet built; the target mechanism is the harness's own tool-disable flag (CC: `--disallowedTools Task`), applied by the worker at spawn. Until it lands, native Task remains reachable. Permission prompts also ride this endpoint (Claude: `--permission-prompt-tool`).
 
 ## 6. Sessions, placement, scheduling
 
 - **Session = one conversation tree rooted at one top-level agent.** No "project" entity. Sessions reference a workspace; grouping by workspace is a TUI query, not data model.
 - **The agent, not the session, is the unit of placement.** Sessions span workers freely.
-- **Workspace locality drives colocation:** agents sharing a *mutable* workspace instance colocate; independent agents go anywhere.
+- **Workspace locality is a placement preference:** the scheduler ranks workers with a warm instance (present or already materializing) first, then the parent's worker, then load — and constraints always win; warmth never overrides a failed constraint. Independent agents go anywhere.
 - Workers advertise **capabilities**: freeform tags (`gpu`, `macos`) + auto-detected facts (os/arch) + provider accounts + reachable git remotes + warm workspace instances + headroom. Spawn requests carry constraints; scheduler matches, preferring the parent's worker when nothing forces otherwise.
-- **No matching worker:** spawn never blocks the caller — returns a handle with status `queued` and the reason ("no online worker with tag `gpu`; `gpu-box` matches but is offline"). Spawner may wait, relax, cancel, or escalate. Default queue timeout; expiry is an event the spawner hears.
+- **No matching worker:** spawn never blocks the caller — returns a handle with status `queued` and the reason ("no online worker with tag `gpu`; `gpu-box` matches but is offline"). Spawner may wait, relax, cancel, or escalate. Default queue timeout: 1 hour. Expiry is an event the spawner hears — evaluated when a placement pass runs, not at the deadline itself.
 - Explicit `prewarm` command materializes a workspace instance on a chosen worker ahead of need; instantiation progress streams as session events.
 
 ## 7. Workspaces
@@ -145,7 +148,7 @@ Split: **definition** (portable) vs **instance** (per-worker materialization). S
 
 Committed to git deliberately (ADR-0002). The unit of sharing is the commit; syncing dirty working trees across workers is permanently out of scope ("commit, then share" — the tool errors helpfully on uncommitted changes).
 
-**Server git relay:** bare mirrors per registered repo (lazy — mirrored on first fetch), served over git smart-HTTP (`git http-backend`) behind the existing mTLS channel.
+**Server git relay:** bare mirrors per registered repo (lazy — mirrored on first fetch), served over git smart-HTTP (`git http-backend`) behind mTLS. As built: the mTLS door is a separate listener sharing the main listener's CA and revocation material — the same trust, not literally the same channel — and a plaintext bootstrap listener exists for loopback only, serving with the ambient principal `horde`.
 
 - Transport resolution per sharing pair, invisible to agents: same clone/worktrees → ref checkout only; same worker → fetch from peer path; cross-worker → push/fetch through the relay.
 - Relay doubles as clone cache and **credential chokepoint**. End state: only the server holds external git credentials; workers' only remote is the relay. Bootstrap phase: workers use ambient machine credentials (ssh-agent, `gh auth`) and advertise reachable remotes as capabilities.
@@ -169,10 +172,12 @@ Single-auth for user MCP servers (Linear, Grafana, …): the **server** runs/own
 
 Layered, evaluated in order:
 
-1. **Deterministic deny** (worker-local, fast)
-2. **Deterministic allow** (worker-local, fast)
+1. **Deterministic deny**
+2. **Deterministic allow**
 3. **LLM policy judge** — plain-text mode definitions ("allow X, never Y") evaluated by a cheap model against the proposed tool call
 4. **Human approval** — an ordinary event in the tree, answerable from *any* connected client (this is the phone-approval story)
+
+As built, the whole chain evaluates **server-side**, in one driver over the event log (deny → remembered allow → allow → judge → escalate) — one authority, not the worker-local fast path originally sketched here. The worker's share of enforcement is the harness-side settings hardening that stops a harness pre-empting the chain (ADR-0003).
 
 Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), and layered under manual-approve / allowlist styles. Escalation requests carry tree path + context ("session ci-fix → reviewer → test-runner wants `docker rm`").
 
@@ -194,9 +199,9 @@ Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), an
 ## 12. Usage and observability
 
 - Usage events per agent (tokens, rate-window state where providers expose it), aggregated by tree path and by provider account.
-- **Reporting + soft alerts:** clients surface per-agent/per-tree usage; threshold alerts fire as ordinary events (phone-visible). This lands first.
+- **Reporting + soft alerts:** clients surface per-agent/per-tree usage; threshold alerts fire as ordinary events (phone-visible). Not yet landed — reporting shipped first (`horde usage`, CLI only), with no alert event kind or threshold config yet.
 - **Hard budgets (end state, sequenced later):** a spawn may carry a budget; at the cap the subtree pauses pending human approval (an ordinary permission-style event). The accounting schema is designed for this from day one.
-- **OTLP tracing:** the agent tree maps onto the span tree (agents = spans, tool calls = events). Flame-graph views of an orchestration for free.
+- **OTLP tracing:** the agent tree maps onto the span tree (agents = spans, tool calls = events), giving flame-graph views of an orchestration. As built: the export pipeline is real but carries RPC-handler spans only — the agent-tree-to-span mapping is still to build, so the flame graph is not yet obtainable — and export is plaintext gRPC (no TLS), an open inconsistency with §3's mTLS-everywhere posture.
 
 ## 13. Configuration layering
 
