@@ -459,6 +459,9 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
             .expect("the stream must not fail")
         {
             Some(StreamUpdate::Event(envelope)) => sequences.push(envelope.sequence),
+            // Liveness, not content: a heartbeat during a replay is legal
+            // and says nothing about the sequence being asserted on.
+            Some(StreamUpdate::Heartbeat) => {}
             Some(StreamUpdate::CaughtUp {
                 session_id: caught,
                 head,

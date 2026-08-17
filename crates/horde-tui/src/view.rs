@@ -38,7 +38,12 @@ fn render_overview(app: &App, frame: &mut Frame<'_>) {
 
     render_rows(
         frame,
-        header_line("horde — sessions", app.waiting_total(), app.status()),
+        header_line(
+            "horde — sessions",
+            app.waiting_total(),
+            app.stream_stale(),
+            app.status(),
+        ),
         rows,
         "[enter] attach  [i] inbox  [r] refresh  [q] quit",
     );
@@ -66,7 +71,7 @@ fn render_inbox(app: &App, frame: &mut Frame<'_>) {
 
     render_rows(
         frame,
-        header_line("inbox", entries.len(), app.status()),
+        header_line("inbox", entries.len(), app.stream_stale(), app.status()),
         rows,
         "[y] allow  [n] deny  [enter] attach  [o] overview  [q] quit",
     );
@@ -131,16 +136,24 @@ fn rows_to_lines(rows: Vec<String>) -> Vec<Line<'static>> {
 
 /// A screen title, the waiting badge when anything waits, and the last
 /// refusal when there was one.
-fn header_line(title: &str, waiting: usize, status: &str) -> Line<'static> {
+fn header_line(title: &str, waiting: usize, stale: bool, status: &str) -> Line<'static> {
     let mut text = format!(" {title}");
     if waiting > 0 {
         text.push_str(&format!("  — {waiting} waiting"));
+    }
+    if stale {
+        text.push_str(STALE_BADGE);
     }
     if !status.is_empty() {
         text.push_str(&format!("  ⚠ {status}"));
     }
     Line::from(text)
 }
+
+/// The staleness badge (fix a9): rendered when the follow stream has been
+/// silent past the heartbeat ceiling, on every screen — a dead stream must
+/// not look like a quiet one anywhere.
+const STALE_BADGE: &str = "  ⚠ stream stale — no heartbeat";
 
 fn overview_row(session: &SessionState, selected: bool) -> String {
     let mut row = format!(
@@ -175,6 +188,9 @@ fn session_header(app: &App, session: &SessionState, agent_id: Option<&str>) -> 
     let elsewhere = app.waiting_elsewhere();
     if elsewhere > 0 {
         text.push_str(&format!("  — {elsewhere} waiting elsewhere"));
+    }
+    if app.stream_stale() {
+        text.push_str(STALE_BADGE);
     }
     if !app.status().is_empty() {
         text.push_str(&format!("  ⚠ {}", app.status()));

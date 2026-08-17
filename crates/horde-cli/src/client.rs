@@ -946,10 +946,6 @@ pub struct EventStream {
 }
 
 /// One meaningful thing a follow stream can say.
-///
-/// Heartbeats are absorbed below this surface: they exist to keep the
-/// connection distinguishable from a dead one, and a consumer that had to
-/// skip them itself would be one more loop with a skip-arm to get wrong.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamUpdate {
     /// The next event, in log order. Boxed: an envelope dwarfs the marker
@@ -960,6 +956,11 @@ pub enum StreamUpdate {
     /// instead of guessing. A merged stream yields one of these per followed
     /// session.
     CaughtUp { session_id: String, head: u64 },
+    /// The server saying "still alive, nothing to say". Surfaced rather
+    /// than absorbed (fix a9): the heartbeat exists so quiet and dead are
+    /// distinguishable, and a client that swallowed it here left no
+    /// component able to make the distinction — the audit's collision #6.
+    Heartbeat,
 }
 
 impl EventStream {
@@ -1005,7 +1006,10 @@ impl EventStream {
                             }
                         }));
                 }
-                Some(sync_events_response::Update::Heartbeat(_)) | None => {}
+                Some(sync_events_response::Update::Heartbeat(_)) => {
+                    return Ok(Some(StreamUpdate::Heartbeat));
+                }
+                None => {}
             }
         }
     }

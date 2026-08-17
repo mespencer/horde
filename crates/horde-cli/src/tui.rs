@@ -119,14 +119,17 @@ where
 
     let sessions = refresh_sessions(&mut client, &mut app).await?;
 
-    // One merged stream serves the whole TUI. This used to be a fan-in of
-    // one stream per session; the server grew `all_sessions`, so it
-    // collapsed.
-    let attachment = app
-        .attachment()
-        .map(|attachment| attachment.session_id.clone());
-    let cursors = overview_cursors(&sessions, attachment.as_deref());
-    tokio::spawn(pump(client.clone(), cursors, updates));
+    // One stream serves the whole TUI. An attach scoped to an agent's
+    // subtree scopes it server-side (`subtree_root`, fix a14) — the server
+    // has honored the field all along; the TUI simply never sent it. An
+    // unscoped launch keeps the merged all-sessions stream.
+    let subscription = subscription_for(app.attachment(), &sessions);
+    tokio::spawn(pump(client.clone(), subscription, updates));
+
+    // The staleness clock (fix a9): a dead stream produces no updates, so
+    // only a tick can notice its silence — and redraw the badge in.
+    let mut ticker = tokio::time::interval(TICK_PERIOD);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !app.should_quit() {
         terminal
@@ -150,10 +153,47 @@ where
                 // `None` cannot happen while `streams` holds a sender; if it
                 // ever does, the next input still exits cleanly.
             }
+            _ = ticker.tick() => {
+                app.apply(Update::Tick { now: std::time::Instant::now() });
+            }
         }
     }
 
     Ok((terminal, app))
+}
+
+/// How often the staleness clock ticks. A third of the badge threshold: the
+/// badge may appear up to one tick late, and ticking faster buys nothing.
+const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the TUI subscribes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Subscription {
+    /// The merged all-sessions stream, with these replay cursors.
+    Everything(Vec<(String, u64)>),
+    /// One session, scoped server-side to one agent's subtree.
+    Subtree {
+        session_id: String,
+        agent_id: String,
+    },
+}
+
+/// The subscription a launch shape calls for: `--agent` scopes the stream
+/// server-side; everything else follows everything.
+fn subscription_for(
+    attachment: Option<&horde_tui::app::Attachment>,
+    sessions: &[horde_proto::v1::SessionSummary],
+) -> Subscription {
+    if let Some(attachment) = attachment
+        && let Some(agent_id) = &attachment.agent_id
+    {
+        return Subscription::Subtree {
+            session_id: attachment.session_id.clone(),
+            agent_id: agent_id.clone(),
+        };
+    }
+    let attachment = attachment.map(|attachment| attachment.session_id.clone());
+    Subscription::Everything(overview_cursors(sessions, attachment.as_deref()))
 }
 
 /// Executes what the App asked for, reporting refusals into its status line.
@@ -229,25 +269,40 @@ fn overview_cursors(
     cursors
 }
 
-/// The TUI's one stream: replays the named sessions from their cursors,
-/// follows everything else live, and forwards it all onto the shared
-/// channel. Ends silently when the receiver goes away (the loop exited) or
-/// the stream does (the server went away — the heartbeat gap will show soon
-/// enough).
-async fn pump(mut client: Client, cursors: Vec<(String, u64)>, updates: mpsc::Sender<Update>) {
-    let _ = follow_into(&mut client, cursors, &updates).await;
+/// The TUI's one stream: opens the subscription and forwards it onto the
+/// shared channel — heartbeats included, because they are what the
+/// staleness clock judges against. Ends silently when the receiver goes
+/// away (the loop exited) or the stream does (the server went away — the
+/// stale badge takes it from here).
+async fn pump(mut client: Client, subscription: Subscription, updates: mpsc::Sender<Update>) {
+    let _ = follow_into(&mut client, subscription, &updates).await;
 }
 
 async fn follow_into(
     client: &mut Client,
-    cursors: Vec<(String, u64)>,
+    subscription: Subscription,
     updates: &mpsc::Sender<Update>,
 ) -> Result<(), ClientError> {
-    let mut stream = client.follow_everything(&cursors).await?;
+    let mut stream = match subscription {
+        Subscription::Everything(cursors) => client.follow_everything(&cursors).await?,
+        Subscription::Subtree {
+            session_id,
+            agent_id,
+        } => {
+            client
+                .follow(
+                    &crate::client::SyncOptions::new(session_id)
+                        .following(true)
+                        .scoped_to(agent_id),
+                )
+                .await?
+        }
+    };
     while let Some(update) = stream.next_update().await? {
         let update = match update {
             StreamUpdate::Event(envelope) => Update::Event(envelope),
             StreamUpdate::CaughtUp { session_id, head } => Update::CaughtUp { session_id, head },
+            StreamUpdate::Heartbeat => Update::Heartbeat,
         };
         if updates.send(update).await.is_err() {
             return Ok(());
