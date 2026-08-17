@@ -46,7 +46,8 @@ pub struct EndpointManager {
 
 struct ServedEndpoint {
     url: String,
-    /// The accept loop; aborted at shutdown, kept alive by being held here.
+    /// The accept loop; aborted and awaited at shutdown, kept alive by being
+    /// held here.
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -101,11 +102,18 @@ impl EndpointManager {
         self.registry.remove(agent_id);
     }
 
-    /// Stops every serving loop. Idempotent; called from Runtime shutdown.
+    /// Stops every serving loop, and does not return until each has actually
+    /// stopped serving: abort, then await the reap, so every listener socket
+    /// is provably dropped by the time this returns. Awaiting an aborted
+    /// accept loop resolves at its next await point, so this stays fast and
+    /// bounded. Idempotent; called from Runtime shutdown.
     pub async fn shutdown(&self) {
-        let mut served = self.served.lock().await;
-        for (_, endpoint) in std::mem::take(&mut *served) {
+        let served = std::mem::take(&mut *self.served.lock().await);
+        for (_, endpoint) in served {
             endpoint.serving.abort();
+            // The JoinError here is the cancellation just requested, not a
+            // fault worth surfacing.
+            let _ = endpoint.serving.await;
         }
     }
 
@@ -306,9 +314,8 @@ mod tests {
         );
 
         manager.shutdown().await;
-        // The accept loop is aborted; give the runtime one breath to reap it,
-        // then the socket must refuse outright.
-        tokio::task::yield_now().await;
+        // shutdown() awaits the reaped accept loop, so the listener is
+        // already dropped: the socket must refuse immediately, no yielding.
         let address = url
             .strip_prefix("http://")
             .and_then(|rest| rest.strip_suffix("/mcp"))
