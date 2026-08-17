@@ -58,7 +58,10 @@ async fn drain_sync<T>(
 async fn register(h: &mut Harness, worker: &str, tags: &[&str]) -> Setup<()> {
     h.worker
         .register_worker(RegisterWorkerRequest {
-            hello: None,
+            hello: Some(horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                ..horde_proto::v1::Hello::default()
+            }),
             worker_id: Some(WorkerId::new(worker)),
             capabilities: Some(WorkerCapabilities {
                 tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
@@ -620,7 +623,14 @@ async fn the_control_plane_handshake_names_a_real_version() {
 
     let server = h
         .control
-        .hello(HelloRequest::default())
+        .hello(HelloRequest {
+            // The version gate (fix a6) reads this; an empty request is now
+            // a refusal, proven in `services.rs`.
+            hello: Some(horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                ..horde_proto::v1::Hello::default()
+            }),
+        })
         .await
         .expect("hello must succeed")
         .into_inner()
@@ -638,7 +648,10 @@ async fn the_worker_handshake_names_the_same_version() {
     let registered = h
         .worker
         .register_worker(RegisterWorkerRequest {
-            hello: None,
+            hello: Some(horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                ..horde_proto::v1::Hello::default()
+            }),
             worker_id: Some(WorkerId::new("worker-a")),
             capabilities: Some(WorkerCapabilities::default()),
         })

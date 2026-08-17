@@ -313,8 +313,11 @@ impl ControlPlaneService for ControlPlane {
     #[instrument(skip_all)]
     async fn hello(
         &self,
-        _request: Request<HelloRequest>,
+        request: Request<HelloRequest>,
     ) -> Result<Response<HelloResponse>, Status> {
+        // The version gate (DESIGN §2, fix a6): the client's Hello is read
+        // and compared, not discarded.
+        super::shared::version_gate(request.into_inner().hello.as_ref())?;
         Ok(Response::new(HelloResponse {
             server: Some(Self::server_hello()),
             // Assigned from the client certificate once enrollment exists.

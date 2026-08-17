@@ -142,6 +142,10 @@ impl WorkerService for WorkerFacing {
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
         let request = request.into_inner();
+        // The version gate (DESIGN §2, fix a6): a worker below the minimum —
+        // or one saying nothing — is refused at registration, with the code
+        // the daemon's fate table treats as fatal.
+        super::shared::version_gate(request.hello.as_ref())?;
         let worker_id = request
             .worker_id
             .as_ref()
