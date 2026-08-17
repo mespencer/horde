@@ -133,8 +133,10 @@ async fn the_daemon_joins_registers_and_a_sigterm_ends_it_cleanly() {
 }
 
 /// The whole worker, as a process, over plaintext loopback: a placed agent's
-/// spawn command reaches the daemon, the fake harness runs the turn, the
-/// four events arrive in the server's log, and SIGTERM reaps the one pump.
+/// spawn command reaches the daemon, the *scripted* fake harness plays its
+/// turn (not an echo — the proof the `--fake-script` file was read and
+/// parsed), the four events arrive in the server's log, and SIGTERM reaps
+/// the one pump.
 #[tokio::test]
 async fn an_insecure_daemon_serves_a_placed_agent_and_reaps_it() {
     let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
@@ -142,6 +144,12 @@ async fn an_insecure_daemon_serves_a_placed_agent_and_reaps_it() {
     support::place_agent(&core.log, "s1", "agent-1", "w-x", "say hello").await;
 
     let state = tempfile::tempdir().expect("a temp dir");
+    let script = state.path().join("script.json");
+    std::fs::write(
+        &script,
+        r#"[{"steps": [{"say": "scripted, not an echo"}], "text": "done"}]"#,
+    )
+    .expect("the script writes");
     let mut daemon = harness::daemon(&[
         "--insecure",
         "--server",
@@ -150,6 +158,8 @@ async fn an_insecure_daemon_serves_a_placed_agent_and_reaps_it() {
         "w-x",
         "--adapter",
         "fake",
+        "--fake-script",
+        &script.to_string_lossy(),
         "--state-dir",
         &state.path().to_string_lossy(),
     ]);
@@ -165,6 +175,17 @@ async fn an_insecure_daemon_serves_a_placed_agent_and_reaps_it() {
     let head = support::server_log_at_least(&core.log, "s1", 6).await;
     assert_eq!(head, 6, "exactly the four worker events, no duplicates");
 
+    // The output is the script's first turn, not an echo of the assignment:
+    // a daemon that quietly fell back to the echo script would still pass
+    // every count above while ignoring the operator's script file.
+    let events = support::decoded_session_log(&core.log, "s1").await;
+    assert!(
+        events.iter().any(|event| matches!(&event.kind,
+            Some(horde_proto::v1::event::Kind::AgentOutputChunk(chunk))
+                if chunk.text == "scripted, not an echo")),
+        "the scripted turn must be what streamed: {events:?}"
+    );
+
     daemon.terminate().await.expect("SIGTERM sends");
     let (status, stdout, _) = daemon.wait().await.expect("the daemon exits");
     assert!(status.success());
@@ -172,6 +193,137 @@ async fn an_insecure_daemon_serves_a_placed_agent_and_reaps_it() {
         stdout.contains("shutdown reaped=1"),
         "the running agent's pump must be reaped, and said so: {stdout}"
     );
+}
+
+/// DESIGN §2's partition behavior, held over the daemon's own reconnect
+/// loop in-process: a severed transport is announced and *survived* — the
+/// loop redials through the healed link and registers again — and only a
+/// requested shutdown ends it. This is the run-loop half the fault tier
+/// exercises against the binary; here it pins the loop's decisions.
+#[tokio::test]
+async fn the_run_loop_survives_a_partition_and_registers_again() {
+    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
+    let upstream = support::serve(core.clone()).await;
+    let proxy = horde_testkit::FaultProxy::front(&upstream)
+        .await
+        .expect("the fault proxy binds");
+
+    let state = tempfile::tempdir().expect("a temp dir");
+    let config = horde_worker::startup::invocation(
+        [
+            "--insecure",
+            "--server",
+            &proxy.endpoint(),
+            "--name",
+            "w-r",
+            "--adapter",
+            "fake",
+            "--state-dir",
+            &state.path().to_string_lossy(),
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned),
+    )
+    .expect("the shape parses");
+
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = std::sync::Arc::clone(&lines);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut announce =
+        move |line: String| recorded.lock().expect("an unpoisoned recorder").push(line);
+    let mut sink = |_: String| {};
+    let prepared = horde_worker::startup::prepare(&config, &mut sink)
+        .await
+        .expect("an insecure daemon prepares");
+
+    // The Debug view an operator's crash report will carry: the facts, and
+    // never the key material.
+    let rendered = format!("{prepared:?}");
+    assert!(
+        rendered.contains("w-r") && rendered.contains("enrolled: false"),
+        "the prepared worker debugs its facts: {rendered}"
+    );
+
+    // `run`'s announce parameter is a plain `&mut dyn FnMut`, so the future
+    // is not `Send` and cannot be spawned; the injector runs beside it on
+    // the same task instead, which changes nothing observed.
+    fn registered(lines: &[String], minimum: usize) -> bool {
+        lines
+            .iter()
+            .filter(|line| line.starts_with("registered worker=w-r"))
+            .count()
+            >= minimum
+    }
+    async fn reached(
+        lines: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        what: &str,
+        holds: impl Fn(&[String]) -> bool,
+    ) {
+        for _ in 0_u32..250 {
+            if holds(&lines.lock().expect("an unpoisoned recorder")) {
+                return;
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "{what} never happened: {:?}",
+            lines.lock().expect("an unpoisoned recorder")
+        );
+    }
+    let injector = async {
+        reached(&lines, "the first registration", |lines| {
+            registered(lines, 1)
+        })
+        .await;
+
+        // The cable is yanked: the loss is announced, not fatal.
+        proxy.cut();
+        reached(&lines, "the disconnect announcement", |lines| {
+            lines
+                .iter()
+                .any(|line| line.starts_with("disconnected") || line.starts_with("dial-failed"))
+        })
+        .await;
+
+        // Healed: the loop must come back by itself and register again.
+        proxy.heal();
+        reached(&lines, "the re-registration", |lines| registered(lines, 2)).await;
+        let _ = stop.send(());
+    };
+
+    let (outcome, ()) = support::within(
+        "the partition round-trip",
+        futures_join(
+            horde_worker::startup::run(
+                prepared,
+                async move {
+                    let _ = stopped.await;
+                },
+                &mut announce,
+            ),
+            injector,
+        ),
+    )
+    .await;
+    assert!(outcome.is_ok(), "a signalled stop is clean: {outcome:?}");
+    assert_eq!(
+        lines
+            .lock()
+            .expect("an unpoisoned recorder")
+            .last()
+            .map(String::as_str),
+        Some("shutdown reaped=0"),
+        "the last word is the reap count"
+    );
+}
+
+/// `tokio::join!` as a function, so the select-free test body stays
+/// readable where the futures are built.
+async fn futures_join<A, B>(
+    a: impl std::future::Future<Output = A>,
+    b: impl std::future::Future<Output = B>,
+) -> (A, B) {
+    tokio::join!(a, b)
 }
 
 /// Revocation closes the door for good: a daemon holding a revoked identity

@@ -376,6 +376,27 @@ mod tests {
         );
     }
 
+    /// The fast path: a binary that already exists is returned without any
+    /// build. The package name is deliberately unbuildable, so reaching the
+    /// fallback would fail loudly instead of quietly making the test slow.
+    #[tokio::test]
+    async fn an_existing_binary_is_found_without_building() {
+        let exe = std::env::current_exe().expect("a test executable");
+        let name = format!("horde-testkit-probe-{}", std::process::id());
+        let candidates = super::binary_candidates(&exe, &name);
+        let planted = candidates.first().expect("at least one candidate");
+        std::fs::write(planted, b"not really a binary").expect("the probe file writes");
+
+        let found = super::product_binary("horde-no-such-package", &name).await;
+        let removed = std::fs::remove_file(planted);
+        assert_eq!(
+            found.expect("an existing binary needs no build"),
+            *planted,
+            "the compiled copy is what comes back"
+        );
+        removed.expect("the probe file cleans up");
+    }
+
     /// The fallback path, driven to its honest failure: a package that does
     /// not exist cannot build, and the error must say so rather than time
     /// out or report a missing file.

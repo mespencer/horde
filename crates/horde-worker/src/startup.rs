@@ -942,8 +942,11 @@ mod tests {
     #[test]
     fn wrong_shapes_are_refused_by_name() {
         for (arguments, needle) in [
-            (&["--bogus"][..], "--bogus"),
-            (&["positional"][..], "positional"),
+            // "unknown argument", precisely: a parser that instead treated
+            // the stray as a valued flag would eat the next argument and
+            // complain about a missing value for a flag that never existed.
+            (&["--bogus"][..], "unknown argument --bogus"),
+            (&["positional"][..], "unknown argument positional"),
             (&["--server"][..], "--server"),
             (&["--adapter", "gpt"][..], "gpt"),
             (&["--adapter", "fake", "--adapter", "fake"][..], "twice"),
@@ -1061,6 +1064,13 @@ mod tests {
         assert_eq!(tool_call_id, "call-1");
         assert_eq!(tool_name, "Bash");
         assert_eq!(input["command"], "true");
+
+        // The object form charges the same nominal spend `saying` does:
+        // scripted turns must flow through the usage pipeline like every
+        // other turn, or a scripted daemon reports free work.
+        assert_eq!(script.turns[1].usage.input_tokens, 10);
+        assert_eq!(script.turns[1].usage.output_tokens, 20);
+        assert!((script.turns[1].cost_usd - 0.001).abs() < f64::EPSILON);
     }
 
     /// A defaulted `input` must still be an object: the wire converts the
@@ -1162,6 +1172,40 @@ mod tests {
     async fn first_of_resolves_on_either_side() {
         super::first_of(async {}, std::future::pending()).await;
         super::first_of(std::future::pending(), async {}).await;
+    }
+
+    /// The redial pause's whole contract, on the paused clock: with no
+    /// shutdown it waits exactly [`RETRY_DELAY`] and says keep-going (a
+    /// pause that returns early is a hot spin against a dead server; one
+    /// that returns `false` shuts a healthy daemon down), and a completed
+    /// shutdown wins the pause immediately.
+    #[tokio::test(start_paused = true)]
+    async fn the_redial_pause_waits_the_delay_and_yields_to_shutdown() {
+        let pending = std::future::pending::<()>();
+        tokio::pin!(pending);
+        let before = tokio::time::Instant::now();
+        assert!(
+            super::pause_before_redial(pending.as_mut()).await,
+            "no shutdown means keep going"
+        );
+        assert_eq!(
+            before.elapsed(),
+            super::RETRY_DELAY,
+            "the pause is the delay, exactly — the paused clock makes this deterministic"
+        );
+
+        let ready = async {};
+        tokio::pin!(ready);
+        let before = tokio::time::Instant::now();
+        assert!(
+            !super::pause_before_redial(ready.as_mut()).await,
+            "a completed shutdown wins the pause"
+        );
+        assert_eq!(
+            before.elapsed(),
+            core::time::Duration::ZERO,
+            "shutdown must not wait out the delay first"
+        );
     }
 
     /// The binary lifecycle wrapper actually runs its loop on a live
