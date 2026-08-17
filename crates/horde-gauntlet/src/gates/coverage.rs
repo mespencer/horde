@@ -1,14 +1,23 @@
 //! Coverage: `cargo llvm-cov`, producing the LCOV the crap gate consumes.
 //!
-//! Blocking here means the measurement must *happen*. There is deliberately no
-//! percentage threshold yet: docs/TESTING.md §4 says an absolute threshold is
-//! chosen from evidence, and on day one there is no evidence. The gate records
-//! the number so the evidence accumulates.
+//! Blocking means the measurement must happen AND clear [`FLOOR_PERCENT`].
+//! docs/TESTING.md §4 says an absolute threshold is chosen from evidence;
+//! the evidence has accumulated — the tree has sat between 96.6% and 97.1%
+//! for weeks — so the floor is 95.0: comfortably below the observed range,
+//! high enough that a regression eating two points of coverage fails the
+//! gate instead of shrinking a number nobody reads (wave-7 fix a16). A
+//! Blocking gate that could not fail was miscounting the gauntlet's
+//! promises.
 
 use std::path::Path;
 
 use crate::gates::prelude::*;
 use crate::gates::read_artifact;
+
+/// The line-coverage floor, in percent. Chosen from evidence (96.6–97.1%
+/// observed over weeks), set below it so ordinary drift passes and a real
+/// regression fails.
+pub const FLOOR_PERCENT: f64 = 95.0;
 
 /// The cargo-llvm-cov version the gate is calibrated against.
 pub const PIN: ToolPin = ToolPin {
@@ -59,12 +68,32 @@ pub fn outcome_of(lcov: &str, path: &Path) -> GateOutcome {
     if totals.found == 0 {
         return GateOutcome::skipped("no instrumented lines to cover".to_owned());
     }
+    if !clears_floor(totals.percent()) {
+        return GateOutcome::fail(format!(
+            "lines {:.1}% ({}/{}) is below the {FLOOR_PERCENT:.1}% floor — \
+             cover the new code, or argue the floor down in gates/coverage.rs \
+             with the evidence",
+            totals.percent(),
+            totals.hit,
+            totals.found
+        ));
+    }
     GateOutcome::pass(format!(
-        "lines {:.1}% ({}/{}); no threshold yet, recording the number",
+        "lines {:.1}% ({}/{}) clears the {FLOOR_PERCENT:.1}% floor",
         totals.percent(),
         totals.hit,
         totals.found
     ))
+}
+
+/// Whether a measured percentage clears the floor.
+///
+/// "At or above": exactly 95.0 passes. Named because the boundary is the
+/// whole point of a floor, and `>` versus `>=` inline would survive every
+/// run whose number avoids the boundary.
+#[must_use]
+pub fn clears_floor(percent: f64) -> bool {
+    percent >= FLOOR_PERCENT
 }
 
 /// Line-coverage totals summed across every LCOV record.
@@ -158,14 +187,35 @@ mod tests {
         assert!(LineTotals { hit: 0, found: 0 }.percent().abs() < f64::EPSILON);
     }
 
+    /// The fixture's 76.9% is below the floor, and the gate finally says
+    /// no: the failure names the number, the floor, and both remedies.
     #[test]
-    fn a_measured_run_reports_the_number_and_states_that_there_is_no_threshold() {
-        let GateOutcome::Pass { detail } = outcome_of(LCOV, Path::new("/repo/lcov.info")) else {
-            panic!("a coverage run that happened is a pass");
+    fn a_run_below_the_floor_fails_naming_the_number_and_the_floor() {
+        let GateOutcome::Fail { detail } = outcome_of(LCOV, Path::new("/repo/lcov.info")) else {
+            panic!("76.9% is below the 95% floor and must fail");
         };
         assert!(detail.contains("76.9%"), "{detail}");
+        assert!(detail.contains("95.0%"), "{detail}");
         assert!(detail.contains("10/13"), "{detail}");
-        assert!(detail.contains("no threshold yet"), "{detail}");
+    }
+
+    /// A run at or above the floor passes, reporting the number against it.
+    #[test]
+    fn a_run_clearing_the_floor_passes_with_the_number() {
+        let lcov = "SF:src/lib.rs\nLF:100\nLH:96\nend_of_record\n";
+        let GateOutcome::Pass { detail } = outcome_of(lcov, Path::new("/repo/lcov.info")) else {
+            panic!("96% clears the 95% floor");
+        };
+        assert!(detail.contains("96.0%"), "{detail}");
+        assert!(detail.contains("95.0%"), "{detail}");
+    }
+
+    /// The boundary itself: exactly the floor passes, a hair below fails.
+    #[test]
+    fn the_floor_is_at_or_above() {
+        assert!(clears_floor(FLOOR_PERCENT));
+        assert!(clears_floor(FLOOR_PERCENT + 0.1));
+        assert!(!clears_floor(FLOOR_PERCENT - 0.1));
     }
 
     #[test]
@@ -202,8 +252,10 @@ mod tests {
 
     #[test]
     fn the_gate_reads_the_lcov_the_tool_actually_wrote() {
-        let GateOutcome::Pass { detail } = run_against(Some(LCOV), exited(0, "")) else {
-            panic!("expected a pass");
+        // The fixture is below the floor, so reading it produces the
+        // gate's own failure — proof the number read is the number judged.
+        let GateOutcome::Fail { detail } = run_against(Some(LCOV), exited(0, "")) else {
+            panic!("expected the below-floor fixture to fail the gate");
         };
         assert!(detail.contains("10/13"), "{detail}");
     }
