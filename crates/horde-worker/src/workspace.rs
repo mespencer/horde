@@ -129,6 +129,13 @@ impl WorkspaceManager {
 
     /// The working directory an agent occupies, per its Checkout Policy.
     ///
+    /// `start_points` maps repo names to the commit each new checkout should
+    /// begin at — a spawning parent's committed HEAD (DESIGN §5: "children
+    /// start from the parent's committed HEAD"), observed by the caller. A
+    /// repo absent from the map starts where the Instance's HEAD is, which
+    /// is also the whole map's meaning when empty: a root agent has no
+    /// parent to inherit from.
+    ///
     /// # Errors
     ///
     /// [`WorkerError::Workspace`] when the Instance has not been materialized
@@ -138,6 +145,7 @@ impl WorkspaceManager {
         definition_id: &str,
         agent_id: &str,
         policy: CheckoutPolicy,
+        start_points: &std::collections::BTreeMap<String, String>,
     ) -> Result<PathBuf, WorkerError> {
         if !is_path_safe(definition_id) || !is_path_safe(agent_id) {
             return Err(WorkerError::Workspace(format!(
@@ -152,11 +160,17 @@ impl WorkspaceManager {
             // The default for mutating agents (DESIGN §7): unspecified is
             // worktree, not an error.
             CheckoutPolicy::Unspecified | CheckoutPolicy::Worktree => {
-                self.compose(&instance_root, &definition, agent_id, worktree_repo)
-                    .await
+                self.compose(
+                    &instance_root,
+                    &definition,
+                    agent_id,
+                    start_points,
+                    worktree_repo,
+                )
+                .await
             }
             CheckoutPolicy::FreshClone => {
-                self.compose(&instance_root, &definition, agent_id, clone_repo)
+                self.compose(&instance_root, &definition, agent_id, start_points, clone_repo)
                     .await
             }
         }
@@ -168,10 +182,11 @@ impl WorkspaceManager {
         instance_root: &Path,
         definition: &WorkspaceDefinition,
         agent_id: &str,
+        start_points: &std::collections::BTreeMap<String, String>,
         checkout_repo: F,
     ) -> Result<PathBuf, WorkerError>
     where
-        F: Fn(PathBuf, PathBuf, String) -> Fut,
+        F: Fn(PathBuf, PathBuf, String, Option<String>) -> Fut,
         Fut: Future<Output = Result<(), WorkerError>>,
     {
         let agent_root = instance_root.join(AGENTS_DIR).join(agent_id);
@@ -183,7 +198,13 @@ impl WorkspaceManager {
                 // delivery must not stack a second worktree beside the first.
                 continue;
             }
-            checkout_repo(source, destination, format!("horde/{agent_id}")).await?;
+            checkout_repo(
+                source,
+                destination,
+                format!("horde/{agent_id}"),
+                start_points.get(&repo.name).cloned(),
+            )
+            .await?;
         }
         Ok(agent_root)
     }
@@ -322,26 +343,33 @@ async fn materialize_repo(
     })
 }
 
-/// One agent worktree: a branch per agent per repo, from the instance's HEAD.
+/// One agent worktree: a branch per agent per repo — from `start_point` when
+/// the spawn inherited one (the parent's committed HEAD, fix a8), from the
+/// instance's HEAD otherwise.
 async fn worktree_repo(
     source: PathBuf,
     destination: PathBuf,
     branch: String,
+    start_point: Option<String>,
 ) -> Result<(), WorkerError> {
-    git(
-        &source,
-        &["worktree", "add", "-b", &branch, &path_str(&destination)],
-    )
-    .await
-    .map(|_| ())
-    .map_err(WorkerError::Workspace)
+    let destination = path_str(&destination);
+    let mut arguments = vec!["worktree", "add", "-b", branch.as_str(), &destination];
+    if let Some(start_point) = &start_point {
+        arguments.push(start_point);
+    }
+    git(&source, &arguments)
+        .await
+        .map(|_| ())
+        .map_err(WorkerError::Workspace)
 }
 
-/// One agent clone: full isolation, cloned locally from the instance's repo.
+/// One agent clone: full isolation, cloned locally from the instance's repo,
+/// switched onto the inherited start point when the spawn carried one.
 async fn clone_repo(
     source: PathBuf,
     destination: PathBuf,
-    _branch: String,
+    branch: String,
+    start_point: Option<String>,
 ) -> Result<(), WorkerError> {
     git(
         &source,
@@ -349,7 +377,14 @@ async fn clone_repo(
     )
     .await
     .map(|_| ())
-    .map_err(WorkerError::Workspace)
+    .map_err(WorkerError::Workspace)?;
+    if let Some(start_point) = &start_point {
+        git(&destination, &["switch", "-c", &branch, start_point])
+            .await
+            .map(|_| ())
+            .map_err(WorkerError::Workspace)?;
+    }
+    Ok(())
 }
 
 /// Runs one git invocation to completion, bounded, capturing its output.

@@ -480,11 +480,53 @@ impl Runtime {
             .unwrap_or_default();
         let policy = horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy)
             .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified);
+        let start_points = self.parent_start_points(&spawn.parent_agent_id).await;
         let root = workspaces
-            .checkout(&definition_id, &agent_id, policy)
+            .checkout(&definition_id, &agent_id, policy, &start_points)
             .await?;
         let repos = workspaces.instance_repos(&definition_id).await?;
         Ok(Some(AgentCheckout { root, repos }))
+    }
+
+    /// The parent's committed HEAD per repo — what a child's checkout starts
+    /// from (DESIGN §5, fix a8). Empty when the spawn has no parent, or the
+    /// parent's checkout is not on this Worker (a cross-worker parent's
+    /// commits travel as payloads, not as checkout ancestry): those children
+    /// honestly start from the instance's HEAD.
+    async fn parent_start_points(
+        &self,
+        parent_agent_id: &Option<horde_proto::v1::AgentId>,
+    ) -> BTreeMap<String, String> {
+        let mut start_points = BTreeMap::new();
+        let Some(parent) = parent_agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+        else {
+            return start_points;
+        };
+        let Some(checkout) = self.broker.checkout_of(&parent) else {
+            return start_points;
+        };
+        for (repo_name, relative) in &checkout.repos {
+            match horde_relay::observe_head(&checkout.root.join(relative)).await {
+                Ok(observed) => {
+                    start_points.insert(repo_name.clone(), observed.commit_sha);
+                }
+                // A parent repo whose HEAD cannot be observed contributes no
+                // start point rather than failing the child's spawn: the
+                // instance HEAD is a working default, a dead spawn is not.
+                Err(error) => {
+                    tracing::warn!(
+                        parent,
+                        repo = %repo_name,
+                        %error,
+                        "could not observe the parent's HEAD; the child starts at the instance's"
+                    );
+                }
+            }
+        }
+        start_points
     }
 
     async fn deliver_message(
