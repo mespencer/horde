@@ -126,61 +126,88 @@ struct ParsedFlags {
     insecure: bool,
 }
 
+/// Whether `flag` is one of the daemon's value-carrying flags.
+///
+/// Decided *before* the value is consumed: an unknown flag must be refused
+/// as unknown, not have the next argument eaten and then complain about a
+/// missing value for a flag that never existed.
+fn takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--server"
+            | "--state-dir"
+            | "--join"
+            | "--enrollment"
+            | "--name"
+            | "--adapter"
+            | "--fake-script"
+            | "--workspace-root"
+            | "--relay"
+    )
+}
+
+/// Consumes the next argument as `flag`'s value, refusing blanks.
+fn take_value(flag: &str, arguments: &mut impl Iterator<Item = String>) -> Result<String, String> {
+    arguments
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{flag} needs a value"))
+}
+
 impl ParsedFlags {
-    /// Folds one argument into the parse, consuming its value when it takes
-    /// one — the same shape as `horde-server`'s parser, and for the same
-    /// reason: a mistyped flag silently ignored would dial the wrong server.
+    /// Folds one argument into the parse. Every flag except `--insecure`
+    /// carries a value; a mistyped flag silently ignored would dial the
+    /// wrong server, so unknown ones are refusals by name.
     fn apply(
         &mut self,
         argument: &str,
         arguments: &mut impl Iterator<Item = String>,
     ) -> Result<(), String> {
-        let mut value_of = |flag: &str| {
-            arguments
-                .next()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| format!("{flag} needs a value"))
-        };
         if argument == "--insecure" {
             self.insecure = true;
             return Ok(());
         }
-        if self.apply_valued(argument, &mut value_of)? {
-            return Ok(());
+        if !takes_value(argument) {
+            return Err(format!("unknown argument {argument}"));
         }
-        Err(format!("unknown argument {argument}"))
+        let value = take_value(argument, arguments)?;
+        self.apply_identity_value(argument, value)
     }
 
-    /// Applies one of the flags that carry a value. `Ok(false)` means the
-    /// argument is not one of them.
-    fn apply_valued(
-        &mut self,
-        argument: &str,
-        value_of: &mut impl FnMut(&str) -> Result<String, String>,
-    ) -> Result<bool, String> {
-        match argument {
-            "--server" => self.server = Some(value_of("--server")?),
-            "--state-dir" => self.state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
-            "--join" => self.join = Some(value_of("--join")?),
-            "--enrollment" => self.enrollment = Some(value_of("--enrollment")?),
-            "--name" => self.name = Some(value_of("--name")?),
+    /// Applies the flags that decide who and where this Worker is; the rest
+    /// fall through to [`Self::apply_runtime_value`]. Split by subject so
+    /// neither half outgrows the complexity bar as the surface grows.
+    fn apply_identity_value(&mut self, flag: &str, value: String) -> Result<(), String> {
+        match flag {
+            "--server" => self.server = Some(value),
+            "--state-dir" => self.state_dir = Some(PathBuf::from(value)),
+            "--join" => self.join = Some(value),
+            "--enrollment" => self.enrollment = Some(value),
+            "--name" => self.name = Some(value),
+            _ => return self.apply_runtime_value(flag, value),
+        }
+        Ok(())
+    }
+
+    /// Applies the flags that decide what this Worker runs.
+    fn apply_runtime_value(&mut self, flag: &str, value: String) -> Result<(), String> {
+        match flag {
             "--adapter" => {
-                let choice = AdapterChoice::parse(&value_of("--adapter")?)?;
+                let choice = AdapterChoice::parse(&value)?;
                 if self.adapters.contains(&choice) {
                     return Err(format!("--adapter {choice:?} was given twice").to_lowercase());
                 }
                 self.adapters.push(choice);
             }
-            "--fake-script" => {
-                self.fake_script = Some(PathBuf::from(value_of("--fake-script")?));
-            }
-            "--workspace-root" => {
-                self.workspace_root = Some(PathBuf::from(value_of("--workspace-root")?));
-            }
-            "--relay" => self.relay = Some(value_of("--relay")?),
-            _ => return Ok(false),
+            "--fake-script" => self.fake_script = Some(PathBuf::from(value)),
+            "--workspace-root" => self.workspace_root = Some(PathBuf::from(value)),
+            "--relay" => self.relay = Some(value),
+            // Unreachable while `takes_value` and these two matches agree;
+            // refusing (rather than ignoring) is what keeps a future drift
+            // between them loud.
+            other => return Err(format!("unknown argument {other}")),
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Applies the shape rules and defaults, yielding the configuration.
@@ -261,12 +288,14 @@ impl WorkerConfig {
 ///
 /// A human-readable refusal naming the flag that was wrong.
 pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<WorkerConfig, String> {
+    let mut stream = arguments.into_iter();
     let mut flags = ParsedFlags::default();
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        flags.apply(&argument, &mut arguments)?;
+    loop {
+        let Some(argument) = stream.next() else {
+            return flags.conclude();
+        };
+        flags.apply(&argument, &mut stream)?;
     }
-    flags.conclude()
 }
 
 /// Parses a fake-adapter script from its JSON form.
@@ -666,6 +695,57 @@ pub fn fate_of(outcome: &Result<(), WorkerError>) -> Fate {
         },
         Err(error) => Fate::Fatal(error.to_string()),
     }
+}
+
+/// The whole binary lifecycle except argv and signals: builds the tokio
+/// runtime, brings up telemetry (DESIGN §12) stamped with the enrolled
+/// principal, installs the stderr subscriber, runs `main_loop`, and flushes
+/// telemetry on the way out.
+///
+/// Lives here rather than in `bin/horde_worker.rs` so the ordering decisions
+/// — runtime before telemetry (the OTLP exporter's channel lives on it),
+/// logs to stderr (stdout is the operator interface), flush before exit but
+/// never letting a dead collector change an exit code — are all testable.
+///
+/// # Errors
+///
+/// A startup refusal: the runtime, the telemetry configuration, or the
+/// subscriber slot (already claimed means a second init, which must refuse
+/// rather than silently swap subscribers).
+pub fn with_observability(
+    state_dir: &Path,
+    main_loop: impl FnOnce(&tokio::runtime::Runtime) -> std::process::ExitCode,
+) -> Result<std::process::ExitCode, String> {
+    // Who the spans speak for is known before any runtime exists; the
+    // runtime still comes before telemetry, because the OTLP exporter's
+    // gRPC channel has to live on it.
+    let identity = horde_observe::ServiceIdentity::new("horde-worker")
+        .with_principal(enrolled_principal(state_dir));
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => return Err(format!("could not build a runtime: {error}")),
+    };
+    let entered = runtime.enter();
+    let telemetry = horde_observe::init_from_env(identity, |name| std::env::var(name).ok())
+        .map_err(|error| error.to_string())?;
+    drop(entered);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,horde_worker=debug"));
+    tracing::dispatcher::set_global_default(horde_observe::stderr_subscriber(
+        filter,
+        telemetry.as_ref(),
+    ))
+    .map_err(|error| format!("could not install the subscriber: {error}"))?;
+
+    let code = main_loop(&runtime);
+
+    if let Some(telemetry) = telemetry {
+        // With the runtime still alive for the flush to travel its channel.
+        // The verdict is discarded deliberately: a collector that is down
+        // must not change an exit code.
+        let _ = telemetry.shutdown();
+    }
+    Ok(code)
 }
 
 /// Resolves when either future does — the daemon's two-signal wait
@@ -1082,6 +1162,33 @@ mod tests {
     async fn first_of_resolves_on_either_side() {
         super::first_of(async {}, std::future::pending()).await;
         super::first_of(std::future::pending(), async {}).await;
+    }
+
+    /// The binary lifecycle wrapper actually runs its loop on a live
+    /// runtime, and the process-global subscriber slot behaves like one: the
+    /// first init claims it, a second init is a refusal rather than a
+    /// silent subscriber swap. One test for both, because the slot is
+    /// process-global and a second test could not get the first-claim half.
+    #[test]
+    fn with_observability_runs_the_loop_once_and_then_refuses_the_slot() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut ran = false;
+        let first = super::with_observability(state.path(), |runtime| {
+            runtime.block_on(async {});
+            ran = true;
+            std::process::ExitCode::SUCCESS
+        });
+        assert!(ran, "the main loop must actually run");
+        assert!(first.is_ok(), "{first:?}");
+
+        let refused = super::with_observability(state.path(), |_| {
+            panic!("the loop must not run when startup refuses")
+        })
+        .expect_err("the subscriber slot is already claimed");
+        assert!(
+            refused.contains("subscriber"),
+            "the refusal names what was already installed: {refused}"
+        );
     }
 
     /// The transport case carries its own reason so a `dial-failed` line is

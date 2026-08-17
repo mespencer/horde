@@ -66,20 +66,31 @@ static BUILD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 ///
 /// The build failing, or the binary still missing after it.
 pub async fn product_binary(package: &str, name: &str) -> Setup<PathBuf> {
-    let current = std::env::current_exe()?;
-    let candidates = binary_candidates(&current, name);
-    if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
-        return Ok(found.clone());
+    let candidates = binary_candidates(&std::env::current_exe()?, name);
+    match existing(&candidates) {
+        Some(found) => Ok(found),
+        None => built(package, name, &candidates).await,
     }
+}
 
+/// The first candidate that is a real file.
+fn existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+}
+
+/// Builds the binary under the lock and locates it.
+async fn built(package: &str, name: &str, candidates: &[PathBuf]) -> Setup<PathBuf> {
     let _build = BUILD_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
     // Re-checked under the lock: the build another suite just finished is
     // this suite's binary too.
-    if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
-        return Ok(found.clone());
+    if let Some(found) = existing(candidates) {
+        return Ok(found);
     }
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(600),
@@ -89,17 +100,68 @@ pub async fn product_binary(package: &str, name: &str) -> Setup<PathBuf> {
     )
     .await
     .map_err(|_| format!("building {name} from {package} timed out"))??;
+    build_verdict(package, name, output.status.success(), &output.stderr)?;
+    existing(candidates)
+        .ok_or_else(|| format!("{name} was built but not found beside the test binary").into())
+}
+
+/// Turns a finished `cargo build` into a verdict, carrying the compiler's
+/// own words on failure — "the build failed" names nothing anyone can fix.
+fn build_verdict(package: &str, name: &str, success: bool, stderr: &[u8]) -> Setup<()> {
+    if success {
+        return Ok(());
+    }
+    Err(format!(
+        "cargo build -p {package} --bin {name} failed:\n{}",
+        String::from_utf8_lossy(stderr)
+    )
+    .into())
+}
+
+/// Runs one git command in `dir`, returning stdout, with identity and
+/// default-branch pinned so no machine config leaks into a test.
+///
+/// The suites' own git, for arranging repos and reading results — the
+/// production git runs live inside `horde-relay` and the worker. Shared here
+/// because the payload suites on both sides of the process boundary arrange
+/// repos the same way, and two copies of a git driver drift.
+///
+/// # Errors
+///
+/// The command failing, with git's own stderr.
+pub async fn git(dir: &Path, args: &[&str]) -> Setup<String> {
+    let mut command = tokio::process::Command::new("git");
+    command.current_dir(dir);
+    for pin in [
+        "user.email=test@horde",
+        "user.name=horde-test",
+        "init.defaultBranch=main",
+    ] {
+        command.arg("-c").arg(pin);
+    }
+    let output = command.args(args).output().await?;
     if !output.status.success() {
         return Err(format!(
-            "cargo build -p {package} --bin {name} failed:\n{}",
+            "git {args:?} in {}: {}",
+            dir.display(),
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
     }
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| format!("{name} was built but not found beside the test binary").into())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Whether `repo` holds `commit_sha` as a commit — the observable fact the
+/// payload suites assert after a share travelled (or refuse to find after
+/// one must not have).
+pub async fn holds_commit(repo: &Path, commit_sha: &str) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &format!("{commit_sha}^{{commit}}")])
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
 }
 
 /// The remainder of the first line of `text` that starts with `key`.
@@ -297,6 +359,65 @@ mod tests {
         assert_eq!(
             binary_candidates(exe, "horde"),
             vec![std::path::PathBuf::from("/w/target/debug/horde")]
+        );
+    }
+
+    /// The build verdict's truth table: success is silent, failure carries
+    /// the compiler's words and the target's name.
+    #[test]
+    fn the_build_verdict_carries_the_compilers_own_words() {
+        assert!(super::build_verdict("horde-cli", "horde", true, b"ignored").is_ok());
+        let refused = super::build_verdict("horde-cli", "horde", false, b"E0599: nope")
+            .expect_err("a failed build is a failure");
+        let rendered = refused.to_string();
+        assert!(
+            rendered.contains("horde-cli") && rendered.contains("E0599"),
+            "the failure names the package and quotes the compiler: {rendered}"
+        );
+    }
+
+    /// The fallback path, driven to its honest failure: a package that does
+    /// not exist cannot build, and the error must say so rather than time
+    /// out or report a missing file.
+    #[tokio::test]
+    async fn a_missing_package_fails_the_fallback_build_loudly() {
+        let error = super::product_binary("horde-no-such-package", "no-such-bin")
+            .await
+            .expect_err("an unbuildable package must fail");
+        assert!(
+            error.to_string().contains("horde-no-such-package"),
+            "the failure names what could not build: {error}"
+        );
+    }
+
+    /// The git driver and the commit probe, over a real repository: a made
+    /// commit is held, an unmade one is not, and a failing git command
+    /// reports git's own words.
+    #[tokio::test]
+    async fn git_runs_and_the_commit_probe_tells_present_from_absent() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        super::git(dir.path(), &["init"]).await.expect("init");
+        std::fs::write(dir.path().join("a.txt"), "a\n").expect("a file");
+        super::git(dir.path(), &["add", "."]).await.expect("add");
+        super::git(dir.path(), &["commit", "-m", "seed"])
+            .await
+            .expect("commit");
+        let sha = super::git(dir.path(), &["rev-parse", "HEAD"])
+            .await
+            .expect("rev-parse");
+
+        assert!(super::holds_commit(dir.path(), &sha).await);
+        assert!(
+            !super::holds_commit(dir.path(), &"0".repeat(40)).await,
+            "an unmade commit must not be reported present"
+        );
+
+        let refused = super::git(dir.path(), &["rev-parse", "not-a-ref"])
+            .await
+            .expect_err("a failing git command is an error");
+        assert!(
+            refused.to_string().contains("not-a-ref"),
+            "the failure quotes what was asked: {refused}"
         );
     }
 

@@ -9,57 +9,19 @@
 use std::process::ExitCode;
 
 use horde_worker::startup;
-use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(code) => code,
-        Err(refusal) => {
-            eprintln!("{refusal}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Everything between the arguments and the exit code. A `String` error is a
-/// startup refusal, printed before any subscriber exists to log it.
-fn run() -> Result<ExitCode, String> {
-    let config = startup::invocation(std::env::args().skip(1))?;
-
-    // The runtime exists before telemetry because the OTLP exporter's gRPC
-    // channel lives on it — the same startup order as the other binaries.
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| format!("could not build a runtime: {error}"))?;
-    let telemetry = {
-        let _guard = runtime.enter();
-        horde_observe::init_from_env(
-            horde_observe::ServiceIdentity::new("horde-worker")
-                .with_principal(startup::enrolled_principal(&config.state_dir)),
-            |name| std::env::var(name).ok(),
-        )
-        .map_err(|error| error.to_string())?
-    };
-
-    // Logs go to stderr: stdout is the operator interface (`registered
-    // worker=…`, `shutdown reaped=…`), and a log line interleaved into it
-    // breaks the scripts that read it.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,horde_worker=debug"));
-    tracing::dispatcher::set_global_default(horde_observe::stderr_subscriber(
-        filter,
-        telemetry.as_ref(),
-    ))
-    .map_err(|error| format!("could not install the subscriber: {error}"))?;
-
-    let code = runtime.block_on(serve_until_terminated(&config));
-
-    if let Some(telemetry) = telemetry {
-        // From main's own thread, with the runtime still alive for the flush
-        // to travel its channel. The verdict is discarded deliberately: a
-        // collector that is down must not change an exit code.
-        let _ = telemetry.shutdown();
-    }
-    Ok(code)
+    // A `String` error is a startup refusal, printed before any subscriber
+    // exists to log it.
+    let outcome = startup::invocation(std::env::args().skip(1)).and_then(|config| {
+        startup::with_observability(&config.state_dir, |runtime| {
+            runtime.block_on(serve_until_terminated(&config))
+        })
+    });
+    outcome.unwrap_or_else(|refusal| {
+        eprintln!("{refusal}");
+        ExitCode::FAILURE
+    })
 }
 
 /// Prepares the daemon and serves until SIGTERM/ctrl-c ends it, or a fatal

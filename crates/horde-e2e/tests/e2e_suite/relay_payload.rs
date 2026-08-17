@@ -66,17 +66,7 @@ async fn path_appears(what: &str, path: &Path) {
     panic!("{what} never appeared at {}", path.display());
 }
 
-/// Whether `repo` holds `commit_sha` as a commit.
-async fn holds_commit(repo: &Path, commit_sha: &str) -> bool {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "-e", &format!("{commit_sha}^{{commit}}")])
-        .status()
-        .await
-        .expect("git spawns")
-        .success()
-}
+use horde_server_testkit::process::holds_commit;
 
 /// The agent-checkout path the worker's WorkspaceManager composes:
 /// `<workspace root>/<definition id>/.horde-agents/<agent>/<layout path>`.

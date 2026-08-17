@@ -279,26 +279,11 @@ pub(crate) fn has_kind(events: &[serde_json::Value], kind: &str) -> bool {
     events.iter().any(|event| event["kind"] == kind)
 }
 
-/// Runs one git command in `dir`, asserting success, returning stdout.
-///
-/// The test's own git, for arranging repos and reading results — the
-/// production git runs live inside `horde-relay` and the worker daemons.
+/// The shared git driver, panicking on the failures an arrangement cannot
+/// survive — the production git runs live inside `horde-relay` and the
+/// worker daemons.
 pub(crate) async fn git(dir: &Path, args: &[&str]) -> String {
-    let mut command = tokio::process::Command::new("git");
-    command.current_dir(dir);
-    for pin in [
-        "user.email=e2e@test",
-        "user.name=e2e",
-        "init.defaultBranch=main",
-    ] {
-        command.arg("-c").arg(pin);
-    }
-    let output = command.args(args).output().await.expect("git spawns");
-    assert!(
-        output.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    horde_server_testkit::process::git(dir, args)
+        .await
+        .expect("the git arrangement succeeds")
 }
