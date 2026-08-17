@@ -25,6 +25,7 @@
 //!   exercise the permission chain — including the human-approval layer — with
 //!   real waiting rather than a simulated decision.
 
+mod endpoint_client;
 pub mod script;
 
 pub use script::{Exhausted, Misbehaviour, Script, ScriptedTurn, Step};
@@ -95,12 +96,19 @@ impl FakeAdapter {
         ProviderSessionId::new(format!("fake-session-{ordinal}"))
     }
 
-    fn session(&self, provider_session_id: ProviderSessionId, turns_taken: u64) -> FakeSession {
+    fn session(
+        &self,
+        provider_session_id: ProviderSessionId,
+        turns_taken: u64,
+        endpoint: Option<horde_adapter::McpEndpoint>,
+    ) -> FakeSession {
         FakeSession {
             script: self.script.clone(),
             capabilities: self.capabilities.clone(),
             provider: self.provider.clone(),
             provider_session_id,
+            endpoint,
+            pending_call: None,
             announced: false,
             turns_taken,
             // The script resumes where the conversation left off, and turn
@@ -139,8 +147,12 @@ impl Adapter for FakeAdapter {
         self.capabilities.clone()
     }
 
-    async fn spawn(&self, _spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
-        Ok(Box::new(self.session(self.mint_session_id(), 0)))
+    async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
+        Ok(Box::new(self.session(
+            self.mint_session_id(),
+            0,
+            spec.horde_endpoint.clone(),
+        )))
     }
 
     async fn resume(
@@ -163,10 +175,19 @@ impl Adapter for FakeAdapter {
             provider: self.provider.clone(),
             message,
         })?;
-        Ok(Box::new(
-            self.session(provider_session_id.clone(), turns_taken),
-        ))
+        Ok(Box::new(self.session(
+            provider_session_id.clone(),
+            turns_taken,
+            spec.horde_endpoint.clone(),
+        )))
     }
+}
+
+/// One scheduled Horde verb call, between `advance` and `next_event`.
+struct PendingCall {
+    tool_call_id: ToolCallId,
+    tool_name: String,
+    input: serde_json::Value,
 }
 
 /// The turn currently being played.
@@ -184,6 +205,12 @@ pub struct FakeSession {
     capabilities: Capabilities,
     provider: String,
     provider_session_id: ProviderSessionId,
+    /// The Horde endpoint this agent was spawned with, when the Worker
+    /// supplied one. Makes [`Step::UseHordeTool`] a real MCP call.
+    endpoint: Option<horde_adapter::McpEndpoint>,
+    /// A verb call `advance` scheduled; executed by `next_event`, which is
+    /// where the session is allowed to be async — the same shape as `stall`.
+    pending_call: Option<PendingCall>,
     announced: bool,
     turns_taken: u64,
     /// Which scripted turn the next send consumes. Distinct from
@@ -234,7 +261,11 @@ impl FakeSession {
     /// Plays steps until the queue produces an event, a decision is needed, or
     /// the turn runs out of steps and ends.
     fn advance(&mut self) {
-        while self.pending.is_empty() && self.waiting_on.is_none() && self.stall.is_none() {
+        while self.pending.is_empty()
+            && self.waiting_on.is_none()
+            && self.stall.is_none()
+            && self.pending_call.is_none()
+        {
             let Some(step) = self.steps.pop_front() else {
                 self.end_turn();
                 return;
@@ -250,13 +281,26 @@ impl FakeSession {
                     input,
                 } => {
                     let tool_call_id = ToolCallId::new(tool_call_id);
-                    let turn_id = self.turn_id();
                     self.emit_output(OutputChannel::ToolCall, format!("{tool_name} {input}"));
-                    self.pending.push_back(AgentEvent::ToolCompleted {
-                        turn_id,
-                        tool_call_id,
-                        is_error: false,
-                    });
+                    if self.endpoint.is_some() {
+                        // The real thing: `next_event` dials the endpoint,
+                        // and the completion carries the endpoint's verdict.
+                        self.pending_call = Some(PendingCall {
+                            tool_call_id,
+                            tool_name,
+                            input,
+                        });
+                    } else {
+                        // No endpoint to dial (a bare-spec session): the
+                        // intent still reaches the stream, which is what the
+                        // conformance suite measures.
+                        let turn_id = self.turn_id();
+                        self.pending.push_back(AgentEvent::ToolCompleted {
+                            turn_id,
+                            tool_call_id,
+                            is_error: false,
+                        });
+                    }
                 }
                 Step::AskPermission {
                     tool_call_id,
@@ -389,10 +433,31 @@ impl FakeSession {
         }
     }
 
+    /// Dials the endpoint for one scheduled verb call and turns the verdict
+    /// into stream events: the result text (or refusal) as tool output, and
+    /// a completion whose error bit is the verdict.
+    async fn execute_horde_call(&mut self, call: PendingCall) {
+        let outcome =
+            endpoint_client::call_horde_tool(self.endpoint.as_ref(), &call.tool_name, &call.input)
+                .await;
+        let turn_id = self.turn_id();
+        let (text, is_error) = match outcome {
+            Ok(text) => (text, false),
+            Err(message) => (message, true),
+        };
+        self.emit_output(OutputChannel::ToolResult, text);
+        self.pending.push_back(AgentEvent::ToolCompleted {
+            turn_id,
+            tool_call_id: call.tool_call_id,
+            is_error,
+        });
+    }
+
     fn cut_turn(&mut self) {
         self.steps.clear();
         self.waiting_on = None;
         self.stall = None;
+        self.pending_call = None;
         if let Some(current) = self.current.as_mut() {
             current.status = TurnStatus::Interrupted;
             current.text = None;
@@ -481,12 +546,21 @@ impl AgentSession for FakeSession {
                 continue;
             }
 
+            if let Some(call) = self.pending_call.take() {
+                self.execute_horde_call(call).await;
+                continue;
+            }
+
             if self.current.is_none() {
                 return Ok(None);
             }
             self.advance();
 
-            if self.pending.is_empty() && self.stall.is_none() && self.waiting_on.is_none() {
+            if self.pending.is_empty()
+                && self.stall.is_none()
+                && self.waiting_on.is_none()
+                && self.pending_call.is_none()
+            {
                 // `advance` ran the turn to its end and produced nothing more.
                 return Ok(None);
             }

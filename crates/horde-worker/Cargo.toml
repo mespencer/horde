@@ -17,6 +17,16 @@ horde-adapter = { workspace = true }
 # the end-to-end suite run this binary for real without a provider login.
 horde-adapter-fake = { workspace = true }
 horde-identity = { workspace = true }
+# The per-agent MCP endpoint (DESIGN §5, ADR-0004): the Worker stands one up
+# per Session, mints each agent's token, and supplies the journal sink and
+# control-plane channel — the three things the ADR's note left to this crate.
+horde-mcp = { workspace = true }
+# The control-plane client the endpoint's verbs issue RPCs through, over the
+# Worker's own authenticated channel.
+horde-cli = { workspace = true }
+# Token minting for the endpoint's per-agent identity pair.
+getrandom = { workspace = true }
+hex = { workspace = true }
 horde-adapter-claude = { workspace = true }
 horde-adapter-codex = { workspace = true }
 # The daemon's OTLP opt-in (DESIGN §12), wired like the other two binaries.

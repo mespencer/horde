@@ -377,24 +377,51 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
         ));
     }
     if let Some(ask) = object.get("ask_permission") {
-        let ask = ask.as_object().ok_or("ask_permission must be an object")?;
-        let field = |name: &str| {
-            ask.get(name)
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| format!("ask_permission needs a non-empty {name}"))
-        };
+        let (tool_call_id, tool_name, input) = tool_step_fields("ask_permission", ask)?;
         return Ok(Step::AskPermission {
-            tool_call_id: field("id")?,
-            tool_name: field("tool")?,
-            input: ask
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+            tool_call_id,
+            tool_name,
+            input,
         });
     }
-    Err("a step must be one of say, think, ask_permission".to_owned())
+    if let Some(call) = object.get("use_horde") {
+        // A real MCP call against the agent's own endpoint — the operator
+        // form of "here the agent reports its result" or "here it spawns a
+        // child" (DESIGN §5's verbs).
+        let (tool_call_id, tool_name, input) = tool_step_fields("use_horde", call)?;
+        return Ok(Step::UseHordeTool {
+            tool_call_id,
+            tool_name,
+            input,
+        });
+    }
+    Err("a step must be one of say, think, ask_permission, use_horde".to_owned())
+}
+
+/// The `{id, tool, input}` triple both tool-shaped steps share.
+fn tool_step_fields(
+    step: &str,
+    value: &serde_json::Value,
+) -> Result<(String, String, serde_json::Value), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{step} must be an object"))?;
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("{step} needs a non-empty {name}"))
+    };
+    Ok((
+        field("id")?,
+        field("tool")?,
+        object
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+    ))
 }
 
 /// How this run comes to hold an identity, decided before any I/O.
@@ -590,11 +617,16 @@ fn build_runtime(
     name: &str,
     journal: Journal,
 ) -> Result<Runtime, String> {
+    // One lazy channel for everything that rides the Worker's own connection
+    // to the Server: attachment transfer, and the per-agent MCP endpoints'
+    // control-plane verbs. Lazy: a Server that is down at startup is the
+    // reconnect loop's business, not a reason to refuse to start.
+    let channel = server_channel(&config.server, identity)?;
     let mut runtime = Runtime::new(journal)
-        // Attachment transfer rides the Worker's own channel to the Server.
-        // Lazy: a Server that is down at startup is the reconnect loop's
-        // business, not a reason to refuse to start.
-        .with_blob_service(blob_channel(&config.server, identity)?);
+        .with_blob_service(channel.clone())
+        // The wire ADR-0004 left to the Worker: every spawned agent gets its
+        // Session's MCP endpoint and a minted identity pair.
+        .with_agent_endpoints(channel);
 
     for adapter in &config.adapters {
         runtime = match adapter {
@@ -628,8 +660,9 @@ fn configured_script(config: &WorkerConfig) -> Result<Script, String> {
     }
 }
 
-/// The lazily-connecting channel attachment transfer uses.
-fn blob_channel(
+/// The lazily-connecting channel the blob service and the agent endpoints
+/// share.
+fn server_channel(
     server: &str,
     identity: Option<&StoredIdentity>,
 ) -> Result<tonic::transport::Channel, String> {
@@ -1073,6 +1106,28 @@ mod tests {
         assert!((script.turns[1].cost_usd - 0.001).abs() < f64::EPSILON);
     }
 
+    /// The operator form of a verb call: how an e2e script says "here the
+    /// agent reports its result through its endpoint".
+    #[test]
+    fn the_script_form_parses_horde_verb_calls() {
+        let script = fake_script(
+            r#"[{"steps": [{"use_horde": {"id": "call-2", "tool": "report_result",
+                                          "input": {"status": "success", "summary": "done"}}}]}]"#,
+        )
+        .expect("a verb-call script parses");
+        let horde_adapter_fake::Step::UseHordeTool {
+            tool_call_id,
+            tool_name,
+            input,
+        } = &script.turns[0].steps[0]
+        else {
+            panic!("the step must be the verb call");
+        };
+        assert_eq!(tool_call_id, "call-2");
+        assert_eq!(tool_name, "report_result");
+        assert_eq!(input["status"], "success");
+    }
+
     /// A defaulted `input` must still be an object: the wire converts the
     /// proposed call's arguments to a Struct, and `null` would be refused
     /// downstream with a message about neither the script nor the flag.
@@ -1102,6 +1157,9 @@ mod tests {
             (r#"[{"text": 42}]"#, "text must be a string"),
             (r#"[{"steps": [{"ask_permission": {"tool": "T"}}]}]"#, "id"),
             (r#"[{"steps": [{"ask_permission": {"id": "c"}}]}]"#, "tool"),
+            (r#"[{"steps": [{"use_horde": {"tool": "T"}}]}]"#, "id"),
+            (r#"[{"steps": [{"use_horde": {"id": "c"}}]}]"#, "tool"),
+            (r#"[{"steps": [{"use_horde": 42}]}]"#, "object"),
         ] {
             let refused = fake_script(json).expect_err("must refuse");
             assert!(
