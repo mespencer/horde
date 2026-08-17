@@ -46,6 +46,7 @@ horde-server-testkit = { path = "crates/horde-server-testkit" }
 horde-testkit = { path = "crates/horde-testkit" }
 horde-tui = { path = "crates/horde-tui" }
 horde-wire = { path = "crates/horde-wire" }
+horde-worker = { path = "crates/horde-worker" }
 
 [workspace.lints.rust]
 # Deliberately *not* `warnings = "deny"`: denying every present and future rustc
