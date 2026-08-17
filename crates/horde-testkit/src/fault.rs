@@ -594,12 +594,10 @@ mod tests {
         .await;
         assert!(matches!(ended, Ok(0) | Err(_)), "got {ended:?}");
 
-        let delivered = received.lock().expect("an unpoisoned sink").clone();
-        assert_eq!(
-            delivered.len(),
-            10,
-            "exactly the budgeted bytes crossed, not one more"
-        );
+        // The budgeted prefix is in flight when the client sees the sever, so
+        // the sink is *waited* to its expected length and then held to it —
+        // asserting the instant after EOF would measure the scheduler.
+        sink_settles_at(&received, 10, "the budgeted prefix").await;
         assert_eq!(proxy.bytes_forwarded(), 10);
 
         // The sever is a cut: new connections are refused until heal, and
@@ -608,18 +606,32 @@ mod tests {
         let mut retry = dial(&proxy).await;
         retry.write_all(&[9_u8; 64]).await.expect("the retry write");
         retry.shutdown().await.expect("the retry closes");
-        within("the retry to be fully delivered", async {
-            let mut polls = 0_u32;
-            loop {
-                if received.lock().expect("an unpoisoned sink").len() == 74 {
-                    return;
-                }
-                polls += 1;
-                assert!(polls < 100, "the healed retry never delivered 64 bytes");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        sink_settles_at(&received, 74, "the healed retry").await;
+    }
+
+    /// Waits (count-bounded) for the sink to hold exactly `expected` bytes,
+    /// then re-checks once more that not one byte follows.
+    async fn sink_settles_at(
+        received: &Arc<std::sync::Mutex<Vec<u8>>>,
+        expected: usize,
+        what: &str,
+    ) {
+        let mut polls = 0_u32;
+        loop {
+            let delivered = received.lock().expect("an unpoisoned sink").len();
+            if delivered >= expected {
+                assert_eq!(delivered, expected, "{what} overshot its length");
+                break;
             }
-        })
-        .await;
+            polls += 1;
+            assert!(polls < 200, "{what} never reached {expected} bytes");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // One settle later, still exactly the expected length: the sever (or
+        // the shutdown) really ended the stream where it claimed to.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let delivered = received.lock().expect("an unpoisoned sink").len();
+        assert_eq!(delivered, expected, "{what} kept flowing past its length");
     }
 
     /// The slow link is slow: a delay defers arrival, a throttle paces it.
@@ -671,6 +683,40 @@ mod tests {
             echoed.len(),
             100,
             "a heal that left any fault armed could not have delivered this"
+        );
+    }
+
+    /// The race the register guard exists for: a relay that registers after
+    /// the cut drained the live list must be aborted at the door, or it
+    /// slips through the partition. Staged directly, because the interleaving
+    /// is exactly the kind a full-stack run can never schedule on demand.
+    #[tokio::test]
+    async fn a_relay_registering_into_a_cut_is_aborted_at_the_door() {
+        let upstream = echo_upstream().await;
+        let proxy = FaultProxy::front(&upstream).await.expect("the proxy binds");
+
+        // Healthy first: a registrant is kept, not aborted.
+        let kept = tokio::spawn(std::future::pending::<()>());
+        proxy.shared.register(&[kept.abort_handle()]);
+        assert!(
+            !kept.is_finished(),
+            "a healthy proxy must keep registrants alive"
+        );
+
+        proxy.cut();
+        let joined = within("the pre-cut registrant to be severed", kept).await;
+        assert!(
+            joined.is_err_and(|error| error.is_cancelled()),
+            "cut() must abort what was registered before it"
+        );
+
+        // The guard itself: registering *after* the cut aborts immediately.
+        let late = tokio::spawn(std::future::pending::<()>());
+        proxy.shared.register(&[late.abort_handle()]);
+        let joined = within("the late registrant to be aborted", late).await;
+        assert!(
+            joined.is_err_and(|error| error.is_cancelled()),
+            "a relay registering into a cut must not outlive it"
         );
     }
 

@@ -375,6 +375,14 @@ impl WorkerProcess {
         Ok(Self { child })
     }
 
+    /// The child's OS pid, while it runs — what a suite probes (`kill -0`)
+    /// to prove a kill was a kill and not a harness that answered `Ok` over
+    /// a process still breathing.
+    #[must_use]
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// SIGKILL mid-whatever, then reap. The journal file is what survives.
     ///
     /// # Errors
