@@ -32,34 +32,16 @@ mod suite {
         }
     }
 
-    /// The test's own git, for arranging repos and inspecting results —
-    /// production git runs live inside `horde-relay`.
+    /// The shared git driver, panicking on the failures a test's
+    /// arrangement cannot survive — production git runs live inside
+    /// `horde-relay`.
     async fn git(dir: &Path, args: &[&str]) -> String {
-        let mut command = tokio::process::Command::new("git");
-        command.current_dir(dir);
-        for pin in ["user.email=a@t", "user.name=a"] {
-            command.arg("-c").arg(pin);
-        }
-        let output = command.args(args).output().await.expect("git spawns");
-        assert!(
-            output.status.success(),
-            "git {args:?} in {}: {}",
-            dir.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        horde_server_testkit::process::git(dir, args)
+            .await
+            .expect("the git arrangement succeeds")
     }
 
-    async fn holds_commit(repo: &Path, commit_sha: &str) -> bool {
-        tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "-e", &format!("{commit_sha}^{{commit}}")])
-            .status()
-            .await
-            .expect("git spawns")
-            .success()
-    }
+    use horde_server_testkit::process::holds_commit;
 
     /// One Worker of the pair: a Runtime over its own journal and workspace
     /// root, with an echoing fake agent and the shared Relay.

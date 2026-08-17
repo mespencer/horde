@@ -17,7 +17,7 @@ horde-identity = { workspace = true }
 horde-observe = { workspace = true }
 horde-proto = { workspace = true }
 horde-server = { workspace = true }
-tokio = { workspace = true, features = ["net", "process", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ring"] }
 

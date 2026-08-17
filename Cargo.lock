@@ -1067,6 +1067,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-e2e"
+version = "0.1.0"
+dependencies = [
+ "horde-identity",
+ "horde-proto",
+ "horde-relay",
+ "horde-server-testkit",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "horde-fault"
 version = "0.1.0"
 dependencies = [
@@ -1276,6 +1290,7 @@ dependencies = [
  "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-relay",
  "horde-server",
@@ -1290,6 +1305,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
