@@ -24,6 +24,31 @@ mod harness {
         SpawnedProcess::spawn("horde-worker", std::path::Path::new(DAEMON), args, &[])
             .expect("the daemon spawns")
     }
+
+    /// The insecure fake-adapter shape both in-process loop tests drive:
+    /// plaintext to `server`, named, stateful under `state`.
+    pub(crate) fn insecure_config(
+        server: &str,
+        name: &str,
+        state: &std::path::Path,
+    ) -> horde_worker::startup::WorkerConfig {
+        horde_worker::startup::invocation(
+            [
+                "--insecure",
+                "--server",
+                server,
+                "--name",
+                name,
+                "--adapter",
+                "fake",
+                "--state-dir",
+                &state.to_string_lossy(),
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned),
+        )
+        .expect("the shape parses")
+    }
 }
 
 use horde_server::EventLog;
@@ -222,22 +247,7 @@ async fn the_run_loop_survives_a_partition_and_registers_again() {
         .expect("the fault proxy binds");
 
     let state = tempfile::tempdir().expect("a temp dir");
-    let config = horde_worker::startup::invocation(
-        [
-            "--insecure",
-            "--server",
-            &proxy.endpoint(),
-            "--name",
-            "w-r",
-            "--adapter",
-            "fake",
-            "--state-dir",
-            &state.path().to_string_lossy(),
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned),
-    )
-    .expect("the shape parses");
+    let config = harness::insecure_config(&proxy.endpoint(), "w-r", state.path());
 
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let recorded = std::sync::Arc::clone(&lines);
@@ -436,22 +446,7 @@ async fn an_enrolled_identity_names_the_worker() {
 #[tokio::test]
 async fn the_run_loop_redials_dial_failures_until_shutdown() {
     let state = tempfile::tempdir().expect("a temp dir");
-    let config = horde_worker::startup::invocation(
-        [
-            "--insecure",
-            "--server",
-            "http://127.0.0.1:1",
-            "--name",
-            "w-dead",
-            "--adapter",
-            "fake",
-            "--state-dir",
-            &state.path().to_string_lossy(),
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned),
-    )
-    .expect("the shape parses");
+    let config = harness::insecure_config("http://127.0.0.1:1", "w-dead", state.path());
 
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
