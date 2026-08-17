@@ -224,5 +224,127 @@ mod tests {
             "the catalog's repo must be fetchable through the mounted relay: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+
+        // The follower keeps the registry current: a definition created
+        // *after* mounting becomes fetchable too. Bounded retries, because
+        // the follower reacts to a notification rather than the append.
+        let late = horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-2")),
+            name: "late-charts".to_owned(),
+            etag: "2".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
+                name: "charts".to_owned(),
+                remote_url: origin.display().to_string(),
+                default_branch: "main".to_owned(),
+                layout_path: String::new(),
+            }],
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        };
+        crate::service::shared::append_server_event(
+            &log,
+            crate::workspace::CATALOG_STREAM,
+            "ws-2:1",
+            horde_proto::v1::Event {
+                agent_id: None,
+                occurred_at: None,
+                idempotency_key: "ws-2:1".to_owned(),
+                kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
+                    horde_proto::v1::WorkspaceDefinitionChanged {
+                        definition: Some(late),
+                        deleted: false,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("the late definition journals");
+
+        let late_url = format!("http://{}/charts", mounted.server.addr());
+        let late_clone = state.path().join("late-clone");
+        let mut cloned = false;
+        for _ in 0..100_u32 {
+            let output = tokio::process::Command::new("git")
+                .args(["clone", "-q", &late_url, &late_clone.display().to_string()])
+                .output()
+                .await
+                .expect("git runs");
+            if output.status.success() {
+                cloned = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            cloned,
+            "a post-mount definition must become fetchable — the follower's whole job"
+        );
+
+        // Dropping the mount stops the follower with it: a leaked follower
+        // would hold the log subscription and keep folding forever.
+        let follower = mounted.follower.abort_handle();
+        drop(mounted);
+        let mut finished = false;
+        for _ in 0..100_u32 {
+            if follower.is_finished() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(finished, "drop must abort the catalog follower");
+    }
+
+    /// `register_catalog` answers how many repos it registered — the count
+    /// the mount's log line reports — skipping (not failing on) a name that
+    /// cannot be a path segment.
+    #[tokio::test]
+    async fn register_catalog_counts_what_it_registered_and_skips_the_hostile() {
+        let log = EventLog::in_memory().expect("an in-memory log");
+        let definition = horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+            name: "mixed".to_owned(),
+            etag: "1".to_owned(),
+            repos: ["maps", "charts", "-hostile"]
+                .into_iter()
+                .map(|name| horde_proto::v1::WorkspaceRepo {
+                    name: name.to_owned(),
+                    remote_url: format!("https://git.example/{name}.git"),
+                    default_branch: "main".to_owned(),
+                    layout_path: String::new(),
+                })
+                .collect(),
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        };
+        crate::service::shared::append_server_event(
+            &log,
+            crate::workspace::CATALOG_STREAM,
+            "ws-1:1",
+            horde_proto::v1::Event {
+                agent_id: None,
+                occurred_at: None,
+                idempotency_key: "ws-1:1".to_owned(),
+                kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
+                    horde_proto::v1::WorkspaceDefinitionChanged {
+                        definition: Some(definition),
+                        deleted: false,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("the definition journals");
+
+        let store =
+            horde_relay::MirrorStore::new(tempfile::tempdir().expect("a dir").path().join("relay"));
+        let registered = super::register_catalog(&store, &log)
+            .await
+            .expect("the catalog reads");
+        assert_eq!(registered, 2, "both valid repos, and only those, count");
+        assert!(store.registered("maps").is_some());
+        assert!(store.registered("charts").is_some());
+        assert!(
+            store.registered("-hostile").is_none(),
+            "a name that cannot be a path segment is skipped, loudly"
+        );
     }
 }

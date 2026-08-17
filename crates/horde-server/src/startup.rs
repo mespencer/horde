@@ -675,7 +675,23 @@ mod tests {
             lines[4],
             format!("bootstrap-client-code {}", code.join_code())
         );
+
+        // Dropping the server takes the chain driver with it: a leaked
+        // driver would keep folding the (closed) log forever.
+        let chain = running.permission_chain.task.abort_handle();
         drop(running);
+        let mut chain_finished = false;
+        for _ in 0..100_u32 {
+            if chain.is_finished() {
+                chain_finished = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            chain_finished,
+            "drop must abort the permission chain driver"
+        );
 
         // Second start, same state: the CA loads, and no client is enrolled
         // yet (a minted code is not an enrollment), so bootstrap re-offers.

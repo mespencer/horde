@@ -262,4 +262,69 @@ mod tests {
 
         manager.shutdown().await;
     }
+
+    /// The minted pair, exercised against the served socket with a real MCP
+    /// client: it authenticates while registered, stops the moment the agent
+    /// is forgotten, and the socket itself stops answering after shutdown —
+    /// a `forget_agent` or `shutdown` that silently did nothing would leave
+    /// an archived agent's credential (and the whole endpoint) alive.
+    #[tokio::test]
+    async fn minted_credentials_dial_until_forgotten_and_the_socket_dies_at_shutdown() {
+        let manager = manager();
+        let endpoint = manager
+            .endpoint_for("s1", "agent-1", sink())
+            .await
+            .expect("the endpoint serves");
+        let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
+            panic!("the worker serves HTTP");
+        };
+        let token = headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .and_then(|(_, value)| value.strip_prefix("Bearer "))
+            .expect("a bearer token")
+            .to_owned();
+
+        let dial = |token: String, url: String| async move {
+            horde_mcp::hub::Upstream::dial(
+                "horde",
+                &url,
+                Some(&token),
+                &[("x-horde-agent", "agent-1")],
+            )
+            .await
+        };
+
+        dial(token.clone(), url.clone())
+            .await
+            .expect("the minted pair authenticates against the served endpoint");
+
+        manager.forget_agent("agent-1");
+        assert!(
+            dial(token.clone(), url.clone()).await.is_err(),
+            "a forgotten agent's token must stop authenticating immediately"
+        );
+
+        manager.shutdown().await;
+        // The accept loop is aborted; give the runtime one breath to reap it,
+        // then the socket must refuse outright.
+        tokio::task::yield_now().await;
+        let address = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.strip_suffix("/mcp"))
+            .expect("the served url shape");
+        assert!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "a shut-down manager must not keep serving its port"
+        );
+    }
+
+    /// The Debug form reaches logs; it must say what it is (the credential
+    /// map stays out of it by construction). A tokio test because even a
+    /// lazy tonic channel wants a reactor to be born on.
+    #[tokio::test]
+    async fn the_manager_debugs_by_name() {
+        let rendered = format!("{:?}", manager());
+        assert!(rendered.contains("EndpointManager"), "{rendered}");
+    }
 }

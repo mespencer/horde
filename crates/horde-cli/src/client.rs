@@ -620,7 +620,7 @@ impl Client {
             .await;
         match by_id {
             Ok(response) => Ok(response.into_inner()),
-            Err(status) if status.code() == tonic::Code::NotFound => Ok(self
+            Err(status) if retry_as_name(&status) => Ok(self
                 .inner
                 .get_workspace_definition(horde_proto::v1::GetWorkspaceDefinitionRequest {
                     workspace_definition_id: None,
@@ -928,6 +928,16 @@ pub struct EventStream {
     queued: std::collections::VecDeque<StreamUpdate>,
 }
 
+/// Whether an id lookup's failure means "no definition has this id" — the
+/// one failure a name lookup can still answer. Anything else (a dead server,
+/// a malformed request) must propagate: retrying it as a name would bury the
+/// real refusal under a second, more confusing one. A named predicate so the
+/// distinction is a truth table rather than a guard no test can reach both
+/// sides of.
+fn retry_as_name(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
+}
+
 /// One meaningful thing a follow stream can say.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamUpdate {
@@ -1180,6 +1190,18 @@ mod tests {
         assert_eq!(super::ttl_of(None), None, "unset lets the server choose");
         let five = super::ttl_of(Some(5)).expect("five minutes");
         assert_eq!((five.seconds, five.nanos), (300, 0));
+    }
+
+    /// The id-lookup fallback's truth table: only NotFound retries as a
+    /// name; every other refusal is the real answer and must propagate.
+    #[test]
+    fn only_a_missing_id_retries_the_lookup_as_a_name() {
+        assert!(super::retry_as_name(&tonic::Status::not_found("no ws")));
+        assert!(!super::retry_as_name(&tonic::Status::unavailable("down")));
+        assert!(!super::retry_as_name(&tonic::Status::invalid_argument(
+            "bad"
+        )));
+        assert!(!super::retry_as_name(&tonic::Status::internal("oops")));
     }
 
     #[test]

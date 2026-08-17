@@ -1384,3 +1384,81 @@ mod stall_tests {
         matches!(event, AgentEvent::Output { text, .. } if text == "played on regardless")
     }
 }
+
+#[cfg(test)]
+mod endpoint_call_tests {
+    use horde_adapter::{Adapter, AgentEvent, AgentSpec, McpEndpoint, OutputChannel, TurnInput};
+    use serde_json::json;
+
+    use crate::endpoint_client::scripted_server;
+    use crate::{FakeAdapter, Script, ScriptedTurn, Step};
+
+    /// A session spawned with an endpoint really dials it: the scheduled
+    /// call executes against the wire, its result text lands as tool output,
+    /// and the completion carries the verdict. An `execute_horde_call` that
+    /// silently did nothing would swallow the step whole — the turn would
+    /// end with the intent announced and no result ever heard.
+    #[tokio::test]
+    async fn a_scripted_verb_call_executes_against_the_endpoint() {
+        let url = scripted_server::serve(vec![
+            scripted_server::http(
+                "200 OK",
+                Some("sess-1"),
+                r#"{"jsonrpc":"2.0","id":0,"result":{}}"#,
+            ),
+            scripted_server::http("202 Accepted", None, ""),
+            scripted_server::http(
+                "200 OK",
+                None,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"recorded"}]}}"#,
+            ),
+        ])
+        .await;
+
+        let adapter = FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("reporting").with_step(Step::UseHordeTool {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "report_result".to_owned(),
+                input: json!({"status": "success", "summary": "done"}),
+            }),
+        ]));
+        let spec = AgentSpec {
+            horde_endpoint: Some(McpEndpoint::Http {
+                url,
+                headers: vec![("Authorization".to_owned(), "Bearer t".to_owned())],
+            }),
+            ..AgentSpec::default()
+        };
+        let mut session = adapter.spawn(&spec).await.expect("spawns");
+        session
+            .send(TurnInput::queued("go"))
+            .await
+            .expect("the first message sends");
+
+        let mut tool_results = Vec::new();
+        let mut completions = Vec::new();
+        while let Some(event) = session.next_event().await.expect("a healthy stream") {
+            match event {
+                AgentEvent::Output {
+                    channel: OutputChannel::ToolResult,
+                    text,
+                    ..
+                } => tool_results.push(text),
+                AgentEvent::ToolCompleted { is_error, .. } => completions.push(is_error),
+                AgentEvent::TurnEnded(_) => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            tool_results,
+            vec!["recorded".to_owned()],
+            "the endpoint's own answer is the tool's output"
+        );
+        assert_eq!(
+            completions,
+            vec![false],
+            "a served call completes without error"
+        );
+    }
+}

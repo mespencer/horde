@@ -47,6 +47,17 @@ pub enum Update {
 /// missed beat is jitter, three is a dead stream.
 pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Whether silence since `last` amounts to a stale stream at `now`.
+///
+/// Strictly past the ceiling: silence of *exactly* [`STALE_AFTER`] is the
+/// third heartbeat arriving on the buzzer, not a dead stream. A pure
+/// function of both instants because the boundary is the whole point, and a
+/// judgment buried in `apply` (where `last` is stamped by a live clock)
+/// cannot have its boundary exercised.
+fn is_stale(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_some_and(|last| now.saturating_duration_since(last) > STALE_AFTER)
+}
+
 /// Something the runtime should ask the server for on the App's behalf.
 ///
 /// Screen navigation never appears here — it is the App's own state. Only the
@@ -301,9 +312,7 @@ impl App {
             // Proof of life and nothing else — the variant's whole job.
             Update::Heartbeat => self.mark_stream_alive(),
             Update::Tick { now } => {
-                self.stream_stale = self
-                    .last_stream_activity
-                    .is_some_and(|last| now.saturating_duration_since(last) > STALE_AFTER);
+                self.stream_stale = is_stale(self.last_stream_activity, now);
             }
         }
     }
@@ -849,6 +858,24 @@ mod tests {
             attachment.agent_id, None,
             "another session attaches at its root"
         );
+    }
+
+    /// The staleness boundary, exactly: silence of the ceiling itself is the
+    /// third heartbeat on the buzzer, one instant more is a dead stream, and
+    /// a stream that never spoke is connecting rather than stale.
+    #[test]
+    fn staleness_begins_strictly_past_the_ceiling() {
+        let last = std::time::Instant::now();
+        assert!(!super::is_stale(None, last + super::STALE_AFTER * 2));
+        assert!(!super::is_stale(Some(last), last));
+        assert!(
+            !super::is_stale(Some(last), last + super::STALE_AFTER),
+            "exactly the ceiling is on time, not stale"
+        );
+        assert!(super::is_stale(
+            Some(last),
+            last + super::STALE_AFTER + std::time::Duration::from_millis(1)
+        ));
     }
 
     /// The staleness clock (fix a9): quiet past the ceiling turns the badge

@@ -50,3 +50,27 @@ pub use usage::{
     UnreadableUtilization, rate_window_from_wire, rate_window_to_wire, token_usage_from_wire,
     token_usage_to_wire,
 };
+#[cfg(test)]
+mod result_status_tests {
+    use super::result_status_name;
+
+    /// The whole table, in this crate's own suite: the consumers' tests do
+    /// not run for a mutation of this package, so the vocabulary must be
+    /// pinned where it lives.
+    #[test]
+    fn every_result_status_names_itself_and_nothing_else() {
+        use horde_proto::v1::ResultStatus;
+        assert_eq!(result_status_name(ResultStatus::Success as i32), "success");
+        assert_eq!(result_status_name(ResultStatus::Partial as i32), "partial");
+        assert_eq!(result_status_name(ResultStatus::Blocked as i32), "blocked");
+        assert_eq!(
+            result_status_name(ResultStatus::Unspecified as i32),
+            "unknown"
+        );
+        assert_eq!(
+            result_status_name(9_999),
+            "unknown",
+            "a status from a newer build is unreadable, not successful"
+        );
+    }
+}

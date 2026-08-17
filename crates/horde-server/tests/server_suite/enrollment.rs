@@ -441,6 +441,55 @@ async fn revocation_severs_a_live_command_stream() -> Setup<()> {
     Ok(())
 }
 
+/// Attribution over the real mTLS door (fix a13): an enrolled client's
+/// interrupt is journaled with that client's own name as the actor. Multi-
+/// attach is why the field exists, and a `requested_by` that vanished on the
+/// way to the log would leave every event in a shared session anonymous.
+#[tokio::test]
+async fn a_clients_interrupt_is_attributed_to_that_client() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let mut client = harness.client(&identity).await?;
+
+    let (summary, root) = within("the session", client.create_session("attributed", "")).await??;
+    let session_id = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or("a session id")?;
+    within("the interrupt", client.interrupt(&root.to_string(), "stop")).await??;
+
+    let mut actors = Vec::new();
+    within(
+        "the replay",
+        client.sync(
+            &horde_cli::client::SyncOptions::new(session_id),
+            |envelope| {
+                if let Some(horde_proto::v1::event::Kind::TurnInterrupted(interrupted)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                {
+                    actors.push(interrupted.requested_by.clone());
+                }
+            },
+            |_| {},
+        ),
+    )
+    .await??;
+
+    assert_eq!(
+        actors,
+        vec![Some(horde_proto::v1::Actor {
+            actor: Some(horde_proto::v1::actor::Actor::ClientId(
+                horde_proto::v1::ClientId::new("laptop")
+            )),
+        })],
+        "the interrupt is the laptop's, and the log says so"
+    );
+    Ok(())
+}
+
 /// The bootstrap question, answered against the live authority: `false` on a
 /// fresh server, `true` the moment a client holds a certificate — the
 /// distinction that opens and closes the printed-code door.

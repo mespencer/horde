@@ -411,17 +411,23 @@ async fn a_follow_stream_hands_back_the_matching_event() {
         .await
         .expect("the note sends");
 
-    let found = stream
-        .next_matching(|envelope| {
+    // Ceilinged: this is a *follow* stream, so a send that silently wrote
+    // nothing would otherwise park this wait forever — a hang where a fast
+    // failure was available (and a mutant nobody evaluated).
+    let found = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.next_matching(|envelope| {
             let horde_proto::v1::event::Kind::NoteSent(sent) =
                 envelope.event.as_ref()?.kind.as_ref()?
             else {
                 return None;
             };
             sent.note.as_ref().map(|note| note.text.clone())
-        })
-        .await
-        .expect("the stream must not fail");
+        }),
+    )
+    .await
+    .expect("the sent note must arrive rather than never")
+    .expect("the stream must not fail");
     assert_eq!(
         found.as_deref(),
         Some("the needle"),

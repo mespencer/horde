@@ -218,8 +218,143 @@ async fn post(
 }
 
 #[cfg(test)]
+pub(crate) mod scripted_server {
+    //! A canned HTTP responder: each connection gets the next scripted
+    //! response, verbatim. Not an MCP server — the subject under test is
+    //! this crate's *client* half, and what it needs from the far side is
+    //! exact bytes it can be right or wrong about.
+
+    /// Serves `responses` in order, one per connection, on a loopback port.
+    /// Returns the endpoint URL. The task ends with the script.
+    pub(crate) async fn serve(responses: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback bind");
+        let address = listener.local_addr().expect("a bound address");
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read the request head (the client sends a full request
+                // before reading), then answer with the canned bytes.
+                let mut sink = [0_u8; 4096];
+                let _ = stream.read(&mut sink).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{address}/mcp")
+    }
+
+    /// An HTTP/1.1 response with `status`, optional session header, `body`.
+    pub(crate) fn http(status: &str, session: Option<&str>, body: &str) -> String {
+        let session_header = session
+            .map(|id| format!("mcp-session-id: {id}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{session_header}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{Target, decode_call_reply};
+    use super::scripted_server::{http, serve};
+    use super::{Target, call_horde_tool, decode_call_reply};
+    use horde_adapter::McpEndpoint;
+
+    fn endpoint(url: String) -> McpEndpoint {
+        McpEndpoint::Http {
+            url,
+            headers: vec![("Authorization".to_owned(), "Bearer t".to_owned())],
+        }
+    }
+
+    const OK_RESULT: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"recorded"}]}}"#;
+
+    /// The whole legacy flow against real sockets: initialize picks up the
+    /// session id, initialized is acknowledged, and the call's result text
+    /// comes back verbatim — not empty, not invented.
+    #[tokio::test]
+    async fn the_call_walks_the_legacy_flow_and_returns_the_result_text() {
+        let url = serve(vec![
+            http(
+                "200 OK",
+                Some("sess-1"),
+                r#"{"jsonrpc":"2.0","id":0,"result":{}}"#,
+            ),
+            http("202 Accepted", None, ""),
+            http("200 OK", None, OK_RESULT),
+        ])
+        .await;
+
+        let answered = call_horde_tool(
+            Some(&endpoint(url)),
+            "report_result",
+            &serde_json::json!({"status": "success", "summary": "done"}),
+        )
+        .await
+        .expect("the flow completes");
+        assert_eq!(
+            answered, "recorded",
+            "the result text is the server's, verbatim"
+        );
+    }
+
+    /// Each hop's refusal is its own error naming the hop — a client that
+    /// read a refused handshake as success would report results nobody
+    /// recorded.
+    #[tokio::test]
+    async fn each_refused_hop_names_itself() {
+        // initialize refused.
+        let url = serve(vec![http("500 Internal Server Error", None, "boom")]).await;
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+            .await
+            .expect_err("a refused initialize is an error");
+        assert!(refused.contains("initialize was refused"), "{refused}");
+
+        // initialize accepted but no session assigned.
+        let url = serve(vec![http("200 OK", None, "{}")]).await;
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+            .await
+            .expect_err("a sessionless initialize is an error");
+        assert!(refused.contains("Mcp-Session-Id"), "{refused}");
+
+        // notifications/initialized refused.
+        let url = serve(vec![
+            http("200 OK", Some("sess-1"), "{}"),
+            http("500 Internal Server Error", None, ""),
+        ])
+        .await;
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+            .await
+            .expect_err("a refused initialized is an error");
+        assert!(refused.contains("notifications/initialized"), "{refused}");
+
+        // tools/call refused.
+        let url = serve(vec![
+            http("200 OK", Some("sess-1"), "{}"),
+            http("202 Accepted", None, ""),
+            http("500 Internal Server Error", None, "no"),
+        ])
+        .await;
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+            .await
+            .expect_err("a refused call is an error");
+        assert!(refused.contains("tools/call was refused"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_session_without_an_http_endpoint_refuses_the_call() {
+        let refused = call_horde_tool(None, "t", &serde_json::json!({}))
+            .await
+            .expect_err("no endpoint is a refusal, not a fabricated result");
+        assert!(refused.contains("no Horde HTTP endpoint"), "{refused}");
+    }
 
     #[test]
     fn the_target_splits_authority_and_path() {

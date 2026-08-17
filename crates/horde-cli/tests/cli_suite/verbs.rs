@@ -261,12 +261,59 @@ async fn the_workspace_verbs_round_trip_through_the_dispatch() {
         .expect_err("prewarming an absent worker refuses");
     assert!(!refused.to_string().is_empty());
 
+    // A registered worker shows up in the listing with its own id — an
+    // empty (or invented) listing is exactly what a stubbed client fakes.
+    let mut worker = horde_proto::v1::worker_service_client::WorkerServiceClient::connect(
+        tonic::transport::Endpoint::try_from(endpoint.clone()).expect("the endpoint parses"),
+    )
+    .await
+    .expect("the worker spine answers");
+    worker
+        .register_worker(horde_proto::v1::RegisterWorkerRequest {
+            hello: Some(horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                ..horde_proto::v1::Hello::default()
+            }),
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-9")),
+            capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+        })
+        .await
+        .expect("the worker registers");
+    let workers = client.list_workers().await.expect("the listing answers");
+    assert_eq!(
+        workers
+            .iter()
+            .filter_map(|summary| summary.worker_id.as_ref().map(ToString::to_string))
+            .collect::<Vec<_>>(),
+        vec!["w-9".to_owned()],
+        "the listing is the registry's truth, not a fabrication"
+    );
+
     let refreshed = client
         .get_workspace_definition(&id)
         .await
         .expect("the widened definition reads back");
     let definition = refreshed.definition.expect("a definition");
     assert_eq!(definition.repos.len(), 2, "the added repo is in the set");
+
+    // A rename through Update: same repo set, new name, fresh etag — and
+    // the answer is the journaled definition, not a default.
+    let renamed = client
+        .update_workspace_definition(horde_proto::v1::UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: definition.workspace_definition_id.clone(),
+            etag: definition.etag.clone(),
+            name: "atlas-renamed".to_owned(),
+            unmanaged_paths: definition.unmanaged_paths.clone(),
+            repos: definition.repos.clone(),
+        })
+        .await
+        .expect("a same-repo-set update applies");
+    assert_eq!(renamed.name, "atlas-renamed");
+    assert_ne!(
+        renamed.etag, definition.etag,
+        "the update's answer carries the etag its change produced"
+    );
+    let definition = renamed;
 
     invoke(
         &endpoint,

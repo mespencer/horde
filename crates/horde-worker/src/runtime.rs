@@ -1556,6 +1556,13 @@ mod tests {
         let journal = runtime.journal.clone();
         let mut head = journal.watch_head();
         let mut polls = 0_u32;
+        // One ceiling for the whole wait rather than 60s per wake: a
+        // journal that has genuinely stopped (a pump a mutant never
+        // started, say) must fail in seconds — under cargo-mutants, a
+        // 60s-per-wake wait across a suite reads as TIMEOUT, a mutant
+        // nobody evaluated. 15s total is still 3× the wake latency that
+        // flaked the old 5s bound, and a passing run never spends it.
+        let deadline = tokio::time::Instant::now() + core::time::Duration::from_secs(15);
         loop {
             let events = journal.read_from(1, 100).await.expect("a readable journal");
             if accept(&events) {
@@ -1564,17 +1571,11 @@ mod tests {
             polls += 1;
             assert!(polls < 64, "the journal never reached {waiting_for}");
             // A positive wait: something must arrive, and the assertion is
-            // on what arrived — so a clock is legitimate here, but only as
-            // a ceiling, never as a duration anything is expected to take.
-            // The previous 5s ceiling was a clock assumption in a costume:
-            // under `cargo test`'s single-process execution with every
-            // suite's threads contending, one wake legitimately took
-            // longer, and the wait reported "stopped moving" for a journal
-            // that was merely slow. Generous on purpose; a passing run
-            // never spends it.
-            tokio::time::timeout(core::time::Duration::from_secs(60), head.changed())
+            // on what arrived — the deadline is a ceiling, never a duration
+            // anything is expected to take.
+            tokio::time::timeout_at(deadline, head.changed())
                 .await
-                .expect("the journal stopped moving")
+                .unwrap_or_else(|_| panic!("the journal stopped moving before {waiting_for}"))
                 .expect("the journal outlives the wait");
         }
     }

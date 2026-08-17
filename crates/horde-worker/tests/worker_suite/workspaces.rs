@@ -106,6 +106,99 @@ mod harness {
     }
 }
 
+/// The Runtime's half of fix a8: a spawn command naming a parent observes
+/// that parent's committed HEAD per repo and starts the child's checkout
+/// there — through the whole apply path, with real git underneath. A
+/// `parent_start_points` that answered nothing (or invented repos) would
+/// leave the child at the instance's HEAD, and the head comparison here is
+/// exactly what notices.
+#[tokio::test]
+async fn a_spawned_child_starts_at_its_parents_committed_head() {
+    use horde_worker::ApplyCommand as _;
+
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let atlas = harness::origin(temp.path(), "atlas");
+    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
+
+    let journal = horde_worker::Journal::in_memory().expect("an in-memory journal");
+    let mut runtime = horde_worker::Runtime::new(journal)
+        .with_adapter(std::sync::Arc::new(horde_adapter_fake::FakeAdapter::new(
+            horde_adapter_fake::Script::echoing(),
+        )))
+        .with_workspaces(harness::manager_under(temp.path()));
+
+    let command = |sequence: u64, kind| horde_proto::v1::StreamCommandsResponse {
+        command_sequence: sequence,
+        command_id: format!("a8:{sequence}"),
+        command: Some(kind),
+    };
+    let spawn = |agent: &str, parent: Option<&str>| {
+        horde_proto::v1::stream_commands_response::Command::SpawnAgent(
+            horde_proto::v1::SpawnAgentCommand {
+                session_id: Some(horde_proto::v1::SessionId::new("s1")),
+                agent_id: Some(horde_proto::v1::AgentId::new(agent)),
+                parent_agent_id: parent.map(horde_proto::v1::AgentId::new),
+                spec: Some(horde_proto::v1::AgentSpec {
+                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                        "ws-1",
+                    )),
+                    checkout_policy: CheckoutPolicy::Worktree as i32,
+                    ..horde_proto::v1::AgentSpec::default()
+                }),
+                ..horde_proto::v1::SpawnAgentCommand::default()
+            },
+        )
+    };
+
+    runtime
+        .apply(command(
+            1,
+            horde_proto::v1::stream_commands_response::Command::MaterializeWorkspace(
+                horde_proto::v1::MaterializeWorkspaceCommand {
+                    definition: Some(definition),
+                    session_id: Some(horde_proto::v1::SessionId::new("s1")),
+                },
+            ),
+        ))
+        .await
+        .expect("the materialize applies");
+    runtime
+        .apply(command(2, spawn("parent-1", None)))
+        .await
+        .expect("the parent spawns");
+
+    // The parent's work: a commit in its worktree, past the instance HEAD.
+    let checkout_of = |agent: &str| {
+        temp.path()
+            .join("workspaces")
+            .join("ws-1")
+            .join(".horde-agents")
+            .join(agent)
+            .join("atlas")
+    };
+    let parent_repo = checkout_of("parent-1");
+    std::fs::write(parent_repo.join("finding.md"), "found\n").expect("writes");
+    harness::git(&parent_repo, &["add", "."]);
+    harness::git(&parent_repo, &["commit", "-qm", "the parent's work"]);
+    let parent_head = harness::git(&parent_repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    runtime
+        .apply(command(3, spawn("child-1", Some("parent-1"))))
+        .await
+        .expect("the child spawns");
+    let child_head = harness::git(&checkout_of("child-1"), &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_eq!(
+        child_head, parent_head,
+        "the child's checkout starts at the parent's committed HEAD"
+    );
+
+    runtime.shutdown().await;
+}
+
 /// "Children start from the parent's committed HEAD" (DESIGN §5, fix a8):
 /// a checkout carrying a start point begins at that commit, not at the
 /// instance's HEAD — for a worktree and for a fresh clone alike — and a
