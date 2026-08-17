@@ -13,7 +13,6 @@
 
 use std::time::Duration;
 
-use horde_proto::prost::Message;
 use horde_proto::v1::control_plane_service_client::ControlPlaneServiceClient;
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::{
@@ -21,7 +20,6 @@ use horde_proto::v1::{
     sync_events_response::Update,
 };
 use horde_server::EventLog;
-use horde_server::log::PendingEvent;
 use horde_server::service::ControlPlane;
 use horde_testkit::FaultProxy;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -64,14 +62,7 @@ async fn append_marker(log: &EventLog, session: &str, marker: &str) {
             },
         )),
     };
-    log.append(PendingEvent {
-        session_id: session.to_owned(),
-        idempotency_key: event.idempotency_key.clone(),
-        payload: event.encode_to_vec(),
-        ..PendingEvent::default()
-    })
-    .await
-    .expect("the marker appends");
+    support::append_event(log, session, event).await;
 }
 
 /// The next frame within `ceiling`, or `None` when the ceiling elapsed —
@@ -181,13 +172,13 @@ async fn heartbeats_mark_a_stale_link_and_the_healed_stream_catches_up() {
         match frame_within(&mut stream, Duration::from_secs(2)).await {
             Some(Update::Batch(batch)) => {
                 for envelope in &batch.events {
-                    let reason = envelope.event.as_ref().and_then(|event| match &event.kind {
-                        Some(horde_proto::v1::event::Kind::TurnInterrupted(interrupted)) => {
-                            Some(interrupted.reason.clone())
-                        }
-                        _ => None,
-                    });
-                    if reason.as_deref() == Some("appended-in-the-dark") {
+                    if let Some(horde_proto::v1::event::Kind::TurnInterrupted(interrupted)) =
+                        envelope
+                            .event
+                            .as_ref()
+                            .and_then(|event| event.kind.as_ref())
+                        && interrupted.reason == "appended-in-the-dark"
+                    {
                         dark_markers += 1;
                     }
                 }

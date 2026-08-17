@@ -15,49 +15,66 @@ use std::time::Duration;
 
 use horde_adapter_fake::{Script, ScriptedTurn, Step};
 use horde_proto::v1::event::Kind;
-use horde_testkit::FaultProxy;
 use horde_worker::Journal;
 
 use crate::support;
 
-/// The turn under partition: announces itself, stalls long enough for the
-/// cut to land deterministically before the stall ends, then finishes.
-fn mid_turn_script() -> Script {
+/// One scripted turn that announces itself, stalls mid-flight long enough
+/// for a fault to land deterministically inside it, then finishes.
+fn stalling_turn(opener: &str, tail: &str, answer: &str) -> Script {
     Script::of(vec![ScriptedTurn {
         steps: vec![
-            Step::Say("before-the-cut".to_owned()),
+            Step::Say(opener.to_owned()),
             Step::Stall(Duration::from_millis(400)),
-            Step::Say("during-the-partition".to_owned()),
+            Step::Say(tail.to_owned()),
         ],
-        ..ScriptedTurn::saying("the-turn-answer")
+        ..ScriptedTurn::saying(answer)
     }])
 }
 
-#[tokio::test]
-async fn a_turn_cut_mid_flight_reaches_the_server_exactly_once_after_heal() {
-    let core = support::fresh_core();
-    let upstream = horde_server_testkit::serve_core(core.clone())
-        .await
-        .expect("the core serves");
-    let proxy = FaultProxy::front(&upstream).await.expect("the proxy binds");
-
+/// Both tests' opening move: a proxied server with agent-1 placed on
+/// worker-a, and an in-process worker supervising `script` through the
+/// proxy. Returns the stage: core, proxy, the worker's journal, and the
+/// supervisor handle to abort.
+async fn staged_worker(
+    script: Script,
+) -> (
+    horde_server::ServerCore,
+    horde_testkit::FaultProxy,
+    Journal,
+    tokio::task::JoinHandle<()>,
+) {
+    let (core, proxy) = support::proxied_core().await;
     horde_server_testkit::place_agent(&core.log, "s1", "agent-1", "worker-a", "begin")
         .await
         .expect("the seed appends");
-
     let journal = Journal::in_memory().expect("an in-memory journal");
-    let runtime = support::scripted_runtime(&journal, mid_turn_script());
+    let runtime = support::scripted_runtime(&journal, script);
     let worker = support::supervise_worker(
         proxy.endpoint(),
         "worker-a".to_owned(),
         journal.clone(),
         runtime,
     );
+    (core, proxy, journal, worker)
+}
+
+#[tokio::test]
+async fn a_turn_cut_mid_flight_reaches_the_server_exactly_once_after_heal() {
+    let (core, proxy, journal, worker) = staged_worker(stalling_turn(
+        "before-the-cut",
+        "during-the-partition",
+        "the-turn-answer",
+    ))
+    .await;
 
     // The turn opens over the healthy link: its first chunk crosses.
-    support::log_until(&core.log, "s1", "the turn never opened at the server", |events| {
-        support::chunks_saying(events, "before-the-cut") == 1
-    })
+    support::log_until(
+        &core.log,
+        "s1",
+        "the turn never opened at the server",
+        |events| support::chunks_saying(events, "before-the-cut") == 1,
+    )
     .await;
 
     // The cable is yanked mid-turn — the 400ms stall is still holding the
@@ -150,39 +167,20 @@ async fn a_turn_cut_mid_flight_reaches_the_server_exactly_once_after_heal() {
 /// mid-transfer sever doing to the event stream what a flaky network does.
 #[tokio::test]
 async fn a_byte_budget_cut_inside_the_push_stream_still_reconciles_exactly() {
-    let core = support::fresh_core();
-    let upstream = horde_server_testkit::serve_core(core.clone())
-        .await
-        .expect("the core serves");
-    let proxy = FaultProxy::front(&upstream).await.expect("the proxy binds");
-
-    horde_server_testkit::place_agent(&core.log, "s1", "agent-1", "worker-a", "begin")
-        .await
-        .expect("the seed appends");
-
-    let journal = Journal::in_memory().expect("an in-memory journal");
-    let runtime = support::scripted_runtime(
-        &journal,
-        Script::of(vec![ScriptedTurn {
-            steps: vec![
-                Step::Say("budget-opener".to_owned()),
-                Step::Stall(Duration::from_millis(400)),
-                Step::Say("budget-tail".to_owned()),
-            ],
-            ..ScriptedTurn::saying("the-budget-answer")
-        }]),
-    );
-    let worker = support::supervise_worker(
-        proxy.endpoint(),
-        "worker-a".to_owned(),
-        journal.clone(),
-        runtime,
-    );
+    let (core, proxy, journal, worker) = staged_worker(stalling_turn(
+        "budget-opener",
+        "budget-tail",
+        "the-budget-answer",
+    ))
+    .await;
 
     // Healthy through registration and the turn's opener…
-    support::log_until(&core.log, "s1", "the turn never opened at the server", |events| {
-        support::chunks_saying(events, "budget-opener") == 1
-    })
+    support::log_until(
+        &core.log,
+        "s1",
+        "the turn never opened at the server",
+        |events| support::chunks_saying(events, "budget-opener") == 1,
+    )
     .await;
 
     // …then a tiny byte budget, armed while the stall holds the turn open.

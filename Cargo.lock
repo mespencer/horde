@@ -1070,7 +1070,6 @@ dependencies = [
 name = "horde-fault"
 version = "0.1.0"
 dependencies = [
- "horde-adapter",
  "horde-adapter-fake",
  "horde-cli",
  "horde-identity",

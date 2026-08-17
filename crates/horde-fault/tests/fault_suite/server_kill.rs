@@ -48,10 +48,7 @@ async fn join_as(
 
 /// Connects as `identity`, retrying while a just-(re)started listener comes
 /// up. Bounded by attempts, each attempt bounded by tonic's own connect.
-async fn connect_client(
-    endpoint: &str,
-    identity: &horde_identity::StoredIdentity,
-) -> Client {
+async fn connect_client(endpoint: &str, identity: &horde_identity::StoredIdentity) -> Client {
     for _ in 0_u32..support::MAX_POLLS {
         match Client::connect_with_identity(endpoint, identity).await {
             Ok(client) => return client,
@@ -294,7 +291,12 @@ async fn a_server_killed_mid_append_restarts_on_its_log_and_everyone_reconciles(
     follow_until_chunk(&mut client, &session, "charlie-answer").await;
 
     let history = replayed_events(&mut client, &session).await;
-    for marker in ["alpha-answer", "bravo-open", "bravo-answer", "charlie-answer"] {
+    for marker in [
+        "alpha-answer",
+        "bravo-open",
+        "bravo-answer",
+        "charlie-answer",
+    ] {
         assert_eq!(
             support::chunks_saying(&history, marker),
             1,

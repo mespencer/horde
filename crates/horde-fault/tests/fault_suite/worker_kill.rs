@@ -18,12 +18,9 @@
 //! (so its spawn command can never have been applied), and only then does
 //! SIGKILL land.
 
-use horde_proto::prost::Message;
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::{AgentId, Assignment, AssignmentSent, Event, PlacementState};
 use horde_server::EventLog;
-use horde_server::log::PendingEvent;
-use horde_testkit::FaultProxy;
 
 use horde_fault::{TurnSpec, WorkerProcess, WorkerRunnerConfig};
 
@@ -47,14 +44,7 @@ async fn send_assignment_event(log: &EventLog, session: &str, agent: &str, text:
             delivery: 0,
         })),
     };
-    log.append(PendingEvent {
-        session_id: session.to_owned(),
-        idempotency_key: event.idempotency_key.clone(),
-        payload: event.encode_to_vec(),
-        ..PendingEvent::default()
-    })
-    .await
-    .expect("the assignment appends");
+    support::append_event(log, session, event).await;
 }
 
 /// The runner's script. Index 0 is the victim turn (opens, then stalls far
@@ -69,11 +59,7 @@ fn runner_turns() -> Vec<TurnSpec> {
 
 #[tokio::test]
 async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running() {
-    let core = support::fresh_core();
-    let upstream = horde_server_testkit::serve_core(core.clone())
-        .await
-        .expect("the core serves");
-    let proxy = FaultProxy::front(&upstream).await.expect("the proxy binds");
+    let (core, proxy) = support::proxied_core().await;
     let journal_dir = tempfile::tempdir().expect("a tempdir");
     let runner = WorkerRunnerConfig {
         endpoint: proxy.endpoint(),
@@ -130,9 +116,7 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
         "s2",
         "the lost worker's unstarted agent was never re-queued",
         |events| {
-            support::placement_states(events, "agent-2")
-                .last()
-                .copied()
+            support::placement_states(events, "agent-2").last().copied()
                 == Some(PlacementState::Queued)
         },
     )
@@ -204,5 +188,8 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
         "the full placement story: placed, lost, re-placed — nothing more"
     );
 
-    second_life.kill_now().await.expect("the cleanup kill lands");
+    second_life
+        .kill_now()
+        .await
+        .expect("the cleanup kill lands");
 }

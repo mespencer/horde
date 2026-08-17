@@ -678,7 +678,10 @@ mod tests {
     #[test]
     fn the_budget_claim_forwards_a_clean_prefix_and_severs_at_the_edge() {
         // Disarmed: everything flows, forever.
-        assert_eq!(budget_claim(BUDGET_DISARMED, 100), (100, false, BUDGET_DISARMED));
+        assert_eq!(
+            budget_claim(BUDGET_DISARMED, 100),
+            (100, false, BUDGET_DISARMED)
+        );
 
         // Under budget: the chunk flows, the budget shrinks.
         assert_eq!(budget_claim(50, 10), (10, false, 40));

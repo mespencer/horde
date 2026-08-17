@@ -85,13 +85,13 @@ pub(crate) async fn log_until(
 
 /// The texts of every assistant-visible output chunk, in log order.
 pub(crate) fn chunk_texts(events: &[Event]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            Some(Kind::AgentOutputChunk(chunk)) => Some(chunk.text.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut texts = Vec::new();
+    for event in events {
+        if let Some(Kind::AgentOutputChunk(chunk)) = &event.kind {
+            texts.push(chunk.text.clone());
+        }
+    }
+    texts
 }
 
 /// How many output chunks say exactly `text` — the duplicate detector for
@@ -155,8 +155,7 @@ pub(crate) fn placement_states(events: &[Event], agent: &str) -> Vec<PlacementSt
                 .placement
                 .as_ref()
                 .filter(|placement| {
-                    placement.agent_id.as_ref().map(ToString::to_string)
-                        == Some(agent.to_owned())
+                    placement.agent_id.as_ref().map(ToString::to_string) == Some(agent.to_owned())
                 })
                 .map(|placement| placement.state()),
             _ => None,
@@ -244,11 +243,34 @@ pub(crate) fn fresh_core() -> horde_server::ServerCore {
     horde_server::ServerCore::new(EventLog::in_memory().expect("an in-memory log"))
 }
 
+/// A served core fronted by the injector — every network scenario's opening
+/// move: real server spines on a real socket, with the proxy in the path.
+pub(crate) async fn proxied_core() -> (horde_server::ServerCore, horde_testkit::FaultProxy) {
+    let core = fresh_core();
+    let upstream = horde_server_testkit::serve_core(core.clone())
+        .await
+        .expect("the core serves");
+    let proxy = horde_testkit::FaultProxy::front(&upstream)
+        .await
+        .expect("the proxy binds");
+    (core, proxy)
+}
+
+/// Appends one already-shaped event to `session`, keyed by the event's own
+/// idempotency key — the arrangement half of "an observed fact is on the
+/// log", shared so the suites do not each restate the append envelope.
+pub(crate) async fn append_event(log: &EventLog, session: &str, event: Event) {
+    let pending = horde_server::log::PendingEvent {
+        session_id: session.to_owned(),
+        idempotency_key: event.idempotency_key.clone(),
+        payload: event.encode_to_vec(),
+        ..horde_server::log::PendingEvent::default()
+    };
+    log.append(pending).await.expect("the event appends");
+}
+
 /// A runtime driving one scripted FakeAdapter over `journal`.
-pub(crate) fn scripted_runtime(
-    journal: &Journal,
-    script: horde_adapter_fake::Script,
-) -> Runtime {
+pub(crate) fn scripted_runtime(journal: &Journal, script: horde_adapter_fake::Script) -> Runtime {
     Runtime::new(journal.clone())
         .with_adapter(Arc::new(horde_adapter_fake::FakeAdapter::new(script)))
 }

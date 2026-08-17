@@ -20,7 +20,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-horde-adapter = { workspace = true }
 horde-cli = { workspace = true }
 horde-proto = { workspace = true }
 horde-server = { workspace = true }

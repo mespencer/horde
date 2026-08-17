@@ -208,24 +208,17 @@ impl ServerProcess {
         config: &ServerConfig,
         expect_bootstrap: bool,
     ) -> Result<Self, FaultHarnessError> {
-        let binary = product_binary("horde-server")?;
-        let mut child = Command::new(&binary)
-            .arg(&config.database)
-            .arg("--serve")
-            .arg("--state-dir")
-            .arg(&config.state_dir)
-            .arg("--bind")
-            .arg(config.bind.to_string())
-            .arg("--enrollment-bind")
-            .arg(config.enrollment_bind.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| FaultHarnessError::Process {
-                doing: format!("spawn {}", binary.display()),
-                source,
-            })?;
+        let arguments = vec![
+            config.database.display().to_string(),
+            "--serve".to_owned(),
+            "--state-dir".to_owned(),
+            config.state_dir.display().to_string(),
+            "--bind".to_owned(),
+            config.bind.to_string(),
+            "--enrollment-bind".to_owned(),
+            config.enrollment_bind.to_string(),
+        ];
+        let mut child = spawn_product("horde-server", &arguments, Stdio::piped())?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             FaultHarnessError::Announcement("the child has no piped stdout".to_owned())
@@ -378,17 +371,7 @@ impl WorkerProcess {
     ///
     /// The fixture binary missing or the spawn failing.
     pub fn spawn(config: &WorkerRunnerConfig) -> Result<Self, FaultHarnessError> {
-        let binary = product_binary("worker-runner")?;
-        let child = Command::new(&binary)
-            .args(runner_args(config))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| FaultHarnessError::Process {
-                doing: format!("spawn {}", binary.display()),
-                source,
-            })?;
+        let child = spawn_product("worker-runner", &runner_args(config), Stdio::null())?;
         Ok(Self { child })
     }
 
@@ -400,6 +383,27 @@ impl WorkerProcess {
     pub async fn kill_now(mut self) -> Result<(), FaultHarnessError> {
         kill_child(&mut self.child, "worker-runner").await
     }
+}
+
+/// Spawns one product binary as a killable fixture child: stderr discarded,
+/// stdout as the caller needs it, and `kill_on_drop` so a panicking test
+/// cannot leak the process.
+fn spawn_product(
+    name: &str,
+    arguments: &[String],
+    stdout: Stdio,
+) -> Result<Child, FaultHarnessError> {
+    let binary = product_binary(name)?;
+    Command::new(&binary)
+        .args(arguments)
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|source| FaultHarnessError::Process {
+            doing: format!("spawn {}", binary.display()),
+            source,
+        })
 }
 
 /// SIGKILL by handle, never by name or pattern (the supervision rule the
@@ -534,7 +538,9 @@ mod tests {
         };
         let args = runner_args(&bare);
         assert!(
-            !args.iter().any(|arg| arg == "--identity" || arg == "--turn"),
+            !args
+                .iter()
+                .any(|arg| arg == "--identity" || arg == "--turn"),
             "absent options must stay absent: {args:?}"
         );
     }
