@@ -77,18 +77,16 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
         .expect("the seed appends");
 
     // SIGKILL, mid-turn. Then sever the held sockets so the transport is
-    // gone, not merely quiet. The pid probe proves the kill was a kill: a
-    // harness that answered Ok over a process still breathing would let a
-    // still-live first incarnation shadow every assertion below.
-    let pid = first_life.id().expect("a live child has a pid");
-    first_life.kill_now().await.expect("the kill lands");
-    let still_breathing = std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output() // captured, so the probe's own noise stays out of the run
-        .expect("the probe runs")
-        .status
-        .success();
-    assert!(!still_breathing, "SIGKILL must have ended the first life");
+    // gone, not merely quiet. The exit status is the fault's receipt: a
+    // still-breathing first incarnation would shadow every assertion below,
+    // so the kill is held to its recorded cause of death (and the harness
+    // itself to reap-before-return, in `fixture_probes`).
+    let ended = first_life.kill_now().await.expect("the kill lands");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&ended),
+        Some(9),
+        "the first life must have died of SIGKILL, mid-turn: {ended:?}"
+    );
     proxy.cut();
 
     // The revival assignment. Its DeliverMessage command is also the next
@@ -175,7 +173,7 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
         "the full placement story: placed, lost, re-placed — nothing more"
     );
 
-    second_life
+    let _ = second_life
         .kill_now()
         .await
         .expect("the cleanup kill lands");

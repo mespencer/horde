@@ -244,7 +244,12 @@ async fn a_server_killed_mid_append_restarts_on_its_log_and_everyone_reconciles(
     .await
     .expect("the assignment is acked");
     follow_until_chunk(&mut client, &session, "bravo-open").await;
-    server.kill_now().await.expect("the kill lands");
+    let ended = server.kill_now().await.expect("the kill lands");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&ended),
+        Some(9),
+        "the server must have died of SIGKILL, mid-append: {ended:?}"
+    );
 
     // — Second life: same database, same state dir, same ports. The log on
     //   disk is the only thing connecting the two lives. —
@@ -313,6 +318,6 @@ async fn a_server_killed_mid_append_restarts_on_its_log_and_everyone_reconciles(
         "the worker reconciled; it did not re-run the spawn"
     );
 
-    worker.kill_now().await.expect("the cleanup kill lands");
-    server.kill_now().await.expect("the cleanup kill lands");
+    let _ = worker.kill_now().await.expect("the cleanup kill lands");
+    let _ = server.kill_now().await.expect("the cleanup kill lands");
 }

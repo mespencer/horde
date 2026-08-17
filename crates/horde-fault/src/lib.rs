@@ -266,13 +266,15 @@ impl ServerProcess {
     }
 
     /// SIGKILL, then reap: no shutdown, no goodbye — the log on disk is what
-    /// survives.
+    /// survives. Returns how the child ended, so a scenario can hold the
+    /// kill to its word (`ExitStatusExt::signal() == Some(9)`): a kill that
+    /// answered `Ok` without killing is the injector lying about its fault.
     ///
     /// # Errors
     ///
     /// The signal or the reap failing.
-    pub async fn kill_now(mut self) -> Result<(), FaultHarnessError> {
-        kill_child(&mut self.child, "horde-server").await
+    pub async fn kill_now(mut self) -> Result<std::process::ExitStatus, FaultHarnessError> {
+        kill_child(&mut self.child, "fault-server").await
     }
 }
 
@@ -391,12 +393,36 @@ impl WorkerProcess {
     }
 
     /// SIGKILL mid-whatever, then reap. The journal file is what survives.
+    /// Returns how the child ended, as [`ServerProcess::kill_now`] does and
+    /// for the same reason: the kill is the injected fault, and a scenario
+    /// holds it to `signal() == Some(9)`.
     ///
     /// # Errors
     ///
     /// The signal or the reap failing.
-    pub async fn kill_now(mut self) -> Result<(), FaultHarnessError> {
+    pub async fn kill_now(mut self) -> Result<std::process::ExitStatus, FaultHarnessError> {
         kill_child(&mut self.child, "worker-runner").await
+    }
+}
+
+/// The fault-server fixture's invocation: the production parser
+/// (`horde_server::startup::invocation`), narrowed to the one shape the
+/// fixture serves. Lives here rather than in the binary because a binary's
+/// functions are reachable only by running the binary — which coverage
+/// cannot see (the same argument `horde-server`'s own `startup` makes).
+///
+/// # Errors
+///
+/// The production parser's refusal, or a command line that did not ask to
+/// serve.
+pub fn fixture_serve_config(
+    arguments: impl Iterator<Item = String>,
+) -> Result<horde_server::startup::ServeConfig, String> {
+    match horde_server::startup::invocation(arguments)? {
+        horde_server::startup::Invocation::Serve(config) => Ok(*config),
+        horde_server::startup::Invocation::CheckOnly { .. } => {
+            Err("this fixture only serves; pass --serve".to_owned())
+        }
     }
 }
 
@@ -423,7 +449,17 @@ fn spawn_product(
 
 /// SIGKILL by handle, never by name or pattern (the supervision rule the
 /// worker itself lives by), then reap so no zombie outlives the test.
-async fn kill_child(child: &mut Child, name: &str) -> Result<(), FaultHarnessError> {
+///
+/// Returning the reaped [`std::process::ExitStatus`] is load-bearing: it is
+/// how the wrappers stay mutation-honest. `kill_on_drop` means a body
+/// replaced with a bare `Ok` would *still* end the child — at drop, not at
+/// the call — which is behaviorally close enough to slip a scenario. An
+/// `ExitStatus` cannot be conjured from nothing, so the only way to answer
+/// is to have actually waited.
+async fn kill_child(
+    child: &mut Child,
+    name: &str,
+) -> Result<std::process::ExitStatus, FaultHarnessError> {
     child
         .start_kill()
         .map_err(|source| FaultHarnessError::Process {
@@ -436,8 +472,7 @@ async fn kill_child(child: &mut Child, name: &str) -> Result<(), FaultHarnessErr
         .map_err(|source| FaultHarnessError::Process {
             doing: format!("reap {name}"),
             source,
-        })?;
-    Ok(())
+        })
 }
 
 #[cfg(test)]
@@ -505,6 +540,40 @@ mod tests {
             message.contains("enrollment=None") && message.contains("fingerprint=None"),
             "the refusal names the gaps: {message}"
         );
+    }
+
+    /// The fixture parses the same command line the shipped binary does —
+    /// through the shipped binary's own parser — and refuses to be anything
+    /// but a server.
+    #[test]
+    fn the_fixture_invocation_is_the_production_serve_line() {
+        let config = super::fixture_serve_config(
+            [
+                "/tmp/x.db",
+                "--serve",
+                "--bind",
+                "127.0.0.1:7071",
+                "--enrollment-bind",
+                "127.0.0.1:7072",
+                "--state-dir",
+                "/tmp/state",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned()),
+        )
+        .expect("a serve line parses");
+        assert_eq!(config.database, "/tmp/x.db");
+        assert_eq!(config.bind.to_string(), "127.0.0.1:7071");
+        assert_eq!(config.enrollment_bind.to_string(), "127.0.0.1:7072");
+        assert_eq!(config.state_dir, std::path::PathBuf::from("/tmp/state"));
+
+        let bare = super::fixture_serve_config(["/tmp/x.db".to_owned()].into_iter())
+            .expect_err("the health-check shape is refused");
+        assert!(bare.contains("--serve"), "the refusal says what to pass");
+
+        let wrong = super::fixture_serve_config(["--bogus".to_owned()].into_iter())
+            .expect_err("the production parser's refusals pass through");
+        assert!(wrong.contains("--bogus"), "naming the flag: {wrong}");
     }
 
     #[test]

@@ -267,6 +267,18 @@ async fn a_worker_less_seed_queues_rather_than_placing() {
         events[1].idempotency_key, "agent-9:placed",
         "re-seeding the same agent must deduplicate, so the key is the agent's"
     );
+
+    // And the dedupe is real, not just a key in the payload: the log's own
+    // idempotency column must carry it, which only a second seed can prove —
+    // a seed that dropped the column would append four events here.
+    horde_server_testkit::seed_agent(&log, "s1", "agent-9", None, "later")
+        .await
+        .expect("the re-seed is absorbed");
+    assert_eq!(
+        log.read_all("s1").await.expect("a readable log").len(),
+        2,
+        "an at-least-once seed must land exactly once"
+    );
 }
 
 /// `serve_with_blob_store` really wires the store, rooted where the caller

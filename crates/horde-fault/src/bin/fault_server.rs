@@ -19,7 +19,8 @@
 use std::convert::Infallible;
 use std::process::ExitCode;
 
-use horde_server::startup::{Invocation, ServeConfig, invocation, operator_lines, serve};
+use horde_fault::fixture_serve_config;
+use horde_server::startup::{ServeConfig, operator_lines, serve};
 
 fn main() -> ExitCode {
     match boot() {
@@ -31,20 +32,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse, serve, and hold the process up until a signal ends it.
+/// Parse, serve, and hold the process up until a signal ends it. The
+/// parsing lives in the library (`fixture_serve_config`), under its tests —
+/// a binary's own functions are reachable only by running the binary.
 fn boot() -> Result<Infallible, String> {
-    let config = serve_config(std::env::args().skip(1))?;
+    let config = fixture_serve_config(std::env::args().skip(1))?;
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| format!("could not build a runtime: {error}"))?;
     runtime.block_on(serve_forever(&config))
-}
-
-/// The `--serve` invocation, through the production parser.
-fn serve_config(arguments: impl Iterator<Item = String>) -> Result<ServeConfig, String> {
-    match invocation(arguments)? {
-        Invocation::Serve(config) => Ok(*config),
-        Invocation::CheckOnly { .. } => Err("this fixture only serves; pass --serve".to_owned()),
-    }
 }
 
 /// Serves and parks. The suite ends this process with SIGKILL — that is

@@ -312,14 +312,15 @@ impl Shared {
             return Err(Undeliverable);
         }
 
+        // No zero-length guard, deliberately: `write_all` of an empty slice
+        // and `fetch_add(0)` are both no-ops, and a branch that cannot
+        // change behavior is an unfalsifiable branch.
         let (allowed, sever) = self.claim(chunk.len());
-        if allowed > 0 {
-            if to.write_all(&chunk[..allowed]).await.is_err() {
-                return Err(Undeliverable);
-            }
-            self.bytes_forwarded
-                .fetch_add(allowed as u64, Ordering::SeqCst);
+        if to.write_all(&chunk[..allowed]).await.is_err() {
+            return Err(Undeliverable);
         }
+        self.bytes_forwarded
+            .fetch_add(allowed as u64, Ordering::SeqCst);
         if sever {
             self.cut();
             return Err(Undeliverable);
@@ -483,6 +484,11 @@ mod tests {
             "the endpoint keeps the upstream's scheme"
         );
 
+        assert_eq!(
+            proxy.connections_carried(),
+            0,
+            "nothing has dialed yet, and the counter must say so"
+        );
         let mut stream = dial(&proxy).await;
         let echoed = within("the echo", round_trip(&mut stream, b"ping")).await;
         assert_eq!(&echoed, b"ping");
@@ -492,6 +498,13 @@ mod tests {
             8,
             "four bytes each way crossed the proxy"
         );
+
+        // A second connection counts as a second connection — a counter
+        // frozen at one reads identically through a single-dial test.
+        let mut second = dial(&proxy).await;
+        within("the second echo", round_trip(&mut second, b"pong")).await;
+        assert_eq!(proxy.connections_carried(), 2);
+        assert_eq!(proxy.bytes_forwarded(), 16);
     }
 
     /// The positive control the seed proxy had, kept: a proxy that cannot be
@@ -740,6 +753,14 @@ mod tests {
 
         // Exhausted: nothing flows and the sever holds.
         assert_eq!(budget_claim(0, 64), (0, true, 0));
+    }
+
+    /// The relay chunk is a calibration constant: the module documents that
+    /// throttling and byte-budget cuts land with sub-chunk precision, and
+    /// that claim was calibrated against this size.
+    #[test]
+    fn the_relay_chunk_is_eight_kib() {
+        assert_eq!(super::CHUNK_BYTES, 8192);
     }
 
     #[test]

@@ -24,6 +24,8 @@ mod support;
 #[cfg(test)]
 mod blob_partition;
 #[cfg(test)]
+mod fixture_probes;
+#[cfg(test)]
 mod partition_turn;
 #[cfg(test)]
 mod server_kill;
