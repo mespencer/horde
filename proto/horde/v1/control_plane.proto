@@ -114,8 +114,9 @@ message HelloResponse {
 message CreateSessionRequest {
   string title = 1;
 
-  // Single-repo definitions are auto-registered from cwd by `horde new`; this
-  // is set either way.
+  // The Workspace the Session's root Agent runs in; clients set it
+  // explicitly. DESIGN §7's cwd auto-registration (`horde new`) is not
+  // yet built.
   WorkspaceDefinitionId workspace_definition_id = 2;
 
   // The top-level Agent. Its initial_assignment is the first prompt.
