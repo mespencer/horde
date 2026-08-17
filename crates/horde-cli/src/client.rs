@@ -287,12 +287,27 @@ impl Client {
         title: &str,
         idempotency_key: &str,
     ) -> Result<(SessionSummary, AgentId), ClientError> {
+        self.create_session_with(title, AgentSpec::default(), idempotency_key)
+            .await
+    }
+
+    /// Creates a session whose root agent is what `root_agent` says — type,
+    /// tier, workspace, checkout policy, permission mode, first assignment.
+    /// The everyday `create_session` is this with a default spec.
+    pub async fn create_session_with(
+        &mut self,
+        title: &str,
+        root_agent: AgentSpec,
+        idempotency_key: &str,
+    ) -> Result<(SessionSummary, AgentId), ClientError> {
         let response = self
             .inner
             .create_session(CreateSessionRequest {
                 title: title.to_owned(),
-                workspace_definition_id: None,
-                root_agent: Some(AgentSpec::default()),
+                // Set either way, per the field's contract: the root spec's
+                // workspace is the one the session references.
+                workspace_definition_id: root_agent.workspace_definition_id.clone(),
+                root_agent: Some(root_agent),
                 idempotency_key: idempotency_key.to_owned(),
             })
             .await?

@@ -28,7 +28,7 @@ use horde_proto::v1::{
     QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
     SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
     SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
-    UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse,
+    UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
 };
 use tokio_stream::{Stream, wrappers::ReceiverStream};
@@ -329,18 +329,37 @@ impl ControlPlaneService for ControlPlane {
     ) -> Result<Response<CreateSessionResponse>, Status> {
         let request = request.into_inner();
 
-        // A root agent naming a workspace the catalog does not hold is
-        // refused before the session exists — the same check spawn makes,
-        // made here for the same reason.
-        let root_workspace = request
-            .root_agent
+        // The request-level workspace is consumed, not decoration: a client
+        // may set it beside a spec that names none, and the root agent works
+        // in it either way.
+        let mut root_agent = request.root_agent.unwrap_or_default();
+        let spec_workspace = root_agent
+            .workspace_definition_id
             .as_ref()
-            .and_then(|spec| spec.workspace_definition_id.as_ref())
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        if spec_workspace.is_none()
+            && let Some(id) = request
+                .workspace_definition_id
+                .as_ref()
+                .map(ToString::to_string)
+                .filter(|id| !id.is_empty())
+        {
+            root_agent.workspace_definition_id = Some(WorkspaceDefinitionId::new(id));
+        }
+
+        // A root agent naming a workspace the catalog does not hold — or a
+        // tier the catalog cannot resolve — is refused before the session
+        // exists: the same checks spawn makes, made here for the same reason.
+        let root_workspace = root_agent
+            .workspace_definition_id
+            .as_ref()
             .map(ToString::to_string)
             .filter(|id| !id.is_empty());
         if let Some(id) = root_workspace.as_deref() {
             self.required_definition(id).await.map_err(Status::from)?;
         }
+        validate_model_selection(Some(&root_agent))?;
 
         // The session id and root agent id are server-assigned. Derived from the
         // idempotency key when one is supplied, so a retry after a lost response
@@ -359,7 +378,7 @@ impl ControlPlaneService for ControlPlane {
             kind: Some(Kind::AgentSpawned(AgentSpawned {
                 parent_agent_id: None,
                 spawned_by: None,
-                spec: request.root_agent,
+                spec: Some(root_agent),
                 tree_path: vec![request.title.clone()],
             })),
         };
@@ -761,9 +780,10 @@ impl ControlPlaneService for ControlPlane {
         let agent_id = format!("agent-{}", uuid_like());
         let spec = request.spec.unwrap_or_default();
 
-        // A spawn naming a workspace the catalog does not hold is refused
-        // before anything is written: placing it would eventually command a
-        // materialization of nothing.
+        // A spawn naming a workspace the catalog does not hold — or a tier
+        // it cannot resolve — is refused before anything is written: placing
+        // it would eventually command a materialization of nothing, or bind
+        // a model of nothing.
         let workspace = spec
             .workspace_definition_id
             .as_ref()
@@ -772,6 +792,7 @@ impl ControlPlaneService for ControlPlane {
         if let Some(id) = workspace.as_deref() {
             self.required_definition(id).await.map_err(Status::from)?;
         }
+        validate_model_selection(Some(&spec))?;
 
         // The whole decision — project, place, append — runs under the
         // placement lock so a drain pass woken by a worker registering cannot
@@ -1332,6 +1353,33 @@ impl ControlPlaneService for ControlPlane {
             accounts,
         }))
     }
+}
+
+/// Refuses a spec naming a tier the catalog cannot resolve.
+///
+/// At the RPC, not the fold: the fold is deterministic over the log and must
+/// not be where an unknown name surfaces — by then the spawn is an event of
+/// record. The refusal lists the tiers that do exist, because "unknown tier"
+/// alone sends the caller to the docs this message could have been.
+///
+/// # Errors
+///
+/// `InvalidArgument` naming the tier and the known ones.
+fn validate_model_selection(spec: Option<&horde_proto::v1::AgentSpec>) -> Result<(), Status> {
+    let Some(horde_proto::v1::model_selection::Selection::Tier(tier)) = spec
+        .and_then(|spec| spec.model.as_ref())
+        .and_then(|model| model.selection.as_ref())
+    else {
+        return Ok(());
+    };
+    let catalog = crate::tiers::TierCatalog::shipped_defaults();
+    if catalog.get(tier).is_none() {
+        return Err(Status::invalid_argument(format!(
+            "tier {tier:?} is not in the catalog; known tiers: {}",
+            catalog.names().join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Requires the caller's certificate to name a Client principal.

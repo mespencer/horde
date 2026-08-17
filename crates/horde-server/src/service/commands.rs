@@ -337,7 +337,7 @@ impl CommandProjection {
                         agent_id: Some(AgentId::new(agent_id)),
                         parent_agent_id: details.parent_agent_id.clone().map(AgentId::new),
                         spec: details.spec.clone(),
-                        binding: None,
+                        binding: binding_for(details.spec.as_ref()),
                         tree_path: details.tree_path.clone(),
                         prompt_overlay: String::new(),
                         local_mcp_servers: self.mcp_servers.local_servers_for(agent_type),
@@ -403,6 +403,39 @@ impl CommandProjection {
             // redelivery" has to mean once a redelivery can follow a restart.
             command_id: command_id(&cause.session_id, cause.sequence, role),
             command: Some(command),
+        }
+    }
+}
+
+/// The binding a spawn's model selection resolves to (W7b finding 5).
+///
+/// Deterministic over the spec alone, which is what a fold demands: a
+/// concrete request binds as itself; a tier binds its catalog's
+/// first-listed candidate. Account-aware selection (`options_for` /
+/// `select`, weighing advertised headroom) stays unfed until workers
+/// advertise accounts — feeding it a live registry here would make two
+/// folds of one log disagree. An unknown tier yields no binding rather
+/// than a panic: the RPC already refused unknown names, so hitting one
+/// means an older log, and the worker's default provider is the honest
+/// fallback.
+fn binding_for(spec: Option<&horde_proto::v1::AgentSpec>) -> Option<horde_proto::v1::ModelBinding> {
+    use horde_proto::v1::model_selection::Selection;
+    match spec?.model.as_ref()?.selection.as_ref()? {
+        Selection::Concrete(concrete) => Some(horde_proto::v1::ModelBinding {
+            tier: String::new(),
+            provider: concrete.provider.clone(),
+            model: concrete.model.clone(),
+            provider_account: String::new(),
+        }),
+        Selection::Tier(tier_name) => {
+            let catalog = crate::tiers::TierCatalog::shipped_defaults();
+            let candidate = catalog.get(tier_name)?.candidates.first()?.clone();
+            Some(horde_proto::v1::ModelBinding {
+                tier: tier_name.clone(),
+                provider: candidate.provider,
+                model: candidate.model,
+                provider_account: String::new(),
+            })
         }
     }
 }
@@ -640,6 +673,54 @@ mod tests {
                 tree_path: Vec::new(),
             })),
         }
+    }
+
+    /// The binding truth table (W7b finding 5): a concrete request binds as
+    /// itself, a tier binds its catalog's first candidate deterministically,
+    /// an unknown tier binds nothing rather than panicking a fold, and no
+    /// selection is no binding.
+    #[test]
+    fn a_spawns_model_selection_resolves_to_its_binding() {
+        use horde_proto::v1::model_selection::Selection;
+        let with_selection = |selection: Selection| AgentSpec {
+            model: Some(horde_proto::v1::ModelSelection {
+                selection: Some(selection),
+            }),
+            ..AgentSpec::default()
+        };
+
+        let concrete = super::binding_for(Some(&with_selection(Selection::Concrete(
+            horde_proto::v1::ConcreteModel {
+                provider: "claude".to_owned(),
+                model: "opus".to_owned(),
+                provider_account: String::new(),
+            },
+        ))))
+        .expect("a concrete request binds");
+        assert_eq!(concrete.provider, "claude");
+        assert_eq!(concrete.model, "opus");
+        assert_eq!(concrete.tier, "", "a concrete bind names no tier");
+
+        let tiered = super::binding_for(Some(&with_selection(Selection::Tier(
+            "deep".to_owned(),
+        ))))
+        .expect("a shipped tier binds");
+        assert_eq!(tiered.tier, "deep");
+        assert_eq!(
+            (tiered.provider.as_str(), tiered.model.as_str()),
+            ("claude", "opus"),
+            "the tier's first-listed candidate, deterministically"
+        );
+
+        assert_eq!(
+            super::binding_for(Some(&with_selection(Selection::Tier(
+                "imaginary".to_owned()
+            )))),
+            None,
+            "an unknown tier in an older log falls back to the worker default"
+        );
+        assert_eq!(super::binding_for(Some(&AgentSpec::default())), None);
+        assert_eq!(super::binding_for(None), None);
     }
 
     fn placement_event(agent: &str, worker: Option<&str>, state: PlacementState) -> Event {

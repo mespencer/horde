@@ -197,6 +197,9 @@ pub enum SessionCommand {
     /// Create a session and its top-level agent.
     New {
         title: String,
+        /// What the root agent is: type, tier, workspace, mode, first task.
+        #[command(flatten)]
+        spec: SpecArgs,
         /// Makes a retry after a lost response safe.
         #[arg(long, default_value = "")]
         idempotency_key: String,
@@ -337,8 +340,127 @@ pub struct SpawnArgs {
     /// The spawner. Defaults to the session's top-level agent.
     #[arg(long)]
     pub parent: Option<String>,
+    #[command(flatten)]
+    pub spec: SpecArgs,
     #[arg(long, default_value = "")]
     pub idempotency_key: String,
+}
+
+/// What an agent is, everywhere an agent is made (DESIGN §5's `AgentSpec`).
+///
+/// Shared between `spawn` and `session new` — the root agent is an agent —
+/// so the two verbs cannot drift apart in what they let a client say.
+#[derive(Args, Debug, Default)]
+pub struct SpecArgs {
+    /// Agent type name, e.g. "reviewer". Hub MCP allowlists key on it, and
+    /// an allowlisted server is invisible to untyped agents.
+    #[arg(long = "type")]
+    pub agent_type: Option<String>,
+    /// Model tier: "fast", "standard", or "deep" (plus whatever the catalog
+    /// grows). The server resolves it to a concrete provider and model.
+    #[arg(long, conflicts_with = "model")]
+    pub tier: Option<String>,
+    /// An explicit provider:model, e.g. "claude:opus". Subject to permission
+    /// policy — tiers are the everyday vocabulary.
+    #[arg(long, value_name = "PROVIDER:MODEL")]
+    pub model: Option<String>,
+    /// The workspace definition the agent works in.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// How the agent's checkout relates to the workspace instance.
+    #[arg(long, value_enum)]
+    pub checkout: Option<CheckoutChoice>,
+    /// The named permission mode the agent runs under.
+    #[arg(long)]
+    pub permission_mode: Option<String>,
+    /// The implicit first assignment: the agent's first turn input, delivered
+    /// the moment it is placed. Absent spawns an idle agent.
+    #[arg(long)]
+    pub task: Option<String>,
+}
+
+/// The checkout policies, in CLI words.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutChoice {
+    /// Work directly in the shared instance.
+    Shared,
+    /// A private worktree of the instance's clone (the default server-side).
+    Worktree,
+    /// A fully separate clone.
+    FreshClone,
+}
+
+/// The wire policy one CLI choice asks for.
+#[must_use]
+pub fn checkout_for(choice: CheckoutChoice) -> horde_proto::v1::CheckoutPolicy {
+    match choice {
+        CheckoutChoice::Shared => horde_proto::v1::CheckoutPolicy::Shared,
+        CheckoutChoice::Worktree => horde_proto::v1::CheckoutPolicy::Worktree,
+        CheckoutChoice::FreshClone => horde_proto::v1::CheckoutPolicy::FreshClone,
+    }
+}
+
+/// The wire `AgentSpec` these flags describe.
+///
+/// # Errors
+///
+/// A `--model` value without its `provider:` half — refused here, where the
+/// message can talk about the flag, rather than sent for the server to
+/// refuse in wire vocabulary.
+pub fn spec_from(args: &SpecArgs) -> Result<horde_proto::v1::AgentSpec, ClientError> {
+    let model = match (&args.tier, &args.model) {
+        (Some(tier), _) => Some(horde_proto::v1::ModelSelection {
+            selection: Some(horde_proto::v1::model_selection::Selection::Tier(
+                tier.clone(),
+            )),
+        }),
+        (None, Some(concrete)) => {
+            let (provider, model) = concrete.split_once(':').ok_or_else(|| {
+                ClientError::Rpc(tonic::Status::invalid_argument(format!(
+                    "--model takes PROVIDER:MODEL (e.g. claude:opus), got {concrete:?}"
+                )))
+            })?;
+            if provider.is_empty() {
+                return Err(ClientError::Rpc(tonic::Status::invalid_argument(
+                    "--model needs a provider before the colon (e.g. claude:opus)",
+                )));
+            }
+            Some(horde_proto::v1::ModelSelection {
+                selection: Some(horde_proto::v1::model_selection::Selection::Concrete(
+                    horde_proto::v1::ConcreteModel {
+                        provider: provider.to_owned(),
+                        model: model.to_owned(),
+                        provider_account: String::new(),
+                    },
+                )),
+            })
+        }
+        (None, None) => None,
+    };
+
+    Ok(horde_proto::v1::AgentSpec {
+        agent_type: args.agent_type.clone().unwrap_or_default(),
+        model,
+        workspace_definition_id: args
+            .workspace
+            .as_deref()
+            .map(horde_proto::v1::WorkspaceDefinitionId::new),
+        checkout_policy: args
+            .checkout
+            .map(checkout_for)
+            .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified)
+            as i32,
+        placement: None,
+        permission_mode: args.permission_mode.clone().unwrap_or_default(),
+        budget: None,
+        initial_assignment: args.task.as_ref().map(|task| {
+            horde_proto::v1::Assignment {
+                assignment_id: None,
+                text: task.clone(),
+                payload: None,
+            }
+        }),
+    })
 }
 
 /// Runs one invocation: the pre-connection special case, then the connected
@@ -699,9 +821,10 @@ async fn run_spawn(
     format: Format,
 ) -> Result<(), ClientError> {
     let response = client
-        .spawn_agent(
+        .spawn_agent_with_spec(
             &args.session_id,
             args.parent.as_deref(),
+            spec_from(&args.spec)?,
             &args.idempotency_key,
         )
         .await?;
@@ -733,9 +856,12 @@ async fn run_session(
     match command {
         SessionCommand::New {
             title,
+            spec,
             idempotency_key,
         } => {
-            let (summary, root) = client.create_session(title, idempotency_key).await?;
+            let (summary, root) = client
+                .create_session_with(title, spec_from(spec)?, idempotency_key)
+                .await?;
             println!("{}", render::created(&summary, &root, format));
         }
         SessionCommand::List { include_archived } => {
@@ -834,6 +960,117 @@ mod tests {
     fn delivery_defaults_to_the_turn_boundary_and_flips_only_when_asked() {
         assert_eq!(delivery_for(false), DeliveryMode::TurnBoundary);
         assert_eq!(delivery_for(true), DeliveryMode::Interrupt);
+    }
+
+    /// The spec flags become the wire `AgentSpec` field for field — the whole
+    /// point of fix a12: before this, every client sent the default and no
+    /// agent could be typed, tiered, homed, or given a first task.
+    #[test]
+    fn spawn_spec_flags_become_the_wire_spec() {
+        let cli = Cli::try_parse_from([
+            "horde",
+            "spawn",
+            "s1",
+            "--type",
+            "reviewer",
+            "--tier",
+            "deep",
+            "--workspace",
+            "ws-1",
+            "--checkout",
+            "fresh-clone",
+            "--permission-mode",
+            "cautious",
+            "--task",
+            "review the diff",
+        ])
+        .expect("valid arguments");
+        let Some(Command::Spawn(args)) = &cli.command else {
+            panic!("expected spawn, got {:?}", cli.command);
+        };
+        let spec = super::spec_from(&args.spec).expect("a valid spec");
+
+        assert_eq!(spec.agent_type, "reviewer");
+        assert_eq!(
+            spec.model.as_ref().and_then(|model| model.selection.clone()),
+            Some(horde_proto::v1::model_selection::Selection::Tier(
+                "deep".to_owned()
+            ))
+        );
+        assert_eq!(
+            spec.workspace_definition_id.map(|id| id.to_string()),
+            Some("ws-1".to_owned())
+        );
+        assert_eq!(
+            spec.checkout_policy,
+            horde_proto::v1::CheckoutPolicy::FreshClone as i32
+        );
+        assert_eq!(spec.permission_mode, "cautious");
+        assert_eq!(
+            spec.initial_assignment.map(|assignment| assignment.text),
+            Some("review the diff".to_owned())
+        );
+    }
+
+    /// `--model` is an explicit provider:model pair; half a pair is refused
+    /// naming the flag, and `--tier` beside it is a clap conflict.
+    #[test]
+    fn the_model_flag_parses_a_provider_model_pair_or_refuses() {
+        let concrete = super::spec_from(&super::SpecArgs {
+            model: Some("claude:opus".to_owned()),
+            ..super::SpecArgs::default()
+        })
+        .expect("a valid pair");
+        assert_eq!(
+            concrete.model.and_then(|model| model.selection),
+            Some(horde_proto::v1::model_selection::Selection::Concrete(
+                horde_proto::v1::ConcreteModel {
+                    provider: "claude".to_owned(),
+                    model: "opus".to_owned(),
+                    provider_account: String::new(),
+                }
+            ))
+        );
+
+        for wrong in ["opus", ":opus"] {
+            let refused = super::spec_from(&super::SpecArgs {
+                model: Some(wrong.to_owned()),
+                ..super::SpecArgs::default()
+            })
+            .expect_err("half a pair must be refused");
+            assert!(
+                refused.to_string().to_lowercase().contains("provider"),
+                "{wrong}: {refused}"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from(["horde", "spawn", "s1", "--tier", "deep", "--model", "claude:opus"])
+                .is_err(),
+            "--tier and --model are one choice, not two flags"
+        );
+
+        // No flags at all is no selection — the worker's default, honestly.
+        let bare = super::spec_from(&super::SpecArgs::default()).expect("a bare spec");
+        assert_eq!(bare, horde_proto::v1::AgentSpec::default());
+    }
+
+    /// Each CLI checkout word maps to its own wire policy.
+    #[test]
+    fn every_checkout_choice_maps_to_its_wire_policy() {
+        use super::{CheckoutChoice, checkout_for};
+        assert_eq!(
+            checkout_for(CheckoutChoice::Shared),
+            horde_proto::v1::CheckoutPolicy::Shared
+        );
+        assert_eq!(
+            checkout_for(CheckoutChoice::Worktree),
+            horde_proto::v1::CheckoutPolicy::Worktree
+        );
+        assert_eq!(
+            checkout_for(CheckoutChoice::FreshClone),
+            horde_proto::v1::CheckoutPolicy::FreshClone
+        );
     }
 
     /// Values contain `=` routinely (base64 padding, URLs), so the split must
