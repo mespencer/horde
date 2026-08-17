@@ -52,7 +52,9 @@ struct ServedEndpoint {
 
 impl std::fmt::Debug for EndpointManager {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("EndpointManager").finish_non_exhaustive()
+        formatter
+            .debug_struct("EndpointManager")
+            .finish_non_exhaustive()
     }
 }
 

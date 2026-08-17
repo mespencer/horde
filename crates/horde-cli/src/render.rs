@@ -215,16 +215,9 @@ fn detail(kind: Option<&Kind>) -> Value {
     }
 }
 
-/// The wire result status, in the words `report_result` accepts.
+/// The wire result status, in the vocabulary `horde-wire` owns for it.
 fn result_status(status: i32) -> &'static str {
-    match horde_proto::v1::ResultStatus::try_from(status) {
-        Ok(horde_proto::v1::ResultStatus::Success) => "success",
-        Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
-        Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
-        // Never rounded to success: a script acting on an invented outcome
-        // is worse than one told the outcome is unreadable.
-        Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
-    }
+    horde_wire::result_status_name(status)
 }
 
 /// The wire outcome, in the words `approve` reports.
@@ -969,7 +962,11 @@ mod tests {
         event::Kind,
     };
 
-    use super::{Format, created, event, hello, sent, sequence, session, sessions, spawned};
+    use super::{
+        Format, created, event, hello, instance_state, prewarmed, sent, sequence, session,
+        sessions, spawned, worker_state, workers, workspace, workspace_deleted,
+        workspace_with_instances, workspaces,
+    };
 
     /// The `mcp` renders: the empty catalog says so in words (a script or a
     /// human reading nothing cannot tell it from a swallowed error), a
@@ -1104,21 +1101,23 @@ mod tests {
     /// payload's refs without parsing prose.
     #[test]
     fn a_result_reported_carries_status_summary_and_refs_in_json() {
-        let reported = envelope(Some(Kind::ResultReported(horde_proto::v1::ResultReported {
-            result: Some(horde_proto::v1::AgentResult {
-                assignment_id: None,
-                status: horde_proto::v1::ResultStatus::Partial as i32,
-                summary: "got halfway".to_owned(),
-                payload: Some(horde_proto::v1::Payload {
-                    git_refs: vec![horde_proto::v1::GitRef {
-                        repo_name: "atlas".to_owned(),
-                        commit_sha: "abc123".to_owned(),
-                        branch: "horde/agent-1".to_owned(),
-                    }],
-                    attachments: Vec::new(),
+        let reported = envelope(Some(Kind::ResultReported(
+            horde_proto::v1::ResultReported {
+                result: Some(horde_proto::v1::AgentResult {
+                    assignment_id: None,
+                    status: horde_proto::v1::ResultStatus::Partial as i32,
+                    summary: "got halfway".to_owned(),
+                    payload: Some(horde_proto::v1::Payload {
+                        git_refs: vec![horde_proto::v1::GitRef {
+                            repo_name: "atlas".to_owned(),
+                            commit_sha: "abc123".to_owned(),
+                            branch: "horde/agent-1".to_owned(),
+                        }],
+                        attachments: Vec::new(),
+                    }),
                 }),
-            }),
-        })));
+            },
+        )));
 
         let parsed: serde_json::Value =
             serde_json::from_str(&event(&reported, Format::Json)).expect("valid JSON");
@@ -1128,31 +1127,193 @@ mod tests {
         assert_eq!(parsed["detail"]["git_refs"][0]["commit"], "abc123");
 
         // An unreadable status must not become a success a script acts on.
-        let unreadable = envelope(Some(Kind::ResultReported(horde_proto::v1::ResultReported {
-            result: Some(horde_proto::v1::AgentResult {
-                status: 9_999,
-                ..horde_proto::v1::AgentResult::default()
-            }),
-        })));
+        let unreadable = envelope(Some(Kind::ResultReported(
+            horde_proto::v1::ResultReported {
+                result: Some(horde_proto::v1::AgentResult {
+                    status: 9_999,
+                    ..horde_proto::v1::AgentResult::default()
+                }),
+            },
+        )));
         let parsed: serde_json::Value =
             serde_json::from_str(&event(&unreadable, Format::Json)).expect("valid JSON");
         assert_eq!(parsed["detail"]["status"], "unknown");
     }
 
-    /// A decision's outcome, reason, and narrowing are part of the record a
-    /// follower reads — an `updated_input` that vanished from the render
-    /// would hide exactly the narrowing the human imposed.
+    fn sample_definition() -> horde_proto::v1::WorkspaceDefinition {
+        horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+            name: "atlas-ws".to_owned(),
+            etag: "3".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
+                name: "atlas".to_owned(),
+                remote_url: "https://git.example/atlas.git".to_owned(),
+                default_branch: "main".to_owned(),
+                layout_path: "src".to_owned(),
+            }],
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        }
+    }
+
+    /// The workspace renders, both formats: what `create`/`list`/`get`
+    /// print is the operator's whole view of a definition, and the etag in
+    /// particular is the token every later edit must quote.
+    #[test]
+    fn workspace_renders_carry_the_id_repos_and_etag() {
+        let definition = sample_definition();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&workspace(&definition, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["workspace_definition_id"], "ws-1");
+        assert_eq!(parsed["etag"], "3");
+        assert_eq!(parsed["repos"][0]["name"], "atlas");
+        assert_eq!(parsed["repos"][0]["layout_path"], "src");
+
+        let human = workspace(&definition, Format::Human);
+        assert!(
+            human.contains("ws-1") && human.contains("etag 3"),
+            "{human}"
+        );
+
+        let listed: serde_json::Value =
+            serde_json::from_str(&workspaces(std::slice::from_ref(&definition), Format::Json))
+                .expect("valid JSON");
+        assert_eq!(listed["workspaces"][0]["name"], "atlas-ws");
+        assert_eq!(
+            workspaces(&[], Format::Human),
+            "no workspaces defined",
+            "an empty list says so rather than printing nothing"
+        );
+        assert!(workspaces(&[definition], Format::Human).contains("atlas-ws"));
+
+        let deleted: serde_json::Value =
+            serde_json::from_str(&workspace_deleted("ws-1", Format::Json)).expect("valid JSON");
+        assert_eq!(deleted["deleted"], "ws-1");
+        assert!(workspace_deleted("ws-1", Format::Human).contains("ws-1"));
+    }
+
+    /// `get` shows the definition and its known instances, with the state
+    /// vocabulary spelled for humans in both formats.
+    #[test]
+    fn a_workspace_get_renders_its_instances_and_their_states() {
+        let response = horde_proto::v1::GetWorkspaceDefinitionResponse {
+            definition: Some(sample_definition()),
+            instances: vec![horde_proto::v1::WorkspaceInstanceReport {
+                worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+                state: horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+                root_path: "/w/ws-1".to_owned(),
+                detail: String::new(),
+                ..horde_proto::v1::WorkspaceInstanceReport::default()
+            }],
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&workspace_with_instances(&response, Format::Json))
+                .expect("valid JSON");
+        assert_eq!(parsed["name"], "atlas-ws");
+        assert_eq!(parsed["instances"][0]["worker_id"], "w-1");
+        assert_eq!(parsed["instances"][0]["state"], "ready");
+
+        let human = workspace_with_instances(&response, Format::Human);
+        assert!(
+            human.contains("instance on w-1: ready"),
+            "the instances render under the definition: {human}"
+        );
+    }
+
+    /// The prewarm render, all four corners: with and without an acceptance
+    /// report, in both formats.
+    #[test]
+    fn a_prewarm_renders_its_acceptance_or_a_bare_accepted() {
+        let report = horde_proto::v1::WorkspaceInstanceReport {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            state: horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
+            ..horde_proto::v1::WorkspaceInstanceReport::default()
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&prewarmed(Some(&report), Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["state"], "materializing");
+        assert!(prewarmed(Some(&report), Format::Human).contains("w-1"));
+
+        let bare: serde_json::Value =
+            serde_json::from_str(&prewarmed(None, Format::Json)).expect("valid JSON");
+        assert_eq!(bare["state"], "accepted");
+        assert_eq!(prewarmed(None, Format::Human), "prewarm accepted");
+    }
+
+    /// The worker listing, and the two state tables' full vocabularies — a
+    /// state that rendered under a neighbour's name would send an operator
+    /// chasing the wrong worker.
+    #[test]
+    fn workers_render_with_their_connection_state() {
+        let worker = horde_proto::v1::WorkerSummary {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            name: "w-1".to_owned(),
+            state: horde_proto::v1::WorkerConnectionState::Online as i32,
+            ..horde_proto::v1::WorkerSummary::default()
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&workers(std::slice::from_ref(&worker), Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["workers"][0]["state"], "online");
+        assert!(workers(&[worker], Format::Human).contains("w-1  online"));
+        assert_eq!(workers(&[], Format::Human), "no workers connected");
+
+        for (state, name) in [
+            (
+                horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
+                "materializing",
+            ),
+            (
+                horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+                "ready",
+            ),
+            (
+                horde_proto::v1::WorkspaceInstanceState::Degraded as i32,
+                "degraded",
+            ),
+            (
+                horde_proto::v1::WorkspaceInstanceState::Missing as i32,
+                "missing",
+            ),
+            (0, "unspecified"),
+            (9_999, "unspecified"),
+        ] {
+            assert_eq!(instance_state(state), name);
+        }
+        for (state, name) in [
+            (
+                horde_proto::v1::WorkerConnectionState::Online as i32,
+                "online",
+            ),
+            (
+                horde_proto::v1::WorkerConnectionState::Offline as i32,
+                "offline",
+            ),
+            (0, "unspecified"),
+            (9_999, "unspecified"),
+        ] {
+            assert_eq!(worker_state(state), name);
+        }
+    }
+
     #[test]
     fn a_permission_decided_carries_outcome_reason_and_narrowing_in_json() {
-        let mut narrowed = horde_proto::prost_types::Struct::default();
-        narrowed.fields.insert(
-            "path".to_owned(),
-            horde_proto::prost_types::Value {
-                kind: Some(horde_proto::prost_types::value::Kind::StringValue(
-                    "/tmp/safe".to_owned(),
-                )),
-            },
-        );
+        // Built from a collected map rather than inserts: one field is all
+        // the render needs, and the terser form keeps this fixture from
+        // twinning the fold suite's.
+        let narrowed = horde_proto::prost_types::Struct {
+            fields: [(
+                "path".to_owned(),
+                horde_proto::prost_types::Value {
+                    kind: Some(horde_proto::prost_types::value::Kind::StringValue(
+                        "/tmp/safe".to_owned(),
+                    )),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
         let decided = envelope(Some(Kind::PermissionDecided(
             horde_proto::v1::PermissionDecided {
                 decision: Some(horde_proto::v1::PermissionDecision {

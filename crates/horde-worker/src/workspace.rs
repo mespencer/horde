@@ -170,8 +170,14 @@ impl WorkspaceManager {
                 .await
             }
             CheckoutPolicy::FreshClone => {
-                self.compose(&instance_root, &definition, agent_id, start_points, clone_repo)
-                    .await
+                self.compose(
+                    &instance_root,
+                    &definition,
+                    agent_id,
+                    start_points,
+                    clone_repo,
+                )
+                .await
             }
         }
     }

@@ -41,6 +41,27 @@ fn register_request(name: &str) -> RegisterWorkerRequest {
     }
 }
 
+/// The revocation arrangement both revocation tests share: an enrolled
+/// client (the revoker), an enrolled and *registered* worker `mac-studio`
+/// (the revokee) with its identity, and the worker's live service client.
+async fn revocable_worker(
+    harness: &SecureHarness,
+) -> Setup<(
+    horde_identity::StoredIdentity,
+    horde_identity::StoredIdentity,
+    horde_proto::v1::worker_service_client::WorkerServiceClient<tonic::transport::Channel>,
+)> {
+    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    let mut worker = harness.worker_client(&worker_identity).await?;
+    within(
+        "the registration",
+        worker.register_worker(register_request("mac-studio")),
+    )
+    .await??;
+    Ok((client_identity, worker_identity, worker))
+}
+
 /// The kinds journaled in the enrollment stream, read back through the
 /// production sync path as an enrolled client.
 async fn journaled_kinds(client: &mut horde_cli::Client) -> Setup<Vec<&'static str>> {
@@ -307,16 +328,8 @@ async fn minting_over_the_control_plane_requires_an_identity_and_works_with_one(
 #[tokio::test]
 async fn revocation_shuts_the_door_at_the_next_rpc_and_is_journaled() -> Setup<()> {
     let harness = serve_secured().await?;
-    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
-
     // The worker is in, on an open connection.
-    let mut worker = harness.worker_client(&worker_identity).await?;
-    within(
-        "the registration",
-        worker.register_worker(register_request("mac-studio")),
-    )
-    .await??;
+    let (client_identity, worker_identity, mut worker) = revocable_worker(&harness).await?;
 
     // An enrolled client revokes it.
     let channel = harness
@@ -386,17 +399,9 @@ async fn revocation_shuts_the_door_at_the_next_rpc_and_is_journaled() -> Setup<(
 #[tokio::test]
 async fn revocation_severs_a_live_command_stream() -> Setup<()> {
     let harness = serve_secured().await?;
-    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
-
     // The worker registers and opens its command stream — the quiet state a
     // deployed worker sits in for hours.
-    let mut worker = harness.worker_client(&worker_identity).await?;
-    within(
-        "the registration",
-        worker.register_worker(register_request("mac-studio")),
-    )
-    .await??;
+    let (client_identity, _worker_identity, mut worker) = revocable_worker(&harness).await?;
     let mut commands = within(
         "the command stream opening",
         worker.stream_commands(horde_proto::v1::StreamCommandsRequest {

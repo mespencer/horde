@@ -178,6 +178,112 @@ async fn every_verb_also_runs_in_json_mode() {
     }
 }
 
+/// The workspace surface (fix a12), through the real dispatch: create,
+/// list, get by id and by name, add-repo at the right etag, delete — plus
+/// `worker list` and a `prewarm` refusal for a worker nobody enrolled.
+#[tokio::test]
+async fn the_workspace_verbs_round_trip_through_the_dispatch() {
+    let endpoint = serve().await.expect("a listening server");
+
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "create",
+            "atlas-ws",
+            "--repo",
+            "atlas=https://git.example/atlas.git,branch=main,path=src",
+            "--unmanaged",
+            "datasets",
+        ],
+    )
+    .await
+    .expect("the definition creates");
+
+    // The id and etag, read back through the client library — the CLI
+    // prints them, but a test scraping stdout would be testing println.
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("a client connects");
+    let listed = client
+        .list_workspace_definitions()
+        .await
+        .expect("the list answers");
+    assert_eq!(listed.len(), 1, "exactly the created definition");
+    let id = listed[0]
+        .workspace_definition_id
+        .as_ref()
+        .expect("an id")
+        .to_string();
+    let etag = listed[0].etag.clone();
+
+    for case in [
+        vec!["workspace", "list"],
+        vec!["--json", "workspace", "list"],
+        vec!["workspace", "get", id.as_str()],
+        vec!["--json", "workspace", "get", "atlas-ws"],
+        vec!["worker", "list"],
+        vec!["--json", "worker", "list"],
+    ] {
+        invoke(&endpoint, &case)
+            .await
+            .unwrap_or_else(|error| panic!("{case:?} must succeed: {error}"));
+    }
+
+    // Lookup by a name that is neither an id nor a name refuses.
+    let missing = invoke(&endpoint, &["workspace", "get", "no-such-workspace"])
+        .await
+        .expect_err("an unknown reference is refused");
+    assert!(
+        missing.to_string().contains("no-such-workspace"),
+        "{missing}"
+    );
+
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "add-repo",
+            &id,
+            "--repo",
+            "docs=https://git.example/docs.git",
+            "--etag",
+            &etag,
+        ],
+    )
+    .await
+    .expect("the repo set widens at the right etag");
+
+    // Prewarm refuses honestly for a worker nobody enrolled; the verb still
+    // crossed the wire.
+    let refused = invoke(&endpoint, &["prewarm", &id, "worker-that-is-not-there"])
+        .await
+        .expect_err("prewarming an absent worker refuses");
+    assert!(!refused.to_string().is_empty());
+
+    let refreshed = client
+        .get_workspace_definition(&id)
+        .await
+        .expect("the widened definition reads back");
+    let definition = refreshed.definition.expect("a definition");
+    assert_eq!(definition.repos.len(), 2, "the added repo is in the set");
+
+    invoke(
+        &endpoint,
+        &["workspace", "delete", &id, "--etag", &definition.etag],
+    )
+    .await
+    .expect("the definition deletes at its current etag");
+    assert!(
+        client
+            .list_workspace_definitions()
+            .await
+            .expect("the list answers")
+            .is_empty(),
+        "deleted means gone from the listing"
+    );
+}
+
 /// `approve` needs an outstanding escalation, which nothing creates yet — no
 /// worker exists to request one. Both paths are still exercised: the server
 /// refuses an unknown request id, which proves the verb reaches it and that a

@@ -159,7 +159,11 @@ pub enum WorkspaceCommand {
         name: String,
         /// One repo, as name=URL with optional ,branch= and ,path= parts;
         /// repeatable. Example: --repo atlas=https://…/atlas.git,branch=main
-        #[arg(long = "repo", value_name = "NAME=URL[,branch=B][,path=P]", required = true)]
+        #[arg(
+            long = "repo",
+            value_name = "NAME=URL[,branch=B][,path=P]",
+            required = true
+        )]
         repos: Vec<String>,
         /// A path agents may use but Horde never syncs; repeatable.
         #[arg(long = "unmanaged")]
@@ -575,20 +579,19 @@ pub fn spec_from(args: &SpecArgs) -> Result<horde_proto::v1::AgentSpec, ClientEr
             .map(checkout_for)
             .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified)
             as i32,
-        placement: args.pin_worker.as_ref().map(|worker| {
-            horde_proto::v1::PlacementConstraints {
+        placement: args
+            .pin_worker
+            .as_ref()
+            .map(|worker| horde_proto::v1::PlacementConstraints {
                 pinned_worker_id: Some(horde_proto::v1::WorkerId::new(worker)),
                 ..horde_proto::v1::PlacementConstraints::default()
-            }
-        }),
+            }),
         permission_mode: args.permission_mode.clone().unwrap_or_default(),
         budget: None,
-        initial_assignment: args.task.as_ref().map(|task| {
-            horde_proto::v1::Assignment {
-                assignment_id: None,
-                text: task.clone(),
-                payload: None,
-            }
+        initial_assignment: args.task.as_ref().map(|task| horde_proto::v1::Assignment {
+            assignment_id: None,
+            text: task.clone(),
+            payload: None,
         }),
     })
 }
@@ -641,13 +644,33 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
-        Some(Command::Blob(command)) => run_blob(client, command, format).await,
-        Some(Command::Mcp(command)) => run_mcp(client, command, format).await,
-        Some(Command::Usage(args)) => run_usage(client, args, format).await,
-        Some(Command::Workspace(command)) => run_workspace(client, command, format).await,
-        Some(Command::Prewarm(args)) => run_prewarm(client, args, format).await,
-        Some(Command::Worker(command)) => run_worker(client, command, format).await,
-        Some(Command::Enroll(command)) => run_enroll(client, command, format).await,
+        Some(command) => dispatch_admin(client, command, format).await,
+    }
+}
+
+/// The administrative half of the verb table: catalogs, stores, and
+/// identity. Split from [`dispatch`] by subject so neither half outgrows the
+/// complexity bar as the surface grows — same rule the worker's flag parser
+/// follows.
+async fn dispatch_admin(
+    client: &mut Client,
+    command: &Command,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        Command::Blob(command) => run_blob(client, command, format).await,
+        Command::Mcp(command) => run_mcp(client, command, format).await,
+        Command::Usage(args) => run_usage(client, args, format).await,
+        Command::Workspace(command) => run_workspace(client, command, format).await,
+        Command::Prewarm(args) => run_prewarm(client, args, format).await,
+        Command::Worker(command) => run_worker(client, command, format).await,
+        Command::Enroll(command) => run_enroll(client, command, format).await,
+        // Unreachable while `dispatch` and this match agree; refusing loudly
+        // (rather than a silent no-op) is what keeps a drift between them
+        // diagnosable.
+        other => Err(ClientError::Rpc(tonic::Status::internal(format!(
+            "verb dispatched to the wrong table: {other:?}"
+        )))),
     }
 }
 
@@ -1159,29 +1182,16 @@ async fn run_sync(client: &mut Client, args: &SyncArgs, format: Format) -> Resul
 }
 
 async fn run_send(client: &mut Client, args: &SendArgs, format: Format) -> Result<(), ClientError> {
-    let delivery = delivery_for(args.interrupt);
-    let payload = payload_from(args)?;
-    let response = if args.note {
-        client
-            .send_note_with_payload(
-                &args.agent_id,
-                &args.text,
-                payload,
-                delivery,
-                &args.idempotency_key,
-            )
-            .await?
-    } else {
-        client
-            .send_assignment_with_payload(
-                &args.agent_id,
-                &args.text,
-                payload,
-                delivery,
-                &args.idempotency_key,
-            )
-            .await?
-    };
+    let response = client
+        .send_with_payload(
+            &args.agent_id,
+            args.note,
+            &args.text,
+            payload_from(args)?,
+            delivery_for(args.interrupt),
+            &args.idempotency_key,
+        )
+        .await?;
     println!("{}", render::sent(&response, format));
     Ok(())
 }
@@ -1258,7 +1268,9 @@ mod tests {
 
         assert_eq!(spec.agent_type, "reviewer");
         assert_eq!(
-            spec.model.as_ref().and_then(|model| model.selection.clone()),
+            spec.model
+                .as_ref()
+                .and_then(|model| model.selection.clone()),
             Some(horde_proto::v1::model_selection::Selection::Tier(
                 "deep".to_owned()
             ))
@@ -1311,8 +1323,16 @@ mod tests {
         }
 
         assert!(
-            Cli::try_parse_from(["horde", "spawn", "s1", "--tier", "deep", "--model", "claude:opus"])
-                .is_err(),
+            Cli::try_parse_from([
+                "horde",
+                "spawn",
+                "s1",
+                "--tier",
+                "deep",
+                "--model",
+                "claude:opus"
+            ])
+            .is_err(),
             "--tier and --model are one choice, not two flags"
         );
 

@@ -582,17 +582,10 @@ impl ControlPlaneService for ControlPlane {
             filter,
             self.heartbeat_period,
         );
+        // Revocation severs a live follow too (fix a4): a revoked client
+        // must not keep reading the log until it reconnects.
         tokio::spawn(async move {
-            tokio::select! {
-                () = stream => {}
-                // Revocation severs a live follow too (fix a4): a revoked
-                // client must not keep reading the log until it reconnects.
-                () = super::shared::severed(deny, serial.clone()) => {
-                    let _ = sender
-                        .send(Err(super::shared::severed_status(serial.as_deref())))
-                        .await;
-                }
-            }
+            super::shared::run_severable(stream, deny, serial, &sender).await;
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))

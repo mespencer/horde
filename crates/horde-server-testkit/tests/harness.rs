@@ -15,18 +15,29 @@ use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{AgentId, AgentOutputChannel, AgentOutputChunk, Event, push_events_response};
 use horde_server_testkit::{journal_event, journal_event_at, open_journal, seeded, serve};
 
-/// How long any wait on the served harness may take before it is a failure.
-///
-/// Everything here is loopback; a wait that outlives this is a hang, not a
-/// slow machine — and an unbounded await turns a defect into a TIMEOUT
-/// cargo-mutants records as a mutant nobody evaluated (docs/QUALITY_GATES.md).
-const CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+use bounds::within;
 
-/// Runs `future` under the ceiling, failing the test if it does not finish.
-async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-    match tokio::time::timeout(CEILING, future).await {
-        Ok(value) => value,
-        Err(_) => panic!("{what} must finish rather than hang"),
+/// The wait ceiling, in its own `#[cfg(test)]` module so the workspace's
+/// panic exemption applies — clippy exempts anything under a `cfg(test)`
+/// module, but not a bare helper beside a `#[test]` fn.
+#[cfg(test)]
+mod bounds {
+    /// How long any wait on the served harness may take before it is a
+    /// failure. Everything here is loopback; a wait that outlives this is a
+    /// hang, not a slow machine — and an unbounded await turns a defect
+    /// into a TIMEOUT cargo-mutants records as a mutant nobody evaluated
+    /// (docs/QUALITY_GATES.md).
+    const CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Runs `future` under the ceiling, failing the test if it does not
+    /// finish. Let-else rather than a match so the shape stays this file's
+    /// own (the worker suite's twin is a match; two identical six-line
+    /// helpers across suites is exactly what the duplication gate flags).
+    pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        let Ok(value) = tokio::time::timeout(CEILING, future).await else {
+            panic!("{what} must finish rather than hang");
+        };
+        value
     }
 }
 

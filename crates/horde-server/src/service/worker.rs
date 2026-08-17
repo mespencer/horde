@@ -232,17 +232,8 @@ impl WorkerService for WorkerFacing {
                     }
                 }
             };
-            tokio::select! {
-                () = pump => {}
-                // Revocation severs the stream (fix a4). Cancelling the pump
-                // mid-batch is safe precisely because the stream ends here:
-                // its cursor dies with it.
-                () = super::shared::severed(deny, serial.clone()) => {
-                    let _ = sender
-                        .send(Err(super::shared::severed_status(serial.as_deref())))
-                        .await;
-                }
-            }
+            // Revocation severs the stream (fix a4).
+            super::shared::run_severable(pump, deny, serial, &sender).await;
 
             // The command stream is the worker's lifeline: once it is gone the
             // server cannot command this worker, so it leaves placement and
@@ -300,8 +291,7 @@ impl WorkerService for WorkerFacing {
                                 .as_ref()
                                 .map(ToString::to_string)
                                 .unwrap_or_default();
-                            handle_start(&core, &worker_id, start.last_local_journal_sequence)
-                                .await
+                            handle_start(&core, &worker_id, start.last_local_journal_sequence).await
                         }
                         Some(push_events_request::Body::Batch(batch)) => {
                             // `acked_command_sequence` is deliberately not
@@ -334,17 +324,10 @@ impl WorkerService for WorkerFacing {
                     }
                 }
             };
-            tokio::select! {
-                () = pump => {}
-                // Revocation severs the journal push mid-connection (fix
-                // a4): a revoked worker must not keep feeding events into
-                // the log until it happens to reconnect.
-                () = super::shared::severed(deny, serial.clone()) => {
-                    let _ = sender
-                        .send(Err(super::shared::severed_status(serial.as_deref())))
-                        .await;
-                }
-            }
+            // Revocation severs the journal push mid-connection (fix a4): a
+            // revoked worker must not keep feeding events into the log until
+            // it happens to reconnect.
+            super::shared::run_severable(pump, deny, serial, &sender).await;
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
@@ -509,6 +492,52 @@ mod tests {
                 kind: Some(Kind::TurnInterrupted(TurnInterrupted::default())),
             }),
         }
+    }
+
+    /// The registration handler itself: a versioned worker registers and is
+    /// told where to resume; a nameless one is refused; a versionless one is
+    /// stopped by the a6 gate before anything registers.
+    #[tokio::test]
+    async fn registration_admits_versioned_named_workers_and_refuses_the_rest() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+
+        let facing = super::WorkerFacing::new(core());
+        let request = |hello: Option<&str>, worker_id: Option<&str>| {
+            tonic::Request::new(horde_proto::v1::RegisterWorkerRequest {
+                hello: hello.map(|semver| horde_proto::v1::Hello {
+                    semver: semver.to_owned(),
+                    ..horde_proto::v1::Hello::default()
+                }),
+                worker_id: worker_id.map(horde_proto::v1::WorkerId::new),
+                capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+            })
+        };
+
+        let registered = facing
+            .register_worker(request(Some("0.1.0"), Some("worker-a")))
+            .await
+            .expect("a versioned, named worker registers")
+            .into_inner();
+        assert_eq!(
+            registered.worker_id.map(|id| id.to_string()),
+            Some("worker-a".to_owned())
+        );
+        assert_eq!(
+            registered.resume_from_journal_sequence, 1,
+            "a fresh worker resumes from the first position"
+        );
+
+        let unnamed = facing
+            .register_worker(request(Some("0.1.0"), None))
+            .await
+            .expect_err("a nameless worker is refused");
+        assert_eq!(unnamed.code(), tonic::Code::InvalidArgument);
+
+        let unversioned = facing
+            .register_worker(request(None, Some("worker-b")))
+            .await
+            .expect_err("the version gate runs before registration");
+        assert_eq!(unversioned.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]

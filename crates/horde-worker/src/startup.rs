@@ -710,7 +710,11 @@ async fn fresh_dial_config(prepared: &PreparedWorker) -> DialConfig {
         endpoint: prepared.server.clone(),
         worker_id: prepared.name.clone(),
         hello: capabilities::hello(&prepared.name),
-        capabilities: capabilities::advertise(prepared.runtime.adapters(), warm, &prepared.declared),
+        capabilities: capabilities::advertise(
+            prepared.runtime.adapters(),
+            warm,
+            &prepared.declared,
+        ),
         identity: prepared.identity.clone(),
     }
 }

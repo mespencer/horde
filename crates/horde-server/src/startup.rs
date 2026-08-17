@@ -128,25 +128,20 @@ impl ParsedFlags {
     }
 
     /// Applies one of the flags that configure how `--serve` serves.
-    /// `Ok(false)` means the argument is not one of them.
+    /// `Ok(false)` means the argument is not one of them. Split from the
+    /// bind-address flags by subject so neither half outgrows the
+    /// complexity bar as listeners accumulate.
     fn apply_serve_flag(
         &mut self,
         argument: &str,
         value_of: &mut impl FnMut(&str) -> Result<String, String>,
     ) -> Result<bool, String> {
+        if self.apply_bind_flag(argument, value_of)? {
+            return Ok(true);
+        }
         match argument {
             "--state-dir" => self.state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
-            "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
-            "--enrollment-bind" => {
-                self.enrollment_bind = Some(parse_bind(
-                    "--enrollment-bind",
-                    &value_of("--enrollment-bind")?,
-                )?);
-            }
             "--san" => self.subject_names.push(value_of("--san")?),
-            "--relay-bind" => {
-                self.relay_bind = Some(parse_bind("--relay-bind", &value_of("--relay-bind")?)?);
-            }
             "--blob-max-bytes" => {
                 let value = value_of("--blob-max-bytes")?;
                 self.blob_max_bytes = Some(
@@ -154,6 +149,28 @@ impl ParsedFlags {
                         .parse()
                         .map_err(|_| format!("--blob-max-bytes {value} is not a byte count"))?,
                 );
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Applies one of the three listener-address flags.
+    fn apply_bind_flag(
+        &mut self,
+        argument: &str,
+        value_of: &mut impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<bool, String> {
+        match argument {
+            "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
+            "--enrollment-bind" => {
+                self.enrollment_bind = Some(parse_bind(
+                    "--enrollment-bind",
+                    &value_of("--enrollment-bind")?,
+                )?);
+            }
+            "--relay-bind" => {
+                self.relay_bind = Some(parse_bind("--relay-bind", &value_of("--relay-bind")?)?);
             }
             _ => return Ok(false),
         }
@@ -605,7 +622,10 @@ mod tests {
 
         let running = super::serve(&config).await.expect("the server comes up");
         assert_ne!(running.main.addr.port(), 0, "the OS chose a real port");
-        let relay = running.relay.as_ref().expect("--relay-bind mounts the relay");
+        let relay = running
+            .relay
+            .as_ref()
+            .expect("--relay-bind mounts the relay");
         assert_ne!(relay.server.addr().port(), 0, "the relay bound a real port");
         assert!(
             super::operator_lines(&running)

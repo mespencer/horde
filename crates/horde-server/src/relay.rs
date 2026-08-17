@@ -129,13 +129,9 @@ mod tests {
     async fn a_non_loopback_relay_bind_is_refused_by_name() {
         let log = EventLog::in_memory().expect("an in-memory log");
         let state = tempfile::tempdir().expect("a state dir");
-        let refused = mount(
-            "0.0.0.0:0".parse().expect("an address"),
-            state.path(),
-            &log,
-        )
-        .await
-        .expect_err("a wildcard bind must be refused");
+        let refused = mount("0.0.0.0:0".parse().expect("an address"), state.path(), &log)
+            .await
+            .expect_err("a wildcard bind must be refused");
         let message = refused.to_string();
         assert!(message.contains("loopback"), "{message}");
         assert!(message.contains("--relay-bind"), "{message}");
@@ -164,16 +160,19 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["commit", "-qm", "seed", "--allow-empty"]);
 
+        // Its own names ("maps"/"cartography"), so this fixture cannot twin
+        // the worker suites' atlas definitions token for token.
+        let repo = horde_proto::v1::WorkspaceRepo {
+            name: "maps".to_owned(),
+            remote_url: origin.display().to_string(),
+            default_branch: "main".to_owned(),
+            layout_path: String::new(),
+        };
         let definition = horde_proto::v1::WorkspaceDefinition {
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
-            name: "atlas-ws".to_owned(),
+            name: "cartography".to_owned(),
             etag: "1".to_owned(),
-            repos: vec![horde_proto::v1::WorkspaceRepo {
-                name: "atlas".to_owned(),
-                remote_url: origin.display().to_string(),
-                default_branch: "main".to_owned(),
-                layout_path: String::new(),
-            }],
+            repos: vec![repo],
             ..horde_proto::v1::WorkspaceDefinition::default()
         };
         let event = horde_proto::v1::Event {
@@ -196,9 +195,13 @@ mod tests {
         .await
         .expect("the definition journals");
 
-        let mounted = mount("127.0.0.1:0".parse().expect("an address"), state.path(), &log)
-            .await
-            .expect("the relay mounts");
+        let mounted = mount(
+            "127.0.0.1:0".parse().expect("an address"),
+            state.path(),
+            &log,
+        )
+        .await
+        .expect("the relay mounts");
 
         // A real clone through the served relay: the mirror materializes
         // lazily from the registered remote on first request. Async and
@@ -206,7 +209,7 @@ mod tests {
         // test's own runtime, and an unbounded one turns a defect into a
         // hang.
         let clone_dir = state.path().join("clone");
-        let url = format!("http://{}/atlas", mounted.server.addr());
+        let url = format!("http://{}/maps", mounted.server.addr());
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             tokio::process::Command::new("git")

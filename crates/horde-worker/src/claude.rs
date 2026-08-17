@@ -475,10 +475,10 @@ mod tests {
     fn a_spec_with_an_endpoint_wires_the_mcp_config_and_the_chain() {
         let spec = AgentSpec {
             horde_endpoint: Some(horde_adapter::McpEndpoint::Http {
-                url: "http://127.0.0.1:8931/mcp".to_owned(),
+                url: "http://127.0.0.1:8942/mcp".to_owned(),
                 headers: vec![
-                    ("Authorization".to_owned(), "Bearer tok-1".to_owned()),
-                    ("X-Horde-Agent".to_owned(), "agent-1".to_owned()),
+                    ("Authorization".to_owned(), "Bearer tok-9".to_owned()),
+                    ("X-Horde-Agent".to_owned(), "agent-9".to_owned()),
                 ],
             }),
             ..AgentSpec::default()
@@ -490,21 +490,20 @@ mod tests {
             .iter()
             .position(|a| a == "--mcp-config")
             .unwrap_or_else(|| panic!("--mcp-config must be emitted: {joined}"));
-        let config: serde_json::Value = serde_json::from_str(&args[config_index + 1])
-            .expect("the mcp config is inline JSON");
+        let config: serde_json::Value =
+            serde_json::from_str(&args[config_index + 1]).expect("the mcp config is inline JSON");
         assert_eq!(config["mcpServers"]["horde"]["type"], "http");
         assert_eq!(
             config["mcpServers"]["horde"]["url"],
-            "http://127.0.0.1:8931/mcp"
+            "http://127.0.0.1:8942/mcp"
         );
         assert_eq!(
-            config["mcpServers"]["horde"]["headers"]["Authorization"],
-            "Bearer tok-1",
+            config["mcpServers"]["horde"]["headers"]["Authorization"], "Bearer tok-9",
             "without the identity pair every request is refused 401"
         );
         assert_eq!(
             config["mcpServers"]["horde"]["headers"]["X-Horde-Agent"],
-            "agent-1"
+            "agent-9"
         );
 
         assert!(

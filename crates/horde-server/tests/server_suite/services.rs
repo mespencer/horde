@@ -45,10 +45,7 @@ async fn register_worker(harness: &mut Harness, worker_id: &str) -> Setup<u64> {
     Ok(harness
         .worker
         .register_worker(RegisterWorkerRequest {
-            hello: Some(horde_proto::v1::Hello {
-                semver: "0.1.0".to_owned(),
-                ..horde_proto::v1::Hello::default()
-            }),
+            hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker_id)),
             capabilities: Some(WorkerCapabilities::default()),
         })
@@ -985,10 +982,7 @@ async fn a_restarted_server_still_knows_what_it_issued_a_worker() {
     let resume = restarted
         .worker
         .register_worker(RegisterWorkerRequest {
-            hello: Some(horde_proto::v1::Hello {
-                semver: "0.1.0".to_owned(),
-                ..horde_proto::v1::Hello::default()
-            }),
+            hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new("worker-a")),
             capabilities: Some(WorkerCapabilities::default()),
         })

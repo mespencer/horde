@@ -283,7 +283,12 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
 
     // Unspecified is the worktree default (DESIGN §7), so this exercises both.
     let checkout = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::Unspecified, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-1",
+            CheckoutPolicy::Unspecified,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("a worktree checkout");
 
@@ -302,14 +307,24 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
 
     // A second agent composes beside the first, not inside it.
     let second = manager
-        .checkout("ws-1", "agent-2", CheckoutPolicy::Worktree, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-2",
+            CheckoutPolicy::Worktree,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("a second checkout");
     assert_ne!(second, checkout, "agents must not share a worktree");
 
     // A redelivered spawn reuses the checkout instead of stacking another.
     let redelivered = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::Worktree, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-1",
+            CheckoutPolicy::Worktree,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("a redelivered checkout");
     assert_eq!(redelivered, checkout);
@@ -321,7 +336,12 @@ async fn a_fresh_clone_checkout_is_a_full_clone() {
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
     let checkout = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::FreshClone, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-1",
+            CheckoutPolicy::FreshClone,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("a fresh clone");
 
@@ -337,7 +357,12 @@ async fn a_shared_checkout_is_the_instance_itself() {
     let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
 
     let checkout = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::Shared, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-1",
+            CheckoutPolicy::Shared,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("the shared checkout");
     assert_eq!(checkout.display().to_string(), instance.root_path);
@@ -396,7 +421,12 @@ async fn a_checkout_for_a_path_hostile_agent_id_is_refused() {
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
     let refused = manager
-        .checkout("ws-1", "agent/../escape", CheckoutPolicy::Worktree, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent/../escape",
+            CheckoutPolicy::Worktree,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect_err("a separator in an agent id is an escape, not a name");
     assert!(
@@ -413,7 +443,12 @@ async fn a_checkout_without_a_materialized_instance_is_refused() {
     let manager = harness::manager_under(temp.path());
 
     let refused = manager
-        .checkout("ws-none", "agent-1", CheckoutPolicy::Worktree, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-none",
+            "agent-1",
+            CheckoutPolicy::Worktree,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect_err("nothing was materialized");
     assert!(
@@ -471,11 +506,21 @@ async fn worktree_agents_share_history_but_not_working_trees() {
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
     let first = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::Worktree, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-1",
+            CheckoutPolicy::Worktree,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("first checkout");
     let second = manager
-        .checkout("ws-1", "agent-2", CheckoutPolicy::Worktree, &std::collections::BTreeMap::new())
+        .checkout(
+            "ws-1",
+            "agent-2",
+            CheckoutPolicy::Worktree,
+            &std::collections::BTreeMap::new(),
+        )
         .await
         .expect("second checkout");
 

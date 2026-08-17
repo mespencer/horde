@@ -251,9 +251,7 @@ fn mcp_server_overrides(endpoint: Option<&McpEndpoint>) -> Vec<String> {
                 // confirmed Codex sends on all of them.
                 let rendered: Vec<String> = headers
                     .iter()
-                    .map(|(name, value)| {
-                        format!("{}={}", toml_string(name), toml_string(value))
-                    })
+                    .map(|(name, value)| format!("{}={}", toml_string(name), toml_string(value)))
                     .collect();
                 push(format!(
                     "mcp_servers.horde.http_headers={{{}}}",

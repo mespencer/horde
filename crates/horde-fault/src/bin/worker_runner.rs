@@ -172,15 +172,19 @@ async fn attempt(
     journal: &Journal,
     runtime: &mut Runtime,
 ) {
+    // The runner declares no tags or remotes — its worker exists to be
+    // partitioned, not placed by constraint.
+    let declared = capabilities::DeclaredFacts::default();
+    let advertised = capabilities::advertise(
+        runtime.adapters(),
+        runtime.workspaces().map(|_| Vec::new()),
+        &declared,
+    );
     let config = DialConfig {
         endpoint: invocation.endpoint.clone(),
         worker_id: invocation.worker_id.clone(),
         hello: capabilities::hello(&invocation.worker_id),
-        capabilities: capabilities::advertise(
-            runtime.adapters(),
-            runtime.workspaces().map(|_| Vec::new()),
-            &capabilities::DeclaredFacts::default(),
-        ),
+        capabilities: advertised,
         identity: identity.clone(),
     };
     if let Ok((mut connection, registration)) = Connection::dial(&config).await {

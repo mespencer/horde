@@ -79,10 +79,7 @@ async fn register(
     harness
         .worker
         .register_worker(RegisterWorkerRequest {
-            hello: Some(horde_proto::v1::Hello {
-                semver: "0.1.0".to_owned(),
-                ..horde_proto::v1::Hello::default()
-            }),
+            hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker)),
             capabilities: Some(capabilities),
         })

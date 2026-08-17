@@ -227,6 +227,35 @@ impl System {
         self.cli_field(&["worker", "enroll", name], "code").await
     }
 
+    /// Writes `script_json` beside the state and starts a worker named
+    /// `name` running it — the arrangement every scripted scenario opens
+    /// with.
+    pub(crate) async fn spawn_scripted_worker(
+        &self,
+        name: &str,
+        script_json: &str,
+    ) -> SpawnedProcess {
+        let script = self.state.path().join(format!("{name}-script.json"));
+        std::fs::write(&script, script_json).expect("the script writes");
+        self.spawn_worker(
+            name,
+            &self.state.path().join(name),
+            &["--fake-script", &script.to_string_lossy()],
+        )
+        .await
+    }
+
+    /// A fresh session whose root agent has been placed — the point from
+    /// which a scenario can start sending.
+    pub(crate) async fn placed_session(&self, title: &str) -> (String, String) {
+        let (session_id, root) = self.new_session(title).await;
+        self.sync_until(&session_id, "the root agent's placement", |events| {
+            has_kind(events, "placement_changed")
+        })
+        .await;
+        (session_id, root)
+    }
+
     /// Starts a worker daemon named `name` over `state_dir`, enrolling it
     /// first when the directory holds no identity yet, and waits for its
     /// registration line. `extra` carries scenario flags (`--fake-script`,

@@ -116,10 +116,7 @@ pub(crate) fn peer_serial<T>(request: &tonic::Request<T>) -> Option<String> {
 /// the stream with the same `PermissionDenied` the interceptor gives unary
 /// calls. Never resolves without both a deny-list and a serial (a plaintext
 /// or unsecured server has neither, and severing nothing is correct there).
-pub(crate) async fn severed(
-    deny: Option<horde_identity::RevocationList>,
-    serial: Option<String>,
-) {
+pub(crate) async fn severed(deny: Option<horde_identity::RevocationList>, serial: Option<String>) {
     let (Some(deny), Some(serial)) = (deny, serial) else {
         return std::future::pending().await;
     };
@@ -138,6 +135,27 @@ pub(crate) fn severed_status(serial: Option<&str>) -> tonic::Status {
         "certificate {} has been revoked; this stream is severed",
         serial.unwrap_or("<unknown>")
     ))
+}
+
+/// Races one stream's pump against revocation, ending the stream with the
+/// severed refusal when revocation wins (fix a4). One helper for all three
+/// long-lived streams — `StreamCommands`, `PushEvents`, `SyncEvents` — so
+/// their severing cannot drift apart. Cancelling a pump mid-step is safe
+/// precisely because the stream ends here: its cursors die with it.
+pub(crate) async fn run_severable<T, F>(
+    pump: F,
+    deny: Option<horde_identity::RevocationList>,
+    serial: Option<String>,
+    sender: &tokio::sync::mpsc::Sender<Result<T, tonic::Status>>,
+) where
+    F: Future<Output = ()>,
+{
+    tokio::select! {
+        () = pump => {}
+        () = severed(deny, serial.clone()) => {
+            let _ = sender.send(Err(severed_status(serial.as_deref()))).await;
+        }
+    }
 }
 
 /// Below this, a peer is refused outright (DESIGN.md §2). Enforced by
@@ -501,7 +519,10 @@ mod tests {
             ..horde_proto::v1::Hello::default()
         };
 
-        assert!(version_gate(Some(&hello("0.1.0"))).is_ok(), "the floor passes");
+        assert!(
+            version_gate(Some(&hello("0.1.0"))).is_ok(),
+            "the floor passes"
+        );
         assert!(version_gate(Some(&hello("0.2.7"))).is_ok());
         assert!(version_gate(Some(&hello("1.0.0"))).is_ok());
 

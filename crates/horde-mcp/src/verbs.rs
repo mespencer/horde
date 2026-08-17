@@ -199,24 +199,16 @@ impl Verbs {
         };
 
         let mut client = self.context.client();
-        let response = match kind {
-            MessageKind::Assign => {
-                client
-                    .send_assignment_with_payload(
-                        to_agent_id,
-                        text,
-                        payload,
-                        delivery,
-                        idempotency_key,
-                    )
-                    .await?
-            }
-            MessageKind::Note => {
-                client
-                    .send_note_with_payload(to_agent_id, text, payload, delivery, idempotency_key)
-                    .await?
-            }
-        };
+        let response = client
+            .send_with_payload(
+                to_agent_id,
+                kind == MessageKind::Note,
+                text,
+                payload,
+                delivery,
+                idempotency_key,
+            )
+            .await?;
         Ok(response.sequence)
     }
 

@@ -1219,14 +1219,10 @@ dependencies = [
 name = "horde-e2e"
 version = "0.1.0"
 dependencies = [
- "horde-identity",
- "horde-proto",
- "horde-relay",
  "horde-server-testkit",
  "serde_json",
  "tempfile",
  "tokio",
- "tonic",
 ]
 
 [[package]]

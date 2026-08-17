@@ -1628,12 +1628,13 @@ mod tests {
         // The control-plane channel dials nowhere: report_result is journal-
         // plane, which is exactly the half this test pins.
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let mut runtime = runtime_with(Script::of(vec![ScriptedTurn::saying("wrapping up")
-            .with_step(Step::UseHordeTool {
+        let mut runtime = runtime_with(Script::of(vec![
+            ScriptedTurn::saying("wrapping up").with_step(Step::UseHordeTool {
                 tool_call_id: "call-r".to_owned(),
                 tool_name: "report_result".to_owned(),
                 input: json!({ "status": "success", "summary": "the work is done" }),
-            })]))
+            }),
+        ]))
         .with_agent_endpoints(channel);
 
         runtime

@@ -23,6 +23,24 @@ pub mod capability;
 pub mod permission;
 pub mod usage;
 
+/// The wire `ResultStatus`, in the words `report_result` accepts and every
+/// render shows. One owner (the endpoint validates these names in and this
+/// maps them out), so the vocabulary cannot drift between the MCP surface
+/// and the CLI's renders.
+///
+/// An unrecognized or unspecified status reports as `unknown` rather than
+/// being rounded to `success`: a consumer acting on an invented outcome is
+/// worse than one told the outcome is unreadable.
+#[must_use]
+pub fn result_status_name(status: i32) -> &'static str {
+    match horde_proto::v1::ResultStatus::try_from(status) {
+        Ok(horde_proto::v1::ResultStatus::Success) => "success",
+        Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
+        Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
+        Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
+    }
+}
+
 pub use capability::{UnknownCapability, capability_from_wire, capability_to_wire};
 pub use permission::{
     ConversionError, permission_decision_from_wire, permission_decision_to_wire,

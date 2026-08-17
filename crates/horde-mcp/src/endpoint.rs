@@ -169,15 +169,12 @@ pub fn status_from_name(name: &str) -> Option<horde_proto::v1::ResultStatus> {
 ///
 /// An unrecognized or unspecified status reports as `unknown` rather than
 /// being rounded to `success`: a parent acting on an invented outcome is worse
-/// than one told the outcome is unreadable.
+/// than one told the outcome is unreadable. Delegates to `horde-wire`, the
+/// vocabulary's one owner, so the endpoint and the CLI's renders cannot
+/// drift apart.
 #[must_use]
 pub fn status_name(status: i32) -> &'static str {
-    match horde_proto::v1::ResultStatus::try_from(status) {
-        Ok(horde_proto::v1::ResultStatus::Success) => "success",
-        Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
-        Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
-        Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
-    }
+    horde_wire::result_status_name(status)
 }
 
 /// Which message kind a `note` flag asks for.

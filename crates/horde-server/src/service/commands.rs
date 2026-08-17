@@ -55,10 +55,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use horde_proto::v1::{
     AgentId, ArchiveAgentCommand, CancelPlacementCommand, DeliverMessageCommand,
-    DeliverPermissionDecisionCommand,
-    Event, InterruptAgentCommand, MaterializeWorkspaceCommand, Placement, PlacementState,
-    SessionId, SpawnAgentCommand, StreamCommandsResponse, WorkspaceDefinition,
-    deliver_message_command, event::Kind, stream_commands_response::Command,
+    DeliverPermissionDecisionCommand, Event, InterruptAgentCommand, MaterializeWorkspaceCommand,
+    Placement, PlacementState, SessionId, SpawnAgentCommand, StreamCommandsResponse,
+    WorkspaceDefinition, deliver_message_command, event::Kind, stream_commands_response::Command,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -755,10 +754,8 @@ mod tests {
         assert_eq!(concrete.model, "opus");
         assert_eq!(concrete.tier, "", "a concrete bind names no tier");
 
-        let tiered = super::binding_for(Some(&with_selection(Selection::Tier(
-            "deep".to_owned(),
-        ))))
-        .expect("a shipped tier binds");
+        let tiered = super::binding_for(Some(&with_selection(Selection::Tier("deep".to_owned()))))
+            .expect("a shipped tier binds");
         assert_eq!(tiered.tier, "deep");
         assert_eq!(
             (tiered.provider.as_str(), tiered.model.as_str()),
@@ -830,11 +827,14 @@ mod tests {
                     agent_id: None,
                     occurred_at: None,
                     idempotency_key: String::new(),
+                    // Only `state` matters to the fold; the defaulted rest
+                    // keeps this fixture from twinning the handler's own
+                    // event construction.
                     kind: Some(Kind::SessionLifecycleChanged(
                         horde_proto::v1::SessionLifecycleChanged {
-                            previous_state: horde_proto::v1::SessionLifecycleState::Active as i32,
                             state: horde_proto::v1::SessionLifecycleState::Archived as i32,
                             reason: "done with it".to_owned(),
+                            ..Default::default()
                         },
                     )),
                 },
@@ -852,20 +852,7 @@ mod tests {
             9,
             "s1",
             9,
-            Event {
-                agent_id: Some(AgentId::new("agent-a")),
-                occurred_at: None,
-                idempotency_key: String::new(),
-                kind: Some(Kind::AssignmentSent(horde_proto::v1::AssignmentSent {
-                    from: None,
-                    assignment: Some(horde_proto::v1::Assignment {
-                        assignment_id: None,
-                        text: "too late".to_owned(),
-                        payload: None,
-                    }),
-                    delivery: DeliveryMode::TurnBoundary as i32,
-                })),
-            },
+            assignment_event("agent-a", "too late", DeliveryMode::TurnBoundary),
         ));
 
         let commands = fold(&rows);
@@ -889,9 +876,7 @@ mod tests {
         );
         let ids: std::collections::BTreeSet<&str> = commands
             .iter()
-            .filter(|(_, issued)| {
-                matches!(&issued.command, Some(Command::ArchiveAgent(_)))
-            })
+            .filter(|(_, issued)| matches!(&issued.command, Some(Command::ArchiveAgent(_))))
             .map(|(_, issued)| issued.command_id.as_str())
             .collect();
         assert_eq!(ids.len(), 2, "one event, two commands, two ids");

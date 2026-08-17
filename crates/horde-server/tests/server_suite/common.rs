@@ -45,6 +45,15 @@ pub fn core() -> Setup<ServerCore> {
     Ok(ServerCore::new(EventLog::in_memory()?))
 }
 
+/// The versioned Hello every registration must carry since the a6 gate —
+/// one helper, so six suites cannot each grow their own copy.
+pub fn versioned_hello() -> Option<horde_proto::v1::Hello> {
+    Some(horde_proto::v1::Hello {
+        semver: "0.1.0".to_owned(),
+        ..horde_proto::v1::Hello::default()
+    })
+}
+
 /// A harness over a fresh core.
 pub async fn connect() -> Setup<Harness> {
     connect_to(core()?).await

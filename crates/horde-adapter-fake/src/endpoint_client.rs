@@ -240,7 +240,8 @@ mod tests {
     /// test can read the verdict.
     #[test]
     fn call_replies_decode_success_and_both_error_shapes() {
-        let plain = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"recorded"}]}}"#;
+        let plain =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"recorded"}]}}"#;
         assert_eq!(decode_call_reply(plain), Ok("recorded".to_owned()));
 
         let framed = format!("event: message\ndata: {plain}\n\n");

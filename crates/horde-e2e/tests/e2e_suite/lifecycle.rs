@@ -84,33 +84,19 @@ async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
 
     // One turn: announce, spawn an idle child (no task — a child that got the
     // same script would spawn grandchildren forever), report the result.
-    let script = system.state.path().join("delegate.json");
-    std::fs::write(
-        &script,
-        r#"[{"steps": [
-            {"say": "delegating"},
-            {"use_horde": {"id": "call-1", "tool": "spawn_agent", "input": {"task": ""}}},
-            {"use_horde": {"id": "call-2", "tool": "report_result",
-                           "input": {"status": "success", "summary": "delegated the work"}}}
-        ], "text": "done"}]"#,
-    )
-    .expect("the script writes");
-
     let mut worker = system
-        .spawn_worker(
+        .spawn_scripted_worker(
             "w-1",
-            &system.state.path().join("w-1"),
-            &["--fake-script", &script.to_string_lossy()],
+            r#"[{"steps": [
+                {"say": "delegating"},
+                {"use_horde": {"id": "call-1", "tool": "spawn_agent", "input": {"task": ""}}},
+                {"use_horde": {"id": "call-2", "tool": "report_result",
+                               "input": {"status": "success", "summary": "delegated the work"}}}
+            ], "text": "done"}]"#,
         )
         .await;
 
-    let (session_id, root) = system.new_session("e2e endpoint verbs").await;
-    system
-        .sync_until(&session_id, "the root agent's placement", |events| {
-            has_kind(events, "placement_changed")
-        })
-        .await;
-
+    let (session_id, root) = system.placed_session("e2e endpoint verbs").await;
     system.cli_json(&["send", &root, "go"]).await;
 
     // The child exists because the *agent* asked for it, over its endpoint:
@@ -137,10 +123,8 @@ async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
         })
         .await;
     assert!(
-        events
-            .iter()
-            .any(|event| event["kind"] == "result_reported"
-                && event["agent_id"].as_str() == Some(root.as_str())),
+        events.iter().any(|event| event["kind"] == "result_reported"
+            && event["agent_id"].as_str() == Some(root.as_str())),
         "the result must be the root agent's own: {events:?}"
     );
 
@@ -165,36 +149,22 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     // The scripted provider: one turn that asks before acting. The ids are
     // the test's to choose, which is how the approval can name the request
     // without scraping it from a render.
-    let script = system.state.path().join("ask.json");
-    std::fs::write(
-        &script,
-        r#"[{"steps": [
-            {"say": "checking the blast radius"},
-            {"ask_permission": {"id": "call-1", "tool": "Bash",
-                                "input": {"command": "docker rm horde-test"}}},
-            {"say": "approved and done"},
-            {"ask_permission": {"id": "call-2", "tool": "Bash",
-                                "input": {"command": "docker rm horde-test"}}},
-            {"say": "remembered and done"}
-        ], "text": "done"}]"#,
-    )
-    .expect("the script writes");
-
     let mut worker = system
-        .spawn_worker(
+        .spawn_scripted_worker(
             "w-1",
-            &system.state.path().join("w-1"),
-            &["--fake-script", &script.to_string_lossy()],
+            r#"[{"steps": [
+                {"say": "checking the blast radius"},
+                {"ask_permission": {"id": "call-1", "tool": "Bash",
+                                    "input": {"command": "docker rm horde-test"}}},
+                {"say": "approved and done"},
+                {"ask_permission": {"id": "call-2", "tool": "Bash",
+                                    "input": {"command": "docker rm horde-test"}}},
+                {"say": "remembered and done"}
+            ], "text": "done"}]"#,
         )
         .await;
 
-    let (session_id, root) = system.new_session("e2e permissions").await;
-    system
-        .sync_until(&session_id, "the root agent's placement", |events| {
-            has_kind(events, "placement_changed")
-        })
-        .await;
-
+    let (session_id, root) = system.placed_session("e2e permissions").await;
     system.cli_json(&["send", &root, "go"]).await;
     let events = system
         .sync_until(&session_id, "the permission escalation", |events| {
