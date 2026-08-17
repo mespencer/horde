@@ -60,7 +60,9 @@ pub struct ApproveParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SpawnParams {
-    /// What the child is for. Carried for the approver and the tree view.
+    /// What the child is for. Becomes the child's initial assignment — its
+    /// first turn input on whatever worker it lands on. Empty spawns an
+    /// idle child to be assigned later.
     #[serde(default)]
     pub task: String,
 }
@@ -285,9 +287,14 @@ impl HordeEndpoint {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<SpawnResult>, ErrorData> {
         let identity = Self::caller(&context)?;
+        // Minted unique, never derived from the task: two children spawned
+        // for the same task text are two children, and a key built from the
+        // text would silently collapse them into one (the audit's collision
+        // #1). The task itself rides the spec as the initial assignment.
+        let key = self.request_id_for(&identity, None);
         let outcome = self
             .verbs()
-            .spawn_agent(&identity, &params.task)
+            .spawn_agent(&identity, &params.task, &key)
             .await
             .map_err(internal)?;
 

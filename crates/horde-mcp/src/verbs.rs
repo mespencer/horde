@@ -122,7 +122,13 @@ impl Verbs {
         Self { context }
     }
 
-    /// Spawns a child under the calling Agent.
+    /// Spawns a child under the calling Agent, carrying `task` as the
+    /// child's initial assignment.
+    ///
+    /// The task rides the spec rather than being sent afterwards: the spawn's
+    /// implicit first assignment is what the worker turns into the child's
+    /// first turn input, and a separate send could race the placement. An
+    /// empty task spawns an idle child, honestly — some parents assign later.
     ///
     /// # Errors
     ///
@@ -131,17 +137,27 @@ impl Verbs {
     pub async fn spawn_agent(
         &self,
         identity: &AgentIdentity,
+        task: &str,
         idempotency_key: &str,
     ) -> Result<SpawnOutcome, VerbError> {
+        let spec = horde_proto::v1::AgentSpec {
+            initial_assignment: (!task.is_empty()).then(|| horde_proto::v1::Assignment {
+                assignment_id: None,
+                text: task.to_owned(),
+                payload: None,
+            }),
+            ..horde_proto::v1::AgentSpec::default()
+        };
         // The parent is the authenticated caller, never a value the Agent
         // supplied: ancestry an Agent could forge is ancestry that cannot be
         // used to attenuate capabilities down the tree (§5).
         let response = self
             .context
             .client()
-            .spawn_agent(
+            .spawn_agent_with_spec(
                 self.context.session_id(),
                 Some(identity.agent_id()),
+                spec,
                 idempotency_key,
             )
             .await?;

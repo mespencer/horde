@@ -26,32 +26,15 @@ use horde_worker::{Connection, Journal, Runtime};
 mod harness {
 
     use horde_adapter::Adapter;
-    use horde_proto::prost::Message;
-    use horde_proto::v1::worker_service_server::WorkerServiceServer;
     use horde_proto::v1::{Event, TurnInterrupted, event::Kind};
     use horde_server::EventLog;
-    use horde_server::service::{ServerCore, WorkerFacing};
     use horde_worker::{DialConfig, JournalEntry, Runtime, capabilities};
-    use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
 
-    /// Serves the worker-facing service on a loopback port the OS picks.
-    ///
-    /// `127.0.0.1` only: DESIGN.md §3 forbids binding wider before auth
-    /// exists, and tests are not an exception to that.
-    pub(crate) async fn serve(core: ServerCore) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
-        let address = listener.local_addr().expect("a bound address");
-        tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await;
-        });
-        format!("http://{address}")
-    }
+    // The server-and-seed half lives in `support`, where the daemon suite
+    // shares it; re-exported so this file's tests keep reading `harness::…`.
+    pub(crate) use crate::support::{
+        decoded_session_log, place_agent, seed_agent, serve, server_log_at_least,
+    };
 
     /// The promoted fault injector, severing and healing exactly as the
     /// `SeverableProxy` that was seeded here did.
@@ -59,31 +42,6 @@ mod harness {
         horde_testkit::FaultProxy::front(upstream)
             .await
             .expect("the fault proxy binds")
-    }
-
-    /// Seeds an agent through the shared testkit helper, panicking on the
-    /// failures a precondition cannot survive.
-    pub(crate) async fn seed_agent(
-        log: &EventLog,
-        session: &str,
-        agent: &str,
-        worker: Option<&str>,
-        first_message: &str,
-    ) {
-        horde_server_testkit::seed_agent(log, session, agent, worker, first_message)
-            .await
-            .expect("the seed events append");
-    }
-
-    /// [`seed_agent`], placed on `worker` — the common case.
-    pub(crate) async fn place_agent(
-        log: &EventLog,
-        session: &str,
-        agent: &str,
-        worker: &str,
-        first_message: &str,
-    ) {
-        seed_agent(log, session, agent, Some(worker), first_message).await;
     }
 
     /// Dials as `config` and runs the connection over `journal`, driving
@@ -152,24 +110,6 @@ mod harness {
         }
     }
 
-    /// Waits until `session`'s server log reaches `minimum`, returning the
-    /// head it reached. Bounded by poll count and by a ceiling per park.
-    pub(crate) async fn server_log_at_least(log: &EventLog, session: &str, minimum: u64) -> u64 {
-        let mut notifications = log.subscribe();
-        let mut polls = 0_u32;
-        loop {
-            let head = log.head(session).await.expect("a readable log");
-            if head >= minimum {
-                return head;
-            }
-            polls += 1;
-            assert!(polls < 256, "the server log stalled below {minimum}");
-            let _ = tokio::time::timeout(core::time::Duration::from_secs(5), notifications.recv())
-                .await
-                .expect("the server log must keep moving");
-        }
-    }
-
     /// Waits until the worker journal's truncation floor reaches `floor` —
     /// which only an ack from the server can cause. Bounded by poll count.
     pub(crate) async fn journal_truncated_to(journal: &horde_worker::Journal, floor: u64) {
@@ -183,16 +123,6 @@ mod harness {
             tokio::time::sleep(core::time::Duration::from_millis(20)).await;
         }
         panic!("the journal never truncated to {floor}; no ack can have arrived");
-    }
-
-    /// Every event of `session`'s server log, decoded.
-    pub(crate) async fn decoded_session_log(log: &EventLog, session: &str) -> Vec<Event> {
-        log.read_all(session)
-            .await
-            .expect("a readable log")
-            .iter()
-            .map(|stored| Event::decode(stored.payload.as_slice()).expect("a decodable event"))
-            .collect()
     }
 
     /// Waits until the decoded session log satisfies `arrived`, returning it.
