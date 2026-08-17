@@ -26,7 +26,7 @@ pub mod usage;
 pub use capability::{UnknownCapability, capability_from_wire, capability_to_wire};
 pub use permission::{
     ConversionError, permission_decision_from_wire, permission_decision_to_wire,
-    proposed_tool_call_to_wire,
+    proposed_tool_call_to_wire, struct_to_json,
 };
 pub use usage::{
     UnreadableUtilization, rate_window_from_wire, rate_window_to_wire, token_usage_from_wire,

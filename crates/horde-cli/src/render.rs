@@ -172,7 +172,67 @@ fn detail(kind: Option<&Kind>) -> Value {
                 .unwrap_or_default(),
         ),
         Some(Kind::TurnInterrupted(interrupted)) => Value::String(interrupted.reason.clone()),
+        // Structured, not a prose line: a script following a session needs
+        // the outcome it can branch on, and burying it in a sentence would
+        // make every consumer a parser (W7b finding 4).
+        Some(Kind::ResultReported(reported)) => reported.result.as_ref().map_or_else(
+            || Value::String(String::new()),
+            |result| {
+                json!({
+                    "status": result_status(result.status),
+                    "summary": result.summary,
+                    "git_refs": result
+                        .payload
+                        .as_ref()
+                        .map(|payload| payload
+                            .git_refs
+                            .iter()
+                            .map(|git_ref| json!({
+                                "repo": git_ref.repo_name,
+                                "commit": git_ref.commit_sha,
+                                "branch": git_ref.branch,
+                            }))
+                            .collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                })
+            },
+        ),
+        Some(Kind::PermissionDecided(decided)) => decided.decision.as_ref().map_or_else(
+            || Value::String(String::new()),
+            |decision| {
+                json!({
+                    "outcome": permission_outcome(decision.outcome),
+                    "reason": decision.reason,
+                    "remembered": decision.remember_for_session,
+                    "updated_input": decision
+                        .updated_input
+                        .as_ref()
+                        .map(horde_wire::struct_to_json),
+                })
+            },
+        ),
         _ => Value::String(String::new()),
+    }
+}
+
+/// The wire result status, in the words `report_result` accepts.
+fn result_status(status: i32) -> &'static str {
+    match horde_proto::v1::ResultStatus::try_from(status) {
+        Ok(horde_proto::v1::ResultStatus::Success) => "success",
+        Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
+        Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
+        // Never rounded to success: a script acting on an invented outcome
+        // is worse than one told the outcome is unreadable.
+        Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+/// The wire outcome, in the words `approve` reports.
+fn permission_outcome(outcome: i32) -> &'static str {
+    match horde_proto::v1::PermissionOutcome::try_from(outcome) {
+        Ok(horde_proto::v1::PermissionOutcome::Allow) => "allowed",
+        Ok(horde_proto::v1::PermissionOutcome::Deny) => "denied",
+        Ok(horde_proto::v1::PermissionOutcome::Unspecified) | Err(_) => "unknown",
     }
 }
 
@@ -839,6 +899,98 @@ mod tests {
         assert_eq!(parsed["sequence"], 7);
         assert_eq!(parsed["kind"], "agent_output_chunk");
         assert_eq!(parsed["detail"], "hello");
+    }
+
+    /// A result's outcome is machine-readable (W7b finding 4): a script
+    /// following a session must be able to branch on status and read the
+    /// payload's refs without parsing prose.
+    #[test]
+    fn a_result_reported_carries_status_summary_and_refs_in_json() {
+        let reported = envelope(Some(Kind::ResultReported(horde_proto::v1::ResultReported {
+            result: Some(horde_proto::v1::AgentResult {
+                assignment_id: None,
+                status: horde_proto::v1::ResultStatus::Partial as i32,
+                summary: "got halfway".to_owned(),
+                payload: Some(horde_proto::v1::Payload {
+                    git_refs: vec![horde_proto::v1::GitRef {
+                        repo_name: "atlas".to_owned(),
+                        commit_sha: "abc123".to_owned(),
+                        branch: "horde/agent-1".to_owned(),
+                    }],
+                    attachments: Vec::new(),
+                }),
+            }),
+        })));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&reported, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["status"], "partial");
+        assert_eq!(parsed["detail"]["summary"], "got halfway");
+        assert_eq!(parsed["detail"]["git_refs"][0]["repo"], "atlas");
+        assert_eq!(parsed["detail"]["git_refs"][0]["commit"], "abc123");
+
+        // An unreadable status must not become a success a script acts on.
+        let unreadable = envelope(Some(Kind::ResultReported(horde_proto::v1::ResultReported {
+            result: Some(horde_proto::v1::AgentResult {
+                status: 9_999,
+                ..horde_proto::v1::AgentResult::default()
+            }),
+        })));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&unreadable, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["status"], "unknown");
+    }
+
+    /// A decision's outcome, reason, and narrowing are part of the record a
+    /// follower reads — an `updated_input` that vanished from the render
+    /// would hide exactly the narrowing the human imposed.
+    #[test]
+    fn a_permission_decided_carries_outcome_reason_and_narrowing_in_json() {
+        let mut narrowed = horde_proto::prost_types::Struct::default();
+        narrowed.fields.insert(
+            "path".to_owned(),
+            horde_proto::prost_types::Value {
+                kind: Some(horde_proto::prost_types::value::Kind::StringValue(
+                    "/tmp/safe".to_owned(),
+                )),
+            },
+        );
+        let decided = envelope(Some(Kind::PermissionDecided(
+            horde_proto::v1::PermissionDecided {
+                decision: Some(horde_proto::v1::PermissionDecision {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new("call-1")),
+                    outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+                    reason: "clamped to /tmp".to_owned(),
+                    remember_for_session: true,
+                    updated_input: Some(narrowed),
+                    ..horde_proto::v1::PermissionDecision::default()
+                }),
+            },
+        )));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&decided, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["outcome"], "allowed");
+        assert_eq!(parsed["detail"]["reason"], "clamped to /tmp");
+        assert_eq!(parsed["detail"]["remembered"], true);
+        assert_eq!(parsed["detail"]["updated_input"]["path"], "/tmp/safe");
+
+        let denied = envelope(Some(Kind::PermissionDecided(
+            horde_proto::v1::PermissionDecided {
+                decision: Some(horde_proto::v1::PermissionDecision {
+                    outcome: horde_proto::v1::PermissionOutcome::Deny as i32,
+                    ..horde_proto::v1::PermissionDecision::default()
+                }),
+            },
+        )));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&denied, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["outcome"], "denied");
+        assert_eq!(
+            parsed["detail"]["updated_input"],
+            serde_json::Value::Null,
+            "no narrowing renders as null, not as an empty object"
+        );
     }
 
     /// Hiding an event this build cannot pretty-print would make the printed
