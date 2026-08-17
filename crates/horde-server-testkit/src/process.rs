@@ -92,10 +92,15 @@ async fn built(package: &str, name: &str, candidates: &[PathBuf]) -> Setup<PathB
     if let Some(found) = existing(candidates) {
         return Ok(found);
     }
+    // `--offline` deliberately: a workspace that runs this suite has been
+    // built before, so every dependency is already local — and the registry
+    // lock an online build takes is contended machine-wide (a cargo-mutants
+    // sweep at --jobs 4 held this exact wait long enough to turn a caught
+    // mutant into a timeout).
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         tokio::process::Command::new("cargo")
-            .args(["build", "--package", package, "--bin", name])
+            .args(["build", "--offline", "--package", package, "--bin", name])
             .output(),
     )
     .await
