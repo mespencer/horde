@@ -28,36 +28,16 @@ mod harness {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use horde_adapter::Adapter;
-    use horde_proto::prost::Message;
-    use horde_proto::v1::worker_service_server::WorkerServiceServer;
-    use horde_proto::v1::{
-        AgentId, AgentSpawned, AgentSpec, Assignment, Event, Placement, PlacementChanged,
-        PlacementState, TurnInterrupted, WorkerId, event::Kind,
-    };
+    use horde_proto::v1::{Event, TurnInterrupted, event::Kind};
     use horde_server::EventLog;
-    use horde_server::log::PendingEvent;
-    use horde_server::service::{ServerCore, WorkerFacing};
     use horde_worker::{DialConfig, JournalEntry, Runtime, capabilities};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio_stream::wrappers::TcpListenerStream;
 
-    /// Serves the worker-facing service on a loopback port the OS picks.
-    ///
-    /// `127.0.0.1` only: DESIGN.md §3 forbids binding wider before auth
-    /// exists, and tests are not an exception to that.
-    pub(crate) async fn serve(core: ServerCore) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
-        let address = listener.local_addr().expect("a bound address");
-        tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await;
-        });
-        format!("http://{address}")
-    }
+    // The server-and-seed half moved to `support`, where the daemon suite
+    // shares it; re-exported so this file's tests keep reading `harness::…`.
+    pub(crate) use crate::support::{
+        decoded_session_log, place_agent, seed_agent, serve, server_log_at_least,
+    };
 
     /// A TCP proxy that can be severed and healed — the fault the partition
     /// tests inject, and the seed of TESTING.md §2's network fault injector.
@@ -134,76 +114,6 @@ mod harness {
         }
     }
 
-    /// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
-    /// writes when the scheduler answers a spawn: placed on a worker when one
-    /// is given, queued when `None`. The placed pair is what the server's
-    /// command fold turns into this worker's `SpawnAgentCommand`, with the
-    /// implicit first assignment riding the spec.
-    pub(crate) async fn seed_agent(
-        log: &EventLog,
-        session: &str,
-        agent: &str,
-        worker: Option<&str>,
-        first_message: &str,
-    ) {
-        let spawned = Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: format!("{agent}:spawned"),
-            kind: Some(Kind::AgentSpawned(AgentSpawned {
-                parent_agent_id: None,
-                spawned_by: None,
-                spec: Some(AgentSpec {
-                    initial_assignment: Some(Assignment {
-                        assignment_id: None,
-                        text: first_message.to_owned(),
-                        payload: None,
-                    }),
-                    ..AgentSpec::default()
-                }),
-                tree_path: Vec::new(),
-            })),
-        };
-        let state = match worker {
-            Some(_) => PlacementState::Placed,
-            None => PlacementState::Queued,
-        };
-        let placed = Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: format!("{agent}:placed"),
-            kind: Some(Kind::PlacementChanged(PlacementChanged {
-                placement: Some(Placement {
-                    agent_id: Some(AgentId::new(agent)),
-                    state: state.into(),
-                    worker_id: worker.map(WorkerId::new),
-                    reason: String::new(),
-                }),
-            })),
-        };
-        for event in [spawned, placed] {
-            log.append(PendingEvent {
-                session_id: session.to_owned(),
-                idempotency_key: event.idempotency_key.clone(),
-                payload: event.encode_to_vec(),
-                ..PendingEvent::default()
-            })
-            .await
-            .expect("the seed event appends");
-        }
-    }
-
-    /// [`seed_agent`], placed on `worker` — the common case.
-    pub(crate) async fn place_agent(
-        log: &EventLog,
-        session: &str,
-        agent: &str,
-        worker: &str,
-        first_message: &str,
-    ) {
-        seed_agent(log, session, agent, Some(worker), first_message).await;
-    }
-
     /// Dials as `config` and runs the connection over `journal`, driving
     /// `runtime` — the whole worker, in one line of test.
     ///
@@ -270,24 +180,6 @@ mod harness {
         }
     }
 
-    /// Waits until `session`'s server log reaches `minimum`, returning the
-    /// head it reached. Bounded by poll count and by a ceiling per park.
-    pub(crate) async fn server_log_at_least(log: &EventLog, session: &str, minimum: u64) -> u64 {
-        let mut notifications = log.subscribe();
-        let mut polls = 0_u32;
-        loop {
-            let head = log.head(session).await.expect("a readable log");
-            if head >= minimum {
-                return head;
-            }
-            polls += 1;
-            assert!(polls < 256, "the server log stalled below {minimum}");
-            let _ = tokio::time::timeout(core::time::Duration::from_secs(5), notifications.recv())
-                .await
-                .expect("the server log must keep moving");
-        }
-    }
-
     /// Waits until the worker journal's truncation floor reaches `floor` —
     /// which only an ack from the server can cause. Bounded by poll count.
     pub(crate) async fn journal_truncated_to(journal: &horde_worker::Journal, floor: u64) {
@@ -301,16 +193,6 @@ mod harness {
             tokio::time::sleep(core::time::Duration::from_millis(20)).await;
         }
         panic!("the journal never truncated to {floor}; no ack can have arrived");
-    }
-
-    /// Every event of `session`'s server log, decoded.
-    pub(crate) async fn decoded_session_log(log: &EventLog, session: &str) -> Vec<Event> {
-        log.read_all(session)
-            .await
-            .expect("a readable log")
-            .iter()
-            .map(|stored| Event::decode(stored.payload.as_slice()).expect("a decodable event"))
-            .collect()
     }
 
     /// Waits until the decoded session log satisfies `arrived`, returning it.

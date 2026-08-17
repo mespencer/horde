@@ -29,6 +29,7 @@
 //! server — a session fetched back, an event replayed — rather than trusting a
 //! returned value.
 
+pub mod process;
 pub mod secure;
 
 use horde_cli::Client;

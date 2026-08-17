@@ -56,3 +56,142 @@ pub(crate) async fn control_log_reaches(
     }
     recorded
 }
+
+/// Serves the worker-facing service on a loopback port the OS picks.
+///
+/// `127.0.0.1` only: DESIGN.md §3 forbids binding wider before auth
+/// exists, and tests are not an exception to that. Shared by the
+/// connection suite (in-process worker) and the daemon suite (the
+/// `horde-worker` binary dialing `--insecure`).
+pub(crate) async fn serve(core: horde_server::service::ServerCore) -> String {
+    use horde_proto::v1::worker_service_server::WorkerServiceServer;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let address = listener.local_addr().expect("a bound address");
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(WorkerServiceServer::new(
+                horde_server::service::WorkerFacing::new(core),
+            ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await;
+    });
+    format!("http://{address}")
+}
+
+/// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
+/// writes when the scheduler answers a spawn: placed on a worker when one
+/// is given, queued when `None`. The placed pair is what the server's
+/// command fold turns into this worker's `SpawnAgentCommand`, with the
+/// implicit first assignment riding the spec.
+pub(crate) async fn seed_agent(
+    log: &horde_server::EventLog,
+    session: &str,
+    agent: &str,
+    worker: Option<&str>,
+    first_message: &str,
+) {
+    use horde_proto::prost::Message;
+    use horde_proto::v1::{
+        AgentId, AgentSpawned, AgentSpec, Assignment, Event, Placement, PlacementChanged,
+        PlacementState, WorkerId, event::Kind,
+    };
+
+    let spawned = Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: format!("{agent}:spawned"),
+        kind: Some(Kind::AgentSpawned(AgentSpawned {
+            parent_agent_id: None,
+            spawned_by: None,
+            spec: Some(AgentSpec {
+                initial_assignment: Some(Assignment {
+                    assignment_id: None,
+                    text: first_message.to_owned(),
+                    payload: None,
+                }),
+                ..AgentSpec::default()
+            }),
+            tree_path: Vec::new(),
+        })),
+    };
+    let state = match worker {
+        Some(_) => PlacementState::Placed,
+        None => PlacementState::Queued,
+    };
+    let placed = Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: format!("{agent}:placed"),
+        kind: Some(Kind::PlacementChanged(PlacementChanged {
+            placement: Some(Placement {
+                agent_id: Some(AgentId::new(agent)),
+                state: state.into(),
+                worker_id: worker.map(WorkerId::new),
+                reason: String::new(),
+            }),
+        })),
+    };
+    for event in [spawned, placed] {
+        log.append(horde_server::log::PendingEvent {
+            session_id: session.to_owned(),
+            idempotency_key: event.idempotency_key.clone(),
+            payload: event.encode_to_vec(),
+            ..horde_server::log::PendingEvent::default()
+        })
+        .await
+        .expect("the seed event appends");
+    }
+}
+
+/// [`seed_agent`], placed on `worker` — the common case.
+pub(crate) async fn place_agent(
+    log: &horde_server::EventLog,
+    session: &str,
+    agent: &str,
+    worker: &str,
+    first_message: &str,
+) {
+    seed_agent(log, session, agent, Some(worker), first_message).await;
+}
+
+/// Waits until `session`'s server log reaches `minimum`, returning the
+/// head it reached. Bounded by poll count and by a ceiling per park.
+pub(crate) async fn server_log_at_least(
+    log: &horde_server::EventLog,
+    session: &str,
+    minimum: u64,
+) -> u64 {
+    let mut notifications = log.subscribe();
+    let mut polls = 0_u32;
+    loop {
+        let head = log.head(session).await.expect("a readable log");
+        if head >= minimum {
+            return head;
+        }
+        polls += 1;
+        assert!(polls < 256, "the server log stalled below {minimum}");
+        let _ = tokio::time::timeout(core::time::Duration::from_secs(5), notifications.recv())
+            .await
+            .expect("the server log must keep moving");
+    }
+}
+
+/// Every event of `session`'s server log, decoded.
+pub(crate) async fn decoded_session_log(
+    log: &horde_server::EventLog,
+    session: &str,
+) -> Vec<horde_proto::v1::Event> {
+    use horde_proto::prost::Message;
+
+    log.read_all(session)
+        .await
+        .expect("a readable log")
+        .iter()
+        .map(|stored| {
+            horde_proto::v1::Event::decode(stored.payload.as_slice()).expect("a decodable event")
+        })
+        .collect()
+}
