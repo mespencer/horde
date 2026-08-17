@@ -33,13 +33,21 @@ use crate::support;
 
 /// A mistyped flag must reach the exit code as a refusal that names it —
 /// the positive control that the parser's verdicts survive `main`.
+///
+/// Bounded: a refusal exits in milliseconds, and a daemon that instead
+/// *ran* would make an unbounded `output().await` a hang — the shape
+/// docs/QUALITY_GATES.md warns turns a defect into a TIMEOUT nobody
+/// evaluated (the resolve-identity mutant found this the hard way).
 #[tokio::test]
 async fn wrong_flags_refuse_by_name_from_the_binary() {
-    let output = tokio::process::Command::new(harness::DAEMON)
-        .arg("--bogus")
-        .output()
-        .await
-        .expect("the binary runs");
+    let output = support::within(
+        "a refused parse must exit, not run",
+        tokio::process::Command::new(harness::DAEMON)
+            .arg("--bogus")
+            .output(),
+    )
+    .await
+    .expect("the binary runs");
     assert!(
         !output.status.success(),
         "a refused parse must exit nonzero"
@@ -52,15 +60,20 @@ async fn wrong_flags_refuse_by_name_from_the_binary() {
 }
 
 /// A missing identity is a startup refusal that says how to enroll, not a
-/// silent plaintext fallback and not a retry loop.
+/// silent plaintext fallback and not a retry loop. Bounded for the same
+/// reason as the flag refusal above: a daemon that wrongly resolved "no
+/// identity" into "run without one" would never exit.
 #[tokio::test]
 async fn a_missing_identity_refuses_startup_naming_the_fix() {
     let state = tempfile::tempdir().expect("a temp dir");
-    let output = tokio::process::Command::new(harness::DAEMON)
-        .args(["--state-dir", &state.path().to_string_lossy()])
-        .output()
-        .await
-        .expect("the binary runs");
+    let output = support::within(
+        "a refused startup must exit, not run",
+        tokio::process::Command::new(harness::DAEMON)
+            .args(["--state-dir", &state.path().to_string_lossy()])
+            .output(),
+    )
+    .await
+    .expect("the binary runs");
     assert!(!output.status.success());
     let refusal = String::from_utf8_lossy(&output.stderr);
     assert!(
