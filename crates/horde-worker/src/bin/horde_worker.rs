@@ -84,31 +84,31 @@ async fn serve_until_terminated(config: &startup::WorkerConfig) -> ExitCode {
 }
 
 /// Resolves when the process is asked to stop: SIGTERM (how a supervisor
-/// stops a daemon) or ctrl-c (how an operator does).
+/// stops a daemon) or ctrl-c (how an operator does). The racing itself is
+/// [`startup::first_of`], where it is tested; failing to even listen for
+/// SIGTERM degrades to ctrl-c alone — the default disposition would kill the
+/// process on SIGTERM anyway.
 async fn termination() {
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(sigterm) => sigterm,
-        Err(error) => {
-            // Without a SIGTERM handler the default disposition kills the
-            // process anyway; ctrl-c still shuts down cleanly.
-            tracing::warn!(%error, "could not listen for SIGTERM");
-            wait_for_ctrl_c().await;
-            return;
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            startup::first_of(wait_for_ctrl_c(), async move {
+                let _ = sigterm.recv().await;
+            })
+            .await;
         }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not listen for SIGTERM; ctrl-c only");
+            wait_for_ctrl_c().await;
+        }
     }
 }
 
-/// Blocks on ctrl-c alone — the fallback when SIGTERM cannot be listened for.
+/// Parks on ctrl-c. A registration failure parks forever instead: with no
+/// signal to hear, returning would stop a healthy daemon, and the operator
+/// still holds SIGKILL.
 async fn wait_for_ctrl_c() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "could not listen for shutdown");
-        // Pending forever: with no signal to hear, ending would stop a
-        // healthy daemon; the operator still holds SIGKILL.
         std::future::pending::<()>().await;
     }
 }

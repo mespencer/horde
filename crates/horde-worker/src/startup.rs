@@ -668,6 +668,16 @@ pub fn fate_of(outcome: &Result<(), WorkerError>) -> Fate {
     }
 }
 
+/// Resolves when either future does — the daemon's two-signal wait
+/// (SIGTERM or ctrl-c), kept here so the binary's own functions stay free
+/// of macro-expanded branching nothing can test.
+pub async fn first_of(a: impl Future<Output = ()>, b: impl Future<Output = ()>) {
+    tokio::select! {
+        () = a => {}
+        () = b => {}
+    }
+}
+
 /// Runs the daemon: dial, register, serve, redial — until `shutdown`
 /// completes or a fatal refusal stops it.
 ///
@@ -1064,6 +1074,14 @@ mod tests {
                 "a refusal must stop the daemon: {fate:?}"
             );
         }
+    }
+
+    /// Both orders of the two-signal wait: whichever side resolves first
+    /// ends it, and a pending other side never blocks it.
+    #[tokio::test]
+    async fn first_of_resolves_on_either_side() {
+        super::first_of(async {}, std::future::pending()).await;
+        super::first_of(std::future::pending(), async {}).await;
     }
 
     /// The transport case carries its own reason so a `dial-failed` line is
