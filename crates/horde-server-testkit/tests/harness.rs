@@ -15,6 +15,21 @@ use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{AgentId, AgentOutputChannel, AgentOutputChunk, Event, push_events_response};
 use horde_server_testkit::{journal_event, journal_event_at, open_journal, seeded, serve};
 
+/// How long any wait on the served harness may take before it is a failure.
+///
+/// Everything here is loopback; a wait that outlives this is a hang, not a
+/// slow machine — and an unbounded await turns a defect into a TIMEOUT
+/// cargo-mutants records as a mutant nobody evaluated (docs/QUALITY_GATES.md).
+const CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `future` under the ceiling, failing the test if it does not finish.
+async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    match tokio::time::timeout(CEILING, future).await {
+        Ok(value) => value,
+        Err(_) => panic!("{what} must finish rather than hang"),
+    }
+}
+
 /// One event a worker might journal: an output chunk carrying `text`.
 fn chunk(agent_id: &str, text: &str) -> Event {
     Event {
@@ -75,8 +90,9 @@ async fn a_seeded_session_is_fetchable_and_names_its_root() {
     );
 
     let mut spawned = Vec::new();
-    client
-        .sync(
+    within(
+        "the replay",
+        client.sync(
             &SyncOptions::new(session_id),
             |envelope| {
                 if let Some(event) = &envelope.event
@@ -87,9 +103,10 @@ async fn a_seeded_session_is_fetchable_and_names_its_root() {
                 }
             },
             |_| {},
-        )
-        .await
-        .expect("replay must succeed");
+        ),
+    )
+    .await
+    .expect("replay must succeed");
     assert_eq!(
         spawned,
         vec![root],
@@ -111,7 +128,7 @@ async fn a_journaled_event_reaches_the_session_log() {
         .await
         .expect("the push must be acked");
 
-    let texts = chunk_texts(&mut client, &session_id)
+    let texts = within("the replay", chunk_texts(&mut client, &session_id))
         .await
         .expect("replay must succeed");
     assert_eq!(
@@ -137,7 +154,7 @@ async fn consecutive_journal_sequences_both_land_in_order() {
         .await
         .expect("the second push must be acked");
 
-    let texts = chunk_texts(&mut client, &session_id)
+    let texts = within("the replay", chunk_texts(&mut client, &session_id))
         .await
         .expect("replay must succeed");
     assert_eq!(
@@ -162,8 +179,7 @@ async fn open_journal_leaves_the_first_ack_for_the_caller() {
     let (_to_server, mut acks) = open_journal(&mut worker, "worker-a", 0)
         .await
         .expect("opening the journal must succeed");
-    let first = acks
-        .message()
+    let first = within("the first ack", acks.message())
         .await
         .expect("the ack stream must answer")
         .expect("the server must ack the start rather than closing the stream");
