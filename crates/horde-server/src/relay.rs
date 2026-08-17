@@ -123,6 +123,33 @@ mod tests {
     use super::mount;
     use crate::log::EventLog;
 
+    /// Journals one definition into the catalog stream under `key` — the
+    /// append every catalog-shaped arrangement here shares.
+    async fn journal_definition(
+        log: &EventLog,
+        key: &str,
+        definition: horde_proto::v1::WorkspaceDefinition,
+    ) {
+        crate::service::shared::append_server_event(
+            log,
+            crate::workspace::CATALOG_STREAM,
+            key,
+            horde_proto::v1::Event {
+                agent_id: None,
+                occurred_at: None,
+                idempotency_key: key.to_owned(),
+                kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
+                    horde_proto::v1::WorkspaceDefinitionChanged {
+                        definition: Some(definition),
+                        deleted: false,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("the definition journals");
+    }
+
     /// The refusal that keeps DESIGN §3 true: no unauthenticated networked
     /// listener. The message names both the reason and the fix.
     #[tokio::test]
@@ -175,25 +202,7 @@ mod tests {
             repos: vec![repo],
             ..horde_proto::v1::WorkspaceDefinition::default()
         };
-        let event = horde_proto::v1::Event {
-            agent_id: None,
-            occurred_at: None,
-            idempotency_key: "ws-1:1".to_owned(),
-            kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
-                horde_proto::v1::WorkspaceDefinitionChanged {
-                    definition: Some(definition),
-                    deleted: false,
-                },
-            )),
-        };
-        crate::service::shared::append_server_event(
-            &log,
-            crate::workspace::CATALOG_STREAM,
-            "ws-1:1",
-            event,
-        )
-        .await
-        .expect("the definition journals");
+        journal_definition(&log, "ws-1:1", definition).await;
 
         let mounted = mount(
             "127.0.0.1:0".parse().expect("an address"),
@@ -240,24 +249,7 @@ mod tests {
             }],
             ..horde_proto::v1::WorkspaceDefinition::default()
         };
-        crate::service::shared::append_server_event(
-            &log,
-            crate::workspace::CATALOG_STREAM,
-            "ws-2:1",
-            horde_proto::v1::Event {
-                agent_id: None,
-                occurred_at: None,
-                idempotency_key: "ws-2:1".to_owned(),
-                kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
-                    horde_proto::v1::WorkspaceDefinitionChanged {
-                        definition: Some(late),
-                        deleted: false,
-                    },
-                )),
-            },
-        )
-        .await
-        .expect("the late definition journals");
+        journal_definition(&log, "ws-2:1", late).await;
 
         let late_url = format!("http://{}/charts", mounted.server.addr());
         let late_clone = state.path().join("late-clone");
@@ -315,24 +307,7 @@ mod tests {
                 .collect(),
             ..horde_proto::v1::WorkspaceDefinition::default()
         };
-        crate::service::shared::append_server_event(
-            &log,
-            crate::workspace::CATALOG_STREAM,
-            "ws-1:1",
-            horde_proto::v1::Event {
-                agent_id: None,
-                occurred_at: None,
-                idempotency_key: "ws-1:1".to_owned(),
-                kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
-                    horde_proto::v1::WorkspaceDefinitionChanged {
-                        definition: Some(definition),
-                        deleted: false,
-                    },
-                )),
-            },
-        )
-        .await
-        .expect("the definition journals");
+        journal_definition(&log, "ws-1:1", definition).await;
 
         let store =
             horde_relay::MirrorStore::new(tempfile::tempdir().expect("a dir").path().join("relay"));

@@ -618,18 +618,26 @@ impl Client {
                 name: String::new(),
             })
             .await;
-        match by_id {
-            Ok(response) => Ok(response.into_inner()),
-            Err(status) if retry_as_name(&status) => Ok(self
-                .inner
-                .get_workspace_definition(horde_proto::v1::GetWorkspaceDefinitionRequest {
-                    workspace_definition_id: None,
-                    name: reference.to_owned(),
-                })
-                .await?
-                .into_inner()),
-            Err(status) => Err(status.into()),
+        let status = match by_id {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) => status,
+        };
+        // A plain branch rather than a match guard: a guard's other side is
+        // unreachable through any server this client can talk to (an id
+        // lookup only misses as NotFound), and an unreachable arm is an
+        // unkillable mutant. The predicate carries the policy; this carries
+        // the plumbing.
+        if !retry_as_name(&status) {
+            return Err(status.into());
         }
+        Ok(self
+            .inner
+            .get_workspace_definition(horde_proto::v1::GetWorkspaceDefinitionRequest {
+                workspace_definition_id: None,
+                name: reference.to_owned(),
+            })
+            .await?
+            .into_inner())
     }
 
     /// Every live workspace definition.

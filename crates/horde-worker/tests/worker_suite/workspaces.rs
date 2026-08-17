@@ -83,6 +83,15 @@ mod harness {
         (definition, atlas, docs)
     }
 
+    /// Commits one file in `repo` as "the parent's work" and returns the
+    /// resulting HEAD — the arrangement both a8 tests inherit from.
+    pub(crate) fn parents_commit(repo: &Path) -> String {
+        std::fs::write(repo.join("finding.md"), "found\n").expect("writes");
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-qm", "the parent's work"]);
+        git(repo, &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
     /// One already-materialized single-repo instance: the arrangement every
     /// checkout-policy test starts from.
     pub(crate) async fn materialized_atlas(
@@ -176,13 +185,7 @@ async fn a_spawned_child_starts_at_its_parents_committed_head() {
             .join(agent)
             .join("atlas")
     };
-    let parent_repo = checkout_of("parent-1");
-    std::fs::write(parent_repo.join("finding.md"), "found\n").expect("writes");
-    harness::git(&parent_repo, &["add", "."]);
-    harness::git(&parent_repo, &["commit", "-qm", "the parent's work"]);
-    let parent_head = harness::git(&parent_repo, &["rev-parse", "HEAD"])
-        .trim()
-        .to_owned();
+    let parent_head = harness::parents_commit(&checkout_of("parent-1"));
 
     runtime
         .apply(command(3, spawn("child-1", Some("parent-1"))))
@@ -218,13 +221,7 @@ async fn a_start_point_makes_the_child_begin_at_the_parents_commit() {
         )
         .await
         .expect("the parent checks out");
-    let parent_repo = parent_root.join("atlas");
-    std::fs::write(parent_repo.join("finding.md"), "found\n").expect("writes");
-    harness::git(&parent_repo, &["add", "."]);
-    harness::git(&parent_repo, &["commit", "-qm", "the parent's work"]);
-    let parent_head = harness::git(&parent_repo, &["rev-parse", "HEAD"])
-        .trim()
-        .to_owned();
+    let parent_head = harness::parents_commit(&parent_root.join("atlas"));
 
     let inherit: std::collections::BTreeMap<String, String> =
         [("atlas".to_owned(), parent_head.clone())].into();

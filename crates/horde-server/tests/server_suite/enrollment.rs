@@ -41,6 +41,13 @@ fn register_request(name: &str) -> RegisterWorkerRequest {
     }
 }
 
+/// An enrolled `laptop` client's control-plane connection — the two-line
+/// preamble half the client-side tests open with.
+async fn enrolled_laptop(harness: &SecureHarness) -> Setup<horde_cli::Client> {
+    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    harness.client(&identity).await
+}
+
 /// The revocation arrangement both revocation tests share: an enrolled
 /// client (the revoker), an enrolled and *registered* worker `mac-studio`
 /// (the revokee) with its identity, and the worker's live service client.
@@ -448,8 +455,7 @@ async fn revocation_severs_a_live_command_stream() -> Setup<()> {
 #[tokio::test]
 async fn a_clients_interrupt_is_attributed_to_that_client() -> Setup<()> {
     let harness = serve_secured().await?;
-    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let mut client = harness.client(&identity).await?;
+    let mut client = enrolled_laptop(&harness).await?;
 
     let (summary, root) = within("the session", client.create_session("attributed", "")).await??;
     let session_id = summary
@@ -541,8 +547,7 @@ async fn dropping_the_harness_stops_its_listeners() -> Setup<()> {
 #[tokio::test]
 async fn the_enrollment_stream_is_not_a_session() -> Setup<()> {
     let harness = serve_secured().await?;
-    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let mut client = harness.client(&identity).await?;
+    let mut client = enrolled_laptop(&harness).await?;
 
     // Enrollment already journaled events; none of them make a session.
     let sessions = client.list_sessions(true).await?;
