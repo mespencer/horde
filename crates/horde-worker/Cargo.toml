@@ -36,6 +36,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [dev-dependencies]
+# The connection suite's partitions are injected through the promoted fault
+# injector — the instrument that grew out of this suite's SeverableProxy seed.
+# (horde-adapter-fake is an ordinary dependency now: the daemon ships it.)
+horde-testkit = { workspace = true }
 # The mTLS dial test enrolls through the shared secured harness, so the
 # certificate it dials with came off the production issuance path.
 # (serde_json is already an ordinary dependency of this crate.)

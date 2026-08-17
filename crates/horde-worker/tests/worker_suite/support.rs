@@ -57,35 +57,18 @@ pub(crate) async fn control_log_reaches(
     recorded
 }
 
-/// Serves the worker-facing service on a loopback port the OS picks.
-///
-/// `127.0.0.1` only: DESIGN.md §3 forbids binding wider before auth
-/// exists, and tests are not an exception to that. Shared by the
-/// connection suite (in-process worker) and the daemon suite (the
-/// `horde-worker` binary dialing `--insecure`).
+/// Serves both spines over `core` on a loopback port the OS picks, through
+/// the shared testkit harness. Shared by the connection suite (in-process
+/// worker) and the daemon suite (the `horde-worker` binary dialing
+/// `--insecure`).
 pub(crate) async fn serve(core: horde_server::service::ServerCore) -> String {
-    use horde_proto::v1::worker_service_server::WorkerServiceServer;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    horde_server_testkit::serve_core(core)
         .await
-        .expect("a loopback port");
-    let address = listener.local_addr().expect("a bound address");
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(WorkerServiceServer::new(
-                horde_server::service::WorkerFacing::new(core),
-            ))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await;
-    });
-    format!("http://{address}")
+        .expect("the server binds loopback")
 }
 
-/// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
-/// writes when the scheduler answers a spawn: placed on a worker when one
-/// is given, queued when `None`. The placed pair is what the server's
-/// command fold turns into this worker's `SpawnAgentCommand`, with the
-/// implicit first assignment riding the spec.
+/// Seeds an agent through the shared testkit helper, panicking on the
+/// failures a precondition cannot survive.
 pub(crate) async fn seed_agent(
     log: &horde_server::EventLog,
     session: &str,
@@ -93,57 +76,9 @@ pub(crate) async fn seed_agent(
     worker: Option<&str>,
     first_message: &str,
 ) {
-    use horde_proto::prost::Message;
-    use horde_proto::v1::{
-        AgentId, AgentSpawned, AgentSpec, Assignment, Event, Placement, PlacementChanged,
-        PlacementState, WorkerId, event::Kind,
-    };
-
-    let spawned = Event {
-        agent_id: Some(AgentId::new(agent)),
-        occurred_at: None,
-        idempotency_key: format!("{agent}:spawned"),
-        kind: Some(Kind::AgentSpawned(AgentSpawned {
-            parent_agent_id: None,
-            spawned_by: None,
-            spec: Some(AgentSpec {
-                initial_assignment: Some(Assignment {
-                    assignment_id: None,
-                    text: first_message.to_owned(),
-                    payload: None,
-                }),
-                ..AgentSpec::default()
-            }),
-            tree_path: Vec::new(),
-        })),
-    };
-    let state = match worker {
-        Some(_) => PlacementState::Placed,
-        None => PlacementState::Queued,
-    };
-    let placed = Event {
-        agent_id: Some(AgentId::new(agent)),
-        occurred_at: None,
-        idempotency_key: format!("{agent}:placed"),
-        kind: Some(Kind::PlacementChanged(PlacementChanged {
-            placement: Some(Placement {
-                agent_id: Some(AgentId::new(agent)),
-                state: state.into(),
-                worker_id: worker.map(WorkerId::new),
-                reason: String::new(),
-            }),
-        })),
-    };
-    for event in [spawned, placed] {
-        log.append(horde_server::log::PendingEvent {
-            session_id: session.to_owned(),
-            idempotency_key: event.idempotency_key.clone(),
-            payload: event.encode_to_vec(),
-            ..horde_server::log::PendingEvent::default()
-        })
+    horde_server_testkit::seed_agent(log, session, agent, worker, first_message)
         .await
-        .expect("the seed event appends");
-    }
+        .expect("the seed events append");
 }
 
 /// [`seed_agent`], placed on `worker` — the common case.
