@@ -4,9 +4,7 @@
 //! the bytes back, a fetch by the verified file on disk — the same
 //! discipline `verbs.rs` learned from mutation testing.
 
-mod common;
-
-use common::{Setup, invoke};
+use crate::common::{Setup, invoke};
 use horde_proto::blob::BlobDigest;
 use horde_server_testkit::serve_with_blob_store;
 

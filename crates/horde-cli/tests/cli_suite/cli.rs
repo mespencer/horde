@@ -10,9 +10,7 @@
 //! the reason that harness binds one at all: a subprocess cannot be handed an
 //! in-process stream.
 
-mod common;
-
-use common::{Setup, serve};
+use crate::common::{self, Setup, serve};
 use tokio::process::Command;
 
 /// What a `horde` invocation produced.

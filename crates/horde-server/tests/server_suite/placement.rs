@@ -14,9 +14,7 @@ use horde_proto::v1::{
 };
 use tokio_stream::StreamExt;
 
-mod common;
-
-use common::{Harness, Setup, connect, open_sync, seed};
+use crate::common::{Harness, Setup, connect, open_sync, seed};
 
 /// One placement fact, as read back from the log.
 #[derive(Debug, PartialEq)]

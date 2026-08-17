@@ -1,8 +1,8 @@
-//! Helpers shared by the process-level test binaries.
+//! Helpers shared by the process-level suites.
 //!
-//! Lives in `tests/support/` (not a test binary itself) so `supervision.rs`
-//! and `codex_supervision.rs` drive their stub harnesses through one set of
-//! primitives instead of two drifting copies.
+//! One set of primitives so `supervision.rs` and `codex_supervision.rs`
+//! drive their stub harnesses the same way instead of through two
+//! drifting copies.
 
 use std::path::PathBuf;
 

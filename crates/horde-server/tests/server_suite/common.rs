@@ -10,10 +10,10 @@
 //! before auth exists) and no flake from a port race. Everything above the
 //! socket — codegen, framing, streaming, status mapping — is the real thing.
 //!
-//! Each test binary compiles its own copy of this module and uses a subset of
-//! it, so items unused by one file are dead code there. The allow is scoped to
-//! this module rather than sprinkled at the call sites, which is the
-//! conventional shape for an integration-test `common` module.
+//! Not every sibling suite uses every item here, so some items would be
+//! dead code without the allow. It is scoped to this module rather than
+//! sprinkled at the call sites, which is the conventional shape for an
+//! integration-test `common` module.
 #![allow(dead_code, unreachable_pub)]
 
 use horde_proto::v1::{

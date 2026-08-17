@@ -9,9 +9,7 @@
 //! everything else" is a claim about what a client can replay, not about
 //! internal state.
 
-mod common;
-
-use common::Setup;
+use crate::common::Setup;
 use horde_identity::{JoinCode, Principal, PrincipalRole};
 use horde_proto::v1::enrollment_service_client::EnrollmentServiceClient;
 use horde_proto::v1::{

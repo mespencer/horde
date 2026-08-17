@@ -9,9 +9,7 @@
 //! Each case builds its `Cli` by parsing real argument vectors, so a flag that
 //! stops reaching its verb fails here rather than in someone's shell.
 
-mod common;
-
-use common::{Setup, invoke, serve};
+use crate::common::{self, Setup, invoke, serve};
 
 /// Creates a session and returns its id and root agent id.
 async fn seed(endpoint: &str) -> Setup<(String, String)> {

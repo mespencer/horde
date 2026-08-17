@@ -2,9 +2,7 @@
 //! properties that make the catalog safe to author concurrently — the etag
 //! discipline and the create/update split.
 
-mod common;
-
-use common::{Harness, Setup, connect};
+use crate::common::{Harness, Setup, connect};
 use horde_proto::v1::{
     ConfigureMcpServerRequest, DeleteMcpServerRequest, ListMcpServersRequest, McpServerConfig,
     McpStdioTransport, mcp_server_config::Transport,

@@ -208,9 +208,6 @@ mod harness {
     pub(crate) use crate::support::control_log_reaches as control_log_shows;
 }
 
-#[cfg(test)]
-mod support;
-
 use harness::{
     adapter_for, basic_turn, control_log_shows, events_through_turn_end, mid_turn, session_on,
     within,
