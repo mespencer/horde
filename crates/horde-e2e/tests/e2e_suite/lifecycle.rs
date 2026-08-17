@@ -73,6 +73,88 @@ async fn the_full_lifecycle_runs_over_real_processes() {
     );
 }
 
+/// An agent drives the orchestrator through its own MCP endpoint: the worker
+/// daemon serves the session's endpoint, mints the agent's identity pair, and
+/// the scripted harness dials back over real HTTP — spawning a child under
+/// itself and reporting its result. Every hop is production wiring: daemon →
+/// endpoint gate → verbs → control plane / stamping sink → server log → CLI.
+#[tokio::test]
+async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
+    let system = System::launch().await;
+
+    // One turn: announce, spawn an idle child (no task — a child that got the
+    // same script would spawn grandchildren forever), report the result.
+    let script = system.state.path().join("delegate.json");
+    std::fs::write(
+        &script,
+        r#"[{"steps": [
+            {"say": "delegating"},
+            {"use_horde": {"id": "call-1", "tool": "spawn_agent", "input": {"task": ""}}},
+            {"use_horde": {"id": "call-2", "tool": "report_result",
+                           "input": {"status": "success", "summary": "delegated the work"}}}
+        ], "text": "done"}]"#,
+    )
+    .expect("the script writes");
+
+    let mut worker = system
+        .spawn_worker(
+            "w-1",
+            &system.state.path().join("w-1"),
+            &["--fake-script", &script.to_string_lossy()],
+        )
+        .await;
+
+    let (session_id, root) = system.new_session("e2e endpoint verbs").await;
+    system
+        .sync_until(&session_id, "the root agent's placement", |events| {
+            has_kind(events, "placement_changed")
+        })
+        .await;
+
+    system.cli_json(&["send", &root, "go"]).await;
+
+    // The child exists because the *agent* asked for it, over its endpoint:
+    // a second spawn in the log, placed on the one worker.
+    let events = system
+        .sync_until(&session_id, "the endpoint-spawned child", |events| {
+            events
+                .iter()
+                .filter(|event| event["kind"] == "agent_spawned")
+                .count()
+                >= 2
+        })
+        .await;
+    assert!(
+        outputs(&events).iter().any(|text| text == "delegating"),
+        "the pre-spawn output arrived: {events:?}"
+    );
+
+    // And the result the agent reported through the same endpoint is an
+    // event of record, attributed to the reporting agent.
+    let events = system
+        .sync_until(&session_id, "the reported result", |events| {
+            has_kind(events, "result_reported")
+        })
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "result_reported"
+                && event["agent_id"].as_str() == Some(root.as_str())),
+        "the result must be the root agent's own: {events:?}"
+    );
+
+    // Both pumps — the root's and the endpoint-spawned child's — were real,
+    // and shutdown reaps them both.
+    worker.terminate().await.expect("SIGTERM sends");
+    let (status, stdout, _) = worker.wait().await.expect("the worker exits");
+    assert!(status.success(), "a signalled worker shutdown exits zero");
+    assert!(
+        stdout.contains("shutdown reaped=2"),
+        "the parent and its endpoint-spawned child were both live pumps: {stdout}"
+    );
+}
+
 /// A permission escalation crosses the whole system and comes back: the fake
 /// harness proposes a tool call and blocks, the request reaches an attached
 /// client through the log, `horde approve` answers it, and the turn resumes.
