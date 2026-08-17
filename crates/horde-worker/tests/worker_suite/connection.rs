@@ -78,6 +78,7 @@ mod harness {
             capabilities: capabilities::advertise(
                 runtime.adapters(),
                 runtime.workspaces().map(|_| Vec::new()),
+                &capabilities::DeclaredFacts::default(),
             ),
             identity: None,
         }
@@ -89,7 +90,11 @@ mod harness {
             endpoint: endpoint.to_owned(),
             worker_id: worker_id.to_owned(),
             hello: capabilities::hello(worker_id),
-            capabilities: capabilities::advertise(std::iter::empty::<&dyn Adapter>(), None),
+            capabilities: capabilities::advertise(
+                std::iter::empty::<&dyn Adapter>(),
+                None,
+                &capabilities::DeclaredFacts::default(),
+            ),
             identity: None,
         }
     }
@@ -465,6 +470,7 @@ async fn an_enrolled_worker_dials_mtls_and_the_unenrolled_or_revoked_are_refused
         capabilities: horde_worker::capabilities::advertise(
             std::iter::empty::<&dyn horde_adapter::Adapter>(),
             None,
+            &horde_worker::capabilities::DeclaredFacts::default(),
         ),
         identity: Some(identity.clone()),
     };

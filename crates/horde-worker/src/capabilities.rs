@@ -28,25 +28,39 @@ pub fn hello(display_name: &str) -> Hello {
     }
 }
 
-/// The full advertisement placement matches on, from the registered adapters
-/// and the Instances actually on disk.
+/// Operator-declared placement facts (fix a15): the config source for the
+/// advertisement's tags and reachable remotes. The scheduler has matched on
+/// both all along; before this, nothing could ever pass those filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredFacts {
+    /// Freeform placement tags, e.g. "gpu" — `--tag`, repeatable.
+    pub tags: Vec<String>,
+    /// Remote URLs this machine's ambient credentials can reach —
+    /// `--advertise-remote`, repeatable. Declared, not probed: reachability
+    /// is a property of the operator's credential setup, which only the
+    /// operator knows.
+    pub reachable_remotes: Vec<String>,
+}
+
+/// The full advertisement placement matches on, from the registered adapters,
+/// the Instances actually on disk, and the operator's declared facts.
 ///
-/// Tags, provider accounts and reachable remotes stay empty until the
-/// subsystems that own those facts exist (accounts are wave-5 enrollment);
-/// advertising them earlier would have the scheduler matching on facts
-/// nothing maintains. Warm instances and workspace support come from the
-/// workspace half: `None` honestly advertises a Worker that would refuse a
-/// materialize command.
+/// Provider accounts stay empty until the subsystem that owns that fact
+/// exists; advertising them earlier would have the scheduler matching on
+/// facts nothing maintains. Warm instances and workspace support come from
+/// the workspace half: `None` honestly advertises a Worker that would refuse
+/// a materialize command.
 #[must_use]
 pub fn advertise<'a>(
     adapters: impl IntoIterator<Item = &'a dyn Adapter>,
     warm_instances: Option<Vec<WorkspaceInstanceReport>>,
+    declared: &DeclaredFacts,
 ) -> WorkerCapabilities {
     WorkerCapabilities {
-        tags: Vec::new(),
+        tags: declared.tags.clone(),
         platform: Some(platform()),
         provider_accounts: Vec::new(),
-        reachable_remotes: Vec::new(),
+        reachable_remotes: declared.reachable_remotes.clone(),
         supports_workspaces: warm_instances.is_some(),
         warm_instances: warm_instances.unwrap_or_default(),
         harnesses: adapters.into_iter().map(harness).collect(),
@@ -105,7 +119,7 @@ mod tests {
     use horde_adapter::Adapter;
     use horde_proto::v1::{AdapterCapability, Role};
 
-    use super::{advertise, goarch, goos, hello};
+    use super::{DeclaredFacts, advertise, goarch, goos, hello};
     use crate::claude::ClaudeAdapter;
 
     #[test]
@@ -124,7 +138,7 @@ mod tests {
     #[test]
     fn a_registered_claude_adapter_is_advertised_with_its_gating() {
         let claude = ClaudeAdapter::new();
-        let capabilities = advertise([&claude as &dyn Adapter], None);
+        let capabilities = advertise([&claude as &dyn Adapter], None, &DeclaredFacts::default());
 
         let harnesses = &capabilities.harnesses;
         assert_eq!(harnesses.len(), 1);
@@ -150,7 +164,7 @@ mod tests {
     #[test]
     fn a_registered_codex_adapter_advertises_without_blanket_gating() {
         let codex = crate::codex::CodexAdapter::new();
-        let capabilities = advertise([&codex as &dyn Adapter], None);
+        let capabilities = advertise([&codex as &dyn Adapter], None, &DeclaredFacts::default());
 
         let harnesses = &capabilities.harnesses;
         assert_eq!(harnesses.len(), 1);
@@ -188,14 +202,32 @@ mod tests {
 
     #[test]
     fn nothing_unmaintained_is_advertised() {
-        let capabilities = advertise([], None);
+        let capabilities = advertise([], None, &DeclaredFacts::default());
         assert!(capabilities.provider_accounts.is_empty());
         assert!(capabilities.warm_instances.is_empty());
         assert!(capabilities.reachable_remotes.is_empty());
         assert!(
+            capabilities.tags.is_empty(),
+            "nothing declared, nothing advertised"
+        );
+        assert!(
             capabilities.platform.is_some(),
             "the platform is auto-detected, so it is always real"
         );
+    }
+
+    /// Declared facts ride the advertisement verbatim (fix a15): the tag and
+    /// remote filters the scheduler has matched on all along finally have a
+    /// config source that can pass them.
+    #[test]
+    fn declared_tags_and_remotes_are_advertised_verbatim() {
+        let declared = DeclaredFacts {
+            tags: vec!["gpu".to_owned(), "fast-disk".to_owned()],
+            reachable_remotes: vec!["https://git.example/atlas.git".to_owned()],
+        };
+        let capabilities = advertise([], None, &declared);
+        assert_eq!(capabilities.tags, declared.tags);
+        assert_eq!(capabilities.reachable_remotes, declared.reachable_remotes);
     }
 
     /// The advertised platform is this machine's, through the vocabulary
@@ -203,7 +235,9 @@ mod tests {
     /// matching placement constraints against a machine that runs nothing.
     #[test]
     fn the_platform_reports_this_machines_facts() {
-        let platform = advertise([], None).platform.expect("a platform");
+        let platform = advertise([], None, &DeclaredFacts::default())
+            .platform
+            .expect("a platform");
         assert_eq!(platform.os, goos(std::env::consts::OS));
         assert_eq!(platform.arch, goarch(std::env::consts::ARCH));
         assert!(

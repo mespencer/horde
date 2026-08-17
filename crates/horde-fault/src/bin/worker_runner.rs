@@ -179,6 +179,7 @@ async fn attempt(
         capabilities: capabilities::advertise(
             runtime.adapters(),
             runtime.workspaces().map(|_| Vec::new()),
+            &capabilities::DeclaredFacts::default(),
         ),
         identity: identity.clone(),
     };

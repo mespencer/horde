@@ -107,6 +107,11 @@ pub struct WorkerConfig {
     pub workspace_root: Option<PathBuf>,
     /// The git Relay payload shares stage to and fetch through.
     pub relay: Option<String>,
+    /// Placement tags this Worker advertises (`--tag`, repeatable).
+    pub tags: Vec<String>,
+    /// Remote URLs this machine's credentials can reach
+    /// (`--advertise-remote`, repeatable).
+    pub advertised_remotes: Vec<String>,
     /// Dial plaintext with no identity — the in-process-test-server shape.
     pub insecure: bool,
 }
@@ -123,6 +128,8 @@ struct ParsedFlags {
     fake_script: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     relay: Option<String>,
+    tags: Vec<String>,
+    advertised_remotes: Vec<String>,
     insecure: bool,
 }
 
@@ -143,6 +150,8 @@ fn takes_value(flag: &str) -> bool {
             | "--fake-script"
             | "--workspace-root"
             | "--relay"
+            | "--tag"
+            | "--advertise-remote"
     )
 }
 
@@ -202,6 +211,8 @@ impl ParsedFlags {
             "--fake-script" => self.fake_script = Some(PathBuf::from(value)),
             "--workspace-root" => self.workspace_root = Some(PathBuf::from(value)),
             "--relay" => self.relay = Some(value),
+            "--tag" => self.tags.push(value),
+            "--advertise-remote" => self.advertised_remotes.push(value),
             // Unreachable while `takes_value` and these two matches agree;
             // refusing (rather than ignoring) is what keeps a future drift
             // between them loud.
@@ -224,6 +235,8 @@ impl ParsedFlags {
             fake_script: self.fake_script,
             workspace_root: self.workspace_root,
             relay: self.relay,
+            tags: self.tags,
+            advertised_remotes: self.advertised_remotes,
             insecure: self.insecure,
         };
         config.check_shape()?;
@@ -556,6 +569,8 @@ pub fn enrolled_principal(state_dir: &Path) -> Option<String> {
 pub struct PreparedWorker {
     pub runtime: Runtime,
     pub journal: Journal,
+    /// The operator-declared placement facts every advertisement carries.
+    pub declared: capabilities::DeclaredFacts,
     /// The main endpoint every dial and the blob channel share.
     pub server: String,
     pub identity: Option<StoredIdentity>,
@@ -604,6 +619,10 @@ pub async fn prepare(
     Ok(PreparedWorker {
         runtime,
         journal,
+        declared: capabilities::DeclaredFacts {
+            tags: config.tags.clone(),
+            reachable_remotes: config.advertised_remotes.clone(),
+        },
         server: config.server.clone(),
         identity,
         name,
@@ -691,7 +710,7 @@ async fn fresh_dial_config(prepared: &PreparedWorker) -> DialConfig {
         endpoint: prepared.server.clone(),
         worker_id: prepared.name.clone(),
         hello: capabilities::hello(&prepared.name),
-        capabilities: capabilities::advertise(prepared.runtime.adapters(), warm),
+        capabilities: capabilities::advertise(prepared.runtime.adapters(), warm, &prepared.declared),
         identity: prepared.identity.clone(),
     }
 }
@@ -911,6 +930,7 @@ mod tests {
         assert!(!config.insecure);
         assert!(config.join.is_none() && config.enrollment.is_none());
         assert!(config.workspace_root.is_none() && config.relay.is_none());
+        assert!(config.tags.is_empty() && config.advertised_remotes.is_empty());
     }
 
     #[test]
@@ -936,6 +956,12 @@ mod tests {
             "/tmp/ws",
             "--relay",
             "https://horde.example:7779",
+            "--tag",
+            "gpu",
+            "--tag",
+            "fast-disk",
+            "--advertise-remote",
+            "https://git.example/atlas.git",
         ])
         .expect("a full line parses");
         assert_eq!(config.server, "https://horde.example:7777");
@@ -960,6 +986,11 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/ws"))
         );
         assert_eq!(config.relay.as_deref(), Some("https://horde.example:7779"));
+        assert_eq!(config.tags, vec!["gpu", "fast-disk"]);
+        assert_eq!(
+            config.advertised_remotes,
+            vec!["https://git.example/atlas.git"]
+        );
         assert_eq!(
             config.identity_dir(),
             std::path::PathBuf::from("/tmp/w/identity")

@@ -2087,6 +2087,7 @@ mod tests {
         let advertised = crate::capabilities::advertise(
             runtime.adapters(),
             runtime.workspaces().map(|_| Vec::new()),
+            &crate::capabilities::DeclaredFacts::default(),
         );
         assert_eq!(advertised.harnesses.len(), 1);
         assert_eq!(advertised.harnesses[0].provider, "fake");
