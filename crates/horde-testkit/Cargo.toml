@@ -13,8 +13,11 @@ workspace = true
 horde-adapter = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The fault injector (docs/TESTING.md §2) is a TCP proxy: it needs sockets,
+# timers and tasks. Every consumer of this crate already builds tokio.
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = "3.24.0"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

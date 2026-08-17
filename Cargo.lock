@@ -1067,6 +1067,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-fault"
+version = "0.1.0"
+dependencies = [
+ "horde-adapter-fake",
+ "horde-cli",
+ "horde-identity",
+ "horde-proto",
+ "horde-server",
+ "horde-server-testkit",
+ "horde-testkit",
+ "horde-worker",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "horde-gauntlet"
 version = "0.1.0"
 dependencies = [
@@ -1261,6 +1280,7 @@ dependencies = [
  "horde-relay",
  "horde-server",
  "horde-server-testkit",
+ "horde-testkit",
  "horde-wire",
  "rusqlite",
  "serde_json",

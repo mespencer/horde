@@ -173,6 +173,114 @@ async fn open_journal_leaves_the_first_ack_for_the_caller() {
     );
 }
 
+/// A placed `seed_agent` is indistinguishable, to the command fold, from a
+/// placement the scheduler wrote: the seeded pair folds into a
+/// `SpawnAgentCommand` for that worker, carrying the first assignment. The
+/// wire effect is the assertion — a seed whose kinds, worker or message were
+/// wrong would fold into nothing, or into somebody else's command.
+#[tokio::test]
+async fn a_placed_seed_folds_into_that_workers_spawn_command() {
+    use horde_proto::v1::stream_commands_response::Command;
+
+    let core = horde_server::ServerCore::new(
+        horde_server::EventLog::in_memory().expect("an in-memory log"),
+    );
+    let endpoint = horde_server_testkit::serve_core(core.clone())
+        .await
+        .expect("the core must serve");
+    horde_server_testkit::place_agent(&core.log, "s1", "agent-7", "worker-a", "first words")
+        .await
+        .expect("the seed must append");
+
+    let mut worker = WorkerServiceClient::connect(
+        tonic::transport::Endpoint::try_from(endpoint).expect("the endpoint must parse"),
+    )
+    .await
+    .expect("the worker client must connect");
+    let mut commands = worker
+        .stream_commands(horde_proto::v1::StreamCommandsRequest {
+            worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
+            resume_from_command_sequence: 1,
+        })
+        .await
+        .expect("the stream must open")
+        .into_inner();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), commands.message())
+        .await
+        .expect("the fold must answer while the suite watches")
+        .expect("the stream must not fail")
+        .expect("the fold must issue the seeded spawn");
+    let Some(Command::SpawnAgent(spawn)) = first.command else {
+        panic!("a placed seed must fold into a spawn, got {first:?}");
+    };
+    assert_eq!(
+        spawn.agent_id.as_ref().map(ToString::to_string),
+        Some("agent-7".to_owned())
+    );
+    assert_eq!(
+        spawn
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.initial_assignment.as_ref())
+            .map(|assignment| assignment.text.clone()),
+        Some("first words".to_owned()),
+        "the implicit first assignment rides the seeded spec"
+    );
+}
+
+/// A worker-less seed is an honest queue entry: the placement event says
+/// `QUEUED` and names nobody — so no worker's fold may claim it.
+#[tokio::test]
+async fn a_worker_less_seed_queues_rather_than_placing() {
+    use horde_proto::prost::Message;
+    use horde_proto::v1::event::Kind as EventKind;
+
+    let log = horde_server::EventLog::in_memory().expect("an in-memory log");
+    horde_server_testkit::seed_agent(&log, "s1", "agent-9", None, "later")
+        .await
+        .expect("the seed must append");
+
+    let stored = log.read_all("s1").await.expect("a readable log");
+    let events: Vec<Event> = stored
+        .iter()
+        .map(|stored| Event::decode(stored.payload.as_slice()).expect("a decodable event"))
+        .collect();
+    assert_eq!(events.len(), 2, "one spawn, one placement, nothing else");
+    assert!(
+        matches!(events[0].kind, Some(EventKind::AgentSpawned(_))),
+        "the spawn leads: {events:?}"
+    );
+    let Some(EventKind::PlacementChanged(changed)) = &events[1].kind else {
+        panic!("the placement follows, got {events:?}");
+    };
+    let placement = changed.placement.as_ref().expect("a placement");
+    assert_eq!(
+        placement.state,
+        horde_proto::v1::PlacementState::Queued as i32
+    );
+    assert!(
+        placement.worker_id.is_none(),
+        "a queued placement names no worker"
+    );
+    assert_eq!(
+        events[1].idempotency_key, "agent-9:placed",
+        "re-seeding the same agent must deduplicate, so the key is the agent's"
+    );
+
+    // And the dedupe is real, not just a key in the payload: the log's own
+    // idempotency column must carry it, which only a second seed can prove —
+    // a seed that dropped the column would append four events here.
+    horde_server_testkit::seed_agent(&log, "s1", "agent-9", None, "later")
+        .await
+        .expect("the re-seed is absorbed");
+    assert_eq!(
+        log.read_all("s1").await.expect("a readable log").len(),
+        2,
+        "an at-least-once seed must land exactly once"
+    );
+}
+
 /// `serve_with_blob_store` really wires the store, rooted where the caller
 /// said: bytes uploaded through the endpoint land as a file under the
 /// caller's directory, and download hands them back. The on-disk effect is
