@@ -476,6 +476,204 @@ pub fn mcp_servers(servers: &[horde_proto::v1::McpServerConfig], format: Format)
     }
 }
 
+fn workspace_json(definition: &horde_proto::v1::WorkspaceDefinition) -> serde_json::Value {
+    json!({
+        "workspace_definition_id": id(definition
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)),
+        "name": definition.name,
+        "etag": definition.etag,
+        "repos": definition
+            .repos
+            .iter()
+            .map(|repo| json!({
+                "name": repo.name,
+                "remote_url": repo.remote_url,
+                "default_branch": repo.default_branch,
+                "layout_path": repo.layout_path,
+            }))
+            .collect::<Vec<_>>(),
+        "unmanaged_paths": definition.unmanaged_paths,
+    })
+}
+
+/// One human line per definition: id, name, repo count, etag.
+fn workspace_line(definition: &horde_proto::v1::WorkspaceDefinition) -> String {
+    format!(
+        "{}  {}  {} repo(s)  etag {}",
+        definition
+            .workspace_definition_id
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), ToString::to_string),
+        definition.name,
+        definition.repos.len(),
+        definition.etag
+    )
+}
+
+/// Renders one definition — what `create` and `add-repo` answer with.
+#[must_use]
+pub fn workspace(definition: &horde_proto::v1::WorkspaceDefinition, format: Format) -> String {
+    match format {
+        Format::Json => workspace_json(definition).to_string(),
+        Format::Human => workspace_line(definition),
+    }
+}
+
+/// Renders the definition list.
+#[must_use]
+pub fn workspaces(definitions: &[horde_proto::v1::WorkspaceDefinition], format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "workspaces": definitions.iter().map(workspace_json).collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Format::Human if definitions.is_empty() => "no workspaces defined".to_owned(),
+        Format::Human => definitions
+            .iter()
+            .map(workspace_line)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Renders one definition and its known instances — what `get` answers with.
+#[must_use]
+pub fn workspace_with_instances(
+    response: &horde_proto::v1::GetWorkspaceDefinitionResponse,
+    format: Format,
+) -> String {
+    let instances: Vec<serde_json::Value> = response
+        .instances
+        .iter()
+        .map(|report| {
+            json!({
+                "worker_id": id(report.worker_id.as_ref().map(ToString::to_string)),
+                "state": instance_state(report.state),
+                "root_path": report.root_path,
+                "detail": report.detail,
+            })
+        })
+        .collect();
+    match format {
+        Format::Json => {
+            let mut rendered = response
+                .definition
+                .as_ref()
+                .map_or_else(|| json!({}), workspace_json);
+            rendered["instances"] = serde_json::Value::Array(instances);
+            rendered.to_string()
+        }
+        Format::Human => {
+            let mut lines = vec![
+                response
+                    .definition
+                    .as_ref()
+                    .map_or_else(|| "no such workspace".to_owned(), workspace_line),
+            ];
+            for report in &response.instances {
+                lines.push(format!(
+                    "  instance on {}: {}",
+                    report
+                        .worker_id
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), ToString::to_string),
+                    instance_state(report.state)
+                ));
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+/// Renders a deletion.
+#[must_use]
+pub fn workspace_deleted(workspace_definition_id: &str, format: Format) -> String {
+    match format {
+        Format::Json => json!({ "deleted": workspace_definition_id }).to_string(),
+        Format::Human => format!("deleted {workspace_definition_id}"),
+    }
+}
+
+/// Renders a prewarm's acceptance report.
+#[must_use]
+pub fn prewarmed(
+    report: Option<&horde_proto::v1::WorkspaceInstanceReport>,
+    format: Format,
+) -> String {
+    match (format, report) {
+        (Format::Json, Some(report)) => json!({
+            "worker_id": id(report.worker_id.as_ref().map(ToString::to_string)),
+            "state": instance_state(report.state),
+            "detail": report.detail,
+        })
+        .to_string(),
+        (Format::Json, None) => json!({ "state": "accepted" }).to_string(),
+        (Format::Human, Some(report)) => format!(
+            "prewarm accepted on {}: {}",
+            report
+                .worker_id
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string),
+            instance_state(report.state)
+        ),
+        (Format::Human, None) => "prewarm accepted".to_owned(),
+    }
+}
+
+/// Renders the connected-worker list.
+#[must_use]
+pub fn workers(workers: &[horde_proto::v1::WorkerSummary], format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "workers": workers
+                .iter()
+                .map(|worker| json!({
+                    "worker_id": id(worker.worker_id.as_ref().map(ToString::to_string)),
+                    "name": worker.name,
+                    "state": worker_state(worker.state),
+                    "semver": worker.semver,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Format::Human if workers.is_empty() => "no workers connected".to_owned(),
+        Format::Human => workers
+            .iter()
+            .map(|worker| {
+                format!(
+                    "{}  {}",
+                    worker
+                        .worker_id
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), ToString::to_string),
+                    worker_state(worker.state)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn instance_state(state: i32) -> &'static str {
+    match horde_proto::v1::WorkspaceInstanceState::try_from(state) {
+        Ok(horde_proto::v1::WorkspaceInstanceState::Materializing) => "materializing",
+        Ok(horde_proto::v1::WorkspaceInstanceState::Ready) => "ready",
+        Ok(horde_proto::v1::WorkspaceInstanceState::Degraded) => "degraded",
+        Ok(horde_proto::v1::WorkspaceInstanceState::Missing) => "missing",
+        _ => "unspecified",
+    }
+}
+
+fn worker_state(state: i32) -> &'static str {
+    match horde_proto::v1::WorkerConnectionState::try_from(state) {
+        Ok(horde_proto::v1::WorkerConnectionState::Online) => "online",
+        Ok(horde_proto::v1::WorkerConnectionState::Offline) => "offline",
+        _ => "unspecified",
+    }
+}
+
 /// Renders a removal.
 #[must_use]
 pub fn mcp_removed(name: &str, format: Format) -> String {

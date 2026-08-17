@@ -13,42 +13,15 @@
 //! observes HEAD and stages the share ref — no test plumbing touches the
 //! relay or the stamp.
 //!
-//! # Why some verbs go over the raw client
+//! # Every verb is the CLI's own
 //!
-//! The CLI has no workspace or payload verbs yet, so the workspace
-//! definition, the pinned spawns and the payload-carrying send speak the
-//! production control-plane RPCs directly, as the operator's enrolled
-//! identity. That is a gap in the CLI's surface (flagged in the wave
-//! report), not in the system under test.
+//! The workspace definition, the pinned session and spawn, and the
+//! payload-carrying send all go through `horde`'s verbs (fix a12) — this
+//! scenario is also the end-to-end proof of that surface.
 
 use std::path::{Path, PathBuf};
 
-use horde_proto::v1::control_plane_service_client::ControlPlaneServiceClient;
-use horde_proto::v1::{
-    AgentId, AgentSpec, Assignment, CreateSessionRequest, CreateWorkspaceDefinitionRequest,
-    DeliveryMode, GitRef, Payload, PlacementConstraints, PlacementState, SendMessageRequest,
-    SpawnAgentRequest, WorkerId, WorkspaceRepo, send_message_request,
-};
-
 use crate::support::{System, git, outputs};
-
-/// A control-plane client speaking as the operator — the production wire
-/// surface, over the same mTLS channel the CLI uses.
-async fn control_plane(system: &System) -> ControlPlaneServiceClient<tonic::transport::Channel> {
-    let identity =
-        horde_identity::StoredIdentity::load(&system.operator).expect("the operator identity");
-    let channel = tonic::transport::Endpoint::from_shared(system.main.clone())
-        .expect("a usable endpoint")
-        .tls_config(horde_identity::tls::grpc_client_mtls(
-            &identity,
-            "localhost",
-        ))
-        .expect("the identity is usable for TLS")
-        .connect()
-        .await
-        .expect("the operator dials the control plane");
-    ControlPlaneServiceClient::new(channel)
-}
 
 /// Waits until `path` exists on disk — the observable half of a materialize
 /// or checkout that happened inside a worker daemon. Bounded.
@@ -134,83 +107,58 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
         )
         .await;
 
-    // The workspace, defined once at the control plane; the full definition
-    // rides every MaterializeWorkspace command from here on.
-    let mut client = control_plane(&system).await;
-    let definition = client
-        .create_workspace_definition(CreateWorkspaceDefinitionRequest {
-            name: "atlas-ws".to_owned(),
-            repos: vec![WorkspaceRepo {
-                name: "atlas".to_owned(),
-                remote_url: origin.to_string_lossy().into_owned(),
-                default_branch: "main".to_owned(),
-                layout_path: "atlas".to_owned(),
-            }],
-            unmanaged_paths: Vec::new(),
-        })
-        .await
-        .expect("the definition creates")
-        .into_inner()
-        .definition
-        .expect("a definition comes back");
-    let definition_id = definition
-        .workspace_definition_id
-        .as_ref()
-        .expect("a definition id")
-        .to_string();
+    // The workspace, defined through the CLI's own verb (fix a12); the full
+    // definition rides every MaterializeWorkspace command from here on.
+    let repo_flag = format!("atlas={},path=atlas", origin.to_string_lossy());
+    let definition_id = system
+        .cli_field(
+            &["workspace", "create", "atlas-ws", "--repo", &repo_flag],
+            "workspace_definition_id",
+        )
+        .await;
 
     // The session's root agent is the sender, pinned to worker A with the
     // workspace; placement materializes the Instance on A before the spawn.
-    let pinned = |worker: &str| {
-        Some(AgentSpec {
-            workspace_definition_id: definition.workspace_definition_id.clone(),
-            placement: Some(PlacementConstraints {
-                pinned_worker_id: Some(WorkerId::new(worker)),
-                ..PlacementConstraints::default()
-            }),
-            ..AgentSpec::default()
-        })
-    };
-    let created = client
-        .create_session(CreateSessionRequest {
-            title: "e2e payload".to_owned(),
-            workspace_definition_id: definition.workspace_definition_id.clone(),
-            root_agent: pinned("w-a"),
-            idempotency_key: "e2e-payload".to_owned(),
-        })
-        .await
-        .expect("the session creates")
-        .into_inner();
-    let summary = created.session.expect("a session summary");
-    let session_id = summary
-        .session_id
-        .as_ref()
+    let created = system
+        .cli_json(&[
+            "session",
+            "new",
+            "e2e payload",
+            "--workspace",
+            &definition_id,
+            "--pin-worker",
+            "w-a",
+        ])
+        .await;
+    let session_id = created["session_id"]
+        .as_str()
         .expect("a session id")
-        .to_string();
-    let sender = summary
-        .root_agent_id
-        .as_ref()
+        .to_owned();
+    let sender = created["root_agent_id"]
+        .as_str()
         .expect("a root agent id")
-        .to_string();
+        .to_owned();
 
     // The receiver, spawned under the sender but pinned to worker B.
-    let spawned = client
-        .spawn_agent(SpawnAgentRequest {
-            session_id: summary.session_id.clone(),
-            parent_agent_id: Some(AgentId::new(sender.clone())),
-            spec: pinned("w-b"),
-            idempotency_key: "e2e-payload-receiver".to_owned(),
-        })
-        .await
-        .expect("the receiver spawns")
-        .into_inner();
-    let receiver = spawned.agent_id.as_ref().expect("an agent id").to_string();
-    let placement = spawned.placement.expect("a placement answer");
+    let spawned = system
+        .cli_json(&[
+            "spawn",
+            &session_id,
+            "--parent",
+            &sender,
+            "--workspace",
+            &definition_id,
+            "--pin-worker",
+            "w-b",
+        ])
+        .await;
+    let receiver = spawned["agent_id"]
+        .as_str()
+        .expect("an agent id")
+        .to_owned();
     assert_eq!(
-        placement.state,
-        i32::from(PlacementState::Placed),
-        "the pinned spawn must place, not queue: {}",
-        placement.reason
+        spawned["placement"], "placed",
+        "the pinned spawn must place, not queue: {spawned}"
     );
 
     // Both daemons materialized their Instances and produced checkouts.
@@ -248,27 +196,17 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
 
     // The payload-carrying delivery. The server folds it into a
     // DeliverMessage for worker B, whose broker must make the commit present
-    // before the agent reads the message.
-    client
-        .send_message(SendMessageRequest {
-            to_agent_id: Some(AgentId::new(receiver.clone())),
-            body: Some(send_message_request::Body::Assignment(Assignment {
-                assignment_id: None,
-                text: "integrate the atlas change".to_owned(),
-                payload: Some(Payload {
-                    git_refs: vec![GitRef {
-                        repo_name: "atlas".to_owned(),
-                        commit_sha: commit_sha.clone(),
-                        branch: String::new(),
-                    }],
-                    attachments: Vec::new(),
-                }),
-            })),
-            delivery: DeliveryMode::TurnBoundary.into(),
-            idempotency_key: "e2e-payload-send".to_owned(),
-        })
-        .await
-        .expect("the payload message sends");
+    // before the agent reads the message — named through the CLI's own
+    // --git-ref flag (fix a12).
+    system
+        .cli_json(&[
+            "send",
+            &receiver,
+            "integrate the atlas change",
+            "--git-ref",
+            &format!("atlas:{commit_sha}"),
+        ])
+        .await;
 
     // The delivery reached the agent: its echo is in the log. The obtain
     // precedes the delivery by construction, so the echo is also the receipt

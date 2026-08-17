@@ -72,6 +72,11 @@ pub enum Command {
     Mcp(McpCommand),
     /// Usage and headroom, folded from the journaled usage events.
     Usage(UsageArgs),
+    /// Workspace definitions: the fixed repo sets agents check out (DESIGN §7).
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
+    /// Ask a worker to materialize a workspace instance ahead of any spawn.
+    Prewarm(PrewarmArgs),
     /// Worker administration: enrollment codes and revocation (DESIGN §3).
     #[command(subcommand)]
     Worker(WorkerCommand),
@@ -148,7 +153,54 @@ pub struct McpAddArgs {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum WorkspaceCommand {
+    /// Define a workspace from one or more repos.
+    Create {
+        name: String,
+        /// One repo, as name=URL with optional ,branch= and ,path= parts;
+        /// repeatable. Example: --repo atlas=https://…/atlas.git,branch=main
+        #[arg(long = "repo", value_name = "NAME=URL[,branch=B][,path=P]", required = true)]
+        repos: Vec<String>,
+        /// A path agents may use but Horde never syncs; repeatable.
+        #[arg(long = "unmanaged")]
+        unmanaged_paths: Vec<String>,
+    },
+    /// List every live definition.
+    List,
+    /// Show one definition (and its known instances), by id or name.
+    Get { reference: String },
+    /// Widen a definition's repo set by one repo — the one deliberate way a
+    /// repo set changes after creation.
+    AddRepo {
+        workspace_definition_id: String,
+        /// The repo, in `create`'s --repo form.
+        #[arg(long = "repo", value_name = "NAME=URL[,branch=B][,path=P]")]
+        repo: String,
+        /// The etag `list` shows, so a concurrent edit aborts.
+        #[arg(long)]
+        etag: String,
+    },
+    /// Remove a definition at the version `--etag` names.
+    Delete {
+        workspace_definition_id: String,
+        #[arg(long)]
+        etag: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct PrewarmArgs {
+    pub workspace_definition_id: String,
+    pub worker_id: String,
+    /// The session whose log carries the progress events.
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum WorkerCommand {
+    /// List the connected workers.
+    List,
     /// Mint a one-time enrollment code for a new worker. Run
     /// `horde-worker`'s join (or `horde enroll join`) with it on the new
     /// machine before it expires.
@@ -443,6 +495,9 @@ pub struct SpecArgs {
     /// The named permission mode the agent runs under.
     #[arg(long)]
     pub permission_mode: Option<String>,
+    /// Pin the agent to this worker instead of letting the scheduler choose.
+    #[arg(long, value_name = "WORKER_ID")]
+    pub pin_worker: Option<String>,
     /// The implicit first assignment: the agent's first turn input, delivered
     /// the moment it is placed. Absent spawns an idle agent.
     #[arg(long)]
@@ -520,7 +575,12 @@ pub fn spec_from(args: &SpecArgs) -> Result<horde_proto::v1::AgentSpec, ClientEr
             .map(checkout_for)
             .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified)
             as i32,
-        placement: None,
+        placement: args.pin_worker.as_ref().map(|worker| {
+            horde_proto::v1::PlacementConstraints {
+                pinned_worker_id: Some(horde_proto::v1::WorkerId::new(worker)),
+                ..horde_proto::v1::PlacementConstraints::default()
+            }
+        }),
         permission_mode: args.permission_mode.clone().unwrap_or_default(),
         budget: None,
         initial_assignment: args.task.as_ref().map(|task| {
@@ -584,6 +644,8 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
         Some(Command::Blob(command)) => run_blob(client, command, format).await,
         Some(Command::Mcp(command)) => run_mcp(client, command, format).await,
         Some(Command::Usage(args)) => run_usage(client, args, format).await,
+        Some(Command::Workspace(command)) => run_workspace(client, command, format).await,
+        Some(Command::Prewarm(args)) => run_prewarm(client, args, format).await,
         Some(Command::Worker(command)) => run_worker(client, command, format).await,
         Some(Command::Enroll(command)) => run_enroll(client, command, format).await,
     }
@@ -784,12 +846,133 @@ async fn run_mcp(
     Ok(())
 }
 
+/// One `--repo` value as the wire repo it describes.
+///
+/// `NAME=URL` first, then optional comma parts `branch=` and `path=` in any
+/// order. The URL may itself contain commas only in the rare case; anyone
+/// bitten passes branch/path explicitly, which bounds the URL.
+///
+/// # Errors
+///
+/// A refusal naming the flag and the shape it takes.
+pub fn repo_from(value: &str) -> Result<horde_proto::v1::WorkspaceRepo, ClientError> {
+    let invalid = || {
+        ClientError::Rpc(tonic::Status::invalid_argument(format!(
+            "--repo takes NAME=URL[,branch=B][,path=P], got {value:?}"
+        )))
+    };
+    let (name, rest) = value.split_once('=').ok_or_else(invalid)?;
+    if name.is_empty() || rest.is_empty() {
+        return Err(invalid());
+    }
+
+    let mut url = rest;
+    let mut branch = String::new();
+    let mut path = String::new();
+    // Options are comma parts *after* the URL; scan from the right so a URL
+    // containing `,branch=` literally would still need to be last to bite.
+    while let Some((head, tail)) = url.rsplit_once(',') {
+        if let Some(value) = tail.strip_prefix("branch=") {
+            branch = value.to_owned();
+        } else if let Some(value) = tail.strip_prefix("path=") {
+            path = value.to_owned();
+        } else {
+            break;
+        }
+        url = head;
+    }
+    if url.is_empty() {
+        return Err(invalid());
+    }
+
+    Ok(horde_proto::v1::WorkspaceRepo {
+        name: name.to_owned(),
+        remote_url: url.to_owned(),
+        default_branch: branch,
+        layout_path: path,
+    })
+}
+
+async fn run_workspace(
+    client: &mut Client,
+    command: &WorkspaceCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        WorkspaceCommand::Create {
+            name,
+            repos,
+            unmanaged_paths,
+        } => {
+            let repos = repos
+                .iter()
+                .map(|value| repo_from(value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let definition = client
+                .create_workspace_definition(name, repos, unmanaged_paths.clone())
+                .await?;
+            println!("{}", render::workspace(&definition, format));
+        }
+        WorkspaceCommand::List => {
+            let definitions = client.list_workspace_definitions().await?;
+            println!("{}", render::workspaces(&definitions, format));
+        }
+        WorkspaceCommand::Get { reference } => {
+            let response = client.get_workspace_definition(reference).await?;
+            println!("{}", render::workspace_with_instances(&response, format));
+        }
+        WorkspaceCommand::AddRepo {
+            workspace_definition_id,
+            repo,
+            etag,
+        } => {
+            let definition = client
+                .add_workspace_repo(workspace_definition_id, repo_from(repo)?, etag)
+                .await?;
+            println!("{}", render::workspace(&definition, format));
+        }
+        WorkspaceCommand::Delete {
+            workspace_definition_id,
+            etag,
+        } => {
+            client
+                .delete_workspace_definition(workspace_definition_id, etag)
+                .await?;
+            println!(
+                "{}",
+                render::workspace_deleted(workspace_definition_id, format)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_prewarm(
+    client: &mut Client,
+    args: &PrewarmArgs,
+    format: Format,
+) -> Result<(), ClientError> {
+    let report = client
+        .prewarm_workspace(
+            &args.workspace_definition_id,
+            &args.worker_id,
+            args.session.as_deref(),
+        )
+        .await?;
+    println!("{}", render::prewarmed(report.as_ref(), format));
+    Ok(())
+}
+
 async fn run_worker(
     client: &mut Client,
     command: &WorkerCommand,
     format: Format,
 ) -> Result<(), ClientError> {
     match command {
+        WorkerCommand::List => {
+            let workers = client.list_workers().await?;
+            println!("{}", render::workers(&workers, format));
+        }
         WorkerCommand::Enroll { name, ttl_minutes } => {
             let minted = client
                 .mint_enrollment_code(horde_proto::v1::Role::Worker, name, *ttl_minutes)
@@ -1136,6 +1319,49 @@ mod tests {
         // No flags at all is no selection — the worker's default, honestly.
         let bare = super::spec_from(&super::SpecArgs::default()).expect("a bare spec");
         assert_eq!(bare, horde_proto::v1::AgentSpec::default());
+    }
+
+    /// One `--repo` value becomes one wire repo: name and URL split on the
+    /// first `=`, branch and path as trailing comma parts in any order, and
+    /// every malformed shape refused naming the flag.
+    #[test]
+    fn repo_values_parse_name_url_branch_and_path_or_refuse() {
+        let bare = super::repo_from("atlas=https://git.example/atlas.git").expect("a bare pair");
+        assert_eq!(bare.name, "atlas");
+        assert_eq!(bare.remote_url, "https://git.example/atlas.git");
+        assert_eq!(bare.default_branch, "");
+        assert_eq!(bare.layout_path, "");
+
+        let full = super::repo_from("atlas=https://git.example/a.git,path=src/atlas,branch=main")
+            .expect("options in any order");
+        assert_eq!(full.remote_url, "https://git.example/a.git");
+        assert_eq!(full.default_branch, "main");
+        assert_eq!(full.layout_path, "src/atlas");
+
+        for wrong in ["atlas", "=url", "atlas=", "atlas=,branch=main"] {
+            assert!(
+                super::repo_from(wrong).is_err(),
+                "{wrong:?} must be refused"
+            );
+        }
+    }
+
+    /// `--pin-worker` becomes a placement constraint; its absence stays no
+    /// constraint at all rather than an empty one.
+    #[test]
+    fn pinning_a_worker_becomes_the_placement_constraint() {
+        let pinned = super::spec_from(&super::SpecArgs {
+            pin_worker: Some("w-1".to_owned()),
+            ..super::SpecArgs::default()
+        })
+        .expect("a pinned spec");
+        assert_eq!(
+            pinned
+                .placement
+                .and_then(|placement| placement.pinned_worker_id)
+                .map(|id| id.to_string()),
+            Some("w-1".to_owned())
+        );
     }
 
     /// The payload flags: refs and attachments parse into the wire payload,
