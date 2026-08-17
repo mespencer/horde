@@ -981,11 +981,7 @@ async fn a_restarted_server_still_knows_what_it_issued_a_worker() {
 
     let resume = restarted
         .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: crate::common::versioned_hello(),
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+        .register_worker(crate::common::plain_registration("worker-a"))
         .await
         .expect("register")
         .into_inner()

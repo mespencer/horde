@@ -54,6 +54,16 @@ pub fn versioned_hello() -> Option<horde_proto::v1::Hello> {
     })
 }
 
+/// A default-capability registration for `worker`, versioned to pass the
+/// gate — the whole request, for the suites that need nothing bespoke.
+pub fn plain_registration(worker: &str) -> horde_proto::v1::RegisterWorkerRequest {
+    horde_proto::v1::RegisterWorkerRequest {
+        hello: versioned_hello(),
+        worker_id: Some(horde_proto::v1::WorkerId::new(worker)),
+        capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+    }
+}
+
 /// A harness over a fresh core.
 pub async fn connect() -> Setup<Harness> {
     connect_to(core()?).await

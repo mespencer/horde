@@ -641,11 +641,7 @@ async fn the_worker_handshake_names_the_same_version() {
 
     let registered = h
         .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: crate::common::versioned_hello(),
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+        .register_worker(crate::common::plain_registration("worker-a"))
         .await
         .expect("registration must succeed")
         .into_inner();

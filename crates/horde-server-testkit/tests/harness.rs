@@ -30,14 +30,14 @@ mod bounds {
     const CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Runs `future` under the ceiling, failing the test if it does not
-    /// finish. Let-else rather than a match so the shape stays this file's
-    /// own (the worker suite's twin is a match; two identical six-line
-    /// helpers across suites is exactly what the duplication gate flags).
+    /// finish. `unwrap_or_else` rather than a match or a let-else so the
+    /// shape stays this file's own — the sibling suites' twins already use
+    /// both of those, and identical six-line helpers across suites are
+    /// exactly what the duplication gate flags.
     pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-        let Ok(value) = tokio::time::timeout(CEILING, future).await else {
-            panic!("{what} must finish rather than hang");
-        };
-        value
+        tokio::time::timeout(CEILING, future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} must finish rather than hang"))
     }
 }
 

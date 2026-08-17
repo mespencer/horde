@@ -1254,7 +1254,8 @@ mod tests {
             ..horde_proto::v1::WorkerSummary::default()
         };
         let parsed: serde_json::Value =
-            serde_json::from_str(&workers(std::slice::from_ref(&worker), Format::Json)).expect("valid JSON");
+            serde_json::from_str(&workers(std::slice::from_ref(&worker), Format::Json))
+                .expect("valid JSON");
         assert_eq!(parsed["workers"][0]["state"], "online");
         assert!(workers(&[worker], Format::Human).contains("w-1  online"));
         assert_eq!(workers(&[], Format::Human), "no workers connected");
