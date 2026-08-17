@@ -478,6 +478,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<SyncEventsRequest>,
     ) -> Result<Response<Self::SyncEventsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
         let request = request.into_inner();
 
         let cursors: Vec<(String, u64)> = request
@@ -546,14 +547,30 @@ impl ControlPlaneService for ControlPlane {
             .map_err(Status::from)?;
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        tokio::spawn(sync::stream_merged(
-            sender,
+        let deny = self
+            .enrollment
+            .as_ref()
+            .map(|authority| authority.deny_list());
+        let stream = sync::stream_merged(
+            sender.clone(),
             history,
             tail,
             request.follow,
             filter,
             self.heartbeat_period,
-        ));
+        );
+        tokio::spawn(async move {
+            tokio::select! {
+                () = stream => {}
+                // Revocation severs a live follow too (fix a4): a revoked
+                // client must not keep reading the log until it reconnects.
+                () = super::shared::severed(deny, serial.clone()) => {
+                    let _ = sender
+                        .send(Err(super::shared::severed_status(serial.as_deref())))
+                        .await;
+                }
+            }
+        });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }

@@ -7,7 +7,9 @@
 //!
 //! * **main** — both gRPC spines (control plane and worker-facing), mTLS
 //!   required, every RPC passing `require_enrolled` so a revoked certificate
-//!   stops working at its next call;
+//!   stops working at its next call — and the long-lived streams re-check
+//!   the same deny-list themselves, so revocation severs them too rather
+//!   than waiting for a reconnect;
 //! * **enrollment** — `EnrollmentService` alone, server-auth only, because a
 //!   joining machine has no certificate yet by definition. A separate
 //!   listener rather than optional client auth on the main one: "may present
@@ -73,7 +75,10 @@ pub async fn serve_main(
         horde_identity::require_enrolled(deny.clone()),
     );
     let worker_facing = WorkerServiceServer::with_interceptor(
-        WorkerFacing::new(core),
+        // The deny-list rides into the service too: the per-RPC interceptor
+        // cannot reach a stream already in flight, so the streams re-check it
+        // themselves and are severed on revocation (fix a4).
+        WorkerFacing::new(core).with_deny(deny.clone()),
         horde_identity::require_enrolled(deny),
     );
 

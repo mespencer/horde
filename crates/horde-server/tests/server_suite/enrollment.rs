@@ -378,6 +378,64 @@ async fn revocation_shuts_the_door_at_the_next_rpc_and_is_journaled() -> Setup<(
     Ok(())
 }
 
+/// Revocation reaches a stream already in flight (wave-7 fix a4): a revoked
+/// worker's open `StreamCommands` is severed with `PermissionDenied` rather
+/// than surviving until the worker deigns to reconnect. Before the fix, the
+/// per-RPC interceptor was the only check, and a worker's whole life is two
+/// long-lived streams it never re-opens.
+#[tokio::test]
+async fn revocation_severs_a_live_command_stream() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+
+    // The worker registers and opens its command stream — the quiet state a
+    // deployed worker sits in for hours.
+    let mut worker = harness.worker_client(&worker_identity).await?;
+    within(
+        "the registration",
+        worker.register_worker(register_request("mac-studio")),
+    )
+    .await??;
+    let mut commands = within(
+        "the command stream opening",
+        worker.stream_commands(horde_proto::v1::StreamCommandsRequest {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            resume_from_command_sequence: 1,
+        }),
+    )
+    .await??
+    .into_inner();
+
+    // An enrolled client revokes the worker while the stream is open.
+    let channel = harness
+        .main_endpoint_as(&client_identity)?
+        .connect()
+        .await?;
+    within(
+        "the revocation RPC",
+        ControlPlaneServiceClient::new(channel).revoke_enrollment(RevokeEnrollmentRequest {
+            principal: Some(revoke_enrollment_request::Principal::WorkerId(
+                WorkerId::new("mac-studio"),
+            )),
+            reason: "machine compromised".to_owned(),
+        }),
+    )
+    .await??;
+
+    // The open stream ends with the revocation refusal — no command was ever
+    // sent on it, so nothing but the severing can end it.
+    let severed = within("the live stream to be severed", commands.message())
+        .await?
+        .expect_err("a revoked worker's stream must end in refusal, not silence");
+    assert_eq!(severed.code(), tonic::Code::PermissionDenied);
+    assert!(
+        severed.message().contains("revoked"),
+        "the refusal says why: {severed}"
+    );
+    Ok(())
+}
+
 /// The bootstrap question, answered against the live authority: `false` on a
 /// fresh server, `true` the moment a client holds a certificate — the
 /// distinction that opens and closes the printed-code door.

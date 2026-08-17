@@ -90,6 +90,56 @@ impl std::fmt::Debug for ServerCore {
 /// This build's semver, echoed in every handshake.
 pub const SERVER_SEMVER: &str = env!("CARGO_PKG_VERSION");
 
+/// How often a long-lived stream re-checks the deny-list.
+///
+/// Streams are the one place the per-RPC interceptor cannot reach: a
+/// `StreamCommands`, `PushEvents`, or `SyncEvents` stream lives for its
+/// peer's whole connection, so revocation would otherwise wait for a
+/// reconnect (DESIGN §3, wave-7 fix a4). A quarter second is far below any
+/// human revocation-to-effect expectation and costs one atomic read per tick
+/// per stream.
+pub(crate) const REVOCATION_RECHECK_PERIOD: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// The serial of the certificate this request arrived under, if the mTLS
+/// interceptor stamped one. Plaintext test channels have none, and for them
+/// [`severed`] never resolves — there is no certificate to revoke.
+pub(crate) fn peer_serial<T>(request: &tonic::Request<T>) -> Option<String> {
+    request
+        .extensions()
+        .get::<horde_identity::PeerIdentity>()
+        .map(|identity| identity.serial_hex.clone())
+}
+
+/// Resolves when this stream's certificate is revoked — the severing half of
+/// revocation. Select the stream's pump against this; when it resolves, end
+/// the stream with the same `PermissionDenied` the interceptor gives unary
+/// calls. Never resolves without both a deny-list and a serial (a plaintext
+/// or unsecured server has neither, and severing nothing is correct there).
+pub(crate) async fn severed(
+    deny: Option<horde_identity::RevocationList>,
+    serial: Option<String>,
+) {
+    let (Some(deny), Some(serial)) = (deny, serial) else {
+        return std::future::pending().await;
+    };
+    loop {
+        if deny.is_revoked(&serial) {
+            return;
+        }
+        tokio::time::sleep(REVOCATION_RECHECK_PERIOD).await;
+    }
+}
+
+/// The refusal a severed stream ends with: the same code and vocabulary the
+/// interceptor uses for a revoked unary call, so a peer sees one story.
+pub(crate) fn severed_status(serial: Option<&str>) -> tonic::Status {
+    tonic::Status::permission_denied(format!(
+        "certificate {} has been revoked; this stream is severed",
+        serial.unwrap_or("<unknown>")
+    ))
+}
+
 /// Below this, a peer's role is refused outright (DESIGN.md §2).
 pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";
 
