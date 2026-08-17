@@ -38,7 +38,15 @@ tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+# The Gherkin runner (docs/TESTING.md §2, "Behavioral"). Pinned exactly, like
+# every calibration-sensitive tool: a runner upgrade silently changes which
+# scenarios parse and how failures are judged.
+cucumber = "=0.23.0"
 horde-server-testkit = { workspace = true }
+# The features suite's full-loop scenarios run a real worker supervising the
+# FakeAdapter against the server the CLI drives — the whole product, one test.
+horde-adapter-fake = { workspace = true }
+horde-worker = { path = "../horde-worker" }
 # The secured suite asserts effects on the server the harness stands up, and
 # stores joined identities in throwaway directories.
 horde-server = { workspace = true }
@@ -52,3 +60,12 @@ tonic = { version = "0.14.6", features = ["channel", "server", "router"] }
 [[bin]]
 name = "horde"
 path = "src/bin/horde.rs"
+
+# The Gherkin behavioral suite (docs/TESTING.md §2): cucumber owns this
+# binary's main, so the libtest harness is off. One binary for every feature
+# file, deliberately — the W6e lesson: cargo-mutants relinks every test target
+# of the mutated package per mutant, so suites consolidate instead of sprawl.
+[[test]]
+name = "features"
+path = "tests/features/main.rs"
+harness = false
