@@ -29,6 +29,9 @@ pub(crate) struct System {
     pub(crate) main: String,
     /// The TLS-only enrollment endpoint, as `https://localhost:PORT`.
     pub(crate) enrollment: String,
+    /// The server-mounted git Relay, as `http://127.0.0.1:PORT` — the
+    /// loopback listener `--relay-bind` stands up (fix a10).
+    pub(crate) relay: String,
     /// Owns every state directory this system uses.
     pub(crate) state: tempfile::TempDir,
     /// The operator's enrolled identity directory.
@@ -82,6 +85,8 @@ impl System {
                 "127.0.0.1:0",
                 "--enrollment-bind",
                 "127.0.0.1:0",
+                "--relay-bind",
+                "127.0.0.1:0",
                 "--state-dir",
                 &server_state.to_string_lossy(),
             ],
@@ -104,11 +109,16 @@ impl System {
         let code = value_after(&stdout, "bootstrap-client-code ")
             .expect("the bootstrap code")
             .to_owned();
+        let relay = format!(
+            "http://{}",
+            value_after(&stdout, "listening relay=").expect("a relay address")
+        );
 
         let system = System {
             _server: server,
             main,
             enrollment,
+            relay,
             operator: state.path().join("operator-identity"),
             state,
             horde,

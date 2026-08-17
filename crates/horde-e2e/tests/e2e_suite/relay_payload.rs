@@ -4,17 +4,14 @@
 //! receiving agent's checkout *before* the message names it — through the
 //! Relay share ref, because it exists nowhere else the receiver can reach.
 //!
-//! # The one stood-in step, named
+//! # Nothing is stood in any more
 //!
-//! The sender's half of stamping — `horde-mcp`'s `report_result` flowing
-//! through the Worker's `StampingSink` — is not wired into the daemon yet
-//! (the Runtime's spawn path still passes `horde_endpoint: None`; see
-//! `runtime.rs`). Until that lands, this scenario stages the sender's commit
-//! onto the Relay with the *same production call* the stamp path makes
-//! (`horde_relay::stage_share`, `ViaRelay`), from the sender agent's real
-//! checkout on worker A's disk. Everything else — the workspace definition,
-//! both materializations, both spawns, the payload-carrying delivery, and
-//! the receiver-side obtain through the Relay — is the product, uninvented.
+//! The Relay is the server's own (`--serve --relay-bind`, fix a10), its
+//! mirror registry fed from the workspace catalog this scenario defines. The
+//! sender's commit reaches the Relay because the sender *agent* reports its
+//! result through its MCP endpoint (fix a1): the Worker's StampingSink
+//! observes HEAD and stages the share ref — no test plumbing touches the
+//! relay or the stamp.
 //!
 //! # Why some verbs go over the raw client
 //!
@@ -25,7 +22,6 @@
 //! report), not in the system under test.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use horde_proto::v1::control_plane_service_client::ControlPlaneServiceClient;
 use horde_proto::v1::{
@@ -90,19 +86,23 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     git(&origin, &["add", "."]).await;
     git(&origin, &["commit", "-m", "seed"]).await;
 
-    // The production Relay, served for real on its own socket; the suite is
-    // only its host process, the way the server binary will be one day.
-    let mirrors = horde_relay::MirrorStore::new(system.state.path().join("mirrors"));
-    mirrors
-        .register("atlas", &origin.to_string_lossy())
-        .expect("the origin registers");
-    let relay = horde_relay::RelayServer::bind(
-        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        Arc::new(mirrors),
+    // The server's own mounted Relay: its registry learns `atlas` from the
+    // workspace definition created below, through the catalog follower.
+    let relay_url = system.relay.clone();
+
+    // The sender's script: one turn that reports through its MCP endpoint.
+    // The stamp is the worker's, observed from the checkout — the script
+    // declares no commits, by design.
+    let script = system.state.path().join("report.json");
+    std::fs::write(
+        &script,
+        r#"[{"steps": [
+            {"use_horde": {"id": "call-r", "tool": "report_result",
+                           "input": {"status": "success",
+                                     "summary": "the finding is committed"}}}
+        ], "text": "reported"}]"#,
     )
-    .await
-    .expect("the relay binds loopback");
-    let relay_url = format!("http://{}", relay.addr());
+    .expect("the script writes");
 
     // Two daemons, each with its own workspace root and the shared Relay.
     let root_a = system.state.path().join("root-a");
@@ -116,6 +116,8 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
                 &root_a.to_string_lossy(),
                 "--relay",
                 &relay_url,
+                "--fake-script",
+                &script.to_string_lossy(),
             ],
         )
         .await;
@@ -218,23 +220,27 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     path_appears("the receiver's checkout", &receiver_checkout).await;
 
     // The sender's work: a commit that exists only on worker A. Then the
-    // stand-in for the not-yet-wired MCP report: the production staging
-    // call pushes it to its content-addressed share ref on the Relay.
+    // real report: a message wakes the sender, whose scripted turn calls
+    // `report_result` through its own MCP endpoint — the Worker's
+    // StampingSink observes this commit and stages it onto the server's
+    // Relay.
     std::fs::write(sender_checkout.join("finding.md"), "the atlas moved\n")
         .expect("the finding writes");
     git(&sender_checkout, &["add", "."]).await;
     git(&sender_checkout, &["commit", "-m", "the finding"]).await;
     let commit_sha = git(&sender_checkout, &["rev-parse", "HEAD"]).await;
-    horde_relay::stage_share(
-        &sender_checkout,
-        &horde_relay::ShareRoute::ViaRelay {
-            repo_name: "atlas".to_owned(),
-        },
-        Some(&relay.location()),
-        &commit_sha,
-    )
-    .await
-    .expect("the stamp path's staging call pushes the share ref");
+
+    system
+        .cli_json(&["send", &sender, "report your result"])
+        .await;
+    system
+        .sync_until(&session_id, "the endpoint-reported result", |events| {
+            events.iter().any(|event| {
+                event["kind"] == "result_reported"
+                    && event["agent_id"].as_str() == Some(sender.as_str())
+            })
+        })
+        .await;
     assert!(
         !holds_commit(&origin, &commit_sha).await,
         "the commit must not have leaked to origin: only the relay may carry it"

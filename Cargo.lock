@@ -1368,6 +1368,7 @@ dependencies = [
  "horde-identity",
  "horde-observe",
  "horde-proto",
+ "horde-relay",
  "horde-server-testkit",
  "hyper-util",
  "proptest",

@@ -75,6 +75,9 @@ pub struct ServeConfig {
     /// ([`crate::blob::DEFAULT_MAX_BLOB_BYTES`]). This is DESIGN §8's
     /// "server-configurable size cap".
     pub blob_max_bytes: Option<u64>,
+    /// Serve the git Relay here (DESIGN §8, fix a10). `None` serves no
+    /// relay; loopback only — see [`crate::relay::mount`].
+    pub relay_bind: Option<SocketAddr>,
 }
 
 /// What one command line asks for.
@@ -96,6 +99,7 @@ struct ParsedFlags {
     enrollment_bind: Option<SocketAddr>,
     subject_names: Vec<String>,
     blob_max_bytes: Option<u64>,
+    relay_bind: Option<SocketAddr>,
 }
 
 impl ParsedFlags {
@@ -140,6 +144,9 @@ impl ParsedFlags {
                 )?);
             }
             "--san" => self.subject_names.push(value_of("--san")?),
+            "--relay-bind" => {
+                self.relay_bind = Some(parse_bind("--relay-bind", &value_of("--relay-bind")?)?);
+            }
             "--blob-max-bytes" => {
                 let value = value_of("--blob-max-bytes")?;
                 self.blob_max_bytes = Some(
@@ -174,9 +181,11 @@ impl ParsedFlags {
                 || self.enrollment_bind.is_some()
                 || self.state_dir.is_some()
                 || self.blob_max_bytes.is_some()
+                || self.relay_bind.is_some()
             {
                 return Err(
-                    "--bind, --enrollment-bind, --state-dir and --blob-max-bytes need --serve"
+                    "--bind, --enrollment-bind, --state-dir, --blob-max-bytes and \
+                     --relay-bind need --serve"
                         .to_owned(),
                 );
             }
@@ -197,6 +206,7 @@ impl ParsedFlags {
                 .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7778))),
             subject_names: self.subject_names,
             blob_max_bytes: self.blob_max_bytes,
+            relay_bind: self.relay_bind,
         })))
     }
 }
@@ -255,6 +265,8 @@ pub struct RunningServer {
     pub server_fingerprint: String,
     /// Present exactly when no client held an active certificate at startup.
     pub bootstrap_code: Option<MintedCode>,
+    /// The mounted git Relay, when `--relay-bind` asked for one.
+    pub relay: Option<crate::relay::MountedRelay>,
     /// The permission chain driver (DESIGN §10, wave-7 fix a5): layers 1–2
     /// live in a deployed server, not only in tests. Held so its lifetime is
     /// the server's.
@@ -320,6 +332,13 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         ),
     };
 
+    // The Relay (fix a10), before the gRPC listeners so a bad relay bind
+    // fails startup whole rather than leaving a half-up server.
+    let relay = match config.relay_bind {
+        Some(bind) => Some(crate::relay::mount(bind, &config.state_dir, &core.log).await?),
+        None => None,
+    };
+
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
 
@@ -328,6 +347,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment,
         server_fingerprint,
         bootstrap_code,
+        relay,
         permission_chain,
     })
 }
@@ -366,6 +386,9 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
         format!("listening enrollment={}", running.enrollment.addr),
         format!("server-fingerprint {}", running.server_fingerprint),
     ];
+    if let Some(relay) = &running.relay {
+        lines.push(format!("listening relay={}", relay.server.addr()));
+    }
     if let Some(code) = &running.bootstrap_code {
         lines.push(format!("bootstrap-client-code {}", code.join_code()));
     }
@@ -466,9 +489,15 @@ mod tests {
             "10.0.0.7",
             "--blob-max-bytes",
             "1048576",
+            "--relay-bind",
+            "127.0.0.1:7420",
         ]) else {
             panic!("a full serve line must parse");
         };
+        assert_eq!(
+            config.relay_bind.map(|addr| addr.to_string()),
+            Some("127.0.0.1:7420".to_owned())
+        );
         assert_eq!(config.database, "/tmp/x.db");
         assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
         assert_eq!(config.enrollment_bind.to_string(), "0.0.0.0:9001");
@@ -517,6 +546,11 @@ mod tests {
             (&["--enrollment-bind", "127.0.0.1:1"][..], "--serve"),
             (&["--state-dir", "/tmp/x"][..], "--serve"),
             (&["--blob-max-bytes", "1"][..], "--serve"),
+            (&["--relay-bind", "127.0.0.1:1"][..], "--serve"),
+            (
+                &["--serve", "--relay-bind", "not-an-address"][..],
+                "not-an-address",
+            ),
             (
                 &["--serve", "--blob-max-bytes", "lots"][..],
                 "--blob-max-bytes lots",
@@ -566,10 +600,19 @@ mod tests {
             enrollment_bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             subject_names: Vec::new(),
             blob_max_bytes: None,
+            relay_bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         };
 
         let running = super::serve(&config).await.expect("the server comes up");
         assert_ne!(running.main.addr.port(), 0, "the OS chose a real port");
+        let relay = running.relay.as_ref().expect("--relay-bind mounts the relay");
+        assert_ne!(relay.server.addr().port(), 0, "the relay bound a real port");
+        assert!(
+            super::operator_lines(&running)
+                .iter()
+                .any(|line| line.starts_with("listening relay=")),
+            "the operator learns where the relay listens"
+        );
         assert_ne!(running.enrollment.addr.port(), 0);
         assert_eq!(running.server_fingerprint.len(), 64);
         let code = running
@@ -591,7 +634,7 @@ mod tests {
 
         // The operator interface, exactly as the binary will print it.
         let lines = super::operator_lines(&running);
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         assert_eq!(lines[0], format!("listening main={}", running.main.addr));
         assert_eq!(
             lines[1],
@@ -603,6 +646,13 @@ mod tests {
         );
         assert_eq!(
             lines[3],
+            format!(
+                "listening relay={}",
+                running.relay.as_ref().expect("mounted").server.addr()
+            )
+        );
+        assert_eq!(
+            lines[4],
             format!("bootstrap-client-code {}", code.join_code())
         );
         drop(running);
