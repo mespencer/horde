@@ -524,12 +524,33 @@ impl Client {
         parent_agent_id: Option<&str>,
         idempotency_key: &str,
     ) -> Result<SpawnAgentResponse, ClientError> {
+        self.spawn_agent_with_spec(
+            session_id,
+            parent_agent_id,
+            AgentSpec::default(),
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// [`Self::spawn_agent`], with a caller-built spec.
+    ///
+    /// The seam the MCP endpoint's `spawn_agent` verb speaks through: an
+    /// agent-initiated spawn carries its task as the spec's initial
+    /// assignment, and a spec-less spawn is just this with the default.
+    pub async fn spawn_agent_with_spec(
+        &mut self,
+        session_id: &str,
+        parent_agent_id: Option<&str>,
+        spec: AgentSpec,
+        idempotency_key: &str,
+    ) -> Result<SpawnAgentResponse, ClientError> {
         Ok(self
             .inner
             .spawn_agent(SpawnAgentRequest {
                 session_id: Some(SessionId::new(session_id)),
                 parent_agent_id: parent_agent_id.map(AgentId::new),
-                spec: Some(AgentSpec::default()),
+                spec: Some(spec),
                 idempotency_key: idempotency_key.to_owned(),
             })
             .await?

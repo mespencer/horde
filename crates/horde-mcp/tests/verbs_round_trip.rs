@@ -91,11 +91,15 @@ async fn a_reported_result_carries_no_agent_declared_payload() -> Setup<()> {
 
 /// A spawn never blocks. With no worker registered there is nowhere to run,
 /// and the right answer is a queued placement carrying the reason — not an
-/// error, and not a wait.
+/// error, and not a wait. The task the spawner named rides the spawn as the
+/// child's initial assignment — the parameter routing the conformance audit
+/// found dropped on the floor (fix list a2).
 #[tokio::test]
 async fn a_spawn_with_nowhere_to_run_comes_back_queued_rather_than_failing() -> Setup<()> {
-    let (_harness, identity, verbs) = verbs_for_one_agent().await?;
-    let outcome = verbs.spawn_agent(&identity, "spawn-1").await?;
+    let (harness, identity, verbs) = verbs_for_one_agent().await?;
+    let outcome = verbs
+        .spawn_agent(&identity, "map the atlas", "spawn-1")
+        .await?;
 
     assert!(
         !outcome.agent_id.is_empty(),
@@ -104,6 +108,44 @@ async fn a_spawn_with_nowhere_to_run_comes_back_queued_rather_than_failing() -> 
     assert!(
         !outcome.placed,
         "no worker is registered, so this cannot have been placed"
+    );
+
+    // The child's `AgentSpawned` carries the task as its initial assignment:
+    // that is what a worker will fold into the first turn input, so a spawn
+    // that lost it would place an agent with nothing to do.
+    let mut client = harness.client().await?;
+    let mut task = None;
+    client
+        .sync(
+            &horde_cli::client::SyncOptions::new(harness.session_id.clone()),
+            |envelope| {
+                let spawned_child = envelope
+                    .event
+                    .as_ref()
+                    .filter(|event| {
+                        event.agent_id.as_ref().map(ToString::to_string)
+                            == Some(outcome.agent_id.clone())
+                    })
+                    .and_then(|event| match &event.kind {
+                        Some(horde_proto::v1::event::Kind::AgentSpawned(spawned)) => {
+                            spawned.spec.as_ref()
+                        }
+                        _ => None,
+                    });
+                if let Some(spec) = spawned_child {
+                    task = spec
+                        .initial_assignment
+                        .as_ref()
+                        .map(|assignment| assignment.text.clone());
+                }
+            },
+            |_| {},
+        )
+        .await?;
+    assert_eq!(
+        task.as_deref(),
+        Some("map the atlas"),
+        "the task must ride the spawn as the initial assignment"
     );
     Ok(())
 }
