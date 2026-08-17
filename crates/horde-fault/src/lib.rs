@@ -3,8 +3,10 @@
 //!
 //! The network half of the injector lives in `horde_testkit::fault` — a
 //! programmable TCP proxy any suite can front a transport with. This crate is
-//! the half that needs real processes: spawning the real `horde-server`
-//! binary so a test can `kill -9` it mid-append, and spawning the
+//! the half that needs real processes: spawning the
+//! [`fault-server`](../src/bin/fault_server.rs) fixture — the production
+//! `horde_server::startup` stack in its own process — so a test can
+//! `kill -9` the server mid-append, and spawning the
 //! [`worker-runner`](../src/bin/worker_runner.rs) fixture — the production
 //! worker library composed around a scripted FakeAdapter — so a test can
 //! `kill -9` a worker mid-turn and then resurrect it over the same journal.
@@ -189,7 +191,8 @@ pub struct ServerConfig {
     pub enrollment_bind: SocketAddr,
 }
 
-/// A real `horde-server --serve` child process, killable without ceremony.
+/// A real serving child process — the production startup stack behind the
+/// same `--serve` command line — killable without ceremony.
 #[derive(Debug)]
 pub struct ServerProcess {
     child: Child,
@@ -218,7 +221,11 @@ impl ServerProcess {
             "--enrollment-bind".to_owned(),
             config.enrollment_bind.to_string(),
         ];
-        let mut child = spawn_product("horde-server", &arguments, Stdio::piped())?;
+        // The fault-server fixture: `horde_server::startup`'s parse, serve
+        // and announce, in a binary this package's own test build always
+        // produces — see its module docs for why the shipped binary's
+        // `[[bin]]` cannot be relied on here.
+        let mut child = spawn_product("fault-server", &arguments, Stdio::piped())?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             FaultHarnessError::Announcement("the child has no piped stdout".to_owned())

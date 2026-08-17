@@ -1,10 +1,13 @@
-//! Scenario (c): `kill -9` the real server mid-append, restart it, and the
+//! Scenario (c): `kill -9` the server mid-append, restart it, and the
 //! log is the only survivor.
 //!
-//! Everything here is the shipped article: the real `horde-server` binary
-//! serving mTLS on fixed ports over a SQLite log on disk, a client enrolled
-//! through the bootstrap code on its stdout, a worker enrolled through a
-//! minted code and running as its own process. The kill lands while a turn
+//! The server is a real OS process running the production startup stack —
+//! `horde_server::startup`'s parse, serve and announce, via the
+//! `fault-server` fixture (see its module docs for why the shipped
+//! binary's `[[bin]]` cannot be relied on across packages) — serving mTLS
+//! on fixed ports over a SQLite log on disk, with a client enrolled
+//! through the bootstrap code on its stdout and a worker enrolled through
+//! a minted code and running as its own process. The kill lands while a turn
 //! is journaling — the victim turn's stall guarantees its completion happens
 //! *while the server is dead*, so recovery has real work to do:
 //!

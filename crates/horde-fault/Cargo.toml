@@ -10,11 +10,14 @@ description = "The fault-injection suite (docs/TESTING.md §2): process-level fa
 workspace = true
 
 [dependencies]
-# The worker-runner fixture binary composes the production worker — journal,
-# runtime, connection — around the FakeAdapter, so the process the suite
-# kills is running the real library code end to end.
+# The fixture binaries compose the production libraries — the worker-runner
+# wires journal, runtime and connection around the FakeAdapter; the
+# fault-server wires horde_server::startup's parse/serve/announce — so the
+# processes the suite kills are running the real code end to end. Both are
+# ordinary dependencies because bins cannot use dev-dependencies.
 horde-adapter-fake = { workspace = true }
 horde-identity = { workspace = true }
+horde-server = { workspace = true }
 horde-worker = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
@@ -22,7 +25,6 @@ tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-mult
 [dev-dependencies]
 horde-cli = { workspace = true }
 horde-proto = { workspace = true }
-horde-server = { workspace = true }
 horde-server-testkit = { workspace = true }
 horde-testkit = { workspace = true }
 tempfile = { workspace = true }
@@ -32,6 +34,10 @@ tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ri
 [[bin]]
 name = "worker-runner"
 path = "src/bin/worker_runner.rs"
+
+[[bin]]
+name = "fault-server"
+path = "src/bin/fault_server.rs"
 
 # The scenarios are one consolidated binary, like every other suite here.
 [[test]]

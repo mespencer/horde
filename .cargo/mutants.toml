@@ -28,11 +28,13 @@ exclude_re = [
     # Same criterion, codex's half: a scripted app-server the codex supervision
     # tests spawn. The suite runs it; it never tests it.
     'crates/horde-worker/src/bin/codex_stub_harness\.rs',
-    # Same criterion, the fault suite's half: the worker-runner is the
-    # production worker library composed into a killable process. The fault
-    # scenarios spawn it and SIGKILL it; it tests nothing, and the library
-    # code it composes is mutated in its own crates.
+    # Same criterion, the fault suite's half: the worker-runner and the
+    # fault-server are production libraries composed into killable
+    # processes. The fault scenarios spawn them and SIGKILL them; they test
+    # nothing, and the library code they compose is mutated in its own
+    # crates.
     'crates/horde-fault/src/bin/worker_runner\.rs',
+    'crates/horde-fault/src/bin/fault_server\.rs',
     # Same criterion, the hub's half: a stub MCP server the hub upstream tests
     # spawn as a child process (main.rs), whose toolset (tools.rs) the duplex
     # tests also include by #[path]. The suite runs both; it tests neither.

@@ -84,8 +84,9 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
     first_life.kill_now().await.expect("the kill lands");
     let still_breathing = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
-        .status()
+        .output() // captured, so the probe's own noise stays out of the run
         .expect("the probe runs")
+        .status
         .success();
     assert!(!still_breathing, "SIGKILL must have ended the first life");
     proxy.cut();
