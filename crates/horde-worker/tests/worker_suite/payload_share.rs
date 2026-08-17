@@ -236,6 +236,56 @@ mod suite {
         (server, store)
     }
 
+    /// "Commit, then share": a result reported from a dirty working tree is
+    /// refused with ADR-0002's helpful error, and nothing is journaled. The
+    /// alternative — stamping whatever HEAD holds — would ack a result whose
+    /// payload silently omits the uncommitted half of the work it reports
+    /// (the audit's collision #9).
+    #[tokio::test]
+    async fn a_dirty_tree_refuses_the_stamp_rather_than_omitting_work() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let origin = seeded_origin(scratch.path()).await;
+
+        let mut worker = Worker::new("w1", scratch.path(), None);
+        within("hosts agent-a", worker.host_agent(&origin, "agent-a")).await;
+
+        // Work happens but is never committed.
+        let repo = worker.checkout("agent-a");
+        std::fs::write(repo.join("feature.rs"), "pub fn feature() {}").expect("write");
+
+        let before = worker.journaled().await.len();
+        let sink = worker.runtime.stamping_sink();
+        let refused = within("record", sink.record(unstamped_result("agent-a")))
+            .await
+            .expect_err("a dirty tree must refuse the stamp");
+        let message = refused.to_string();
+        assert!(
+            message.contains("commit, then share"),
+            "the refusal is the designed helpful error: {message}"
+        );
+        assert!(
+            message.contains("feature.rs"),
+            "the refusal names the uncommitted paths: {message}"
+        );
+        assert_eq!(
+            worker.journaled().await.len(),
+            before,
+            "a refused result must not be journaled"
+        );
+
+        // The same report after committing goes through — the refusal asks
+        // for exactly one action, and that action suffices.
+        within("stage", git(&repo, &["add", "."])).await;
+        within("commit", git(&repo, &["commit", "-qm", "the feature"])).await;
+        within("record again", sink.record(unstamped_result("agent-a")))
+            .await
+            .expect("a committed tree stamps");
+        assert!(
+            stamped_payload(&worker.journaled().await).is_some(),
+            "the committed report carries its stamped payload"
+        );
+    }
+
     /// The whole seam: agent A commits on Worker 1, its result is stamped and
     /// staged by the production sink, and delivering that payload to agent B
     /// on Worker 2 makes the commit present in B's checkout — through the
