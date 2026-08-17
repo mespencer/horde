@@ -1433,25 +1433,34 @@ mod tests {
         }
     }
 
-    /// Waits until the journal holds at least `minimum` events.
+    /// Waits until the journal satisfies `accept`, returning what it holds.
+    ///
+    /// The wait is on a *fact* about the journal, never on an event count:
+    /// the pump journals each session event in its own transaction with its
+    /// own head announcement, so a watcher can legitimately wake between two
+    /// appends of the same logical step and read a journal that is mid-way
+    /// through it. A count-based wait turns that interleaving into a flake
+    /// (`a_permission_decision_unblocks_the_waiting_agent`, twice); a
+    /// fact-based wait just parks again.
     ///
     /// Bounded twice: by iteration count (a hot loop cannot spin past 64
     /// polls) and by a ceiling on each park (a journal that stops moving fails
     /// in seconds, not never).
-    async fn journal_at_least(
+    async fn journal_satisfying(
         runtime: &Runtime,
-        minimum: usize,
+        waiting_for: &str,
+        accept: impl Fn(&[horde_proto::v1::JournaledEvent]) -> bool,
     ) -> Vec<horde_proto::v1::JournaledEvent> {
         let journal = runtime.journal.clone();
         let mut head = journal.watch_head();
         let mut polls = 0_u32;
         loop {
             let events = journal.read_from(1, 100).await.expect("a readable journal");
-            if events.len() >= minimum {
+            if accept(&events) {
                 return events;
             }
             polls += 1;
-            assert!(polls < 64, "the journal never reached {minimum} events");
+            assert!(polls < 64, "the journal never reached {waiting_for}");
             // A positive wait: something must arrive, and the assertion is
             // on what arrived — so a clock is legitimate here, but only as
             // a ceiling, never as a duration anything is expected to take.
@@ -1466,6 +1475,21 @@ mod tests {
                 .expect("the journal stopped moving")
                 .expect("the journal outlives the wait");
         }
+    }
+
+    /// Waits until the journal holds at least `minimum` events.
+    ///
+    /// Only for waits whose assertion is genuinely about arrival order up to
+    /// a fixed prefix; a wait for "the event I am about to assert on" belongs
+    /// on [`journal_satisfying`] with that fact as the predicate.
+    async fn journal_at_least(
+        runtime: &Runtime,
+        minimum: usize,
+    ) -> Vec<horde_proto::v1::JournaledEvent> {
+        journal_satisfying(runtime, &format!("{minimum} events"), |events| {
+            events.len() >= minimum
+        })
+        .await
     }
 
     fn kinds(events: &[horde_proto::v1::JournaledEvent]) -> Vec<&'static str> {
@@ -1547,14 +1571,26 @@ mod tests {
 
     /// A turn that proposes `Bash ls` as tool call `call-1` and blocks on the
     /// decision — the shape both permission tests drive.
+    ///
+    /// The stall behind the ask pins the interleaving that made the
+    /// unblocking test flake: an answered permission releases the tool
+    /// result *before* the turn's ending, as two separate journal appends,
+    /// and the stall holds that gap open for real time. A wait that infers
+    /// "the turn ended" from an event count reads the journal inside the gap
+    /// and fails deterministically here, instead of only under a loaded
+    /// scheduler. The refusal test never reaches the stall — a session
+    /// waiting on a decision plays no further steps — so it costs nothing
+    /// there.
     fn asking_permission() -> Script {
-        Script::of(vec![ScriptedTurn::saying("checking").with_step(
-            Step::AskPermission {
-                tool_call_id: "call-1".to_owned(),
-                tool_name: "Bash".to_owned(),
-                input: json!({ "command": "ls" }),
-            },
-        )])
+        Script::of(vec![
+            ScriptedTurn::saying("checking")
+                .with_step(Step::AskPermission {
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "Bash".to_owned(),
+                    input: json!({ "command": "ls" }),
+                })
+                .with_step(Step::Stall(core::time::Duration::from_millis(250))),
+        ])
     }
 
     #[tokio::test]
@@ -1565,28 +1601,27 @@ mod tests {
             .await
             .expect("the spawn applies");
 
-        // starting, established, output, permission request — then blocked.
-        let events = journal_at_least(&runtime, 4).await;
-        assert!(
-            kinds(&events).contains(&"permission-requested"),
-            "the request must reach the journal or nobody can ever answer it: {:?}",
-            kinds(&events)
-        );
+        // The request must reach the journal, or nobody can ever answer it.
+        journal_satisfying(&runtime, "the permission request", |events| {
+            kinds(events).contains(&"permission-requested")
+        })
+        .await;
 
         runtime
             .apply(decision_command(2, "agent-1", "call-1", None))
             .await
             .expect("the decision applies");
 
-        // The turn resumes and closes: a usage record arrives.
-        let events = journal_at_least(&runtime, 5).await;
-        let all = kinds(&events);
+        // The turn resumes and closes: a usage record arrives. Waited for as
+        // a fact, not a count — the resumed turn journals its tool result
+        // ahead of its ending, so "five events" is a journal that may not
+        // have ended anything yet (the interleaving the script's stall pins).
+        let events = journal_satisfying(&runtime, "a usage record", |events| {
+            kinds(events).contains(&"usage")
+        })
+        .await;
         assert!(
-            all.contains(&"usage"),
-            "the turn must end after the allow: {all:?}"
-        );
-        assert!(
-            !all.contains(&"permission-decided"),
+            !kinds(&events).contains(&"permission-decided"),
             "the decision is the Server's event; journaling it here doubles it"
         );
         runtime.shutdown().await;
