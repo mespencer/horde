@@ -255,6 +255,23 @@ pub struct RunningServer {
     pub server_fingerprint: String,
     /// Present exactly when no client held an active certificate at startup.
     pub bootstrap_code: Option<MintedCode>,
+    /// The permission chain driver (DESIGN §10, wave-7 fix a5): layers 1–2
+    /// live in a deployed server, not only in tests. Held so its lifetime is
+    /// the server's.
+    pub permission_chain: ChainTask,
+}
+
+/// The chain driver's task, stopped when the server is dropped — the same
+/// lifetime [`BoundListener`] gives the listeners.
+#[derive(Debug)]
+pub struct ChainTask {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ChainTask {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Brings the networked server up (DESIGN §3, activated in wave 5).
@@ -289,6 +306,20 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     }
 
     let core = ServerCore::new(log).with_blob_store(Arc::new(blobs));
+
+    // The permission chain driver (fix a5): the deterministic layers run in
+    // the deployed server, over an escalate-everything default registry —
+    // exactly what an unconfigured server should do with every request until
+    // §13's authoring layer exists. The judge stays a seam; a missing judge
+    // already escalates.
+    let permission_chain = ChainTask {
+        task: crate::permission::spawn(
+            &core.log,
+            Arc::new(crate::permission::PermissionModes::default()),
+            None,
+        ),
+    };
+
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
 
@@ -297,6 +328,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment,
         server_fingerprint,
         bootstrap_code,
+        permission_chain,
     })
 }
 

@@ -172,7 +172,10 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
             {"say": "checking the blast radius"},
             {"ask_permission": {"id": "call-1", "tool": "Bash",
                                 "input": {"command": "docker rm horde-test"}}},
-            {"say": "approved and done"}
+            {"say": "approved and done"},
+            {"ask_permission": {"id": "call-2", "tool": "Bash",
+                                "input": {"command": "docker rm horde-test"}}},
+            {"say": "remembered and done"}
         ], "text": "done"}]"#,
     )
     .expect("the script writes");
@@ -211,8 +214,9 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
         "the harness must be blocked on the decision, not past it: {events:?}"
     );
 
-    // Any attached client may answer (DESIGN §10); this one does.
-    let approved = system.cli(&["approve", "call-1"]).await;
+    // Any attached client may answer (DESIGN §10); this one does — and asks
+    // the chain to remember the answer.
+    let approved = system.cli(&["approve", "call-1", "--remember"]).await;
     assert!(
         approved.status.success(),
         "the approval must land: {}",
@@ -229,6 +233,26 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     assert!(
         has_kind(&events, "permission_decided"),
         "the decision is an event of record, not just a delivery: {events:?}"
+    );
+
+    // The second, identical ask resolves with no human in the loop: the
+    // chain driver the deployed server spawns (wave-7 fix a5) answers it
+    // from the remembered decision. Reaching the final output with exactly
+    // one `approve` call is the proof.
+    let events = system
+        .sync_until(&session_id, "the remembered decision", |events| {
+            outputs(events)
+                .iter()
+                .any(|text| text == "remembered and done")
+        })
+        .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "permission_decided")
+            .count(),
+        2,
+        "the remembered layer's answer is an event of record too: {events:?}"
     );
 
     worker.terminate().await.expect("SIGTERM sends");
