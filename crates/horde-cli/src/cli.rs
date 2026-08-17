@@ -240,8 +240,78 @@ pub struct SendArgs {
     /// Cancel the turn in flight rather than waiting for the turn boundary.
     #[arg(long)]
     pub interrupt: bool,
+    /// A commit the message names, as REPO:COMMIT[:BRANCH]; repeatable. The
+    /// receiving worker makes it present in the agent's checkout before the
+    /// text is read — transport is never the agent's concern (DESIGN §5).
+    #[arg(long = "git-ref", value_name = "REPO:COMMIT[:BRANCH]")]
+    pub git_refs: Vec<String>,
+    /// An attachment by content address, as NAME:sha256:<64 hex>:SIZE;
+    /// repeatable. `horde blob stash` prints the address half.
+    #[arg(long = "attach", value_name = "NAME:ADDRESS:SIZE")]
+    pub attachments: Vec<String>,
     #[arg(long, default_value = "")]
     pub idempotency_key: String,
+}
+
+/// The wire payload a send's flags describe, or `None` when they name none.
+///
+/// # Errors
+///
+/// A malformed `--git-ref` or `--attach` entry, refused naming the flag and
+/// the shape it takes.
+pub fn payload_from(args: &SendArgs) -> Result<Option<horde_proto::v1::Payload>, ClientError> {
+    if args.git_refs.is_empty() && args.attachments.is_empty() {
+        return Ok(None);
+    }
+    let invalid = |flag: &str, shape: &str, got: &str| {
+        ClientError::Rpc(tonic::Status::invalid_argument(format!(
+            "{flag} takes {shape}, got {got:?}"
+        )))
+    };
+
+    let mut git_refs = Vec::new();
+    for entry in &args.git_refs {
+        let mut parts = entry.splitn(3, ':');
+        let (repo, commit) = match (parts.next(), parts.next()) {
+            (Some(repo), Some(commit)) if !repo.is_empty() && !commit.is_empty() => (repo, commit),
+            _ => return Err(invalid("--git-ref", "REPO:COMMIT[:BRANCH]", entry)),
+        };
+        git_refs.push(horde_proto::v1::GitRef {
+            repo_name: repo.to_owned(),
+            commit_sha: commit.to_owned(),
+            branch: parts.next().unwrap_or_default().to_owned(),
+        });
+    }
+
+    let mut attachments = Vec::new();
+    for entry in &args.attachments {
+        // NAME:sha256:<hex>:SIZE — the address itself contains a colon, so
+        // split from both ends rather than blindly on every colon.
+        let (name, rest) = entry
+            .split_once(':')
+            .ok_or_else(|| invalid("--attach", "NAME:ADDRESS:SIZE", entry))?;
+        let (address, size) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("--attach", "NAME:ADDRESS:SIZE", entry))?;
+        let size_bytes: u64 = size
+            .parse()
+            .map_err(|_| invalid("--attach", "NAME:ADDRESS:SIZE (SIZE in bytes)", entry))?;
+        if name.is_empty() || address.is_empty() {
+            return Err(invalid("--attach", "NAME:ADDRESS:SIZE", entry));
+        }
+        attachments.push(horde_proto::v1::Attachment {
+            name: name.to_owned(),
+            blob_digest: address.to_owned(),
+            size_bytes,
+            media_type: String::new(),
+            inline: Vec::new(),
+        });
+    }
+
+    Ok(Some(horde_proto::v1::Payload {
+        git_refs,
+        attachments,
+    }))
 }
 
 #[derive(Args, Debug)]
@@ -907,13 +977,26 @@ async fn run_sync(client: &mut Client, args: &SyncArgs, format: Format) -> Resul
 
 async fn run_send(client: &mut Client, args: &SendArgs, format: Format) -> Result<(), ClientError> {
     let delivery = delivery_for(args.interrupt);
+    let payload = payload_from(args)?;
     let response = if args.note {
         client
-            .send_note(&args.agent_id, &args.text, delivery, &args.idempotency_key)
+            .send_note_with_payload(
+                &args.agent_id,
+                &args.text,
+                payload,
+                delivery,
+                &args.idempotency_key,
+            )
             .await?
     } else {
         client
-            .send_assignment(&args.agent_id, &args.text, delivery, &args.idempotency_key)
+            .send_assignment_with_payload(
+                &args.agent_id,
+                &args.text,
+                payload,
+                delivery,
+                &args.idempotency_key,
+            )
             .await?
     };
     println!("{}", render::sent(&response, format));
@@ -1053,6 +1136,63 @@ mod tests {
         // No flags at all is no selection — the worker's default, honestly.
         let bare = super::spec_from(&super::SpecArgs::default()).expect("a bare spec");
         assert_eq!(bare, horde_proto::v1::AgentSpec::default());
+    }
+
+    /// The payload flags: refs and attachments parse into the wire payload,
+    /// nothing named is no payload (not an empty one), and malformed entries
+    /// refuse naming the flag and its shape.
+    #[test]
+    fn send_payload_flags_parse_refs_and_attachments_or_refuse() {
+        let args = |git_refs: &[&str], attachments: &[&str]| super::SendArgs {
+            agent_id: "a1".to_owned(),
+            text: "integrate".to_owned(),
+            note: false,
+            interrupt: false,
+            git_refs: git_refs.iter().map(|s| (*s).to_owned()).collect(),
+            attachments: attachments.iter().map(|s| (*s).to_owned()).collect(),
+            idempotency_key: String::new(),
+        };
+
+        assert_eq!(
+            super::payload_from(&args(&[], &[])).expect("no flags"),
+            None,
+            "nothing named is no payload, not an empty one"
+        );
+
+        let payload = super::payload_from(&args(
+            &["atlas:abc123:main", "codex:def456"],
+            &["log.txt:sha256:aa:120"],
+        ))
+        .expect("well-formed flags")
+        .expect("a payload");
+        assert_eq!(payload.git_refs.len(), 2);
+        assert_eq!(payload.git_refs[0].repo_name, "atlas");
+        assert_eq!(payload.git_refs[0].commit_sha, "abc123");
+        assert_eq!(payload.git_refs[0].branch, "main");
+        assert_eq!(
+            payload.git_refs[1].branch, "",
+            "the branch is optional and advisory"
+        );
+        assert_eq!(payload.attachments.len(), 1);
+        assert_eq!(payload.attachments[0].name, "log.txt");
+        assert_eq!(
+            payload.attachments[0].blob_digest, "sha256:aa",
+            "the address keeps its own colon — split from both ends"
+        );
+        assert_eq!(payload.attachments[0].size_bytes, 120);
+
+        for (git_refs, attachments) in [
+            (&["atlas"][..], &[][..]),
+            (&[":abc"][..], &[][..]),
+            (&[][..], &["log.txt"][..]),
+            (&[][..], &["log.txt:sha256:aa:lots"][..]),
+            (&[][..], &[":sha256:aa:1"][..]),
+        ] {
+            assert!(
+                super::payload_from(&args(git_refs, attachments)).is_err(),
+                "{git_refs:?} {attachments:?} must be refused"
+            );
+        }
     }
 
     /// Each CLI checkout word maps to its own wire policy.

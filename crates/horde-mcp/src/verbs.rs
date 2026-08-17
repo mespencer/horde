@@ -186,6 +186,7 @@ impl Verbs {
         to_agent_id: &str,
         kind: MessageKind,
         text: &str,
+        payload: Option<horde_proto::v1::Payload>,
         interrupt: bool,
         idempotency_key: &str,
     ) -> Result<u64, VerbError> {
@@ -201,12 +202,18 @@ impl Verbs {
         let response = match kind {
             MessageKind::Assign => {
                 client
-                    .send_assignment(to_agent_id, text, delivery, idempotency_key)
+                    .send_assignment_with_payload(
+                        to_agent_id,
+                        text,
+                        payload,
+                        delivery,
+                        idempotency_key,
+                    )
                     .await?
             }
             MessageKind::Note => {
                 client
-                    .send_note(to_agent_id, text, delivery, idempotency_key)
+                    .send_note_with_payload(to_agent_id, text, payload, delivery, idempotency_key)
                     .await?
             }
         };

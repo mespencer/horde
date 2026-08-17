@@ -376,12 +376,28 @@ impl Client {
         delivery: DeliveryMode,
         idempotency_key: &str,
     ) -> Result<SendMessageResponse, ClientError> {
+        self.send_assignment_with_payload(agent_id, text, None, delivery, idempotency_key)
+            .await
+    }
+
+    /// An assignment whose message names work: the payload's commits and
+    /// attachments are made present in the receiving agent's checkout before
+    /// the text reaches it (DESIGN §5 — transport is never the agent's
+    /// concern).
+    pub async fn send_assignment_with_payload(
+        &mut self,
+        agent_id: &str,
+        text: &str,
+        payload: Option<horde_proto::v1::Payload>,
+        delivery: DeliveryMode,
+        idempotency_key: &str,
+    ) -> Result<SendMessageResponse, ClientError> {
         self.send(
             agent_id,
             send_message_request::Body::Assignment(Assignment {
                 assignment_id: None,
                 text: text.to_owned(),
-                payload: None,
+                payload,
             }),
             delivery,
             idempotency_key,
@@ -396,11 +412,25 @@ impl Client {
         delivery: DeliveryMode,
         idempotency_key: &str,
     ) -> Result<SendMessageResponse, ClientError> {
+        self.send_note_with_payload(agent_id, text, None, delivery, idempotency_key)
+            .await
+    }
+
+    /// A note carrying a payload — context that rides as commits or
+    /// attachments rather than prose.
+    pub async fn send_note_with_payload(
+        &mut self,
+        agent_id: &str,
+        text: &str,
+        payload: Option<horde_proto::v1::Payload>,
+        delivery: DeliveryMode,
+        idempotency_key: &str,
+    ) -> Result<SendMessageResponse, ClientError> {
         self.send(
             agent_id,
             send_message_request::Body::Note(Note {
                 text: text.to_owned(),
-                payload: None,
+                payload,
             }),
             delivery,
             idempotency_key,

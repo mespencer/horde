@@ -86,6 +86,41 @@ pub struct SendParams {
     /// Cancel the recipient's turn rather than waiting for its boundary.
     #[serde(default)]
     pub interrupt: bool,
+    /// Commits the message names. The receiving worker makes each present in
+    /// the recipient's checkout before the text is read — name a commit here
+    /// rather than telling the recipient how to fetch it.
+    #[serde(default)]
+    pub git_refs: Vec<SendGitRef>,
+}
+
+/// One commit riding a message's payload.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendGitRef {
+    /// The repo's workspace-definition name.
+    pub repo: String,
+    /// The commit id. Authoritative — the branch is advisory.
+    pub commit: String,
+    #[serde(default)]
+    pub branch: String,
+}
+
+/// The wire payload a send's `git_refs` describe, or `None` for none.
+#[must_use]
+pub fn payload_from_refs(git_refs: &[SendGitRef]) -> Option<horde_proto::v1::Payload> {
+    if git_refs.is_empty() {
+        return None;
+    }
+    Some(horde_proto::v1::Payload {
+        git_refs: git_refs
+            .iter()
+            .map(|git_ref| horde_proto::v1::GitRef {
+                repo_name: git_ref.repo.clone(),
+                commit_sha: git_ref.commit.clone(),
+                branch: git_ref.branch.clone(),
+            })
+            .collect(),
+        attachments: Vec::new(),
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -325,6 +360,7 @@ impl HordeEndpoint {
                 &params.to_agent_id,
                 message_kind_for(params.note),
                 &params.text,
+                payload_from_refs(&params.git_refs),
                 params.interrupt,
                 &key,
             )
@@ -792,6 +828,25 @@ mod tests {
             "unknown",
             "a status from a newer build is unreadable, not successful"
         );
+    }
+
+    /// A send naming refs carries them as its payload; naming none carries
+    /// no payload rather than an empty one (an empty payload would read as
+    /// "work: nothing" instead of "no work named").
+    #[test]
+    fn send_git_refs_become_the_payload_or_nothing() {
+        assert_eq!(super::payload_from_refs(&[]), None);
+
+        let payload = super::payload_from_refs(&[super::SendGitRef {
+            repo: "atlas".to_owned(),
+            commit: "abc123".to_owned(),
+            branch: "main".to_owned(),
+        }])
+        .expect("a named ref is a payload");
+        assert_eq!(payload.git_refs.len(), 1);
+        assert_eq!(payload.git_refs[0].repo_name, "atlas");
+        assert_eq!(payload.git_refs[0].commit_sha, "abc123");
+        assert_eq!(payload.git_refs[0].branch, "main");
     }
 
     /// One bit, and the inversion is the whole risk.
