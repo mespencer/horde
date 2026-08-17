@@ -161,6 +161,68 @@ async fn a_turn_cut_mid_flight_reaches_the_server_exactly_once_after_heal() {
     worker.abort();
 }
 
+/// TESTING.md §2 names the network faults by name: sever, delay, **flap**.
+/// A flapping link dies and returns over and over while a conversation
+/// flows, so the resume arithmetic — journal watermarks, ack-driven
+/// truncation, command replay — runs once per flap inside a single agent's
+/// life. Four flaps, five turns, and the ledger must still read exactly
+/// once each, with the spawn having run once.
+#[tokio::test]
+async fn a_flapping_link_delivers_five_turns_exactly_once() {
+    let script = Script::of(
+        (1..=5)
+            .map(|i| ScriptedTurn::saying(format!("flap-answer-{i}")))
+            .collect(),
+    );
+    let (core, proxy, _journal, worker) = staged_worker(script).await;
+
+    support::log_until(&core.log, "s1", "the first turn never landed", |events| {
+        support::chunks_saying(events, "flap-answer-1") == 1
+    })
+    .await;
+
+    for i in 2..=5_u32 {
+        // Flap: the link dies mid-life and comes back at once. The next
+        // assignment forces traffic through whatever the reconnect rebuilt.
+        proxy.cut();
+        proxy.heal();
+        support::send_assignment(&core.log, "s1", "agent-1", &format!("go {i}")).await;
+        let wanted = format!("flap-answer-{i}");
+        support::log_until(
+            &core.log,
+            "s1",
+            &format!("turn {i} never landed through the flapping link"),
+            |events| support::chunks_saying(events, &wanted) == 1,
+        )
+        .await;
+    }
+
+    // Turn five's billing closes the ledger; then the whole history is held
+    // to exactly-once, per turn and per marker.
+    let events = support::log_until(
+        &core.log,
+        "s1",
+        "the flapped conversation never billed all five turns",
+        |events| support::usage_counts_by_turn(events).len() >= 5,
+    )
+    .await;
+    for i in 1..=5_u32 {
+        assert_eq!(
+            support::chunks_saying(&events, &format!("flap-answer-{i}")),
+            1,
+            "every turn's answer must arrive exactly once across four flaps"
+        );
+    }
+    support::assert_usage_exactly_once(&events, "five turns over a flapping link");
+    assert_eq!(
+        support::lifecycle_count(&events, "agent-1", "placed on this worker"),
+        1,
+        "four reconnects, one spawn"
+    );
+
+    worker.abort();
+}
+
 /// The same wire, attacked at the byte level: the cut is armed by *budget*,
 /// so the partition lands somewhere inside a gRPC frame nobody chose — and
 /// recovery must still be exact. This is the injector's deterministic

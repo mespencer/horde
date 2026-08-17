@@ -18,34 +18,11 @@
 //! (so its spawn command can never have been applied), and only then does
 //! SIGKILL land.
 
-use horde_proto::v1::event::Kind;
-use horde_proto::v1::{AgentId, Assignment, AssignmentSent, Event, PlacementState};
-use horde_server::EventLog;
+use horde_proto::v1::PlacementState;
 
 use horde_fault::{TurnSpec, WorkerProcess, WorkerRunnerConfig};
 
 use crate::support;
-
-/// Appends the `AssignmentSent` a control-plane send would journal — the
-/// message that both (a) triggers loss detection when its command cannot be
-/// sent, and (b) revives the agent when the worker returns.
-async fn send_assignment_event(log: &EventLog, session: &str, agent: &str, text: &str) {
-    let event = Event {
-        agent_id: Some(AgentId::new(agent)),
-        occurred_at: None,
-        idempotency_key: format!("{agent}:assign:{text}"),
-        kind: Some(Kind::AssignmentSent(AssignmentSent {
-            from: None,
-            assignment: Some(Assignment {
-                assignment_id: None,
-                text: text.to_owned(),
-                payload: None,
-            }),
-            delivery: 0,
-        })),
-    };
-    support::append_event(log, session, event).await;
-}
 
 /// The runner's script. Index 0 is the victim turn (opens, then stalls far
 /// past the test — it dies half-journaled, and its ordinal is the one
@@ -116,7 +93,7 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
     // The revival assignment. Its DeliverMessage command is also the next
     // send on worker-a's command stream — the send whose failure is how the
     // server learns the worker is lost (nothing here runs on a timer).
-    send_assignment_event(&core.log, "s1", "agent-1", "are you alive?").await;
+    support::send_assignment(&core.log, "s1", "agent-1", "are you alive?").await;
 
     // Loss detected: the never-started agent is re-queued. The mid-turn
     // agent must NOT be — a disconnect is a partition, not a death.

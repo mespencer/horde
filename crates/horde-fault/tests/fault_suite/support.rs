@@ -256,6 +256,29 @@ pub(crate) async fn proxied_core() -> (horde_server::ServerCore, horde_testkit::
     (core, proxy)
 }
 
+/// Appends the `AssignmentSent` a control-plane send would journal — the
+/// standard way a scenario gives an agent its next turn, and (for a lost
+/// worker) the send whose undeliverable command is how the loss surfaces.
+pub(crate) async fn send_assignment(log: &EventLog, session: &str, agent: &str, text: &str) {
+    use horde_proto::v1::{AgentId, Assignment, AssignmentSent};
+
+    let event = Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: format!("{agent}:assign:{text}"),
+        kind: Some(Kind::AssignmentSent(AssignmentSent {
+            from: None,
+            assignment: Some(Assignment {
+                assignment_id: None,
+                text: text.to_owned(),
+                payload: None,
+            }),
+            delivery: 0,
+        })),
+    };
+    append_event(log, session, event).await;
+}
+
 /// Appends one already-shaped event to `session`, keyed by the event's own
 /// idempotency key — the arrangement half of "an observed fact is on the
 /// log", shared so the suites do not each restate the append envelope.
