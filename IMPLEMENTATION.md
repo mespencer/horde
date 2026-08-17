@@ -20,29 +20,30 @@ Working agreement for building Horde to the end state in [DESIGN.md](./DESIGN.md
 
 Dependencies flow downward; items within a wave run in parallel worktrees.
 
-| Wave | Item | Depends on |
-|---|---|---|
-| 1 | **W1a** Workspace scaffold + gauntlet (all gates blocking, self-passing) | — |
-| 1 | **W1b** Proto contracts (buf + tonic-prost `horde-proto`) | — |
-| 1 | **W1c** Spike: drive `claude` via stream-json (ADR-0003; golden transcripts; verdict incl. fallback to Agent SDK/ACP) | — |
-| 2 | Event log + server core (SQLite, sessions/agents/events, sync-from-offset) | W1a, W1b |
-| 2 | Adapter trait + FakeAdapter + `horde-testkit` | W1a, W1c verdict |
-| 2 | Spike: Codex CLI for GPT-subscription agents (prepare for all outcomes, like W1c) | W1a |
-| 3 | Worker core (process supervision, journaling, worker↔server stream) | wave 2 |
-| 3 | Agent MCP endpoint (spawn/assign/note/result, ancestry, payload auto-detect) | wave 2 |
-| 3 | Client CLI verbs (new/attach headless, sessions, approve) | wave 2 |
-| 4 | Scheduler/placement + workspaces (definitions/instances, checkout policies) | wave 3 |
-| 4 | Git relay + share resolution (same-clone / same-worker / cross-worker) | wave 3 |
-| 4 | Permission chain (deny → allow → judge → human; routing incl. tree path) | wave 3 |
-| 4 | TUI (session view, attach, inbox; insta snapshots) | wave 3 |
-| 5 | Claude adapter productionized (from W1c) + revival/steering/interrupt | wave 3–4 |
-| 5 | Codex/GPT adapter productionized (from wave-2 spike) | wave 3–4 |
-| 5 | Enrollment + mTLS everywhere | wave 4 |
-| 6 | MCP hub + `local` servers; blob store; usage/tiers/headroom; OTLP | wave 5 |
-| 7 | Fault-injection suite; Gherkin features; full e2e hardening; DESIGN.md conformance audit | all |
+| Wave | Item | Depends on | Status |
+|---|---|---|---|
+| 1 | **W1a** Workspace scaffold + gauntlet (all gates blocking, self-passing) | — | delivered |
+| 1 | **W1b** Proto contracts (buf + tonic-prost `horde-proto`) | — | delivered |
+| 1 | **W1c** Spike: drive `claude` via stream-json (ADR-0003; golden transcripts; verdict incl. fallback to Agent SDK/ACP) | — | delivered |
+| 2 | Event log + server core (SQLite, sessions/agents/events, sync-from-offset) | W1a, W1b | delivered |
+| 2 | Adapter trait + FakeAdapter + `horde-testkit` | W1a, W1c verdict | delivered |
+| 2 | Spike: Codex CLI for GPT-subscription agents (prepare for all outcomes, like W1c) | W1a | delivered |
+| 3 | Worker core (process supervision, journaling, worker↔server stream) | wave 2 | delivered |
+| 3 | Agent MCP endpoint (spawn/assign/note/result, ancestry, payload auto-detect) | wave 2 | delivered |
+| 3 | Client CLI verbs (new/attach headless, sessions, approve) | wave 2 | delivered |
+| 4 | Scheduler/placement + workspaces (definitions/instances, checkout policies) | wave 3 | delivered |
+| 4 | Git relay + share resolution (same-clone / same-worker / cross-worker) | wave 3 | delivered |
+| 4 | Permission chain (deny → allow → judge → human; routing incl. tree path) | wave 3 | delivered |
+| 4 | TUI (session view, attach, inbox; insta snapshots) | wave 3 | delivered |
+| 5 | Claude adapter productionized (from W1c) + revival/steering/interrupt | wave 3–4 | delivered |
+| 5 | Codex/GPT adapter productionized (from wave-2 spike) | wave 3–4 | delivered |
+| 5 | Enrollment + mTLS everywhere | wave 4 | delivered |
+| 6 | MCP hub + `local` servers; blob store; usage/tiers/headroom; OTLP | wave 5 | delivered |
+| 7 | Fault-injection suite; Gherkin features; full e2e hardening; DESIGN.md conformance audit | all | delivered (audit fixes in flight) |
+| 8 | Port forwards: expose/inject relayed through the server (ADR-0006) | wave 7 | — |
 
 Wave contents will be refined as reality reports back; the dependency spine holds.
 
 ## Status
 
-Tracked in the session task list (orchestrator-owned); this file records the plan, not live status.
+Tracked in the session task list (orchestrator-owned); this file records the plan and which waves have been delivered, not live task status.

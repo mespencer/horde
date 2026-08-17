@@ -84,8 +84,9 @@ message WorkspaceInstanceReport {
   google.protobuf.Timestamp observed_at = 7;
 }
 
-// Streamed while an Instance is being materialized, so `prewarm` is visible
-// rather than a silent wait.
+// Designed to stream while an Instance is being materialized, so `prewarm`
+// is visible rather than a silent wait (DESIGN §6). Not yet produced:
+// Workers currently report once, on completion, with no progress attached.
 message MaterializationProgress {
   // What is happening now, e.g. "cloning atlas".
   string step = 1;
