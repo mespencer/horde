@@ -1261,6 +1261,7 @@ dependencies = [
  "horde-relay",
  "horde-server",
  "horde-server-testkit",
+ "horde-testkit",
  "horde-wire",
  "rusqlite",
  "serde_json",

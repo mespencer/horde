@@ -4,9 +4,10 @@
 //! real `horde-worker` dials it — the dependency points this way only
 //! (`horde-server` knows nothing about the worker), the shape `horde-cli`'s
 //! tests already use. TCP rather than a duplex pair because the partition test
-//! needs a transport that can be *severed*: the [`harness::SeverableProxy`]
-//! sits in front of the listener with `cut()`/`heal()`, and is the seed of
-//! TESTING.md §2's fault injector.
+//! needs a transport that can be *severed*: a [`horde_testkit::FaultProxy`]
+//! sits in front of the listener with `cut()`/`heal()`. That proxy was seeded
+//! here as `SeverableProxy` and grew into TESTING.md §2's fault injector; the
+//! suite now uses the promoted instrument rather than a private copy.
 //!
 //! The two headline tests here are the ones the design documents by name:
 //! `a_real_worker_reconciles_its_applied_commands_after_a_restart` (marked as
@@ -23,9 +24,7 @@ use horde_worker::{Connection, Journal, Runtime};
 /// applies to helpers as well as to `#[test]` fns.
 #[cfg(test)]
 mod harness {
-    use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use horde_adapter::Adapter;
     use horde_proto::prost::Message;
@@ -38,7 +37,7 @@ mod harness {
     use horde_server::log::PendingEvent;
     use horde_server::service::{ServerCore, WorkerFacing};
     use horde_worker::{DialConfig, JournalEntry, Runtime, capabilities};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
     /// Serves the worker-facing service on a loopback port the OS picks.
@@ -59,79 +58,12 @@ mod harness {
         format!("http://{address}")
     }
 
-    /// A TCP proxy that can be severed and healed — the fault the partition
-    /// tests inject, and the seed of TESTING.md §2's network fault injector.
-    ///
-    /// `cut()` aborts every live relay (both sockets drop, so each side sees
-    /// the peer vanish mid-stream, exactly like a yanked cable) and refuses
-    /// new connections until `heal()`.
-    pub(crate) struct SeverableProxy {
-        endpoint: String,
-        severed: Arc<AtomicBool>,
-        live: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
-    }
-
-    impl SeverableProxy {
-        /// Starts a proxy in front of `upstream` (an `http://addr` endpoint).
-        pub(crate) async fn front(upstream: &str) -> SeverableProxy {
-            let upstream: SocketAddr = upstream
-                .trim_start_matches("http://")
-                .parse()
-                .expect("an upstream socket address");
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("a loopback port");
-            let address = listener.local_addr().expect("a bound address");
-
-            let severed = Arc::new(AtomicBool::new(false));
-            let live = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let accept_severed = Arc::clone(&severed);
-            let accept_live = Arc::clone(&live);
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut inbound, _)) = listener.accept().await else {
-                        return;
-                    };
-                    if accept_severed.load(Ordering::SeqCst) {
-                        // The network is down; the connection dies at once.
-                        continue;
-                    }
-                    let relay = tokio::spawn(async move {
-                        let Ok(mut outbound) = TcpStream::connect(upstream).await else {
-                            return;
-                        };
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                    });
-                    accept_live
-                        .lock()
-                        .expect("an unpoisoned proxy")
-                        .push(relay.abort_handle());
-                }
-            });
-
-            SeverableProxy {
-                endpoint: format!("http://{address}"),
-                severed,
-                live,
-            }
-        }
-
-        pub(crate) fn endpoint(&self) -> String {
-            self.endpoint.clone()
-        }
-
-        /// Severs every live connection and refuses new ones.
-        pub(crate) fn cut(&self) {
-            self.severed.store(true, Ordering::SeqCst);
-            for relay in self.live.lock().expect("an unpoisoned proxy").drain(..) {
-                relay.abort();
-            }
-        }
-
-        /// Lets new connections through again.
-        pub(crate) fn heal(&self) {
-            self.severed.store(false, Ordering::SeqCst);
-        }
+    /// The promoted fault injector, severing and healing exactly as the
+    /// `SeverableProxy` that was seeded here did.
+    pub(crate) async fn front(upstream: &str) -> horde_testkit::FaultProxy {
+        horde_testkit::FaultProxy::front(upstream)
+            .await
+            .expect("the fault proxy binds")
     }
 
     /// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
@@ -462,7 +394,7 @@ async fn a_real_worker_reconciles_its_applied_commands_after_a_restart() {
 async fn a_partitioned_worker_journals_locally_and_reconciles_on_reconnect() {
     let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
     let upstream = harness::serve(core.clone()).await;
-    let proxy = harness::SeverableProxy::front(&upstream).await;
+    let proxy = harness::front(&upstream).await;
     let journal = Journal::in_memory().expect("an in-memory journal");
     let sink = journal.sink();
 
@@ -607,7 +539,7 @@ async fn the_real_claude_path_streams_a_turn_into_the_server_log() {
 async fn the_proxy_severs_on_cut_and_carries_again_on_heal() {
     let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
     let upstream = harness::serve(core.clone()).await;
-    let proxy = harness::SeverableProxy::front(&upstream).await;
+    let proxy = harness::front(&upstream).await;
     let config = harness::bare_config(&proxy.endpoint(), "worker-a");
 
     let (connection, _) = Connection::dial(&config)
