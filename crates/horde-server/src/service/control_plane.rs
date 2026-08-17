@@ -836,7 +836,10 @@ impl ControlPlaneService for ControlPlane {
                 idempotency_key: request.idempotency_key.clone(),
                 kind: Some(Kind::AgentSpawned(AgentSpawned {
                     parent_agent_id: parent.clone().map(AgentId::new),
-                    spawned_by: None,
+                    // A client identity, or nothing: an MCP-initiated spawn
+                    // arrives over the worker's channel and its true actor is
+                    // the parent agent, which `parent_agent_id` already names.
+                    spawned_by: actor,
                     spec: Some(spec.clone()),
                     tree_path: Vec::new(),
                 })),

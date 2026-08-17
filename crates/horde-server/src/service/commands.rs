@@ -54,7 +54,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use horde_proto::v1::{
-    AgentId, CancelPlacementCommand, DeliverMessageCommand, DeliverPermissionDecisionCommand,
+    AgentId, ArchiveAgentCommand, CancelPlacementCommand, DeliverMessageCommand,
+    DeliverPermissionDecisionCommand,
     Event, InterruptAgentCommand, MaterializeWorkspaceCommand, Placement, PlacementState,
     SessionId, SpawnAgentCommand, StreamCommandsResponse, WorkspaceDefinition,
     deliver_message_command, event::Kind, stream_commands_response::Command,
@@ -211,6 +212,14 @@ impl CommandProjection {
                 let issued = self.issue(&worker_id, &global.event, command, MAIN);
                 vec![(worker_id, issued)]
             }
+            // Archive finally has a producer (fix a7): archiving the session
+            // folds into an ArchiveAgentCommand for each of its placed
+            // agents. Context dies at archive, not at result (DESIGN §5),
+            // and before this arm `ArchiveAgentCommand` was honored by every
+            // worker and issued by nobody.
+            (Some(Kind::SessionLifecycleChanged(changed)), _) => {
+                self.archive_commands(global, &changed)
+            }
             (Some(Kind::PermissionDecided(decided)), Some(agent_id)) => {
                 let (Some(decision), Some(worker_id)) =
                     (decided.decision, self.placed.get(&agent_id).cloned())
@@ -280,6 +289,51 @@ impl CommandProjection {
         });
         let issued = self.issue(&worker_id, &global.event, command, MAIN);
         vec![(worker_id, issued)]
+    }
+
+    /// The archive commands one session-archive event causes: every placed
+    /// agent of the archived session is archived on its worker.
+    ///
+    /// Each command's id carries the agent's own suffix — one event causes
+    /// as many commands as the session has placed agents, and two commands
+    /// under one id would be one command redelivered. The agents leave both
+    /// maps: an archived agent must take no later deliveries here, and the
+    /// worker's own bookkeeping forgets it on apply.
+    fn archive_commands(
+        &mut self,
+        global: &GlobalEvent,
+        changed: &horde_proto::v1::SessionLifecycleChanged,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        if changed.state != i32::from(horde_proto::v1::SessionLifecycleState::Archived) {
+            return Vec::new();
+        }
+        let session_id = &global.event.session_id;
+        let archived: Vec<String> = self
+            .spawned
+            .iter()
+            .filter(|(_, details)| &details.session_id == session_id)
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+
+        let mut commands = Vec::new();
+        for agent_id in archived {
+            self.spawned.remove(&agent_id);
+            let Some(worker_id) = self.placed.remove(&agent_id) else {
+                continue; // Queued or never placed: nobody is running it.
+            };
+            let command = Command::ArchiveAgent(ArchiveAgentCommand {
+                agent_id: Some(AgentId::new(agent_id.clone())),
+                reason: if changed.reason.is_empty() {
+                    "the session was archived".to_owned()
+                } else {
+                    changed.reason.clone()
+                },
+            });
+            let suffix = format!(":archive:{agent_id}");
+            let issued = self.issue(&worker_id, &global.event, command, &suffix);
+            commands.push((worker_id, issued));
+        }
+        commands
     }
 
     /// The commands one placement transition causes.
@@ -758,6 +812,99 @@ mod tests {
         rows.iter()
             .flat_map(|global| projection.advance(global))
             .collect()
+    }
+
+    /// Archiving a session archives its placed agents where they run (fix
+    /// a7) — and only its own: a sibling session's agents, and its own
+    /// queued ones, take no command. Each command carries its agent's own
+    /// id-suffix so one event's several commands stay several, and a later
+    /// message to an archived agent folds into nothing.
+    #[test]
+    fn archiving_a_session_archives_its_placed_agents_and_only_those() {
+        let archive = |row_at: u64, session: &str| {
+            row(
+                row_at,
+                session,
+                row_at,
+                Event {
+                    agent_id: None,
+                    occurred_at: None,
+                    idempotency_key: String::new(),
+                    kind: Some(Kind::SessionLifecycleChanged(
+                        horde_proto::v1::SessionLifecycleChanged {
+                            previous_state: horde_proto::v1::SessionLifecycleState::Active as i32,
+                            state: horde_proto::v1::SessionLifecycleState::Archived as i32,
+                            reason: "done with it".to_owned(),
+                        },
+                    )),
+                },
+            )
+        };
+
+        let mut rows = placed_agent(1, "s1", "agent-a", "worker-1");
+        rows.extend(placed_agent(3, "s1", "agent-b", "worker-2"));
+        rows.extend(placed_agent(5, "s2", "agent-c", "worker-1"));
+        // A queued agent of s1: spawned, never placed.
+        rows.push(row(7, "s1", 7, spawn_event("agent-q", None)));
+        rows.push(archive(8, "s1"));
+        // A message for an archived agent must fold into nothing.
+        rows.push(row(
+            9,
+            "s1",
+            9,
+            Event {
+                agent_id: Some(AgentId::new("agent-a")),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(Kind::AssignmentSent(horde_proto::v1::AssignmentSent {
+                    from: None,
+                    assignment: Some(horde_proto::v1::Assignment {
+                        assignment_id: None,
+                        text: "too late".to_owned(),
+                        payload: None,
+                    }),
+                    delivery: DeliveryMode::TurnBoundary as i32,
+                })),
+            },
+        ));
+
+        let commands = fold(&rows);
+        let archives: Vec<(&str, String)> = commands
+            .iter()
+            .filter_map(|(worker, issued)| match &issued.command {
+                Some(Command::ArchiveAgent(archive)) => Some((
+                    worker.as_str(),
+                    archive.agent_id.as_ref().map(ToString::to_string)?,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            archives,
+            vec![
+                ("worker-1", "agent-a".to_owned()),
+                ("worker-2", "agent-b".to_owned()),
+            ],
+            "each placed agent of s1, on its own worker, and nobody else"
+        );
+        let ids: std::collections::BTreeSet<&str> = commands
+            .iter()
+            .filter(|(_, issued)| {
+                matches!(&issued.command, Some(Command::ArchiveAgent(_)))
+            })
+            .map(|(_, issued)| issued.command_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2, "one event, two commands, two ids");
+
+        assert!(
+            !commands.iter().any(|(_, issued)| matches!(
+                &issued.command,
+                Some(Command::DeliverMessage(deliver))
+                    if deliver.agent_id.as_ref().map(ToString::to_string)
+                        == Some("agent-a".to_owned())
+            )),
+            "a message after the archive has nobody to reach: {commands:?}"
+        );
     }
 
     /// All four corners. Inline as `state == Placed && worker.is_some()` these
