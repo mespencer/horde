@@ -7,11 +7,14 @@
 //! `join` flow). Identities exist here exclusively by being issued through
 //! the production path: a mint through the authority, a join over the real
 //! enrollment listener. There are no fixture certificates anywhere in this
-//! workspace to rot.
+//! workspace to rot — the process-wide trust root below
+//! reuses what the production path issued, never a baked artifact.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use horde_identity::{JoinCode, Principal, PrincipalRole, StoredIdentity};
+use horde_identity::{
+    CertificateAuthority, JoinCode, Principal, PrincipalRole, ServerCredential, StoredIdentity,
+};
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{Hello, Role};
 use horde_server::service::enrollment::{EnrollmentAuthority, wall_clock_ms};
@@ -88,13 +91,54 @@ pub async fn serve_secured_with_blob_store(blob_root: &std::path::Path) -> Setup
     serve_secured_with_blobs(Some(Arc::new(store))).await
 }
 
+/// The process-wide trust root every secured harness shares.
+///
+/// Generated once per test process through the production path — a real
+/// [`CertificateAuthority::generate`], persisted with the same `persist` a
+/// first server boot uses — and reloaded per harness through
+/// [`CertificateAuthority::load`], the production restart path. One root per
+/// process instead of one per test because every secured test repeats the
+/// mint otherwise. Suites whose subject is the trust material itself — a
+/// foreign CA, a fingerprint mismatch — build their own CA and are
+/// untouched by this.
+struct TrustRoot {
+    /// Held for the process's life so the CA files stay loadable.
+    directory: tempfile::TempDir,
+    /// The one localhost listener credential every harness presents. Its
+    /// fields are cloned out rather than the struct because
+    /// [`ServerCredential`] is a pair of PEM strings without a `Clone`.
+    certificate_pem: String,
+    key_pem: String,
+}
+
+fn trust_root() -> Setup<&'static TrustRoot> {
+    static ROOT: OnceLock<Result<TrustRoot, String>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let now = wall_clock_ms();
+        let ca = CertificateAuthority::generate(now).map_err(|e| e.to_string())?;
+        let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+        ca.persist(directory.path()).map_err(|e| e.to_string())?;
+        let credential = ca.issue_localhost_server(now).map_err(|e| e.to_string())?;
+        Ok(TrustRoot {
+            directory,
+            certificate_pem: credential.certificate_pem,
+            key_pem: credential.key_pem,
+        })
+    })
+    .as_ref()
+    .map_err(|error| format!("the shared trust root failed to build: {error}").into())
+}
+
 async fn serve_secured_with_blobs(
     blobs: Option<Arc<horde_server::blob::BlobStore>>,
 ) -> Setup<SecureHarness> {
     let log = EventLog::in_memory()?;
-    let now = wall_clock_ms();
-    let ca = horde_identity::CertificateAuthority::generate(now)?;
-    let credential = ca.issue_localhost_server(now)?;
+    let root = trust_root()?;
+    let ca = CertificateAuthority::load(root.directory.path())?;
+    let credential = ServerCredential {
+        certificate_pem: root.certificate_pem.clone(),
+        key_pem: root.key_pem.clone(),
+    };
     let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
 
     let mut core = ServerCore::new(log.clone());

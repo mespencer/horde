@@ -158,3 +158,30 @@ fn the_hello_helper_speaks_the_role_it_was_asked_for() {
     let client = hello(PrincipalRole::Client, "laptop");
     assert_eq!(client.role, horde_proto::v1::Role::Client as i32);
 }
+
+/// Two harnesses in one process share one trust root — the relation two
+/// boots of one production server have to one persisted CA, reached here
+/// through the same `persist`/`load` pair. Proven by effect, in both
+/// directions of trust: an identity enrolled through the first harness is
+/// admitted by the *second* harness's interceptor, and the second harness's
+/// listener certificate satisfies the first identity's stored CA. A harness
+/// that quietly regenerated its root per test would refuse this dial.
+#[tokio::test]
+async fn harnesses_share_one_trust_root_across_the_process() -> Setup<()> {
+    let first = serve_secured().await?;
+    let second = serve_secured().await?;
+
+    let identity = within(
+        "the join through the first harness",
+        first.enroll(PrincipalRole::Client, "laptop"),
+    )
+    .await??;
+
+    let mut client = second.client(&identity).await?;
+    let server = within("the cross-harness handshake", client.hello("0.1.0")).await??;
+    assert!(
+        !server.semver.is_empty(),
+        "the second harness must answer a verb for the first harness's identity"
+    );
+    Ok(())
+}

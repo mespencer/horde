@@ -17,11 +17,13 @@ horde-identity = { workspace = true }
 horde-observe = { workspace = true }
 horde-proto = { workspace = true }
 horde-server = { workspace = true }
+# The secured harness's process-wide trust root persists its CA into a
+# throwaway directory it holds for the process's life — and the blob-store
+# harness tests root their stores the same way.
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "process", "rt", "sync"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ring"] }
 
 [dev-dependencies]
-# The blob-store harness tests root their stores in throwaway directories.
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
