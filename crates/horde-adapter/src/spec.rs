@@ -99,7 +99,16 @@ pub enum McpEndpoint {
     /// A child process speaking MCP over stdio.
     Stdio { command: String, args: Vec<String> },
     /// An HTTP service the Worker already hosts.
-    Http { url: String },
+    Http {
+        url: String,
+        /// Headers the harness must send on **every** request — the per-agent
+        /// identity pair (`Authorization: Bearer …`, `X-Horde-Agent: …`) the
+        /// endpoint's gate validates before rmcp sees anything. Both harnesses
+        /// carry arbitrary headers (Claude via `--mcp-config`, Codex via
+        /// `http_headers`), which is why this is a header list rather than a
+        /// token field.
+        headers: Vec<(String, String)>,
+    },
 }
 
 /// A message sent into a running agent.

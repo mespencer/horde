@@ -81,9 +81,23 @@ impl ClaudeAdapter {
             args.push("--append-system-prompt".to_owned());
             args.push(overlay.clone());
         }
-        if let Some(tool) = &self.permission_prompt_tool {
+        // The endpoint from the spec is the production wire (the Worker mints
+        // one per agent); the constructor option remains for callers that
+        // configure the tool without an endpoint (the live smoke).
+        if let Some(config) = mcp_config_for(spec.horde_endpoint.as_ref()) {
+            args.push("--mcp-config".to_owned());
+            args.push(config);
+        }
+        let prompt_tool = match (&self.permission_prompt_tool, &spec.horde_endpoint) {
+            (Some(tool), _) => Some(tool.clone()),
+            // The verb is served as `approve` on the endpoint named `horde`;
+            // the harness addresses it by its namespaced MCP name.
+            (None, Some(_)) => Some("mcp__horde__approve".to_owned()),
+            (None, None) => None,
+        };
+        if let Some(tool) = prompt_tool {
             args.push("--permission-prompt-tool".to_owned());
-            args.push(tool.clone());
+            args.push(tool);
             // ADR-0003 (re-verified 2026-08-11): ambient settings allowlists
             // decide a tool call BEFORE the permission tool ever sees it — an
             // allowed call executes with no prompt, no denial, and no event.
@@ -221,6 +235,34 @@ impl LiveClaudeSession {
         }
         AdapterError::HarnessExited { exit_code }
     }
+}
+
+/// The `--mcp-config` JSON handing one agent its Horde endpoint.
+///
+/// Inline JSON rather than a file: `CLAUDE_CONFIG_DIR` is shared by every
+/// agent on the same Provider Account, and a config file written there by one
+/// spawn would race every concurrent one — the same reasoning as Codex's
+/// per-process `-c` overrides. The identity headers ride the entry because
+/// the endpoint's gate refuses any request without them.
+fn mcp_config_for(endpoint: Option<&horde_adapter::McpEndpoint>) -> Option<String> {
+    let horde_adapter::McpEndpoint::Http { url, headers } = endpoint? else {
+        // The stdio shape is Codex vocabulary; the Worker serves Claude over
+        // HTTP. Refusing to render it would fail the spawn for a shape nobody
+        // produces — leaving it unwired is the honest no-op.
+        return None;
+    };
+    let headers: serde_json::Map<String, serde_json::Value> = headers
+        .iter()
+        .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    Some(
+        serde_json::json!({
+            "mcpServers": {
+                "horde": { "type": "http", "url": url, "headers": headers }
+            }
+        })
+        .to_string(),
+    )
 }
 
 /// What a dead harness left on stderr, or `None` when it left nothing.
@@ -423,6 +465,76 @@ mod tests {
             !plain.iter().any(|a| a == "--settings"),
             "no chain means no override, not an empty one"
         );
+    }
+
+    /// The production wire: a spec carrying the Worker-minted endpoint gets
+    /// the `--mcp-config` entry (identity headers included), the namespaced
+    /// permission prompt tool, and the ADR-0003 settings hardening — all
+    /// three, because any one missing silently disarms the §10 chain.
+    #[test]
+    fn a_spec_with_an_endpoint_wires_the_mcp_config_and_the_chain() {
+        let spec = AgentSpec {
+            horde_endpoint: Some(horde_adapter::McpEndpoint::Http {
+                url: "http://127.0.0.1:8931/mcp".to_owned(),
+                headers: vec![
+                    ("Authorization".to_owned(), "Bearer tok-1".to_owned()),
+                    ("X-Horde-Agent".to_owned(), "agent-1".to_owned()),
+                ],
+            }),
+            ..AgentSpec::default()
+        };
+        let args = ClaudeAdapter::new().base_args(&spec);
+        let joined = args.join(" ");
+
+        let config_index = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .unwrap_or_else(|| panic!("--mcp-config must be emitted: {joined}"));
+        let config: serde_json::Value = serde_json::from_str(&args[config_index + 1])
+            .expect("the mcp config is inline JSON");
+        assert_eq!(config["mcpServers"]["horde"]["type"], "http");
+        assert_eq!(
+            config["mcpServers"]["horde"]["url"],
+            "http://127.0.0.1:8931/mcp"
+        );
+        assert_eq!(
+            config["mcpServers"]["horde"]["headers"]["Authorization"],
+            "Bearer tok-1",
+            "without the identity pair every request is refused 401"
+        );
+        assert_eq!(
+            config["mcpServers"]["horde"]["headers"]["X-Horde-Agent"],
+            "agent-1"
+        );
+
+        assert!(
+            joined.contains("--permission-prompt-tool mcp__horde__approve"),
+            "the approve verb is addressed by its namespaced MCP name: {joined}"
+        );
+        assert!(
+            joined.contains(r#"--settings {"permissions":{"allow":[],"deny":[]}}"#),
+            "an endpoint without the settings hardening lets ambient allowlists \
+             bypass the chain: {joined}"
+        );
+        assert!(joined.contains("--permission-mode manual"), "{joined}");
+    }
+
+    /// A configured prompt tool (the live-smoke shape) outranks the derived
+    /// name, and a spec without an endpoint changes nothing.
+    #[test]
+    fn the_constructor_prompt_tool_outranks_the_derived_name() {
+        let mut adapter = ClaudeAdapter::new();
+        adapter.permission_prompt_tool = Some("mcp__custom__gate".to_owned());
+        let spec = AgentSpec {
+            horde_endpoint: Some(horde_adapter::McpEndpoint::Http {
+                url: "http://127.0.0.1:8931/mcp".to_owned(),
+                headers: Vec::new(),
+            }),
+            ..AgentSpec::default()
+        };
+        let joined = adapter.base_args(&spec).join(" ");
+        assert!(joined.contains("--permission-prompt-tool mcp__custom__gate"));
+        assert!(!joined.contains("mcp__horde__approve"));
     }
 
     /// Both directions of the stderr distinction: a silent death reports no
