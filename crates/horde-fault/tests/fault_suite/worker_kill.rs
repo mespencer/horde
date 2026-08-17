@@ -162,7 +162,10 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
         &core.log,
         "s1",
         "the revival never answered through the second life",
-        |events| support::chunks_saying(events, "revived-answer") == 1,
+        |events| {
+            support::chunks_saying(events, "revived-answer") == 1
+                && !support::usage_counts_by_turn(events).is_empty()
+        },
     )
     .await;
     assert_eq!(

@@ -102,10 +102,13 @@ fn decode_turn(spec: &str) -> Result<ScriptedTurn, Refusal> {
             let stall_ms: u64 = stall_ms
                 .parse()
                 .map_err(|_| format!("{stall_ms:?} is not a stall in milliseconds"))?;
+            // The answer is spoken as a chunk after the stall as well as
+            // closing the turn, so a suite can watch for it in the log.
             Ok(ScriptedTurn {
                 steps: vec![
                     Step::Say((*opener).to_owned()),
                     Step::Stall(Duration::from_millis(stall_ms)),
+                    Step::Say((*answer).to_owned()),
                 ],
                 ..ScriptedTurn::saying(*answer)
             })
