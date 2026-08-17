@@ -1160,6 +1160,7 @@ impl ControlPlaneService for ControlPlane {
         let Some(authority) = self.enrollment.as_ref() else {
             return Err(ServerError::Unimplemented("enrollment on this listener").into());
         };
+        require_client_role(&request, "mint enrollment codes")?;
         let request = request.into_inner();
 
         let role = crate::enrollment::role_from_wire(request.role)
@@ -1196,6 +1197,7 @@ impl ControlPlaneService for ControlPlane {
         let Some(authority) = self.enrollment.as_ref() else {
             return Err(ServerError::Unimplemented("enrollment on this listener").into());
         };
+        require_client_role(&request, "revoke enrollment")?;
         let request = request.into_inner();
 
         use horde_proto::v1::revoke_enrollment_request::Principal as Wire;
@@ -1313,6 +1315,38 @@ impl ControlPlaneService for ControlPlane {
             accounts,
         }))
     }
+}
+
+/// Requires the caller's certificate to name a Client principal.
+///
+/// Mint and revoke are *operator* verbs (DESIGN §3, wave-7 fix a3): a worker
+/// certificate must not be able to mint codes for any role or revoke every
+/// client. The interceptor stamped the verified [`PeerIdentity`] into the
+/// request extensions; an absent identity means this request did not come
+/// through the mTLS door at all, which is the same refusal — this check runs
+/// only on servers whose enrollment authority is live, and those always
+/// front their control plane with the interceptor.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the caller and the verb it may not use.
+fn require_client_role<T>(request: &Request<T>, verb: &str) -> Result<(), Status> {
+    let identity = request
+        .extensions()
+        .get::<horde_identity::PeerIdentity>()
+        .ok_or_else(|| {
+            Status::permission_denied(format!(
+                "only an enrolled client may {verb}; this channel carries no peer identity"
+            ))
+        })?;
+    if identity.principal.role() != horde_identity::PrincipalRole::Client {
+        return Err(Status::permission_denied(format!(
+            "only an enrolled client may {verb}; {} is a {}",
+            identity.principal,
+            identity.principal.role()
+        )));
+    }
+    Ok(())
 }
 
 /// A unique-enough identifier without pulling in a uuid dependency.

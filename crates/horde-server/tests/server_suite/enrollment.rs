@@ -444,31 +444,49 @@ async fn the_enrollment_stream_is_not_a_session() -> Setup<()> {
 #[tokio::test]
 async fn the_worker_role_cannot_walk_through_the_client_door() -> Setup<()> {
     // A worker certificate is a valid certificate — the interceptor admits
-    // it to the channel. What it cannot do is *mint*: minting requires
-    // nothing today beyond enrollment, so this pins the current truth that
-    // any enrolled principal may mint (DESIGN §3 says clients enroll and
-    // workers enroll but not who may mint; flagged in the wave report), and
-    // it proves a worker identity at least authenticates rather than erroring.
+    // it to the channel. What it may not do is *mint or revoke*: those are
+    // operator verbs (wave-7 fix a3), and before the role check a worker
+    // could mint codes for any role and revoke every client.
     let harness = serve_secured().await?;
     let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
 
     let channel = harness
         .main_endpoint_as(&worker_identity)?
         .connect()
         .await?;
-    let minted = within(
+    let mut control = ControlPlaneServiceClient::new(channel);
+    let refused = within(
         "the mint RPC under a worker identity",
-        ControlPlaneServiceClient::new(channel).mint_enrollment_code(MintEnrollmentCodeRequest {
+        control.mint_enrollment_code(MintEnrollmentCodeRequest {
             role: Role::Worker as i32,
             name: "gpu-box".to_owned(),
             ttl: None,
         }),
     )
-    .await??;
+    .await?
+    .expect_err("a worker identity must not mint");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
     assert!(
-        !minted.into_inner().code.is_empty(),
-        "today every enrolled principal may mint; if this starts failing, \
-         someone added the role check the wave report flags as open"
+        refused.message().contains("worker:mac-studio"),
+        "the refusal names the caller: {refused}"
     );
+
+    let refused = within(
+        "the revoke RPC under a worker identity",
+        control.revoke_enrollment(RevokeEnrollmentRequest {
+            principal: Some(revoke_enrollment_request::Principal::ClientId(
+                horde_proto::v1::ClientId::new("laptop"),
+            )),
+            reason: "a worker trying to revoke the operator".to_owned(),
+        }),
+    )
+    .await?
+    .expect_err("a worker identity must not revoke");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+    // And the client the worker aimed at still works — nothing was revoked.
+    let mut client = harness.client(&client_identity).await?;
+    within("the client's post-attempt handshake", client.hello("0.1.0")).await??;
     Ok(())
 }
