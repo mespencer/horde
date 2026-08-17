@@ -37,11 +37,18 @@ fn process_name_of(pid: u32) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-#[tokio::test]
-async fn the_reported_pid_names_the_runner_itself() {
+/// Both probes' opening move: a parked runner in its own tempdir, and the
+/// pid it reports.
+async fn spawned_probe() -> (tempfile::TempDir, WorkerProcess, u32) {
     let dir = tempfile::tempdir().expect("a tempdir");
     let worker = WorkerProcess::spawn(&parked_runner(&dir)).expect("the runner spawns");
     let pid = worker.id().expect("a live child has a pid");
+    (dir, worker, pid)
+}
+
+#[tokio::test]
+async fn the_reported_pid_names_the_runner_itself() {
+    let (_dir, worker, pid) = spawned_probe().await;
 
     let name = process_name_of(pid);
     assert!(
@@ -53,9 +60,7 @@ async fn the_reported_pid_names_the_runner_itself() {
 
 #[tokio::test]
 async fn kill_now_delivers_sigkill_and_reaps_before_returning() {
-    let dir = tempfile::tempdir().expect("a tempdir");
-    let worker = WorkerProcess::spawn(&parked_runner(&dir)).expect("the runner spawns");
-    let pid = worker.id().expect("a live child has a pid");
+    let (_dir, worker, pid) = spawned_probe().await;
 
     let ended = worker.kill_now().await.expect("the kill lands");
     assert_eq!(
