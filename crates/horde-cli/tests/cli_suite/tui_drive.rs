@@ -11,12 +11,10 @@
 //! The raw-terminal shell around this loop is exercised separately, by the
 //! pty suite in `tui_pty.rs`.
 
-mod common;
-
 use std::future::Future;
 use std::time::Duration;
 
-use common::{Setup, journal_event, seeded, serve};
+use crate::common::{Setup, journal_event, seeded, serve};
 use horde_cli::tui::drive;
 use horde_cli::{Client, ClientError};
 use horde_proto::v1::{

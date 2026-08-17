@@ -7,9 +7,7 @@
 //! client through [`horde_cli::Client::with_channel`] so that seam is covered
 //! too.
 
-mod common;
-
-use common::Setup;
+use crate::common::{self, Setup};
 use horde_cli::client::{PermissionAnswer, SyncOptions};
 use horde_cli::{Client, render};
 use horde_proto::v1::{DeliveryMode, PlacementState};

@@ -18,9 +18,7 @@ use horde_proto::v1::{
 use tokio_stream::StreamExt;
 use tonic::Code;
 
-mod common;
-
-use common::{Harness, Setup, connect, open_sync, seed};
+use crate::common::{Harness, Setup, connect, open_sync, seed};
 
 /// Every sequence in a session, read back through SyncEvents.
 async fn sequences(harness: &mut Harness, session_id: &str) -> Setup<Vec<u64>> {

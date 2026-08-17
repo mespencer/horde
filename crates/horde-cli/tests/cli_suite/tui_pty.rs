@@ -11,12 +11,10 @@
 //! Every read is a positive wait with a ceiling, asserting on the bytes that
 //! arrived; a child that outlives its ceiling is killed, not leaked.
 
-mod common;
-
 use std::io::Read;
 use std::time::Duration;
 
-use common::{Setup, seeded, serve};
+use crate::common::{Setup, seeded, serve};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 

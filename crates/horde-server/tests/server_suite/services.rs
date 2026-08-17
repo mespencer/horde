@@ -21,9 +21,7 @@ use tokio::io::DuplexStream;
 use tokio_stream::StreamExt;
 use tonic::Code;
 
-mod common;
-
-use common::{Harness, Setup, connect_to, connect_with_plane, core, open_sync, seed};
+use crate::common::{Harness, Setup, connect_to, connect_with_plane, core, open_sync, seed};
 use horde_server::service::ServerCore;
 
 /// Opens a journal stream and announces the worker's journal position.

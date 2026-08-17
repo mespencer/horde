@@ -543,7 +543,7 @@ async fn a_partitioned_worker_journals_locally_and_reconciles_on_reconnect() {
 /// because the command fold does not carry a binding yet.
 ///
 /// ```sh
-/// cargo test -p horde-worker --test connection -- --ignored --nocapture
+/// cargo test -p horde-worker --test worker_suite -- connection --ignored --nocapture
 /// ```
 #[tokio::test]
 #[ignore = "spends real tokens and needs a claude login"]

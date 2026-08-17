@@ -9,9 +9,6 @@ use std::path::PathBuf;
 use horde_worker::process::HarnessSpec;
 use horde_worker::{SupervisedHarness, SupervisorError};
 
-#[cfg(test)]
-mod support;
-
 /// Test-only fixtures.
 ///
 /// Wrapped in `#[cfg(test)]` so the workspace's `expect_used` exemption applies:
