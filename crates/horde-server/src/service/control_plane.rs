@@ -330,6 +330,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<CreateSessionRequest>,
     ) -> Result<Response<CreateSessionResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
 
         // The request-level workspace is consumed, not decoration: a client
@@ -380,7 +381,7 @@ impl ControlPlaneService for ControlPlane {
             idempotency_key: request.idempotency_key.clone(),
             kind: Some(Kind::AgentSpawned(AgentSpawned {
                 parent_agent_id: None,
-                spawned_by: None,
+                spawned_by: actor,
                 spec: Some(root_agent),
                 tree_path: vec![request.title.clone()],
             })),
@@ -602,6 +603,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<SendMessageRequest>,
     ) -> Result<Response<SendMessageResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let agent_id = request
             .to_agent_id
@@ -619,7 +621,7 @@ impl ControlPlaneService for ControlPlane {
                 assignment.assignment_id = Some(id.clone());
                 (
                     Kind::AssignmentSent(AssignmentSent {
-                        from: None,
+                        from: actor.clone(),
                         assignment: Some(assignment),
                         delivery: request.delivery,
                     }),
@@ -628,7 +630,7 @@ impl ControlPlaneService for ControlPlane {
             }
             Some(send_message_request::Body::Note(note)) => (
                 Kind::NoteSent(NoteSent {
-                    from: None,
+                    from: actor,
                     note: Some(note),
                     delivery: request.delivery,
                 }),
@@ -667,6 +669,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<InterruptAgentRequest>,
     ) -> Result<Response<InterruptAgentResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let agent_id = request
             .agent_id
@@ -683,6 +686,7 @@ impl ControlPlaneService for ControlPlane {
                 &session_id,
                 agent_id,
                 Kind::TurnInterrupted(horde_proto::v1::TurnInterrupted {
+                    requested_by: actor,
                     reason: request.reason,
                     ..horde_proto::v1::TurnInterrupted::default()
                 }),
@@ -698,6 +702,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<AnswerPermissionRequest>,
     ) -> Result<Response<AnswerPermissionResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let request_id = request
             .request_id
@@ -743,7 +748,7 @@ impl ControlPlaneService for ControlPlane {
                         request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
                         outcome: request.outcome,
                         decided_by: horde_proto::v1::PermissionLayer::Human as i32,
-                        decided_by_actor: None,
+                        decided_by_actor: actor,
                         reason: request.reason,
                         remember_for_session: request.remember_for_session,
                         // Carried through rather than dropped. Absence and an
@@ -767,6 +772,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<SpawnAgentRequest>,
     ) -> Result<Response<SpawnAgentResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let session_id = request
             .session_id
@@ -1358,6 +1364,26 @@ impl ControlPlaneService for ControlPlane {
     }
 }
 
+/// The actor a request's channel identity names, for event attribution.
+///
+/// Multi-attach is why this exists: "the user did it" is not specific enough
+/// once several clients can drive one session (`id.proto`, wave-7 fix a13).
+/// A client certificate names the client; a worker channel is a *conduit* —
+/// the true actor is an agent the request does not name — so it attributes
+/// nothing rather than crediting the machine. Plaintext test channels carry
+/// no identity and attribute nothing either.
+fn actor_of<T>(request: &Request<T>) -> Option<horde_proto::v1::Actor> {
+    let identity = request.extensions().get::<horde_identity::PeerIdentity>()?;
+    if identity.principal.role() != horde_identity::PrincipalRole::Client {
+        return None;
+    }
+    Some(horde_proto::v1::Actor {
+        actor: Some(horde_proto::v1::actor::Actor::ClientId(
+            horde_proto::v1::ClientId::new(identity.principal.name()),
+        )),
+    })
+}
+
 /// Refuses a spec naming a tier the catalog cannot resolve.
 ///
 /// At the RPC, not the fold: the fold is deterministic over the log and must
@@ -1436,4 +1462,44 @@ fn uuid_like() -> String {
     });
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::actor_of;
+    use horde_identity::{PeerIdentity, Principal, PrincipalRole};
+
+    fn request_as(role: Option<PrincipalRole>) -> tonic::Request<()> {
+        let mut request = tonic::Request::new(());
+        if let Some(role) = role {
+            request.extensions_mut().insert(PeerIdentity {
+                principal: Principal::new(role, "laptop").expect("a valid name"),
+                serial_hex: "aa".to_owned(),
+            });
+        }
+        request
+    }
+
+    /// Attribution's truth table (fix a13): a client certificate names the
+    /// client, a worker channel is a conduit and names nobody, and a
+    /// plaintext channel has nobody to name.
+    #[test]
+    fn only_a_client_identity_becomes_the_events_actor() {
+        let actor = actor_of(&request_as(Some(PrincipalRole::Client)))
+            .expect("a client identity attributes");
+        assert_eq!(
+            actor.actor,
+            Some(horde_proto::v1::actor::Actor::ClientId(
+                horde_proto::v1::ClientId::new("laptop")
+            ))
+        );
+
+        assert_eq!(
+            actor_of(&request_as(Some(PrincipalRole::Worker))),
+            None,
+            "a worker channel is a conduit; crediting the machine would be \
+             attributing the wrong thing"
+        );
+        assert_eq!(actor_of(&request_as(None)), None);
+    }
 }
