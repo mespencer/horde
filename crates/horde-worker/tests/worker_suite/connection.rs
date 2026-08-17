@@ -24,17 +24,12 @@ use horde_worker::{Connection, Journal, Runtime};
 /// applies to helpers as well as to `#[test]` fns.
 #[cfg(test)]
 mod harness {
-    use std::sync::Arc;
 
     use horde_adapter::Adapter;
     use horde_proto::prost::Message;
     use horde_proto::v1::worker_service_server::WorkerServiceServer;
-    use horde_proto::v1::{
-        AgentId, AgentSpawned, AgentSpec, Assignment, Event, Placement, PlacementChanged,
-        PlacementState, TurnInterrupted, WorkerId, event::Kind,
-    };
+    use horde_proto::v1::{Event, TurnInterrupted, event::Kind};
     use horde_server::EventLog;
-    use horde_server::log::PendingEvent;
     use horde_server::service::{ServerCore, WorkerFacing};
     use horde_worker::{DialConfig, JournalEntry, Runtime, capabilities};
     use tokio::net::TcpListener;
@@ -66,11 +61,8 @@ mod harness {
             .expect("the fault proxy binds")
     }
 
-    /// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
-    /// writes when the scheduler answers a spawn: placed on a worker when one
-    /// is given, queued when `None`. The placed pair is what the server's
-    /// command fold turns into this worker's `SpawnAgentCommand`, with the
-    /// implicit first assignment riding the spec.
+    /// Seeds an agent through the shared testkit helper, panicking on the
+    /// failures a precondition cannot survive.
     pub(crate) async fn seed_agent(
         log: &EventLog,
         session: &str,
@@ -78,51 +70,9 @@ mod harness {
         worker: Option<&str>,
         first_message: &str,
     ) {
-        let spawned = Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: format!("{agent}:spawned"),
-            kind: Some(Kind::AgentSpawned(AgentSpawned {
-                parent_agent_id: None,
-                spawned_by: None,
-                spec: Some(AgentSpec {
-                    initial_assignment: Some(Assignment {
-                        assignment_id: None,
-                        text: first_message.to_owned(),
-                        payload: None,
-                    }),
-                    ..AgentSpec::default()
-                }),
-                tree_path: Vec::new(),
-            })),
-        };
-        let state = match worker {
-            Some(_) => PlacementState::Placed,
-            None => PlacementState::Queued,
-        };
-        let placed = Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: format!("{agent}:placed"),
-            kind: Some(Kind::PlacementChanged(PlacementChanged {
-                placement: Some(Placement {
-                    agent_id: Some(AgentId::new(agent)),
-                    state: state.into(),
-                    worker_id: worker.map(WorkerId::new),
-                    reason: String::new(),
-                }),
-            })),
-        };
-        for event in [spawned, placed] {
-            log.append(PendingEvent {
-                session_id: session.to_owned(),
-                idempotency_key: event.idempotency_key.clone(),
-                payload: event.encode_to_vec(),
-                ..PendingEvent::default()
-            })
+        horde_server_testkit::seed_agent(log, session, agent, worker, first_message)
             .await
-            .expect("the seed event appends");
-        }
+            .expect("the seed events append");
     }
 
     /// [`seed_agent`], placed on `worker` — the common case.

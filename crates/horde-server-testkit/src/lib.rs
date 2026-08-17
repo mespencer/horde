@@ -111,8 +111,16 @@ pub async fn serve_with_permissions(
     serve_core(core).await
 }
 
-/// Serves both spines over a caller-built core.
-async fn serve_core(core: ServerCore) -> Setup<String> {
+/// Serves both spines over a caller-built core — for suites that need to keep
+/// the core's handles (the log to assert on, the registries to observe) while
+/// a real socket carries the traffic. The fault-injection suite fronts this
+/// endpoint with its proxy; [`serve`] and its siblings stay the one-liner for
+/// suites that only need the endpoint.
+///
+/// # Errors
+///
+/// The socket failing to bind.
+pub async fn serve_core(core: ServerCore) -> Setup<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
 
@@ -235,6 +243,95 @@ pub async fn journal_event_at(
 /// As [`journal_event_at`].
 pub async fn journal_event(endpoint: &str, session_id: &str, event: Event) -> Setup<()> {
     journal_event_at(endpoint, session_id, 1, event).await
+}
+
+/// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
+/// writes when the scheduler answers a spawn: placed on `worker` when one is
+/// given, queued when `None`. The placed pair is what the server's command
+/// fold turns into that worker's `SpawnAgentCommand`, with the implicit first
+/// assignment riding the spec.
+///
+/// This is precondition seeding for suites whose subject is what happens
+/// *after* placement — reconciliation, partitions, worker loss — not a second
+/// implementation of the placement pass, which appends through
+/// `horde_server::placement` and is tested there.
+///
+/// # Errors
+///
+/// Either append failing.
+pub async fn seed_agent(
+    log: &EventLog,
+    session: &str,
+    agent: &str,
+    worker: Option<&str>,
+    first_message: &str,
+) -> Setup<()> {
+    use horde_proto::prost::Message;
+    use horde_proto::v1::{
+        AgentId, AgentSpawned, AgentSpec, Assignment, Placement, PlacementChanged, PlacementState,
+        event::Kind,
+    };
+
+    let spawned = Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: format!("{agent}:spawned"),
+        kind: Some(Kind::AgentSpawned(AgentSpawned {
+            parent_agent_id: None,
+            spawned_by: None,
+            spec: Some(AgentSpec {
+                initial_assignment: Some(Assignment {
+                    assignment_id: None,
+                    text: first_message.to_owned(),
+                    payload: None,
+                }),
+                ..AgentSpec::default()
+            }),
+            tree_path: Vec::new(),
+        })),
+    };
+    let state = match worker {
+        Some(_) => PlacementState::Placed,
+        None => PlacementState::Queued,
+    };
+    let placed = Event {
+        agent_id: Some(AgentId::new(agent)),
+        occurred_at: None,
+        idempotency_key: format!("{agent}:placed"),
+        kind: Some(Kind::PlacementChanged(PlacementChanged {
+            placement: Some(Placement {
+                agent_id: Some(AgentId::new(agent)),
+                state: state.into(),
+                worker_id: worker.map(WorkerId::new),
+                reason: String::new(),
+            }),
+        })),
+    };
+    for event in [spawned, placed] {
+        log.append(horde_server::log::PendingEvent {
+            session_id: session.to_owned(),
+            idempotency_key: event.idempotency_key.clone(),
+            payload: event.encode_to_vec(),
+            ..horde_server::log::PendingEvent::default()
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// [`seed_agent`], placed on `worker` — the common case.
+///
+/// # Errors
+///
+/// As [`seed_agent`].
+pub async fn place_agent(
+    log: &EventLog,
+    session: &str,
+    agent: &str,
+    worker: &str,
+    first_message: &str,
+) -> Setup<()> {
+    seed_agent(log, session, agent, Some(worker), first_message).await
 }
 
 /// Creates a session, returning its id and its root agent's id.
