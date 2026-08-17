@@ -54,10 +54,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use horde_proto::v1::{
-    AgentId, CancelPlacementCommand, DeliverMessageCommand, DeliverPermissionDecisionCommand,
-    Event, InterruptAgentCommand, MaterializeWorkspaceCommand, Placement, PlacementState,
-    SessionId, SpawnAgentCommand, StreamCommandsResponse, WorkspaceDefinition,
-    deliver_message_command, event::Kind, stream_commands_response::Command,
+    AgentId, ArchiveAgentCommand, CancelPlacementCommand, DeliverMessageCommand,
+    DeliverPermissionDecisionCommand, Event, InterruptAgentCommand, MaterializeWorkspaceCommand,
+    Placement, PlacementState, SessionId, SpawnAgentCommand, StreamCommandsResponse,
+    WorkspaceDefinition, deliver_message_command, event::Kind, stream_commands_response::Command,
 };
 use prost::Message;
 use tokio::sync::broadcast;
@@ -211,6 +211,14 @@ impl CommandProjection {
                 let issued = self.issue(&worker_id, &global.event, command, MAIN);
                 vec![(worker_id, issued)]
             }
+            // Archive finally has a producer (fix a7): archiving the session
+            // folds into an ArchiveAgentCommand for each of its placed
+            // agents. Context dies at archive, not at result (DESIGN §5),
+            // and before this arm `ArchiveAgentCommand` was honored by every
+            // worker and issued by nobody.
+            (Some(Kind::SessionLifecycleChanged(changed)), _) => {
+                self.archive_commands(global, &changed)
+            }
             (Some(Kind::PermissionDecided(decided)), Some(agent_id)) => {
                 let (Some(decision), Some(worker_id)) =
                     (decided.decision, self.placed.get(&agent_id).cloned())
@@ -282,6 +290,51 @@ impl CommandProjection {
         vec![(worker_id, issued)]
     }
 
+    /// The archive commands one session-archive event causes: every placed
+    /// agent of the archived session is archived on its worker.
+    ///
+    /// Each command's id carries the agent's own suffix — one event causes
+    /// as many commands as the session has placed agents, and two commands
+    /// under one id would be one command redelivered. The agents leave both
+    /// maps: an archived agent must take no later deliveries here, and the
+    /// worker's own bookkeeping forgets it on apply.
+    fn archive_commands(
+        &mut self,
+        global: &GlobalEvent,
+        changed: &horde_proto::v1::SessionLifecycleChanged,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        if changed.state != i32::from(horde_proto::v1::SessionLifecycleState::Archived) {
+            return Vec::new();
+        }
+        let session_id = &global.event.session_id;
+        let archived: Vec<String> = self
+            .spawned
+            .iter()
+            .filter(|(_, details)| &details.session_id == session_id)
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+
+        let mut commands = Vec::new();
+        for agent_id in archived {
+            self.spawned.remove(&agent_id);
+            let Some(worker_id) = self.placed.remove(&agent_id) else {
+                continue; // Queued or never placed: nobody is running it.
+            };
+            let command = Command::ArchiveAgent(ArchiveAgentCommand {
+                agent_id: Some(AgentId::new(agent_id.clone())),
+                reason: if changed.reason.is_empty() {
+                    "the session was archived".to_owned()
+                } else {
+                    changed.reason.clone()
+                },
+            });
+            let suffix = format!(":archive:{agent_id}");
+            let issued = self.issue(&worker_id, &global.event, command, &suffix);
+            commands.push((worker_id, issued));
+        }
+        commands
+    }
+
     /// The commands one placement transition causes.
     ///
     /// A placement that lands an agent issues its spawn command; a placement
@@ -337,7 +390,7 @@ impl CommandProjection {
                         agent_id: Some(AgentId::new(agent_id)),
                         parent_agent_id: details.parent_agent_id.clone().map(AgentId::new),
                         spec: details.spec.clone(),
-                        binding: None,
+                        binding: binding_for(details.spec.as_ref()),
                         tree_path: details.tree_path.clone(),
                         prompt_overlay: String::new(),
                         local_mcp_servers: self.mcp_servers.local_servers_for(agent_type),
@@ -403,6 +456,39 @@ impl CommandProjection {
             // redelivery" has to mean once a redelivery can follow a restart.
             command_id: command_id(&cause.session_id, cause.sequence, role),
             command: Some(command),
+        }
+    }
+}
+
+/// The binding a spawn's model selection resolves to (W7b finding 5).
+///
+/// Deterministic over the spec alone, which is what a fold demands: a
+/// concrete request binds as itself; a tier binds its catalog's
+/// first-listed candidate. Account-aware selection (`options_for` /
+/// `select`, weighing advertised headroom) stays unfed until workers
+/// advertise accounts — feeding it a live registry here would make two
+/// folds of one log disagree. An unknown tier yields no binding rather
+/// than a panic: the RPC already refused unknown names, so hitting one
+/// means an older log, and the worker's default provider is the honest
+/// fallback.
+fn binding_for(spec: Option<&horde_proto::v1::AgentSpec>) -> Option<horde_proto::v1::ModelBinding> {
+    use horde_proto::v1::model_selection::Selection;
+    match spec?.model.as_ref()?.selection.as_ref()? {
+        Selection::Concrete(concrete) => Some(horde_proto::v1::ModelBinding {
+            tier: String::new(),
+            provider: concrete.provider.clone(),
+            model: concrete.model.clone(),
+            provider_account: String::new(),
+        }),
+        Selection::Tier(tier_name) => {
+            let catalog = crate::tiers::TierCatalog::shipped_defaults();
+            let candidate = catalog.get(tier_name)?.candidates.first()?.clone();
+            Some(horde_proto::v1::ModelBinding {
+                tier: tier_name.clone(),
+                provider: candidate.provider,
+                model: candidate.model,
+                provider_account: String::new(),
+            })
         }
     }
 }
@@ -642,6 +728,52 @@ mod tests {
         }
     }
 
+    /// The binding truth table (W7b finding 5): a concrete request binds as
+    /// itself, a tier binds its catalog's first candidate deterministically,
+    /// an unknown tier binds nothing rather than panicking a fold, and no
+    /// selection is no binding.
+    #[test]
+    fn a_spawns_model_selection_resolves_to_its_binding() {
+        use horde_proto::v1::model_selection::Selection;
+        let with_selection = |selection: Selection| AgentSpec {
+            model: Some(horde_proto::v1::ModelSelection {
+                selection: Some(selection),
+            }),
+            ..AgentSpec::default()
+        };
+
+        let concrete = super::binding_for(Some(&with_selection(Selection::Concrete(
+            horde_proto::v1::ConcreteModel {
+                provider: "claude".to_owned(),
+                model: "opus".to_owned(),
+                provider_account: String::new(),
+            },
+        ))))
+        .expect("a concrete request binds");
+        assert_eq!(concrete.provider, "claude");
+        assert_eq!(concrete.model, "opus");
+        assert_eq!(concrete.tier, "", "a concrete bind names no tier");
+
+        let tiered = super::binding_for(Some(&with_selection(Selection::Tier("deep".to_owned()))))
+            .expect("a shipped tier binds");
+        assert_eq!(tiered.tier, "deep");
+        assert_eq!(
+            (tiered.provider.as_str(), tiered.model.as_str()),
+            ("claude", "opus"),
+            "the tier's first-listed candidate, deterministically"
+        );
+
+        assert_eq!(
+            super::binding_for(Some(&with_selection(Selection::Tier(
+                "imaginary".to_owned()
+            )))),
+            None,
+            "an unknown tier in an older log falls back to the worker default"
+        );
+        assert_eq!(super::binding_for(Some(&AgentSpec::default())), None);
+        assert_eq!(super::binding_for(None), None);
+    }
+
     fn placement_event(agent: &str, worker: Option<&str>, state: PlacementState) -> Event {
         Event {
             agent_id: Some(AgentId::new(agent)),
@@ -677,6 +809,87 @@ mod tests {
         rows.iter()
             .flat_map(|global| projection.advance(global))
             .collect()
+    }
+
+    /// Archiving a session archives its placed agents where they run (fix
+    /// a7) — and only its own: a sibling session's agents, and its own
+    /// queued ones, take no command. Each command carries its agent's own
+    /// id-suffix so one event's several commands stay several, and a later
+    /// message to an archived agent folds into nothing.
+    #[test]
+    fn archiving_a_session_archives_its_placed_agents_and_only_those() {
+        let archive = |row_at: u64, session: &str| {
+            row(
+                row_at,
+                session,
+                row_at,
+                Event {
+                    agent_id: None,
+                    occurred_at: None,
+                    idempotency_key: String::new(),
+                    // Only `state` matters to the fold; the defaulted rest
+                    // keeps this fixture from twinning the handler's own
+                    // event construction.
+                    kind: Some(Kind::SessionLifecycleChanged(
+                        horde_proto::v1::SessionLifecycleChanged {
+                            state: horde_proto::v1::SessionLifecycleState::Archived as i32,
+                            reason: "done with it".to_owned(),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )
+        };
+
+        let mut rows = placed_agent(1, "s1", "agent-a", "worker-1");
+        rows.extend(placed_agent(3, "s1", "agent-b", "worker-2"));
+        rows.extend(placed_agent(5, "s2", "agent-c", "worker-1"));
+        // A queued agent of s1: spawned, never placed.
+        rows.push(row(7, "s1", 7, spawn_event("agent-q", None)));
+        rows.push(archive(8, "s1"));
+        // A message for an archived agent must fold into nothing.
+        rows.push(row(
+            9,
+            "s1",
+            9,
+            assignment_event("agent-a", "too late", DeliveryMode::TurnBoundary),
+        ));
+
+        let commands = fold(&rows);
+        let archives: Vec<(&str, String)> = commands
+            .iter()
+            .filter_map(|(worker, issued)| match &issued.command {
+                Some(Command::ArchiveAgent(archive)) => Some((
+                    worker.as_str(),
+                    archive.agent_id.as_ref().map(ToString::to_string)?,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            archives,
+            vec![
+                ("worker-1", "agent-a".to_owned()),
+                ("worker-2", "agent-b".to_owned()),
+            ],
+            "each placed agent of s1, on its own worker, and nobody else"
+        );
+        let ids: std::collections::BTreeSet<&str> = commands
+            .iter()
+            .filter(|(_, issued)| matches!(&issued.command, Some(Command::ArchiveAgent(_))))
+            .map(|(_, issued)| issued.command_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2, "one event, two commands, two ids");
+
+        assert!(
+            !commands.iter().any(|(_, issued)| matches!(
+                &issued.command,
+                Some(Command::DeliverMessage(deliver))
+                    if deliver.agent_id.as_ref().map(ToString::to_string)
+                        == Some("agent-a".to_owned())
+            )),
+            "a message after the archive has nobody to reach: {commands:?}"
+        );
     }
 
     /// All four corners. Inline as `state == Placed && worker.is_some()` these

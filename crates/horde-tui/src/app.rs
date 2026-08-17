@@ -31,6 +31,31 @@ pub enum Update {
     Event(Box<EventEnvelope>),
     /// A session's replay finished; everything after is live.
     CaughtUp { session_id: String, head: u64 },
+    /// The stream said "still alive, nothing to say" — the server's
+    /// staleness signal (DESIGN §11, fix a9). Carries nothing to render, and
+    /// exists precisely so quiet and dead stop looking identical.
+    Heartbeat,
+    /// The runtime's clock, so staleness can be *judged*: a dead stream
+    /// produces no updates, and only something outside the stream can notice
+    /// that. Carries the time so the judgment is a pure function a test can
+    /// drive.
+    Tick { now: std::time::Instant },
+}
+
+/// How long the stream may say nothing — no events, no heartbeats — before
+/// the TUI calls it stale. Three of the server's 15s heartbeat periods: one
+/// missed beat is jitter, three is a dead stream.
+pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Whether silence since `last` amounts to a stale stream at `now`.
+///
+/// Strictly past the ceiling: silence of *exactly* [`STALE_AFTER`] is the
+/// third heartbeat arriving on the buzzer, not a dead stream. A pure
+/// function of both instants because the boundary is the whole point, and a
+/// judgment buried in `apply` (where `last` is stamped by a live clock)
+/// cannot have its boundary exercised.
+fn is_stale(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_some_and(|last| now.saturating_duration_since(last) > STALE_AFTER)
 }
 
 /// Something the runtime should ask the server for on the App's behalf.
@@ -87,6 +112,15 @@ pub struct App {
     scroll: usize,
     /// The last refusal or notice, shown until the next one replaces it.
     status: String,
+    /// The agent scope `horde attach --agent` launched with, remembered so
+    /// detaching and re-attaching to that session restores it (fix a14) —
+    /// before this, a detach silently widened the view to the session root.
+    launched_scope: Option<Attachment>,
+    /// When the stream last said anything — an event, a caught-up, a
+    /// heartbeat. `None` until it first speaks.
+    last_stream_activity: Option<std::time::Instant>,
+    /// Judged on each [`Update::Tick`] against [`STALE_AFTER`].
+    stream_stale: bool,
     quit: bool,
 }
 
@@ -103,6 +137,9 @@ impl App {
             input: String::new(),
             scroll: 0,
             status: String::new(),
+            launched_scope: None,
+            last_stream_activity: None,
+            stream_stale: false,
             quit: false,
         }
     }
@@ -114,10 +151,14 @@ impl App {
         let mut app = Self::overview();
         app.sessions
             .insert(session_id.clone(), SessionState::new(session_id.clone()));
-        app.attachment = Some(Attachment {
+        let attachment = Attachment {
             session_id,
             agent_id,
-        });
+        };
+        app.attachment = Some(attachment.clone());
+        // Remembered so a detach and re-attach restores the same scope
+        // rather than silently widening to the session root (fix a14).
+        app.launched_scope = Some(attachment);
         app.screen = Screen::Session;
         app
     }
@@ -260,13 +301,35 @@ impl App {
                     .as_ref()
                     .map_or_else(String::new, ToString::to_string);
                 self.session_entry(session_id).apply(&envelope);
+                self.mark_stream_alive();
             }
             Update::CaughtUp { session_id, head } => {
                 let session = self.session_entry(session_id);
                 session.caught_up = true;
                 session.head = session.head.max(head);
+                self.mark_stream_alive();
+            }
+            // Proof of life and nothing else — the variant's whole job.
+            Update::Heartbeat => self.mark_stream_alive(),
+            Update::Tick { now } => {
+                self.stream_stale = is_stale(self.last_stream_activity, now);
             }
         }
+    }
+
+    /// Every stream-borne update — an event, a caught-up, a heartbeat — is
+    /// proof of life. The session list is an RPC answer and deliberately is
+    /// not: a live control plane says nothing about a dead follow stream.
+    fn mark_stream_alive(&mut self) {
+        self.last_stream_activity = Some(std::time::Instant::now());
+        self.stream_stale = false;
+    }
+
+    /// Whether the follow stream has said nothing for [`STALE_AFTER`] — the
+    /// badge that keeps a dead stream from looking like a quiet one.
+    #[must_use]
+    pub fn stream_stale(&self) -> bool {
+        self.stream_stale
     }
 
     fn session_entry(&mut self, session_id: String) -> &mut SessionState {
@@ -329,9 +392,17 @@ impl App {
     }
 
     fn attach_to(&mut self, session_id: String) {
+        // Re-attaching to the session this TUI was launched scoped into
+        // restores its agent scope (fix a14): detaching must not silently
+        // widen a subtree attach to the session root.
+        let agent_id = self
+            .launched_scope
+            .as_ref()
+            .filter(|scope| scope.session_id == session_id)
+            .and_then(|scope| scope.agent_id.clone());
         self.attachment = Some(Attachment {
             session_id,
-            agent_id: None,
+            agent_id,
         });
         self.screen = Screen::Session;
         self.scroll = 0;
@@ -749,6 +820,94 @@ mod tests {
             "the refusal must say why: {:?}",
             app.status()
         );
+    }
+
+    /// Detaching from an agent-scoped attach and re-attaching to the same
+    /// session restores the agent scope (fix a14) — before this, the
+    /// re-attach silently widened the view to the session root. A different
+    /// session attaches at its root, as ever.
+    #[test]
+    fn re_attaching_restores_the_launched_agent_scope() {
+        let mut app = App::attached("s1", Some("child-1".to_owned()));
+        app.apply(Update::Sessions(vec![
+            summary("s1", "ci-fix", "root-1"),
+            summary("s2", "docs", "root-2"),
+        ]));
+
+        // Detach: back at the overview, no attachment.
+        app.on_input(&key(KeyCode::Esc));
+        assert_eq!(app.attachment(), None, "escape detaches");
+
+        // Re-attach to s1 (first row): the agent scope comes back.
+        app.on_input(&key(KeyCode::Enter));
+        let attachment = app.attachment().expect("re-attached");
+        assert_eq!(attachment.session_id, "s1");
+        assert_eq!(
+            attachment.agent_id.as_deref(),
+            Some("child-1"),
+            "the launched scope survives detach/re-attach"
+        );
+
+        // A different session is not scoped by s1's launch.
+        app.on_input(&key(KeyCode::Esc));
+        app.on_input(&key(KeyCode::Down));
+        app.on_input(&key(KeyCode::Enter));
+        let attachment = app.attachment().expect("attached to s2");
+        assert_eq!(attachment.session_id, "s2");
+        assert_eq!(
+            attachment.agent_id, None,
+            "another session attaches at its root"
+        );
+    }
+
+    /// The staleness boundary, exactly: silence of the ceiling itself is the
+    /// third heartbeat on the buzzer, one instant more is a dead stream, and
+    /// a stream that never spoke is connecting rather than stale.
+    #[test]
+    fn staleness_begins_strictly_past_the_ceiling() {
+        let last = std::time::Instant::now();
+        assert!(!super::is_stale(None, last + super::STALE_AFTER * 2));
+        assert!(!super::is_stale(Some(last), last));
+        assert!(
+            !super::is_stale(Some(last), last + super::STALE_AFTER),
+            "exactly the ceiling is on time, not stale"
+        );
+        assert!(super::is_stale(
+            Some(last),
+            last + super::STALE_AFTER + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    /// The staleness clock (fix a9): quiet past the ceiling turns the badge
+    /// on, any stream activity — a heartbeat included — turns it off, and a
+    /// stream that has never spoken is connecting, not stale.
+    #[test]
+    fn the_stream_goes_stale_on_silence_and_recovers_on_a_heartbeat() {
+        let mut app = App::overview();
+        let long_past = super::STALE_AFTER + std::time::Duration::from_secs(1);
+
+        // Never spoke: not stale, however late the clock runs.
+        app.apply(Update::Tick {
+            now: std::time::Instant::now() + long_past,
+        });
+        assert!(!app.stream_stale(), "no stream yet is connecting, not dead");
+
+        // A heartbeat is proof of life...
+        app.apply(Update::Heartbeat);
+        app.apply(Update::Tick {
+            now: std::time::Instant::now(),
+        });
+        assert!(!app.stream_stale(), "fresh activity is not stale");
+
+        // ...and silence past the ceiling is not.
+        app.apply(Update::Tick {
+            now: std::time::Instant::now() + long_past,
+        });
+        assert!(app.stream_stale(), "silence past the ceiling is stale");
+
+        // The next heartbeat clears it without waiting for a tick.
+        app.apply(Update::Heartbeat);
+        assert!(!app.stream_stale(), "life observed clears the badge");
     }
 
     #[test]

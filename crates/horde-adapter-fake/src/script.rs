@@ -33,6 +33,14 @@ pub enum Step {
     /// How a test says "here the agent spawns a child" or "here it reports a
     /// result" — the orchestrator verbs of DESIGN.md §5 reach the adapter as
     /// ordinary tool calls, so that is how the script expresses them.
+    ///
+    /// When the session was spawned with a `horde_endpoint`, the call is
+    /// **real**: the fake dials the endpoint over HTTP with its identity
+    /// headers, exactly as a live harness would, and the result (or refusal)
+    /// comes back as the tool's output. Without an endpoint the step stays
+    /// what it always was — the intent surfaced as a tool-call event — so
+    /// conformance suites that spawn bare sessions keep measuring the stream
+    /// shape rather than a network.
     UseHordeTool {
         tool_call_id: String,
         tool_name: String,

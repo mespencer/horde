@@ -107,6 +107,11 @@ pub struct WorkerConfig {
     pub workspace_root: Option<PathBuf>,
     /// The git Relay payload shares stage to and fetch through.
     pub relay: Option<String>,
+    /// Placement tags this Worker advertises (`--tag`, repeatable).
+    pub tags: Vec<String>,
+    /// Remote URLs this machine's credentials can reach
+    /// (`--advertise-remote`, repeatable).
+    pub advertised_remotes: Vec<String>,
     /// Dial plaintext with no identity — the in-process-test-server shape.
     pub insecure: bool,
 }
@@ -123,6 +128,8 @@ struct ParsedFlags {
     fake_script: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     relay: Option<String>,
+    tags: Vec<String>,
+    advertised_remotes: Vec<String>,
     insecure: bool,
 }
 
@@ -143,6 +150,8 @@ fn takes_value(flag: &str) -> bool {
             | "--fake-script"
             | "--workspace-root"
             | "--relay"
+            | "--tag"
+            | "--advertise-remote"
     )
 }
 
@@ -202,6 +211,8 @@ impl ParsedFlags {
             "--fake-script" => self.fake_script = Some(PathBuf::from(value)),
             "--workspace-root" => self.workspace_root = Some(PathBuf::from(value)),
             "--relay" => self.relay = Some(value),
+            "--tag" => self.tags.push(value),
+            "--advertise-remote" => self.advertised_remotes.push(value),
             // Unreachable while `takes_value` and these two matches agree;
             // refusing (rather than ignoring) is what keeps a future drift
             // between them loud.
@@ -224,6 +235,8 @@ impl ParsedFlags {
             fake_script: self.fake_script,
             workspace_root: self.workspace_root,
             relay: self.relay,
+            tags: self.tags,
+            advertised_remotes: self.advertised_remotes,
             insecure: self.insecure,
         };
         config.check_shape()?;
@@ -377,24 +390,51 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
         ));
     }
     if let Some(ask) = object.get("ask_permission") {
-        let ask = ask.as_object().ok_or("ask_permission must be an object")?;
-        let field = |name: &str| {
-            ask.get(name)
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| format!("ask_permission needs a non-empty {name}"))
-        };
+        let (tool_call_id, tool_name, input) = tool_step_fields("ask_permission", ask)?;
         return Ok(Step::AskPermission {
-            tool_call_id: field("id")?,
-            tool_name: field("tool")?,
-            input: ask
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+            tool_call_id,
+            tool_name,
+            input,
         });
     }
-    Err("a step must be one of say, think, ask_permission".to_owned())
+    if let Some(call) = object.get("use_horde") {
+        // A real MCP call against the agent's own endpoint — the operator
+        // form of "here the agent reports its result" or "here it spawns a
+        // child" (DESIGN §5's verbs).
+        let (tool_call_id, tool_name, input) = tool_step_fields("use_horde", call)?;
+        return Ok(Step::UseHordeTool {
+            tool_call_id,
+            tool_name,
+            input,
+        });
+    }
+    Err("a step must be one of say, think, ask_permission, use_horde".to_owned())
+}
+
+/// The `{id, tool, input}` triple both tool-shaped steps share.
+fn tool_step_fields(
+    step: &str,
+    value: &serde_json::Value,
+) -> Result<(String, String, serde_json::Value), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{step} must be an object"))?;
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("{step} needs a non-empty {name}"))
+    };
+    Ok((
+        field("id")?,
+        field("tool")?,
+        object
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+    ))
 }
 
 /// How this run comes to hold an identity, decided before any I/O.
@@ -529,6 +569,8 @@ pub fn enrolled_principal(state_dir: &Path) -> Option<String> {
 pub struct PreparedWorker {
     pub runtime: Runtime,
     pub journal: Journal,
+    /// The operator-declared placement facts every advertisement carries.
+    pub declared: capabilities::DeclaredFacts,
     /// The main endpoint every dial and the blob channel share.
     pub server: String,
     pub identity: Option<StoredIdentity>,
@@ -577,6 +619,10 @@ pub async fn prepare(
     Ok(PreparedWorker {
         runtime,
         journal,
+        declared: capabilities::DeclaredFacts {
+            tags: config.tags.clone(),
+            reachable_remotes: config.advertised_remotes.clone(),
+        },
         server: config.server.clone(),
         identity,
         name,
@@ -590,11 +636,16 @@ fn build_runtime(
     name: &str,
     journal: Journal,
 ) -> Result<Runtime, String> {
+    // One lazy channel for everything that rides the Worker's own connection
+    // to the Server: attachment transfer, and the per-agent MCP endpoints'
+    // control-plane verbs. Lazy: a Server that is down at startup is the
+    // reconnect loop's business, not a reason to refuse to start.
+    let channel = server_channel(&config.server, identity)?;
     let mut runtime = Runtime::new(journal)
-        // Attachment transfer rides the Worker's own channel to the Server.
-        // Lazy: a Server that is down at startup is the reconnect loop's
-        // business, not a reason to refuse to start.
-        .with_blob_service(blob_channel(&config.server, identity)?);
+        .with_blob_service(channel.clone())
+        // The wire ADR-0004 left to the Worker: every spawned agent gets its
+        // Session's MCP endpoint and a minted identity pair.
+        .with_agent_endpoints(channel);
 
     for adapter in &config.adapters {
         runtime = match adapter {
@@ -628,8 +679,9 @@ fn configured_script(config: &WorkerConfig) -> Result<Script, String> {
     }
 }
 
-/// The lazily-connecting channel attachment transfer uses.
-fn blob_channel(
+/// The lazily-connecting channel the blob service and the agent endpoints
+/// share.
+fn server_channel(
     server: &str,
     identity: Option<&StoredIdentity>,
 ) -> Result<tonic::transport::Channel, String> {
@@ -658,7 +710,11 @@ async fn fresh_dial_config(prepared: &PreparedWorker) -> DialConfig {
         endpoint: prepared.server.clone(),
         worker_id: prepared.name.clone(),
         hello: capabilities::hello(&prepared.name),
-        capabilities: capabilities::advertise(prepared.runtime.adapters(), warm),
+        capabilities: capabilities::advertise(
+            prepared.runtime.adapters(),
+            warm,
+            &prepared.declared,
+        ),
         identity: prepared.identity.clone(),
     }
 }
@@ -878,6 +934,7 @@ mod tests {
         assert!(!config.insecure);
         assert!(config.join.is_none() && config.enrollment.is_none());
         assert!(config.workspace_root.is_none() && config.relay.is_none());
+        assert!(config.tags.is_empty() && config.advertised_remotes.is_empty());
     }
 
     #[test]
@@ -903,6 +960,12 @@ mod tests {
             "/tmp/ws",
             "--relay",
             "https://horde.example:7779",
+            "--tag",
+            "gpu",
+            "--tag",
+            "fast-disk",
+            "--advertise-remote",
+            "https://git.example/atlas.git",
         ])
         .expect("a full line parses");
         assert_eq!(config.server, "https://horde.example:7777");
@@ -927,6 +990,11 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/ws"))
         );
         assert_eq!(config.relay.as_deref(), Some("https://horde.example:7779"));
+        assert_eq!(config.tags, vec!["gpu", "fast-disk"]);
+        assert_eq!(
+            config.advertised_remotes,
+            vec!["https://git.example/atlas.git"]
+        );
         assert_eq!(
             config.identity_dir(),
             std::path::PathBuf::from("/tmp/w/identity")
@@ -1073,6 +1141,28 @@ mod tests {
         assert!((script.turns[1].cost_usd - 0.001).abs() < f64::EPSILON);
     }
 
+    /// The operator form of a verb call: how an e2e script says "here the
+    /// agent reports its result through its endpoint".
+    #[test]
+    fn the_script_form_parses_horde_verb_calls() {
+        let script = fake_script(
+            r#"[{"steps": [{"use_horde": {"id": "call-2", "tool": "report_result",
+                                          "input": {"status": "success", "summary": "done"}}}]}]"#,
+        )
+        .expect("a verb-call script parses");
+        let horde_adapter_fake::Step::UseHordeTool {
+            tool_call_id,
+            tool_name,
+            input,
+        } = &script.turns[0].steps[0]
+        else {
+            panic!("the step must be the verb call");
+        };
+        assert_eq!(tool_call_id, "call-2");
+        assert_eq!(tool_name, "report_result");
+        assert_eq!(input["status"], "success");
+    }
+
     /// A defaulted `input` must still be an object: the wire converts the
     /// proposed call's arguments to a Struct, and `null` would be refused
     /// downstream with a message about neither the script nor the flag.
@@ -1102,6 +1192,9 @@ mod tests {
             (r#"[{"text": 42}]"#, "text must be a string"),
             (r#"[{"steps": [{"ask_permission": {"tool": "T"}}]}]"#, "id"),
             (r#"[{"steps": [{"ask_permission": {"id": "c"}}]}]"#, "tool"),
+            (r#"[{"steps": [{"use_horde": {"tool": "T"}}]}]"#, "id"),
+            (r#"[{"steps": [{"use_horde": {"id": "c"}}]}]"#, "tool"),
+            (r#"[{"steps": [{"use_horde": 42}]}]"#, "object"),
         ] {
             let refused = fake_script(json).expect_err("must refuse");
             assert!(

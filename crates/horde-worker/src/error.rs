@@ -99,6 +99,15 @@ pub enum WorkerError {
     #[error("no adapter is registered for provider {0:?}")]
     UnknownProvider(String),
 
+    /// An Agent's MCP endpoint could not be served.
+    ///
+    /// Like [`Self::Workspace`], this is the *spawn's* failure: an agent
+    /// launched without its endpoint would run with no orchestrator verbs and
+    /// no permission prompt tool, which is worse than failing the spawn
+    /// honestly.
+    #[error("the agent's MCP endpoint could not be served: {0}")]
+    EndpointUnavailable(String),
+
     /// A workspace checkout could not be produced for an agent.
     ///
     /// This is the *spawn's* failure, not the Worker's: the runtime journals

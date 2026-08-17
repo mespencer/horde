@@ -146,7 +146,11 @@ fn number_from_wire(n: f64) -> JsonValue {
     Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)
 }
 
-fn struct_to_json(value: &Struct) -> JsonValue {
+/// A wire `Struct` as the JSON object it encodes — the render-side inverse
+/// of the narrowing conversions above, public so a client can *show* a
+/// decision's `updated_input` without pretending to be an adapter.
+#[must_use]
+pub fn struct_to_json(value: &Struct) -> JsonValue {
     JsonValue::Object(
         value
             .fields

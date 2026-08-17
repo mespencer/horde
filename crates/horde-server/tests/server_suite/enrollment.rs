@@ -41,6 +41,34 @@ fn register_request(name: &str) -> RegisterWorkerRequest {
     }
 }
 
+/// An enrolled `laptop` client's control-plane connection — the two-line
+/// preamble half the client-side tests open with.
+async fn enrolled_laptop(harness: &SecureHarness) -> Setup<horde_cli::Client> {
+    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    harness.client(&identity).await
+}
+
+/// The revocation arrangement both revocation tests share: an enrolled
+/// client (the revoker), an enrolled and *registered* worker `mac-studio`
+/// (the revokee) with its identity, and the worker's live service client.
+async fn revocable_worker(
+    harness: &SecureHarness,
+) -> Setup<(
+    horde_identity::StoredIdentity,
+    horde_identity::StoredIdentity,
+    horde_proto::v1::worker_service_client::WorkerServiceClient<tonic::transport::Channel>,
+)> {
+    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    let mut worker = harness.worker_client(&worker_identity).await?;
+    within(
+        "the registration",
+        worker.register_worker(register_request("mac-studio")),
+    )
+    .await??;
+    Ok((client_identity, worker_identity, worker))
+}
+
 /// The kinds journaled in the enrollment stream, read back through the
 /// production sync path as an enrolled client.
 async fn journaled_kinds(client: &mut horde_cli::Client) -> Setup<Vec<&'static str>> {
@@ -307,16 +335,8 @@ async fn minting_over_the_control_plane_requires_an_identity_and_works_with_one(
 #[tokio::test]
 async fn revocation_shuts_the_door_at_the_next_rpc_and_is_journaled() -> Setup<()> {
     let harness = serve_secured().await?;
-    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
-
     // The worker is in, on an open connection.
-    let mut worker = harness.worker_client(&worker_identity).await?;
-    within(
-        "the registration",
-        worker.register_worker(register_request("mac-studio")),
-    )
-    .await??;
+    let (client_identity, worker_identity, mut worker) = revocable_worker(&harness).await?;
 
     // An enrolled client revokes it.
     let channel = harness
@@ -378,6 +398,104 @@ async fn revocation_shuts_the_door_at_the_next_rpc_and_is_journaled() -> Setup<(
     Ok(())
 }
 
+/// Revocation reaches a stream already in flight (wave-7 fix a4): a revoked
+/// worker's open `StreamCommands` is severed with `PermissionDenied` rather
+/// than surviving until the worker deigns to reconnect. Before the fix, the
+/// per-RPC interceptor was the only check, and a worker's whole life is two
+/// long-lived streams it never re-opens.
+#[tokio::test]
+async fn revocation_severs_a_live_command_stream() -> Setup<()> {
+    let harness = serve_secured().await?;
+    // The worker registers and opens its command stream — the quiet state a
+    // deployed worker sits in for hours.
+    let (client_identity, _worker_identity, mut worker) = revocable_worker(&harness).await?;
+    let mut commands = within(
+        "the command stream opening",
+        worker.stream_commands(horde_proto::v1::StreamCommandsRequest {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            resume_from_command_sequence: 1,
+        }),
+    )
+    .await??
+    .into_inner();
+
+    // An enrolled client revokes the worker while the stream is open.
+    let channel = harness
+        .main_endpoint_as(&client_identity)?
+        .connect()
+        .await?;
+    within(
+        "the revocation RPC",
+        ControlPlaneServiceClient::new(channel).revoke_enrollment(RevokeEnrollmentRequest {
+            principal: Some(revoke_enrollment_request::Principal::WorkerId(
+                WorkerId::new("mac-studio"),
+            )),
+            reason: "machine compromised".to_owned(),
+        }),
+    )
+    .await??;
+
+    // The open stream ends with the revocation refusal — no command was ever
+    // sent on it, so nothing but the severing can end it.
+    let severed = within("the live stream to be severed", commands.message())
+        .await?
+        .expect_err("a revoked worker's stream must end in refusal, not silence");
+    assert_eq!(severed.code(), tonic::Code::PermissionDenied);
+    assert!(
+        severed.message().contains("revoked"),
+        "the refusal says why: {severed}"
+    );
+    Ok(())
+}
+
+/// Attribution over the real mTLS door (fix a13): an enrolled client's
+/// interrupt is journaled with that client's own name as the actor. Multi-
+/// attach is why the field exists, and a `requested_by` that vanished on the
+/// way to the log would leave every event in a shared session anonymous.
+#[tokio::test]
+async fn a_clients_interrupt_is_attributed_to_that_client() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let mut client = enrolled_laptop(&harness).await?;
+
+    let (summary, root) = within("the session", client.create_session("attributed", "")).await??;
+    let session_id = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or("a session id")?;
+    within("the interrupt", client.interrupt(&root.to_string(), "stop")).await??;
+
+    let mut actors = Vec::new();
+    within(
+        "the replay",
+        client.sync(
+            &horde_cli::client::SyncOptions::new(session_id),
+            |envelope| {
+                if let Some(horde_proto::v1::event::Kind::TurnInterrupted(interrupted)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                {
+                    actors.push(interrupted.requested_by.clone());
+                }
+            },
+            |_| {},
+        ),
+    )
+    .await??;
+
+    assert_eq!(
+        actors,
+        vec![Some(horde_proto::v1::Actor {
+            actor: Some(horde_proto::v1::actor::Actor::ClientId(
+                horde_proto::v1::ClientId::new("laptop")
+            )),
+        })],
+        "the interrupt is the laptop's, and the log says so"
+    );
+    Ok(())
+}
+
 /// The bootstrap question, answered against the live authority: `false` on a
 /// fresh server, `true` the moment a client holds a certificate — the
 /// distinction that opens and closes the printed-code door.
@@ -429,8 +547,7 @@ async fn dropping_the_harness_stops_its_listeners() -> Setup<()> {
 #[tokio::test]
 async fn the_enrollment_stream_is_not_a_session() -> Setup<()> {
     let harness = serve_secured().await?;
-    let identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let mut client = harness.client(&identity).await?;
+    let mut client = enrolled_laptop(&harness).await?;
 
     // Enrollment already journaled events; none of them make a session.
     let sessions = client.list_sessions(true).await?;
@@ -444,31 +561,49 @@ async fn the_enrollment_stream_is_not_a_session() -> Setup<()> {
 #[tokio::test]
 async fn the_worker_role_cannot_walk_through_the_client_door() -> Setup<()> {
     // A worker certificate is a valid certificate — the interceptor admits
-    // it to the channel. What it cannot do is *mint*: minting requires
-    // nothing today beyond enrollment, so this pins the current truth that
-    // any enrolled principal may mint (DESIGN §3 says clients enroll and
-    // workers enroll but not who may mint; flagged in the wave report), and
-    // it proves a worker identity at least authenticates rather than erroring.
+    // it to the channel. What it may not do is *mint or revoke*: those are
+    // operator verbs (wave-7 fix a3), and before the role check a worker
+    // could mint codes for any role and revoke every client.
     let harness = serve_secured().await?;
     let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    let client_identity = harness.enroll(PrincipalRole::Client, "laptop").await?;
 
     let channel = harness
         .main_endpoint_as(&worker_identity)?
         .connect()
         .await?;
-    let minted = within(
+    let mut control = ControlPlaneServiceClient::new(channel);
+    let refused = within(
         "the mint RPC under a worker identity",
-        ControlPlaneServiceClient::new(channel).mint_enrollment_code(MintEnrollmentCodeRequest {
+        control.mint_enrollment_code(MintEnrollmentCodeRequest {
             role: Role::Worker as i32,
             name: "gpu-box".to_owned(),
             ttl: None,
         }),
     )
-    .await??;
+    .await?
+    .expect_err("a worker identity must not mint");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
     assert!(
-        !minted.into_inner().code.is_empty(),
-        "today every enrolled principal may mint; if this starts failing, \
-         someone added the role check the wave report flags as open"
+        refused.message().contains("worker:mac-studio"),
+        "the refusal names the caller: {refused}"
     );
+
+    let refused = within(
+        "the revoke RPC under a worker identity",
+        control.revoke_enrollment(RevokeEnrollmentRequest {
+            principal: Some(revoke_enrollment_request::Principal::ClientId(
+                horde_proto::v1::ClientId::new("laptop"),
+            )),
+            reason: "a worker trying to revoke the operator".to_owned(),
+        }),
+    )
+    .await?
+    .expect_err("a worker identity must not revoke");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+    // And the client the worker aimed at still works — nothing was revoked.
+    let mut client = harness.client(&client_identity).await?;
+    within("the client's post-attempt handshake", client.hello("0.1.0")).await??;
     Ok(())
 }

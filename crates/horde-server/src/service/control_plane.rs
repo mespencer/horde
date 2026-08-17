@@ -28,7 +28,7 @@ use horde_proto::v1::{
     QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
     SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
     SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
-    UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse,
+    UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
 };
 use tokio_stream::{Stream, wrappers::ReceiverStream};
@@ -313,8 +313,11 @@ impl ControlPlaneService for ControlPlane {
     #[instrument(skip_all)]
     async fn hello(
         &self,
-        _request: Request<HelloRequest>,
+        request: Request<HelloRequest>,
     ) -> Result<Response<HelloResponse>, Status> {
+        // The version gate (DESIGN §2, fix a6): the client's Hello is read
+        // and compared, not discarded.
+        super::shared::version_gate(request.into_inner().hello.as_ref())?;
         Ok(Response::new(HelloResponse {
             server: Some(Self::server_hello()),
             // Assigned from the client certificate once enrollment exists.
@@ -327,20 +330,40 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<CreateSessionRequest>,
     ) -> Result<Response<CreateSessionResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
 
-        // A root agent naming a workspace the catalog does not hold is
-        // refused before the session exists — the same check spawn makes,
-        // made here for the same reason.
-        let root_workspace = request
-            .root_agent
+        // The request-level workspace is consumed, not decoration: a client
+        // may set it beside a spec that names none, and the root agent works
+        // in it either way.
+        let mut root_agent = request.root_agent.unwrap_or_default();
+        let spec_workspace = root_agent
+            .workspace_definition_id
             .as_ref()
-            .and_then(|spec| spec.workspace_definition_id.as_ref())
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        if spec_workspace.is_none()
+            && let Some(id) = request
+                .workspace_definition_id
+                .as_ref()
+                .map(ToString::to_string)
+                .filter(|id| !id.is_empty())
+        {
+            root_agent.workspace_definition_id = Some(WorkspaceDefinitionId::new(id));
+        }
+
+        // A root agent naming a workspace the catalog does not hold — or a
+        // tier the catalog cannot resolve — is refused before the session
+        // exists: the same checks spawn makes, made here for the same reason.
+        let root_workspace = root_agent
+            .workspace_definition_id
+            .as_ref()
             .map(ToString::to_string)
             .filter(|id| !id.is_empty());
         if let Some(id) = root_workspace.as_deref() {
             self.required_definition(id).await.map_err(Status::from)?;
         }
+        validate_model_selection(Some(&root_agent))?;
 
         // The session id and root agent id are server-assigned. Derived from the
         // idempotency key when one is supplied, so a retry after a lost response
@@ -358,8 +381,8 @@ impl ControlPlaneService for ControlPlane {
             idempotency_key: request.idempotency_key.clone(),
             kind: Some(Kind::AgentSpawned(AgentSpawned {
                 parent_agent_id: None,
-                spawned_by: None,
-                spec: request.root_agent,
+                spawned_by: actor,
+                spec: Some(root_agent),
                 tree_path: vec![request.title.clone()],
             })),
         };
@@ -478,6 +501,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<SyncEventsRequest>,
     ) -> Result<Response<Self::SyncEventsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
         let request = request.into_inner();
 
         let cursors: Vec<(String, u64)> = request
@@ -546,14 +570,23 @@ impl ControlPlaneService for ControlPlane {
             .map_err(Status::from)?;
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        tokio::spawn(sync::stream_merged(
-            sender,
+        let deny = self
+            .enrollment
+            .as_ref()
+            .map(|authority| authority.deny_list());
+        let stream = sync::stream_merged(
+            sender.clone(),
             history,
             tail,
             request.follow,
             filter,
             self.heartbeat_period,
-        ));
+        );
+        // Revocation severs a live follow too (fix a4): a revoked client
+        // must not keep reading the log until it reconnects.
+        tokio::spawn(async move {
+            super::shared::run_severable(stream, deny, serial, &sender).await;
+        });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
@@ -563,6 +596,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<SendMessageRequest>,
     ) -> Result<Response<SendMessageResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let agent_id = request
             .to_agent_id
@@ -580,7 +614,7 @@ impl ControlPlaneService for ControlPlane {
                 assignment.assignment_id = Some(id.clone());
                 (
                     Kind::AssignmentSent(AssignmentSent {
-                        from: None,
+                        from: actor.clone(),
                         assignment: Some(assignment),
                         delivery: request.delivery,
                     }),
@@ -589,7 +623,7 @@ impl ControlPlaneService for ControlPlane {
             }
             Some(send_message_request::Body::Note(note)) => (
                 Kind::NoteSent(NoteSent {
-                    from: None,
+                    from: actor,
                     note: Some(note),
                     delivery: request.delivery,
                 }),
@@ -628,6 +662,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<InterruptAgentRequest>,
     ) -> Result<Response<InterruptAgentResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let agent_id = request
             .agent_id
@@ -644,6 +679,7 @@ impl ControlPlaneService for ControlPlane {
                 &session_id,
                 agent_id,
                 Kind::TurnInterrupted(horde_proto::v1::TurnInterrupted {
+                    requested_by: actor,
                     reason: request.reason,
                     ..horde_proto::v1::TurnInterrupted::default()
                 }),
@@ -659,6 +695,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<AnswerPermissionRequest>,
     ) -> Result<Response<AnswerPermissionResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let request_id = request
             .request_id
@@ -704,7 +741,7 @@ impl ControlPlaneService for ControlPlane {
                         request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
                         outcome: request.outcome,
                         decided_by: horde_proto::v1::PermissionLayer::Human as i32,
-                        decided_by_actor: None,
+                        decided_by_actor: actor,
                         reason: request.reason,
                         remember_for_session: request.remember_for_session,
                         // Carried through rather than dropped. Absence and an
@@ -728,6 +765,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<SpawnAgentRequest>,
     ) -> Result<Response<SpawnAgentResponse>, Status> {
+        let actor = actor_of(&request);
         let request = request.into_inner();
         let session_id = request
             .session_id
@@ -744,9 +782,10 @@ impl ControlPlaneService for ControlPlane {
         let agent_id = format!("agent-{}", uuid_like());
         let spec = request.spec.unwrap_or_default();
 
-        // A spawn naming a workspace the catalog does not hold is refused
-        // before anything is written: placing it would eventually command a
-        // materialization of nothing.
+        // A spawn naming a workspace the catalog does not hold — or a tier
+        // it cannot resolve — is refused before anything is written: placing
+        // it would eventually command a materialization of nothing, or bind
+        // a model of nothing.
         let workspace = spec
             .workspace_definition_id
             .as_ref()
@@ -755,6 +794,7 @@ impl ControlPlaneService for ControlPlane {
         if let Some(id) = workspace.as_deref() {
             self.required_definition(id).await.map_err(Status::from)?;
         }
+        validate_model_selection(Some(&spec))?;
 
         // The whole decision — project, place, append — runs under the
         // placement lock so a drain pass woken by a worker registering cannot
@@ -789,7 +829,10 @@ impl ControlPlaneService for ControlPlane {
                 idempotency_key: request.idempotency_key.clone(),
                 kind: Some(Kind::AgentSpawned(AgentSpawned {
                     parent_agent_id: parent.clone().map(AgentId::new),
-                    spawned_by: None,
+                    // A client identity, or nothing: an MCP-initiated spawn
+                    // arrives over the worker's channel and its true actor is
+                    // the parent agent, which `parent_agent_id` already names.
+                    spawned_by: actor,
                     spec: Some(spec.clone()),
                     tree_path: Vec::new(),
                 })),
@@ -1160,6 +1203,7 @@ impl ControlPlaneService for ControlPlane {
         let Some(authority) = self.enrollment.as_ref() else {
             return Err(ServerError::Unimplemented("enrollment on this listener").into());
         };
+        require_client_role(&request, "mint enrollment codes")?;
         let request = request.into_inner();
 
         let role = crate::enrollment::role_from_wire(request.role)
@@ -1196,6 +1240,7 @@ impl ControlPlaneService for ControlPlane {
         let Some(authority) = self.enrollment.as_ref() else {
             return Err(ServerError::Unimplemented("enrollment on this listener").into());
         };
+        require_client_role(&request, "revoke enrollment")?;
         let request = request.into_inner();
 
         use horde_proto::v1::revoke_enrollment_request::Principal as Wire;
@@ -1315,6 +1360,85 @@ impl ControlPlaneService for ControlPlane {
     }
 }
 
+/// The actor a request's channel identity names, for event attribution.
+///
+/// Multi-attach is why this exists: "the user did it" is not specific enough
+/// once several clients can drive one session (`id.proto`, wave-7 fix a13).
+/// A client certificate names the client; a worker channel is a *conduit* —
+/// the true actor is an agent the request does not name — so it attributes
+/// nothing rather than crediting the machine. Plaintext test channels carry
+/// no identity and attribute nothing either.
+fn actor_of<T>(request: &Request<T>) -> Option<horde_proto::v1::Actor> {
+    let identity = request.extensions().get::<horde_identity::PeerIdentity>()?;
+    if identity.principal.role() != horde_identity::PrincipalRole::Client {
+        return None;
+    }
+    Some(horde_proto::v1::Actor {
+        actor: Some(horde_proto::v1::actor::Actor::ClientId(
+            horde_proto::v1::ClientId::new(identity.principal.name()),
+        )),
+    })
+}
+
+/// Refuses a spec naming a tier the catalog cannot resolve.
+///
+/// At the RPC, not the fold: the fold is deterministic over the log and must
+/// not be where an unknown name surfaces — by then the spawn is an event of
+/// record. The refusal lists the tiers that do exist, because "unknown tier"
+/// alone sends the caller to the docs this message could have been.
+///
+/// # Errors
+///
+/// `InvalidArgument` naming the tier and the known ones.
+fn validate_model_selection(spec: Option<&horde_proto::v1::AgentSpec>) -> Result<(), Status> {
+    let Some(horde_proto::v1::model_selection::Selection::Tier(tier)) = spec
+        .and_then(|spec| spec.model.as_ref())
+        .and_then(|model| model.selection.as_ref())
+    else {
+        return Ok(());
+    };
+    let catalog = crate::tiers::TierCatalog::shipped_defaults();
+    if catalog.get(tier).is_none() {
+        return Err(Status::invalid_argument(format!(
+            "tier {tier:?} is not in the catalog; known tiers: {}",
+            catalog.names().join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Requires the caller's certificate to name a Client principal.
+///
+/// Mint and revoke are *operator* verbs (DESIGN §3, wave-7 fix a3): a worker
+/// certificate must not be able to mint codes for any role or revoke every
+/// client. The interceptor stamped the verified [`PeerIdentity`] into the
+/// request extensions; an absent identity means this request did not come
+/// through the mTLS door at all, which is the same refusal — this check runs
+/// only on servers whose enrollment authority is live, and those always
+/// front their control plane with the interceptor.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the caller and the verb it may not use.
+fn require_client_role<T>(request: &Request<T>, verb: &str) -> Result<(), Status> {
+    let identity = request
+        .extensions()
+        .get::<horde_identity::PeerIdentity>()
+        .ok_or_else(|| {
+            Status::permission_denied(format!(
+                "only an enrolled client may {verb}; this channel carries no peer identity"
+            ))
+        })?;
+    if identity.principal.role() != horde_identity::PrincipalRole::Client {
+        return Err(Status::permission_denied(format!(
+            "only an enrolled client may {verb}; {} is a {}",
+            identity.principal,
+            identity.principal.role()
+        )));
+    }
+    Ok(())
+}
+
 /// A unique-enough identifier without pulling in a uuid dependency.
 ///
 /// Ids are opaque to every consumer; the only requirement is that two calls
@@ -1334,4 +1458,44 @@ fn uuid_like() -> String {
     });
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{start:x}-{ordinal:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::actor_of;
+    use horde_identity::{PeerIdentity, Principal, PrincipalRole};
+
+    fn request_as(role: Option<PrincipalRole>) -> tonic::Request<()> {
+        let mut request = tonic::Request::new(());
+        if let Some(role) = role {
+            request.extensions_mut().insert(PeerIdentity {
+                principal: Principal::new(role, "laptop").expect("a valid name"),
+                serial_hex: "aa".to_owned(),
+            });
+        }
+        request
+    }
+
+    /// Attribution's truth table (fix a13): a client certificate names the
+    /// client, a worker channel is a conduit and names nobody, and a
+    /// plaintext channel has nobody to name.
+    #[test]
+    fn only_a_client_identity_becomes_the_events_actor() {
+        let actor = actor_of(&request_as(Some(PrincipalRole::Client)))
+            .expect("a client identity attributes");
+        assert_eq!(
+            actor.actor,
+            Some(horde_proto::v1::actor::Actor::ClientId(
+                horde_proto::v1::ClientId::new("laptop")
+            ))
+        );
+
+        assert_eq!(
+            actor_of(&request_as(Some(PrincipalRole::Worker))),
+            None,
+            "a worker channel is a conduit; crediting the machine would be \
+             attributing the wrong thing"
+        );
+        assert_eq!(actor_of(&request_as(None)), None);
+    }
 }

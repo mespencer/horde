@@ -17,6 +17,7 @@ pub mod log;
 pub mod mcp;
 pub mod permission;
 pub mod placement;
+pub mod relay;
 pub mod scheduler;
 pub mod service;
 pub mod startup;

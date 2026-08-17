@@ -27,6 +27,7 @@ pub mod capabilities;
 pub mod claude;
 pub mod client;
 pub mod codex;
+pub mod endpoint;
 pub mod error;
 pub mod journal;
 pub mod process;

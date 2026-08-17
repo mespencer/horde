@@ -163,6 +163,7 @@ async fn assignments_and_notes_both_land_and_report_where() -> Setup<()> {
             &harness.agent_id,
             MessageKind::Assign,
             "fix the build",
+            None,
             false,
             "assign-1",
         )
@@ -172,6 +173,7 @@ async fn assignments_and_notes_both_land_and_report_where() -> Setup<()> {
             &harness.agent_id,
             MessageKind::Note,
             "for context",
+            None,
             false,
             "note-1",
         )

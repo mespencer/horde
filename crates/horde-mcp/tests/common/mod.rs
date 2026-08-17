@@ -192,7 +192,7 @@ pub fn escalation_request_id(envelope: &horde_proto::v1::EventEnvelope) -> Optio
 /// proof a token matched, and a test that forged one would be testing a type
 /// that does not exist in production.
 pub fn identity_for(agent_id: &str) -> Setup<AgentIdentity> {
-    let mut registry = AgentRegistry::new();
+    let registry = AgentRegistry::new();
     registry.insert(agent_id, "token");
 
     let mut headers = http::HeaderMap::new();

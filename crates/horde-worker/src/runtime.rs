@@ -73,6 +73,10 @@ pub struct Runtime {
     /// attachments into receiving checkouts — the blob half of a Payload,
     /// beside the broker's commit half.
     attachments: Arc<crate::blob::AttachmentBroker>,
+    /// Serves each Session's MCP endpoint and mints per-agent tokens.
+    /// `None` means spawned agents get no endpoint — the in-process test
+    /// shape, and the state of the world before `with_agent_endpoints`.
+    endpoints: Option<Arc<crate::endpoint::EndpointManager>>,
     agents: BTreeMap<String, AgentHandle>,
     /// Pumps whose agents were archived, kept so shutdown can wait for them.
     retired: Vec<tokio::task::JoinHandle<()>>,
@@ -163,9 +167,20 @@ impl Runtime {
             workspaces: None,
             broker: Arc::new(ShareBroker::new(None)),
             attachments: Arc::new(crate::blob::AttachmentBroker::new(None)),
+            endpoints: None,
             agents: BTreeMap::new(),
             retired: Vec::new(),
         }
+    }
+
+    /// Enables the per-agent MCP endpoint (DESIGN §5): every spawned or
+    /// revived agent gets its Session's loopback endpoint and a freshly
+    /// minted identity pair. `channel` is the Worker's authenticated channel
+    /// to the Server, which the orchestrator verbs issue their RPCs over.
+    #[must_use]
+    pub fn with_agent_endpoints(mut self, channel: tonic::transport::Channel) -> Self {
+        self.endpoints = Some(Arc::new(crate::endpoint::EndpointManager::new(channel)));
+        self
     }
 
     /// Points attachment transfer at the Server's blob store, over the
@@ -244,6 +259,9 @@ impl Runtime {
     /// "shutdown actually reaped the agents" are different facts, and only the
     /// second one is evidence.
     pub async fn shutdown(mut self) -> usize {
+        if let Some(endpoints) = &self.endpoints {
+            endpoints.shutdown().await;
+        }
         let handles: Vec<AgentHandle> = std::mem::take(&mut self.agents).into_values().collect();
         let mut tasks = std::mem::take(&mut self.retired);
         for handle in handles {
@@ -325,7 +343,14 @@ impl Runtime {
             Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
         };
         let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
-        let (session, can_rewrite) = match self.start_session(&spawn, cwd).await {
+        // The endpoint before the harness: an agent launched without its
+        // verbs and permission prompt tool is not degraded, it is a different
+        // (and unpermissioned) product — so a bind failure fails the spawn.
+        let endpoint = match self.agent_endpoint(&session_id, &agent_id).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
+        };
+        let (session, can_rewrite) = match self.start_session(&spawn, cwd, endpoint).await {
             Ok(started) => started,
             Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
         };
@@ -370,19 +395,37 @@ impl Runtime {
         })
     }
 
-    /// Resolves the adapter and starts the harness session in `cwd`.
+    /// Resolves the adapter and starts the harness session in `cwd`, with
+    /// `endpoint` as the agent's one Horde-controlled MCP endpoint.
     async fn start_session(
         &self,
         spawn: &SpawnAgentCommand,
         cwd: Option<std::path::PathBuf>,
+        endpoint: Option<horde_adapter::McpEndpoint>,
     ) -> Result<(Box<dyn AgentSession>, bool), WorkerError> {
         let adapter = self.adapter_for(spawn)?;
-        let spec = domain_spec(spawn, cwd);
+        let spec = domain_spec(spawn, cwd, endpoint);
         let session = adapter.spawn(&spec).await?;
         let can_rewrite = adapter
             .capabilities()
             .supports(Capability::RewritesToolInput);
         Ok((session, can_rewrite))
+    }
+
+    /// The endpoint one agent's harness is pointed at, or `None` when this
+    /// Runtime serves no endpoints (the pre-wiring test shape).
+    async fn agent_endpoint(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<horde_adapter::McpEndpoint>, WorkerError> {
+        let Some(endpoints) = &self.endpoints else {
+            return Ok(None);
+        };
+        endpoints
+            .endpoint_for(session_id, agent_id, self.stamping_sink())
+            .await
+            .map(Some)
     }
 
     /// The adapter a spawn command binds, or the Worker's default.
@@ -437,11 +480,53 @@ impl Runtime {
             .unwrap_or_default();
         let policy = horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy)
             .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified);
+        let start_points = self.parent_start_points(&spawn.parent_agent_id).await;
         let root = workspaces
-            .checkout(&definition_id, &agent_id, policy)
+            .checkout(&definition_id, &agent_id, policy, &start_points)
             .await?;
         let repos = workspaces.instance_repos(&definition_id).await?;
         Ok(Some(AgentCheckout { root, repos }))
+    }
+
+    /// The parent's committed HEAD per repo — what a child's checkout starts
+    /// from (DESIGN §5, fix a8). Empty when the spawn has no parent, or the
+    /// parent's checkout is not on this Worker (a cross-worker parent's
+    /// commits travel as payloads, not as checkout ancestry): those children
+    /// honestly start from the instance's HEAD.
+    async fn parent_start_points(
+        &self,
+        parent_agent_id: &Option<horde_proto::v1::AgentId>,
+    ) -> BTreeMap<String, String> {
+        let mut start_points = BTreeMap::new();
+        let Some(parent) = parent_agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+        else {
+            return start_points;
+        };
+        let Some(checkout) = self.broker.checkout_of(&parent) else {
+            return start_points;
+        };
+        for (repo_name, relative) in &checkout.repos {
+            match horde_relay::observe_head(&checkout.root.join(relative)).await {
+                Ok(observed) => {
+                    start_points.insert(repo_name.clone(), observed.commit_sha);
+                }
+                // A parent repo whose HEAD cannot be observed contributes no
+                // start point rather than failing the child's spawn: the
+                // instance HEAD is a working default, a dead spawn is not.
+                Err(error) => {
+                    tracing::warn!(
+                        parent,
+                        repo = %repo_name,
+                        %error,
+                        "could not observe the parent's HEAD; the child starts at the instance's"
+                    );
+                }
+            }
+        }
+        start_points
     }
 
     async fn deliver_message(
@@ -603,11 +688,21 @@ impl Runtime {
         let adapter = self.adapter_for(&record.spawn)?;
         let checkout = self.agent_checkout(&record.spawn).await?;
         let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
+        // A fresh endpoint identity per incarnation: the token the previous
+        // process held is replaced, never reused.
+        let agent_id = record
+            .spawn
+            .agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let endpoint = self.agent_endpoint(&record.session_id, &agent_id).await?;
         // One past the recorded count: a turn that died half-journaled has
         // already spent its ordinal, and reusing it would hand the revived
         // turn journal keys the Server has partially seen. Turn ids need
         // uniqueness, not density, so the skip is free.
-        let spec = domain_spec(&record.spawn, cwd).with_turns_taken(record.turns_taken + 1);
+        let spec =
+            domain_spec(&record.spawn, cwd, endpoint).with_turns_taken(record.turns_taken + 1);
         let session = adapter
             .resume(
                 &spec,
@@ -870,7 +965,12 @@ impl Runtime {
             AfterCommit::Retire { agent_id } => {
                 // The checkout registry must not outlive the agent: a stale
                 // entry would stamp an archived agent's HEAD, or offer its
-                // checkout as a peer-fetch source, forever.
+                // checkout as a peer-fetch source, forever. Same for the
+                // endpoint token — an archived agent's credential must stop
+                // authenticating on its next request.
+                if let Some(endpoints) = &self.endpoints {
+                    endpoints.forget_agent(&agent_id);
+                }
                 self.broker.forget(&agent_id);
                 if let Some(handle) = self.agents.remove(&agent_id) {
                     let _ = handle.control.send(AgentControl::Archive).await;
@@ -1016,6 +1116,7 @@ fn known_agent(
 fn domain_spec(
     spawn: &SpawnAgentCommand,
     cwd: Option<std::path::PathBuf>,
+    horde_endpoint: Option<horde_adapter::McpEndpoint>,
 ) -> horde_adapter::AgentSpec {
     let binding = spawn.binding.as_ref();
     horde_adapter::AgentSpec {
@@ -1031,8 +1132,9 @@ fn domain_spec(
             .map(|binding| binding.provider_account.clone())
             .filter(|account| !account.is_empty())
             .map(ProviderAccount::new),
-        // The MCP endpoint is the sibling increment; wired here when it lands.
-        horde_endpoint: None,
+        // The Session's served endpoint with this agent's own identity pair
+        // (`None` only when this Runtime serves no endpoints).
+        horde_endpoint,
         // The named mode rides to the adapter because for a sandboxed-at-spawn
         // provider (Codex) it is what the sandbox tier is derived from; empty
         // means the spawn named none, which must read as absent, not as a mode
@@ -1454,6 +1556,13 @@ mod tests {
         let journal = runtime.journal.clone();
         let mut head = journal.watch_head();
         let mut polls = 0_u32;
+        // One ceiling for the whole wait rather than 60s per wake: a
+        // journal that has genuinely stopped (a pump a mutant never
+        // started, say) must fail in seconds — under cargo-mutants, a
+        // 60s-per-wake wait across a suite reads as TIMEOUT, a mutant
+        // nobody evaluated. 15s total is still 3× the wake latency that
+        // flaked the old 5s bound, and a passing run never spends it.
+        let deadline = tokio::time::Instant::now() + core::time::Duration::from_secs(15);
         loop {
             let events = journal.read_from(1, 100).await.expect("a readable journal");
             if accept(&events) {
@@ -1462,17 +1571,11 @@ mod tests {
             polls += 1;
             assert!(polls < 64, "the journal never reached {waiting_for}");
             // A positive wait: something must arrive, and the assertion is
-            // on what arrived — so a clock is legitimate here, but only as
-            // a ceiling, never as a duration anything is expected to take.
-            // The previous 5s ceiling was a clock assumption in a costume:
-            // under `cargo test`'s single-process execution with every
-            // suite's threads contending, one wake legitimately took
-            // longer, and the wait reported "stopped moving" for a journal
-            // that was merely slow. Generous on purpose; a passing run
-            // never spends it.
-            tokio::time::timeout(core::time::Duration::from_secs(60), head.changed())
+            // on what arrived — the deadline is a ceiling, never a duration
+            // anything is expected to take.
+            tokio::time::timeout_at(deadline, head.changed())
                 .await
-                .expect("the journal stopped moving")
+                .unwrap_or_else(|_| panic!("the journal stopped moving before {waiting_for}"))
                 .expect("the journal outlives the wait");
         }
     }
@@ -1514,6 +1617,47 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// The whole ADR-0004 wire, in-process: the Runtime serves the Session's
+    /// endpoint, mints the agent's identity pair, hands both to the harness —
+    /// and the scripted harness dials back over real HTTP to report its
+    /// result, which lands in the journal through the stamping sink under
+    /// the *authenticated* agent id.
+    #[tokio::test]
+    async fn an_agent_reports_its_result_through_its_own_mcp_endpoint() {
+        // The control-plane channel dials nowhere: report_result is journal-
+        // plane, which is exactly the half this test pins.
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut runtime = runtime_with(Script::of(vec![
+            ScriptedTurn::saying("wrapping up").with_step(Step::UseHordeTool {
+                tool_call_id: "call-r".to_owned(),
+                tool_name: "report_result".to_owned(),
+                input: json!({ "status": "success", "summary": "the work is done" }),
+            }),
+        ]))
+        .with_agent_endpoints(channel);
+
+        runtime
+            .apply(spawn_command(1, "agent-1", "go"))
+            .await
+            .expect("the spawn applies");
+
+        let reported = |events: &[horde_proto::v1::JournaledEvent]| {
+            events.iter().any(|journaled| {
+                journaled.event.as_ref().is_some_and(|event| {
+                    matches!(
+                        event.kind.as_ref(),
+                        Some(Kind::ResultReported(reported))
+                            if reported.result.as_ref()
+                                .is_some_and(|result| result.summary == "the work is done")
+                    ) && event.agent_id.as_ref().map(ToString::to_string)
+                        == Some("agent-1".to_owned())
+                })
+            })
+        };
+        journal_satisfying(&runtime, "the endpoint-reported result", reported).await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -1945,6 +2089,7 @@ mod tests {
         let advertised = crate::capabilities::advertise(
             runtime.adapters(),
             runtime.workspaces().map(|_| Vec::new()),
+            &crate::capabilities::DeclaredFacts::default(),
         );
         assert_eq!(advertised.harnesses.len(), 1);
         assert_eq!(advertised.harnesses[0].provider, "fake");
@@ -2016,7 +2161,7 @@ mod tests {
             ..SpawnAgentCommand::default()
         };
 
-        let spec = super::domain_spec(&spawn, None);
+        let spec = super::domain_spec(&spawn, None, None);
         assert_eq!(spec.model.as_deref(), Some("fake-deep"));
         assert_eq!(
             spec.account,
@@ -2034,7 +2179,7 @@ mod tests {
     /// account means "the harness's default", and protobuf cannot say `None`.
     #[test]
     fn empty_wire_strings_mean_absent_not_empty() {
-        let spec = super::domain_spec(&SpawnAgentCommand::default(), None);
+        let spec = super::domain_spec(&SpawnAgentCommand::default(), None, None);
         assert_eq!(spec.model, None, "no binding is not an empty model name");
         assert_eq!(spec.account, None, "no account is the ambient default");
         assert_eq!(

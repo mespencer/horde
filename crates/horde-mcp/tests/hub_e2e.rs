@@ -52,7 +52,7 @@ async fn stack() -> Setup<Stack> {
     let hub_proxy = ToolProxy::new()
         .with_server(stub_mcp::upstream("linear").await?)
         .with_server(stub_mcp::upstream("payments").await?);
-    let mut hub_registry = AgentRegistry::new();
+    let hub_registry = AgentRegistry::new();
     hub_registry.insert(&horde.agent_id, HUB_TOKEN);
     let (hub_address, hub_serving) = serve(
         &EndpointConfig::loopback(0),
@@ -90,7 +90,7 @@ async fn stack() -> Setup<Stack> {
         .with_server(local);
     let endpoint = HordeEndpoint::new(horde.context().await?).with_proxy(Arc::new(proxy));
 
-    let mut registry = AgentRegistry::new();
+    let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, AGENT_TOKEN);
     let (address, endpoint_serving) = serve(
         &EndpointConfig::loopback(0),

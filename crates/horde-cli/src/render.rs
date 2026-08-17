@@ -172,7 +172,60 @@ fn detail(kind: Option<&Kind>) -> Value {
                 .unwrap_or_default(),
         ),
         Some(Kind::TurnInterrupted(interrupted)) => Value::String(interrupted.reason.clone()),
+        // Structured, not a prose line: a script following a session needs
+        // the outcome it can branch on, and burying it in a sentence would
+        // make every consumer a parser (W7b finding 4).
+        Some(Kind::ResultReported(reported)) => reported.result.as_ref().map_or_else(
+            || Value::String(String::new()),
+            |result| {
+                json!({
+                    "status": result_status(result.status),
+                    "summary": result.summary,
+                    "git_refs": result
+                        .payload
+                        .as_ref()
+                        .map(|payload| payload
+                            .git_refs
+                            .iter()
+                            .map(|git_ref| json!({
+                                "repo": git_ref.repo_name,
+                                "commit": git_ref.commit_sha,
+                                "branch": git_ref.branch,
+                            }))
+                            .collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                })
+            },
+        ),
+        Some(Kind::PermissionDecided(decided)) => decided.decision.as_ref().map_or_else(
+            || Value::String(String::new()),
+            |decision| {
+                json!({
+                    "outcome": permission_outcome(decision.outcome),
+                    "reason": decision.reason,
+                    "remembered": decision.remember_for_session,
+                    "updated_input": decision
+                        .updated_input
+                        .as_ref()
+                        .map(horde_wire::struct_to_json),
+                })
+            },
+        ),
         _ => Value::String(String::new()),
+    }
+}
+
+/// The wire result status, in the vocabulary `horde-wire` owns for it.
+fn result_status(status: i32) -> &'static str {
+    horde_wire::result_status_name(status)
+}
+
+/// The wire outcome, in the words `approve` reports.
+fn permission_outcome(outcome: i32) -> &'static str {
+    match horde_proto::v1::PermissionOutcome::try_from(outcome) {
+        Ok(horde_proto::v1::PermissionOutcome::Allow) => "allowed",
+        Ok(horde_proto::v1::PermissionOutcome::Deny) => "denied",
+        Ok(horde_proto::v1::PermissionOutcome::Unspecified) | Err(_) => "unknown",
     }
 }
 
@@ -413,6 +466,204 @@ pub fn mcp_servers(servers: &[horde_proto::v1::McpServerConfig], format: Format)
             .map(mcp_server_line)
             .collect::<Vec<_>>()
             .join("\n"),
+    }
+}
+
+fn workspace_json(definition: &horde_proto::v1::WorkspaceDefinition) -> serde_json::Value {
+    json!({
+        "workspace_definition_id": id(definition
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)),
+        "name": definition.name,
+        "etag": definition.etag,
+        "repos": definition
+            .repos
+            .iter()
+            .map(|repo| json!({
+                "name": repo.name,
+                "remote_url": repo.remote_url,
+                "default_branch": repo.default_branch,
+                "layout_path": repo.layout_path,
+            }))
+            .collect::<Vec<_>>(),
+        "unmanaged_paths": definition.unmanaged_paths,
+    })
+}
+
+/// One human line per definition: id, name, repo count, etag.
+fn workspace_line(definition: &horde_proto::v1::WorkspaceDefinition) -> String {
+    format!(
+        "{}  {}  {} repo(s)  etag {}",
+        definition
+            .workspace_definition_id
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), ToString::to_string),
+        definition.name,
+        definition.repos.len(),
+        definition.etag
+    )
+}
+
+/// Renders one definition — what `create` and `add-repo` answer with.
+#[must_use]
+pub fn workspace(definition: &horde_proto::v1::WorkspaceDefinition, format: Format) -> String {
+    match format {
+        Format::Json => workspace_json(definition).to_string(),
+        Format::Human => workspace_line(definition),
+    }
+}
+
+/// Renders the definition list.
+#[must_use]
+pub fn workspaces(definitions: &[horde_proto::v1::WorkspaceDefinition], format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "workspaces": definitions.iter().map(workspace_json).collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Format::Human if definitions.is_empty() => "no workspaces defined".to_owned(),
+        Format::Human => definitions
+            .iter()
+            .map(workspace_line)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Renders one definition and its known instances — what `get` answers with.
+#[must_use]
+pub fn workspace_with_instances(
+    response: &horde_proto::v1::GetWorkspaceDefinitionResponse,
+    format: Format,
+) -> String {
+    let instances: Vec<serde_json::Value> = response
+        .instances
+        .iter()
+        .map(|report| {
+            json!({
+                "worker_id": id(report.worker_id.as_ref().map(ToString::to_string)),
+                "state": instance_state(report.state),
+                "root_path": report.root_path,
+                "detail": report.detail,
+            })
+        })
+        .collect();
+    match format {
+        Format::Json => {
+            let mut rendered = response
+                .definition
+                .as_ref()
+                .map_or_else(|| json!({}), workspace_json);
+            rendered["instances"] = serde_json::Value::Array(instances);
+            rendered.to_string()
+        }
+        Format::Human => {
+            let mut lines = vec![
+                response
+                    .definition
+                    .as_ref()
+                    .map_or_else(|| "no such workspace".to_owned(), workspace_line),
+            ];
+            for report in &response.instances {
+                lines.push(format!(
+                    "  instance on {}: {}",
+                    report
+                        .worker_id
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), ToString::to_string),
+                    instance_state(report.state)
+                ));
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+/// Renders a deletion.
+#[must_use]
+pub fn workspace_deleted(workspace_definition_id: &str, format: Format) -> String {
+    match format {
+        Format::Json => json!({ "deleted": workspace_definition_id }).to_string(),
+        Format::Human => format!("deleted {workspace_definition_id}"),
+    }
+}
+
+/// Renders a prewarm's acceptance report.
+#[must_use]
+pub fn prewarmed(
+    report: Option<&horde_proto::v1::WorkspaceInstanceReport>,
+    format: Format,
+) -> String {
+    match (format, report) {
+        (Format::Json, Some(report)) => json!({
+            "worker_id": id(report.worker_id.as_ref().map(ToString::to_string)),
+            "state": instance_state(report.state),
+            "detail": report.detail,
+        })
+        .to_string(),
+        (Format::Json, None) => json!({ "state": "accepted" }).to_string(),
+        (Format::Human, Some(report)) => format!(
+            "prewarm accepted on {}: {}",
+            report
+                .worker_id
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string),
+            instance_state(report.state)
+        ),
+        (Format::Human, None) => "prewarm accepted".to_owned(),
+    }
+}
+
+/// Renders the connected-worker list.
+#[must_use]
+pub fn workers(workers: &[horde_proto::v1::WorkerSummary], format: Format) -> String {
+    match format {
+        Format::Json => json!({
+            "workers": workers
+                .iter()
+                .map(|worker| json!({
+                    "worker_id": id(worker.worker_id.as_ref().map(ToString::to_string)),
+                    "name": worker.name,
+                    "state": worker_state(worker.state),
+                    "semver": worker.semver,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Format::Human if workers.is_empty() => "no workers connected".to_owned(),
+        Format::Human => workers
+            .iter()
+            .map(|worker| {
+                format!(
+                    "{}  {}",
+                    worker
+                        .worker_id
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), ToString::to_string),
+                    worker_state(worker.state)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn instance_state(state: i32) -> &'static str {
+    match horde_proto::v1::WorkspaceInstanceState::try_from(state) {
+        Ok(horde_proto::v1::WorkspaceInstanceState::Materializing) => "materializing",
+        Ok(horde_proto::v1::WorkspaceInstanceState::Ready) => "ready",
+        Ok(horde_proto::v1::WorkspaceInstanceState::Degraded) => "degraded",
+        Ok(horde_proto::v1::WorkspaceInstanceState::Missing) => "missing",
+        _ => "unspecified",
+    }
+}
+
+fn worker_state(state: i32) -> &'static str {
+    match horde_proto::v1::WorkerConnectionState::try_from(state) {
+        Ok(horde_proto::v1::WorkerConnectionState::Online) => "online",
+        Ok(horde_proto::v1::WorkerConnectionState::Offline) => "offline",
+        _ => "unspecified",
     }
 }
 
@@ -711,7 +962,11 @@ mod tests {
         event::Kind,
     };
 
-    use super::{Format, created, event, hello, sent, sequence, session, sessions, spawned};
+    use super::{
+        Format, created, event, hello, instance_state, prewarmed, sent, sequence, session,
+        sessions, spawned, worker_state, workers, workspace, workspace_deleted,
+        workspace_with_instances, workspaces,
+    };
 
     /// The `mcp` renders: the empty catalog says so in words (a script or a
     /// human reading nothing cannot tell it from a swallowed error), a
@@ -839,6 +1094,263 @@ mod tests {
         assert_eq!(parsed["sequence"], 7);
         assert_eq!(parsed["kind"], "agent_output_chunk");
         assert_eq!(parsed["detail"], "hello");
+    }
+
+    /// A result's outcome is machine-readable (W7b finding 4): a script
+    /// following a session must be able to branch on status and read the
+    /// payload's refs without parsing prose.
+    #[test]
+    fn a_result_reported_carries_status_summary_and_refs_in_json() {
+        let reported = envelope(Some(Kind::ResultReported(
+            horde_proto::v1::ResultReported {
+                result: Some(horde_proto::v1::AgentResult {
+                    assignment_id: None,
+                    status: horde_proto::v1::ResultStatus::Partial as i32,
+                    summary: "got halfway".to_owned(),
+                    payload: Some(horde_proto::v1::Payload {
+                        git_refs: vec![horde_proto::v1::GitRef {
+                            repo_name: "atlas".to_owned(),
+                            commit_sha: "abc123".to_owned(),
+                            branch: "horde/agent-1".to_owned(),
+                        }],
+                        attachments: Vec::new(),
+                    }),
+                }),
+            },
+        )));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&reported, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["status"], "partial");
+        assert_eq!(parsed["detail"]["summary"], "got halfway");
+        assert_eq!(parsed["detail"]["git_refs"][0]["repo"], "atlas");
+        assert_eq!(parsed["detail"]["git_refs"][0]["commit"], "abc123");
+
+        // An unreadable status must not become a success a script acts on.
+        let unreadable = envelope(Some(Kind::ResultReported(
+            horde_proto::v1::ResultReported {
+                result: Some(horde_proto::v1::AgentResult {
+                    status: 9_999,
+                    ..horde_proto::v1::AgentResult::default()
+                }),
+            },
+        )));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&unreadable, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["status"], "unknown");
+    }
+
+    fn sample_definition() -> horde_proto::v1::WorkspaceDefinition {
+        horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+            name: "atlas-ws".to_owned(),
+            etag: "3".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
+                name: "atlas".to_owned(),
+                remote_url: "https://git.example/atlas.git".to_owned(),
+                default_branch: "main".to_owned(),
+                layout_path: "src".to_owned(),
+            }],
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        }
+    }
+
+    /// The workspace renders, both formats: what `create`/`list`/`get`
+    /// print is the operator's whole view of a definition, and the etag in
+    /// particular is the token every later edit must quote.
+    #[test]
+    fn workspace_renders_carry_the_id_repos_and_etag() {
+        let definition = sample_definition();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&workspace(&definition, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["workspace_definition_id"], "ws-1");
+        assert_eq!(parsed["etag"], "3");
+        assert_eq!(parsed["repos"][0]["name"], "atlas");
+        assert_eq!(parsed["repos"][0]["layout_path"], "src");
+
+        let human = workspace(&definition, Format::Human);
+        assert!(
+            human.contains("ws-1") && human.contains("etag 3"),
+            "{human}"
+        );
+
+        let listed: serde_json::Value =
+            serde_json::from_str(&workspaces(std::slice::from_ref(&definition), Format::Json))
+                .expect("valid JSON");
+        assert_eq!(listed["workspaces"][0]["name"], "atlas-ws");
+        assert_eq!(
+            workspaces(&[], Format::Human),
+            "no workspaces defined",
+            "an empty list says so rather than printing nothing"
+        );
+        assert!(workspaces(&[definition], Format::Human).contains("atlas-ws"));
+
+        let deleted: serde_json::Value =
+            serde_json::from_str(&workspace_deleted("ws-1", Format::Json)).expect("valid JSON");
+        assert_eq!(deleted["deleted"], "ws-1");
+        assert!(workspace_deleted("ws-1", Format::Human).contains("ws-1"));
+    }
+
+    /// `get` shows the definition and its known instances, with the state
+    /// vocabulary spelled for humans in both formats.
+    #[test]
+    fn a_workspace_get_renders_its_instances_and_their_states() {
+        let response = horde_proto::v1::GetWorkspaceDefinitionResponse {
+            definition: Some(sample_definition()),
+            instances: vec![horde_proto::v1::WorkspaceInstanceReport {
+                worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+                state: horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+                root_path: "/w/ws-1".to_owned(),
+                detail: String::new(),
+                ..horde_proto::v1::WorkspaceInstanceReport::default()
+            }],
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&workspace_with_instances(&response, Format::Json))
+                .expect("valid JSON");
+        assert_eq!(parsed["name"], "atlas-ws");
+        assert_eq!(parsed["instances"][0]["worker_id"], "w-1");
+        assert_eq!(parsed["instances"][0]["state"], "ready");
+
+        let human = workspace_with_instances(&response, Format::Human);
+        assert!(
+            human.contains("instance on w-1: ready"),
+            "the instances render under the definition: {human}"
+        );
+    }
+
+    /// The prewarm render, all four corners: with and without an acceptance
+    /// report, in both formats.
+    #[test]
+    fn a_prewarm_renders_its_acceptance_or_a_bare_accepted() {
+        let report = horde_proto::v1::WorkspaceInstanceReport {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            state: horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
+            ..horde_proto::v1::WorkspaceInstanceReport::default()
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&prewarmed(Some(&report), Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["state"], "materializing");
+        assert!(prewarmed(Some(&report), Format::Human).contains("w-1"));
+
+        let bare: serde_json::Value =
+            serde_json::from_str(&prewarmed(None, Format::Json)).expect("valid JSON");
+        assert_eq!(bare["state"], "accepted");
+        assert_eq!(prewarmed(None, Format::Human), "prewarm accepted");
+    }
+
+    /// The worker listing, and the two state tables' full vocabularies — a
+    /// state that rendered under a neighbour's name would send an operator
+    /// chasing the wrong worker.
+    #[test]
+    fn workers_render_with_their_connection_state() {
+        let worker = horde_proto::v1::WorkerSummary {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            name: "w-1".to_owned(),
+            state: horde_proto::v1::WorkerConnectionState::Online as i32,
+            ..horde_proto::v1::WorkerSummary::default()
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&workers(std::slice::from_ref(&worker), Format::Json))
+                .expect("valid JSON");
+        assert_eq!(parsed["workers"][0]["state"], "online");
+        assert!(workers(&[worker], Format::Human).contains("w-1  online"));
+        assert_eq!(workers(&[], Format::Human), "no workers connected");
+
+        for (state, name) in [
+            (
+                horde_proto::v1::WorkspaceInstanceState::Materializing as i32,
+                "materializing",
+            ),
+            (
+                horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+                "ready",
+            ),
+            (
+                horde_proto::v1::WorkspaceInstanceState::Degraded as i32,
+                "degraded",
+            ),
+            (
+                horde_proto::v1::WorkspaceInstanceState::Missing as i32,
+                "missing",
+            ),
+            (0, "unspecified"),
+            (9_999, "unspecified"),
+        ] {
+            assert_eq!(instance_state(state), name);
+        }
+        for (state, name) in [
+            (
+                horde_proto::v1::WorkerConnectionState::Online as i32,
+                "online",
+            ),
+            (
+                horde_proto::v1::WorkerConnectionState::Offline as i32,
+                "offline",
+            ),
+            (0, "unspecified"),
+            (9_999, "unspecified"),
+        ] {
+            assert_eq!(worker_state(state), name);
+        }
+    }
+
+    #[test]
+    fn a_permission_decided_carries_outcome_reason_and_narrowing_in_json() {
+        // Built from a collected map rather than inserts: one field is all
+        // the render needs, and the terser form keeps this fixture from
+        // twinning the fold suite's.
+        let narrowed = horde_proto::prost_types::Struct {
+            fields: [(
+                "path".to_owned(),
+                horde_proto::prost_types::Value {
+                    kind: Some(horde_proto::prost_types::value::Kind::StringValue(
+                        "/tmp/safe".to_owned(),
+                    )),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let decided = envelope(Some(Kind::PermissionDecided(
+            horde_proto::v1::PermissionDecided {
+                decision: Some(horde_proto::v1::PermissionDecision {
+                    request_id: Some(horde_proto::v1::PermissionRequestId::new("call-1")),
+                    outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
+                    reason: "clamped to /tmp".to_owned(),
+                    remember_for_session: true,
+                    updated_input: Some(narrowed),
+                    ..horde_proto::v1::PermissionDecision::default()
+                }),
+            },
+        )));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&decided, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["outcome"], "allowed");
+        assert_eq!(parsed["detail"]["reason"], "clamped to /tmp");
+        assert_eq!(parsed["detail"]["remembered"], true);
+        assert_eq!(parsed["detail"]["updated_input"]["path"], "/tmp/safe");
+
+        let denied = envelope(Some(Kind::PermissionDecided(
+            horde_proto::v1::PermissionDecided {
+                decision: Some(horde_proto::v1::PermissionDecision {
+                    outcome: horde_proto::v1::PermissionOutcome::Deny as i32,
+                    ..horde_proto::v1::PermissionDecision::default()
+                }),
+            },
+        )));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&denied, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["detail"]["outcome"], "denied");
+        assert_eq!(
+            parsed["detail"]["updated_input"],
+            serde_json::Value::Null,
+            "no narrowing renders as null, not as an empty object"
+        );
     }
 
     /// Hiding an event this build cannot pretty-print would make the printed

@@ -13,7 +13,16 @@ workspace = true
 async-trait = { workspace = true }
 horde-adapter = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["net", "time"] }
+
+# The endpoint client (`Step::UseHordeTool` against a real endpoint) is a
+# hand-rolled legacy-era JSON-RPC POST over hyper. Deliberately not an MCP
+# client crate: `horde-cli` depends on this crate, so reaching for `horde-mcp`
+# here would close a dependency cycle.
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 horde-testkit = { workspace = true }

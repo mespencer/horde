@@ -90,8 +90,134 @@ impl std::fmt::Debug for ServerCore {
 /// This build's semver, echoed in every handshake.
 pub const SERVER_SEMVER: &str = env!("CARGO_PKG_VERSION");
 
-/// Below this, a peer's role is refused outright (DESIGN.md §2).
+/// How often a long-lived stream re-checks the deny-list.
+///
+/// Streams are the one place the per-RPC interceptor cannot reach: a
+/// `StreamCommands`, `PushEvents`, or `SyncEvents` stream lives for its
+/// peer's whole connection, so revocation would otherwise wait for a
+/// reconnect (DESIGN §3, wave-7 fix a4). A quarter second is far below any
+/// human revocation-to-effect expectation and costs one atomic read per tick
+/// per stream.
+pub(crate) const REVOCATION_RECHECK_PERIOD: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// The serial of the certificate this request arrived under, if the mTLS
+/// interceptor stamped one. Plaintext test channels have none, and for them
+/// [`severed`] never resolves — there is no certificate to revoke.
+pub(crate) fn peer_serial<T>(request: &tonic::Request<T>) -> Option<String> {
+    request
+        .extensions()
+        .get::<horde_identity::PeerIdentity>()
+        .map(|identity| identity.serial_hex.clone())
+}
+
+/// Resolves when this stream's certificate is revoked — the severing half of
+/// revocation. Select the stream's pump against this; when it resolves, end
+/// the stream with the same `PermissionDenied` the interceptor gives unary
+/// calls. Never resolves without both a deny-list and a serial (a plaintext
+/// or unsecured server has neither, and severing nothing is correct there).
+pub(crate) async fn severed(deny: Option<horde_identity::RevocationList>, serial: Option<String>) {
+    let (Some(deny), Some(serial)) = (deny, serial) else {
+        return std::future::pending().await;
+    };
+    loop {
+        if deny.is_revoked(&serial) {
+            return;
+        }
+        tokio::time::sleep(REVOCATION_RECHECK_PERIOD).await;
+    }
+}
+
+/// The refusal a severed stream ends with: the same code and vocabulary the
+/// interceptor uses for a revoked unary call, so a peer sees one story.
+pub(crate) fn severed_status(serial: Option<&str>) -> tonic::Status {
+    tonic::Status::permission_denied(format!(
+        "certificate {} has been revoked; this stream is severed",
+        serial.unwrap_or("<unknown>")
+    ))
+}
+
+/// Races one stream's pump against revocation, ending the stream with the
+/// severed refusal when revocation wins (fix a4). One helper for all three
+/// long-lived streams — `StreamCommands`, `PushEvents`, `SyncEvents` — so
+/// their severing cannot drift apart. Cancelling a pump mid-step is safe
+/// precisely because the stream ends here: its cursors die with it.
+pub(crate) async fn run_severable<T, F>(
+    pump: F,
+    deny: Option<horde_identity::RevocationList>,
+    serial: Option<String>,
+    sender: &tokio::sync::mpsc::Sender<Result<T, tonic::Status>>,
+) where
+    F: Future<Output = ()>,
+{
+    tokio::select! {
+        () = pump => {}
+        () = severed(deny, serial.clone()) => {
+            let _ = sender.send(Err(severed_status(serial.as_deref()))).await;
+        }
+    }
+}
+
+/// Below this, a peer is refused outright (DESIGN.md §2). Enforced by
+/// [`version_gate`] at both handshakes — `Hello` on the control plane and
+/// `RegisterWorker` on the worker spine.
 pub const MIN_SUPPORTED_SEMVER: &str = "0.1.0";
+
+/// [`MIN_SUPPORTED_SEMVER`] as the triple comparisons run on. A test pins
+/// the two together so the string in refusal messages cannot drift from the
+/// number actually enforced.
+const MINIMUM_TRIPLE: (u64, u64, u64) = (0, 1, 0);
+
+/// Enforces the version handshake (DESIGN §2, wave-7 fix a6): a peer must
+/// say what it is, and what it says must be a semver at or above
+/// [`MIN_SUPPORTED_SEMVER`].
+///
+/// `FailedPrecondition` for every refusal — the code the worker daemon's
+/// fate table treats as fatal, which is right: neither a missing Hello nor
+/// an old build heals by redialing.
+///
+/// # Errors
+///
+/// A refusal naming what was missing, unreadable, or too old — and the
+/// minimum, so the operator knows what to upgrade to.
+pub fn version_gate(hello: Option<&horde_proto::v1::Hello>) -> Result<(), tonic::Status> {
+    let Some(hello) = hello else {
+        return Err(tonic::Status::failed_precondition(format!(
+            "this handshake carried no Hello; peers below {MIN_SUPPORTED_SEMVER} \
+             (or saying nothing) are refused"
+        )));
+    };
+    let Some(version) = parse_semver(&hello.semver) else {
+        return Err(tonic::Status::failed_precondition(format!(
+            "{:?} is not a semver this server can compare; the minimum supported \
+             version is {MIN_SUPPORTED_SEMVER}",
+            hello.semver
+        )));
+    };
+    if version < MINIMUM_TRIPLE {
+        return Err(tonic::Status::failed_precondition(format!(
+            "version {} is below the minimum supported {MIN_SUPPORTED_SEMVER}; \
+             upgrade the peer",
+            hello.semver
+        )));
+    }
+    Ok(())
+}
+
+/// `MAJOR.MINOR.PATCH` as a comparable triple, or `None` for anything else.
+///
+/// Deliberately no pre-release or build-metadata handling: every version
+/// Horde has ever stamped is a bare triple, and accepting more would let a
+/// typo compare as valid.
+fn parse_semver(semver: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = semver.split('.');
+    let triple = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(triple)
+}
 
 /// A human-readable name for an event kind.
 ///
@@ -379,6 +505,58 @@ mod tests {
             "permission_requested"
         );
         assert_eq!(kind_name(None), "empty");
+    }
+
+    /// The version gate's truth table (fix a6): no Hello, an unreadable
+    /// version, and a version below the minimum all refuse with
+    /// FailedPrecondition — the code the worker daemon treats as fatal — and
+    /// the minimum rides every refusal so the operator knows the target.
+    #[test]
+    fn the_version_gate_refuses_missing_unreadable_and_old_peers() {
+        use super::version_gate;
+        let hello = |semver: &str| horde_proto::v1::Hello {
+            semver: semver.to_owned(),
+            ..horde_proto::v1::Hello::default()
+        };
+
+        assert!(
+            version_gate(Some(&hello("0.1.0"))).is_ok(),
+            "the floor passes"
+        );
+        assert!(version_gate(Some(&hello("0.2.7"))).is_ok());
+        assert!(version_gate(Some(&hello("1.0.0"))).is_ok());
+
+        for (peer, needle) in [
+            (None, "no Hello"),
+            (Some(hello("")), "not a semver"),
+            (Some(hello("banana")), "not a semver"),
+            (Some(hello("0.1")), "not a semver"),
+            (Some(hello("0.1.0.1")), "not a semver"),
+            (Some(hello("0.0.9")), "below the minimum"),
+        ] {
+            let refused = version_gate(peer.as_ref()).expect_err("must refuse");
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                refused.message().contains(needle),
+                "{peer:?} must be refused naming {needle}: {}",
+                refused.message()
+            );
+            assert!(
+                refused.message().contains(super::MIN_SUPPORTED_SEMVER),
+                "every refusal names the minimum: {}",
+                refused.message()
+            );
+        }
+    }
+
+    /// The string in refusal messages and the triple actually enforced are
+    /// two spellings of one number; this is what keeps them one.
+    #[test]
+    fn the_advertised_minimum_is_the_enforced_minimum() {
+        assert_eq!(
+            super::parse_semver(super::MIN_SUPPORTED_SEMVER),
+            Some(super::MINIMUM_TRIPLE)
+        );
     }
 
     #[test]

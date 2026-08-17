@@ -182,6 +182,7 @@ pub(crate) fn supervise_worker(
                 capabilities::advertise(
                     runtime.adapters(),
                     runtime.workspaces().map(|_| Vec::new()),
+                    &capabilities::DeclaredFacts::default(),
                 ),
             );
             if let Ok((mut connection, _)) = Connection::dial(&config).await {

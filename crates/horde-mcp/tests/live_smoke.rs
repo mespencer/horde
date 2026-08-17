@@ -79,7 +79,7 @@ async fn answer_first_escalation(endpoint: &str, session_id: &str) -> Setup<Stri
 async fn a_real_claude_routes_its_permission_prompt_through_this_endpoint() -> Setup<()> {
     let horde = harness().await?;
 
-    let mut registry = AgentRegistry::new();
+    let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, TOKEN);
 
     let mcp = HordeEndpoint::new(horde.context().await?);

@@ -4,55 +4,24 @@
 //! receiving agent's checkout *before* the message names it — through the
 //! Relay share ref, because it exists nowhere else the receiver can reach.
 //!
-//! # The one stood-in step, named
+//! # Nothing is stood in any more
 //!
-//! The sender's half of stamping — `horde-mcp`'s `report_result` flowing
-//! through the Worker's `StampingSink` — is not wired into the daemon yet
-//! (the Runtime's spawn path still passes `horde_endpoint: None`; see
-//! `runtime.rs`). Until that lands, this scenario stages the sender's commit
-//! onto the Relay with the *same production call* the stamp path makes
-//! (`horde_relay::stage_share`, `ViaRelay`), from the sender agent's real
-//! checkout on worker A's disk. Everything else — the workspace definition,
-//! both materializations, both spawns, the payload-carrying delivery, and
-//! the receiver-side obtain through the Relay — is the product, uninvented.
+//! The Relay is the server's own (`--serve --relay-bind`, fix a10), its
+//! mirror registry fed from the workspace catalog this scenario defines. The
+//! sender's commit reaches the Relay because the sender *agent* reports its
+//! result through its MCP endpoint (fix a1): the Worker's StampingSink
+//! observes HEAD and stages the share ref — no test plumbing touches the
+//! relay or the stamp.
 //!
-//! # Why some verbs go over the raw client
+//! # Every verb is the CLI's own
 //!
-//! The CLI has no workspace or payload verbs yet, so the workspace
-//! definition, the pinned spawns and the payload-carrying send speak the
-//! production control-plane RPCs directly, as the operator's enrolled
-//! identity. That is a gap in the CLI's surface (flagged in the wave
-//! report), not in the system under test.
+//! The workspace definition, the pinned session and spawn, and the
+//! payload-carrying send all go through `horde`'s verbs (fix a12) — this
+//! scenario is also the end-to-end proof of that surface.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use horde_proto::v1::control_plane_service_client::ControlPlaneServiceClient;
-use horde_proto::v1::{
-    AgentId, AgentSpec, Assignment, CreateSessionRequest, CreateWorkspaceDefinitionRequest,
-    DeliveryMode, GitRef, Payload, PlacementConstraints, PlacementState, SendMessageRequest,
-    SpawnAgentRequest, WorkerId, WorkspaceRepo, send_message_request,
-};
 
 use crate::support::{System, git, outputs};
-
-/// A control-plane client speaking as the operator — the production wire
-/// surface, over the same mTLS channel the CLI uses.
-async fn control_plane(system: &System) -> ControlPlaneServiceClient<tonic::transport::Channel> {
-    let identity =
-        horde_identity::StoredIdentity::load(&system.operator).expect("the operator identity");
-    let channel = tonic::transport::Endpoint::from_shared(system.main.clone())
-        .expect("a usable endpoint")
-        .tls_config(horde_identity::tls::grpc_client_mtls(
-            &identity,
-            "localhost",
-        ))
-        .expect("the identity is usable for TLS")
-        .connect()
-        .await
-        .expect("the operator dials the control plane");
-    ControlPlaneServiceClient::new(channel)
-}
 
 /// Waits until `path` exists on disk — the observable half of a materialize
 /// or checkout that happened inside a worker daemon. Bounded.
@@ -90,19 +59,23 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     git(&origin, &["add", "."]).await;
     git(&origin, &["commit", "-m", "seed"]).await;
 
-    // The production Relay, served for real on its own socket; the suite is
-    // only its host process, the way the server binary will be one day.
-    let mirrors = horde_relay::MirrorStore::new(system.state.path().join("mirrors"));
-    mirrors
-        .register("atlas", &origin.to_string_lossy())
-        .expect("the origin registers");
-    let relay = horde_relay::RelayServer::bind(
-        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        Arc::new(mirrors),
+    // The server's own mounted Relay: its registry learns `atlas` from the
+    // workspace definition created below, through the catalog follower.
+    let relay_url = system.relay.clone();
+
+    // The sender's script: one turn that reports through its MCP endpoint.
+    // The stamp is the worker's, observed from the checkout — the script
+    // declares no commits, by design.
+    let script = system.state.path().join("report.json");
+    std::fs::write(
+        &script,
+        r#"[{"steps": [
+            {"use_horde": {"id": "call-r", "tool": "report_result",
+                           "input": {"status": "success",
+                                     "summary": "the finding is committed"}}}
+        ], "text": "reported"}]"#,
     )
-    .await
-    .expect("the relay binds loopback");
-    let relay_url = format!("http://{}", relay.addr());
+    .expect("the script writes");
 
     // Two daemons, each with its own workspace root and the shared Relay.
     let root_a = system.state.path().join("root-a");
@@ -116,6 +89,8 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
                 &root_a.to_string_lossy(),
                 "--relay",
                 &relay_url,
+                "--fake-script",
+                &script.to_string_lossy(),
             ],
         )
         .await;
@@ -132,83 +107,58 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
         )
         .await;
 
-    // The workspace, defined once at the control plane; the full definition
-    // rides every MaterializeWorkspace command from here on.
-    let mut client = control_plane(&system).await;
-    let definition = client
-        .create_workspace_definition(CreateWorkspaceDefinitionRequest {
-            name: "atlas-ws".to_owned(),
-            repos: vec![WorkspaceRepo {
-                name: "atlas".to_owned(),
-                remote_url: origin.to_string_lossy().into_owned(),
-                default_branch: "main".to_owned(),
-                layout_path: "atlas".to_owned(),
-            }],
-            unmanaged_paths: Vec::new(),
-        })
-        .await
-        .expect("the definition creates")
-        .into_inner()
-        .definition
-        .expect("a definition comes back");
-    let definition_id = definition
-        .workspace_definition_id
-        .as_ref()
-        .expect("a definition id")
-        .to_string();
+    // The workspace, defined through the CLI's own verb (fix a12); the full
+    // definition rides every MaterializeWorkspace command from here on.
+    let repo_flag = format!("atlas={},path=atlas", origin.to_string_lossy());
+    let definition_id = system
+        .cli_field(
+            &["workspace", "create", "atlas-ws", "--repo", &repo_flag],
+            "workspace_definition_id",
+        )
+        .await;
 
     // The session's root agent is the sender, pinned to worker A with the
     // workspace; placement materializes the Instance on A before the spawn.
-    let pinned = |worker: &str| {
-        Some(AgentSpec {
-            workspace_definition_id: definition.workspace_definition_id.clone(),
-            placement: Some(PlacementConstraints {
-                pinned_worker_id: Some(WorkerId::new(worker)),
-                ..PlacementConstraints::default()
-            }),
-            ..AgentSpec::default()
-        })
-    };
-    let created = client
-        .create_session(CreateSessionRequest {
-            title: "e2e payload".to_owned(),
-            workspace_definition_id: definition.workspace_definition_id.clone(),
-            root_agent: pinned("w-a"),
-            idempotency_key: "e2e-payload".to_owned(),
-        })
-        .await
-        .expect("the session creates")
-        .into_inner();
-    let summary = created.session.expect("a session summary");
-    let session_id = summary
-        .session_id
-        .as_ref()
+    let created = system
+        .cli_json(&[
+            "session",
+            "new",
+            "e2e payload",
+            "--workspace",
+            &definition_id,
+            "--pin-worker",
+            "w-a",
+        ])
+        .await;
+    let session_id = created["session_id"]
+        .as_str()
         .expect("a session id")
-        .to_string();
-    let sender = summary
-        .root_agent_id
-        .as_ref()
+        .to_owned();
+    let sender = created["root_agent_id"]
+        .as_str()
         .expect("a root agent id")
-        .to_string();
+        .to_owned();
 
     // The receiver, spawned under the sender but pinned to worker B.
-    let spawned = client
-        .spawn_agent(SpawnAgentRequest {
-            session_id: summary.session_id.clone(),
-            parent_agent_id: Some(AgentId::new(sender.clone())),
-            spec: pinned("w-b"),
-            idempotency_key: "e2e-payload-receiver".to_owned(),
-        })
-        .await
-        .expect("the receiver spawns")
-        .into_inner();
-    let receiver = spawned.agent_id.as_ref().expect("an agent id").to_string();
-    let placement = spawned.placement.expect("a placement answer");
+    let spawned = system
+        .cli_json(&[
+            "spawn",
+            &session_id,
+            "--parent",
+            &sender,
+            "--workspace",
+            &definition_id,
+            "--pin-worker",
+            "w-b",
+        ])
+        .await;
+    let receiver = spawned["agent_id"]
+        .as_str()
+        .expect("an agent id")
+        .to_owned();
     assert_eq!(
-        placement.state,
-        i32::from(PlacementState::Placed),
-        "the pinned spawn must place, not queue: {}",
-        placement.reason
+        spawned["placement"], "placed",
+        "the pinned spawn must place, not queue: {spawned}"
     );
 
     // Both daemons materialized their Instances and produced checkouts.
@@ -218,23 +168,27 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     path_appears("the receiver's checkout", &receiver_checkout).await;
 
     // The sender's work: a commit that exists only on worker A. Then the
-    // stand-in for the not-yet-wired MCP report: the production staging
-    // call pushes it to its content-addressed share ref on the Relay.
+    // real report: a message wakes the sender, whose scripted turn calls
+    // `report_result` through its own MCP endpoint — the Worker's
+    // StampingSink observes this commit and stages it onto the server's
+    // Relay.
     std::fs::write(sender_checkout.join("finding.md"), "the atlas moved\n")
         .expect("the finding writes");
     git(&sender_checkout, &["add", "."]).await;
     git(&sender_checkout, &["commit", "-m", "the finding"]).await;
     let commit_sha = git(&sender_checkout, &["rev-parse", "HEAD"]).await;
-    horde_relay::stage_share(
-        &sender_checkout,
-        &horde_relay::ShareRoute::ViaRelay {
-            repo_name: "atlas".to_owned(),
-        },
-        Some(&relay.location()),
-        &commit_sha,
-    )
-    .await
-    .expect("the stamp path's staging call pushes the share ref");
+
+    system
+        .cli_json(&["send", &sender, "report your result"])
+        .await;
+    system
+        .sync_until(&session_id, "the endpoint-reported result", |events| {
+            events.iter().any(|event| {
+                event["kind"] == "result_reported"
+                    && event["agent_id"].as_str() == Some(sender.as_str())
+            })
+        })
+        .await;
     assert!(
         !holds_commit(&origin, &commit_sha).await,
         "the commit must not have leaked to origin: only the relay may carry it"
@@ -242,27 +196,17 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
 
     // The payload-carrying delivery. The server folds it into a
     // DeliverMessage for worker B, whose broker must make the commit present
-    // before the agent reads the message.
-    client
-        .send_message(SendMessageRequest {
-            to_agent_id: Some(AgentId::new(receiver.clone())),
-            body: Some(send_message_request::Body::Assignment(Assignment {
-                assignment_id: None,
-                text: "integrate the atlas change".to_owned(),
-                payload: Some(Payload {
-                    git_refs: vec![GitRef {
-                        repo_name: "atlas".to_owned(),
-                        commit_sha: commit_sha.clone(),
-                        branch: String::new(),
-                    }],
-                    attachments: Vec::new(),
-                }),
-            })),
-            delivery: DeliveryMode::TurnBoundary.into(),
-            idempotency_key: "e2e-payload-send".to_owned(),
-        })
-        .await
-        .expect("the payload message sends");
+    // before the agent reads the message — named through the CLI's own
+    // --git-ref flag (fix a12).
+    system
+        .cli_json(&[
+            "send",
+            &receiver,
+            "integrate the atlas change",
+            "--git-ref",
+            &format!("atlas:{commit_sha}"),
+        ])
+        .await;
 
     // The delivery reached the agent: its echo is in the log. The obtain
     // precedes the delivery by construction, so the echo is also the receipt

@@ -68,7 +68,11 @@ async fn join_with(world: &mut HordeWorld, script: Script) -> StepResult {
         endpoint,
         worker_id: "scripted-box".to_owned(),
         hello: horde_worker::capabilities::hello("scripted-box"),
-        capabilities: horde_worker::capabilities::advertise(runtime.adapters(), None),
+        capabilities: horde_worker::capabilities::advertise(
+            runtime.adapters(),
+            None,
+            &horde_worker::capabilities::DeclaredFacts::default(),
+        ),
         identity: None,
     };
     let (mut connection, _registration) = horde_worker::Connection::dial(&config).await?;

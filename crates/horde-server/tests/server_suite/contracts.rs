@@ -58,7 +58,7 @@ async fn drain_sync<T>(
 async fn register(h: &mut Harness, worker: &str, tags: &[&str]) -> Setup<()> {
     h.worker
         .register_worker(RegisterWorkerRequest {
-            hello: None,
+            hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker)),
             capabilities: Some(WorkerCapabilities {
                 tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
@@ -152,6 +152,111 @@ async fn every_unbuilt_control_plane_rpc_refuses_rather_than_fabricating_success
         .await
         .expect_err("a groupless usage query is refused");
     assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+/// The request-level workspace's precedence truth table (fix a12): the spec's
+/// own workspace always wins, the request-level id fills in only when the
+/// spec names none, and the filled-in workspace is *consumed* — it lands in
+/// the root agent's journaled spec, where placement reads it.
+#[tokio::test]
+async fn the_request_level_workspace_fills_in_without_overriding_the_spec() {
+    use horde_proto::v1::CreateSessionRequest;
+
+    let mut h = connect().await.expect("a harness");
+    let definition = create_named(&mut h, "precedence-ws")
+        .await
+        .expect("a definition");
+    let ws = definition.workspace_definition_id.clone();
+
+    // Request-level only: the id is consumed into the root agent's spec.
+    let created = h
+        .control
+        .create_session(CreateSessionRequest {
+            title: "request-level".to_owned(),
+            workspace_definition_id: ws.clone(),
+            root_agent: None,
+            idempotency_key: "ws-precedence-1".to_owned(),
+        })
+        .await
+        .expect("the session creates")
+        .into_inner();
+    let session_id = created
+        .session
+        .and_then(|summary| summary.session_id)
+        .map(|id| id.to_string())
+        .expect("a session id");
+    let spawned_workspaces = drain_sync(&mut h, &session_id, |batch, out| {
+        for envelope in &batch.events {
+            if let Some(horde_proto::v1::event::Kind::AgentSpawned(spawned)) =
+                envelope.event.as_ref().and_then(|event| event.kind.clone())
+            {
+                out.push(
+                    spawned
+                        .spec
+                        .and_then(|spec| spec.workspace_definition_id)
+                        .map(|id| id.to_string()),
+                );
+            }
+        }
+    })
+    .await
+    .expect("the log replays");
+    assert_eq!(
+        spawned_workspaces,
+        vec![ws.as_ref().map(ToString::to_string)],
+        "the request-level workspace must land in the root agent's spec"
+    );
+
+    // Spec-level beside a bogus request-level id: the spec wins, so the
+    // bogus id is never validated and the create succeeds.
+    h.control
+        .create_session(CreateSessionRequest {
+            title: "spec-wins".to_owned(),
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                "ws-that-does-not-exist",
+            )),
+            root_agent: Some(horde_proto::v1::AgentSpec {
+                workspace_definition_id: ws.clone(),
+                ..horde_proto::v1::AgentSpec::default()
+            }),
+            idempotency_key: "ws-precedence-2".to_owned(),
+        })
+        .await
+        .expect("the spec's workspace outranks the request-level id");
+}
+
+/// An unknown tier is refused at the RPC, naming the catalog's own — never
+/// left for the deterministic fold to trip over (fix a12 / W7b f5).
+#[tokio::test]
+async fn a_spawn_naming_an_unknown_tier_is_refused_with_the_known_ones() {
+    let mut h = connect().await.expect("a harness");
+    let (session_id, _) = seed(&mut h, "tiers", "tier-key").await.expect("a session");
+
+    let refused = h
+        .control
+        .spawn_agent(horde_proto::v1::SpawnAgentRequest {
+            session_id: Some(SessionId::new(session_id)),
+            parent_agent_id: None,
+            spec: Some(horde_proto::v1::AgentSpec {
+                model: Some(horde_proto::v1::ModelSelection {
+                    selection: Some(horde_proto::v1::model_selection::Selection::Tier(
+                        "imaginary".to_owned(),
+                    )),
+                }),
+                ..horde_proto::v1::AgentSpec::default()
+            }),
+            idempotency_key: String::new(),
+        })
+        .await
+        .expect_err("an unknown tier must be refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    for known in ["imaginary", "fast", "standard", "deep"] {
+        assert!(
+            refused.message().contains(known),
+            "the refusal names the tier and the catalog: {}",
+            refused.message()
+        );
+    }
 }
 
 // -- Workspaces --------------------------------------------------------------
@@ -620,7 +725,11 @@ async fn the_control_plane_handshake_names_a_real_version() {
 
     let server = h
         .control
-        .hello(HelloRequest::default())
+        .hello(HelloRequest {
+            // The version gate (fix a6) reads this; an empty request is now
+            // a refusal, proven in `services.rs`.
+            hello: crate::common::versioned_hello(),
+        })
         .await
         .expect("hello must succeed")
         .into_inner()
@@ -637,11 +746,7 @@ async fn the_worker_handshake_names_the_same_version() {
 
     let registered = h
         .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+        .register_worker(crate::common::plain_registration("worker-a"))
         .await
         .expect("registration must succeed")
         .into_inner();

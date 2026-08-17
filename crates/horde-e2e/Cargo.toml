@@ -13,13 +13,11 @@ workspace = true
 # library target exists only to give the suite a crate to belong to, so a
 # plain `cargo build` never pays for the e2e harness.
 [dev-dependencies]
-horde-identity = { workspace = true }
-horde-proto = { workspace = true }
-# The relay the payload scenario hosts is the production component over a
-# real TCP socket; only its host process is the suite's.
-horde-relay = { workspace = true }
+# The scenarios drive everything through the product binaries' own operator
+# interfaces — stdout lines and `--json` renders — so the suite needs no wire
+# types and no client library of its own (the raw-client stand-ins left with
+# fix a12).
 horde-server-testkit = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time"] }
-tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }

@@ -136,6 +136,12 @@ impl ShareBroker {
         let mut git_refs = Vec::new();
         for (repo_name, relative) in &checkout.repos {
             let repo = checkout.root.join(relative);
+            // "Commit, then share" (ADR-0002, §8): a dirty working tree is
+            // refused with the helpful error, never silently reduced to
+            // whatever HEAD happens to hold. Stamping around uncommitted work
+            // would ack a result whose payload omits part of the work it
+            // reports — the acked-but-discarded shape, one layer up.
+            horde_relay::require_committed(&repo).await?;
             let observed = observe_head(&repo)
                 .await
                 .map_err(horde_relay::ShareError::from)?;

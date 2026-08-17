@@ -152,21 +152,24 @@ an `error`; an *absent* nextest is a supported fallback and is not.
 **What.** `cargo llvm-cov` over the whole workspace, all features, writing LCOV to
 `target/quality/lcov.info` — which is also the input the `crap` gate scores against.
 
-**Why.** Two jobs. It produces the artifact CRAP needs, and it records the number so a
-threshold can eventually be chosen from evidence rather than from a default.
+**Why.** Two jobs. It produces the artifact CRAP needs, and it holds the line-coverage
+floor.
 
-**Blocking with no threshold.** There is deliberately no minimum percentage yet.
-"Blocking" here means the measurement must *happen*: if llvm-cov cannot run, or leaves no
-readable LCOV, the gate is an `error` and the run is red. TESTING.md §4 is explicit that
-an absolute threshold is chosen from evidence, and on day one there is no evidence. This
-is the one gate whose bar is expected to tighten later, and doing so is a deliberate,
-reviewable one-line change.
+**Blocking, floor 95.0% (wave 7).** The gate ran thresholdless while evidence
+accumulated, exactly as TESTING.md §4 prescribes; the evidence is in — the tree sat
+between 96.6% and 97.1% for weeks — so the floor is set at 95.0%: comfortably below the
+observed range, high enough that a regression eating two points of coverage fails the
+gate instead of shrinking a number nobody reads. Before this the gate was Blocking in
+name only (it could error but never fail), which miscounted the gauntlet's promises.
+The measurement must still *happen*: an llvm-cov that cannot run, or leaves no readable
+LCOV, is an `error` and the run is red. Raising (or arguing down) the floor is a
+deliberate, reviewable one-line change in `gates/coverage.rs`, made with evidence.
 
 **Local.** `gauntlet run coverage`. For a browsable report:
 `cargo llvm-cov --all-features --workspace --html`.
 
-**How to read.** The detail is `lines <pct>% (<hit>/<found>)`. Watch the trend, not the
-absolute number.
+**How to read.** The detail is `lines <pct>% (<hit>/<found>)` against the floor. Watch
+the trend as well as the boundary.
 
 ## crap
 

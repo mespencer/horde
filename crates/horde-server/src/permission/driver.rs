@@ -442,7 +442,14 @@ fn decided_event(
                 request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
                 outcome: outcome as i32,
                 decided_by: decided_by as i32,
-                decided_by_actor: None,
+                // The chain is the server acting on its own behalf — layers
+                // 1–3 have no human to name, and an unattributed decision
+                // reads as "nobody decided this" in a multi-attach audit.
+                decided_by_actor: Some(horde_proto::v1::Actor {
+                    actor: Some(horde_proto::v1::actor::Actor::Server(
+                        horde_proto::v1::ServerActor {},
+                    )),
+                }),
                 reason,
                 remember_for_session: false,
                 updated_input,

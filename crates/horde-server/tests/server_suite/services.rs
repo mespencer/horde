@@ -45,13 +45,67 @@ async fn register_worker(harness: &mut Harness, worker_id: &str) -> Setup<u64> {
     Ok(harness
         .worker
         .register_worker(RegisterWorkerRequest {
-            hello: None,
+            hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker_id)),
             capabilities: Some(WorkerCapabilities::default()),
         })
         .await?
         .into_inner()
         .resume_from_journal_sequence)
+}
+
+/// The version gate over the real wire (fix a6): a worker below the minimum
+/// — or one saying nothing — is refused at registration with the code its
+/// daemon treats as fatal, and a healthy client's Hello passes.
+#[tokio::test]
+async fn the_handshakes_refuse_peers_below_the_minimum_version() -> Setup<()> {
+    let mut harness = crate::common::connect().await?;
+
+    let register = |semver: Option<&str>| RegisterWorkerRequest {
+        hello: semver.map(|semver| horde_proto::v1::Hello {
+            semver: semver.to_owned(),
+            ..horde_proto::v1::Hello::default()
+        }),
+        worker_id: Some(WorkerId::new("old-worker")),
+        capabilities: Some(WorkerCapabilities::default()),
+    };
+
+    for peer in [None, Some("0.0.1"), Some("not-a-version")] {
+        let refused = harness
+            .worker
+            .register_worker(register(peer))
+            .await
+            .expect_err("an unversioned or old worker must be refused");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{peer:?}");
+        assert!(
+            refused.message().contains("0.1.0"),
+            "the refusal names the minimum: {}",
+            refused.message()
+        );
+    }
+
+    // The refused worker never entered the registry: nothing to place on.
+    assert!(
+        harness
+            .control
+            .list_workers(horde_proto::v1::ListWorkersRequest {
+                include_offline: true
+            })
+            .await?
+            .into_inner()
+            .workers
+            .is_empty(),
+        "a refused registration must not register"
+    );
+
+    // The client side of the same gate.
+    let refused = harness
+        .control
+        .hello(horde_proto::v1::HelloRequest { hello: None })
+        .await
+        .expect_err("a client saying nothing is refused");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    Ok(())
 }
 
 /// Spawns a root agent under `session_id` and returns its id and placement.
@@ -927,11 +981,7 @@ async fn a_restarted_server_still_knows_what_it_issued_a_worker() {
 
     let resume = restarted
         .worker
-        .register_worker(RegisterWorkerRequest {
-            hello: None,
-            worker_id: Some(WorkerId::new("worker-a")),
-            capabilities: Some(WorkerCapabilities::default()),
-        })
+        .register_worker(crate::common::plain_registration("worker-a"))
         .await
         .expect("register")
         .into_inner()

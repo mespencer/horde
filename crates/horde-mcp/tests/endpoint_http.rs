@@ -32,7 +32,7 @@ struct Served {
 async fn served() -> Setup<Served> {
     let horde = harness().await?;
 
-    let mut registry = AgentRegistry::new();
+    let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, TOKEN);
 
     let endpoint = HordeEndpoint::new(horde.context().await?);

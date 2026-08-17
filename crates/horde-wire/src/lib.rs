@@ -23,12 +23,54 @@ pub mod capability;
 pub mod permission;
 pub mod usage;
 
+/// The wire `ResultStatus`, in the words `report_result` accepts and every
+/// render shows. One owner (the endpoint validates these names in and this
+/// maps them out), so the vocabulary cannot drift between the MCP surface
+/// and the CLI's renders.
+///
+/// An unrecognized or unspecified status reports as `unknown` rather than
+/// being rounded to `success`: a consumer acting on an invented outcome is
+/// worse than one told the outcome is unreadable.
+#[must_use]
+pub fn result_status_name(status: i32) -> &'static str {
+    match horde_proto::v1::ResultStatus::try_from(status) {
+        Ok(horde_proto::v1::ResultStatus::Success) => "success",
+        Ok(horde_proto::v1::ResultStatus::Partial) => "partial",
+        Ok(horde_proto::v1::ResultStatus::Blocked) => "blocked",
+        Ok(horde_proto::v1::ResultStatus::Unspecified) | Err(_) => "unknown",
+    }
+}
+
 pub use capability::{UnknownCapability, capability_from_wire, capability_to_wire};
 pub use permission::{
     ConversionError, permission_decision_from_wire, permission_decision_to_wire,
-    proposed_tool_call_to_wire,
+    proposed_tool_call_to_wire, struct_to_json,
 };
 pub use usage::{
     UnreadableUtilization, rate_window_from_wire, rate_window_to_wire, token_usage_from_wire,
     token_usage_to_wire,
 };
+#[cfg(test)]
+mod result_status_tests {
+    use super::result_status_name;
+
+    /// The whole table, in this crate's own suite: the consumers' tests do
+    /// not run for a mutation of this package, so the vocabulary must be
+    /// pinned where it lives.
+    #[test]
+    fn every_result_status_names_itself_and_nothing_else() {
+        use horde_proto::v1::ResultStatus;
+        assert_eq!(result_status_name(ResultStatus::Success as i32), "success");
+        assert_eq!(result_status_name(ResultStatus::Partial as i32), "partial");
+        assert_eq!(result_status_name(ResultStatus::Blocked as i32), "blocked");
+        assert_eq!(
+            result_status_name(ResultStatus::Unspecified as i32),
+            "unknown"
+        );
+        assert_eq!(
+            result_status_name(9_999),
+            "unknown",
+            "a status from a newer build is unreadable, not successful"
+        );
+    }
+}

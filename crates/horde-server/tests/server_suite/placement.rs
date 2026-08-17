@@ -79,7 +79,7 @@ async fn register(
     harness
         .worker
         .register_worker(RegisterWorkerRequest {
-            hello: None,
+            hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker)),
             capabilities: Some(capabilities),
         })

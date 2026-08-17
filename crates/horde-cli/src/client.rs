@@ -287,12 +287,27 @@ impl Client {
         title: &str,
         idempotency_key: &str,
     ) -> Result<(SessionSummary, AgentId), ClientError> {
+        self.create_session_with(title, AgentSpec::default(), idempotency_key)
+            .await
+    }
+
+    /// Creates a session whose root agent is what `root_agent` says — type,
+    /// tier, workspace, checkout policy, permission mode, first assignment.
+    /// The everyday `create_session` is this with a default spec.
+    pub async fn create_session_with(
+        &mut self,
+        title: &str,
+        root_agent: AgentSpec,
+        idempotency_key: &str,
+    ) -> Result<(SessionSummary, AgentId), ClientError> {
         let response = self
             .inner
             .create_session(CreateSessionRequest {
                 title: title.to_owned(),
-                workspace_definition_id: None,
-                root_agent: Some(AgentSpec::default()),
+                // Set either way, per the field's contract: the root spec's
+                // workspace is the one the session references.
+                workspace_definition_id: root_agent.workspace_definition_id.clone(),
+                root_agent: Some(root_agent),
                 idempotency_key: idempotency_key.to_owned(),
             })
             .await?
@@ -361,17 +376,8 @@ impl Client {
         delivery: DeliveryMode,
         idempotency_key: &str,
     ) -> Result<SendMessageResponse, ClientError> {
-        self.send(
-            agent_id,
-            send_message_request::Body::Assignment(Assignment {
-                assignment_id: None,
-                text: text.to_owned(),
-                payload: None,
-            }),
-            delivery,
-            idempotency_key,
-        )
-        .await
+        self.send_with_payload(agent_id, false, text, None, delivery, idempotency_key)
+            .await
     }
 
     pub async fn send_note(
@@ -381,16 +387,36 @@ impl Client {
         delivery: DeliveryMode,
         idempotency_key: &str,
     ) -> Result<SendMessageResponse, ClientError> {
-        self.send(
-            agent_id,
+        self.send_with_payload(agent_id, true, text, None, delivery, idempotency_key)
+            .await
+    }
+
+    /// A message whose payload names work: the commits and attachments are
+    /// made present in the receiving agent's checkout before the text
+    /// reaches it (DESIGN §5 — transport is never the agent's concern).
+    /// `note` is the one-bit message kind: a note owes no result.
+    pub async fn send_with_payload(
+        &mut self,
+        agent_id: &str,
+        note: bool,
+        text: &str,
+        payload: Option<horde_proto::v1::Payload>,
+        delivery: DeliveryMode,
+        idempotency_key: &str,
+    ) -> Result<SendMessageResponse, ClientError> {
+        let body = if note {
             send_message_request::Body::Note(Note {
                 text: text.to_owned(),
-                payload: None,
-            }),
-            delivery,
-            idempotency_key,
-        )
-        .await
+                payload,
+            })
+        } else {
+            send_message_request::Body::Assignment(Assignment {
+                assignment_id: None,
+                text: text.to_owned(),
+                payload,
+            })
+        };
+        self.send(agent_id, body, delivery, idempotency_key).await
     }
 
     async fn send(
@@ -555,6 +581,166 @@ impl Client {
             })
             .await?
             .into_inner())
+    }
+
+    /// Defines a workspace: the fixed repo set agents check out (DESIGN §7).
+    pub async fn create_workspace_definition(
+        &mut self,
+        name: &str,
+        repos: Vec<horde_proto::v1::WorkspaceRepo>,
+        unmanaged_paths: Vec<String>,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ClientError> {
+        self.inner
+            .create_workspace_definition(horde_proto::v1::CreateWorkspaceDefinitionRequest {
+                name: name.to_owned(),
+                repos,
+                unmanaged_paths,
+            })
+            .await?
+            .into_inner()
+            .definition
+            .ok_or_else(|| ClientError::Rpc(tonic::Status::internal("no definition came back")))
+    }
+
+    /// One definition and its known instances, by id — or by name when no
+    /// definition has the id (ids win, so a name that happens to be an id
+    /// resolves as the id).
+    pub async fn get_workspace_definition(
+        &mut self,
+        reference: &str,
+    ) -> Result<horde_proto::v1::GetWorkspaceDefinitionResponse, ClientError> {
+        let by_id = self
+            .inner
+            .get_workspace_definition(horde_proto::v1::GetWorkspaceDefinitionRequest {
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                    reference,
+                )),
+                name: String::new(),
+            })
+            .await;
+        let status = match by_id {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) => status,
+        };
+        // A plain branch rather than a match guard: a guard's other side is
+        // unreachable through any server this client can talk to (an id
+        // lookup only misses as NotFound), and an unreachable arm is an
+        // unkillable mutant. The predicate carries the policy; this carries
+        // the plumbing.
+        if !retry_as_name(&status) {
+            return Err(status.into());
+        }
+        Ok(self
+            .inner
+            .get_workspace_definition(horde_proto::v1::GetWorkspaceDefinitionRequest {
+                workspace_definition_id: None,
+                name: reference.to_owned(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Every live workspace definition.
+    pub async fn list_workspace_definitions(
+        &mut self,
+    ) -> Result<Vec<horde_proto::v1::WorkspaceDefinition>, ClientError> {
+        Ok(self
+            .inner
+            .list_workspace_definitions(horde_proto::v1::ListWorkspaceDefinitionsRequest {
+                page_size: 0,
+                page_token: String::new(),
+            })
+            .await?
+            .into_inner()
+            .definitions)
+    }
+
+    /// Widens a definition's repo set by one repo — the one deliberate way a
+    /// repo set changes after creation (DESIGN §7).
+    pub async fn add_workspace_repo(
+        &mut self,
+        workspace_definition_id: &str,
+        repo: horde_proto::v1::WorkspaceRepo,
+        etag: &str,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ClientError> {
+        self.inner
+            .add_workspace_repo(horde_proto::v1::AddWorkspaceRepoRequest {
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                    workspace_definition_id,
+                )),
+                repo: Some(repo),
+                etag: etag.to_owned(),
+            })
+            .await?
+            .into_inner()
+            .definition
+            .ok_or_else(|| ClientError::Rpc(tonic::Status::internal("no definition came back")))
+    }
+
+    /// Updates a definition's name, layout, or unmanaged paths — never its
+    /// repo set (the server refuses adds and removes here by design).
+    pub async fn update_workspace_definition(
+        &mut self,
+        request: horde_proto::v1::UpdateWorkspaceDefinitionRequest,
+    ) -> Result<horde_proto::v1::WorkspaceDefinition, ClientError> {
+        self.inner
+            .update_workspace_definition(request)
+            .await?
+            .into_inner()
+            .definition
+            .ok_or_else(|| ClientError::Rpc(tonic::Status::internal("no definition came back")))
+    }
+
+    /// Removes a definition at the version `etag` names.
+    pub async fn delete_workspace_definition(
+        &mut self,
+        workspace_definition_id: &str,
+        etag: &str,
+    ) -> Result<(), ClientError> {
+        self.inner
+            .delete_workspace_definition(horde_proto::v1::DeleteWorkspaceDefinitionRequest {
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                    workspace_definition_id,
+                )),
+                etag: etag.to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Asks a worker to materialize a workspace instance ahead of any spawn.
+    pub async fn prewarm_workspace(
+        &mut self,
+        workspace_definition_id: &str,
+        worker_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<horde_proto::v1::WorkspaceInstanceReport>, ClientError> {
+        Ok(self
+            .inner
+            .prewarm_workspace(horde_proto::v1::PrewarmWorkspaceRequest {
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                    workspace_definition_id,
+                )),
+                worker_id: Some(horde_proto::v1::WorkerId::new(worker_id)),
+                session_id: session_id.map(SessionId::new),
+            })
+            .await?
+            .into_inner()
+            .report)
+    }
+
+    /// The connected workers, as the registry sees them.
+    pub async fn list_workers(
+        &mut self,
+    ) -> Result<Vec<horde_proto::v1::WorkerSummary>, ClientError> {
+        Ok(self
+            .inner
+            .list_workers(horde_proto::v1::ListWorkersRequest {
+                include_offline: false,
+            })
+            .await?
+            .into_inner()
+            .workers)
     }
 
     /// Usage and headroom, folded server-side from the journaled usage
@@ -750,11 +936,17 @@ pub struct EventStream {
     queued: std::collections::VecDeque<StreamUpdate>,
 }
 
+/// Whether an id lookup's failure means "no definition has this id" — the
+/// one failure a name lookup can still answer. Anything else (a dead server,
+/// a malformed request) must propagate: retrying it as a name would bury the
+/// real refusal under a second, more confusing one. A named predicate so the
+/// distinction is a truth table rather than a guard no test can reach both
+/// sides of.
+fn retry_as_name(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
+}
+
 /// One meaningful thing a follow stream can say.
-///
-/// Heartbeats are absorbed below this surface: they exist to keep the
-/// connection distinguishable from a dead one, and a consumer that had to
-/// skip them itself would be one more loop with a skip-arm to get wrong.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamUpdate {
     /// The next event, in log order. Boxed: an envelope dwarfs the marker
@@ -765,6 +957,11 @@ pub enum StreamUpdate {
     /// instead of guessing. A merged stream yields one of these per followed
     /// session.
     CaughtUp { session_id: String, head: u64 },
+    /// The server saying "still alive, nothing to say". Surfaced rather
+    /// than absorbed (fix a9): the heartbeat exists so quiet and dead are
+    /// distinguishable, and a client that swallowed it here left no
+    /// component able to make the distinction — the audit's collision #6.
+    Heartbeat,
 }
 
 impl EventStream {
@@ -810,7 +1007,10 @@ impl EventStream {
                             }
                         }));
                 }
-                Some(sync_events_response::Update::Heartbeat(_)) | None => {}
+                Some(sync_events_response::Update::Heartbeat(_)) => {
+                    return Ok(Some(StreamUpdate::Heartbeat));
+                }
+                None => {}
             }
         }
     }
@@ -998,6 +1198,18 @@ mod tests {
         assert_eq!(super::ttl_of(None), None, "unset lets the server choose");
         let five = super::ttl_of(Some(5)).expect("five minutes");
         assert_eq!((five.seconds, five.nanos), (300, 0));
+    }
+
+    /// The id-lookup fallback's truth table: only NotFound retries as a
+    /// name; every other refusal is the real answer and must propagate.
+    #[test]
+    fn only_a_missing_id_retries_the_lookup_as_a_name() {
+        assert!(super::retry_as_name(&tonic::Status::not_found("no ws")));
+        assert!(!super::retry_as_name(&tonic::Status::unavailable("down")));
+        assert!(!super::retry_as_name(&tonic::Status::invalid_argument(
+            "bad"
+        )));
+        assert!(!super::retry_as_name(&tonic::Status::internal("oops")));
     }
 
     #[test]

@@ -29,6 +29,9 @@ pub(crate) struct System {
     pub(crate) main: String,
     /// The TLS-only enrollment endpoint, as `https://localhost:PORT`.
     pub(crate) enrollment: String,
+    /// The server-mounted git Relay, as `http://127.0.0.1:PORT` — the
+    /// loopback listener `--relay-bind` stands up (fix a10).
+    pub(crate) relay: String,
     /// Owns every state directory this system uses.
     pub(crate) state: tempfile::TempDir,
     /// The operator's enrolled identity directory.
@@ -82,6 +85,8 @@ impl System {
                 "127.0.0.1:0",
                 "--enrollment-bind",
                 "127.0.0.1:0",
+                "--relay-bind",
+                "127.0.0.1:0",
                 "--state-dir",
                 &server_state.to_string_lossy(),
             ],
@@ -104,11 +109,16 @@ impl System {
         let code = value_after(&stdout, "bootstrap-client-code ")
             .expect("the bootstrap code")
             .to_owned();
+        let relay = format!(
+            "http://{}",
+            value_after(&stdout, "listening relay=").expect("a relay address")
+        );
 
         let system = System {
             _server: server,
             main,
             enrollment,
+            relay,
             operator: state.path().join("operator-identity"),
             state,
             horde,
@@ -215,6 +225,35 @@ impl System {
     /// Mints a one-time worker enrollment code, as the operator would.
     pub(crate) async fn mint_worker_code(&self, name: &str) -> String {
         self.cli_field(&["worker", "enroll", name], "code").await
+    }
+
+    /// Writes `script_json` beside the state and starts a worker named
+    /// `name` running it — the arrangement every scripted scenario opens
+    /// with.
+    pub(crate) async fn spawn_scripted_worker(
+        &self,
+        name: &str,
+        script_json: &str,
+    ) -> SpawnedProcess {
+        let script = self.state.path().join(format!("{name}-script.json"));
+        std::fs::write(&script, script_json).expect("the script writes");
+        self.spawn_worker(
+            name,
+            &self.state.path().join(name),
+            &["--fake-script", &script.to_string_lossy()],
+        )
+        .await
+    }
+
+    /// A fresh session whose root agent has been placed — the point from
+    /// which a scenario can start sending.
+    pub(crate) async fn placed_session(&self, title: &str) -> (String, String) {
+        let (session_id, root) = self.new_session(title).await;
+        self.sync_until(&session_id, "the root agent's placement", |events| {
+            has_kind(events, "placement_changed")
+        })
+        .await;
+        (session_id, root)
     }
 
     /// Starts a worker daemon named `name` over `state_dir`, enrolling it

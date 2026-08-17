@@ -1180,6 +1180,10 @@ dependencies = [
  "async-trait",
  "horde-adapter",
  "horde-testkit",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde_json",
  "tokio",
 ]
@@ -1215,14 +1219,10 @@ dependencies = [
 name = "horde-e2e"
 version = "0.1.0"
 dependencies = [
- "horde-identity",
- "horde-proto",
- "horde-relay",
  "horde-server-testkit",
  "serde_json",
  "tempfile",
  "tokio",
- "tonic",
 ]
 
 [[package]]
@@ -1364,6 +1364,7 @@ dependencies = [
  "horde-identity",
  "horde-observe",
  "horde-proto",
+ "horde-relay",
  "horde-server-testkit",
  "hyper-util",
  "proptest",
@@ -1430,11 +1431,15 @@ name = "horde-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.3.4",
+ "hex",
  "horde-adapter",
  "horde-adapter-claude",
  "horde-adapter-codex",
  "horde-adapter-fake",
+ "horde-cli",
  "horde-identity",
+ "horde-mcp",
  "horde-observe",
  "horde-proto",
  "horde-relay",

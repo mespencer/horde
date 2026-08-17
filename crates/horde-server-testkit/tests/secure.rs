@@ -152,7 +152,9 @@ fn the_hello_helper_speaks_the_role_it_was_asked_for() {
     assert_eq!(worker.display_name, "mac-studio");
     assert!(
         !worker.semver.is_empty(),
-        "a Hello without a version is refused"
+        "the helper must carry a version: the server's version gate refuses \
+         a Hello without one, and a versionless helper would fail every \
+         registration this harness makes"
     );
 
     let client = hello(PrincipalRole::Client, "laptop");

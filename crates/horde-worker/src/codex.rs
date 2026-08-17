@@ -242,8 +242,22 @@ fn mcp_server_overrides(endpoint: Option<&McpEndpoint>) -> Vec<String> {
     };
     match endpoint {
         None => {}
-        Some(McpEndpoint::Http { url }) => {
+        Some(McpEndpoint::Http { url, headers }) => {
             push(format!("mcp_servers.horde.url={}", toml_string(url)));
+            if !headers.is_empty() {
+                // An inline TOML table: the identity pair must ride *every*
+                // request (the endpoint's gate refuses unidentified ones), and
+                // `http_headers` is the config.toml mechanism the spike
+                // confirmed Codex sends on all of them.
+                let rendered: Vec<String> = headers
+                    .iter()
+                    .map(|(name, value)| format!("{}={}", toml_string(name), toml_string(value)))
+                    .collect();
+                push(format!(
+                    "mcp_servers.horde.http_headers={{{}}}",
+                    rendered.join(",")
+                ));
+            }
         }
         Some(McpEndpoint::Stdio { command, args }) => {
             push(format!(
@@ -720,6 +734,7 @@ mod tests {
     fn the_horde_endpoint_becomes_per_process_config_overrides() {
         let http = mcp_server_overrides(Some(&McpEndpoint::Http {
             url: "http://127.0.0.1:8931/mcp".to_owned(),
+            headers: Vec::new(),
         }));
         assert_eq!(
             http,
@@ -727,6 +742,23 @@ mod tests {
                 "-c".to_owned(),
                 "mcp_servers.horde.url=\"http://127.0.0.1:8931/mcp\"".to_owned(),
             ]
+        );
+
+        // The per-agent identity pair rides as an inline `http_headers`
+        // table — on every request, which is what the endpoint's gate
+        // demands; a headerless entry would be refused 401 on each call.
+        let with_identity = mcp_server_overrides(Some(&McpEndpoint::Http {
+            url: "http://127.0.0.1:8931/mcp".to_owned(),
+            headers: vec![
+                ("Authorization".to_owned(), "Bearer tok-1".to_owned()),
+                ("X-Horde-Agent".to_owned(), "agent-1".to_owned()),
+            ],
+        }));
+        let expected_headers = "mcp_servers.horde.http_headers=\
+                                {\"Authorization\"=\"Bearer tok-1\",\"X-Horde-Agent\"=\"agent-1\"}";
+        assert!(
+            with_identity.contains(&expected_headers.to_owned()),
+            "the identity pair must ride the config override: {with_identity:?}"
         );
 
         let stdio = mcp_server_overrides(Some(&McpEndpoint::Stdio {

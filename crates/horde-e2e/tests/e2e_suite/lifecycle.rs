@@ -73,6 +73,72 @@ async fn the_full_lifecycle_runs_over_real_processes() {
     );
 }
 
+/// An agent drives the orchestrator through its own MCP endpoint: the worker
+/// daemon serves the session's endpoint, mints the agent's identity pair, and
+/// the scripted harness dials back over real HTTP — spawning a child under
+/// itself and reporting its result. Every hop is production wiring: daemon →
+/// endpoint gate → verbs → control plane / stamping sink → server log → CLI.
+#[tokio::test]
+async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
+    let system = System::launch().await;
+
+    // One turn: announce, spawn an idle child (no task — a child that got the
+    // same script would spawn grandchildren forever), report the result.
+    let mut worker = system
+        .spawn_scripted_worker(
+            "w-1",
+            r#"[{"steps": [
+                {"say": "delegating"},
+                {"use_horde": {"id": "call-1", "tool": "spawn_agent", "input": {"task": ""}}},
+                {"use_horde": {"id": "call-2", "tool": "report_result",
+                               "input": {"status": "success", "summary": "delegated the work"}}}
+            ], "text": "done"}]"#,
+        )
+        .await;
+
+    let (session_id, root) = system.placed_session("e2e endpoint verbs").await;
+    system.cli_json(&["send", &root, "go"]).await;
+
+    // The child exists because the *agent* asked for it, over its endpoint:
+    // a second spawn in the log, placed on the one worker.
+    let events = system
+        .sync_until(&session_id, "the endpoint-spawned child", |events| {
+            events
+                .iter()
+                .filter(|event| event["kind"] == "agent_spawned")
+                .count()
+                >= 2
+        })
+        .await;
+    assert!(
+        outputs(&events).iter().any(|text| text == "delegating"),
+        "the pre-spawn output arrived: {events:?}"
+    );
+
+    // And the result the agent reported through the same endpoint is an
+    // event of record, attributed to the reporting agent.
+    let events = system
+        .sync_until(&session_id, "the reported result", |events| {
+            has_kind(events, "result_reported")
+        })
+        .await;
+    assert!(
+        events.iter().any(|event| event["kind"] == "result_reported"
+            && event["agent_id"].as_str() == Some(root.as_str())),
+        "the result must be the root agent's own: {events:?}"
+    );
+
+    // Both pumps — the root's and the endpoint-spawned child's — were real,
+    // and shutdown reaps them both.
+    worker.terminate().await.expect("SIGTERM sends");
+    let (status, stdout, _) = worker.wait().await.expect("the worker exits");
+    assert!(status.success(), "a signalled worker shutdown exits zero");
+    assert!(
+        stdout.contains("shutdown reaped=2"),
+        "the parent and its endpoint-spawned child were both live pumps: {stdout}"
+    );
+}
+
 /// A permission escalation crosses the whole system and comes back: the fake
 /// harness proposes a tool call and blocks, the request reaches an attached
 /// client through the log, `horde approve` answers it, and the turn resumes.
@@ -83,33 +149,22 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     // The scripted provider: one turn that asks before acting. The ids are
     // the test's to choose, which is how the approval can name the request
     // without scraping it from a render.
-    let script = system.state.path().join("ask.json");
-    std::fs::write(
-        &script,
-        r#"[{"steps": [
-            {"say": "checking the blast radius"},
-            {"ask_permission": {"id": "call-1", "tool": "Bash",
-                                "input": {"command": "docker rm horde-test"}}},
-            {"say": "approved and done"}
-        ], "text": "done"}]"#,
-    )
-    .expect("the script writes");
-
     let mut worker = system
-        .spawn_worker(
+        .spawn_scripted_worker(
             "w-1",
-            &system.state.path().join("w-1"),
-            &["--fake-script", &script.to_string_lossy()],
+            r#"[{"steps": [
+                {"say": "checking the blast radius"},
+                {"ask_permission": {"id": "call-1", "tool": "Bash",
+                                    "input": {"command": "docker rm horde-test"}}},
+                {"say": "approved and done"},
+                {"ask_permission": {"id": "call-2", "tool": "Bash",
+                                    "input": {"command": "docker rm horde-test"}}},
+                {"say": "remembered and done"}
+            ], "text": "done"}]"#,
         )
         .await;
 
-    let (session_id, root) = system.new_session("e2e permissions").await;
-    system
-        .sync_until(&session_id, "the root agent's placement", |events| {
-            has_kind(events, "placement_changed")
-        })
-        .await;
-
+    let (session_id, root) = system.placed_session("e2e permissions").await;
     system.cli_json(&["send", &root, "go"]).await;
     let events = system
         .sync_until(&session_id, "the permission escalation", |events| {
@@ -129,8 +184,9 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
         "the harness must be blocked on the decision, not past it: {events:?}"
     );
 
-    // Any attached client may answer (DESIGN §10); this one does.
-    let approved = system.cli(&["approve", "call-1"]).await;
+    // Any attached client may answer (DESIGN §10); this one does — and asks
+    // the chain to remember the answer.
+    let approved = system.cli(&["approve", "call-1", "--remember"]).await;
     assert!(
         approved.status.success(),
         "the approval must land: {}",
@@ -147,6 +203,26 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     assert!(
         has_kind(&events, "permission_decided"),
         "the decision is an event of record, not just a delivery: {events:?}"
+    );
+
+    // The second, identical ask resolves with no human in the loop: the
+    // chain driver the deployed server spawns (wave-7 fix a5) answers it
+    // from the remembered decision. Reaching the final output with exactly
+    // one `approve` call is the proof.
+    let events = system
+        .sync_until(&session_id, "the remembered decision", |events| {
+            outputs(events)
+                .iter()
+                .any(|text| text == "remembered and done")
+        })
+        .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "permission_decided")
+            .count(),
+        2,
+        "the remembered layer's answer is an event of record too: {events:?}"
     );
 
     worker.terminate().await.expect("SIGTERM sends");

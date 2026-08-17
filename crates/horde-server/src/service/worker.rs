@@ -33,12 +33,25 @@ use crate::placement;
 #[derive(Clone, Debug)]
 pub struct WorkerFacing {
     core: ServerCore,
+    /// The live deny-list, when this spine serves behind the mTLS door.
+    /// Streams re-check it so revocation reaches them without waiting for a
+    /// reconnect (wave-7 fix a4); `None` — the plaintext test shape — has no
+    /// certificates to revoke.
+    deny: Option<horde_identity::RevocationList>,
 }
 
 impl WorkerFacing {
     #[must_use]
     pub fn new(core: ServerCore) -> Self {
-        Self { core }
+        Self { core, deny: None }
+    }
+
+    /// Attaches the deny-list the mTLS door shares, so live streams are
+    /// severed on revocation rather than at the next reconnect.
+    #[must_use]
+    pub fn with_deny(mut self, deny: horde_identity::RevocationList) -> Self {
+        self.deny = Some(deny);
+        self
     }
 
     fn server_hello() -> ServerHello {
@@ -129,6 +142,10 @@ impl WorkerService for WorkerFacing {
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
         let request = request.into_inner();
+        // The version gate (DESIGN §2, fix a6): a worker below the minimum —
+        // or one saying nothing — is refused at registration, with the code
+        // the daemon's fate table treats as fatal.
+        super::shared::version_gate(request.hello.as_ref())?;
         let worker_id = request
             .worker_id
             .as_ref()
@@ -171,6 +188,7 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<StreamCommandsRequest>,
     ) -> Result<Response<Self::StreamCommandsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
         let request = request.into_inner();
         let worker_id = request
             .worker_id
@@ -192,25 +210,30 @@ impl WorkerService for WorkerFacing {
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         let core = self.core.clone();
+        let deny = self.deny.clone();
         // Captured now, checked at disconnect: by the time this stream
         // notices its peer is gone, the worker may have re-registered, and a
         // stale stream must not knock the fresh registration out of placement.
         let epoch = core.workers.epoch_of(&worker_id);
         tokio::spawn(async move {
-            'stream: while let Some(batch) = stream.next_batch().await {
-                let batch = match batch {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        let _ = sender.send(Err(Status::from(error))).await;
-                        break 'stream;
-                    }
-                };
-                for command in batch {
-                    if sender.send(Ok(command)).await.is_err() {
-                        break 'stream; // The worker hung up.
+            let pump = async {
+                'stream: while let Some(batch) = stream.next_batch().await {
+                    let batch = match batch {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            let _ = sender.send(Err(Status::from(error))).await;
+                            break 'stream;
+                        }
+                    };
+                    for command in batch {
+                        if sender.send(Ok(command)).await.is_err() {
+                            break 'stream; // The worker hung up.
+                        }
                     }
                 }
-            }
+            };
+            // Revocation severs the stream (fix a4).
+            super::shared::run_severable(pump, deny, serial, &sender).await;
 
             // The command stream is the worker's lifeline: once it is gone the
             // server cannot command this worker, so it leaves placement and
@@ -241,61 +264,70 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<Streaming<PushEventsRequest>>,
     ) -> Result<Response<Self::PushEventsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
         let mut inbound = request.into_inner();
         let core = self.core.clone();
+        let deny = self.deny.clone();
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
-            let mut worker_id = String::new();
+            let pump = async {
+                let mut worker_id = String::new();
 
-            while let Some(message) = inbound.next().await {
-                let message = match message {
-                    Ok(message) => message,
-                    Err(status) => {
-                        let _ = sender.send(Err(status)).await;
+                while let Some(message) = inbound.next().await {
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(status) => {
+                            let _ = sender.send(Err(status)).await;
+                            return;
+                        }
+                    };
+
+                    let outcome = match message.body {
+                        Some(push_events_request::Body::Start(start)) => {
+                            worker_id = start
+                                .worker_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_default();
+                            handle_start(&core, &worker_id, start.last_local_journal_sequence).await
+                        }
+                        Some(push_events_request::Body::Batch(batch)) => {
+                            // `acked_command_sequence` is deliberately not
+                            // recorded server-side. The worker replays from
+                            // its own ack on the next StreamCommands, so a
+                            // server-held copy would be a second answer to a
+                            // question the worker already answers — and the
+                            // copy is the one a restart loses.
+                            ingest_batch(&core, &worker_id, batch.events).await.map(
+                                |acked_journal_sequence| PushEventsResponse {
+                                    body: Some(push_events_response::Body::Ack(JournalAck {
+                                        acked_journal_sequence,
+                                    })),
+                                },
+                            )
+                        }
+                        None => Err(ServerError::Invalid(
+                            "a PushEvents message must carry a body".to_owned(),
+                        )),
+                    };
+
+                    let reply = match outcome {
+                        Ok(reply) => Ok(reply),
+                        Err(error) => Err(Status::from(error)),
+                    };
+                    let reply_failed = reply.is_err();
+                    let send_failed = sender.send(reply).await.is_err();
+                    if should_stop(send_failed, reply_failed) {
                         return;
                     }
-                };
-
-                let outcome = match message.body {
-                    Some(push_events_request::Body::Start(start)) => {
-                        worker_id = start
-                            .worker_id
-                            .as_ref()
-                            .map(ToString::to_string)
-                            .unwrap_or_default();
-                        handle_start(&core, &worker_id, start.last_local_journal_sequence).await
-                    }
-                    Some(push_events_request::Body::Batch(batch)) => {
-                        // `acked_command_sequence` is deliberately not recorded
-                        // server-side. The worker replays from its own ack on
-                        // the next StreamCommands, so a server-held copy would
-                        // be a second answer to a question the worker already
-                        // answers — and the copy is the one a restart loses.
-                        ingest_batch(&core, &worker_id, batch.events).await.map(
-                            |acked_journal_sequence| PushEventsResponse {
-                                body: Some(push_events_response::Body::Ack(JournalAck {
-                                    acked_journal_sequence,
-                                })),
-                            },
-                        )
-                    }
-                    None => Err(ServerError::Invalid(
-                        "a PushEvents message must carry a body".to_owned(),
-                    )),
-                };
-
-                let reply = match outcome {
-                    Ok(reply) => Ok(reply),
-                    Err(error) => Err(Status::from(error)),
-                };
-                let reply_failed = reply.is_err();
-                let send_failed = sender.send(reply).await.is_err();
-                if should_stop(send_failed, reply_failed) {
-                    return;
                 }
-            }
+            };
+            // Revocation severs the journal push mid-connection (fix a4): a
+            // revoked worker must not keep feeding events into the log until
+            // it happens to reconnect.
+            super::shared::run_severable(pump, deny, serial, &sender).await;
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
@@ -460,6 +492,52 @@ mod tests {
                 kind: Some(Kind::TurnInterrupted(TurnInterrupted::default())),
             }),
         }
+    }
+
+    /// The registration handler itself: a versioned worker registers and is
+    /// told where to resume; a nameless one is refused; a versionless one is
+    /// stopped by the a6 gate before anything registers.
+    #[tokio::test]
+    async fn registration_admits_versioned_named_workers_and_refuses_the_rest() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+
+        let facing = super::WorkerFacing::new(core());
+        let request = |hello: Option<&str>, worker_id: Option<&str>| {
+            tonic::Request::new(horde_proto::v1::RegisterWorkerRequest {
+                hello: hello.map(|semver| horde_proto::v1::Hello {
+                    semver: semver.to_owned(),
+                    ..horde_proto::v1::Hello::default()
+                }),
+                worker_id: worker_id.map(horde_proto::v1::WorkerId::new),
+                capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+            })
+        };
+
+        let registered = facing
+            .register_worker(request(Some("0.1.0"), Some("worker-a")))
+            .await
+            .expect("a versioned, named worker registers")
+            .into_inner();
+        assert_eq!(
+            registered.worker_id.map(|id| id.to_string()),
+            Some("worker-a".to_owned())
+        );
+        assert_eq!(
+            registered.resume_from_journal_sequence, 1,
+            "a fresh worker resumes from the first position"
+        );
+
+        let unnamed = facing
+            .register_worker(request(Some("0.1.0"), None))
+            .await
+            .expect_err("a nameless worker is refused");
+        assert_eq!(unnamed.code(), tonic::Code::InvalidArgument);
+
+        let unversioned = facing
+            .register_worker(request(None, Some("worker-b")))
+            .await
+            .expect_err("the version gate runs before registration");
+        assert_eq!(unversioned.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]

@@ -75,6 +75,9 @@ pub struct ServeConfig {
     /// ([`crate::blob::DEFAULT_MAX_BLOB_BYTES`]). This is DESIGN §8's
     /// "server-configurable size cap".
     pub blob_max_bytes: Option<u64>,
+    /// Serve the git Relay here (DESIGN §8, fix a10). `None` serves no
+    /// relay; loopback only — see [`crate::relay::mount`].
+    pub relay_bind: Option<SocketAddr>,
 }
 
 /// What one command line asks for.
@@ -96,6 +99,7 @@ struct ParsedFlags {
     enrollment_bind: Option<SocketAddr>,
     subject_names: Vec<String>,
     blob_max_bytes: Option<u64>,
+    relay_bind: Option<SocketAddr>,
 }
 
 impl ParsedFlags {
@@ -124,21 +128,19 @@ impl ParsedFlags {
     }
 
     /// Applies one of the flags that configure how `--serve` serves.
-    /// `Ok(false)` means the argument is not one of them.
+    /// `Ok(false)` means the argument is not one of them. Split from the
+    /// bind-address flags by subject so neither half outgrows the
+    /// complexity bar as listeners accumulate.
     fn apply_serve_flag(
         &mut self,
         argument: &str,
         value_of: &mut impl FnMut(&str) -> Result<String, String>,
     ) -> Result<bool, String> {
+        if self.apply_bind_flag(argument, value_of)? {
+            return Ok(true);
+        }
         match argument {
             "--state-dir" => self.state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
-            "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
-            "--enrollment-bind" => {
-                self.enrollment_bind = Some(parse_bind(
-                    "--enrollment-bind",
-                    &value_of("--enrollment-bind")?,
-                )?);
-            }
             "--san" => self.subject_names.push(value_of("--san")?),
             "--blob-max-bytes" => {
                 let value = value_of("--blob-max-bytes")?;
@@ -147,6 +149,28 @@ impl ParsedFlags {
                         .parse()
                         .map_err(|_| format!("--blob-max-bytes {value} is not a byte count"))?,
                 );
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Applies one of the three listener-address flags.
+    fn apply_bind_flag(
+        &mut self,
+        argument: &str,
+        value_of: &mut impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<bool, String> {
+        match argument {
+            "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
+            "--enrollment-bind" => {
+                self.enrollment_bind = Some(parse_bind(
+                    "--enrollment-bind",
+                    &value_of("--enrollment-bind")?,
+                )?);
+            }
+            "--relay-bind" => {
+                self.relay_bind = Some(parse_bind("--relay-bind", &value_of("--relay-bind")?)?);
             }
             _ => return Ok(false),
         }
@@ -174,9 +198,11 @@ impl ParsedFlags {
                 || self.enrollment_bind.is_some()
                 || self.state_dir.is_some()
                 || self.blob_max_bytes.is_some()
+                || self.relay_bind.is_some()
             {
                 return Err(
-                    "--bind, --enrollment-bind, --state-dir and --blob-max-bytes need --serve"
+                    "--bind, --enrollment-bind, --state-dir, --blob-max-bytes and \
+                     --relay-bind need --serve"
                         .to_owned(),
                 );
             }
@@ -197,6 +223,7 @@ impl ParsedFlags {
                 .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7778))),
             subject_names: self.subject_names,
             blob_max_bytes: self.blob_max_bytes,
+            relay_bind: self.relay_bind,
         })))
     }
 }
@@ -255,6 +282,25 @@ pub struct RunningServer {
     pub server_fingerprint: String,
     /// Present exactly when no client held an active certificate at startup.
     pub bootstrap_code: Option<MintedCode>,
+    /// The mounted git Relay, when `--relay-bind` asked for one.
+    pub relay: Option<crate::relay::MountedRelay>,
+    /// The permission chain driver (DESIGN §10, wave-7 fix a5): layers 1–2
+    /// live in a deployed server, not only in tests. Held so its lifetime is
+    /// the server's.
+    pub permission_chain: ChainTask,
+}
+
+/// The chain driver's task, stopped when the server is dropped — the same
+/// lifetime [`BoundListener`] gives the listeners.
+#[derive(Debug)]
+pub struct ChainTask {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ChainTask {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Brings the networked server up (DESIGN §3, activated in wave 5).
@@ -289,6 +335,27 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     }
 
     let core = ServerCore::new(log).with_blob_store(Arc::new(blobs));
+
+    // The permission chain driver (fix a5): the deterministic layers run in
+    // the deployed server, over an escalate-everything default registry —
+    // exactly what an unconfigured server should do with every request until
+    // §13's authoring layer exists. The judge stays a seam; a missing judge
+    // already escalates.
+    let permission_chain = ChainTask {
+        task: crate::permission::spawn(
+            &core.log,
+            Arc::new(crate::permission::PermissionModes::default()),
+            None,
+        ),
+    };
+
+    // The Relay (fix a10), before the gRPC listeners so a bad relay bind
+    // fails startup whole rather than leaving a half-up server.
+    let relay = match config.relay_bind {
+        Some(bind) => Some(crate::relay::mount(bind, &config.state_dir, &core.log).await?),
+        None => None,
+    };
+
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
 
@@ -297,6 +364,8 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment,
         server_fingerprint,
         bootstrap_code,
+        relay,
+        permission_chain,
     })
 }
 
@@ -334,6 +403,9 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
         format!("listening enrollment={}", running.enrollment.addr),
         format!("server-fingerprint {}", running.server_fingerprint),
     ];
+    if let Some(relay) = &running.relay {
+        lines.push(format!("listening relay={}", relay.server.addr()));
+    }
     if let Some(code) = &running.bootstrap_code {
         lines.push(format!("bootstrap-client-code {}", code.join_code()));
     }
@@ -434,9 +506,15 @@ mod tests {
             "10.0.0.7",
             "--blob-max-bytes",
             "1048576",
+            "--relay-bind",
+            "127.0.0.1:7420",
         ]) else {
             panic!("a full serve line must parse");
         };
+        assert_eq!(
+            config.relay_bind.map(|addr| addr.to_string()),
+            Some("127.0.0.1:7420".to_owned())
+        );
         assert_eq!(config.database, "/tmp/x.db");
         assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
         assert_eq!(config.enrollment_bind.to_string(), "0.0.0.0:9001");
@@ -485,6 +563,11 @@ mod tests {
             (&["--enrollment-bind", "127.0.0.1:1"][..], "--serve"),
             (&["--state-dir", "/tmp/x"][..], "--serve"),
             (&["--blob-max-bytes", "1"][..], "--serve"),
+            (&["--relay-bind", "127.0.0.1:1"][..], "--serve"),
+            (
+                &["--serve", "--relay-bind", "not-an-address"][..],
+                "not-an-address",
+            ),
             (
                 &["--serve", "--blob-max-bytes", "lots"][..],
                 "--blob-max-bytes lots",
@@ -534,10 +617,22 @@ mod tests {
             enrollment_bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             subject_names: Vec::new(),
             blob_max_bytes: None,
+            relay_bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         };
 
         let running = super::serve(&config).await.expect("the server comes up");
         assert_ne!(running.main.addr.port(), 0, "the OS chose a real port");
+        let relay = running
+            .relay
+            .as_ref()
+            .expect("--relay-bind mounts the relay");
+        assert_ne!(relay.server.addr().port(), 0, "the relay bound a real port");
+        assert!(
+            super::operator_lines(&running)
+                .iter()
+                .any(|line| line.starts_with("listening relay=")),
+            "the operator learns where the relay listens"
+        );
         assert_ne!(running.enrollment.addr.port(), 0);
         assert_eq!(running.server_fingerprint.len(), 64);
         let code = running
@@ -559,7 +654,7 @@ mod tests {
 
         // The operator interface, exactly as the binary will print it.
         let lines = super::operator_lines(&running);
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         assert_eq!(lines[0], format!("listening main={}", running.main.addr));
         assert_eq!(
             lines[1],
@@ -571,9 +666,32 @@ mod tests {
         );
         assert_eq!(
             lines[3],
+            format!(
+                "listening relay={}",
+                running.relay.as_ref().expect("mounted").server.addr()
+            )
+        );
+        assert_eq!(
+            lines[4],
             format!("bootstrap-client-code {}", code.join_code())
         );
+
+        // Dropping the server takes the chain driver with it: a leaked
+        // driver would keep folding the (closed) log forever.
+        let chain = running.permission_chain.task.abort_handle();
         drop(running);
+        let mut chain_finished = false;
+        for _ in 0..100_u32 {
+            if chain.is_finished() {
+                chain_finished = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            chain_finished,
+            "drop must abort the permission chain driver"
+        );
 
         // Second start, same state: the CA loads, and no client is enrolled
         // yet (a minted code is not an enrollment), so bootstrap re-offers.
