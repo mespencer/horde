@@ -375,7 +375,7 @@ mod tests {
     }
 
     fn registry() -> Arc<AgentRegistry> {
-        let mut registry = AgentRegistry::new();
+        let registry = AgentRegistry::new();
         registry.insert("agent-42", "horde-agent-42-token");
         Arc::new(registry)
     }
@@ -535,7 +535,7 @@ mod tests {
             "s1",
         ));
 
-        let mut registry = AgentRegistry::new();
+        let registry = AgentRegistry::new();
         registry.insert("agent-42", "token");
 
         let (bound, _serving) = super::serve(

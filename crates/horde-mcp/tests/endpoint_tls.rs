@@ -52,7 +52,7 @@ async fn served_tls() -> Setup<Tls> {
         ca_pem: ca.certificate_pem().to_owned(),
     };
 
-    let mut registry = AgentRegistry::new();
+    let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, TOKEN);
     let deny = RevocationList::new();
 

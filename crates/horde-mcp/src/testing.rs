@@ -46,7 +46,7 @@ pub(crate) fn envelope_without_event(agent: &str) -> EventEnvelope {
 /// proof a token matched, so the tests go through the same door production
 /// does.
 pub(crate) fn identity(agent_id: &str) -> crate::identity::AgentIdentity {
-    let mut registry = crate::identity::AgentRegistry::new();
+    let registry = crate::identity::AgentRegistry::new();
     registry.insert(agent_id, "token");
     let mut headers = http::HeaderMap::new();
     headers.insert("authorization", "Bearer token".parse().expect("header"));

@@ -98,9 +98,15 @@ pub const AUTHORIZATION_HEADER: &str = "authorization";
 /// One endpoint serves many Agents on one port, so the token is what separates
 /// them; the `X-Horde-Agent` header alone is an unauthenticated claim and is
 /// never trusted on its own.
-#[derive(Debug, Default, Clone)]
+///
+/// Interior-mutable on purpose: the serving loop holds this behind an `Arc`
+/// for the life of the endpoint, and the Worker mints a token for each Agent
+/// it spawns *after* the endpoint is already serving. A registry that could
+/// only be populated before serving would freeze the toolset to whichever
+/// agents existed at bind time.
+#[derive(Debug, Default)]
 pub struct AgentRegistry {
-    tokens: HashMap<String, String>,
+    tokens: std::sync::RwLock<HashMap<String, String>>,
 }
 
 impl AgentRegistry {
@@ -110,13 +116,22 @@ impl AgentRegistry {
     }
 
     /// Registers the token minted for an Agent, replacing any previous one.
-    pub fn insert(&mut self, agent_id: impl Into<String>, token: impl Into<String>) {
-        self.tokens.insert(agent_id.into(), token.into());
+    pub fn insert(&self, agent_id: impl Into<String>, token: impl Into<String>) {
+        self.write().insert(agent_id.into(), token.into());
     }
 
     /// Forgets an Agent, so its token stops working immediately.
-    pub fn remove(&mut self, agent_id: &str) {
-        self.tokens.remove(agent_id);
+    pub fn remove(&self, agent_id: &str) {
+        self.write().remove(agent_id);
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+        // A poisoned lock means a panic mid-insert; the map itself is still
+        // coherent (single-key operations), and refusing every later request
+        // would turn one panic into a dead endpoint.
+        self.tokens
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Validates a request's headers.
@@ -144,10 +159,16 @@ impl AgentRegistry {
             .to_str()
             .map_err(|_| IdentityError::NotAscii(AGENT_HEADER))?;
 
-        let expected = self
-            .tokens
-            .get(agent_id)
-            .ok_or(IdentityError::Unauthenticated)?;
+        let expected = {
+            let tokens = self
+                .tokens
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tokens
+                .get(agent_id)
+                .cloned()
+                .ok_or(IdentityError::Unauthenticated)?
+        };
 
         // Length-independent comparison is not the point here — the tokens are
         // server-minted and equal length — but a mismatch must not reveal
@@ -183,7 +204,7 @@ mod tests {
     use super::{AGENT_HEADER, AgentRegistry, IdentityError};
 
     fn registry() -> AgentRegistry {
-        let mut registry = AgentRegistry::new();
+        let registry = AgentRegistry::new();
         registry.insert("agent-42", "horde-agent-42-token");
         registry
     }
@@ -289,7 +310,7 @@ mod tests {
     /// id presented with a token minted for somebody else.
     #[test]
     fn one_agents_token_does_not_authenticate_another_agent() {
-        let mut registry = registry();
+        let registry = registry();
         registry.insert("agent-77", "horde-agent-77-token");
 
         assert_eq!(
@@ -320,9 +341,38 @@ mod tests {
         assert_eq!(wrong_token, unknown_agent);
     }
 
+    /// The property interior mutability exists for: an agent registered
+    /// *after* the registry is already shared (the serving loop holds an
+    /// `Arc`) authenticates through that same shared handle. Without it, a
+    /// Worker could never mint a token for an agent spawned after bind time.
+    #[test]
+    fn an_agent_registered_after_sharing_authenticates_through_the_shared_handle() {
+        let shared = std::sync::Arc::new(AgentRegistry::new());
+        let serving_side = std::sync::Arc::clone(&shared);
+
+        assert_eq!(
+            serving_side.authenticate(&headers(&[
+                ("authorization", "Bearer late-token"),
+                (AGENT_HEADER, "late-agent"),
+            ])),
+            Err(IdentityError::Unauthenticated),
+            "the agent does not exist yet"
+        );
+
+        shared.insert("late-agent", "late-token");
+
+        let identity = serving_side
+            .authenticate(&headers(&[
+                ("authorization", "Bearer late-token"),
+                (AGENT_HEADER, "late-agent"),
+            ]))
+            .expect("a late-registered agent must authenticate");
+        assert_eq!(identity.agent_id(), "late-agent");
+    }
+
     #[test]
     fn a_removed_agent_stops_authenticating() {
-        let mut registry = registry();
+        let registry = registry();
         registry.remove("agent-42");
 
         assert_eq!(
