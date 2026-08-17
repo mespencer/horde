@@ -12,9 +12,15 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 horde-adapter = { workspace = true }
+# The scripted hermetic provider (TESTING.md §3) is a product surface of the
+# daemon, not only a test double: `horde-worker --adapter fake` is what lets
+# the end-to-end suite run this binary for real without a provider login.
+horde-adapter-fake = { workspace = true }
 horde-identity = { workspace = true }
 horde-adapter-claude = { workspace = true }
 horde-adapter-codex = { workspace = true }
+# The daemon's OTLP opt-in (DESIGN §12), wired like the other two binaries.
+horde-observe = { workspace = true }
 horde-proto = { workspace = true }
 # The share layer: observe_head for stamping a result's Payload, and the
 # stage/obtain halves of moving a commit between checkouts (DESIGN §5, §8).
@@ -23,13 +29,13 @@ horde-wire = { workspace = true }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [dev-dependencies]
-horde-adapter-fake = { workspace = true }
 # The mTLS dial test enrolls through the shared secured harness, so the
 # certificate it dials with came off the production issuance path.
 # (serde_json is already an ordinary dependency of this crate.)
@@ -43,6 +49,12 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
+
+# The Worker daemon (DESIGN §2's third binary): enrolls, dials the Server
+# over mTLS, and runs the full Runtime until terminated.
+[[bin]]
+name = "horde-worker"
+path = "src/bin/horde_worker.rs"
 
 # The stub harness is a real binary the process tests spawn, so supervision is
 # exercised over real stdio rather than simulated.

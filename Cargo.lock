@@ -1257,6 +1257,7 @@ dependencies = [
  "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-relay",
  "horde-server",
@@ -1270,6 +1271,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

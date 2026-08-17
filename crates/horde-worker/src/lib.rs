@@ -32,6 +32,7 @@ pub mod journal;
 pub mod process;
 pub mod runtime;
 pub mod share;
+pub mod startup;
 pub mod translate;
 pub mod workspace;
 
