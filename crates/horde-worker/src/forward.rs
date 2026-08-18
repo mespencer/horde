@@ -302,14 +302,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Dropping a listener aborts its accept loop — the owned witness is a
-    /// guard the loop holds: cancellation drops it, and the receiver's error
-    /// is the proof. A `Drop` hollowed to nothing leaks the loop, and the
-    /// port it holds, past the intent that justified them.
+    /// liveness watch the loop holds: cancellation drops its sender, and
+    /// `changed` erroring is the proof. A `Drop` hollowed to nothing leaks
+    /// the loop, and the port it holds, past the intent that justified them.
     #[tokio::test]
     async fn dropping_an_inject_listener_reaps_its_accept_loop() {
-        let (guard, reaped) = tokio::sync::oneshot::channel::<()>();
+        let (alive, mut liveness) = tokio::sync::watch::channel(true);
         let accept_task = tokio::spawn(async move {
-            let _guard = guard;
+            let _alive = alive;
             std::future::pending::<()>().await;
         });
         drop(super::InjectListener {
@@ -317,12 +317,12 @@ mod tests {
             accept_task,
         });
 
-        let witnessed = tokio::time::timeout(std::time::Duration::from_secs(5), reaped)
+        let witnessed = tokio::time::timeout(std::time::Duration::from_secs(5), liveness.changed())
             .await
             .expect("the drop must reap within the ceiling");
         assert!(
             witnessed.is_err(),
-            "the guard must be dropped by cancellation, never sent"
+            "the loop must be gone, not merely quiet: its watch sender died"
         );
     }
 

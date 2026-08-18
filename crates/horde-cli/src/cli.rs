@@ -2311,28 +2311,35 @@ mod forward_flow_tests {
 
     use horde_proto::v1::{ForwardDirection, ForwardSpec};
 
+    use crate::forward::testing::within;
+
     use super::{Format, ForwardCommand, run_forward};
 
-    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(10), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
+    /// One foreground verb driven to completion with an instant shutdown —
+    /// the shared shape of every flow case here.
+    async fn run_headless(
+        client: &mut crate::Client,
+        command: ForwardCommand,
+    ) -> Result<(), crate::ClientError> {
+        within(
+            "the flow completes",
+            run_forward(
+                client,
+                &command,
+                None,
+                Format::Human,
+                std::future::ready(()),
+            ),
+        )
+        .await
     }
 
-    async fn placed_server() -> (horde_server::service::ServerCore, String, crate::Client) {
-        let core = horde_server::service::ServerCore::new(
-            horde_server::EventLog::in_memory().expect("an in-memory log"),
-        );
-        let endpoint = horde_server_testkit::serve_core(core.clone())
-            .await
-            .expect("the server binds loopback");
+    async fn placed_server() -> (horde_server::service::ServerCore, crate::Client) {
+        let (core, client) = crate::forward::testing::served().await;
         horde_server_testkit::place_agent(&core.log, "s1", "agent-1", "w1", "serve")
             .await
             .expect("the placement seeds");
-        let client = crate::Client::connect(&endpoint)
-            .await
-            .expect("the client dials");
-        (core, endpoint, client)
+        (core, client)
     }
 
     fn named(forwards: &[horde_proto::v1::ForwardStatus]) -> Vec<String> {
@@ -2348,20 +2355,14 @@ mod forward_flow_tests {
     /// forward nobody opened must come back as the server's error.
     #[tokio::test]
     async fn the_forward_dispatch_reports_refusals() {
-        let (_core, _endpoint, mut client) = placed_server().await;
-        let refused = within(
-            "the close returns",
-            run_forward(
-                &mut client,
-                &ForwardCommand::Close {
-                    session_id: "s1".to_owned(),
-                    forward_id: "fwd-none".to_owned(),
-                    reason: String::new(),
-                },
-                None,
-                Format::Human,
-                std::future::ready(()),
-            ),
+        let (_core, mut client) = placed_server().await;
+        let refused = run_headless(
+            &mut client,
+            ForwardCommand::Close {
+                session_id: "s1".to_owned(),
+                forward_id: "fwd-none".to_owned(),
+                reason: String::new(),
+            },
         )
         .await;
         assert!(refused.is_err(), "a refused verb must not report success");
@@ -2372,22 +2373,16 @@ mod forward_flow_tests {
     /// ran, and it must carry the name the arguments chose.
     #[tokio::test]
     async fn the_expose_verb_declares_and_realizes_until_shutdown() {
-        let (_core, _endpoint, mut client) = placed_server().await;
-        within(
-            "the expose flow completes",
-            run_forward(
-                &mut client,
-                &ForwardCommand::Expose(super::ForwardExposeArgs {
-                    session_id: "s1".to_owned(),
-                    agent_id: "agent-1".to_owned(),
-                    port: 4242,
-                    name: "vite".to_owned(),
-                    local_port: None,
-                }),
-                None,
-                Format::Human,
-                std::future::ready(()),
-            ),
+        let (_core, mut client) = placed_server().await;
+        run_headless(
+            &mut client,
+            ForwardCommand::Expose(super::ForwardExposeArgs {
+                session_id: "s1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                port: 4242,
+                name: "vite".to_owned(),
+                local_port: None,
+            }),
         )
         .await
         .expect("the flow succeeds");
@@ -2422,21 +2417,15 @@ mod forward_flow_tests {
             .await
             .expect("the enrolled client dials");
 
-        within(
-            "the inject flow completes",
-            run_forward(
-                &mut client,
-                &ForwardCommand::Inject(super::ForwardInjectArgs {
-                    session_id: "s1".to_owned(),
-                    agent_id: "agent-1".to_owned(),
-                    port: 5432,
-                    name: "db".to_owned(),
-                    worker_port: None,
-                }),
-                None,
-                Format::Human,
-                std::future::ready(()),
-            ),
+        run_headless(
+            &mut client,
+            ForwardCommand::Inject(super::ForwardInjectArgs {
+                session_id: "s1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                port: 5432,
+                name: "db".to_owned(),
+                worker_port: None,
+            }),
         )
         .await
         .expect("the flow succeeds");
@@ -2458,7 +2447,7 @@ mod forward_flow_tests {
     /// observable a headless caller can hold the verb to.
     #[tokio::test]
     async fn serve_counts_what_it_realized() {
-        let (_core, _endpoint, mut client) = placed_server().await;
+        let (_core, mut client) = placed_server().await;
         client
             .open_forward(
                 "s1",
@@ -2493,7 +2482,7 @@ mod forward_flow_tests {
     /// verb reports it — a serve that cannot back must not claim it did.
     #[tokio::test]
     async fn an_unbackable_serve_reports_the_refusal() {
-        let (_core, _endpoint, mut client) = placed_server().await;
+        let (_core, mut client) = placed_server().await;
         let outcome = within(
             "the serve returns",
             super::run_forward_serve(
@@ -2544,7 +2533,7 @@ mod forward_flow_tests {
     /// assertion looks.
     #[tokio::test]
     async fn stop_all_reaps_every_listener() {
-        let (_core, _endpoint, client) = placed_server().await;
+        let (_core, client) = placed_server().await;
         let realized = crate::forward::realize_expose(&client, "fwd-x", "x", 4242, 0)
             .await
             .expect("the listener binds");

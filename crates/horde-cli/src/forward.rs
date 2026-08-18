@@ -637,6 +637,7 @@ fn lookup_target(targets: &InjectTargets, forward_id: &str) -> Option<InjectTarg
 
 #[cfg(test)]
 mod tests {
+    use super::testing::within;
     use horde_proto::forward::{accepted_frame, data_frame, eof_frame, refusal_frame};
     use horde_proto::v1::ForwardRefusalReason;
     use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
@@ -660,12 +661,6 @@ mod tests {
             from_relay: Box::pin(ReceiverStream::new(from_relay)),
         };
         (tunnel, feed, sent)
-    }
-
-    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
     }
 
     #[test]
@@ -1058,6 +1053,29 @@ mod tests {
 pub(crate) mod testing {
     use super::RealizedExpose;
 
+    /// A ceilinged wait: the one positive-wait helper every horde-cli
+    /// suite shares, per the duplication gate.
+    pub(crate) async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(10), future)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
+    }
+
+    /// A server whose core the test holds — the registry is how a test
+    /// plays the far side of the relay — and a client dialed into it.
+    pub(crate) async fn served() -> (horde_server::service::ServerCore, crate::Client) {
+        let core = horde_server::service::ServerCore::new(
+            horde_server::EventLog::in_memory().expect("an in-memory log"),
+        );
+        let endpoint = horde_server_testkit::serve_core(core.clone())
+            .await
+            .expect("the server binds loopback");
+        let client = crate::Client::connect(&endpoint)
+            .await
+            .expect("the client dials");
+        (core, client)
+    }
+
     /// A guarded realization: the accept task holds the oneshot's sender,
     /// so the receiver's state is the loop's — alive while `Empty`, gone
     /// once `Closed`.
@@ -1089,28 +1107,10 @@ mod engine_tests {
     use horde_proto::v1::{ForwardDirection, ForwardSpec};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{InjectTarget, InjectTargets, RealizedExpose, realize_expose, serve_backing};
+    use super::testing::within;
+    use super::{InjectTarget, InjectTargets, realize_expose, serve_backing};
 
-    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
-    }
-
-    /// A server whose core the test holds — the registry is how it plays the
-    /// far side of the relay.
-    async fn served() -> (horde_server::service::ServerCore, crate::Client) {
-        let core = horde_server::service::ServerCore::new(
-            horde_server::EventLog::in_memory().expect("an in-memory log"),
-        );
-        let endpoint = horde_server_testkit::serve_core(core.clone())
-            .await
-            .expect("the server binds loopback");
-        let client = crate::Client::connect(&endpoint)
-            .await
-            .expect("the client dials");
-        (core, client)
-    }
+    use super::testing::served;
 
     /// One live placed expose, opened through the real verb.
     async fn opened_expose(
@@ -1250,6 +1250,32 @@ mod engine_tests {
         );
     }
 
+    /// Parks one pending connection and spawns the answer for it,
+    /// returning the paired leg — the shared opening of both inject cases.
+    async fn answered(
+        core: &horde_server::service::ServerCore,
+        client: &crate::Client,
+        targets: &InjectTargets,
+        forward_id: &str,
+        connection_id: &str,
+    ) -> horde_server::forward::registry::PassiveLeg {
+        let paired = core.forwards.park_pending(
+            connection_id,
+            horde_server::forward::registry::PassiveTarget::Client("anyone".to_owned()),
+        );
+        tokio::spawn(super::answer_inject_connection(
+            client.clone(),
+            targets.clone(),
+            horde_proto::v1::ForwardConnectionRequest {
+                forward_id: Some(horde_proto::v1::ForwardId::new(forward_id)),
+                connection_id: connection_id.to_owned(),
+            },
+        ));
+        within("the pairing resolves", paired)
+            .await
+            .expect("the answer claimed the connection")
+    }
+
     /// The backer's inject answer, end to end: the parked pairing resolves,
     /// the local target is dialed, and bytes echo through it. A missing
     /// target refuses instead — the code the worker branches on.
@@ -1269,22 +1295,7 @@ mod engine_tests {
             },
         );
 
-        let paired = core.forwards.park_pending(
-            "c9",
-            horde_server::forward::registry::PassiveTarget::Client("anyone".to_owned()),
-        );
-        let answer = tokio::spawn(super::answer_inject_connection(
-            client.clone(),
-            targets.clone(),
-            horde_proto::v1::ForwardConnectionRequest {
-                forward_id: Some(horde_proto::v1::ForwardId::new("fwd-db")),
-                connection_id: "c9".to_owned(),
-            },
-        ));
-
-        let mut leg = within("the pairing resolves", paired)
-            .await
-            .expect("the answer claimed the connection");
+        let mut leg = answered(&core, &client, &targets, "fwd-db", "c9").await;
         leg.to_passive
             .send(horde_proto::forward::data_frame(b"ping".to_vec()))
             .await
@@ -1293,24 +1304,9 @@ mod engine_tests {
             .await
             .expect("a frame");
         assert_eq!(echoed, horde_proto::forward::data_frame(b"ping".to_vec()));
-        answer.abort();
 
         // The refusal side: an id this client is not serving.
-        let paired = core.forwards.park_pending(
-            "c10",
-            horde_server::forward::registry::PassiveTarget::Client("anyone".to_owned()),
-        );
-        let answer = tokio::spawn(super::answer_inject_connection(
-            client.clone(),
-            targets.clone(),
-            horde_proto::v1::ForwardConnectionRequest {
-                forward_id: Some(horde_proto::v1::ForwardId::new("fwd-none")),
-                connection_id: "c10".to_owned(),
-            },
-        ));
-        let mut leg = within("the refusal pairing resolves", paired)
-            .await
-            .expect("the refusal still answers the connection");
+        let mut leg = answered(&core, &client, &targets, "fwd-none", "c10").await;
         let refused = within("the refusal frame", leg.from_passive.recv())
             .await
             .expect("a frame");
@@ -1319,7 +1315,6 @@ mod engine_tests {
             refusal.reason,
             horde_proto::v1::ForwardRefusalReason::UnknownForward as i32
         );
-        answer.abort();
     }
 
     /// Backing over a channel that names no principal is refused by the

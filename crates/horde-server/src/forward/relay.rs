@@ -650,21 +650,46 @@ mod tests {
 
     /// A scripted leg driven through the full [`super::run_tunnel`], with
     /// the registry and log the test arranged.
+    /// One scripted leg's handles: its feed, its outbound, its task.
+    type LegHandles = (
+        tokio::sync::mpsc::Sender<Result<ForwardTunnelFrame, Status>>,
+        tokio::sync::mpsc::Receiver<ForwardTunnelFrame>,
+        tokio::task::JoinHandle<()>,
+    );
+
     fn tunneling(
         log: &crate::log::EventLog,
         registry: &super::ForwardRegistry,
         caller: TunnelPrincipal,
-    ) -> (
-        tokio::sync::mpsc::Sender<Result<ForwardTunnelFrame, Status>>,
-        tokio::sync::mpsc::Receiver<ForwardTunnelFrame>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> LegHandles {
         let (io, feed, out) = scripted_leg();
         let log = log.clone();
         let registry = registry.clone();
         let task = tokio::spawn(async move {
             super::run_tunnel(&log, &registry, caller, io).await;
         });
+        (feed, out, task)
+    }
+
+    /// A log holding one live expose (`fwd-agent-1`, placed on `w1`) and a
+    /// fresh registry — the arrangement every ruling test shares.
+    async fn expose_fixture() -> (crate::log::EventLog, super::ForwardRegistry) {
+        let log = crate::log::EventLog::in_memory().expect("log");
+        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
+        (log, super::ForwardRegistry::new())
+    }
+
+    /// One leg run as `caller`, its opening frame for `fwd-agent-1`/`c1`
+    /// already sent.
+    async fn opened_as(
+        log: &crate::log::EventLog,
+        registry: &super::ForwardRegistry,
+        caller: TunnelPrincipal,
+    ) -> LegHandles {
+        let (feed, out, task) = tunneling(log, registry, caller);
+        feed.send(Ok(open_frame("fwd-agent-1", "c1")))
+            .await
+            .expect("the opening frame sends");
         (feed, out, task)
     }
 
@@ -688,15 +713,9 @@ mod tests {
     /// on the reason.
     #[tokio::test]
     async fn a_wrong_principal_refusal_carries_its_reason_code() {
-        let log = crate::log::EventLog::in_memory().expect("log");
-        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
-        let registry = super::ForwardRegistry::new();
-
-        let (feed, mut out, task) =
-            tunneling(&log, &registry, TunnelPrincipal::Worker("w1".to_owned()));
-        feed.send(Ok(open_frame("fwd-agent-1", "c1")))
-            .await
-            .expect("send");
+        let (log, registry) = expose_fixture().await;
+        let (_feed, mut out, task) =
+            opened_as(&log, &registry, TunnelPrincipal::Worker("w1".to_owned())).await;
         let refused = within("the ruling refusal arrives", &mut out).await;
         let refusal = refusal_in(&refused).expect("a refusal frame");
         assert_eq!(
@@ -711,14 +730,8 @@ mod tests {
     /// the worker, fast — the whole fast-refusal promise, at the relay.
     #[tokio::test]
     async fn an_absent_worker_lane_refuses_naming_the_worker() {
-        let log = crate::log::EventLog::in_memory().expect("log");
-        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
-        let registry = super::ForwardRegistry::new();
-
-        let (feed, mut out, task) = tunneling(&log, &registry, TunnelPrincipal::Ambient);
-        feed.send(Ok(open_frame("fwd-agent-1", "c1")))
-            .await
-            .expect("send");
+        let (log, registry) = expose_fixture().await;
+        let (_feed, mut out, task) = opened_as(&log, &registry, TunnelPrincipal::Ambient).await;
         let refused = within("the unreachable refusal arrives", &mut out).await;
         let refusal = refusal_in(&refused).expect("a refusal frame");
         assert_eq!(
@@ -735,17 +748,11 @@ mod tests {
     /// success arm turns this accepted into a refusal.
     #[tokio::test]
     async fn two_legs_pair_and_carry_frames_both_ways() {
-        let log = crate::log::EventLog::in_memory().expect("log");
-        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
-        let registry = super::ForwardRegistry::new();
+        let (log, registry) = expose_fixture().await;
         let (_epoch, mut lane) = registry.register_worker("w1");
 
         let (origin_feed, mut origin_out, origin_task) =
-            tunneling(&log, &registry, TunnelPrincipal::Ambient);
-        origin_feed
-            .send(Ok(open_frame("fwd-agent-1", "c1")))
-            .await
-            .expect("send");
+            opened_as(&log, &registry, TunnelPrincipal::Ambient).await;
 
         let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), lane.recv())
             .await
@@ -758,11 +765,7 @@ mod tests {
         );
 
         let (answer_feed, mut answer_out, answer_task) =
-            tunneling(&log, &registry, TunnelPrincipal::Worker("w1".to_owned()));
-        answer_feed
-            .send(Ok(open_frame("fwd-agent-1", "c1")))
-            .await
-            .expect("send");
+            opened_as(&log, &registry, TunnelPrincipal::Worker("w1".to_owned())).await;
 
         let accepted = within("the originator hears accepted", &mut origin_out).await;
         assert_eq!(accepted, accepted_frame());
