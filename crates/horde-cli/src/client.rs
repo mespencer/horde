@@ -544,6 +544,98 @@ impl Client {
             .sequence)
     }
 
+    // -- Port forwards (ADR-0006) ---------------------------------------------
+
+    /// Journals a forward intent. For an inject, the server records this
+    /// client's principal as the backer — the initiator is the backer.
+    ///
+    /// # Errors
+    ///
+    /// The server's refusals for an incomplete spec, a dead agent, a live
+    /// duplicate name, or an unidentifiable backer.
+    pub async fn open_forward(
+        &mut self,
+        session_id: &str,
+        agent_id: &str,
+        spec: horde_proto::v1::ForwardSpec,
+        idempotency_key: &str,
+    ) -> Result<horde_proto::v1::OpenForwardResponse, ClientError> {
+        Ok(self
+            .inner
+            .open_forward(horde_proto::v1::OpenForwardRequest {
+                session_id: Some(SessionId::new(session_id)),
+                agent_id: Some(AgentId::new(agent_id)),
+                spec: Some(spec),
+                idempotency_key: idempotency_key.to_owned(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Closes a forward intent for good.
+    pub async fn close_forward(
+        &mut self,
+        session_id: &str,
+        forward_id: &str,
+        reason: &str,
+    ) -> Result<u64, ClientError> {
+        Ok(self
+            .inner
+            .close_forward(horde_proto::v1::CloseForwardRequest {
+                session_id: Some(SessionId::new(session_id)),
+                forward_id: Some(horde_proto::v1::ForwardId::new(forward_id)),
+                reason: reason.to_owned(),
+            })
+            .await?
+            .into_inner()
+            .sequence)
+    }
+
+    /// Live forward intents plus their realization overlay — worker
+    /// reachability and backing, which the log deliberately does not carry.
+    pub async fn list_forwards(
+        &mut self,
+        session_id: Option<&str>,
+    ) -> Result<Vec<horde_proto::v1::ForwardStatus>, ClientError> {
+        Ok(self
+            .inner
+            .list_forwards(horde_proto::v1::ListForwardsRequest {
+                session_id: session_id.map(SessionId::new),
+            })
+            .await?
+            .into_inner()
+            .forwards)
+    }
+
+    /// Backs this client's inject forwards: the returned stream carries one
+    /// connection request per worker-side connection, each answered by
+    /// dialing the local target and opening a tunnel. Backing IS this
+    /// stream's liveness.
+    pub async fn serve_forwards(
+        &mut self,
+    ) -> Result<tonic::Streaming<horde_proto::v1::ServeForwardsResponse>, ClientError> {
+        Ok(self
+            .inner
+            .serve_forwards(horde_proto::v1::ServeForwardsRequest {})
+            .await?
+            .into_inner())
+    }
+
+    /// Opens one tunnel leg, stripped to bare frames for the pump.
+    pub async fn open_forward_tunnel(&mut self) -> Result<crate::forward::Tunnel, ClientError> {
+        use tokio_stream::StreamExt as _;
+        let (to_relay, outbound) = tokio::sync::mpsc::channel(16);
+        let requests = tokio_stream::wrappers::ReceiverStream::new(outbound)
+            .map(|frame| horde_proto::v1::ForwardTunnelRequest { frame: Some(frame) });
+        let inbound = self.inner.forward_tunnel(requests).await?.into_inner();
+        Ok(crate::forward::Tunnel {
+            to_relay,
+            from_relay: Box::pin(
+                inbound.map(|message| message.map(|reply| reply.frame.unwrap_or_default())),
+            ),
+        })
+    }
+
     pub async fn spawn_agent(
         &mut self,
         session_id: &str,

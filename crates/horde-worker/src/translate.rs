@@ -177,6 +177,10 @@ pub fn journal_entries(
                     // escalated would be inventing one.
                     escalated_from: 0,
                     expires_at: None,
+                    // A harness escalation proposes a tool call, never a
+                    // forward; the forward verbs raise their own requests
+                    // through the endpoint's broker (ADR-0006).
+                    forward: None,
                 }),
             }),
         )],

@@ -17,7 +17,6 @@ use prost::Message;
 
 use crate::error::ServerError;
 use crate::log::{EventLog, GlobalEvent};
-use crate::service::shared::append_server_event;
 use crate::state::{PendingPermission, SessionState, forward_is_live};
 
 /// Why a spec cannot become an intent. Rendered to the caller verbatim.

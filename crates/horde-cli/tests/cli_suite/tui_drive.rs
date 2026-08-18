@@ -131,6 +131,7 @@ fn escalation(agent_id: &str, request_id: &str, rendered: &str) -> Event {
                 permission_mode: "manual".to_owned(),
                 escalated_from: 0,
                 expires_at: None,
+                forward: None,
             }),
         })),
     }
