@@ -10,7 +10,12 @@ use horde_proto::v1::{Event, event::Kind};
 use prost::Message;
 
 use crate::error::ServerError;
-use crate::forward::ForwardRegistry;
+// The child module directly, not `forward`'s re-export: `forward::intent`
+// imports this module's append helpers, so going through the parent would
+// close a module cycle (QUALITY_GATES: mod.rs declares and re-exports; a
+// parent that both re-exports a child and defines what a sibling imports is
+// a knot).
+use crate::forward::registry::ForwardRegistry;
 use crate::log::store::Appended;
 use crate::log::{EventLog, PendingEvent};
 use crate::scheduler::{CapabilityScheduler, Scheduler, WorkerRegistry};
