@@ -48,7 +48,10 @@ pub fn accepted_frame() -> ForwardTunnelFrame {
 /// A terminal refusal, with the reason a peer can branch on and the detail a
 /// human can read.
 #[must_use]
-pub fn refusal_frame(reason: ForwardRefusalReason, detail: impl Into<String>) -> ForwardTunnelFrame {
+pub fn refusal_frame(
+    reason: ForwardRefusalReason,
+    detail: impl Into<String>,
+) -> ForwardTunnelFrame {
     ForwardTunnelFrame {
         frame: Some(Frame::Refused(ForwardTunnelRefusal {
             reason: reason as i32,

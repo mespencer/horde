@@ -339,7 +339,9 @@ mod tests {
         actor::Actor as ActorKind,
     };
 
-    use super::{SpecRefusal, backing_client_of, derived_forward_id, forward_needs_human, openable};
+    use super::{
+        SpecRefusal, backing_client_of, derived_forward_id, forward_needs_human, openable,
+    };
     use crate::state::PendingPermission;
 
     fn spec(direction: ForwardDirection, name: &str, worker: u32, client: u32) -> ForwardSpec {

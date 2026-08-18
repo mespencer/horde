@@ -128,7 +128,10 @@ impl ForwardRegistry {
     /// (most recent wins). Returns the epoch to deregister with and the
     /// receiving end of the lane.
     #[must_use]
-    pub fn register_worker(&self, worker_id: &str) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
+    pub fn register_worker(
+        &self,
+        worker_id: &str,
+    ) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
         let (sender, receiver) = mpsc::channel(LANE_DEPTH);
         let mut inner = self.locked();
         inner.next_epoch += 1;
@@ -155,7 +158,10 @@ impl ForwardRegistry {
     /// replacement, and an older stream from the same principal is simply
     /// never routed to again.
     #[must_use]
-    pub fn register_client(&self, principal: &str) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
+    pub fn register_client(
+        &self,
+        principal: &str,
+    ) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
         let (sender, receiver) = mpsc::channel(LANE_DEPTH);
         let mut inner = self.locked();
         inner.next_epoch += 1;
@@ -227,7 +233,10 @@ impl ForwardRegistry {
     /// The sender to dispatch a connection request through, if the target is
     /// connected. Cloned out so the send happens outside the lock.
     #[must_use]
-    pub fn lane_to(&self, target: &PassiveTarget) -> Option<mpsc::Sender<ForwardConnectionRequest>> {
+    pub fn lane_to(
+        &self,
+        target: &PassiveTarget,
+    ) -> Option<mpsc::Sender<ForwardConnectionRequest>> {
         let inner = self.locked();
         let lane = match target {
             PassiveTarget::Worker(worker_id) => inner.workers.get(worker_id),

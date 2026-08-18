@@ -338,7 +338,10 @@ fn machinery_line(kind: &Kind) -> (&'static str, String) {
             joined(
                 &format!(
                     "closed {}",
-                    closed.forward_id.as_ref().map_or_else(String::new, ToString::to_string)
+                    closed
+                        .forward_id
+                        .as_ref()
+                        .map_or_else(String::new, ToString::to_string)
                 ),
                 &closed.reason,
             ),
@@ -356,7 +359,10 @@ fn forward_opened_text(opened: &horde_proto::v1::ForwardOpened) -> String {
         return String::new();
     };
     let direction = forward_direction_name(spec.direction);
-    let mut text = format!("{} → localhost:{} ({direction})", spec.name, spec.worker_port);
+    let mut text = format!(
+        "{} → localhost:{} ({direction})",
+        spec.name, spec.worker_port
+    );
     if let Some(backer) = opened.backer_client_id.as_ref() {
         text.push_str(&format!(", backed by {backer}"));
     }

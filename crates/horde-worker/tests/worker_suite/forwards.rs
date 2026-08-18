@@ -154,9 +154,12 @@ async fn an_expose_carries_a_tcp_echo_end_to_end() {
     );
 
     for payload in [b"ping over the relay".as_slice(), b"and again".as_slice()] {
-        let mut conn = within("dial the realized listener", TcpStream::connect(realized.local_addr))
-            .await
-            .expect("the realized listener accepts");
+        let mut conn = within(
+            "dial the realized listener",
+            TcpStream::connect(realized.local_addr),
+        )
+        .await
+        .expect("the realized listener accepts");
         echo_round_trip(&mut conn, payload).await;
         // Full close, both ways, ends clean rather than hanging.
         within("shutdown", conn.shutdown()).await.expect("shutdown");
@@ -175,7 +178,14 @@ async fn an_expose_carries_a_tcp_echo_end_to_end() {
 async fn an_unreachable_worker_refuses_connections_fast() {
     let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
     let endpoint = serve(core.clone()).await;
-    place_agent(&core.log, "fwd-refuse", "agent-1", "w-gone", "nothing serves").await;
+    place_agent(
+        &core.log,
+        "fwd-refuse",
+        "agent-1",
+        "w-gone",
+        "nothing serves",
+    )
+    .await;
 
     let mut client = Client::connect(&endpoint).await.expect("the client dials");
     let opened = within(
@@ -287,9 +297,12 @@ async fn a_partition_resets_in_flight_forwards_and_reattach_re_realizes() {
     })
     .await;
 
-    let mut conn = within("dial after reattach", TcpStream::connect(realized.local_addr))
-        .await
-        .expect("the listener stayed bound");
+    let mut conn = within(
+        "dial after reattach",
+        TcpStream::connect(realized.local_addr),
+    )
+    .await
+    .expect("the listener stayed bound");
     echo_round_trip(&mut conn, b"after the reattach").await;
 
     realized.stop().await;

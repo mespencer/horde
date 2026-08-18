@@ -260,7 +260,10 @@ pub fn connection_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    format!("conn-{nanos:x}-{:x}", ORDINAL.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "conn-{nanos:x}-{:x}",
+        ORDINAL.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// How many consecutive accept failures end a listener's loop. A count
@@ -446,7 +449,11 @@ async fn answer_inject_connection(
     let Ok(mut tunnel) = client.open_forward_tunnel().await else {
         return;
     };
-    if tunnel.open(&forward_id, &request.connection_id).await.is_err() {
+    if tunnel
+        .open(&forward_id, &request.connection_id)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -522,7 +529,9 @@ impl ServePlan {
             let Some(intent) = status.intent.as_ref() else {
                 continue;
             };
-            let Some(spec) = intent.spec.as_ref() else { continue };
+            let Some(spec) = intent.spec.as_ref() else {
+                continue;
+            };
             let forward_id = intent
                 .forward_id
                 .as_ref()
@@ -621,7 +630,11 @@ mod tests {
 
     #[test]
     fn the_requested_port_prefers_the_specs_client_port() {
-        assert_eq!(requested_local_port(5173, 0), 5173, "zero means same-as-worker");
+        assert_eq!(
+            requested_local_port(5173, 0),
+            5173,
+            "zero means same-as-worker"
+        );
         assert_eq!(requested_local_port(5173, 8080), 8080);
         assert_eq!(
             requested_local_port(70_000, 0),
@@ -633,7 +646,10 @@ mod tests {
     #[test]
     fn both_eofs_end_a_pump_and_neither_alone_does() {
         assert!(pump_is_done(true, true));
-        assert!(!pump_is_done(true, false), "the response may still be coming");
+        assert!(
+            !pump_is_done(true, false),
+            "the response may still be coming"
+        );
         assert!(!pump_is_done(false, true), "the request may still be going");
         assert!(!pump_is_done(false, false));
     }
@@ -667,8 +683,8 @@ mod tests {
         use horde_proto::v1::{
             ClientId, ForwardDirection, ForwardId, ForwardIntent, ForwardSpec, ForwardStatus,
         };
-        let status = |name: &str, direction: ForwardDirection, backer: Option<&str>| {
-            ForwardStatus {
+        let status =
+            |name: &str, direction: ForwardDirection, backer: Option<&str>| ForwardStatus {
                 intent: Some(ForwardIntent {
                     forward_id: Some(ForwardId::new(format!("fwd-{name}"))),
                     session_id: None,
@@ -683,8 +699,7 @@ mod tests {
                 }),
                 worker_reachable: true,
                 backed: false,
-            }
-        };
+            };
 
         let plan = super::ServePlan::from_statuses(
             &[
@@ -805,12 +820,17 @@ mod tests {
         assert_eq!(frame, data_frame(b"ping".to_vec()));
 
         // Relay → local peer.
-        feed.send(Ok(data_frame(b"pong".to_vec()))).await.expect("feed");
+        feed.send(Ok(data_frame(b"pong".to_vec())))
+            .await
+            .expect("feed");
         let mut buffer = [0_u8; 4];
         use tokio::io::AsyncReadExt;
-        within("relay bytes reach the socket", local.read_exact(&mut buffer))
-            .await
-            .expect("read");
+        within(
+            "relay bytes reach the socket",
+            local.read_exact(&mut buffer),
+        )
+        .await
+        .expect("read");
         assert_eq!(&buffer, b"pong");
 
         // Local half-close becomes an eof frame; relay eof half-closes back.

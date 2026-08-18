@@ -8,7 +8,12 @@
 use horde_proto::v1::{AgentLifecycleState, ForwardDirection, ForwardSpec};
 use horde_server_testkit::{Setup, journal_event_at, seeded};
 
-fn spec(direction: ForwardDirection, name: &str, worker_port: u32, client_port: u32) -> ForwardSpec {
+fn spec(
+    direction: ForwardDirection,
+    name: &str,
+    worker_port: u32,
+    client_port: u32,
+) -> ForwardSpec {
     ForwardSpec {
         direction: direction as i32,
         name: name.to_owned(),
@@ -32,8 +37,14 @@ async fn open_forward_refuses_what_the_log_must_not_hold() -> Setup<()> {
     for (spec, needle) in [
         (spec(ForwardDirection::Unspecified, "x", 1, 0), "which way"),
         (spec(ForwardDirection::Expose, "", 1, 0), "named"),
-        (spec(ForwardDirection::Expose, "x", 0, 0), "worker-side port"),
-        (spec(ForwardDirection::Inject, "x", 1, 0), "client-side port"),
+        (
+            spec(ForwardDirection::Expose, "x", 0, 0),
+            "worker-side port",
+        ),
+        (
+            spec(ForwardDirection::Inject, "x", 1, 0),
+            "client-side port",
+        ),
     ] {
         let refused = client
             .open_forward(&session, &root, spec, "")

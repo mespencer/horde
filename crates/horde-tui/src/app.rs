@@ -74,10 +74,19 @@ pub enum Directive {
     RefreshSessions,
     /// Ask the server for the live forwards and their realization overlay.
     RefreshForwards,
-    Approve { request_id: String },
-    Deny { request_id: String },
-    SendAssignment { agent_id: String, text: String },
-    Interrupt { agent_id: String },
+    Approve {
+        request_id: String,
+    },
+    Deny {
+        request_id: String,
+    },
+    SendAssignment {
+        agent_id: String,
+        text: String,
+    },
+    Interrupt {
+        agent_id: String,
+    },
 }
 
 /// Which screen is showing.
@@ -344,9 +353,9 @@ impl App {
             }
             Update::Forwards(forwards) => {
                 self.forwards = forwards;
-                self.forwards_selected = self.forwards_selected.min(
-                    self.forwards.len().saturating_sub(1),
-                );
+                self.forwards_selected = self
+                    .forwards_selected
+                    .min(self.forwards.len().saturating_sub(1));
             }
         }
     }
@@ -487,8 +496,7 @@ impl App {
                 self.forwards_selected = step_back(self.forwards_selected);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.forwards_selected =
-                    step_forward(self.forwards_selected, self.forwards.len());
+                self.forwards_selected = step_forward(self.forwards_selected, self.forwards.len());
             }
             _ => {}
         }

@@ -185,7 +185,6 @@ fn opened_event(
     (forward_id, event)
 }
 
-
 /// The forward id a stored `ForwardOpened` payload carries.
 fn opened_id_in(payload: &[u8]) -> Option<String> {
     match Event::decode(payload).ok()?.kind? {
@@ -317,7 +316,10 @@ pub async fn any_affects_forwards(
     notes: &[crate::log::Notification],
 ) -> Result<bool, ServerError> {
     for note in notes {
-        let rows = core.log.read_from(&note.session_id, note.sequence, 1).await?;
+        let rows = core
+            .log
+            .read_from(&note.session_id, note.sequence, 1)
+            .await?;
         for row in rows {
             let event = Event::decode(row.payload.as_slice())?;
             if affects_forwards(event.kind.as_ref()) {

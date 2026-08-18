@@ -159,17 +159,18 @@ async fn originate(
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
-    let resolved = intent::resolve_live(log, &forward_id).await.map_err(|error| {
-        refusal_frame(
-            ForwardRefusalReason::Unspecified,
-            format!("the relay could not read the log: {error}"),
-        )
-    })?;
-    let target = originate_ruling(resolved.as_ref(), caller).map_err(|refusal| {
-        ForwardTunnelFrame {
+    let resolved = intent::resolve_live(log, &forward_id)
+        .await
+        .map_err(|error| {
+            refusal_frame(
+                ForwardRefusalReason::Unspecified,
+                format!("the relay could not read the log: {error}"),
+            )
+        })?;
+    let target =
+        originate_ruling(resolved.as_ref(), caller).map_err(|refusal| ForwardTunnelFrame {
             frame: Some(Frame::Refused(refusal.into_refusal())),
-        }
-    })?;
+        })?;
 
     let Some(lane) = registry.lane_to(&target) else {
         return Err(missing_lane_refusal(&target));
@@ -623,7 +624,11 @@ mod tests {
             .send(data_frame(vec![9]))
             .await
             .expect("send from peer");
-        let echoed = within("frames still flow after a relayed eof", &mut harness.outbound).await;
+        let echoed = within(
+            "frames still flow after a relayed eof",
+            &mut harness.outbound,
+        )
+        .await;
         assert_eq!(echoed.expect("an ok frame"), data_frame(vec![9]));
         harness.task.abort();
     }
@@ -652,8 +657,7 @@ mod tests {
 
     #[test]
     fn missing_and_unanswered_lanes_refuse_with_the_directions_vocabulary() {
-        let worker_gone =
-            super::missing_lane_refusal(&PassiveTarget::Worker("gpu-box".to_owned()));
+        let worker_gone = super::missing_lane_refusal(&PassiveTarget::Worker("gpu-box".to_owned()));
         let refusal = refusal_in(&worker_gone).expect("a refusal");
         assert_eq!(
             refusal.reason,
@@ -676,7 +680,11 @@ mod tests {
             refusal.reason,
             ForwardRefusalReason::WorkerUnreachable as i32
         );
-        assert!(refusal.detail.contains("did not answer"), "{}", refusal.detail);
+        assert!(
+            refusal.detail.contains("did not answer"),
+            "{}",
+            refusal.detail
+        );
 
         let slow_backer = super::unanswered_refusal(&PassiveTarget::Client("laptop".to_owned()));
         let refusal = refusal_in(&slow_backer).expect("a refusal");

@@ -15,7 +15,9 @@
 
 use std::collections::BTreeMap;
 
-use horde_cli::forward::{ConfirmEnd, DIAL_DEADLINE, Tunnel, confirm_opened, connection_id, pump_tcp};
+use horde_cli::forward::{
+    ConfirmEnd, DIAL_DEADLINE, Tunnel, confirm_opened, connection_id, pump_tcp,
+};
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{
     ForwardConnectionRequest, ForwardDirection, ForwardIntent, ForwardRefusalReason,

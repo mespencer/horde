@@ -362,7 +362,8 @@ impl WorkerService for WorkerFacing {
         tokio::spawn(async move {
             let pump = pump_forwards(&core, &worker_id, lane, notifications, &sender);
             super::shared::run_severable(pump, deny, serial, &sender).await;
-            core.forwards.deregister_worker_if_current(&worker_id, epoch);
+            core.forwards
+                .deregister_worker_if_current(&worker_id, epoch);
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))

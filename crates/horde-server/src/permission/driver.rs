@@ -1310,7 +1310,10 @@ mod tests {
 
     // -- forwards through the chain (ADR-0006) -------------------------------
 
-    fn forward_spec(direction: horde_proto::v1::ForwardDirection, name: &str) -> horde_proto::v1::ForwardSpec {
+    fn forward_spec(
+        direction: horde_proto::v1::ForwardDirection,
+        name: &str,
+    ) -> horde_proto::v1::ForwardSpec {
         horde_proto::v1::ForwardSpec {
             direction: direction as i32,
             name: name.to_owned(),
@@ -1469,10 +1472,7 @@ mod tests {
         let requests = requests_in(&log, "s1").await;
         assert_eq!(requests.len(), 2, "escalated to the inbox instead");
         assert_eq!(
-            requests[1]
-                .forward
-                .as_ref()
-                .map(|spec| spec.direction),
+            requests[1].forward.as_ref().map(|spec| spec.direction),
             Some(horde_proto::v1::ForwardDirection::Inject as i32),
             "the escalation still carries the spec the acceptance will open"
         );
@@ -1488,7 +1488,13 @@ mod tests {
             forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
         )
         .await;
-        append(&log, "s1", "human-1", client_decided("root", "req-1", "laptop")).await;
+        append(
+            &log,
+            "s1",
+            "human-1",
+            client_decided("root", "req-1", "laptop"),
+        )
+        .await;
 
         run_chain(&log, allows_expose(), None).await;
 
@@ -1510,8 +1516,20 @@ mod tests {
             forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
         )
         .await;
-        append(&log, "s1", "human-1", client_decided("root", "req-1", "laptop")).await;
-        append(&log, "s1", "human-2", client_decided("root", "req-1", "desk")).await;
+        append(
+            &log,
+            "s1",
+            "human-1",
+            client_decided("root", "req-1", "laptop"),
+        )
+        .await;
+        append(
+            &log,
+            "s1",
+            "human-2",
+            client_decided("root", "req-1", "desk"),
+        )
+        .await;
 
         run_chain(&log, allows_expose(), None).await;
 
