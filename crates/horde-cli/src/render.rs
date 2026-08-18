@@ -2170,4 +2170,139 @@ mod usage_tests {
         assert_eq!(UsageGrouping::Account.word(), "provider account");
         assert_eq!(UsageGrouping::Model.word(), "model");
     }
+
+    // -- forwards (ADR-0006) -------------------------------------------------
+
+    fn forward_status(
+        name: &str,
+        direction: horde_proto::v1::ForwardDirection,
+        backer: Option<&str>,
+        worker_reachable: bool,
+        backed: bool,
+    ) -> horde_proto::v1::ForwardStatus {
+        horde_proto::v1::ForwardStatus {
+            intent: Some(horde_proto::v1::ForwardIntent {
+                forward_id: Some(horde_proto::v1::ForwardId::new(format!("fwd-{name}"))),
+                session_id: Some(horde_proto::v1::SessionId::new("s1")),
+                agent_id: Some(horde_proto::v1::AgentId::new("a1")),
+                spec: Some(horde_proto::v1::ForwardSpec {
+                    direction: direction as i32,
+                    name: name.to_owned(),
+                    worker_port: 5173,
+                    client_port: 5432,
+                }),
+                backer_client_id: backer.map(horde_proto::v1::ClientId::new),
+            }),
+            worker_reachable,
+            backed,
+        }
+    }
+
+    /// The three row shapes an operator reads: a reachable expose, a backed
+    /// inject, and an unbacked inject naming the detached backer — whose
+    /// return is the remedy, which is why the name must survive the state.
+    #[test]
+    fn the_forward_list_says_reachability_and_backing_in_words() {
+        use horde_proto::v1::ForwardDirection;
+
+        let rendered = super::forwards(
+            &[
+                forward_status("vite", ForwardDirection::Expose, None, true, false),
+                forward_status("db", ForwardDirection::Inject, Some("laptop"), true, true),
+                forward_status(
+                    "cache",
+                    ForwardDirection::Inject,
+                    Some("desk"),
+                    false,
+                    false,
+                ),
+            ],
+            Format::Human,
+        );
+        assert!(rendered.contains("vite  expose 5173"), "{rendered}");
+        assert!(rendered.contains("worker ok"), "{rendered}");
+        assert!(rendered.contains("backed by laptop"), "{rendered}");
+        assert!(rendered.contains("worker unreachable"), "{rendered}");
+        assert!(rendered.contains("UNBACKED (desk detached)"), "{rendered}");
+        assert!(
+            !rendered.contains("vite")
+                || !rendered.lines().next().unwrap_or("").contains("UNBACKED"),
+            "an expose has no backing state to claim: {rendered}"
+        );
+
+        assert_eq!(super::forwards(&[], Format::Human), "no live forwards");
+    }
+
+    #[test]
+    fn the_forward_list_renders_json_rows_scripts_can_read() {
+        use horde_proto::v1::ForwardDirection;
+
+        let rendered = super::forwards(
+            &[forward_status(
+                "db",
+                ForwardDirection::Inject,
+                Some("laptop"),
+                true,
+                false,
+            )],
+            Format::Json,
+        );
+        let rows: serde_json::Value = serde_json::from_str(&rendered).expect("one JSON value");
+        assert_eq!(rows[0]["name"], "db");
+        assert_eq!(rows[0]["direction"], "inject");
+        assert_eq!(rows[0]["worker_port"], 5173);
+        assert_eq!(rows[0]["client_port"], 5432);
+        assert_eq!(rows[0]["backer"], "laptop");
+        assert_eq!(rows[0]["worker_reachable"], true);
+        assert_eq!(rows[0]["backed"], false);
+        assert_eq!(rows[0]["session_id"], "s1");
+    }
+
+    /// The mapping line is the whole point of the fallback: it must say when
+    /// the address is not the one asked for.
+    #[test]
+    fn a_realized_expose_prints_its_mapping_and_names_a_fallback() {
+        let addr: std::net::SocketAddr = "127.0.0.1:49152".parse().expect("an address");
+
+        let exact = super::forward_realized("vite", "fwd-1", addr, false, Format::Human);
+        assert!(exact.contains("vite → 127.0.0.1:49152"), "{exact}");
+        assert!(!exact.contains("fallback"), "{exact}");
+
+        let fallback = super::forward_realized("vite", "fwd-1", addr, true, Format::Human);
+        assert!(fallback.contains("ephemeral fallback"), "{fallback}");
+
+        let json: serde_json::Value = serde_json::from_str(&super::forward_realized(
+            "vite",
+            "fwd-1",
+            addr,
+            true,
+            Format::Json,
+        ))
+        .expect("one JSON value");
+        assert_eq!(json["local_addr"], "127.0.0.1:49152");
+        assert_eq!(json["fell_back"], true);
+    }
+
+    /// The backing line names both ends; an unknown worker port (serve mode)
+    /// stays honest rather than printing `:0`.
+    #[test]
+    fn a_backing_line_names_both_ends_or_neither() {
+        let both = super::forward_backing("db", "fwd-1", 5432, 15432, Format::Human);
+        assert!(both.contains("127.0.0.1:5432 here"), "{both}");
+        assert!(both.contains("worker localhost:15432"), "{both}");
+
+        let unknown = super::forward_backing("db", "fwd-1", 5432, 0, Format::Human);
+        assert!(!unknown.contains(":0"), "{unknown}");
+
+        let json: serde_json::Value = serde_json::from_str(&super::forward_backing(
+            "db",
+            "fwd-1",
+            5432,
+            15432,
+            Format::Json,
+        ))
+        .expect("one JSON value");
+        assert_eq!(json["local_port"], 5432);
+        assert_eq!(json["worker_port"], 15432);
+    }
 }

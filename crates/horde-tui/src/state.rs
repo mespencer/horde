@@ -1246,4 +1246,73 @@ mod tests {
         assert_eq!(account_of("", ""), None);
         assert_eq!(super::account_of(None), None);
     }
+
+    /// The forward feed lines (ADR-0006): an open renders the ADR's own
+    /// `name → localhost:port` shape with the backer named, and a close
+    /// names what closed and why.
+    #[test]
+    fn forward_events_render_as_the_adr_promises() {
+        use horde_proto::v1::{
+            ClientId, ForwardClosed, ForwardDirection, ForwardId, ForwardOpened, ForwardSpec,
+        };
+
+        let opened = Kind::ForwardOpened(ForwardOpened {
+            forward_id: Some(ForwardId::new("fwd-1")),
+            spec: Some(ForwardSpec {
+                direction: ForwardDirection::Inject as i32,
+                name: "db".to_owned(),
+                worker_port: 15432,
+                client_port: 5432,
+            }),
+            opened_by: None,
+            backer_client_id: Some(ClientId::new("laptop")),
+        });
+        let (label, text) = super::describe(Some(&opened));
+        assert_eq!(label, "forward");
+        assert_eq!(text, "db → localhost:15432 (inject), backed by laptop");
+
+        let unbacked = Kind::ForwardOpened(ForwardOpened {
+            forward_id: Some(ForwardId::new("fwd-2")),
+            spec: Some(ForwardSpec {
+                direction: ForwardDirection::Expose as i32,
+                name: "vite".to_owned(),
+                worker_port: 5173,
+                client_port: 0,
+            }),
+            opened_by: None,
+            backer_client_id: None,
+        });
+        let (_label, text) = super::describe(Some(&unbacked));
+        assert_eq!(text, "vite → localhost:5173 (expose)");
+
+        let specless = Kind::ForwardOpened(ForwardOpened::default());
+        let (_label, text) = super::describe(Some(&specless));
+        assert_eq!(
+            text, "",
+            "a specless open renders nothing rather than lying"
+        );
+
+        let closed = Kind::ForwardClosed(ForwardClosed {
+            forward_id: Some(ForwardId::new("fwd-1")),
+            closed_by: None,
+            reason: "done".to_owned(),
+        });
+        let (label, text) = super::describe(Some(&closed));
+        assert_eq!(label, "forward");
+        assert_eq!(text, "closed fwd-1: done");
+    }
+
+    #[test]
+    fn forward_directions_name_themselves() {
+        use horde_proto::v1::ForwardDirection;
+        assert_eq!(
+            super::forward_direction_name(ForwardDirection::Expose as i32),
+            "expose"
+        );
+        assert_eq!(
+            super::forward_direction_name(ForwardDirection::Inject as i32),
+            "inject"
+        );
+        assert_eq!(super::forward_direction_name(99), "unspecified");
+    }
 }

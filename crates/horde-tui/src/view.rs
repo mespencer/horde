@@ -337,6 +337,31 @@ mod tests {
         }
     }
 
+    /// The backing suffix's table. Asserted here beside the snapshots
+    /// because the 80-column screen clips the unbacked row's tail — exactly
+    /// where the detached backer's name lives, and the name is the remedy.
+    #[test]
+    fn the_backing_note_always_names_the_backer_it_has() {
+        assert_eq!(
+            super::backing_note(Some("laptop".to_owned()), true),
+            "  backed by laptop"
+        );
+        assert_eq!(
+            super::backing_note(Some("laptop".to_owned()), false),
+            "  UNBACKED — laptop is detached"
+        );
+        assert_eq!(
+            super::backing_note(None, false),
+            "  UNBACKED — no backer recorded"
+        );
+        assert_eq!(
+            super::backing_note(None, true),
+            "  UNBACKED — no backer recorded",
+            "a 'backed' inject with no recorded backer is a contradiction; \
+             the row says the alarming half"
+        );
+    }
+
     /// Asserted here rather than left to the screen snapshots, because on an
     /// 80-column screen a long prompt pushes the suffix past the right edge —
     /// where every miscounted variant clips to the same pixels.

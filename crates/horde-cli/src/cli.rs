@@ -2161,3 +2161,74 @@ mod enrollment_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod forward_tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, ForwardCommand, forward_name_or_default};
+
+    /// Forwards are named, not numbered — but the CLI defaults rather than
+    /// refuses, mirroring the agent verb where the name is the declarer's
+    /// choice.
+    #[test]
+    fn a_nameless_forward_defaults_to_its_port() {
+        assert_eq!(forward_name_or_default("vite", 5173), "vite");
+        assert_eq!(forward_name_or_default("", 5173), "port-5173");
+    }
+
+    /// The verb surface, as ADR-0006 names it: `expose <port> --as <name>`,
+    /// `inject` with the worker port defaulted, `ls`, `close`, `serve`.
+    #[test]
+    fn the_forward_verbs_parse_as_the_adr_names_them() {
+        let cli = Cli::try_parse_from([
+            "horde", "forward", "expose", "s1", "agent-1", "5173", "--as", "vite",
+        ])
+        .expect("the expose verb parses");
+        match cli.command {
+            Some(Command::Forward(ForwardCommand::Expose(args))) => {
+                assert_eq!(args.session_id, "s1");
+                assert_eq!(args.agent_id, "agent-1");
+                assert_eq!(args.port, 5173);
+                assert_eq!(args.name, "vite");
+                assert_eq!(
+                    args.local_port, None,
+                    "the local port is the client's choice"
+                );
+            }
+            other => panic!("expected forward expose, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["horde", "forward", "inject", "s1", "agent-1", "5432"])
+            .expect("the inject verb parses");
+        match cli.command {
+            Some(Command::Forward(ForwardCommand::Inject(args))) => {
+                assert_eq!(args.port, 5432);
+                assert_eq!(
+                    args.worker_port, None,
+                    "the worker port defaults to the local one"
+                );
+            }
+            other => panic!("expected forward inject, got {other:?}"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["horde", "forward", "ls"])
+                .expect("ls parses")
+                .command,
+            Some(Command::Forward(ForwardCommand::Ls { session: None }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["horde", "forward", "close", "s1", "fwd-1"])
+                .expect("close parses")
+                .command,
+            Some(Command::Forward(ForwardCommand::Close { .. }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["horde", "forward", "serve", "--session", "s1"])
+                .expect("serve parses")
+                .command,
+            Some(Command::Forward(ForwardCommand::Serve { session: Some(_) }))
+        ));
+    }
+}
