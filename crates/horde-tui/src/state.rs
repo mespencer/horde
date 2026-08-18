@@ -332,9 +332,44 @@ fn machinery_line(kind: &Kind) -> (&'static str, String) {
                 }),
         ),
         Kind::TurnInterrupted(interrupted) => ("interrupt", interrupted.reason.clone()),
+        Kind::ForwardOpened(opened) => ("forward", forward_opened_text(opened)),
+        Kind::ForwardClosed(closed) => (
+            "forward",
+            joined(
+                &format!(
+                    "closed {}",
+                    closed.forward_id.as_ref().map_or_else(String::new, ToString::to_string)
+                ),
+                &closed.reason,
+            ),
+        ),
         // Only reachable for a conversational kind handed here directly; the
         // dispatcher never does, but a total answer beats a panic.
         _ => ("unknown", String::new()),
+    }
+}
+
+/// One opened forward as feed text: `vite → localhost:5173 (expose)`, the
+/// rendering ADR-0006 promises, with the backer named when there is one.
+fn forward_opened_text(opened: &horde_proto::v1::ForwardOpened) -> String {
+    let Some(spec) = opened.spec.as_ref() else {
+        return String::new();
+    };
+    let direction = forward_direction_name(spec.direction);
+    let mut text = format!("{} → localhost:{} ({direction})", spec.name, spec.worker_port);
+    if let Some(backer) = opened.backer_client_id.as_ref() {
+        text.push_str(&format!(", backed by {backer}"));
+    }
+    text
+}
+
+/// The wire direction as the word the panel and the feed print.
+#[must_use]
+pub fn forward_direction_name(direction: i32) -> &'static str {
+    match horde_proto::v1::ForwardDirection::try_from(direction) {
+        Ok(horde_proto::v1::ForwardDirection::Expose) => "expose",
+        Ok(horde_proto::v1::ForwardDirection::Inject) => "inject",
+        _ => "unspecified",
     }
 }
 

@@ -83,6 +83,72 @@ pub enum Command {
     /// This machine's own identity: joining, and client codes for others.
     #[command(subcommand)]
     Enroll(EnrollCommand),
+    /// Port forwards (ADR-0006): expose worker ports here, inject local
+    /// ports there.
+    #[command(subcommand)]
+    Forward(ForwardCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ForwardCommand {
+    /// Declare an expose and realize it here: the agent's worker port
+    /// appears on this machine's localhost until ctrl-c. The requested local
+    /// port falls back to an ephemeral one, with the mapping printed.
+    Expose(ForwardExposeArgs),
+    /// Declare an inject and back it here: a local port appears on the
+    /// agent's worker loopback, served by this process until ctrl-c. The
+    /// initiator is the backer.
+    Inject(ForwardInjectArgs),
+    /// Live forwards, with worker reachability and backing.
+    Ls {
+        /// Restrict to one session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Close a forward intent for good.
+    Close {
+        session_id: String,
+        forward_id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Realize every live forward in scope: bind a listener per expose, and
+    /// back the injects this client's principal owns. Reattach = rerun.
+    Serve {
+        /// Restrict to one session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct ForwardExposeArgs {
+    pub session_id: String,
+    /// The owning agent; the intent lives and dies with its lifecycle.
+    pub agent_id: String,
+    /// The port on the agent's worker.
+    pub port: u16,
+    /// The forward's name — forwards are named, not numbered.
+    #[arg(long = "as", default_value = "")]
+    pub name: String,
+    /// The local port to bind; defaults to the worker port.
+    #[arg(long)]
+    pub local_port: Option<u16>,
+}
+
+#[derive(Args, Debug)]
+pub struct ForwardInjectArgs {
+    pub session_id: String,
+    pub agent_id: String,
+    /// The local port whose service the agent should reach.
+    pub port: u16,
+    /// The forward's name — forwards are named, not numbered.
+    #[arg(long = "as", default_value = "")]
+    pub name: String,
+    /// The worker-loopback port where the service appears; defaults to the
+    /// local port.
+    #[arg(long)]
+    pub worker_port: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -644,6 +710,12 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
+        // Routed here rather than through the admin table because serving
+        // needs the invocation's identity: backing is keyed to the enrolled
+        // principal, which only the flags know.
+        Some(Command::Forward(command)) => {
+            run_forward(client, command, cli.identity.as_deref(), format).await
+        }
         Some(command) => dispatch_admin(client, command, format).await,
     }
 }
@@ -1049,6 +1121,213 @@ async fn run_enroll(
             println!("{}", render::revoked(name, &serials, format));
             Ok(())
         }
+    }
+}
+
+// -- Port forwards (ADR-0006) -------------------------------------------------
+
+async fn run_forward(
+    client: &mut Client,
+    command: &ForwardCommand,
+    identity: Option<&std::path::Path>,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
+        ForwardCommand::Expose(args) => run_forward_expose(client, args, format).await,
+        ForwardCommand::Inject(args) => run_forward_inject(client, args, format).await,
+        ForwardCommand::Ls { session } => {
+            let forwards = client.list_forwards(session.as_deref()).await?;
+            println!("{}", render::forwards(&forwards, format));
+            Ok(())
+        }
+        ForwardCommand::Close {
+            session_id,
+            forward_id,
+            reason,
+        } => {
+            let sequence = client.close_forward(session_id, forward_id, reason).await?;
+            println!("{}", render::sequence("closed", sequence, format));
+            Ok(())
+        }
+        ForwardCommand::Serve { session } => {
+            run_forward_serve(client, session.as_deref(), identity, format).await
+        }
+    }
+}
+
+/// The forward's display name: what `--as` said, or `port-<port>` — a
+/// default rather than a refusal, because the CLI mirrors the agent verb
+/// where the name is likewise the declarer's choice.
+#[must_use]
+pub fn forward_name_or_default(name: &str, port: u16) -> String {
+    if name.is_empty() {
+        format!("port-{port}")
+    } else {
+        name.to_owned()
+    }
+}
+
+async fn run_forward_expose(
+    client: &mut Client,
+    args: &ForwardExposeArgs,
+    format: Format,
+) -> Result<(), ClientError> {
+    let name = forward_name_or_default(&args.name, args.port);
+    let spec = horde_proto::v1::ForwardSpec {
+        direction: horde_proto::v1::ForwardDirection::Expose as i32,
+        name: name.clone(),
+        worker_port: u32::from(args.port),
+        client_port: u32::from(args.local_port.unwrap_or(0)),
+    };
+    let opened = client
+        .open_forward(&args.session_id, &args.agent_id, spec, "")
+        .await?;
+    let forward_id = opened
+        .forward_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+
+    let realized = crate::forward::realize_expose(
+        client,
+        &forward_id,
+        &name,
+        u32::from(args.port),
+        u32::from(args.local_port.unwrap_or(0)),
+    )
+    .await
+    .map_err(|source| ClientError::File {
+        path: std::path::PathBuf::from("127.0.0.1"),
+        source,
+    })?;
+    println!(
+        "{}",
+        render::forward_realized(
+            &name,
+            &forward_id,
+            realized.local_addr,
+            realized.fell_back,
+            format
+        )
+    );
+
+    // Foreground until the operator says otherwise — a listener is only as
+    // alive as the process holding it, and exiting silently would be a
+    // realization lying about itself.
+    let _ = tokio::signal::ctrl_c().await;
+    realized.stop().await;
+    Ok(())
+}
+
+async fn run_forward_inject(
+    client: &mut Client,
+    args: &ForwardInjectArgs,
+    format: Format,
+) -> Result<(), ClientError> {
+    let name = forward_name_or_default(&args.name, args.port);
+    let worker_port = args.worker_port.unwrap_or(args.port);
+    let spec = horde_proto::v1::ForwardSpec {
+        direction: horde_proto::v1::ForwardDirection::Inject as i32,
+        name: name.clone(),
+        worker_port: u32::from(worker_port),
+        client_port: u32::from(args.port),
+    };
+    let opened = client
+        .open_forward(&args.session_id, &args.agent_id, spec, "")
+        .await?;
+    let forward_id = opened
+        .forward_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+
+    println!(
+        "{}",
+        render::forward_backing(&name, &forward_id, args.port, worker_port, format)
+    );
+
+    let targets: crate::forward::InjectTargets = std::sync::Arc::default();
+    if let Ok(mut map) = targets.write() {
+        map.insert(
+            forward_id,
+            crate::forward::InjectTarget {
+                name,
+                client_port: args.port,
+            },
+        );
+    }
+    // Serving IS backing: this call returning means the server now counts
+    // this client unbacked, so it runs until ctrl-c or the stream dies.
+    tokio::select! {
+        outcome = crate::forward::serve_backing(client, targets) => outcome,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+async fn run_forward_serve(
+    client: &mut Client,
+    session: Option<&str>,
+    identity: Option<&std::path::Path>,
+    format: Format,
+) -> Result<(), ClientError> {
+    let statuses = client.list_forwards(session).await?;
+    let principal = enrolled_principal(identity);
+    let plan = crate::forward::ServePlan::from_statuses(&statuses, principal.as_deref());
+
+    let mut realized = Vec::new();
+    for expose in &plan.exposes {
+        match crate::forward::realize_expose(
+            client,
+            &expose.forward_id,
+            &expose.name,
+            expose.worker_port,
+            expose.client_port,
+        )
+        .await
+        {
+            Ok(listener) => {
+                println!(
+                    "{}",
+                    render::forward_realized(
+                        &expose.name,
+                        &expose.forward_id,
+                        listener.local_addr,
+                        listener.fell_back,
+                        format
+                    )
+                );
+                realized.push(listener);
+            }
+            Err(error) => eprintln!("could not realize {}: {error}", expose.name),
+        }
+    }
+    for (forward_id, target) in read_targets(&plan.injects) {
+        println!(
+            "{}",
+            render::forward_backing(&target.name, &forward_id, target.client_port, 0, format)
+        );
+    }
+
+    tokio::select! {
+        outcome = crate::forward::serve_backing(client, plan.injects.clone()) => outcome?,
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    for listener in realized {
+        listener.stop().await;
+    }
+    Ok(())
+}
+
+/// A snapshot of the inject targets, for printing without holding the lock.
+fn read_targets(
+    targets: &crate::forward::InjectTargets,
+) -> Vec<(String, crate::forward::InjectTarget)> {
+    match targets.read() {
+        Ok(map) => map
+            .iter()
+            .map(|(id, target)| (id.clone(), target.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 

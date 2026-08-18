@@ -492,6 +492,88 @@ async fn answer_inject_connection(
     }
 }
 
+/// One expose `forward serve` will realize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedExpose {
+    pub forward_id: String,
+    pub name: String,
+    pub worker_port: u32,
+    pub client_port: u32,
+}
+
+/// What one `forward serve` invocation realizes: every live expose (each
+/// client realizes exposes independently — no coordination, no conflict),
+/// and exactly the injects this principal backs.
+#[derive(Debug, Default)]
+pub struct ServePlan {
+    pub exposes: Vec<PlannedExpose>,
+    pub injects: InjectTargets,
+}
+
+impl ServePlan {
+    /// Plans from a `ListForwards` answer and this invocation's principal.
+    #[must_use]
+    pub fn from_statuses(
+        statuses: &[horde_proto::v1::ForwardStatus],
+        principal: Option<&str>,
+    ) -> Self {
+        let mut plan = Self::default();
+        for status in statuses {
+            let Some(intent) = status.intent.as_ref() else {
+                continue;
+            };
+            let Some(spec) = intent.spec.as_ref() else { continue };
+            let forward_id = intent
+                .forward_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            match horde_proto::v1::ForwardDirection::try_from(spec.direction) {
+                Ok(horde_proto::v1::ForwardDirection::Expose) => {
+                    plan.exposes.push(PlannedExpose {
+                        forward_id,
+                        name: spec.name.clone(),
+                        worker_port: spec.worker_port,
+                        client_port: spec.client_port,
+                    });
+                }
+                Ok(horde_proto::v1::ForwardDirection::Inject) => {
+                    let backer = intent.backer_client_id.as_ref().map(ToString::to_string);
+                    if backs_here(backer.as_deref(), principal)
+                        && let Ok(port) = u16::try_from(spec.client_port)
+                        && let Ok(mut map) = plan.injects.write()
+                    {
+                        map.insert(
+                            forward_id,
+                            InjectTarget {
+                                name: spec.name.clone(),
+                                client_port: port,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        plan
+    }
+}
+
+/// Whether an inject's recorded backer is this invocation's principal.
+///
+/// Both must exist and match: an unidentified invocation backs nothing (it
+/// has no principal the server could route to), and an inject with no
+/// recorded backer is nobody's to serve. The mixed rows are unreachable
+/// end-to-end — the server refuses to journal backerless injects — which is
+/// exactly why the predicate is named.
+#[must_use]
+pub fn backs_here(backer: Option<&str>, principal: Option<&str>) -> bool {
+    match (backer, principal) {
+        (Some(backer), Some(principal)) => backer == principal,
+        _ => false,
+    }
+}
+
 /// The target an id maps to right now, read without holding the lock across
 /// an await.
 fn lookup_target(targets: &InjectTargets, forward_id: &str) -> Option<InjectTarget> {
@@ -562,6 +644,62 @@ mod tests {
         let b = connection_id();
         assert_ne!(a, b);
         assert!(a.starts_with("conn-"));
+    }
+
+    /// All four corners: only a named backer matching a named principal
+    /// backs here. The mixed rows are what an `||` or a `!=` typo would get
+    /// wrong, and the server's refusal of backerless injects makes them
+    /// unreachable end-to-end.
+    #[test]
+    fn an_inject_is_served_only_by_its_own_principal() {
+        use super::backs_here;
+        assert!(backs_here(Some("laptop"), Some("laptop")));
+        assert!(!backs_here(Some("laptop"), Some("desk")));
+        assert!(!backs_here(Some("laptop"), None));
+        assert!(!backs_here(None, Some("laptop")));
+        assert!(!backs_here(None, None));
+    }
+
+    /// The serve plan splits by direction and keeps only this principal's
+    /// injects — every client realizes every expose, no coordination.
+    #[test]
+    fn a_serve_plan_realizes_exposes_and_backs_only_its_own_injects() {
+        use horde_proto::v1::{
+            ClientId, ForwardDirection, ForwardId, ForwardIntent, ForwardSpec, ForwardStatus,
+        };
+        let status = |name: &str, direction: ForwardDirection, backer: Option<&str>| {
+            ForwardStatus {
+                intent: Some(ForwardIntent {
+                    forward_id: Some(ForwardId::new(format!("fwd-{name}"))),
+                    session_id: None,
+                    agent_id: None,
+                    spec: Some(ForwardSpec {
+                        direction: direction as i32,
+                        name: name.to_owned(),
+                        worker_port: 5173,
+                        client_port: 5432,
+                    }),
+                    backer_client_id: backer.map(ClientId::new),
+                }),
+                worker_reachable: true,
+                backed: false,
+            }
+        };
+
+        let plan = super::ServePlan::from_statuses(
+            &[
+                status("vite", ForwardDirection::Expose, None),
+                status("db", ForwardDirection::Inject, Some("laptop")),
+                status("other", ForwardDirection::Inject, Some("desk")),
+            ],
+            Some("laptop"),
+        );
+
+        assert_eq!(plan.exposes.len(), 1);
+        assert_eq!(plan.exposes[0].name, "vite");
+        let injects = plan.injects.read().expect("readable");
+        assert_eq!(injects.len(), 1, "only this principal's inject is backed");
+        assert_eq!(injects["fwd-db"].client_port, 5432);
     }
 
     #[tokio::test]

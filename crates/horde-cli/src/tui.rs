@@ -213,6 +213,11 @@ async fn execute(
 ) -> Result<(), ClientError> {
     match directive {
         Directive::RefreshSessions => refresh_sessions(client, app).await.map(drop),
+        Directive::RefreshForwards => {
+            let forwards = client.list_forwards(None).await?;
+            app.apply(Update::Forwards(forwards));
+            Ok(())
+        }
         Directive::Approve { request_id } => client
             .answer_permission(PermissionAnswer::allow(&request_id))
             .await

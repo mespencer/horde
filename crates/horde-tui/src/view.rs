@@ -20,6 +20,71 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         Screen::Overview => render_overview(app, frame),
         Screen::Inbox => render_inbox(app, frame),
         Screen::Session => render_session(app, frame),
+        Screen::Forwards => render_forwards(app, frame),
+    }
+}
+
+/// The forward panel (ADR-0006): named forwards, where they lead, and the
+/// backer/unbacked state only the server's connection registry can vouch for.
+fn render_forwards(app: &App, frame: &mut Frame<'_>) {
+    let forwards = app.forwards();
+    let rows = if forwards.is_empty() {
+        vec!["  no live forwards — agents declare them, or `horde forward expose`".to_owned()]
+    } else {
+        forwards
+            .iter()
+            .enumerate()
+            .map(|(index, status)| forward_row(status, index == app.forwards_selected()))
+            .collect()
+    };
+
+    render_rows(
+        frame,
+        header_line("forwards", 0, app.stream_stale(), app.status()),
+        rows,
+        "[r] refresh  [o] overview  [q] quit",
+    );
+}
+
+/// One forward as a panel row: `> vite  expose 5173  session s1  worker ok  backed by laptop`.
+fn forward_row(status: &horde_proto::v1::ForwardStatus, selected: bool) -> String {
+    let intent = status.intent.clone().unwrap_or_default();
+    let spec = intent.spec.unwrap_or_default();
+    let direction = crate::state::forward_direction_name(spec.direction);
+    let mut row = format!(
+        "{} {}  {} {}  session {}",
+        marker(selected),
+        spec.name,
+        direction,
+        spec.worker_port,
+        intent
+            .session_id
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string),
+    );
+    row.push_str(if status.worker_reachable {
+        "  worker ok"
+    } else {
+        "  worker unreachable"
+    });
+    if direction == "inject" {
+        row.push_str(&backing_note(
+            intent.backer_client_id.as_ref().map(ToString::to_string),
+            status.backed,
+        ));
+    }
+    row
+}
+
+/// The inject row's backing suffix. Backed and unbacked both name the
+/// backer, because the unbacked state's remedy is that principal's return.
+fn backing_note(backer: Option<String>, backed: bool) -> String {
+    match (backer, backed) {
+        (Some(backer), true) => format!("  backed by {backer}"),
+        (Some(backer), false) => format!("  UNBACKED — {backer} is detached"),
+        // An inject with no recorded backer should be unjournalable; saying
+        // so beats hiding the row that proves otherwise.
+        (None, _) => "  UNBACKED — no backer recorded".to_owned(),
     }
 }
 
@@ -45,7 +110,7 @@ fn render_overview(app: &App, frame: &mut Frame<'_>) {
             app.status(),
         ),
         rows,
-        "[enter] attach  [i] inbox  [r] refresh  [q] quit",
+        "[enter] attach  [i] inbox  [f] forwards  [r] refresh  [q] quit",
     );
 }
 
