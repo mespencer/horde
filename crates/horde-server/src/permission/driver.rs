@@ -172,8 +172,10 @@ impl ChainDriver {
         loop {
             let page = self.log.read_global_from(self.cursor, PAGE).await?;
             // Terminates on the page it read: the rows this loop itself
-            // appends are decisions and enriched re-raises, and `consider`
-            // appends nothing for either, so the tail it chases is finite.
+            // appends are decisions, enriched re-raises, and the forward
+            // opens a settling decision produces — and `consider` appends
+            // nothing for a re-raise or a `ForwardOpened`, while a decision
+            // appends at most one open, so the tail it chases is finite.
             let Some(last) = page.last() else {
                 return Ok(appended);
             };
@@ -187,6 +189,15 @@ impl ChainDriver {
 
     /// Acts on one log row, returning how many events it appended.
     async fn consider(&self, global: &GlobalEvent) -> Result<u64, ServerError> {
+        // A settling decision may open the forward it approved (ADR-0006).
+        // Routed through this driver — the one log-ordered writer — so the
+        // first acceptance *in the log* is the one whose principal backs an
+        // inject, however the racing RPCs interleaved. The appended
+        // `ForwardOpened` triggers nothing further, so the tail this fold
+        // chases stays finite.
+        if let Some(decision) = crate::forward::intent::settled_in(global) {
+            return crate::forward::intent::open_for_settled(&self.log, global, &decision).await;
+        }
         let Some(request) = raised_in(global) else {
             return Ok(0);
         };
@@ -231,9 +242,18 @@ impl ChainDriver {
         );
         let ancestry = ancestry(state, &pending.agent_id);
 
-        let settled = self
-            .ruling_for(mode_name, pending.tool_call.as_ref(), &ancestry, state)
-            .await;
+        // An inject skips every automatic layer (ADR-0006): acceptance and
+        // backing are one act, and only a client's connection can back one —
+        // a rule or judge that "allowed" it would open an intent nothing can
+        // ever serve.
+        let settled = if crate::forward::intent::forward_needs_human(pending) {
+            Settled::Escalate {
+                from: PermissionLayer::DeterministicAllow,
+            }
+        } else {
+            self.ruling_for(mode_name, pending.tool_call.as_ref(), &ancestry, state)
+                .await
+        };
 
         let (key, event) = match settled {
             Settled::Decided {

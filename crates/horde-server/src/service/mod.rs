@@ -13,6 +13,7 @@ pub mod blob;
 pub mod commands;
 pub mod control_plane;
 pub mod enrollment;
+pub mod forwards;
 pub mod shared;
 pub mod sync;
 pub mod worker;

@@ -31,7 +31,7 @@ use horde_proto::v1::{
     UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
 };
-use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
@@ -1358,6 +1358,149 @@ impl ControlPlaneService for ControlPlane {
             accounts,
         }))
     }
+
+    // -- Port forwards (ADR-0006) ---------------------------------------------
+
+    #[instrument(skip_all)]
+    async fn open_forward(
+        &self,
+        request: Request<horde_proto::v1::OpenForwardRequest>,
+    ) -> Result<Response<horde_proto::v1::OpenForwardResponse>, Status> {
+        let actor = actor_of(&request);
+        let response = super::forwards::open_forward(&self.core, actor, request.into_inner())
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(response))
+    }
+
+    #[instrument(skip_all)]
+    async fn close_forward(
+        &self,
+        request: Request<horde_proto::v1::CloseForwardRequest>,
+    ) -> Result<Response<horde_proto::v1::CloseForwardResponse>, Status> {
+        let actor = actor_of(&request);
+        let request = request.into_inner();
+        let session_id = request
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let forward_id = request
+            .forward_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let sequence = super::forwards::close_forward(
+            &self.core,
+            actor,
+            &session_id,
+            &forward_id,
+            request.reason,
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(horde_proto::v1::CloseForwardResponse {
+            sequence,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_forwards(
+        &self,
+        request: Request<horde_proto::v1::ListForwardsRequest>,
+    ) -> Result<Response<horde_proto::v1::ListForwardsResponse>, Status> {
+        let filter = request
+            .into_inner()
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let response = super::forwards::list_forwards(&self.core, filter)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(response))
+    }
+
+    type ServeForwardsStream =
+        Pin<Box<dyn Stream<Item = Result<horde_proto::v1::ServeForwardsResponse, Status>> + Send>>;
+
+    /// Backing IS this stream's liveness: registering the lane is the act of
+    /// backing, and the lane leaving the registry — however the stream ends —
+    /// is what "unbacked" means. The owning client's return re-backs by
+    /// simply calling again.
+    #[instrument(skip_all)]
+    async fn serve_forwards(
+        &self,
+        request: Request<horde_proto::v1::ServeForwardsRequest>,
+    ) -> Result<Response<Self::ServeForwardsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
+        let Some(principal) = client_principal_of(&request) else {
+            return Err(Status::unauthenticated(
+                "backing is keyed to a client principal, and this channel names none; \
+                 connect over mTLS",
+            ));
+        };
+
+        let (epoch, mut lane) = self.core.forwards.register_client(&principal);
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let deny = self
+            .enrollment
+            .as_ref()
+            .map(|authority| authority.deny_list());
+        let registry = self.core.forwards.clone();
+        tokio::spawn(async move {
+            let pump = async {
+                while let Some(connection) = lane.recv().await {
+                    let update = horde_proto::v1::ServeForwardsResponse {
+                        connection: Some(connection),
+                    };
+                    if sender.send(Ok(update)).await.is_err() {
+                        return; // The client hung up; deregistration unbacks.
+                    }
+                }
+            };
+            super::shared::run_severable(pump, deny, serial, &sender).await;
+            registry.deregister_client_if_current(&principal, epoch);
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    type ForwardTunnelStream =
+        Pin<Box<dyn Stream<Item = Result<horde_proto::v1::ForwardTunnelResponse, Status>> + Send>>;
+
+    #[instrument(skip_all)]
+    async fn forward_tunnel(
+        &self,
+        request: Request<tonic::Streaming<horde_proto::v1::ForwardTunnelRequest>>,
+    ) -> Result<Response<Self::ForwardTunnelStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
+        let caller = super::forwards::tunnel_principal_of(&request);
+        let inbound = request
+            .into_inner()
+            .map(|message| message.map(|frame| frame.frame.unwrap_or_default()));
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let deny = self
+            .enrollment
+            .as_ref()
+            .map(|authority| authority.deny_list());
+        let log = self.core.log.clone();
+        let registry = self.core.forwards.clone();
+        tokio::spawn(async move {
+            let pump = crate::forward::relay::run_tunnel(
+                &log,
+                &registry,
+                caller,
+                inbound,
+                &sender,
+                |frame| horde_proto::v1::ForwardTunnelResponse { frame: Some(frame) },
+            );
+            super::shared::run_severable(pump, deny, serial, &sender).await;
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
 }
 
 /// The actor a request's channel identity names, for event attribution.
@@ -1378,6 +1521,17 @@ fn actor_of<T>(request: &Request<T>) -> Option<horde_proto::v1::Actor> {
             horde_proto::v1::ClientId::new(identity.principal.name()),
         )),
     })
+}
+
+/// The client principal name a request's channel carries, if any — the key
+/// forward backing is registered under. Same identity rules as [`actor_of`];
+/// this is the bare name where that is the wire's `Actor`.
+fn client_principal_of<T>(request: &Request<T>) -> Option<String> {
+    let identity = request.extensions().get::<horde_identity::PeerIdentity>()?;
+    if identity.principal.role() != horde_identity::PrincipalRole::Client {
+        return None;
+    }
+    Some(identity.principal.name().to_owned())
 }
 
 /// Refuses a spec naming a tier the catalog cannot resolve.
@@ -1439,26 +1593,9 @@ fn require_client_role<T>(request: &Request<T>, verb: &str) -> Result<(), Status
     Ok(())
 }
 
-/// A unique-enough identifier without pulling in a uuid dependency.
-///
-/// Ids are opaque to every consumer; the only requirement is that two calls
-/// never collide within a server's lifetime, which a monotonic counter over a
-/// process-start nonce satisfies.
-fn uuid_like() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-    let start = *START.get_or_init(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64)
-    });
-    let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{start:x}-{ordinal:x}")
-}
+// `uuid_like` lives in `service::shared` now that the forward verbs mint ids
+// too; re-imported here so every existing call site reads unchanged.
+use super::shared::uuid_like;
 
 #[cfg(test)]
 mod tests {

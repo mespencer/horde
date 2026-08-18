@@ -32,6 +32,7 @@ impl_id!(
     AgentId,
     AssignmentId,
     ClientId,
+    ForwardId,
     PermissionRequestId,
     SessionId,
     WorkerId,
