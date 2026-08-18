@@ -65,11 +65,44 @@ impl Tunnel {
             .map_err(|_| TunnelGone)
     }
 
-    /// Sends a terminal refusal — the passive side's "I could not carry this".
-    pub async fn refuse(&mut self, reason: ForwardRefusalReason, detail: String) {
+    /// Sends a terminal refusal — the passive side's "I could not carry
+    /// this" — and finishes the leg. Consumes the tunnel on purpose: a
+    /// refusal is the last word, and the finish is what makes it audible.
+    pub async fn refuse(self, reason: ForwardRefusalReason, detail: String) {
         let _ = self.to_relay.send(refusal_frame(reason, detail)).await;
+        self.finish().await;
+    }
+
+    /// Ends this leg gracefully: the send half closes cleanly — which is
+    /// what actually transmits any still-queued frames, where dropping the
+    /// whole tunnel cancels the RPC and races them — and the receive half
+    /// is drained (count-bounded, ceilinged) until the relay closes it.
+    ///
+    /// Found the hard way: a passive answer that only refused and returned
+    /// dropped its tunnel before the open and refusal frames left the
+    /// process, so the originator saw a pairing deadline instead of the
+    /// coded reason.
+    pub async fn finish(mut self) {
+        drop(self.to_relay);
+        let _ = tokio::time::timeout(FINISH_DEADLINE, async {
+            let mut drained = 0_u32;
+            while drained < FINISH_FRAME_BOUND {
+                if self.from_relay.next().await.is_none() {
+                    return;
+                }
+                drained += 1;
+            }
+        })
+        .await;
     }
 }
+
+/// How long a finishing leg waits for the relay to close it.
+const FINISH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How many trailing frames a finishing leg drains before giving up on a
+/// babbling relay. A count bound, so a clock is never asked to end a loop.
+const FINISH_FRAME_BOUND: u32 = 64;
 
 /// The relay leg closed under a send.
 #[derive(Debug, thiserror::Error)]
@@ -484,7 +517,7 @@ async fn answer_inject_connection(
 /// refuse with the coded reason. The worker's expose dial and the backer's
 /// inject dial are this same three-way outcome, which is why it lives once,
 /// here, where both peers already meet the [`Tunnel`].
-pub async fn dial_and_pump(mut tunnel: Tunnel, port: u16) {
+pub async fn dial_and_pump(tunnel: Tunnel, port: u16) {
     let dialed = tokio::time::timeout(DIAL_DEADLINE, TcpStream::connect(("127.0.0.1", port))).await;
     match dialed {
         Ok(Ok(tcp)) => {
@@ -609,7 +642,7 @@ fn lookup_target(targets: &InjectTargets, forward_id: &str) -> Option<InjectTarg
 mod tests {
     use horde_proto::forward::{accepted_frame, data_frame, eof_frame, refusal_frame};
     use horde_proto::v1::ForwardRefusalReason;
-    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 
     use super::{
         ConfirmEnd, PumpEnd, Tunnel, bind_with_fallback, confirm_opened, connection_id,
@@ -670,6 +703,107 @@ mod tests {
         let b = connection_id();
         assert_ne!(a, b);
         assert!(a.starts_with("conn-"));
+    }
+
+    /// The chunk size is contract, not tuning: it is the frame ceiling the
+    /// relay's flow control meters, so the literal is pinned rather than
+    /// recomputed.
+    #[test]
+    fn the_read_chunk_is_sixteen_kib() {
+        assert_eq!(super::READ_CHUNK, 16_384);
+    }
+
+    /// The failure budget's boundary, which no test can stage through a real
+    /// listener: within the budget accepts continue, at it the loop ends.
+    #[test]
+    fn the_accept_budget_ends_exactly_at_its_bound() {
+        use super::{ACCEPT_FAILURE_BOUND, keeps_accepting};
+        assert!(keeps_accepting(0));
+        assert!(keeps_accepting(ACCEPT_FAILURE_BOUND - 1));
+        assert!(!keeps_accepting(ACCEPT_FAILURE_BOUND));
+        assert!(!keeps_accepting(ACCEPT_FAILURE_BOUND + 1));
+    }
+
+    /// A tunnel speaks exactly the frames its methods name — and reports the
+    /// leg's death rather than pretending the open landed.
+    #[tokio::test]
+    async fn a_tunnel_says_open_and_refusals_and_notices_a_dead_leg() {
+        let (mut tunnel, _feed, mut sent) = scripted_tunnel();
+        assert!(
+            format!("{tunnel:?}").contains("Tunnel"),
+            "the debug view names the type"
+        );
+        tunnel.open("fwd-1", "c1").await.expect("the leg is open");
+        assert_eq!(
+            within("the open frame", sent.recv())
+                .await
+                .expect("a frame"),
+            horde_proto::forward::open_frame("fwd-1", "c1")
+        );
+
+        // The refusal is the last word: sent, and the leg finished — which
+        // the test observes as the sender closing after the frame.
+        let (refusing, feed, mut refused_sent) = scripted_tunnel();
+        drop(feed); // The relay's half is already gone; finish must not hang.
+        refusing
+            .refuse(ForwardRefusalReason::Unbacked, "backer gone".to_owned())
+            .await;
+        assert_eq!(
+            within("the refusal frame", refused_sent.recv())
+                .await
+                .expect("a frame"),
+            refusal_frame(ForwardRefusalReason::Unbacked, "backer gone")
+        );
+        assert!(
+            within("the leg finishes after refusing", refused_sent.recv())
+                .await
+                .is_none(),
+            "the refusal consumes the tunnel; nothing else may follow"
+        );
+
+        drop(sent);
+        assert!(
+            tunnel.open("fwd-1", "c2").await.is_err(),
+            "a dead leg is TunnelGone, never a silent success"
+        );
+    }
+
+    /// The confirmation's count bound, frame-exact: sixteen non-answers are
+    /// tolerated and the seventeenth is left unread. A widened bound or a
+    /// broken counter consumes it — or never returns at all.
+    #[tokio::test]
+    async fn confirmation_reads_exactly_its_frame_budget() {
+        let (mut tunnel, feed, _sent) = scripted_tunnel();
+        // Fed concurrently: the scripted channel is shallower than the
+        // budget plus one, so a sequential feed would deadlock against the
+        // consumer it is arranging.
+        let feeding = tokio::spawn(async move {
+            for ordinal in 0..=u8::try_from(super::CONFIRM_FRAME_BOUND).expect("small bound") {
+                if feed.send(Ok(data_frame(vec![ordinal]))).await.is_err() {
+                    return;
+                }
+            }
+            // Held open so the leftover frame stays readable below.
+            std::future::pending::<()>().await;
+        });
+
+        let gave_up = within("the bound gives up", confirm_opened(&mut tunnel))
+            .await
+            .expect_err("babble is not an answer");
+        assert!(matches!(gave_up, ConfirmEnd::NoAnswer));
+
+        let leftover = within("the frame past the budget", tunnel.from_relay.next())
+            .await
+            .expect("a frame")
+            .expect("ok");
+        assert_eq!(
+            leftover,
+            data_frame(vec![
+                u8::try_from(super::CONFIRM_FRAME_BOUND).expect("small bound")
+            ]),
+            "exactly the budget was consumed, not one frame more"
+        );
+        feeding.abort();
     }
 
     /// All four corners: only a named backer matching a named principal
@@ -901,5 +1035,271 @@ mod tests {
             .await
             .expect("no panic");
         assert!(matches!(end, PumpEnd::RelayEnded), "got {end:?}");
+    }
+
+    #[test]
+    fn lookup_answers_from_the_map_and_only_the_map() {
+        let targets: super::InjectTargets = std::sync::Arc::default();
+        targets.write().expect("writable").insert(
+            "fwd-db".to_owned(),
+            super::InjectTarget {
+                name: "db".to_owned(),
+                client_port: 5432,
+            },
+        );
+        assert_eq!(
+            super::lookup_target(&targets, "fwd-db").map(|target| target.client_port),
+            Some(5432)
+        );
+        assert_eq!(super::lookup_target(&targets, "fwd-none"), None);
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    //! The realization engines against a real `horde-server` on loopback —
+    //! in this package, because a kill in another crate's suite does not
+    //! count for this one's mutants.
+
+    use horde_proto::v1::{ForwardDirection, ForwardSpec};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{InjectTarget, InjectTargets, RealizedExpose, realize_expose, serve_backing};
+
+    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
+    }
+
+    /// A server whose core the test holds — the registry is how it plays the
+    /// far side of the relay.
+    async fn served() -> (horde_server::service::ServerCore, crate::Client) {
+        let core = horde_server::service::ServerCore::new(
+            horde_server::EventLog::in_memory().expect("an in-memory log"),
+        );
+        let endpoint = horde_server_testkit::serve_core(core.clone())
+            .await
+            .expect("the server binds loopback");
+        let client = crate::Client::connect(&endpoint)
+            .await
+            .expect("the client dials");
+        (core, client)
+    }
+
+    /// One live placed expose, opened through the real verb.
+    async fn opened_expose(
+        core: &horde_server::service::ServerCore,
+        client: &mut crate::Client,
+    ) -> String {
+        horde_server_testkit::place_agent(&core.log, "s1", "agent-1", "w1", "serve")
+            .await
+            .expect("the placement seeds");
+        let opened = client
+            .open_forward(
+                "s1",
+                "agent-1",
+                ForwardSpec {
+                    direction: ForwardDirection::Expose as i32,
+                    name: "echo".to_owned(),
+                    worker_port: 4242,
+                    client_port: 0,
+                },
+                "open-1",
+            )
+            .await
+            .expect("the intent journals");
+        opened.forward_id.expect("an id").to_string()
+    }
+
+    /// The client engine end to end, with the test playing the worker leg
+    /// through the registry: accept → tunnel open → dispatch → pair →
+    /// bytes both ways — then stop, and the listener is provably gone.
+    #[tokio::test]
+    async fn a_realized_expose_carries_bytes_and_stops_reaped() {
+        let (core, mut client) = served().await;
+        let forward_id = opened_expose(&core, &mut client).await;
+        let (_epoch, mut lane) = core.forwards.register_worker("w1");
+
+        let realized = realize_expose(&client, &forward_id, "echo", 4242, 0)
+            .await
+            .expect("the listener binds");
+        let local_addr = realized.local_addr;
+
+        let mut conn = within(
+            "dial the realized listener",
+            tokio::net::TcpStream::connect(local_addr),
+        )
+        .await
+        .expect("accepts");
+
+        // The accept loop's carry opened a tunnel: the dispatch proves it.
+        let dispatched = within("the worker lane hears the dispatch", lane.recv())
+            .await
+            .expect("a connection request");
+        assert_eq!(
+            dispatched.forward_id.as_ref().map(ToString::to_string),
+            Some(forward_id.clone())
+        );
+
+        // Answer as the worker would: a second tunnel echoing the id. The
+        // plaintext channel claims as Ambient, which may answer anything.
+        let mut answering = client
+            .open_forward_tunnel()
+            .await
+            .expect("the answering leg opens");
+        answering
+            .open(&forward_id, &dispatched.connection_id)
+            .await
+            .expect("the answer names the connection");
+
+        conn.write_all(b"ping").await.expect("the write lands");
+        let crossed = within("bytes reach the answering leg", async {
+            use tokio_stream::StreamExt as _;
+            loop {
+                match answering.from_relay.next().await {
+                    Some(Ok(frame)) => {
+                        if let Some(horde_proto::v1::forward_tunnel_frame::Frame::Data(bytes)) =
+                            frame.frame
+                        {
+                            return bytes;
+                        }
+                    }
+                    other => panic!("the leg ended before the bytes: {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert_eq!(crossed, b"ping");
+
+        answering
+            .to_relay
+            .send(horde_proto::forward::data_frame(b"pong".to_vec()))
+            .await
+            .expect("the answer sends");
+        let mut echoed = [0_u8; 4];
+        within("bytes reach the local socket", conn.read_exact(&mut echoed))
+            .await
+            .expect("the read lands");
+        assert_eq!(&echoed, b"pong");
+
+        // Stop is reaped, and provably: the port stops answering.
+        realized.stop().await;
+        assert!(
+            tokio::net::TcpStream::connect(local_addr).await.is_err(),
+            "a stopped realization must not keep its port"
+        );
+    }
+
+    /// Dropping a realization (not just stopping it) aborts the accept
+    /// loop: the guard task pattern, on the loop the listener owns.
+    #[tokio::test]
+    async fn dropping_a_realization_reaps_its_accept_loop() {
+        let (guard, reaped) = tokio::sync::oneshot::channel::<()>();
+        let accept_task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        drop(RealizedExpose {
+            forward_id: "fwd-1".to_owned(),
+            name: "echo".to_owned(),
+            local_addr: "127.0.0.1:1".parse().expect("an address"),
+            fell_back: false,
+            accept_task: Some(accept_task),
+        });
+
+        let witnessed = within("the drop reaps", reaped).await;
+        assert!(
+            witnessed.is_err(),
+            "the guard must be dropped by cancellation, never sent"
+        );
+    }
+
+    /// The backer's inject answer, end to end: the parked pairing resolves,
+    /// the local target is dialed, and bytes echo through it. A missing
+    /// target refuses instead — the code the worker branches on.
+    #[tokio::test]
+    async fn an_inject_answer_dials_its_target_and_echoes() {
+        let (core, client) = served().await;
+        let (echo_addr, _echo) = horde_server_testkit::echo_server()
+            .await
+            .expect("the echo binds");
+
+        let targets: InjectTargets = std::sync::Arc::default();
+        targets.write().expect("writable").insert(
+            "fwd-db".to_owned(),
+            InjectTarget {
+                name: "db".to_owned(),
+                client_port: echo_addr.port(),
+            },
+        );
+
+        let paired = core.forwards.park_pending(
+            "c9",
+            horde_server::forward::registry::PassiveTarget::Client("anyone".to_owned()),
+        );
+        let answer = tokio::spawn(super::answer_inject_connection(
+            client.clone(),
+            targets.clone(),
+            horde_proto::v1::ForwardConnectionRequest {
+                forward_id: Some(horde_proto::v1::ForwardId::new("fwd-db")),
+                connection_id: "c9".to_owned(),
+            },
+        ));
+
+        let mut leg = within("the pairing resolves", paired)
+            .await
+            .expect("the answer claimed the connection");
+        leg.to_passive
+            .send(horde_proto::forward::data_frame(b"ping".to_vec()))
+            .await
+            .expect("the relay side sends");
+        let echoed = within("the echo returns through the leg", leg.from_passive.recv())
+            .await
+            .expect("a frame");
+        assert_eq!(echoed, horde_proto::forward::data_frame(b"ping".to_vec()));
+        answer.abort();
+
+        // The refusal side: an id this client is not serving.
+        let paired = core.forwards.park_pending(
+            "c10",
+            horde_server::forward::registry::PassiveTarget::Client("anyone".to_owned()),
+        );
+        let answer = tokio::spawn(super::answer_inject_connection(
+            client.clone(),
+            targets.clone(),
+            horde_proto::v1::ForwardConnectionRequest {
+                forward_id: Some(horde_proto::v1::ForwardId::new("fwd-none")),
+                connection_id: "c10".to_owned(),
+            },
+        ));
+        let mut leg = within("the refusal pairing resolves", paired)
+            .await
+            .expect("the refusal still answers the connection");
+        let refused = within("the refusal frame", leg.from_passive.recv())
+            .await
+            .expect("a frame");
+        let refusal = horde_proto::forward::refusal_in(&refused).expect("a refusal, not a pump");
+        assert_eq!(
+            refusal.reason,
+            horde_proto::v1::ForwardRefusalReason::UnknownForward as i32
+        );
+        answer.abort();
+    }
+
+    /// Backing over a channel that names no principal is refused by the
+    /// server, and the engine reports it rather than pretending to back.
+    #[tokio::test]
+    async fn serving_without_an_identity_reports_the_refusal() {
+        let (_core, client) = served().await;
+        let outcome = within(
+            "the unauthenticated serve returns",
+            serve_backing(&client, std::sync::Arc::default()),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "an unbackable serve must not report success"
+        );
     }
 }

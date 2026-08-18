@@ -914,7 +914,9 @@ mod tests {
         let (epoch, lane) = core.forwards.register_worker("w1");
         let lane_feed = core
             .forwards
-            .lane_to(&crate::forward::registry::PassiveTarget::Worker("w1".to_owned()))
+            .lane_to(&crate::forward::registry::PassiveTarget::Worker(
+                "w1".to_owned(),
+            ))
             .expect("the lane is registered");
         let notifications = core.log.subscribe();
         let (sender, mut updates) = tokio::sync::mpsc::channel(8);

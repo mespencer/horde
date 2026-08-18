@@ -533,9 +533,7 @@ mod tests {
             "an open does"
         );
         assert!(
-            !super::any_affects_forwards(&core, &[])
-                .await
-                .expect("read"),
+            !super::any_affects_forwards(&core, &[]).await.expect("read"),
             "no rows, no recompute"
         );
     }

@@ -95,8 +95,10 @@ pub fn inject_worker_port(port: u16, worker_port: Option<u16>) -> Result<u16, &'
     if forwardable_port(chosen) {
         Ok(chosen)
     } else {
-        Err("worker_port must be nonzero: the intent is journaled, and the log cannot hold an \
-             ephemeral port")
+        Err(
+            "worker_port must be nonzero: the intent is journaled, and the log cannot hold an \
+             ephemeral port",
+        )
     }
 }
 

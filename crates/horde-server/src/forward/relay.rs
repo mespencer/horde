@@ -70,7 +70,6 @@ pub async fn run_tunnel(
         Ok(open) => open,
         Err(refusal) => return io.say(refusal).await,
     };
-
     match registry.claim(&open.connection_id, &caller) {
         Claim::Matched(pair) => run_passive(pair, io).await,
         Claim::WrongPrincipal => {
@@ -675,8 +674,7 @@ mod tests {
     async fn a_tunnel_opening_with_data_is_refused_on_its_own_leg() {
         let log = crate::log::EventLog::in_memory().expect("log");
         let registry = super::ForwardRegistry::new();
-        let (feed, mut out, task) =
-            tunneling(&log, &registry, TunnelPrincipal::Ambient);
+        let (feed, mut out, task) = tunneling(&log, &registry, TunnelPrincipal::Ambient);
 
         feed.send(Ok(data_frame(vec![1]))).await.expect("send");
         let refused = within("the protocol refusal arrives", &mut out).await;
@@ -694,11 +692,8 @@ mod tests {
         crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
         let registry = super::ForwardRegistry::new();
 
-        let (feed, mut out, task) = tunneling(
-            &log,
-            &registry,
-            TunnelPrincipal::Worker("w1".to_owned()),
-        );
+        let (feed, mut out, task) =
+            tunneling(&log, &registry, TunnelPrincipal::Worker("w1".to_owned()));
         feed.send(Ok(open_frame("fwd-agent-1", "c1")))
             .await
             .expect("send");
@@ -726,7 +721,10 @@ mod tests {
             .expect("send");
         let refused = within("the unreachable refusal arrives", &mut out).await;
         let refusal = refusal_in(&refused).expect("a refusal frame");
-        assert_eq!(refusal.reason, ForwardRefusalReason::WorkerUnreachable as i32);
+        assert_eq!(
+            refusal.reason,
+            ForwardRefusalReason::WorkerUnreachable as i32
+        );
         assert!(refusal.detail.contains("w1"), "{}", refusal.detail);
         task.abort();
     }
@@ -749,22 +747,18 @@ mod tests {
             .await
             .expect("send");
 
-        let dispatched =
-            tokio::time::timeout(std::time::Duration::from_secs(5), lane.recv())
-                .await
-                .expect("the lane must hear the dispatch")
-                .expect("a connection request");
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), lane.recv())
+            .await
+            .expect("the lane must hear the dispatch")
+            .expect("a connection request");
         assert_eq!(dispatched.connection_id, "c1");
         assert_eq!(
             dispatched.forward_id.as_ref().map(ToString::to_string),
             Some("fwd-agent-1".to_owned())
         );
 
-        let (answer_feed, mut answer_out, answer_task) = tunneling(
-            &log,
-            &registry,
-            TunnelPrincipal::Worker("w1".to_owned()),
-        );
+        let (answer_feed, mut answer_out, answer_task) =
+            tunneling(&log, &registry, TunnelPrincipal::Worker("w1".to_owned()));
         answer_feed
             .send(Ok(open_frame("fwd-agent-1", "c1")))
             .await
