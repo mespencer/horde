@@ -195,6 +195,30 @@ fn find_duplicate(
         .map_err(ServerError::storage("checking the idempotency key"))
 }
 
+/// The event already stored under `(session_id, key)`, if one is: its
+/// sequence and payload — the same question the append's dedupe asks,
+/// exposed so a verb can recognize a retry *before* running validations the
+/// original already passed (a retried `OpenForward` must not be refused as
+/// its own duplicate).
+pub fn stored_under_key(
+    connection: &Connection,
+    session_id: &str,
+    key: &str,
+) -> Result<Option<(u64, Vec<u8>)>, ServerError> {
+    if key.is_empty() {
+        return Ok(None); // Empty is the log's "never deduplicate".
+    }
+    connection
+        .query_row(
+            "SELECT sequence, payload FROM events
+             WHERE session_id = ?1 AND idempotency_key = ?2",
+            params![session_id, key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(ServerError::storage("looking up an idempotency key"))
+}
+
 /// Highest sequence in a session, or zero when the session has no events.
 ///
 /// Zero is meaningful: sequences are 1-based, so "head is 0" and "session does

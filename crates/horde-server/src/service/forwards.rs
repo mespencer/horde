@@ -71,6 +71,22 @@ pub async fn open_forward(
         .map(ToString::to_string)
         .unwrap_or_default();
 
+    // A retry short-circuits before any validation: the original already
+    // passed them, and re-running the duplicate-name check against the very
+    // forward the first attempt opened would refuse the retry as its own
+    // duplicate.
+    if let Some((sequence, payload)) = core
+        .log
+        .stored_under_key(&session_id, &request.idempotency_key)
+        .await?
+        && let Some(forward_id) = opened_id_in(&payload)
+    {
+        return Ok(OpenForwardResponse {
+            forward_id: Some(ForwardId::new(forward_id)),
+            sequence,
+        });
+    }
+
     let events = core.log.read_all(&session_id).await?;
     let state = SessionState::project(&session_id, &events)?;
     check_owner(&state, &agent_id)?;
