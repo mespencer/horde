@@ -82,16 +82,13 @@ impl Tunnel {
     /// dropped its tunnel before the open and refusal frames left the
     /// process, so the originator saw a pairing deadline instead of the
     /// coded reason.
-    pub async fn finish(mut self) {
+    pub async fn finish(self) {
         drop(self.to_relay);
+        // Bounded by structure — `take` owns the count — with the ceiling
+        // for a relay that stops sending without closing.
+        let mut trailing = self.from_relay.take(FINISH_FRAME_BOUND);
         let _ = tokio::time::timeout(FINISH_DEADLINE, async {
-            let mut drained = 0_u32;
-            while drained < FINISH_FRAME_BOUND {
-                if self.from_relay.next().await.is_none() {
-                    return;
-                }
-                drained += 1;
-            }
+            while trailing.next().await.is_some() {}
         })
         .await;
     }
@@ -102,7 +99,7 @@ const FINISH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How many trailing frames a finishing leg drains before giving up on a
 /// babbling relay. A count bound, so a clock is never asked to end a loop.
-const FINISH_FRAME_BOUND: u32 = 64;
+const FINISH_FRAME_BOUND: usize = 64;
 
 /// The relay leg closed under a send.
 #[derive(Debug, thiserror::Error)]
