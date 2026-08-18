@@ -10,6 +10,8 @@
 //! this endpoint would lose a security property between two releases.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 
@@ -167,9 +169,30 @@ pub struct ServingEndpoint {
     /// too, which is what makes drop a background stop.
     stop: tokio::sync::oneshot::Sender<()>,
     serving: tokio::task::JoinHandle<()>,
+    /// Set by the serving task as its final act — after the listener is
+    /// dropped and the connection `JoinSet` is drained — and read through
+    /// [`ReapWitness`].
+    reaped: Arc<AtomicBool>,
 }
 
 impl ServingEndpoint {
+    /// A witness to this endpoint's reap: it answers, without blocking,
+    /// whether the serving task has run to completion — listener dropped,
+    /// every admitted connection aborted *and joined*.
+    ///
+    /// This is the sound way to observe shutdown: state this process owns.
+    /// Probing the OS port instead (a connect, or a re-bind of the freed
+    /// address) races the rest of the machine — an ephemeral-range
+    /// wraparound can hand the port to a dual-stack `[::]:0` listener in
+    /// any process, and a test's own earlier client sockets can leave the
+    /// address in TIME_WAIT — so a port probe can lie in both directions
+    /// about a perfectly correct shutdown. Nothing outside this process
+    /// can flip the witness.
+    #[must_use]
+    pub fn reap_witness(&self) -> ReapWitness {
+        ReapWitness(Arc::clone(&self.reaped))
+    }
+
     /// Stops serving, returning only after the listener and every admitted
     /// connection have actually been dropped. Bounded: the reap is an abort
     /// plus a join, and an aborted connection resolves at its next await.
@@ -178,6 +201,27 @@ impl ServingEndpoint {
         // The JoinError here is only ever this endpoint's own completion
         // being reported; the reap having happened is the point.
         let _ = self.serving.await;
+    }
+}
+
+/// Answers whether one [`ServingEndpoint`]'s reap has completed.
+///
+/// `true` exactly when [`ServingEndpoint::shutdown`]'s guarantee has been
+/// delivered: the serving task finished, which by construction happens only
+/// after its listener is dropped and its connection `JoinSet` is drained.
+/// Taken before a shutdown and read synchronously after it (no await in
+/// between, on a current-thread runtime), it distinguishes a completed reap
+/// from one merely signalled and left to the background — the serving task
+/// provably cannot have run in that window.
+#[derive(Debug, Clone)]
+pub struct ReapWitness(Arc<AtomicBool>);
+
+impl ReapWitness {
+    /// Whether the reap has completed. Never true early: the flag is the
+    /// serving task's final act, sequenced after the `JoinSet` drain.
+    #[must_use]
+    pub fn is_reaped(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -232,53 +276,68 @@ where
     let bound = listener.local_addr()?;
 
     let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio::spawn(async move {
-        // Owned by the loop, not detached: a connection this endpoint
-        // admitted is this endpoint's to reap.
-        let mut connections = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                // Resolves when the ServingEndpoint closes (or drops) the
-                // channel — the stop signal either way.
-                _ = &mut stopped => break,
-                // Reap connections as they finish, so a long-lived endpoint
-                // does not accumulate one dead handle per request ever made.
-                finished = connections.join_next(), if !connections.is_empty() => {
-                    // A connection ending (even by panic) is that
-                    // connection's business; the reap was the point.
-                    let _ = finished;
-                }
-                accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else {
-                        break;
-                    };
-                    let guarded = guarded.clone();
-                    let acceptor = acceptor.clone();
-                    connections.spawn(async move {
-                        match acceptor {
-                            // mTLS: a peer with no certificate, a foreign
-                            // one, or a revoked serial fails here and the
-                            // connection ends — the refused-connection
-                            // outcome for this channel.
-                            Some(acceptor) => {
-                                let Ok(tls) = acceptor.accept(stream).await else {
-                                    return;
-                                };
-                                serve_connection(tls, guarded).await;
+    let reaped = Arc::new(AtomicBool::new(false));
+    let serving = tokio::spawn({
+        let reaped = Arc::clone(&reaped);
+        async move {
+            // Owned by the loop, not detached: a connection this endpoint
+            // admitted is this endpoint's to reap.
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    // Resolves when the ServingEndpoint closes (or drops) the
+                    // channel — the stop signal either way.
+                    _ = &mut stopped => break,
+                    // Reap connections as they finish, so a long-lived endpoint
+                    // does not accumulate one dead handle per request ever made.
+                    finished = connections.join_next(), if !connections.is_empty() => {
+                        // A connection ending (even by panic) is that
+                        // connection's business; the reap was the point.
+                        let _ = finished;
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            break;
+                        };
+                        let guarded = guarded.clone();
+                        let acceptor = acceptor.clone();
+                        connections.spawn(async move {
+                            match acceptor {
+                                // mTLS: a peer with no certificate, a foreign
+                                // one, or a revoked serial fails here and the
+                                // connection ends — the refused-connection
+                                // outcome for this channel.
+                                Some(acceptor) => {
+                                    let Ok(tls) = acceptor.accept(stream).await else {
+                                        return;
+                                    };
+                                    serve_connection(tls, guarded).await;
+                                }
+                                None => serve_connection(stream, guarded).await,
                             }
-                            None => serve_connection(stream, guarded).await,
-                        }
-                    });
+                        });
+                    }
                 }
             }
+            // The door closes before the rooms are cleared: no new connection
+            // can arrive while the admitted ones are aborted and awaited.
+            drop(listener);
+            connections.shutdown().await;
+            // The terminal fact `reap_witness` reports. Last, deliberately: a
+            // witness that read true before the JoinSet drained would be the
+            // exact lie this endpoint's shutdown contract forbids.
+            reaped.store(true, Ordering::Release);
         }
-        // The door closes before the rooms are cleared: no new connection
-        // can arrive while the admitted ones are aborted and awaited.
-        drop(listener);
-        connections.shutdown().await;
     });
 
-    Ok((bound, ServingEndpoint { stop, serving }))
+    Ok((
+        bound,
+        ServingEndpoint {
+            stop,
+            serving,
+            reaped,
+        },
+    ))
 }
 
 /// One HTTP/1.1 connection over whichever transport the endpoint accepted.
@@ -577,29 +636,36 @@ mod tests {
         }
     }
 
-    /// `serve` stands the endpoint up behind the identity gate. The property
-    /// worth asserting is not that it binds — it is that the gate is actually
-    /// in front of rmcp on a real socket, because wiring the layer in the wrong
-    /// order would still compile and still serve.
-    #[tokio::test]
-    async fn a_served_endpoint_refuses_an_unidentified_request() {
+    /// One endpoint served on a real loopback socket — the arrangement
+    /// shared by the tests that exercise `serve` end to end rather than the
+    /// identity layer alone.
+    async fn served_on_loopback(
+        registry: AgentRegistry,
+    ) -> (std::net::SocketAddr, super::ServingEndpoint) {
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let endpoint = crate::endpoint::HordeEndpoint::new(crate::context::AgentContext::new(
             std::sync::Arc::new(crate::journal::testing::RecordingJournal::new()),
             horde_cli::client::Client::with_channel(channel),
             "s1",
         ));
-
-        let registry = AgentRegistry::new();
-        registry.insert("agent-42", "token");
-
-        let (bound, _serving) = super::serve(
+        super::serve(
             &EndpointConfig::loopback(0),
             std::sync::Arc::new(registry),
             endpoint,
         )
         .await
-        .expect("the endpoint must bind on an OS-chosen port");
+        .expect("the endpoint must bind on an OS-chosen port")
+    }
+
+    /// `serve` stands the endpoint up behind the identity gate. The property
+    /// worth asserting is not that it binds — it is that the gate is actually
+    /// in front of rmcp on a real socket, because wiring the layer in the wrong
+    /// order would still compile and still serve.
+    #[tokio::test]
+    async fn a_served_endpoint_refuses_an_unidentified_request() {
+        let registry = AgentRegistry::new();
+        registry.insert("agent-42", "token");
+        let (bound, _serving) = served_on_loopback(registry).await;
 
         assert!(bound.ip().is_loopback());
         assert_ne!(bound.port(), 0, "the bound port must be reported back");
@@ -632,28 +698,19 @@ mod tests {
     }
 
     /// `shutdown` must not *return* before the endpoint's sockets are gone —
-    /// the listener and the admitted connections both. The probe is a
-    /// synchronous re-bind of the bound address: between `shutdown().await`
-    /// resolving and the bind there is no await point, so on this test's
-    /// current-thread runtime a shutdown that merely signalled and returned
-    /// (leaving the reap to run in the background) cannot slip through on a
-    /// lucky poll — the serving task provably has not run in between, and
-    /// only the completed reap can have freed the address.
+    /// the listener and the admitted connections both. The observation is
+    /// the reap witness, read synchronously after `shutdown().await`: with
+    /// no await point in between, on this test's current-thread runtime a
+    /// shutdown that merely signalled and returned (leaving the reap to run
+    /// in the background) cannot slip through on a lucky poll — the serving
+    /// task provably has not run in between, so only a reap completed
+    /// *before* shutdown returned can have set the flag. The witness is
+    /// process-owned state; the port probes this replaced (connect, then
+    /// re-bind) each lost to sockets this test never owned — an
+    /// ephemeral-wraparound squatter and TIME_WAIT remnants respectively.
     #[tokio::test]
     async fn shutdown_returns_only_after_the_sockets_are_reaped() {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let endpoint = crate::endpoint::HordeEndpoint::new(crate::context::AgentContext::new(
-            std::sync::Arc::new(crate::journal::testing::RecordingJournal::new()),
-            horde_cli::client::Client::with_channel(channel),
-            "s1",
-        ));
-        let (bound, serving) = super::serve(
-            &EndpointConfig::loopback(0),
-            std::sync::Arc::new(AgentRegistry::new()),
-            endpoint,
-        )
-        .await
-        .expect("the endpoint must bind on an OS-chosen port");
+        let (bound, serving) = served_on_loopback(AgentRegistry::new()).await;
 
         // An admitted connection, held open across the shutdown: reaping it
         // is part of what `shutdown` owes before returning.
@@ -661,13 +718,18 @@ mod tests {
             .await
             .expect("the endpoint must accept a connection");
 
+        let witness = serving.reap_witness();
+        assert!(
+            !witness.is_reaped(),
+            "an endpoint still serving must not claim its reap has run"
+        );
+
         serving.shutdown().await;
 
-        let probe = tokio::net::TcpSocket::new_v4().expect("a probe socket");
-        probe.set_reuseaddr(true).expect("reuseaddr on the probe");
         assert!(
-            probe.bind(bound).is_ok(),
-            "shutdown returned while the endpoint still held its socket"
+            witness.is_reaped(),
+            "shutdown returned before the listener and admitted connections \
+             were reaped"
         );
         drop(admitted);
     }

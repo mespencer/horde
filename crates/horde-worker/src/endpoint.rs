@@ -41,7 +41,17 @@ pub struct EndpointManager {
     /// The tokens the serving gate accepts; shared with every endpoint this
     /// manager serves.
     registry: Arc<AgentRegistry>,
-    served: tokio::sync::Mutex<BTreeMap<String, ServedEndpoint>>,
+    served: tokio::sync::Mutex<Served>,
+}
+
+/// The manager's serving state. One lock guards both fields, so "may a new
+/// endpoint bind?" and "which endpoints exist?" can never disagree.
+struct Served {
+    /// Cleared by [`EndpointManager::shutdown`]. A manager that has shut
+    /// down refuses new endpoints rather than resurrecting the port behind
+    /// a Worker on its way out.
+    accepting: bool,
+    endpoints: BTreeMap<String, ServedEndpoint>,
 }
 
 struct ServedEndpoint {
@@ -65,7 +75,10 @@ impl EndpointManager {
         Self {
             channel,
             registry: Arc::new(AgentRegistry::new()),
-            served: tokio::sync::Mutex::new(BTreeMap::new()),
+            served: tokio::sync::Mutex::new(Served {
+                accepting: true,
+                endpoints: BTreeMap::new(),
+            }),
         }
     }
 
@@ -109,13 +122,33 @@ impl EndpointManager {
     /// an accept loop reaped alone leaves its connections alive in detached
     /// tasks, still answering an archived agent's verbs and still holding
     /// the port. Bounded: the reap is an abort plus a join per task, each
-    /// resolving at its next await point. Idempotent; called from Runtime
-    /// shutdown.
-    pub async fn shutdown(&self) {
-        let served = std::mem::take(&mut *self.served.lock().await);
-        for (_, endpoint) in served {
+    /// resolving at its next await point. Idempotent (a second call finds
+    /// nothing to reap and returns 0); called from Runtime shutdown.
+    ///
+    /// From here on the manager refuses to serve: a later
+    /// [`endpoint_for`](Self::endpoint_for) is an error, not a fresh bind.
+    ///
+    /// Returns how many endpoints' reaps provably completed — each one's
+    /// [`ReapWitness`](horde_mcp::server::ReapWitness) confirming its
+    /// accept loop finished after draining its connection `JoinSet`.
+    /// Returned rather than logged for the same reason `Runtime::shutdown`
+    /// returns its count: "shutdown finished" and "shutdown actually
+    /// reaped" are different facts, and only the second one is evidence.
+    pub async fn shutdown(&self) -> usize {
+        let mut served = self.served.lock().await;
+        served.accepting = false;
+        let endpoints = std::mem::take(&mut served.endpoints);
+        drop(served);
+
+        let mut reaped = 0;
+        for (_, endpoint) in endpoints {
+            let witness = endpoint.serving.reap_witness();
             endpoint.serving.shutdown().await;
+            if witness.is_reaped() {
+                reaped += 1;
+            }
         }
+        reaped
     }
 
     /// The served URL for one Session's endpoint, binding it on first use.
@@ -125,7 +158,12 @@ impl EndpointManager {
         sink: StampingSink,
     ) -> Result<String, WorkerError> {
         let mut served = self.served.lock().await;
-        if let Some(endpoint) = served.get(session_id) {
+        if !served.accepting {
+            return Err(WorkerError::EndpointUnavailable(
+                "the endpoint manager has shut down".to_owned(),
+            ));
+        }
+        if let Some(endpoint) = served.endpoints.get(session_id) {
             return Ok(endpoint.url.clone());
         }
 
@@ -144,7 +182,7 @@ impl EndpointManager {
         .map_err(|error| WorkerError::EndpointUnavailable(error.to_string()))?;
 
         let url = format!("http://{bound}/mcp");
-        served.insert(
+        served.endpoints.insert(
             session_id.to_owned(),
             ServedEndpoint {
                 url: url.clone(),
@@ -269,14 +307,27 @@ mod tests {
             "siblings share a port, so the tokens are what separate them"
         );
 
-        manager.shutdown().await;
+        assert_eq!(
+            manager.shutdown().await,
+            2,
+            "both sessions' endpoints must complete their reaps"
+        );
     }
 
     /// The minted pair, exercised against the served socket with a real MCP
     /// client: it authenticates while registered, stops the moment the agent
-    /// is forgotten, and the socket itself stops answering after shutdown —
-    /// a `forget_agent` or `shutdown` that silently did nothing would leave
+    /// is forgotten, and shutdown provably reaps the endpoint — a
+    /// `forget_agent` or `shutdown` that silently did nothing would leave
     /// an archived agent's credential (and the whole endpoint) alive.
+    ///
+    /// After shutdown, every assertion is on state this process owns: the
+    /// manager's reaped count and its refusal to serve again. Three sweeps
+    /// proved that asserting on OS-level port state here instead — connect
+    /// fails, or the freed address re-binds — is unsound on a shared
+    /// machine: an ephemeral-wraparound squatter in another process
+    /// answered the connect probe, and this test's own earlier client
+    /// sockets (TIME_WAIT) defeated the re-bind probe. The port is a
+    /// resource this test does not own; the manager's word is.
     #[tokio::test]
     async fn minted_credentials_dial_until_forgotten_and_the_socket_dies_at_shutdown() {
         let manager = manager();
@@ -314,29 +365,25 @@ mod tests {
             "a forgotten agent's token must stop authenticating immediately"
         );
 
-        manager.shutdown().await;
-        // shutdown() reaped the accept loop AND the dials' accepted
-        // connections, so nothing of the endpoint holds the port any more —
-        // proven by re-binding its exact address, which only the manager's
-        // own sockets could still occupy (a leaked listener, or an accepted
-        // connection still held by a detached task). Probing with a
-        // connect() instead is unsound: the loopback port comes from the
-        // ephemeral range, and once the machine-wide port counter wraps, a
-        // `[::]:0` bind in ANY process can be handed this same port and
-        // coexist with the live v4 listener (v6 wildcard allocation does
-        // not conflict with a specific v4 binding). Such a dual-stack
-        // squatter answers v4 connects the moment our listener drops, so a
-        // connect can succeed against a correctly shut-down endpoint. A
-        // squatter does not block re-binding the specific address, and a
-        // leaked endpoint socket does — exactly the property under test.
-        // No yielding: the reap completed before shutdown() returned.
-        let address = url
-            .strip_prefix("http://")
-            .and_then(|rest| rest.strip_suffix("/mcp"))
-            .expect("the served url shape");
+        // The reaped count is the terminal fact: 1 means this test's one
+        // endpoint ran its reap to completion — accept loop finished,
+        // listener dropped, every connection the dials opened aborted AND
+        // joined — before shutdown() returned. A shutdown that only
+        // signalled and left the reap in the background cannot produce it:
+        // the witness behind the count is set as the serving task's final
+        // act, and awaiting that task is exactly what shutdown owes.
+        assert_eq!(
+            manager.shutdown().await,
+            1,
+            "the served endpoint must complete its reap at shutdown"
+        );
+
+        // And the manager knows it is shut down: a new endpoint through its
+        // own API is refused, not freshly bound. Owned state again — no
+        // other process on the machine can make this call succeed or fail.
         assert!(
-            tokio::net::TcpListener::bind(address).await.is_ok(),
-            "a shut-down manager must not keep holding its socket"
+            manager.endpoint_for("s1", "agent-2", sink()).await.is_err(),
+            "a shut-down manager must refuse to serve new endpoints"
         );
     }
 
