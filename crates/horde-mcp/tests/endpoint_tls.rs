@@ -33,7 +33,7 @@ struct Tls {
     serial_hex: String,
     deny: RevocationList,
     ca: CertificateAuthority,
-    _serving: tokio::task::JoinHandle<()>,
+    _serving: horde_mcp::server::ServingEndpoint,
 }
 
 async fn served_tls() -> Setup<Tls> {

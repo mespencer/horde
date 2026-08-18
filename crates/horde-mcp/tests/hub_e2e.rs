@@ -30,8 +30,8 @@ struct Stack {
     /// wire cannot make (rmcp answers `tools/call` routing itself, but
     /// `get_tool` is consulted internally for validation).
     endpoint: HordeEndpoint,
-    _hub_serving: tokio::task::JoinHandle<()>,
-    _endpoint_serving: tokio::task::JoinHandle<()>,
+    _hub_serving: horde_mcp::server::ServingEndpoint,
+    _endpoint_serving: horde_mcp::server::ServingEndpoint,
 }
 
 /// The agent's mode: deterministic rules over the namespaced tool names, so
