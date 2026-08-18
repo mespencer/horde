@@ -369,7 +369,7 @@ async fn splice(
 
 #[cfg(test)]
 mod tests {
-    use horde_proto::forward::{data_frame, eof_frame, open_frame, refusal_in};
+    use horde_proto::forward::{accepted_frame, data_frame, eof_frame, open_frame, refusal_in};
     use horde_proto::v1::{ForwardDirection, ForwardRefusalReason, ForwardTunnelFrame};
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::Status;
@@ -645,6 +645,150 @@ mod tests {
             .await
             .expect("the splice must end on an errored leg")
             .expect("no panic");
+    }
+
+    // -- the whole tunnel, over scripted legs -------------------------------
+
+    /// A scripted leg driven through the full [`super::run_tunnel`], with
+    /// the registry and log the test arranged.
+    fn tunneling(
+        log: &crate::log::EventLog,
+        registry: &super::ForwardRegistry,
+        caller: TunnelPrincipal,
+    ) -> (
+        tokio::sync::mpsc::Sender<Result<ForwardTunnelFrame, Status>>,
+        tokio::sync::mpsc::Receiver<ForwardTunnelFrame>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (io, feed, out) = scripted_leg();
+        let log = log.clone();
+        let registry = registry.clone();
+        let task = tokio::spawn(async move {
+            super::run_tunnel(&log, &registry, caller, io).await;
+        });
+        (feed, out, task)
+    }
+
+    /// A protocol breach is refused on the offender's own leg — the send
+    /// the `say` helper exists for.
+    #[tokio::test]
+    async fn a_tunnel_opening_with_data_is_refused_on_its_own_leg() {
+        let log = crate::log::EventLog::in_memory().expect("log");
+        let registry = super::ForwardRegistry::new();
+        let (feed, mut out, task) =
+            tunneling(&log, &registry, TunnelPrincipal::Ambient);
+
+        feed.send(Ok(data_frame(vec![1]))).await.expect("send");
+        let refused = within("the protocol refusal arrives", &mut out).await;
+        let refusal = refusal_in(&refused).expect("a refusal frame");
+        assert!(refusal.detail.contains("first frame"), "{}", refusal.detail);
+        task.abort();
+    }
+
+    /// The ruling's refusal crosses the wire with its code intact — a
+    /// defaulted conversion would say `UNSPECIFIED` to a peer that branches
+    /// on the reason.
+    #[tokio::test]
+    async fn a_wrong_principal_refusal_carries_its_reason_code() {
+        let log = crate::log::EventLog::in_memory().expect("log");
+        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
+        let registry = super::ForwardRegistry::new();
+
+        let (feed, mut out, task) = tunneling(
+            &log,
+            &registry,
+            TunnelPrincipal::Worker("w1".to_owned()),
+        );
+        feed.send(Ok(open_frame("fwd-agent-1", "c1")))
+            .await
+            .expect("send");
+        let refused = within("the ruling refusal arrives", &mut out).await;
+        let refusal = refusal_in(&refused).expect("a refusal frame");
+        assert_eq!(
+            refusal.reason,
+            ForwardRefusalReason::WrongPrincipal as i32,
+            "the code is the contract; the detail is for humans"
+        );
+        task.abort();
+    }
+
+    /// No lane registered: the originator hears WORKER_UNREACHABLE naming
+    /// the worker, fast — the whole fast-refusal promise, at the relay.
+    #[tokio::test]
+    async fn an_absent_worker_lane_refuses_naming_the_worker() {
+        let log = crate::log::EventLog::in_memory().expect("log");
+        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
+        let registry = super::ForwardRegistry::new();
+
+        let (feed, mut out, task) = tunneling(&log, &registry, TunnelPrincipal::Ambient);
+        feed.send(Ok(open_frame("fwd-agent-1", "c1")))
+            .await
+            .expect("send");
+        let refused = within("the unreachable refusal arrives", &mut out).await;
+        let refusal = refusal_in(&refused).expect("a refusal frame");
+        assert_eq!(refusal.reason, ForwardRefusalReason::WorkerUnreachable as i32);
+        assert!(refusal.detail.contains("w1"), "{}", refusal.detail);
+        task.abort();
+    }
+
+    /// The whole pairing: originator dispatched down the lane, the passive
+    /// side claims, `accepted` reaches the originator, and frames cross both
+    /// ways. This is the arm-by-arm proof that pairing succeeds — a deleted
+    /// success arm turns this accepted into a refusal.
+    #[tokio::test]
+    async fn two_legs_pair_and_carry_frames_both_ways() {
+        let log = crate::log::EventLog::in_memory().expect("log");
+        crate::forward::testfix::placed_expose(&log, "s1", "agent-1", "w1").await;
+        let registry = super::ForwardRegistry::new();
+        let (_epoch, mut lane) = registry.register_worker("w1");
+
+        let (origin_feed, mut origin_out, origin_task) =
+            tunneling(&log, &registry, TunnelPrincipal::Ambient);
+        origin_feed
+            .send(Ok(open_frame("fwd-agent-1", "c1")))
+            .await
+            .expect("send");
+
+        let dispatched =
+            tokio::time::timeout(std::time::Duration::from_secs(5), lane.recv())
+                .await
+                .expect("the lane must hear the dispatch")
+                .expect("a connection request");
+        assert_eq!(dispatched.connection_id, "c1");
+        assert_eq!(
+            dispatched.forward_id.as_ref().map(ToString::to_string),
+            Some("fwd-agent-1".to_owned())
+        );
+
+        let (answer_feed, mut answer_out, answer_task) = tunneling(
+            &log,
+            &registry,
+            TunnelPrincipal::Worker("w1".to_owned()),
+        );
+        answer_feed
+            .send(Ok(open_frame("fwd-agent-1", "c1")))
+            .await
+            .expect("send");
+
+        let accepted = within("the originator hears accepted", &mut origin_out).await;
+        assert_eq!(accepted, accepted_frame());
+
+        origin_feed
+            .send(Ok(data_frame(b"request".to_vec())))
+            .await
+            .expect("send");
+        let crossed = within("origin bytes reach the answerer", &mut answer_out).await;
+        assert_eq!(crossed, data_frame(b"request".to_vec()));
+
+        answer_feed
+            .send(Ok(data_frame(b"response".to_vec())))
+            .await
+            .expect("send");
+        let echoed = within("answer bytes reach the originator", &mut origin_out).await;
+        assert_eq!(echoed, data_frame(b"response".to_vec()));
+
+        origin_task.abort();
+        answer_task.abort();
     }
 
     // -- refusal plumbing ---------------------------------------------------

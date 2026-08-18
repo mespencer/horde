@@ -105,17 +105,29 @@ pub async fn open_forward(
         append_server_event_returning(&core.log, &session_id, &request.idempotency_key, opened.1)
             .await?;
 
-    // A retried open deduplicates against the stored event, whose forward id
-    // is the one the first attempt minted — returning the fresh one would
-    // hand the caller an id the log never heard of.
-    let forward_id = match appended.existing_payload.as_deref().map(opened_id_in) {
-        Some(Some(stored)) => stored,
-        _ => opened.0,
-    };
     Ok(OpenForwardResponse {
-        forward_id: Some(ForwardId::new(forward_id)),
+        forward_id: Some(ForwardId::new(stored_or_minted(
+            appended.existing_payload.as_deref(),
+            opened.0,
+        ))),
         sequence: appended.sequence,
     })
+}
+
+/// Which id an open answers with: the stored event's, when the append
+/// deduplicated, else the freshly minted one.
+///
+/// The keyed pre-check already short-circuits ordinary retries, so this arm
+/// is the *race* case — two concurrent opens under one key, where the loser
+/// deduplicates in the append itself. Returning the fresh id there would
+/// hand the caller an identity the log never heard of, which is why the
+/// choice is a named function with its own table rather than an inline
+/// match nothing concurrent can stage.
+fn stored_or_minted(existing_payload: Option<&[u8]>, minted: String) -> String {
+    match existing_payload.map(opened_id_in) {
+        Some(Some(stored)) => stored,
+        _ => minted,
+    }
 }
 
 /// The owning agent must exist and still be able to carry intents.
@@ -424,6 +436,109 @@ mod tests {
     };
 
     use super::affects_forwards;
+
+    /// The race arm's table: a deduplicated append answers with the stored
+    /// event's id, anything else with the minted one — including a stored
+    /// payload that is not a `ForwardOpened`, which the kind-collision
+    /// refusal upstream makes unreachable but this choice must not invent
+    /// an id for.
+    #[test]
+    fn a_deduplicated_open_answers_with_the_stored_id() {
+        use horde_proto::prost::Message;
+
+        let stored = horde_proto::v1::Event {
+            kind: Some(Kind::ForwardOpened(ForwardOpened {
+                forward_id: Some(horde_proto::v1::ForwardId::new("fwd-first")),
+                ..ForwardOpened::default()
+            })),
+            ..horde_proto::v1::Event::default()
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            super::stored_or_minted(Some(&stored), "fwd-fresh".to_owned()),
+            "fwd-first",
+            "the log's identity outranks the loser's mint"
+        );
+        assert_eq!(
+            super::stored_or_minted(None, "fwd-fresh".to_owned()),
+            "fwd-fresh",
+            "a fresh append keeps its mint"
+        );
+        let not_an_open = horde_proto::v1::Event::default().encode_to_vec();
+        assert_eq!(
+            super::stored_or_minted(Some(&not_an_open), "fwd-fresh".to_owned()),
+            "fwd-fresh",
+            "a stored non-open yields no identity to steal"
+        );
+    }
+
+    /// Only a client actor names a backer; servers and agents name nothing.
+    #[test]
+    fn only_a_client_actor_names_a_principal() {
+        use horde_proto::v1::{Actor, AgentId, ClientId, ServerActor, actor::Actor as ActorKind};
+
+        let of = |kind: Option<ActorKind>| {
+            super::client_named_by(kind.map(|actor| Actor { actor: Some(actor) }).as_ref())
+        };
+        assert_eq!(
+            of(Some(ActorKind::ClientId(ClientId::new("laptop")))),
+            Some("laptop".to_owned())
+        );
+        assert_eq!(of(Some(ActorKind::Server(ServerActor {}))), None);
+        assert_eq!(of(Some(ActorKind::AgentId(AgentId::new("a1")))), None);
+        assert_eq!(of(None), None);
+        assert_eq!(super::client_named_by(None), None);
+    }
+
+    /// The recompute trigger over real rows: a chatty append must answer
+    /// false, an intent-moving one true — both directions, because the
+    /// mutants replacing this with a constant each pass one half.
+    #[tokio::test]
+    async fn any_affects_forwards_reads_exactly_the_notified_rows() {
+        use crate::log::Notification;
+
+        let core = super::ServerCore::new(crate::log::EventLog::in_memory().expect("log"));
+        crate::forward::testfix::append(
+            &core.log,
+            "s1",
+            "chunk",
+            "agent-1",
+            Kind::AgentOutputChunk(AgentOutputChunk::default()),
+        )
+        .await;
+        crate::forward::testfix::append(
+            &core.log,
+            "s1",
+            "open",
+            "agent-1",
+            Kind::ForwardOpened(ForwardOpened::default()),
+        )
+        .await;
+
+        let note = |sequence| Notification {
+            session_id: "s1".to_owned(),
+            sequence,
+        };
+        assert!(
+            !super::any_affects_forwards(&core, &[note(1)])
+                .await
+                .expect("read"),
+            "an output chunk moves no intent set"
+        );
+        assert!(
+            super::any_affects_forwards(&core, &[note(2)])
+                .await
+                .expect("read"),
+            "an open does"
+        );
+        assert!(
+            !super::any_affects_forwards(&core, &[])
+                .await
+                .expect("read"),
+            "no rows, no recompute"
+        );
+    }
 
     /// The filter's table: the four kinds that move intent sets, and the two
     /// commonest kinds that must not — output chunks are the chatty case the

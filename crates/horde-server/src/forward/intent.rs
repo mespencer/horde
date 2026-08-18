@@ -461,3 +461,111 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod log_backed_tests {
+    use horde_proto::v1::{
+        AgentLifecycleChanged, AgentLifecycleState, ForwardDirection, event::Kind,
+    };
+
+    use super::super::testfix::{append, placed_expose};
+    use super::{intents_for_worker, placed_on, resolve_live};
+    use crate::log::EventLog;
+    use crate::state::SessionState;
+
+    /// The set is exactly the placed worker's live intents, whole — id,
+    /// session, agent, and spec — and nobody else's.
+    #[tokio::test]
+    async fn a_worker_hears_exactly_its_own_live_intents() {
+        let log = EventLog::in_memory().expect("log");
+        placed_expose(&log, "s1", "agent-1", "w1").await;
+        placed_expose(&log, "s2", "agent-2", "w2").await;
+
+        let intents = intents_for_worker(&log, "w1").await.expect("intents");
+        assert_eq!(intents.len(), 1, "w2's intent is not w1's to realize");
+        assert_eq!(
+            intents[0].forward_id.as_ref().map(ToString::to_string),
+            Some("fwd-agent-1".to_owned())
+        );
+        assert_eq!(
+            intents[0].session_id.as_ref().map(ToString::to_string),
+            Some("s1".to_owned())
+        );
+        assert_eq!(
+            intents[0].agent_id.as_ref().map(ToString::to_string),
+            Some("agent-1".to_owned())
+        );
+        assert_eq!(
+            intents[0].spec.as_ref().map(|spec| spec.worker_port),
+            Some(5173),
+            "the spec rides whole; the worker dials what it names"
+        );
+
+        assert!(
+            intents_for_worker(&log, "w3")
+                .await
+                .expect("intents")
+                .is_empty(),
+            "an unknown worker has nothing to realize"
+        );
+    }
+
+    #[tokio::test]
+    async fn placed_on_answers_the_placement_or_nothing() {
+        let log = EventLog::in_memory().expect("log");
+        placed_expose(&log, "s1", "agent-1", "w1").await;
+        let events = log.read_all("s1").await.expect("read");
+        let state = SessionState::project("s1", &events).expect("project");
+
+        assert_eq!(placed_on(&state, "agent-1"), Some("w1"));
+        assert_eq!(placed_on(&state, "ghost"), None, "nothing is invented");
+    }
+
+    /// Resolution across sessions: a live forward comes back whole, and a
+    /// dead one — its agent failed — resolves to nothing, because to the
+    /// tunnel plane they are the same refusal.
+    #[tokio::test]
+    async fn resolve_live_finds_live_intents_and_refuses_dead_ones() {
+        let log = EventLog::in_memory().expect("log");
+        placed_expose(&log, "s1", "agent-1", "w1").await;
+
+        let resolved = resolve_live(&log, "fwd-agent-1")
+            .await
+            .expect("read")
+            .expect("a live forward resolves");
+        assert_eq!(resolved.forward_id, "fwd-agent-1");
+        assert_eq!(resolved.session_id, "s1");
+        assert_eq!(resolved.direction, ForwardDirection::Expose);
+        assert_eq!(resolved.name, "vite");
+        assert_eq!(resolved.placed_worker.as_deref(), Some("w1"));
+        assert_eq!(resolved.backer, None);
+
+        assert!(
+            resolve_live(&log, "fwd-nothing")
+                .await
+                .expect("read")
+                .is_none(),
+            "never-opened resolves to nothing"
+        );
+
+        append(
+            &log,
+            "s1",
+            "agent-1:failed",
+            "agent-1",
+            Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                previous_state: AgentLifecycleState::Running as i32,
+                state: AgentLifecycleState::Failed as i32,
+                reason: "harness exited".to_owned(),
+            }),
+        )
+        .await;
+        assert!(
+            resolve_live(&log, "fwd-agent-1")
+                .await
+                .expect("read")
+                .is_none(),
+            "a dead agent's forward is the same refusal as no forward"
+        );
+    }
+}

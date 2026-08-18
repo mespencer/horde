@@ -17,5 +17,7 @@
 pub mod intent;
 pub mod registry;
 pub mod relay;
+#[cfg(test)]
+pub(crate) mod testfix;
 
 pub use registry::ForwardRegistry;

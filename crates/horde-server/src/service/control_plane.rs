@@ -1631,4 +1631,22 @@ mod tests {
         );
         assert_eq!(actor_of(&request_as(None)), None);
     }
+
+    /// The backing key follows the same rules as attribution, and it is the
+    /// *name* — misnaming it would register backing under a principal no
+    /// inject records, which reads as permanently unbacked.
+    #[test]
+    fn only_a_client_identity_names_the_backing_principal() {
+        assert_eq!(
+            super::client_principal_of(&request_as(Some(PrincipalRole::Client))),
+            Some("laptop".to_owned()),
+            "the exact principal name is the backing key"
+        );
+        assert_eq!(
+            super::client_principal_of(&request_as(Some(PrincipalRole::Worker))),
+            None,
+            "a worker cannot back; only a human's client can"
+        );
+        assert_eq!(super::client_principal_of(&request_as(None)), None);
+    }
 }
