@@ -751,6 +751,75 @@ mod tests {
         assert!(app.should_quit());
     }
 
+    /// One forward panel row per status, for the key tests.
+    fn forward_rows(count: usize) -> Vec<horde_proto::v1::ForwardStatus> {
+        (0..count)
+            .map(|ordinal| horde_proto::v1::ForwardStatus {
+                intent: Some(horde_proto::v1::ForwardIntent {
+                    forward_id: Some(horde_proto::v1::ForwardId::new(format!("fwd-{ordinal}"))),
+                    ..horde_proto::v1::ForwardIntent::default()
+                }),
+                worker_reachable: true,
+                backed: false,
+            })
+            .collect()
+    }
+
+    /// The forward panel's whole key table (ADR-0006): entry refreshes,
+    /// `r` re-asks, the selection moves and clamps, `o`/Esc leave, and `q`
+    /// quits — each arm asserted, because a dropped arm is a dead key that
+    /// no snapshot notices.
+    #[test]
+    fn the_forward_panel_keys_refresh_move_leave_and_quit() {
+        let mut app = App::overview();
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('f'))),
+            vec![Directive::RefreshForwards],
+            "entering the panel asks for fresh backing state"
+        );
+        assert_eq!(app.screen(), Screen::Forwards);
+
+        app.apply(Update::Forwards(forward_rows(2)));
+        assert_eq!(app.forwards_selected(), 0);
+        assert!(app.on_input(&key(KeyCode::Down)).is_empty());
+        assert_eq!(app.forwards_selected(), 1);
+        assert!(app.on_input(&key(KeyCode::Up)).is_empty());
+        assert_eq!(app.forwards_selected(), 0);
+
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('r'))),
+            vec![Directive::RefreshForwards],
+            "r re-asks without leaving"
+        );
+        assert_eq!(app.screen(), Screen::Forwards);
+
+        assert!(app.on_input(&key(KeyCode::Char('o'))).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+
+        app.on_input(&key(KeyCode::Char('f')));
+        assert!(app.on_input(&key(KeyCode::Esc)).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+
+        app.on_input(&key(KeyCode::Char('f')));
+        assert!(app.on_input(&key(KeyCode::Char('q'))).is_empty());
+        assert!(app.should_quit());
+    }
+
+    /// A shrinking answer clamps the selection instead of leaving it past
+    /// the end — the row under the cursor may be the one that closed.
+    #[test]
+    fn a_shrinking_forward_list_clamps_the_selection() {
+        let mut app = App::overview();
+        app.on_input(&key(KeyCode::Char('f')));
+        app.apply(Update::Forwards(forward_rows(3)));
+        app.on_input(&key(KeyCode::Down));
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.forwards_selected(), 2);
+
+        app.apply(Update::Forwards(forward_rows(1)));
+        assert_eq!(app.forwards_selected(), 0, "clamped to the last real row");
+    }
+
     #[test]
     fn ctrl_c_quits_from_every_screen_even_mid_compose() {
         for setup in [

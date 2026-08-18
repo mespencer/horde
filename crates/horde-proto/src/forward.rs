@@ -120,4 +120,30 @@ mod tests {
         assert!(refusal_in(&eof_frame()).is_none());
         assert!(refusal_in(&ForwardTunnelFrame::default()).is_none());
     }
+
+    /// The words every surface prints, pinned literally — arm by arm,
+    /// because a dropped arm falls to "unspecified" and every panel and
+    /// render would print it without failing anything else in this crate.
+    #[test]
+    fn every_direction_prints_its_own_word() {
+        assert_eq!(
+            direction_name(crate::v1::ForwardDirection::Expose as i32),
+            "expose"
+        );
+        assert_eq!(
+            direction_name(crate::v1::ForwardDirection::Inject as i32),
+            "inject"
+        );
+        assert_eq!(direction_name(0), "unspecified");
+        assert_eq!(direction_name(99), "unspecified");
+    }
+
+    /// The derivation is shared vocabulary: the exact string, not just
+    /// non-emptiness, because the server's keyed append and the agent's
+    /// answer must mint the same id.
+    #[test]
+    fn the_derived_forward_id_is_the_request_id_prefixed() {
+        assert_eq!(derived_forward_id("req-9"), "fwd-req-9");
+        assert_eq!(derived_forward_id(""), "fwd-");
+    }
 }
