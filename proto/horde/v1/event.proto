@@ -18,6 +18,7 @@ package horde.v1;
 
 import "google/protobuf/timestamp.proto";
 import "horde/v1/agent.proto";
+import "horde/v1/forward.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
 import "horde/v1/mcp.proto";
@@ -255,6 +256,11 @@ message Event {
     // like the Workspace Definition catalog; the message is in mcp.proto
     // beside the config it carries.
     McpServerConfigChanged mcp_server_config_changed = 28;
+
+    // A port-forward intent opened or closed (ADR-0006). Durable intent
+    // only; the tunnel plane realizing it never touches the log.
+    ForwardOpened forward_opened = 29;
+    ForwardClosed forward_closed = 30;
   }
 }
 
