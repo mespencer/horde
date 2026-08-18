@@ -62,20 +62,12 @@ async fn an_exposed_port_relays_raw_tcp_and_survives_a_worker_kill() {
         .await;
     let (session_id, root) = system.placed_session("forward e2e").await;
 
-    // The agent's workspace process: a raw TCP echo on a port this test
-    // owns, bound on :0 and passed around by address.
-    let echo = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+    // The agent's workspace process: the shared testkit echo, bound on :0
+    // and passed around by address.
+    let (echo_addr, _echo) = horde_server_testkit::echo_server()
         .await
         .expect("the echo binds :0");
-    let echo_port = echo.local_addr().expect("a bound address").port();
-    tokio::spawn(async move {
-        while let Ok((socket, _peer)) = echo.accept().await {
-            tokio::spawn(async move {
-                let (mut read, mut write) = socket.into_split();
-                let _ = tokio::io::copy(&mut read, &mut write).await;
-            });
-        }
-    });
+    let echo_port = echo_addr.port();
 
     // The operator exposes it: a foreground CLI process that journals the
     // intent, realizes the listener, and prints the mapping.

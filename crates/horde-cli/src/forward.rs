@@ -467,12 +467,15 @@ async fn answer_inject_connection(
             .await;
         return;
     };
+    dial_and_pump(tunnel, target.client_port).await;
+}
 
-    let dialed = tokio::time::timeout(
-        DIAL_DEADLINE,
-        TcpStream::connect(("127.0.0.1", target.client_port)),
-    )
-    .await;
+/// The passive side's shared tail: dial the local target and pump, or
+/// refuse with the coded reason. The worker's expose dial and the backer's
+/// inject dial are this same three-way outcome, which is why it lives once,
+/// here, where both peers already meet the [`Tunnel`].
+pub async fn dial_and_pump(mut tunnel: Tunnel, port: u16) {
+    let dialed = tokio::time::timeout(DIAL_DEADLINE, TcpStream::connect(("127.0.0.1", port))).await;
     match dialed {
         Ok(Ok(tcp)) => {
             let _ = pump_tcp(tcp, tunnel).await;
@@ -481,7 +484,7 @@ async fn answer_inject_connection(
             tunnel
                 .refuse(
                     ForwardRefusalReason::TargetDialFailed,
-                    format!("dialing 127.0.0.1:{} failed: {error}", target.client_port),
+                    format!("dialing 127.0.0.1:{port} failed: {error}"),
                 )
                 .await;
         }
@@ -489,10 +492,7 @@ async fn answer_inject_connection(
             tunnel
                 .refuse(
                     ForwardRefusalReason::TargetDialFailed,
-                    format!(
-                        "127.0.0.1:{} did not accept within {DIAL_DEADLINE:?}",
-                        target.client_port
-                    ),
+                    format!("127.0.0.1:{port} did not accept within {DIAL_DEADLINE:?}"),
                 )
                 .await;
         }
@@ -795,10 +795,15 @@ mod tests {
         flood.abort();
     }
 
-    /// The pump, end to end over a real socket pair: bytes both ways, then
-    /// EOFs both ways, ending clean.
-    #[tokio::test]
-    async fn a_pump_carries_bytes_both_ways_and_ends_on_both_eofs() {
+    /// A pump over a real connected pair, with the test holding the local
+    /// peer socket and the scripted relay side — the arrangement all three
+    /// pump tests share.
+    async fn pumped_pair() -> (
+        tokio::net::TcpStream,
+        tokio::sync::mpsc::Sender<Result<horde_proto::v1::ForwardTunnelFrame, tonic::Status>>,
+        tokio::sync::mpsc::Receiver<horde_proto::v1::ForwardTunnelFrame>,
+        tokio::task::JoinHandle<PumpEnd>,
+    ) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
@@ -806,10 +811,18 @@ mod tests {
         let dialed = tokio::net::TcpStream::connect(addr);
         let (accepted, dialed) = tokio::join!(listener.accept(), dialed);
         let (accepted, _) = accepted.expect("accept");
-        let mut local = dialed.expect("dial");
+        let local = dialed.expect("dial");
 
-        let (tunnel, feed, mut sent) = scripted_tunnel();
+        let (tunnel, feed, sent) = scripted_tunnel();
         let pump = tokio::spawn(pump_tcp(accepted, tunnel));
+        (local, feed, sent, pump)
+    }
+
+    /// The pump, end to end over a real socket pair: bytes both ways, then
+    /// EOFs both ways, ending clean.
+    #[tokio::test]
+    async fn a_pump_carries_bytes_both_ways_and_ends_on_both_eofs() {
+        let (mut local, feed, mut sent, pump) = pumped_pair().await;
 
         // Local peer → relay.
         use tokio::io::AsyncWriteExt;
@@ -855,17 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mid_stream_refusal_tears_the_pump_down() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let dialed = tokio::net::TcpStream::connect(addr);
-        let (accepted, dialed) = tokio::join!(listener.accept(), dialed);
-        let (accepted, _) = accepted.expect("accept");
-        let _local = dialed.expect("dial");
-
-        let (tunnel, feed, _sent) = scripted_tunnel();
-        let pump = tokio::spawn(pump_tcp(accepted, tunnel));
+        let (_local, feed, _sent, pump) = pumped_pair().await;
         feed.send(Ok(refusal_frame(ForwardRefusalReason::Unbacked, "gone")))
             .await
             .expect("feed");
@@ -881,17 +884,7 @@ mod tests {
     /// outlives it elsewhere.
     #[tokio::test]
     async fn a_dead_relay_leg_ends_the_pump_as_relay_ended() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let dialed = tokio::net::TcpStream::connect(addr);
-        let (accepted, dialed) = tokio::join!(listener.accept(), dialed);
-        let (accepted, _) = accepted.expect("accept");
-        let _local = dialed.expect("dial");
-
-        let (tunnel, feed, _sent) = scripted_tunnel();
-        let pump = tokio::spawn(pump_tcp(accepted, tunnel));
+        let (_local, feed, _sent, pump) = pumped_pair().await;
         drop(feed);
 
         let end = within("a dead leg ends the pump", pump)

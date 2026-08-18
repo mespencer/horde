@@ -284,6 +284,89 @@ fn status_of(
     }
 }
 
+/// One tunnel leg answered whole: identity and serial read off the request,
+/// the relay driven over bare frames, an adapter lifting them into the
+/// spine's response type, and revocation severing the stream. Shared by
+/// both spines — the client leg and the worker leg differ only in their
+/// wrapper types, and two copies of this plumbing is exactly the drift the
+/// duplication gate exists to refuse.
+pub(crate) fn tunnel_response<Req, T, U, W>(
+    core: &ServerCore,
+    deny: Option<horde_identity::RevocationList>,
+    request: tonic::Request<tonic::Streaming<Req>>,
+    unwrap: U,
+    wrap: W,
+) -> tonic::Response<
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, tonic::Status>> + Send>>,
+>
+where
+    Req: Send + 'static,
+    U: Fn(Req) -> horde_proto::v1::ForwardTunnelFrame + Send + 'static,
+    T: Send + 'static,
+    W: Fn(horde_proto::v1::ForwardTunnelFrame) -> T + Send + 'static,
+{
+    use tokio_stream::StreamExt as _;
+    let serial = super::shared::peer_serial(&request);
+    let caller = tunnel_principal_of(&request);
+    let inbound = request
+        .into_inner()
+        .map(move |message| message.map(&unwrap));
+    tonic::Response::new(tunnel_stream(
+        core,
+        deny,
+        serial,
+        caller,
+        Box::pin(inbound),
+        wrap,
+    ))
+}
+
+fn tunnel_stream<T, W>(
+    core: &ServerCore,
+    deny: Option<horde_identity::RevocationList>,
+    serial: Option<String>,
+    caller: TunnelPrincipal,
+    inbound: std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<horde_proto::v1::ForwardTunnelFrame, tonic::Status>,
+                > + Send,
+        >,
+    >,
+    wrap: W,
+) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, tonic::Status>> + Send>>
+where
+    T: Send + 'static,
+    W: Fn(horde_proto::v1::ForwardTunnelFrame) -> T + Send + 'static,
+{
+    let (typed, stream) = tokio::sync::mpsc::channel(16);
+    let (frames, mut frame_rx) = tokio::sync::mpsc::channel(16);
+    let log = core.log.clone();
+    let registry = core.forwards.clone();
+
+    let lift = typed.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            if lift.send(Ok(wrap(frame))).await.is_err() {
+                return; // The peer hung up; the relay sees the channel close.
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let pump = crate::forward::relay::run_tunnel(
+            &log,
+            &registry,
+            caller,
+            crate::forward::relay::LegIo {
+                inbound,
+                outbound: frames,
+            },
+        );
+        super::shared::run_severable(pump, deny, serial, &typed).await;
+    });
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(stream))
+}
+
 /// Whether an appended event can change any worker's realized intent set.
 ///
 /// The worker forward streams recompute their set on log movement, and this

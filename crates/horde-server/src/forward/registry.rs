@@ -132,25 +132,13 @@ impl ForwardRegistry {
         &self,
         worker_id: &str,
     ) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
-        let (sender, receiver) = mpsc::channel(LANE_DEPTH);
-        let mut inner = self.locked();
-        inner.next_epoch += 1;
-        let epoch = inner.next_epoch;
-        inner
-            .workers
-            .insert(worker_id.to_owned(), Lane { epoch, sender });
-        (epoch, receiver)
+        register_lane(&mut self.locked(), Side::Workers, worker_id)
     }
 
     /// Removes `worker_id`'s lane, unless a newer stream has replaced it.
     /// Returns whether this call removed anything.
     pub fn deregister_worker_if_current(&self, worker_id: &str, epoch: u64) -> bool {
-        let mut inner = self.locked();
-        if lane_is_current(inner.workers.get(worker_id), epoch) {
-            inner.workers.remove(worker_id);
-            return true;
-        }
-        false
+        deregister_lane(&mut self.locked(), Side::Workers, worker_id, epoch)
     }
 
     /// Registers `principal`'s serve stream — the act of backing. Most
@@ -162,24 +150,12 @@ impl ForwardRegistry {
         &self,
         principal: &str,
     ) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
-        let (sender, receiver) = mpsc::channel(LANE_DEPTH);
-        let mut inner = self.locked();
-        inner.next_epoch += 1;
-        let epoch = inner.next_epoch;
-        inner
-            .clients
-            .insert(principal.to_owned(), Lane { epoch, sender });
-        (epoch, receiver)
+        register_lane(&mut self.locked(), Side::Clients, principal)
     }
 
     /// Removes `principal`'s lane, unless a newer stream re-backed since.
     pub fn deregister_client_if_current(&self, principal: &str, epoch: u64) -> bool {
-        let mut inner = self.locked();
-        if lane_is_current(inner.clients.get(principal), epoch) {
-            inner.clients.remove(principal);
-            return true;
-        }
-        false
+        deregister_lane(&mut self.locked(), Side::Clients, principal, epoch)
     }
 
     /// Whether `worker_id` currently holds a forward stream.
@@ -244,6 +220,49 @@ impl ForwardRegistry {
         };
         lane.map(|lane| lane.sender.clone())
     }
+}
+
+/// Which of the two lane maps an operation addresses. One mechanism, two
+/// sides: workers and backers register, replace, and epoch-guard their
+/// teardown identically, and two copies of that mechanism is how the sides
+/// drift.
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Workers,
+    Clients,
+}
+
+impl Side {
+    fn of<'a>(self, inner: &'a mut Inner) -> &'a mut BTreeMap<String, Lane> {
+        match self {
+            Self::Workers => &mut inner.workers,
+            Self::Clients => &mut inner.clients,
+        }
+    }
+}
+
+/// Registers one lane on one side: fresh epoch, most recent wins.
+fn register_lane(
+    inner: &mut Inner,
+    side: Side,
+    key: &str,
+) -> (u64, mpsc::Receiver<ForwardConnectionRequest>) {
+    let (sender, receiver) = mpsc::channel(LANE_DEPTH);
+    inner.next_epoch += 1;
+    let epoch = inner.next_epoch;
+    side.of(inner)
+        .insert(key.to_owned(), Lane { epoch, sender });
+    (epoch, receiver)
+}
+
+/// Removes one lane, unless a newer stream has replaced it.
+fn deregister_lane(inner: &mut Inner, side: Side, key: &str, epoch: u64) -> bool {
+    let lanes = side.of(inner);
+    if lane_is_current(lanes.get(key), epoch) {
+        lanes.remove(key);
+        return true;
+    }
+    false
 }
 
 /// Whether a stored lane is the one an epoch refers to.

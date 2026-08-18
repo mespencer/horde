@@ -20,23 +20,12 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::support::{place_agent, serve, within};
 
-/// A TCP echo server on a port the test owns. Plays the agent's workspace
-/// process (expose) or the service on the human's machine (inject).
+/// The shared testkit echo server: plays the agent's workspace process
+/// (expose) or the service on the human's machine (inject).
 async fn echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+    horde_server_testkit::echo_server()
         .await
-        .expect("the echo server binds :0");
-    let addr = listener.local_addr().expect("a bound address");
-    let task = tokio::spawn(async move {
-        // Ends when accept fails — the listener dying with the test.
-        while let Ok((socket, _peer)) = listener.accept().await {
-            tokio::spawn(async move {
-                let (mut read, mut write) = socket.into_split();
-                let _ = tokio::io::copy(&mut read, &mut write).await;
-            });
-        }
-    });
-    (addr, task)
+        .expect("the echo server binds :0")
 }
 
 fn expose_spec(name: &str, worker_port: u16) -> ForwardSpec {
@@ -91,6 +80,91 @@ async fn dial_until_accepted(port: u16) -> TcpStream {
     panic!("the worker-side listener on {port} never came up");
 }
 
+/// A relayed expose ready to realize: fresh server, echo bound, agent
+/// placed on `w1`, intent journaled — the arrangement the expose tests
+/// share. The echo task rides along so its listener lives as long as the
+/// harness does.
+struct ExposedEcho {
+    endpoint: String,
+    client: Client,
+    forward_id: String,
+    echo_port: u16,
+    _echo: tokio::task::JoinHandle<()>,
+}
+
+async fn exposed_echo(session: &str) -> ExposedEcho {
+    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
+    let endpoint = serve(core.clone()).await;
+    let (echo_addr, echo) = echo_server().await;
+    place_agent(&core.log, session, "agent-1", "w1", "serve the echo").await;
+
+    let mut client = Client::connect(&endpoint).await.expect("the client dials");
+    let opened = within(
+        "open the expose",
+        client.open_forward(
+            session,
+            "agent-1",
+            expose_spec("echo", echo_addr.port()),
+            "open-1",
+        ),
+    )
+    .await
+    .expect("the intent journals");
+    ExposedEcho {
+        endpoint,
+        client,
+        forward_id: opened.forward_id.expect("an id").to_string(),
+        echo_port: echo_addr.port(),
+        _echo: echo,
+    }
+}
+
+/// A worker forward plane serving `w1` over its own channel.
+async fn worker_plane(endpoint: &str) -> tokio::task::JoinHandle<()> {
+    let worker_client = WorkerServiceClient::connect(endpoint.to_owned())
+        .await
+        .expect("the worker dials");
+    tokio::spawn(async move {
+        let _ = horde_worker::forward::serve(worker_client, "w1").await;
+    })
+}
+
+/// Waits for the overlay to report the placed worker (un)reachable.
+async fn reachability_reaches(client: &mut Client, wanted: bool) {
+    forwards_reach(client, |forwards| {
+        forwards
+            .iter()
+            .any(|status| status.worker_reachable == wanted)
+    })
+    .await;
+}
+
+/// The harness's expose realized on this client — requesting the echo's
+/// own port, so the ephemeral fallback is what actually binds.
+async fn realized_echo(harness: &ExposedEcho) -> horde_cli::forward::RealizedExpose {
+    horde_cli::forward::realize_expose(
+        &harness.client,
+        &harness.forward_id,
+        "echo",
+        u32::from(harness.echo_port),
+        0,
+    )
+    .await
+    .expect("the listener binds")
+}
+
+/// Serving IS backing: one spawned backing task over these targets.
+fn spawn_backing(
+    client: &Client,
+    targets: &horde_cli::forward::InjectTargets,
+) -> tokio::task::JoinHandle<()> {
+    let client = client.clone();
+    let targets = targets.clone();
+    tokio::spawn(async move {
+        let _ = horde_cli::forward::serve_backing(&client, targets).await;
+    })
+}
+
 /// A refused connection: closes with nothing readable, within the ceiling.
 async fn assert_refused_fast(conn: &mut TcpStream) {
     let mut buffer = [0_u8; 1];
@@ -108,45 +182,11 @@ async fn assert_refused_fast(conn: &mut TcpStream) {
 /// the second connection proves the relay outlives its first.
 #[tokio::test]
 async fn an_expose_carries_a_tcp_echo_end_to_end() {
-    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
-    let endpoint = serve(core.clone()).await;
-    let (echo_addr, _echo) = echo_server().await;
-    place_agent(&core.log, "fwd-e2e", "agent-1", "w1", "serve the echo").await;
+    let mut harness = exposed_echo("fwd-e2e").await;
+    let plane = worker_plane(&harness.endpoint).await;
+    reachability_reaches(&mut harness.client, true).await;
 
-    let mut client = Client::connect(&endpoint).await.expect("the client dials");
-    let opened = within(
-        "open the expose",
-        client.open_forward(
-            "fwd-e2e",
-            "agent-1",
-            expose_spec("echo", echo_addr.port()),
-            "open-1",
-        ),
-    )
-    .await
-    .expect("the intent journals");
-    let forward_id = opened.forward_id.expect("an id").to_string();
-
-    let worker_client = WorkerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("the worker dials");
-    let plane = tokio::spawn(async move {
-        let _ = horde_worker::forward::serve(worker_client, "w1").await;
-    });
-    forwards_reach(&mut client, |forwards| {
-        forwards.iter().any(|status| status.worker_reachable)
-    })
-    .await;
-
-    let realized = horde_cli::forward::realize_expose(
-        &client,
-        &forward_id,
-        "echo",
-        u32::from(echo_addr.port()),
-        0,
-    )
-    .await
-    .expect("the listener binds");
+    let realized = realized_echo(&harness).await;
     assert!(
         realized.fell_back,
         "the requested port is the echo server's own, so the client falls \
@@ -216,45 +256,11 @@ async fn an_unreachable_worker_refuses_connections_fast() {
 /// a reconnected worker plane re-realizes without re-declaration.
 #[tokio::test]
 async fn a_partition_resets_in_flight_forwards_and_reattach_re_realizes() {
-    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
-    let endpoint = serve(core.clone()).await;
-    let (echo_addr, _echo) = echo_server().await;
-    place_agent(&core.log, "fwd-part", "agent-1", "w1", "serve the echo").await;
+    let mut harness = exposed_echo("fwd-part").await;
+    let plane = worker_plane(&harness.endpoint).await;
+    reachability_reaches(&mut harness.client, true).await;
 
-    let mut client = Client::connect(&endpoint).await.expect("the client dials");
-    let opened = within(
-        "open the expose",
-        client.open_forward(
-            "fwd-part",
-            "agent-1",
-            expose_spec("echo", echo_addr.port()),
-            "open-1",
-        ),
-    )
-    .await
-    .expect("the intent journals");
-    let forward_id = opened.forward_id.expect("an id").to_string();
-
-    let worker_client = WorkerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("the worker dials");
-    let plane = tokio::spawn(async move {
-        let _ = horde_worker::forward::serve(worker_client, "w1").await;
-    });
-    forwards_reach(&mut client, |forwards| {
-        forwards.iter().any(|status| status.worker_reachable)
-    })
-    .await;
-
-    let realized = horde_cli::forward::realize_expose(
-        &client,
-        &forward_id,
-        "echo",
-        u32::from(echo_addr.port()),
-        0,
-    )
-    .await
-    .expect("the listener binds");
+    let realized = realized_echo(&harness).await;
 
     // A connection alive mid-partition.
     let mut conn = within("dial", TcpStream::connect(realized.local_addr))
@@ -278,7 +284,7 @@ async fn a_partition_resets_in_flight_forwards_and_reattach_re_realizes() {
     );
 
     // The durable intent survives the dead realization.
-    let survived = forwards_reach(&mut client, |forwards| {
+    let survived = forwards_reach(&mut harness.client, |forwards| {
         forwards.iter().any(|status| !status.worker_reachable)
     })
     .await;
@@ -286,16 +292,8 @@ async fn a_partition_resets_in_flight_forwards_and_reattach_re_realizes() {
 
     // Reattach: a fresh plane re-realizes from the re-sent intent set, and
     // the same still-bound client listener carries bytes again.
-    let worker_client = WorkerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("the worker redials");
-    let plane = tokio::spawn(async move {
-        let _ = horde_worker::forward::serve(worker_client, "w1").await;
-    });
-    forwards_reach(&mut client, |forwards| {
-        forwards.iter().any(|status| status.worker_reachable)
-    })
-    .await;
+    let plane = worker_plane(&harness.endpoint).await;
+    reachability_reaches(&mut harness.client, true).await;
 
     let mut conn = within(
         "dial after reattach",
@@ -382,11 +380,7 @@ async fn an_inject_backs_serves_unbacks_and_re_backs() {
             },
         );
     }
-    let backing_client = client.clone();
-    let backing_targets = targets.clone();
-    let backing = tokio::spawn(async move {
-        let _ = horde_cli::forward::serve_backing(&backing_client, backing_targets).await;
-    });
+    let backing = spawn_backing(&client, &targets);
     forwards_reach(&mut client, |forwards| {
         forwards
             .iter()
@@ -417,11 +411,7 @@ async fn an_inject_backs_serves_unbacks_and_re_backs() {
     assert_refused_fast(&mut refused).await;
 
     // The owning client's return re-backs without re-declaration.
-    let backing_client = client.clone();
-    let backing_targets = targets.clone();
-    let backing = tokio::spawn(async move {
-        let _ = horde_cli::forward::serve_backing(&backing_client, backing_targets).await;
-    });
+    let backing = spawn_backing(&client, &targets);
     forwards_reach(&mut client, |forwards| {
         forwards.iter().any(|status| status.backed)
     })

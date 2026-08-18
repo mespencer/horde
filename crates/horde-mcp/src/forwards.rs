@@ -57,6 +57,16 @@ pub fn forwardable_port(port: u16) -> bool {
     port != 0
 }
 
+/// Whether a spec is complete enough to raise: a forwardable worker port
+/// *and* a name — forwards are named, not numbered. The compound is named
+/// because its mixed rows are what an `||` typo would get wrong, and the
+/// handler wrapping it is reachable only through a whole MCP request.
+#[must_use]
+pub fn declarable(spec: &ForwardSpec) -> bool {
+    let port = u16::try_from(spec.worker_port).unwrap_or(0);
+    forwardable_port(port) && !spec.name.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +107,25 @@ mod tests {
     fn only_a_nonzero_port_is_forwardable() {
         assert!(forwardable_port(5173));
         assert!(!forwardable_port(0));
+    }
+
+    /// All four corners, plus the port that fits no u16: a spec is raisable
+    /// only with a real port and a real name.
+    #[test]
+    fn only_a_named_spec_with_a_real_port_is_declarable() {
+        let spec = |port: u32, name: &str| ForwardSpec {
+            direction: ForwardDirection::Expose as i32,
+            name: name.to_owned(),
+            worker_port: port,
+            client_port: 0,
+        };
+        assert!(declarable(&spec(5173, "vite")));
+        assert!(!declarable(&spec(0, "vite")));
+        assert!(!declarable(&spec(5173, "")));
+        assert!(!declarable(&spec(0, "")));
+        assert!(
+            !declarable(&spec(70_000, "vite")),
+            "a port that fits no u16 is not a port"
+        );
     }
 }

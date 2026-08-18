@@ -69,6 +69,18 @@ pub fn refusal_in(frame: &ForwardTunnelFrame) -> Option<&ForwardTunnelRefusal> {
     }
 }
 
+/// The wire direction as the word every surface prints — `forward ls`, the
+/// TUI panel, the feed. One owner so the vocabulary cannot drift between
+/// frontends (the same reasoning as the result-status words in horde-wire).
+#[must_use]
+pub fn direction_name(direction: i32) -> &'static str {
+    match crate::v1::ForwardDirection::try_from(direction) {
+        Ok(crate::v1::ForwardDirection::Expose) => "expose",
+        Ok(crate::v1::ForwardDirection::Inject) => "inject",
+        _ => "unspecified",
+    }
+}
+
 /// The forward id a chain-approved request opens under (ADR-0006).
 ///
 /// Shared vocabulary rather than a server detail: the server's opener derives

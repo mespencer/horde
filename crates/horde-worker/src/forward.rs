@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use horde_cli::forward::{
-    ConfirmEnd, DIAL_DEADLINE, Tunnel, confirm_opened, connection_id, pump_tcp,
+    ConfirmEnd, Tunnel, confirm_opened, connection_id, dial_and_pump, pump_tcp,
 };
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{
@@ -230,30 +230,7 @@ async fn dial_and_carry(
             .await;
         return;
     };
-    let port = u16::try_from(port).unwrap_or(0);
-
-    let dialed = tokio::time::timeout(DIAL_DEADLINE, TcpStream::connect(("127.0.0.1", port))).await;
-    match dialed {
-        Ok(Ok(tcp)) => {
-            let _ = pump_tcp(tcp, tunnel).await;
-        }
-        Ok(Err(error)) => {
-            tunnel
-                .refuse(
-                    ForwardRefusalReason::TargetDialFailed,
-                    format!("dialing 127.0.0.1:{port} failed: {error}"),
-                )
-                .await;
-        }
-        Err(_elapsed) => {
-            tunnel
-                .refuse(
-                    ForwardRefusalReason::TargetDialFailed,
-                    format!("127.0.0.1:{port} did not accept within {DIAL_DEADLINE:?}"),
-                )
-                .await;
-        }
-    }
+    dial_and_pump(tunnel, u16::try_from(port).unwrap_or(0)).await;
 }
 
 /// An inject listener's life: accept, originate, pump — refusing fast when

@@ -39,55 +39,64 @@ const PAIR_DEADLINE: Duration = Duration::from_secs(10);
 /// that a stalled peer exerts backpressure within a few frames.
 const SPLICE_DEPTH: usize = 16;
 
+/// One leg's I/O, stripped to bare frames. The service layer owns the gRPC
+/// wrapper types and the severing; the relay never learns them — which is
+/// also what keeps every function here monomorphic and the two spines'
+/// handlers one shared bridge.
+pub struct LegIo {
+    pub inbound: std::pin::Pin<Box<dyn Stream<Item = Result<ForwardTunnelFrame, Status>> + Send>>,
+    pub outbound: mpsc::Sender<ForwardTunnelFrame>,
+}
+
+impl LegIo {
+    /// Sends one frame toward this leg's peer, shrugging when it is gone —
+    /// a peer that hung up has no use for the refusal it caused. `&mut` for
+    /// the same reason as the client engine's `Tunnel`: a `&LegIo` held
+    /// across an await drags the non-`Sync` boxed stream into the bound.
+    async fn say(&mut self, frame: ForwardTunnelFrame) {
+        let _ = self.outbound.send(frame).await;
+    }
+}
+
 /// Runs one tunnel stream to completion: handshake, claim-or-originate,
-/// splice. `wrap` lifts a bare frame into the service's response type.
-pub async fn run_tunnel<S, T, W>(
+/// splice.
+pub async fn run_tunnel(
     log: &EventLog,
     registry: &ForwardRegistry,
     caller: TunnelPrincipal,
-    mut inbound: S,
-    sender: &mpsc::Sender<Result<T, Status>>,
-    wrap: W,
-) where
-    S: Stream<Item = Result<ForwardTunnelFrame, Status>> + Unpin + Send,
-    W: Fn(ForwardTunnelFrame) -> T,
-{
-    let open = match handshake(&mut inbound).await {
+    mut io: LegIo,
+) {
+    let open = match handshake(&mut io).await {
         Ok(open) => open,
-        Err(refusal) => {
-            let _ = sender.send(Ok(wrap(refusal))).await;
-            return;
-        }
+        Err(refusal) => return io.say(refusal).await,
     };
 
     match registry.claim(&open.connection_id, &caller) {
-        Claim::Matched(pair) => run_passive(pair, inbound, sender, wrap).await,
+        Claim::Matched(pair) => run_passive(pair, io).await,
         Claim::WrongPrincipal => {
-            let refusal = refusal_frame(
+            let mut io = io;
+            io.say(refusal_frame(
                 ForwardRefusalReason::WrongPrincipal,
                 format!(
                     "connection {} was dispatched to a different peer",
                     open.connection_id
                 ),
-            );
-            let _ = sender.send(Ok(wrap(refusal))).await;
+            ))
+            .await;
         }
-        Claim::Unknown => run_originator(log, registry, caller, open, inbound, sender, wrap).await,
+        Claim::Unknown => run_originator(log, registry, caller, open, io).await,
     }
 }
 
 /// Waits (ceilinged) for the opening frame.
-async fn handshake<S>(inbound: &mut S) -> Result<ForwardTunnelOpen, ForwardTunnelFrame>
-where
-    S: Stream<Item = Result<ForwardTunnelFrame, Status>> + Unpin + Send,
-{
+async fn handshake(io: &mut LegIo) -> Result<ForwardTunnelOpen, ForwardTunnelFrame> {
     let protocol_refusal = || {
         refusal_frame(
             ForwardRefusalReason::Unspecified,
             "a tunnel's first frame must be `open`, within the handshake deadline",
         )
     };
-    match tokio::time::timeout(HANDSHAKE_DEADLINE, inbound.next()).await {
+    match tokio::time::timeout(HANDSHAKE_DEADLINE, io.inbound.next()).await {
         Ok(Some(Ok(ForwardTunnelFrame {
             frame: Some(Frame::Open(open)),
         }))) => Ok(open),
@@ -96,15 +105,7 @@ where
 }
 
 /// The passive side: complete the pairing, then splice.
-async fn run_passive<S, T, W>(
-    pair: tokio::sync::oneshot::Sender<PassiveLeg>,
-    inbound: S,
-    sender: &mpsc::Sender<Result<T, Status>>,
-    wrap: W,
-) where
-    S: Stream<Item = Result<ForwardTunnelFrame, Status>> + Unpin + Send,
-    W: Fn(ForwardTunnelFrame) -> T,
-{
+async fn run_passive(pair: tokio::sync::oneshot::Sender<PassiveLeg>, io: LegIo) {
     let (to_origin, from_passive) = mpsc::channel(SPLICE_DEPTH);
     let (to_passive, from_origin) = mpsc::channel(SPLICE_DEPTH);
     if pair
@@ -118,33 +119,23 @@ async fn run_passive<S, T, W>(
         // the passive peer tears its dialed connection down on it.
         return;
     }
-    splice(inbound, to_origin, from_origin, sender, wrap).await;
+    splice(io, to_origin, from_origin).await;
 }
 
 /// The originating side: validate, dispatch, wait for the pairing, splice.
-async fn run_originator<S, T, W>(
+async fn run_originator(
     log: &EventLog,
     registry: &ForwardRegistry,
     caller: TunnelPrincipal,
     open: ForwardTunnelOpen,
-    inbound: S,
-    sender: &mpsc::Sender<Result<T, Status>>,
-    wrap: W,
-) where
-    S: Stream<Item = Result<ForwardTunnelFrame, Status>> + Unpin + Send,
-    W: Fn(ForwardTunnelFrame) -> T,
-{
+    mut io: LegIo,
+) {
     let leg = match originate(log, registry, &caller, &open).await {
         Ok(leg) => leg,
-        Err(refusal) => {
-            let _ = sender.send(Ok(wrap(refusal))).await;
-            return;
-        }
+        Err(refusal) => return io.say(refusal).await,
     };
-    if sender.send(Ok(wrap(accepted_frame()))).await.is_err() {
-        return;
-    }
-    splice(inbound, leg.to_passive, leg.from_passive, sender, wrap).await;
+    io.say(accepted_frame()).await;
+    splice(io, leg.to_passive, leg.from_passive).await;
 }
 
 /// Everything between "an open frame arrived" and "both legs are up".
@@ -349,19 +340,14 @@ fn unanswered_refusal(target: &PassiveTarget) -> ForwardTunnelFrame {
 /// on the other side. Ends by structure, no clock: every arm's terminal
 /// case returns, and returning drops both channel ends, which is what the
 /// paired splice observes as its own terminal case.
-async fn splice<S, T, W>(
-    mut inbound: S,
+async fn splice(
+    mut io: LegIo,
     to_peer: mpsc::Sender<ForwardTunnelFrame>,
     mut from_peer: mpsc::Receiver<ForwardTunnelFrame>,
-    sender: &mpsc::Sender<Result<T, Status>>,
-    wrap: W,
-) where
-    S: Stream<Item = Result<ForwardTunnelFrame, Status>> + Unpin + Send,
-    W: Fn(ForwardTunnelFrame) -> T,
-{
+) {
     loop {
         tokio::select! {
-            frame = inbound.next() => {
+            frame = io.inbound.next() => {
                 let Some(Ok(frame)) = frame else {
                     return; // This leg ended or errored: teardown.
                 };
@@ -373,7 +359,7 @@ async fn splice<S, T, W>(
                 let Some(frame) = frame else {
                     return; // The peer leg ended: teardown.
                 };
-                if sender.send(Ok(wrap(frame))).await.is_err() {
+                if io.outbound.send(frame).await.is_err() {
                     return; // Our own peer hung up; nothing left to carry.
                 }
             }
@@ -525,25 +511,33 @@ mod tests {
         to_peer: tokio::sync::mpsc::Receiver<ForwardTunnelFrame>,
         /// Feeds frames as the paired peer.
         from_peer: tokio::sync::mpsc::Sender<ForwardTunnelFrame>,
-        /// What the splice sent back down its own gRPC stream.
-        outbound: tokio::sync::mpsc::Receiver<Result<ForwardTunnelFrame, Status>>,
+        /// What the splice sent back down its own leg.
+        outbound: tokio::sync::mpsc::Receiver<ForwardTunnelFrame>,
         task: tokio::task::JoinHandle<()>,
     }
 
-    fn spliced() -> SpliceHarness {
+    /// A [`super::LegIo`] the test plays the peer of: feed the returned
+    /// sender, read the returned receiver.
+    fn scripted_leg() -> (
+        super::LegIo,
+        tokio::sync::mpsc::Sender<Result<ForwardTunnelFrame, Status>>,
+        tokio::sync::mpsc::Receiver<ForwardTunnelFrame>,
+    ) {
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
+        let io = super::LegIo {
+            inbound: Box::pin(ReceiverStream::new(inbound_rx)),
+            outbound: outbound_tx,
+        };
+        (io, inbound_tx, outbound_rx)
+    }
+
+    fn spliced() -> SpliceHarness {
+        let (io, inbound_tx, outbound_rx) = scripted_leg();
         let (to_peer_tx, to_peer_rx) = tokio::sync::mpsc::channel(8);
         let (from_peer_tx, from_peer_rx) = tokio::sync::mpsc::channel(8);
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
         let task = tokio::spawn(async move {
-            splice(
-                ReceiverStream::new(inbound_rx),
-                to_peer_tx,
-                from_peer_rx,
-                &outbound_tx,
-                |frame| frame,
-            )
-            .await;
+            splice(io, to_peer_tx, from_peer_rx).await;
         });
         SpliceHarness {
             inbound: inbound_tx,
@@ -580,7 +574,7 @@ mod tests {
             .await
             .expect("send from peer");
         let echoed = within("peer frames reach outbound", &mut harness.outbound).await;
-        assert_eq!(echoed.expect("an ok frame"), data_frame(vec![3]));
+        assert_eq!(echoed, data_frame(vec![3]));
 
         harness.task.abort();
     }
@@ -629,7 +623,7 @@ mod tests {
             &mut harness.outbound,
         )
         .await;
-        assert_eq!(echoed.expect("an ok frame"), data_frame(vec![9]));
+        assert_eq!(echoed, data_frame(vec![9]));
         harness.task.abort();
     }
 
@@ -696,26 +690,25 @@ mod tests {
     /// observation: the refusal frame is the assertion.
     #[tokio::test]
     async fn the_handshake_refuses_wrong_and_missing_openings() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ForwardTunnelFrame, Status>>(4);
-        tx.send(Ok(data_frame(vec![9]))).await.expect("send");
-        let mut stream = ReceiverStream::new(rx);
-        let refused = super::handshake(&mut stream)
+        let (mut io, feed, _out) = scripted_leg();
+        feed.send(Ok(data_frame(vec![9]))).await.expect("send");
+        let refused = super::handshake(&mut io)
             .await
             .expect_err("data before open must refuse");
         assert!(refusal_in(&refused).is_some());
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ForwardTunnelFrame, Status>>(4);
-        drop(tx);
-        let mut stream = ReceiverStream::new(rx);
-        let refused = super::handshake(&mut stream)
+        let (mut io, feed, _out) = scripted_leg();
+        drop(feed);
+        let refused = super::handshake(&mut io)
             .await
             .expect_err("an empty stream must refuse");
         assert!(refusal_in(&refused).is_some());
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ForwardTunnelFrame, Status>>(4);
-        tx.send(Ok(open_frame("fwd-1", "c1"))).await.expect("send");
-        let mut stream = ReceiverStream::new(rx);
-        let open = super::handshake(&mut stream)
+        let (mut io, feed, _out) = scripted_leg();
+        feed.send(Ok(open_frame("fwd-1", "c1")))
+            .await
+            .expect("send");
+        let open = super::handshake(&mut io)
             .await
             .expect("a proper open passes the handshake");
         assert_eq!(open.connection_id, "c1");

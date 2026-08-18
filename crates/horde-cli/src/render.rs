@@ -780,13 +780,7 @@ fn forward_line(status: &horde_proto::v1::ForwardStatus) -> String {
     line
 }
 
-fn direction_word(direction: i32) -> &'static str {
-    match horde_proto::v1::ForwardDirection::try_from(direction) {
-        Ok(horde_proto::v1::ForwardDirection::Expose) => "expose",
-        Ok(horde_proto::v1::ForwardDirection::Inject) => "inject",
-        _ => "unspecified",
-    }
-}
+use horde_proto::forward::direction_name as direction_word;
 
 /// A realized expose: the mapping the ADR promises, fallback named when the
 /// requested port was taken.

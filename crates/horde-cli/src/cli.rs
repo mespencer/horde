@@ -1167,33 +1167,43 @@ pub fn forward_name_or_default(name: &str, port: u16) -> String {
     }
 }
 
+/// Journals one declaration and returns the id the log minted — the shared
+/// opening move of both foreground forward verbs.
+async fn declare(
+    client: &mut Client,
+    session_id: &str,
+    agent_id: &str,
+    spec: horde_proto::v1::ForwardSpec,
+) -> Result<String, ClientError> {
+    let opened = client.open_forward(session_id, agent_id, spec, "").await?;
+    Ok(opened
+        .forward_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default())
+}
+
 async fn run_forward_expose(
     client: &mut Client,
     args: &ForwardExposeArgs,
     format: Format,
 ) -> Result<(), ClientError> {
     let name = forward_name_or_default(&args.name, args.port);
+    let local_port = u32::from(args.local_port.unwrap_or(0));
     let spec = horde_proto::v1::ForwardSpec {
         direction: horde_proto::v1::ForwardDirection::Expose as i32,
         name: name.clone(),
         worker_port: u32::from(args.port),
-        client_port: u32::from(args.local_port.unwrap_or(0)),
+        client_port: local_port,
     };
-    let opened = client
-        .open_forward(&args.session_id, &args.agent_id, spec, "")
-        .await?;
-    let forward_id = opened
-        .forward_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let forward_id = declare(client, &args.session_id, &args.agent_id, spec).await?;
 
     let realized = crate::forward::realize_expose(
         client,
         &forward_id,
         &name,
         u32::from(args.port),
-        u32::from(args.local_port.unwrap_or(0)),
+        local_port,
     )
     .await
     .map_err(|source| ClientError::File {
@@ -1232,14 +1242,7 @@ async fn run_forward_inject(
         worker_port: u32::from(worker_port),
         client_port: u32::from(args.port),
     };
-    let opened = client
-        .open_forward(&args.session_id, &args.agent_id, spec, "")
-        .await?;
-    let forward_id = opened
-        .forward_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let forward_id = declare(client, &args.session_id, &args.agent_id, spec).await?;
 
     println!(
         "{}",
@@ -1256,12 +1259,7 @@ async fn run_forward_inject(
             },
         );
     }
-    // Serving IS backing: this call returning means the server now counts
-    // this client unbacked, so it runs until ctrl-c or the stream dies.
-    tokio::select! {
-        outcome = crate::forward::serve_backing(client, targets) => outcome,
-        _ = tokio::signal::ctrl_c() => Ok(()),
-    }
+    serve_until_interrupted(client, targets).await
 }
 
 async fn run_forward_serve(
@@ -1274,48 +1272,92 @@ async fn run_forward_serve(
     let principal = enrolled_principal(identity);
     let plan = crate::forward::ServePlan::from_statuses(&statuses, principal.as_deref());
 
+    let realized = realize_planned(client, &plan.exposes, format).await;
+    announce_backings(&plan.injects, format);
+    let outcome = serve_until_interrupted(client, plan.injects.clone()).await;
+    stop_all(realized).await;
+    outcome
+}
+
+/// Realizes every planned expose; a bind failure costs that one forward,
+/// loudly, never the rest.
+async fn realize_planned(
+    client: &Client,
+    exposes: &[crate::forward::PlannedExpose],
+    format: Format,
+) -> Vec<crate::forward::RealizedExpose> {
     let mut realized = Vec::new();
-    for expose in &plan.exposes {
-        match crate::forward::realize_expose(
-            client,
-            &expose.forward_id,
-            &expose.name,
-            expose.worker_port,
-            expose.client_port,
-        )
-        .await
-        {
-            Ok(listener) => {
-                println!(
-                    "{}",
-                    render::forward_realized(
-                        &expose.name,
-                        &expose.forward_id,
-                        listener.local_addr,
-                        listener.fell_back,
-                        format
-                    )
-                );
-                realized.push(listener);
-            }
-            Err(error) => eprintln!("could not realize {}: {error}", expose.name),
+    for expose in exposes {
+        if let Some(listener) = realize_one(client, expose, format).await {
+            realized.push(listener);
         }
     }
-    for (forward_id, target) in read_targets(&plan.injects) {
+    realized
+}
+
+/// One planned expose realized and announced, or a loud `None`.
+async fn realize_one(
+    client: &Client,
+    expose: &crate::forward::PlannedExpose,
+    format: Format,
+) -> Option<crate::forward::RealizedExpose> {
+    match crate::forward::realize_expose(
+        client,
+        &expose.forward_id,
+        &expose.name,
+        expose.worker_port,
+        expose.client_port,
+    )
+    .await
+    {
+        Ok(listener) => {
+            println!(
+                "{}",
+                render::forward_realized(
+                    &expose.name,
+                    &expose.forward_id,
+                    listener.local_addr,
+                    listener.fell_back,
+                    format
+                )
+            );
+            Some(listener)
+        }
+        Err(error) => {
+            eprintln!("could not realize {}: {error}", expose.name);
+            None
+        }
+    }
+}
+
+/// Prints what this invocation backs, before the serving starts.
+fn announce_backings(targets: &crate::forward::InjectTargets, format: Format) {
+    for (forward_id, target) in read_targets(targets) {
         println!(
             "{}",
             render::forward_backing(&target.name, &forward_id, target.client_port, 0, format)
         );
     }
+}
 
+/// Backs `targets` until ctrl-c or the serve stream dies — serving IS
+/// backing, so returning is the moment the server counts this client
+/// unbacked.
+async fn serve_until_interrupted(
+    client: &Client,
+    targets: crate::forward::InjectTargets,
+) -> Result<(), ClientError> {
     tokio::select! {
-        outcome = crate::forward::serve_backing(client, plan.injects.clone()) => outcome?,
-        _ = tokio::signal::ctrl_c() => {}
+        outcome = crate::forward::serve_backing(client, targets) => outcome,
+        _ = tokio::signal::ctrl_c() => Ok(()),
     }
+}
+
+/// Tears every realization down, waiting for each accept loop to be gone.
+async fn stop_all(realized: Vec<crate::forward::RealizedExpose>) {
     for listener in realized {
         listener.stop().await;
     }
-    Ok(())
 }
 
 /// A snapshot of the inject targets, for printing without holding the lock.

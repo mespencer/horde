@@ -369,15 +369,9 @@ fn forward_opened_text(opened: &horde_proto::v1::ForwardOpened) -> String {
     text
 }
 
-/// The wire direction as the word the panel and the feed print.
-#[must_use]
-pub fn forward_direction_name(direction: i32) -> &'static str {
-    match horde_proto::v1::ForwardDirection::try_from(direction) {
-        Ok(horde_proto::v1::ForwardDirection::Expose) => "expose",
-        Ok(horde_proto::v1::ForwardDirection::Inject) => "inject",
-        _ => "unspecified",
-    }
-}
+/// The wire direction as the word the panel and the feed print — the schema
+/// crate's own vocabulary, re-exported so the fold and the views share it.
+pub use horde_proto::forward::direction_name as forward_direction_name;
 
 /// One journaled usage record as feed text: the *measured* facts only —
 /// token counts as journaled, and a rate-window statement as the provider

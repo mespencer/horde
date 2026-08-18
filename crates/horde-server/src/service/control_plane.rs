@@ -31,7 +31,7 @@ use horde_proto::v1::{
     UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
 };
-use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
@@ -1485,32 +1485,17 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<tonic::Streaming<horde_proto::v1::ForwardTunnelRequest>>,
     ) -> Result<Response<Self::ForwardTunnelStream>, Status> {
-        let serial = super::shared::peer_serial(&request);
-        let caller = super::forwards::tunnel_principal_of(&request);
-        let inbound = request
-            .into_inner()
-            .map(|message| message.map(|frame| frame.frame.unwrap_or_default()));
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let deny = self
             .enrollment
             .as_ref()
             .map(|authority| authority.deny_list());
-        let log = self.core.log.clone();
-        let registry = self.core.forwards.clone();
-        tokio::spawn(async move {
-            let pump = crate::forward::relay::run_tunnel(
-                &log,
-                &registry,
-                caller,
-                inbound,
-                &sender,
-                |frame| horde_proto::v1::ForwardTunnelResponse { frame: Some(frame) },
-            );
-            super::shared::run_severable(pump, deny, serial, &sender).await;
-        });
-
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        Ok(super::forwards::tunnel_response(
+            &self.core,
+            deny,
+            request,
+            |message: horde_proto::v1::ForwardTunnelRequest| message.frame.unwrap_or_default(),
+            |frame| horde_proto::v1::ForwardTunnelResponse { frame: Some(frame) },
+        ))
     }
 }
 

@@ -167,6 +167,44 @@ pub struct ForwardResult {
     pub message: String,
 }
 
+/// The raise a forward declaration becomes: judged under its direction's
+/// verb name, with the spec's proposal as the arguments modes constrain.
+#[must_use]
+pub fn forward_prompt(
+    spec: &horde_proto::v1::ForwardSpec,
+    tool_use_id: String,
+) -> horde_adapter_claude::permission::PromptRequest {
+    horde_adapter_claude::permission::PromptRequest {
+        tool_name: forward_verb_name(spec).to_owned(),
+        input: crate::forwards::forward_proposal(spec),
+        tool_use_id,
+    }
+}
+
+/// What a settled declaration means to the agent: a denial with its reason,
+/// or a grant naming the journaled intent's derived id.
+#[must_use]
+pub fn declared_result(
+    decision: &horde_adapter::PermissionDecision,
+    verb: &str,
+    name: &str,
+    worker_port: u32,
+    request_id: &str,
+) -> ForwardResult {
+    match decision {
+        horde_adapter::PermissionDecision::Deny { message } => ForwardResult {
+            granted: false,
+            forward_id: String::new(),
+            message: format!("denied: {message}"),
+        },
+        horde_adapter::PermissionDecision::Allow { .. } => ForwardResult {
+            granted: true,
+            forward_id: horde_proto::forward::derived_forward_id(request_id),
+            message: forward_granted_message(verb, name, worker_port),
+        },
+    }
+}
+
 /// The verb name a forward proposal is judged under — the tool name modes
 /// write rules against.
 #[must_use]
@@ -518,22 +556,18 @@ impl HordeEndpoint {
         identity: &AgentIdentity,
         spec: horde_proto::v1::ForwardSpec,
     ) -> Result<Json<ForwardResult>, ErrorData> {
-        if !crate::forwards::forwardable_port(spec.worker_port as u16) || spec.name.is_empty() {
+        if !crate::forwards::declarable(&spec) {
             return Err(ErrorData::invalid_params(
                 "a forward needs a nonzero port and a name: forwards are named, not numbered",
                 None,
             ));
         }
 
-        let prompt = horde_adapter_claude::permission::PromptRequest {
-            tool_name: forward_verb_name(&spec).to_owned(),
-            input: crate::forwards::forward_proposal(&spec),
-            // Minted, not harness-carried: verbs dispatched through the tool
-            // router cannot see `_meta`, so a retried declare re-raises
-            // rather than deduping — a safe failure (the chain re-asks), not
-            // a silent one.
-            tool_use_id: self.request_id_for(identity, None),
-        };
+        // The request id is minted, not harness-carried: verbs dispatched
+        // through the tool router cannot see `_meta`, so a retried declare
+        // re-raises rather than deduping — a safe failure (the chain
+        // re-asks), not a silent one.
+        let prompt = forward_prompt(&spec, self.request_id_for(identity, None));
         let name = spec.name.clone();
         let worker_port = spec.worker_port;
         let decision = self
@@ -542,18 +576,13 @@ impl HordeEndpoint {
             .await
             .map_err(internal)?;
 
-        Ok(Json(match decision {
-            horde_adapter::PermissionDecision::Deny { message } => ForwardResult {
-                granted: false,
-                forward_id: String::new(),
-                message: format!("denied: {message}"),
-            },
-            horde_adapter::PermissionDecision::Allow { .. } => ForwardResult {
-                granted: true,
-                forward_id: horde_proto::forward::derived_forward_id(&prompt.tool_use_id),
-                message: forward_granted_message(&prompt.tool_name, &name, worker_port),
-            },
-        }))
+        Ok(Json(declared_result(
+            &decision,
+            &prompt.tool_name,
+            &name,
+            worker_port,
+            &prompt.tool_use_id,
+        )))
     }
 
     #[tool(
@@ -1009,6 +1038,51 @@ mod tests {
             super::forward_verb_name(&spec(horde_proto::v1::ForwardDirection::Inject)),
             "inject"
         );
+    }
+
+    /// A declaration's raise and its settled result, both pure: the prompt
+    /// is judged under the direction's verb with string ports, and the
+    /// result carries the derived id on a grant and the reason on a denial.
+    #[test]
+    fn a_declaration_raises_and_settles_as_the_adr_says() {
+        let spec = horde_proto::v1::ForwardSpec {
+            direction: horde_proto::v1::ForwardDirection::Expose as i32,
+            name: "vite".to_owned(),
+            worker_port: 5173,
+            client_port: 0,
+        };
+        let prompt = super::forward_prompt(&spec, "req-9".to_owned());
+        assert_eq!(prompt.tool_name, "expose");
+        assert_eq!(prompt.tool_use_id, "req-9");
+        assert_eq!(prompt.input["port"], "5173", "ports ride as strings");
+
+        let granted = super::declared_result(
+            &horde_adapter::PermissionDecision::Allow {
+                updated_input: None,
+            },
+            "expose",
+            "vite",
+            5173,
+            "req-9",
+        );
+        assert!(granted.granted);
+        assert_eq!(
+            granted.forward_id, "fwd-req-9",
+            "the id the agent hears is the one the log derives"
+        );
+
+        let denied = super::declared_result(
+            &horde_adapter::PermissionDecision::Deny {
+                message: "not on this session".to_owned(),
+            },
+            "expose",
+            "vite",
+            5173,
+            "req-9",
+        );
+        assert!(!denied.granted);
+        assert!(denied.forward_id.is_empty(), "a denial names no intent");
+        assert!(denied.message.contains("not on this session"));
     }
 
     /// The grant message is what the agent acts on: an inject names the local

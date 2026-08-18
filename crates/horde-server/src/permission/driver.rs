@@ -1326,50 +1326,41 @@ mod tests {
         }
     }
 
-    /// A `PermissionRequested` proposing a forward: the tool-call shape the
-    /// rules match on, plus the spec the opener journals.
+    /// A `PermissionRequested` proposing a forward: [`requested`]'s shape —
+    /// the tool call the rules match on — plus the spec the opener journals.
     fn forward_requested(
         agent: &str,
         request_id: &str,
         spec: horde_proto::v1::ForwardSpec,
     ) -> Event {
-        agent_event(
-            agent,
-            Kind::PermissionRequested(PermissionRequested {
-                request: Some(PermissionRequest {
-                    request_id: Some(PermissionRequestId::new(request_id)),
-                    agent_id: Some(AgentId::new(agent)),
-                    tool_call: Some(ProposedToolCall {
-                        tool_name: "expose".to_owned(),
-                        input: None,
-                        rendered: format!("{} {}", spec.name, spec.worker_port),
-                    }),
-                    forward: Some(spec),
-                    ..PermissionRequest::default()
-                }),
-            }),
-        )
+        let call = ProposedToolCall {
+            tool_name: "expose".to_owned(),
+            input: None,
+            rendered: format!("{} {}", spec.name, spec.worker_port),
+        };
+        let mut event = requested(agent, request_id, Some(call));
+        if let Some(Kind::PermissionRequested(raised)) = event.kind.as_mut()
+            && let Some(request) = raised.request.as_mut()
+        {
+            request.forward = Some(spec);
+        }
+        event
     }
 
-    /// A human's allow, attributed to a client principal — the shape
+    /// [`human_decided`], attributed to a client principal — the shape
     /// `AnswerPermission` writes, and what backs an inject.
     fn client_decided(agent: &str, request_id: &str, client: &str) -> Event {
-        agent_event(
-            agent,
-            Kind::PermissionDecided(PermissionDecided {
-                decision: Some(PermissionDecision {
-                    request_id: Some(PermissionRequestId::new(request_id)),
-                    outcome: PermissionOutcome::Allow as i32,
-                    decided_by: PermissionLayer::Human as i32,
-                    decided_by_actor: Some(horde_proto::v1::Actor {
-                        actor: Some(horde_proto::v1::actor::Actor::ClientId(
-                            horde_proto::v1::ClientId::new(client),
-                        )),
-                    }),
-                    ..PermissionDecision::default()
-                }),
-            }),
-        )
+        let mut event = human_decided(agent, request_id, false);
+        if let Some(Kind::PermissionDecided(decided)) = event.kind.as_mut()
+            && let Some(decision) = decided.decision.as_mut()
+        {
+            decision.decided_by_actor = Some(horde_proto::v1::Actor {
+                actor: Some(horde_proto::v1::actor::Actor::ClientId(
+                    horde_proto::v1::ClientId::new(client),
+                )),
+            });
+        }
+        event
     }
 
     async fn forwards_in(log: &EventLog, session: &str) -> Vec<horde_proto::v1::ForwardOpened> {
@@ -1403,16 +1394,35 @@ mod tests {
         append(log, "s1", "req-1", forward_requested("root", "req-1", spec)).await;
     }
 
+    /// One forward request under `allows_expose`, accepted by these clients
+    /// in log order, then one full chain pass — the arrangement every
+    /// settled-forward test shares.
+    async fn settled_forward_run(
+        spec: horde_proto::v1::ForwardSpec,
+        accepting_clients: &[&str],
+    ) -> EventLog {
+        let log = EventLog::in_memory().expect("log");
+        one_forward_request(&log, spec).await;
+        for (ordinal, client) in accepting_clients.iter().enumerate() {
+            append(
+                &log,
+                "s1",
+                &format!("human-{ordinal}"),
+                client_decided("root", "req-1", client),
+            )
+            .await;
+        }
+        run_chain(&log, allows_expose(), None).await;
+        log
+    }
+
     #[tokio::test]
     async fn an_allowed_expose_opens_its_forward_with_no_backer() {
-        let log = EventLog::in_memory().expect("log");
-        one_forward_request(
-            &log,
+        let log = settled_forward_run(
             forward_spec(horde_proto::v1::ForwardDirection::Expose, "vite"),
+            &[],
         )
         .await;
-
-        run_chain(&log, allows_expose(), None).await;
 
         let opened = forwards_in(&log, "s1").await;
         assert_eq!(opened.len(), 1, "one settling allow, one open");
@@ -1456,14 +1466,11 @@ mod tests {
     /// can back one.
     #[tokio::test]
     async fn an_inject_escalates_past_every_automatic_layer() {
-        let log = EventLog::in_memory().expect("log");
-        one_forward_request(
-            &log,
+        let log = settled_forward_run(
             forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &[],
         )
         .await;
-
-        run_chain(&log, allows_expose(), None).await;
 
         assert!(
             decisions_in(&log, "s1").await.is_empty(),
@@ -1482,21 +1489,11 @@ mod tests {
     /// is journaled as the backer.
     #[tokio::test]
     async fn a_humans_acceptance_opens_the_inject_and_backs_it() {
-        let log = EventLog::in_memory().expect("log");
-        one_forward_request(
-            &log,
+        let log = settled_forward_run(
             forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &["laptop"],
         )
         .await;
-        append(
-            &log,
-            "s1",
-            "human-1",
-            client_decided("root", "req-1", "laptop"),
-        )
-        .await;
-
-        run_chain(&log, allows_expose(), None).await;
 
         let opened = forwards_in(&log, "s1").await;
         assert_eq!(opened.len(), 1);
@@ -1510,28 +1507,11 @@ mod tests {
     /// in the log is the backer, and the loser opens nothing.
     #[tokio::test]
     async fn racing_acceptances_back_the_first_in_the_log() {
-        let log = EventLog::in_memory().expect("log");
-        one_forward_request(
-            &log,
+        let log = settled_forward_run(
             forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &["laptop", "desk"],
         )
         .await;
-        append(
-            &log,
-            "s1",
-            "human-1",
-            client_decided("root", "req-1", "laptop"),
-        )
-        .await;
-        append(
-            &log,
-            "s1",
-            "human-2",
-            client_decided("root", "req-1", "desk"),
-        )
-        .await;
-
-        run_chain(&log, allows_expose(), None).await;
 
         let opened = forwards_in(&log, "s1").await;
         assert_eq!(opened.len(), 1, "one open, however many answers raced");
@@ -1546,14 +1526,12 @@ mod tests {
     /// is not opened at all rather than opened unbackable.
     #[tokio::test]
     async fn a_server_attributed_allow_cannot_back_an_inject() {
-        let log = EventLog::in_memory().expect("log");
-        one_forward_request(
-            &log,
+        let log = settled_forward_run(
             forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &[],
         )
         .await;
         append(&log, "s1", "human-1", human_decided("root", "req-1", false)).await;
-
         run_chain(&log, allows_expose(), None).await;
 
         assert!(
@@ -1566,14 +1544,11 @@ mod tests {
     /// the same single open.
     #[tokio::test]
     async fn a_restarted_driver_does_not_open_twice() {
-        let log = EventLog::in_memory().expect("log");
-        one_forward_request(
-            &log,
+        let log = settled_forward_run(
             forward_spec(horde_proto::v1::ForwardDirection::Expose, "vite"),
+            &[],
         )
         .await;
-
-        run_chain(&log, allows_expose(), None).await;
         let second = run_chain(&log, allows_expose(), None).await;
 
         assert_eq!(forwards_in(&log, "s1").await.len(), 1);

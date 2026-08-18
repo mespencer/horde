@@ -378,29 +378,15 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<Streaming<horde_proto::v1::WorkerForwardTunnelRequest>>,
     ) -> Result<Response<Self::WorkerForwardTunnelStream>, Status> {
-        let serial = super::shared::peer_serial(&request);
-        let caller = super::forwards::tunnel_principal_of(&request);
-        let inbound = request
-            .into_inner()
-            .map(|message| message.map(|frame| frame.frame.unwrap_or_default()));
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(16);
-        let deny = self.deny.clone();
-        let log = self.core.log.clone();
-        let registry = self.core.forwards.clone();
-        tokio::spawn(async move {
-            let pump = crate::forward::relay::run_tunnel(
-                &log,
-                &registry,
-                caller,
-                inbound,
-                &sender,
-                |frame| horde_proto::v1::WorkerForwardTunnelResponse { frame: Some(frame) },
-            );
-            super::shared::run_severable(pump, deny, serial, &sender).await;
-        });
-
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        Ok(super::forwards::tunnel_response(
+            &self.core,
+            self.deny.clone(),
+            request,
+            |message: horde_proto::v1::WorkerForwardTunnelRequest| {
+                message.frame.unwrap_or_default()
+            },
+            |frame| horde_proto::v1::WorkerForwardTunnelResponse { frame: Some(frame) },
+        ))
     }
 
     #[instrument(skip_all)]
