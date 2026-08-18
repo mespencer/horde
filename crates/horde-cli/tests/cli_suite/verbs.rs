@@ -354,6 +354,74 @@ async fn approve_reaches_the_server_and_an_unknown_request_is_refused() {
     }
 }
 
+/// The forward verbs' client calls, held to their effects on the log and
+/// the list — not their `Ok`s, per this suite's founding lesson.
+#[tokio::test]
+async fn the_forward_calls_round_trip_open_list_close() {
+    let endpoint = serve().await.expect("a listening server");
+    let (session_id, agent_id) = seed(&endpoint).await.expect("a seeded session");
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("the client dials");
+
+    let opened = client
+        .open_forward(
+            &session_id,
+            &agent_id,
+            horde_proto::v1::ForwardSpec {
+                direction: horde_proto::v1::ForwardDirection::Expose as i32,
+                name: "vite".to_owned(),
+                worker_port: 5173,
+                client_port: 8080,
+            },
+            "open-1",
+        )
+        .await
+        .expect("the open journals");
+    let forward_id = opened.forward_id.expect("an id").to_string();
+    assert!(
+        forward_id.starts_with("fwd-"),
+        "a defaulted answer names no identity: {forward_id}"
+    );
+    assert!(opened.sequence > 0, "the open names its log position");
+
+    let listed = client
+        .list_forwards(Some(&session_id))
+        .await
+        .expect("the list answers");
+    assert_eq!(listed.len(), 1, "the open is listable, not just acked");
+    let intent = listed[0].intent.as_ref().expect("the intent rides whole");
+    assert_eq!(
+        intent.forward_id.as_ref().map(ToString::to_string),
+        Some(forward_id.clone())
+    );
+    assert_eq!(
+        intent
+            .spec
+            .as_ref()
+            .map(|spec| (spec.worker_port, spec.client_port)),
+        Some((5173, 8080)),
+        "both ports survive the round trip"
+    );
+
+    let closed_at = client
+        .close_forward(&session_id, &forward_id, "done")
+        .await
+        .expect("the close journals");
+    assert!(
+        closed_at > opened.sequence,
+        "the close is a later log position than the open, never a constant"
+    );
+    assert!(
+        client
+            .list_forwards(Some(&session_id))
+            .await
+            .expect("the list answers")
+            .is_empty(),
+        "a closed forward leaves the live list"
+    );
+}
+
 #[tokio::test]
 async fn a_verb_against_a_missing_session_fails_rather_than_printing_nothing() {
     let endpoint = serve().await.expect("a listening server");
