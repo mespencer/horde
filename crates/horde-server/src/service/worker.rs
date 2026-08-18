@@ -574,6 +574,11 @@ async fn pump_forwards(
     }
     loop {
         tokio::select! {
+            // The worker hung up. Noticed here rather than on the next failed
+            // send, because deregistration is what turns tunnel opens into
+            // fast WORKER_UNREACHABLE refusals instead of pairing-deadline
+            // stalls.
+            () = sender.closed() => return,
             connection = lane.recv() => {
                 // A closed lane means a newer stream replaced this one; the
                 // replacement carries the intents from here on.

@@ -1450,12 +1450,23 @@ impl ControlPlaneService for ControlPlane {
         let registry = self.core.forwards.clone();
         tokio::spawn(async move {
             let pump = async {
-                while let Some(connection) = lane.recv().await {
-                    let update = horde_proto::v1::ServeForwardsResponse {
-                        connection: Some(connection),
-                    };
-                    if sender.send(Ok(update)).await.is_err() {
-                        return; // The client hung up; deregistration unbacks.
+                loop {
+                    tokio::select! {
+                        // The client hung up. Noticed here rather than on the
+                        // next failed send, because deregistering is what
+                        // "unbacked" means — a detached backer must refuse
+                        // worker-side connections promptly, not after the
+                        // next one happens to be pushed.
+                        () = sender.closed() => return,
+                        connection = lane.recv() => {
+                            let Some(connection) = connection else { return };
+                            let update = horde_proto::v1::ServeForwardsResponse {
+                                connection: Some(connection),
+                            };
+                            if sender.send(Ok(update)).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             };

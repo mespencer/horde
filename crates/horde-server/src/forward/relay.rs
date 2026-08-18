@@ -339,13 +339,15 @@ fn unanswered_refusal(target: &PassiveTarget) -> ForwardTunnelFrame {
     }
 }
 
-/// Moves frames both ways until both directions end.
+/// Moves frames both ways until either leg ends.
 ///
-/// Ends by structure: the inbound stream finishing (or failing) drops
-/// `to_peer`, which the peer's splice observes as its channel closing; the
-/// peer channel closing disables that arm. When both arms are disabled the
-/// `else` branch returns. No clock — a tunnel lives exactly as long as its
-/// connection.
+/// TCP half-close is the explicit `eof` *frame*, relayed like any other; a
+/// leg's stream ending is full teardown — the peer process finished or
+/// died — and must end the whole tunnel, or a worker partition would leave
+/// every idle client connection hanging open against a relay with nothing
+/// on the other side. Ends by structure, no clock: every arm's terminal
+/// case returns, and returning drops both channel ends, which is what the
+/// paired splice observes as its own terminal case.
 async fn splice<S, T, W>(
     mut inbound: S,
     to_peer: mpsc::Sender<ForwardTunnelFrame>,
@@ -356,35 +358,24 @@ async fn splice<S, T, W>(
     S: Stream<Item = Result<ForwardTunnelFrame, Status>> + Unpin + Send,
     W: Fn(ForwardTunnelFrame) -> T,
 {
-    let mut to_peer = Some(to_peer);
-    let mut peer_open = true;
     loop {
         tokio::select! {
-            frame = inbound.next(), if to_peer.is_some() => {
-                let delivered = match frame {
-                    Some(Ok(frame)) => match &to_peer {
-                        Some(lane) => lane.send(frame).await.is_ok(),
-                        None => false,
-                    },
-                    _ => false,
+            frame = inbound.next() => {
+                let Some(Ok(frame)) = frame else {
+                    return; // This leg ended or errored: teardown.
                 };
-                if !delivered {
-                    // Inbound ended, errored, or the peer is gone: dropping
-                    // the sender is the half-close the peer observes.
-                    to_peer = None;
+                if to_peer.send(frame).await.is_err() {
+                    return; // The paired splice returned already.
                 }
             }
-            frame = from_peer.recv(), if peer_open => {
-                match frame {
-                    Some(frame) => {
-                        if sender.send(Ok(wrap(frame))).await.is_err() {
-                            return; // Our own peer hung up; nothing left to carry.
-                        }
-                    }
-                    None => peer_open = false,
+            frame = from_peer.recv() => {
+                let Some(frame) = frame else {
+                    return; // The peer leg ended: teardown.
+                };
+                if sender.send(Ok(wrap(frame))).await.is_err() {
+                    return; // Our own peer hung up; nothing left to carry.
                 }
             }
-            else => return,
         }
     }
 }
@@ -593,10 +584,13 @@ mod tests {
         harness.task.abort();
     }
 
-    /// Inbound ending must half-close toward the peer while the peer's
-    /// frames keep flowing — and the splice must end once both do.
+    /// A leg's stream ending is teardown, not half-close: the peer channel
+    /// closes and the splice returns. Half-close is the `eof` frame, which
+    /// relays like data — the previous test's second exchange proves that.
+    /// This is the partition contract: a dead worker leg must not leave an
+    /// idle client connection hanging.
     #[tokio::test]
-    async fn a_splice_half_closes_and_then_ends_by_structure() {
+    async fn a_legs_stream_ending_tears_the_whole_splice_down() {
         let mut harness = spliced();
 
         drop(harness.inbound);
@@ -606,30 +600,37 @@ mod tests {
                 .expect("the peer channel must close within the ceiling");
         assert!(
             peer_saw_close.is_none(),
-            "dropping inbound is the peer's half-close"
+            "a dead leg closes the peer channel"
         );
-
-        // The other direction still delivers.
-        harness
-            .from_peer
-            .send(eof_frame())
-            .await
-            .expect("send from peer");
-        let last = within("late peer frames still relay", &mut harness.outbound).await;
-        assert_eq!(last.expect("an ok frame"), eof_frame());
-
-        // And closing it ends the splice — by structure, not by clock.
-        drop(harness.from_peer);
         tokio::time::timeout(std::time::Duration::from_secs(5), harness.task)
             .await
-            .expect("the splice must end when both directions have")
+            .expect("the splice must end with its leg, not idle on")
             .expect("the splice task must not panic");
     }
 
-    /// An inbound *error* (peer reset) tears down the peer direction the
-    /// same way an end does.
+    /// The eof frame relays as a frame — half-close is carried, never
+    /// interpreted as teardown by the relay.
     #[tokio::test]
-    async fn an_inbound_error_half_closes_toward_the_peer() {
+    async fn an_eof_frame_relays_without_ending_the_splice() {
+        let mut harness = spliced();
+        harness.inbound.send(Ok(eof_frame())).await.expect("send");
+        let relayed = within("eof relays as a frame", &mut harness.to_peer).await;
+        assert_eq!(relayed, eof_frame());
+
+        // Still alive: the other direction delivers after the eof.
+        harness
+            .from_peer
+            .send(data_frame(vec![9]))
+            .await
+            .expect("send from peer");
+        let echoed = within("frames still flow after a relayed eof", &mut harness.outbound).await;
+        assert_eq!(echoed.expect("an ok frame"), data_frame(vec![9]));
+        harness.task.abort();
+    }
+
+    /// An inbound *error* (peer reset) ends the splice like an end does.
+    #[tokio::test]
+    async fn an_inbound_error_tears_the_splice_down() {
         let mut harness = spliced();
         harness
             .inbound
@@ -641,7 +642,10 @@ mod tests {
                 .await
                 .expect("must close within the ceiling");
         assert!(closed.is_none());
-        harness.task.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(5), harness.task)
+            .await
+            .expect("the splice must end on an errored leg")
+            .expect("no panic");
     }
 
     // -- refusal plumbing ---------------------------------------------------

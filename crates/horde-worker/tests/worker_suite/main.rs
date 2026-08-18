@@ -23,6 +23,7 @@ mod attachments;
 mod codex_supervision;
 mod connection;
 mod daemon;
+mod forwards;
 mod payload_share;
 mod supervision;
 mod workspaces;
