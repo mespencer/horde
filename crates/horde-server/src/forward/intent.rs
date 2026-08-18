@@ -175,8 +175,17 @@ pub async fn open_for_settled(
     let Some(event) = opened_event(&state, &request_id, pending, spec, decision) else {
         return Ok(0);
     };
-    append_server_event(log, &session_id, &format!("forward-open:{request_id}"), event).await?;
-    Ok(1)
+    let appended = crate::service::shared::append_server_event_returning(
+        log,
+        &session_id,
+        &format!("forward-open:{request_id}"),
+        event,
+    )
+    .await?;
+    // A replayed decision recomputes the same open and deduplicates into it;
+    // only a first-time append counts, so a restarted driver reports the
+    // idempotence it claims.
+    Ok(u64::from(!appended.deduplicated))
 }
 
 /// The `ForwardOpened` a settled forward request produces, or `None` when
