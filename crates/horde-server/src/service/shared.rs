@@ -520,6 +520,8 @@ mod tests {
             Kind::EnrollmentCodeMinted(EnrollmentCodeMinted::default()),
             Kind::IdentityEnrolled(IdentityEnrolled::default()),
             Kind::EnrollmentRevoked(EnrollmentRevoked::default()),
+            Kind::ForwardOpened(ForwardOpened::default()),
+            Kind::ForwardClosed(ForwardClosed::default()),
         ];
 
         let mut seen = std::collections::BTreeSet::new();

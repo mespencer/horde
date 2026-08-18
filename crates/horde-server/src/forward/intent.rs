@@ -121,14 +121,7 @@ pub fn settled_in(global: &GlobalEvent) -> Option<PermissionDecision> {
     }
 }
 
-/// The forward id a chain-driven open derives from its request.
-///
-/// Deterministic on purpose: a restarted driver re-deriving the same id is
-/// what lets the keyed append deduplicate instead of double-opening.
-#[must_use]
-pub fn derived_forward_id(request_id: &str) -> String {
-    format!("fwd-{request_id}")
-}
+pub use horde_proto::forward::derived_forward_id;
 
 /// Opens the forward a settling decision approved, if it approved one.
 /// Returns how many events were appended (0 or 1).

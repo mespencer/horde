@@ -125,6 +125,36 @@ impl PermissionBroker {
         identity: &AgentIdentity,
         prompt: &PromptRequest,
     ) -> Result<PermissionDecision, PermissionError> {
+        self.adjudicate_proposal(identity, prompt, None).await
+    }
+
+    /// [`Self::adjudicate`], with a forward spec riding the raise (ADR-0006).
+    ///
+    /// The spec on the request is what turns an ALLOW into a journaled
+    /// `ForwardOpened` server-side: an expose flows the chain's modes like
+    /// any proposed action, and an inject escalates to the inbox where the
+    /// first accepting client becomes the backer. This endpoint only raises
+    /// and waits, exactly as for every other proposal.
+    ///
+    /// # Errors
+    ///
+    /// [`PermissionError`], same as [`Self::adjudicate`].
+    pub async fn adjudicate_forward(
+        &self,
+        identity: &AgentIdentity,
+        prompt: &PromptRequest,
+        forward: horde_proto::v1::ForwardSpec,
+    ) -> Result<PermissionDecision, PermissionError> {
+        self.adjudicate_proposal(identity, prompt, Some(forward))
+            .await
+    }
+
+    async fn adjudicate_proposal(
+        &self,
+        identity: &AgentIdentity,
+        prompt: &PromptRequest,
+        forward: Option<horde_proto::v1::ForwardSpec>,
+    ) -> Result<PermissionDecision, PermissionError> {
         let session_id = self.context.session_id().to_owned();
         let mut client = self.context.client();
         // The harness's own id for this tool call: unique per call, and stable
@@ -147,7 +177,12 @@ impl PermissionBroker {
                 session_id,
                 agent_id: Some(identity.agent_id().to_owned()),
                 idempotency_key: request_id.clone(),
-                kind: EventKind::PermissionRequested(requested(identity, prompt, &request_id)),
+                kind: EventKind::PermissionRequested(requested(
+                    identity,
+                    prompt,
+                    &request_id,
+                    forward,
+                )),
             })
             .await
             .map_err(|source| PermissionError::NotRaised { source })?;
@@ -194,6 +229,7 @@ fn requested(
     identity: &AgentIdentity,
     prompt: &PromptRequest,
     request_id: &str,
+    forward: Option<horde_proto::v1::ForwardSpec>,
 ) -> horde_proto::v1::PermissionRequested {
     horde_proto::v1::PermissionRequested {
         request: Some(horde_proto::v1::PermissionRequest {
@@ -207,6 +243,7 @@ fn requested(
                 input: as_struct(&prompt.input),
                 rendered: rendered(prompt),
             }),
+            forward,
             ..horde_proto::v1::PermissionRequest::default()
         }),
     }
@@ -285,9 +322,38 @@ mod tests {
             &crate::testing::identity("agent-42"),
             &prompt("Write", json!({"file_path": "/x"})),
             "toolu_01",
+            None,
         )
         .request
         .expect("the escalation carries its request")
+    }
+
+    /// A forward raise carries its spec, and an ordinary raise carries none:
+    /// the spec on the request is the entire difference between "a tool call
+    /// was allowed" and "a forward was opened" server-side.
+    #[test]
+    fn a_forward_raise_carries_the_spec_the_acceptance_will_open() {
+        let spec = horde_proto::v1::ForwardSpec {
+            direction: horde_proto::v1::ForwardDirection::Expose as i32,
+            name: "vite".to_owned(),
+            worker_port: 5173,
+            client_port: 0,
+        };
+        let raised = requested(
+            &crate::testing::identity("agent-42"),
+            &prompt("expose", json!({"port": "5173", "name": "vite"})),
+            "toolu_02",
+            Some(spec.clone()),
+        )
+        .request
+        .expect("the escalation carries its request");
+
+        assert_eq!(raised.forward, Some(spec));
+        assert_eq!(
+            escalation().forward,
+            None,
+            "an ordinary proposal must not grow a forward"
+        );
     }
 
     /// The escalation is attributed to the authenticated caller. An event

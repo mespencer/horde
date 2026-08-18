@@ -8,8 +8,9 @@ use horde_proto::prost::Message;
 use horde_proto::prost_types::{DescriptorProto, FileDescriptorSet};
 use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
-    AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, EnrollmentCodeMinted,
-    EnrollmentRevoked, Event, EventEnvelope, IdentityEnrolled, McpHttpTransport, McpServerConfig,
+    AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, ClientId,
+    EnrollmentCodeMinted, EnrollmentRevoked, Event, EventEnvelope, ForwardClosed, ForwardDirection,
+    ForwardId, ForwardOpened, ForwardSpec, IdentityEnrolled, McpHttpTransport, McpServerConfig,
     McpServerConfigChanged, Note, NoteSent, Payload, PermissionDecided, PermissionDecision,
     PermissionRequest, PermissionRequested, Placement, PlacementChanged, PlacementState,
     ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged, SessionLifecycleState,
@@ -34,6 +35,8 @@ use horde_proto::v1::{
 /// * Enrollment (DESIGN §3): codes minted, identities issued, certificates
 ///   revoked — journaled through the log like everything else, in a reserved
 ///   stream like the Definition catalog's.
+/// * Port-forward intents (ADR-0006): opened and closed. Durable intent
+///   only — the tunnel plane realizing a forward never touches the log.
 const EVENT_VOCABULARY: &[&str] = &[
     "agent_output_chunk",
     "agent_spawned",
@@ -54,6 +57,8 @@ const EVENT_VOCABULARY: &[&str] = &[
     "identity_enrolled",
     "enrollment_revoked",
     "mcp_server_config_changed",
+    "forward_opened",
+    "forward_closed",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -81,6 +86,8 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::IdentityEnrolled(_) => "identity_enrolled",
         event::Kind::EnrollmentRevoked(_) => "enrollment_revoked",
         event::Kind::McpServerConfigChanged(_) => "mcp_server_config_changed",
+        event::Kind::ForwardOpened(_) => "forward_opened",
+        event::Kind::ForwardClosed(_) => "forward_closed",
     }
 }
 
@@ -209,6 +216,22 @@ fn every_kind() -> Vec<event::Kind> {
             }),
             deleted: false,
         }),
+        event::Kind::ForwardOpened(ForwardOpened {
+            forward_id: Some(ForwardId::new("fwd-1")),
+            spec: Some(ForwardSpec {
+                direction: ForwardDirection::Inject.into(),
+                name: "db".to_owned(),
+                worker_port: 15432,
+                client_port: 5432,
+            }),
+            opened_by: None,
+            backer_client_id: Some(ClientId::new("laptop")),
+        }),
+        event::Kind::ForwardClosed(ForwardClosed {
+            forward_id: Some(ForwardId::new("fwd-1")),
+            closed_by: None,
+            reason: "done with the database".to_owned(),
+        }),
     ]
 }
 
@@ -319,7 +342,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 19] = [
+    let expected: [(&str, i32); 21] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -339,6 +362,8 @@ fn event_kind_tags_are_stable() {
         ("identity_enrolled", 26),
         ("enrollment_revoked", 27),
         ("mcp_server_config_changed", 28),
+        ("forward_opened", 29),
+        ("forward_closed", 30),
     ];
 
     let expected: Vec<(String, i32)> = expected

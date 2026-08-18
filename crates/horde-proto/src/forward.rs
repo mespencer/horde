@@ -66,6 +66,18 @@ pub fn refusal_in(frame: &ForwardTunnelFrame) -> Option<&ForwardTunnelRefusal> {
     }
 }
 
+/// The forward id a chain-approved request opens under (ADR-0006).
+///
+/// Shared vocabulary rather than a server detail: the server's opener derives
+/// it to make its keyed append idempotent across restarts, and the agent
+/// endpoint derives the same id to tell the agent what its approved expose is
+/// called — two crates, one rule, or the id the agent hears drifts from the
+/// one the log holds.
+#[must_use]
+pub fn derived_forward_id(request_id: &str) -> String {
+    format!("fwd-{request_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

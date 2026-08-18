@@ -135,6 +135,61 @@ pub struct WaitParams {
     pub agent_id: String,
 }
 
+/// `expose <port> as <name>` (ADR-0006).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExposeParams {
+    /// The port your workspace serves on this worker's localhost.
+    pub port: u16,
+    /// The forward's name, e.g. "vite". Forwards are named, not numbered.
+    pub name: String,
+}
+
+/// An agent-initiated inject (ADR-0006).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InjectParams {
+    /// The port on the accepting human's machine you want to reach.
+    pub port: u16,
+    /// The forward's name, e.g. "db".
+    pub name: String,
+    /// The localhost port on this worker where the injected service appears.
+    /// Defaults to `port`.
+    #[serde(default)]
+    pub worker_port: Option<u16>,
+}
+
+/// What a forward declaration came back as.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ForwardResult {
+    /// False means the chain (or a human) refused; the message says why.
+    pub granted: bool,
+    /// The journaled intent's id, when granted.
+    pub forward_id: String,
+    pub message: String,
+}
+
+/// The verb name a forward proposal is judged under — the tool name modes
+/// write rules against.
+#[must_use]
+pub fn forward_verb_name(spec: &horde_proto::v1::ForwardSpec) -> &'static str {
+    if spec.direction == horde_proto::v1::ForwardDirection::Inject as i32 {
+        "inject"
+    } else {
+        "expose"
+    }
+}
+
+/// What a granted forward means, in words the agent can act on.
+#[must_use]
+pub fn forward_granted_message(verb: &str, name: &str, worker_port: u32) -> String {
+    if verb == "inject" {
+        format!("granted: {name} will appear at 127.0.0.1:{worker_port} on this worker")
+    } else {
+        format!(
+            "granted: attached clients will realize {name} from this worker's port {worker_port}"
+        )
+    }
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ResultView {
     pub status: String,
@@ -414,6 +469,91 @@ impl HordeEndpoint {
             .map_err(internal)?;
 
         Ok("recorded".to_owned())
+    }
+
+    #[tool(
+        name = "expose",
+        description = "Expose a port your workspace serves (e.g. a dev server) so it appears on each attached human's localhost. Flows the permission chain like any proposed action; the humans' clients realize it."
+    )]
+    async fn expose(
+        &self,
+        Parameters(params): Parameters<ExposeParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ForwardResult>, ErrorData> {
+        let identity = Self::caller(&context)?;
+        let spec = crate::forwards::expose_spec(params.port, &params.name);
+        self.declare_forward(&identity, spec).await
+    }
+
+    #[tool(
+        name = "inject",
+        description = "Ask for a port on an attached human's machine (e.g. a database only they can reach) to appear on this worker's localhost. Surfaces in every attached client's inbox and blocks until a human accepts; the first to accept serves the traffic."
+    )]
+    async fn inject(
+        &self,
+        Parameters(params): Parameters<InjectParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ForwardResult>, ErrorData> {
+        let identity = Self::caller(&context)?;
+        let worker_port = params.worker_port.unwrap_or(params.port);
+        if !crate::forwards::forwardable_port(worker_port) {
+            return Err(ErrorData::invalid_params(
+                "worker_port must be nonzero: the intent is journaled, and the log cannot \
+                 hold an ephemeral port",
+                None,
+            ));
+        }
+        let spec = crate::forwards::inject_spec(params.port, worker_port, &params.name);
+        self.declare_forward(&identity, spec).await
+    }
+
+    /// The body both forward verbs share: validate, raise through the chain
+    /// with the spec riding the request, and report what the decision means.
+    ///
+    /// On ALLOW the server's chain driver journals the `ForwardOpened` (the
+    /// decision *is* the open — this endpoint never writes one), under the id
+    /// derived from this raise's request id.
+    async fn declare_forward(
+        &self,
+        identity: &AgentIdentity,
+        spec: horde_proto::v1::ForwardSpec,
+    ) -> Result<Json<ForwardResult>, ErrorData> {
+        if !crate::forwards::forwardable_port(spec.worker_port as u16) || spec.name.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "a forward needs a nonzero port and a name: forwards are named, not numbered",
+                None,
+            ));
+        }
+
+        let prompt = horde_adapter_claude::permission::PromptRequest {
+            tool_name: forward_verb_name(&spec).to_owned(),
+            input: crate::forwards::forward_proposal(&spec),
+            // Minted, not harness-carried: verbs dispatched through the tool
+            // router cannot see `_meta`, so a retried declare re-raises
+            // rather than deduping — a safe failure (the chain re-asks), not
+            // a silent one.
+            tool_use_id: self.request_id_for(identity, None),
+        };
+        let name = spec.name.clone();
+        let worker_port = spec.worker_port;
+        let decision = self
+            .broker()
+            .adjudicate_forward(identity, &prompt, spec)
+            .await
+            .map_err(internal)?;
+
+        Ok(Json(match decision {
+            horde_adapter::PermissionDecision::Deny { message } => ForwardResult {
+                granted: false,
+                forward_id: String::new(),
+                message: format!("denied: {message}"),
+            },
+            horde_adapter::PermissionDecision::Allow { .. } => ForwardResult {
+                granted: true,
+                forward_id: horde_proto::forward::derived_forward_id(&prompt.tool_use_id),
+                message: forward_granted_message(&prompt.tool_name, &name, worker_port),
+            },
+        }))
     }
 
     #[tool(
@@ -853,6 +993,41 @@ mod tests {
         assert_eq!(super::message_kind_for(false), MessageKind::Assign);
     }
 
+    /// The verb name is what modes write rules against, so the mapping from
+    /// direction to name is contract, not cosmetics.
+    #[test]
+    fn a_forward_is_judged_under_its_directions_verb() {
+        let spec = |direction: horde_proto::v1::ForwardDirection| horde_proto::v1::ForwardSpec {
+            direction: direction as i32,
+            ..horde_proto::v1::ForwardSpec::default()
+        };
+        assert_eq!(
+            super::forward_verb_name(&spec(horde_proto::v1::ForwardDirection::Expose)),
+            "expose"
+        );
+        assert_eq!(
+            super::forward_verb_name(&spec(horde_proto::v1::ForwardDirection::Inject)),
+            "inject"
+        );
+    }
+
+    /// The grant message is what the agent acts on: an inject names the local
+    /// address to dial, an expose says who realizes it.
+    #[test]
+    fn the_grant_message_tells_the_agent_what_to_do_next() {
+        let inject = super::forward_granted_message("inject", "db", 15432);
+        assert!(inject.contains("127.0.0.1:15432"), "{inject}");
+        assert!(inject.contains("db"), "{inject}");
+
+        let expose = super::forward_granted_message("expose", "vite", 5173);
+        assert!(expose.contains("5173"), "{expose}");
+        assert!(expose.contains("vite"), "{expose}");
+        assert!(
+            !expose.contains("127.0.0.1"),
+            "an expose is not dialable worker-side: {expose}"
+        );
+    }
+
     #[tokio::test]
     async fn the_tool_names_are_the_ones_agents_are_told_about() {
         let names = endpoint().tool_names();
@@ -863,6 +1038,8 @@ mod tests {
             "send_message",
             "report_result",
             "wait_for_agent",
+            "expose",
+            "inject",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),
