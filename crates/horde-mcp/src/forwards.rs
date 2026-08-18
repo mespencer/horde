@@ -67,6 +67,39 @@ pub fn declarable(spec: &ForwardSpec) -> bool {
     forwardable_port(port) && !spec.name.is_empty()
 }
 
+/// [`declarable`] as the gate the handlers apply: `Err` carries the words
+/// the agent reads. A gate rather than an `if !…` in the handler, because
+/// the handler is reachable only through a whole MCP request and an
+/// inverted refusal there would pass everything else this crate tests.
+///
+/// # Errors
+///
+/// The refusal, in the agent's vocabulary.
+pub fn declaration_gate(spec: &ForwardSpec) -> Result<(), &'static str> {
+    if declarable(spec) {
+        Ok(())
+    } else {
+        Err("a forward needs a nonzero port and a name: forwards are named, not numbered")
+    }
+}
+
+/// The worker-loopback port an inject binds: the explicit one, defaulted to
+/// the target port — refused as unforwardable when zero, because the intent
+/// is journaled and the log cannot hold an ephemeral port.
+///
+/// # Errors
+///
+/// The refusal, in the agent's vocabulary.
+pub fn inject_worker_port(port: u16, worker_port: Option<u16>) -> Result<u16, &'static str> {
+    let chosen = worker_port.unwrap_or(port);
+    if forwardable_port(chosen) {
+        Ok(chosen)
+    } else {
+        Err("worker_port must be nonzero: the intent is journaled, and the log cannot hold an \
+             ephemeral port")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +160,21 @@ mod tests {
             !declarable(&spec(70_000, "vite")),
             "a port that fits no u16 is not a port"
         );
+
+        // The gate the handlers apply: same verdicts, plus the words.
+        assert!(declaration_gate(&spec(5173, "vite")).is_ok());
+        let refused = declaration_gate(&spec(0, "vite")).expect_err("must refuse");
+        assert!(refused.contains("named, not numbered"), "{refused}");
+    }
+
+    /// The inject port choice, both directions: explicit outranks default,
+    /// the default is the target port, and zero refuses either way.
+    #[test]
+    fn the_inject_worker_port_defaults_and_refuses_zero() {
+        assert_eq!(inject_worker_port(5432, None), Ok(5432));
+        assert_eq!(inject_worker_port(5432, Some(15432)), Ok(15432));
+        assert!(inject_worker_port(0, None).is_err());
+        let refused = inject_worker_port(5432, Some(0)).expect_err("zero is no port");
+        assert!(refused.contains("nonzero"), "{refused}");
     }
 }

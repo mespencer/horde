@@ -533,14 +533,8 @@ impl HordeEndpoint {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<ForwardResult>, ErrorData> {
         let identity = Self::caller(&context)?;
-        let worker_port = params.worker_port.unwrap_or(params.port);
-        if !crate::forwards::forwardable_port(worker_port) {
-            return Err(ErrorData::invalid_params(
-                "worker_port must be nonzero: the intent is journaled, and the log cannot \
-                 hold an ephemeral port",
-                None,
-            ));
-        }
+        let worker_port = crate::forwards::inject_worker_port(params.port, params.worker_port)
+            .map_err(|refusal| ErrorData::invalid_params(refusal, None))?;
         let spec = crate::forwards::inject_spec(params.port, worker_port, &params.name);
         self.declare_forward(&identity, spec).await
     }
@@ -556,12 +550,8 @@ impl HordeEndpoint {
         identity: &AgentIdentity,
         spec: horde_proto::v1::ForwardSpec,
     ) -> Result<Json<ForwardResult>, ErrorData> {
-        if !crate::forwards::declarable(&spec) {
-            return Err(ErrorData::invalid_params(
-                "a forward needs a nonzero port and a name: forwards are named, not numbered",
-                None,
-            ));
-        }
+        crate::forwards::declaration_gate(&spec)
+            .map_err(|refusal| ErrorData::invalid_params(refusal, None))?;
 
         // The request id is minted, not harness-carried: verbs dispatched
         // through the tool router cannot see `_meta`, so a retried declare

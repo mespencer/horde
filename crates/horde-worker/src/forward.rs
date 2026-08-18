@@ -242,7 +242,7 @@ async fn inject_accept_loop(
 ) {
     let mut carried = tokio::task::JoinSet::new();
     let mut consecutive_failures = 0_u32;
-    while consecutive_failures < horde_cli::forward::ACCEPT_FAILURE_BOUND {
+    while horde_cli::forward::keeps_accepting(consecutive_failures) {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((tcp, _peer)) => {
@@ -300,6 +300,31 @@ async fn originate_inject_connection(
 mod tests {
     use super::still_wanted;
     use std::collections::BTreeMap;
+
+    /// Dropping a listener aborts its accept loop — the owned witness is a
+    /// guard the loop holds: cancellation drops it, and the receiver's error
+    /// is the proof. A `Drop` hollowed to nothing leaks the loop, and the
+    /// port it holds, past the intent that justified them.
+    #[tokio::test]
+    async fn dropping_an_inject_listener_reaps_its_accept_loop() {
+        let (guard, reaped) = tokio::sync::oneshot::channel::<()>();
+        let accept_task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        drop(super::InjectListener {
+            worker_port: 5432,
+            accept_task,
+        });
+
+        let witnessed = tokio::time::timeout(std::time::Duration::from_secs(5), reaped)
+            .await
+            .expect("the drop must reap within the ceiling");
+        assert!(
+            witnessed.is_err(),
+            "the guard must be dropped by cancellation, never sent"
+        );
+    }
 
     /// The reconciliation predicate's table: same id and same port keeps a
     /// listener; a vanished intent or a moved port drops it. The moved-port

@@ -270,6 +270,16 @@ pub fn connection_id() -> String {
 /// bound, because a clock cannot bound a loop that fails without waiting.
 pub const ACCEPT_FAILURE_BOUND: u32 = 32;
 
+/// Whether an accept loop is still within its failure budget. Named — and
+/// shared with the worker's inject listener — because the boundary is
+/// unreachable in any test that cannot stage thirty-two consecutive accept
+/// failures, and off-by-one here is the difference between a bounded loop
+/// and a spin.
+#[must_use]
+pub fn keeps_accepting(consecutive_failures: u32) -> bool {
+    consecutive_failures < ACCEPT_FAILURE_BOUND
+}
+
 /// One realized expose: a bound local listener whose every accepted
 /// connection becomes a tunnel. Stopping it (or dropping it) closes the
 /// listener and aborts every in-flight connection — realization is tied to
@@ -339,7 +349,7 @@ pub async fn realize_expose(
 async fn accept_loop(listener: TcpListener, client: crate::client::Client, forward_id: String) {
     let mut connections = tokio::task::JoinSet::new();
     let mut consecutive_failures = 0_u32;
-    while consecutive_failures < ACCEPT_FAILURE_BOUND {
+    while keeps_accepting(consecutive_failures) {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((tcp, _peer)) => {
