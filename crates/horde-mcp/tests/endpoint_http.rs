@@ -26,7 +26,7 @@ const TOKEN: &str = "endpoint-http-token";
 struct Served {
     address: std::net::SocketAddr,
     horde: common::Harness,
-    _serving: tokio::task::JoinHandle<()>,
+    _serving: horde_mcp::server::ServingEndpoint,
 }
 
 async fn served() -> Setup<Served> {

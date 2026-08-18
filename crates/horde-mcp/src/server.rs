@@ -149,7 +149,39 @@ impl EndpointConfig {
     }
 }
 
-/// Serves one endpoint until the returned handle is dropped.
+/// One serving endpoint: its accept loop and every connection it admitted.
+///
+/// Shutdown is a reap, not just an abort: the loop is told to stop, drops
+/// its listener, then aborts and awaits each connection task it spawned —
+/// so when [`ServingEndpoint::shutdown`] returns, every socket this
+/// endpoint ever held (the listener *and* the accepted connections) is
+/// provably closed. Merely aborting an accept loop leaves the connections
+/// it admitted alive in detached tasks, still serving verbs and still
+/// holding the port after "shutdown" claimed otherwise.
+///
+/// Dropping the handle instead stops the endpoint the same way, but in the
+/// background, with nothing to await.
+#[derive(Debug)]
+pub struct ServingEndpoint {
+    /// Closing this channel is the stop signal; a dropped handle closes it
+    /// too, which is what makes drop a background stop.
+    stop: tokio::sync::oneshot::Sender<()>,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl ServingEndpoint {
+    /// Stops serving, returning only after the listener and every admitted
+    /// connection have actually been dropped. Bounded: the reap is an abort
+    /// plus a join, and an aborted connection resolves at its next await.
+    pub async fn shutdown(self) {
+        drop(self.stop);
+        // The JoinError here is only ever this endpoint's own completion
+        // being reported; the reap having happened is the point.
+        let _ = self.serving.await;
+    }
+}
+
+/// Serves one endpoint until the returned handle is shut down or dropped.
 ///
 /// Returns the address actually bound, which is what a caller passes to the
 /// harness — a config with port 0 is resolved by the OS, and guessing at it
@@ -167,7 +199,7 @@ pub async fn serve<H>(
     config: &EndpointConfig,
     registry: std::sync::Arc<AgentRegistry>,
     endpoint: H,
-) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>
+) -> std::io::Result<(std::net::SocketAddr, ServingEndpoint)>
 where
     H: rmcp::ServerHandler + Clone + Sync,
 {
@@ -199,31 +231,54 @@ where
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let bound = listener.local_addr()?;
 
-    let handle = tokio::spawn(async move {
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        // Owned by the loop, not detached: a connection this endpoint
+        // admitted is this endpoint's to reap.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let guarded = guarded.clone();
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                match acceptor {
-                    // mTLS: a peer with no certificate, a foreign one, or a
-                    // revoked serial fails here and the connection ends —
-                    // the refused-connection outcome for this channel.
-                    Some(acceptor) => {
-                        let Ok(tls) = acceptor.accept(stream).await else {
-                            return;
-                        };
-                        serve_connection(tls, guarded).await;
-                    }
-                    None => serve_connection(stream, guarded).await,
+            tokio::select! {
+                // Resolves when the ServingEndpoint closes (or drops) the
+                // channel — the stop signal either way.
+                _ = &mut stopped => break,
+                // Reap connections as they finish, so a long-lived endpoint
+                // does not accumulate one dead handle per request ever made.
+                finished = connections.join_next(), if !connections.is_empty() => {
+                    // A connection ending (even by panic) is that
+                    // connection's business; the reap was the point.
+                    let _ = finished;
                 }
-            });
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else {
+                        break;
+                    };
+                    let guarded = guarded.clone();
+                    let acceptor = acceptor.clone();
+                    connections.spawn(async move {
+                        match acceptor {
+                            // mTLS: a peer with no certificate, a foreign
+                            // one, or a revoked serial fails here and the
+                            // connection ends — the refused-connection
+                            // outcome for this channel.
+                            Some(acceptor) => {
+                                let Ok(tls) = acceptor.accept(stream).await else {
+                                    return;
+                                };
+                                serve_connection(tls, guarded).await;
+                            }
+                            None => serve_connection(stream, guarded).await,
+                        }
+                    });
+                }
+            }
         }
+        // The door closes before the rooms are cleared: no new connection
+        // can arrive while the admitted ones are aborted and awaited.
+        drop(listener);
+        connections.shutdown().await;
     });
 
-    Ok((bound, handle))
+    Ok((bound, ServingEndpoint { stop, serving }))
 }
 
 /// One HTTP/1.1 connection over whichever transport the endpoint accepted.
@@ -574,6 +629,47 @@ mod tests {
             http::StatusCode::UNAUTHORIZED,
             "an unidentified request must be refused before it reaches rmcp"
         );
+    }
+
+    /// `shutdown` must not *return* before the endpoint's sockets are gone —
+    /// the listener and the admitted connections both. The probe is a
+    /// synchronous re-bind of the bound address: between `shutdown().await`
+    /// resolving and the bind there is no await point, so on this test's
+    /// current-thread runtime a shutdown that merely signalled and returned
+    /// (leaving the reap to run in the background) cannot slip through on a
+    /// lucky poll — the serving task provably has not run in between, and
+    /// only the completed reap can have freed the address.
+    #[tokio::test]
+    async fn shutdown_returns_only_after_the_sockets_are_reaped() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let endpoint = crate::endpoint::HordeEndpoint::new(crate::context::AgentContext::new(
+            std::sync::Arc::new(crate::journal::testing::RecordingJournal::new()),
+            horde_cli::client::Client::with_channel(channel),
+            "s1",
+        ));
+        let (bound, serving) = super::serve(
+            &EndpointConfig::loopback(0),
+            std::sync::Arc::new(AgentRegistry::new()),
+            endpoint,
+        )
+        .await
+        .expect("the endpoint must bind on an OS-chosen port");
+
+        // An admitted connection, held open across the shutdown: reaping it
+        // is part of what `shutdown` owes before returning.
+        let admitted = tokio::net::TcpStream::connect(bound)
+            .await
+            .expect("the endpoint must accept a connection");
+
+        serving.shutdown().await;
+
+        let probe = tokio::net::TcpSocket::new_v4().expect("a probe socket");
+        probe.set_reuseaddr(true).expect("reuseaddr on the probe");
+        assert!(
+            probe.bind(bound).is_ok(),
+            "shutdown returned while the endpoint still held its socket"
+        );
+        drop(admitted);
     }
 
     /// The TLS half's Debug reaches logs; it must say what it is and hold

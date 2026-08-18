@@ -46,9 +46,9 @@ pub struct EndpointManager {
 
 struct ServedEndpoint {
     url: String,
-    /// The accept loop; aborted and awaited at shutdown, kept alive by being
-    /// held here.
-    serving: tokio::task::JoinHandle<()>,
+    /// The serving handle; shut down (listener and admitted connections
+    /// both reaped) at shutdown, kept alive by being held here.
+    serving: horde_mcp::server::ServingEndpoint,
 }
 
 impl std::fmt::Debug for EndpointManager {
@@ -103,17 +103,18 @@ impl EndpointManager {
     }
 
     /// Stops every serving loop, and does not return until each has actually
-    /// stopped serving: abort, then await the reap, so every listener socket
-    /// is provably dropped by the time this returns. Awaiting an aborted
-    /// accept loop resolves at its next await point, so this stays fast and
-    /// bounded. Idempotent; called from Runtime shutdown.
+    /// stopped serving: every listener socket *and every connection those
+    /// listeners ever admitted* is provably dropped by the time this
+    /// returns. The admitted connections matter as much as the listeners —
+    /// an accept loop reaped alone leaves its connections alive in detached
+    /// tasks, still answering an archived agent's verbs and still holding
+    /// the port. Bounded: the reap is an abort plus a join per task, each
+    /// resolving at its next await point. Idempotent; called from Runtime
+    /// shutdown.
     pub async fn shutdown(&self) {
         let served = std::mem::take(&mut *self.served.lock().await);
         for (_, endpoint) in served {
-            endpoint.serving.abort();
-            // The JoinError here is the cancellation just requested, not a
-            // fault worth surfacing.
-            let _ = endpoint.serving.await;
+            endpoint.serving.shutdown().await;
         }
     }
 
@@ -314,15 +315,28 @@ mod tests {
         );
 
         manager.shutdown().await;
-        // shutdown() awaits the reaped accept loop, so the listener is
-        // already dropped: the socket must refuse immediately, no yielding.
+        // shutdown() reaped the accept loop AND the dials' accepted
+        // connections, so nothing of the endpoint holds the port any more —
+        // proven by re-binding its exact address, which only the manager's
+        // own sockets could still occupy (a leaked listener, or an accepted
+        // connection still held by a detached task). Probing with a
+        // connect() instead is unsound: the loopback port comes from the
+        // ephemeral range, and once the machine-wide port counter wraps, a
+        // `[::]:0` bind in ANY process can be handed this same port and
+        // coexist with the live v4 listener (v6 wildcard allocation does
+        // not conflict with a specific v4 binding). Such a dual-stack
+        // squatter answers v4 connects the moment our listener drops, so a
+        // connect can succeed against a correctly shut-down endpoint. A
+        // squatter does not block re-binding the specific address, and a
+        // leaked endpoint socket does — exactly the property under test.
+        // No yielding: the reap completed before shutdown() returned.
         let address = url
             .strip_prefix("http://")
             .and_then(|rest| rest.strip_suffix("/mcp"))
             .expect("the served url shape");
         assert!(
-            tokio::net::TcpStream::connect(address).await.is_err(),
-            "a shut-down manager must not keep serving its port"
+            tokio::net::TcpListener::bind(address).await.is_ok(),
+            "a shut-down manager must not keep holding its socket"
         );
     }
 
