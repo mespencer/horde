@@ -1052,6 +1052,34 @@ mod tests {
     }
 }
 
+/// Test scaffolding this crate's own suites share (the CLI's stop tests
+/// witness the same reap this module's do).
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::RealizedExpose;
+
+    /// A guarded realization: the accept task holds the oneshot's sender,
+    /// so the receiver's state is the loop's — alive while `Empty`, gone
+    /// once `Closed`.
+    pub(crate) fn guarded_realization() -> (RealizedExpose, tokio::sync::oneshot::Receiver<()>) {
+        let (guard, reaped) = tokio::sync::oneshot::channel::<()>();
+        let accept_task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        (
+            RealizedExpose {
+                forward_id: "fwd-1".to_owned(),
+                name: "echo".to_owned(),
+                local_addr: "127.0.0.1:1".parse().expect("an address"),
+                fell_back: false,
+                accept_task: Some(accept_task),
+            },
+            reaped,
+        )
+    }
+}
+
 #[cfg(test)]
 mod engine_tests {
     //! The realization engines against a real `horde-server` on loopback —
@@ -1188,27 +1216,37 @@ mod engine_tests {
         );
     }
 
+    use super::testing::guarded_realization;
+
     /// Dropping a realization (not just stopping it) aborts the accept
     /// loop: the guard task pattern, on the loop the listener owns.
     #[tokio::test]
     async fn dropping_a_realization_reaps_its_accept_loop() {
-        let (guard, reaped) = tokio::sync::oneshot::channel::<()>();
-        let accept_task = tokio::spawn(async move {
-            let _guard = guard;
-            std::future::pending::<()>().await;
-        });
-        drop(RealizedExpose {
-            forward_id: "fwd-1".to_owned(),
-            name: "echo".to_owned(),
-            local_addr: "127.0.0.1:1".parse().expect("an address"),
-            fell_back: false,
-            accept_task: Some(accept_task),
-        });
+        let (realized, reaped) = guarded_realization();
+        drop(realized);
 
         let witnessed = within("the drop reaps", reaped).await;
         assert!(
             witnessed.is_err(),
             "the guard must be dropped by cancellation, never sent"
+        );
+    }
+
+    /// `stop` is a reap, not an abort-and-hope: by the time it returns, the
+    /// loop is provably gone — the guard's channel reads `Closed`
+    /// *synchronously* after the call. A stop hollowed down to `Drop`'s
+    /// abort cannot pass this on a current-thread runtime, because the
+    /// abort has not run yet when the assertion looks.
+    #[tokio::test]
+    async fn stop_joins_the_accept_loop_before_returning() {
+        let (realized, mut reaped) = guarded_realization();
+        realized.stop().await;
+        assert!(
+            matches!(
+                reaped.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "stop must return only after the loop is gone"
         );
     }
 

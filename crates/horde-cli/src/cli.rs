@@ -2536,7 +2536,12 @@ mod forward_flow_tests {
         assert!(lines[0].contains("5432"), "{}", lines[0]);
     }
 
-    /// Stopping every realization is provable: the ports stop answering.
+    /// Stopping every realization is provable, twice over: the port stops
+    /// answering, and — through an owned witness — the accept loop is
+    /// already gone when `stop_all` returns. The second half is what
+    /// separates a real stop from `Drop`'s fire-and-forget abort: on a
+    /// current-thread runtime, an un-awaited abort has not run when the
+    /// assertion looks.
     #[tokio::test]
     async fn stop_all_reaps_every_listener() {
         let (_core, _endpoint, client) = placed_server().await;
@@ -2550,5 +2555,31 @@ mod forward_flow_tests {
             tokio::net::TcpStream::connect(local_addr).await.is_err(),
             "a stopped listener must not keep its port"
         );
+
+        let (guarded, mut reaped) = crate::forward::testing::guarded_realization();
+        super::stop_all(vec![guarded]).await;
+        assert!(
+            matches!(
+                reaped.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "stop_all must return only after every loop is gone"
+        );
+    }
+
+    /// The foreground lifetime ends on the signal and nothing else: a wait
+    /// that completed with nobody sending one would turn every foreground
+    /// verb into an instant exit. Biased order makes the probe
+    /// deterministic — the wait is polled first, and only its pending-ness
+    /// lets the ready arm win.
+    #[tokio::test]
+    async fn the_foreground_wait_outlives_a_ready_future() {
+        tokio::select! {
+            biased;
+            () = super::ctrl_c_ends() => {
+                panic!("nobody sent a signal, so the wait must not end")
+            }
+            () = std::future::ready(()) => {}
+        }
     }
 }
