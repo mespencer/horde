@@ -12,6 +12,8 @@
 mod support;
 
 #[cfg(test)]
+mod forwards;
+#[cfg(test)]
 mod lifecycle;
 #[cfg(test)]
 mod relay_payload;
