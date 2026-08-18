@@ -284,6 +284,18 @@ fn status_of(
     }
 }
 
+/// One spine's tunnel answer: its response type, boxed and severable.
+pub(crate) type TunnelAnswer<T> =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, tonic::Status>> + Send>>;
+
+/// A leg's inbound, stripped to bare frames.
+type FrameStream = std::pin::Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<horde_proto::v1::ForwardTunnelFrame, tonic::Status>>
+            + Send,
+    >,
+>;
+
 /// One tunnel leg answered whole: identity and serial read off the request,
 /// the relay driven over bare frames, an adapter lifting them into the
 /// spine's response type, and revocation severing the stream. Shared by
@@ -296,9 +308,7 @@ pub(crate) fn tunnel_response<Req, T, U, W>(
     request: tonic::Request<tonic::Streaming<Req>>,
     unwrap: U,
     wrap: W,
-) -> tonic::Response<
-    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, tonic::Status>> + Send>>,
->
+) -> tonic::Response<TunnelAnswer<T>>
 where
     Req: Send + 'static,
     U: Fn(Req) -> horde_proto::v1::ForwardTunnelFrame + Send + 'static,
@@ -326,15 +336,9 @@ fn tunnel_stream<T, W>(
     deny: Option<horde_identity::RevocationList>,
     serial: Option<String>,
     caller: TunnelPrincipal,
-    inbound: std::pin::Pin<
-        Box<
-            dyn tokio_stream::Stream<
-                    Item = Result<horde_proto::v1::ForwardTunnelFrame, tonic::Status>,
-                > + Send,
-        >,
-    >,
+    inbound: FrameStream,
     wrap: W,
-) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, tonic::Status>> + Send>>
+) -> TunnelAnswer<T>
 where
     T: Send + 'static,
     W: Fn(horde_proto::v1::ForwardTunnelFrame) -> T + Send + 'static,

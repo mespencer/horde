@@ -233,7 +233,7 @@ enum Side {
 }
 
 impl Side {
-    fn of<'a>(self, inner: &'a mut Inner) -> &'a mut BTreeMap<String, Lane> {
+    fn of(self, inner: &mut Inner) -> &mut BTreeMap<String, Lane> {
         match self {
             Self::Workers => &mut inner.workers,
             Self::Clients => &mut inner.clients,
