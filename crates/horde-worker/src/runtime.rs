@@ -1476,7 +1476,7 @@ mod tests {
     use super::{Runtime, carried_payload};
     use crate::client::ApplyCommand;
     use crate::error::WorkerError;
-    use crate::journal::Journal;
+    use crate::journal::{AgentBookkeeping, Journal};
 
     fn runtime_with(script: Script) -> Runtime {
         Runtime::new(Journal::in_memory().expect("an in-memory journal"))
@@ -2964,5 +2964,104 @@ mod tests {
             reason.contains("codex"),
             "the reason names the missing adapter: {reason}"
         );
+    }
+
+    /// A pump around `journal`, for driving [`super::Pump::journal_event`]
+    /// directly at its boundary. The session is a real (scripted) one; the
+    /// paths under test never reach it.
+    async fn journaling_pump(journal: Journal) -> super::Pump {
+        use horde_adapter::Adapter as _;
+        let session = FakeAdapter::default()
+            .spawn(&horde_adapter::AgentSpec::default())
+            .await
+            .expect("a fake session");
+        super::Pump {
+            session,
+            journal,
+            context: crate::translate::AgentContext {
+                session_id: "s1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                binding: None,
+                permission_mode: String::new(),
+                tree_path: Vec::new(),
+            },
+            state: super::PumpState::Streaming,
+            turns_in_flight: 1,
+            queued: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// One boundary of `journal_event`'s early-continue guard: an event that
+    /// yields entries or progress must reach the journal — here a
+    /// `SessionEstablished`, whose lifecycle entry and revival identity
+    /// commit in one batch.
+    #[tokio::test]
+    async fn an_event_carrying_progress_journals_it_with_its_entries() {
+        let journal = Journal::in_memory().expect("an in-memory journal");
+        journal
+            .apply_command(
+                "cmd-1",
+                1,
+                Vec::new(),
+                AgentBookkeeping::Remember {
+                    agent_id: "agent-1".to_owned(),
+                    session_id: "s1".to_owned(),
+                    spawn: Box::new(horde_proto::v1::SpawnAgentCommand::default()),
+                },
+            )
+            .await
+            .expect("the agent is remembered");
+        let mut pump = journaling_pump(journal.clone()).await;
+
+        let flow = pump
+            .journal_event(&horde_adapter::AgentEvent::SessionEstablished {
+                provider_session_id: horde_adapter::ProviderSessionId::new("fake-session-9"),
+                model: "m1".to_owned(),
+            })
+            .await;
+
+        assert!(matches!(flow, super::Flow::Continue));
+        let events = journal.read_from(1, 100).await.expect("a readable journal");
+        assert_eq!(kinds(&events), vec!["lifecycle"]);
+        let revivable = journal
+            .revivable_agent("agent-1")
+            .await
+            .expect("a readable agent")
+            .expect("a remembered agent");
+        assert_eq!(
+            revivable.provider_session_id.as_deref(),
+            Some("fake-session-9"),
+            "the progress must land with the entry, not be skipped by the guard"
+        );
+    }
+
+    /// The other boundary: an event yielding neither entries nor progress —
+    /// a `ToolCompleted`, per the recorded translation decisions — must not
+    /// touch the journal at all. "At all" includes the head watch: a
+    /// spurious empty-batch commit would still announce a head and wake the
+    /// push pump for nothing, so the watch staying quiet is the observable
+    /// proof the guard took the early continue.
+    #[tokio::test]
+    async fn an_event_with_nothing_to_journal_leaves_the_journal_untouched() {
+        let journal = Journal::in_memory().expect("an in-memory journal");
+        let mut pump = journaling_pump(journal.clone()).await;
+        let mut head = journal.watch_head();
+        head.mark_unchanged();
+
+        let flow = pump
+            .journal_event(&horde_adapter::AgentEvent::ToolCompleted {
+                turn_id: horde_adapter::TurnId::new("s1#1"),
+                tool_call_id: horde_adapter::ToolCallId::new("call-1"),
+                is_error: false,
+            })
+            .await;
+
+        assert!(matches!(flow, super::Flow::Continue));
+        assert!(
+            !head.has_changed().expect("the journal outlives the check"),
+            "a no-op event must not announce a journal head"
+        );
+        let events = journal.read_from(1, 100).await.expect("a readable journal");
+        assert!(events.is_empty(), "nothing may be appended: {events:?}");
     }
 }
