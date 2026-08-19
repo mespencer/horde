@@ -15,6 +15,7 @@ pub mod enrollment;
 pub mod error;
 pub mod forward;
 pub mod log;
+pub mod login;
 pub mod mcp;
 pub mod permission;
 pub mod placement;

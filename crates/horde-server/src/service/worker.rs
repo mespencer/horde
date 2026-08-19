@@ -389,6 +389,58 @@ impl WorkerService for WorkerFacing {
         ))
     }
 
+    type StreamLoginsStream =
+        Pin<Box<dyn Stream<Item = Result<horde_proto::v1::StreamLoginsResponse, Status>> + Send>>;
+
+    #[instrument(skip_all)]
+    async fn stream_logins(
+        &self,
+        request: Request<horde_proto::v1::StreamLoginsRequest>,
+    ) -> Result<Response<Self::StreamLoginsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
+        let worker_id = super::logins::login_worker_id(&request);
+        if worker_id.is_empty() {
+            return Err(Status::from(ServerError::Invalid(
+                "a login stream must name its worker".to_owned(),
+            )));
+        }
+
+        let (epoch, lane) = self.core.logins.register_worker(&worker_id);
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let deny = self.deny.clone();
+        let logins = self.core.logins.clone();
+        tokio::spawn(async move {
+            let pump = super::logins::pump_logins(lane, &sender);
+            super::shared::run_severable(pump, deny, serial, &sender).await;
+            logins.deregister_worker_if_current(&worker_id, epoch);
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    type WorkerLoginTunnelStream = Pin<
+        Box<dyn Stream<Item = Result<horde_proto::v1::WorkerLoginTunnelResponse, Status>> + Send>,
+    >;
+
+    #[instrument(skip_all)]
+    async fn worker_login_tunnel(
+        &self,
+        request: Request<Streaming<horde_proto::v1::WorkerLoginTunnelRequest>>,
+    ) -> Result<Response<Self::WorkerLoginTunnelStream>, Status> {
+        let logins = self.core.logins.clone();
+        Ok(super::logins::login_response(
+            self.deny.clone(),
+            request,
+            |message: horde_proto::v1::WorkerLoginTunnelRequest| message.frame.unwrap_or_default(),
+            |frame| horde_proto::v1::WorkerLoginTunnelResponse { frame: Some(frame) },
+            Box::new(move |caller, io| {
+                Box::pin(async move {
+                    crate::login::relay::run_worker_login_tunnel(&logins, caller, io).await;
+                })
+            }),
+        ))
+    }
+
     #[instrument(skip_all)]
     async fn report_capabilities(
         &self,
@@ -633,13 +685,25 @@ async fn push_intents(
     last_sent: &mut Option<Vec<horde_proto::v1::ForwardIntent>>,
     sender: &tokio::sync::mpsc::Sender<Result<horde_proto::v1::StreamForwardsResponse, Status>>,
 ) -> bool {
-    let intents = match crate::forward::intent::intents_for_worker(&core.log, worker_id).await {
+    let mut intents = match crate::forward::intent::intents_for_worker(&core.log, worker_id).await {
         Ok(intents) => intents,
         Err(error) => {
             let _ = sender.send(Err(Status::from(error))).await;
             return false;
         }
     };
+    // Live logins' callback exposes ride every push (DESIGN §4): the worker
+    // replaces its dialable map wholesale per set, so a merge done in only
+    // some pushes would flap the callback route mid-login. Merged from the
+    // registry, not the log — ephemeral intent has no journaled fold.
+    intents.extend(core.logins.callback_intents_for(worker_id));
+    intents.sort_by_key(|intent| {
+        intent
+            .forward_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    });
     if last_sent.as_ref() == Some(&intents) {
         return true;
     }

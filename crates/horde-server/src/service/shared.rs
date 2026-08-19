@@ -54,6 +54,11 @@ pub struct ServerCore {
     /// awaiting their pair. Ephemeral on purpose — realization is tied to
     /// connections, so a restart honestly forgetting all of it is correct.
     pub forwards: ForwardRegistry,
+    /// The login plane's state (DESIGN §4): worker login-dispatch lanes and
+    /// the logins alive right now, callback exposes included. Ephemeral for
+    /// the same reason as `forwards`, and more so — a login has no durable
+    /// intent at all, only its audit events.
+    pub logins: crate::login::registry::LoginRegistry,
 }
 
 impl ServerCore {
@@ -71,6 +76,7 @@ impl ServerCore {
             blobs: None,
             placement_lock: Arc::new(tokio::sync::Mutex::new(())),
             forwards: ForwardRegistry::new(),
+            logins: crate::login::registry::LoginRegistry::new(),
         }
     }
 

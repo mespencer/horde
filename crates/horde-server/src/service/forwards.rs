@@ -359,6 +359,7 @@ where
     let (frames, mut frame_rx) = tokio::sync::mpsc::channel(16);
     let log = core.log.clone();
     let registry = core.forwards.clone();
+    let logins = core.logins.clone();
 
     let lift = typed.clone();
     tokio::spawn(async move {
@@ -372,6 +373,7 @@ where
         let pump = crate::forward::relay::run_tunnel(
             &log,
             &registry,
+            &logins,
             caller,
             crate::forward::relay::LegIo {
                 inbound,
@@ -399,6 +401,12 @@ pub fn affects_forwards(kind: Option<&Kind>) -> bool {
                 | Kind::ForwardClosed(_)
                 | Kind::AgentLifecycleChanged(_)
                 | Kind::PlacementChanged(_)
+                // Login lifecycle moves the ephemeral callback expose in and
+                // out of the merged intent set (DESIGN §4): the started
+                // append is deliberately what wakes the push that makes the
+                // worker's dialable map carry the callback port.
+                | Kind::WorkerLoginStarted(_)
+                | Kind::WorkerLoginEnded(_)
         )
     )
 }
