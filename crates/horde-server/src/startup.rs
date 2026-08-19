@@ -349,23 +349,8 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         ),
     };
 
-    // The Relay (fix a10), before the gRPC listeners so a bad relay bind
-    // fails startup whole rather than leaving a half-up server.
-    let relay = match config.relay_bind {
-        Some(bind) => Some(crate::relay::mount(bind, &config.state_dir, &core.log).await?),
-        None => None,
-    };
-
-    // The MCP Hub's upstreams (ADR-0004, 2026-08-19 amendment), from the
-    // journaled catalog — there is deliberately no flag for this: which
-    // servers exist is `horde mcp add`'s to say, and the catalog rides the
-    // same log as everything else. Warmed here so a misconfigured upstream
-    // surfaces where the operator is looking; a failure is reported, not
-    // fatal, because a dead user server must not hold the control plane
-    // down, and the connect is retried at the next forwarded call.
-    for line in crate::hub::warm(&core).await? {
-        tracing::info!("{line}");
-    }
+    let relay = mounted_relay(config, &core).await?;
+    warm_hub(&core).await?;
 
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
@@ -378,6 +363,43 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         relay,
         permission_chain,
     })
+}
+
+/// The Relay, when `--relay-bind` asked for one (DESIGN §8, fix a10) —
+/// mounted before the gRPC listeners so a bad relay bind fails startup whole
+/// rather than leaving a half-up server.
+///
+/// # Errors
+///
+/// The mount failing: the bind, or the relay's own state directory.
+async fn mounted_relay(
+    config: &ServeConfig,
+    core: &ServerCore,
+) -> Result<Option<crate::relay::MountedRelay>, ServerError> {
+    match config.relay_bind {
+        Some(bind) => Ok(Some(
+            crate::relay::mount(bind, &config.state_dir, &core.log).await?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Warms the MCP Hub's upstreams (ADR-0004, 2026-08-19 amendment) from the
+/// journaled catalog — there is deliberately no flag for this: which servers
+/// exist is `horde mcp add`'s to say, and the catalog rides the same log as
+/// everything else. Warmed at startup so a misconfigured upstream surfaces
+/// where the operator is looking; a failure is a reported line, not fatal,
+/// because a dead user server must not hold the control plane down, and the
+/// connect is retried at the next forwarded call anyway.
+///
+/// # Errors
+///
+/// Only the log failing to yield the catalog.
+async fn warm_hub(core: &ServerCore) -> Result<(), ServerError> {
+    for line in crate::hub::warm(core).await? {
+        tracing::info!("{line}");
+    }
+    Ok(())
 }
 
 /// The persisted CA, or a fresh one persisted on first start.
@@ -706,10 +728,20 @@ mod tests {
 
         // Second start, same state: the CA loads, and no client is enrolled
         // yet (a minted code is not an enrollment), so bootstrap re-offers.
-        let again = super::serve(&config).await.expect("a restart comes up");
+        // This restart also drops `--relay-bind`: no relay is mounted and no
+        // relay line is owed — the other half of `mounted_relay`'s table.
+        let mut without_relay = config.clone();
+        without_relay.relay_bind = None;
+        let again = super::serve(&without_relay)
+            .await
+            .expect("a restart comes up");
         assert!(
             again.bootstrap_code.is_some(),
             "an unredeemed bootstrap code must not close the bootstrap door"
+        );
+        assert!(
+            again.relay.is_none(),
+            "no --relay-bind mounts no relay, quietly"
         );
     }
 }

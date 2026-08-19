@@ -288,12 +288,7 @@ impl FakeSession {
     /// Plays steps until the queue produces an event, a decision is needed, or
     /// the turn runs out of steps and ends.
     fn advance(&mut self) {
-        while self.pending.is_empty()
-            && self.waiting_on.is_none()
-            && self.stall.is_none()
-            && self.pending_call.is_none()
-            && self.in_flight_call.is_none()
-        {
+        while self.nothing_more_to_play() {
             let Some(step) = self.steps.pop_front() else {
                 self.end_turn();
                 return;
@@ -485,6 +480,40 @@ impl FakeSession {
         self.in_flight_call = Some(InFlightCall { tool_call_id, task });
     }
 
+    /// Waits out the launched call and turns its outcome into events.
+    ///
+    /// The `&mut` await on the *stored* handle is the cancellation-safety:
+    /// losing the pump's select race drops this future, but the handle stays
+    /// in `in_flight_call` and the next `next_event` resumes it — the call
+    /// itself never dies with the future (see [`InFlightCall`]).
+    async fn settle_horde_call(&mut self) {
+        let Some(in_flight) = self.in_flight_call.as_mut() else {
+            return;
+        };
+        let outcome = match (&mut in_flight.task).await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(format!("the endpoint call died: {join_error}")),
+        };
+        if let Some(finished) = self.in_flight_call.take() {
+            // Cloned out rather than moved: the guard's Drop (an abort, a
+            // no-op on this finished task) keeps the field.
+            self.finish_horde_call(finished.tool_call_id.clone(), outcome);
+        }
+    }
+
+    /// Whether the turn has nothing left to deliver or wait on: no queued
+    /// events, no pending decision, no stall, no call scheduled or in
+    /// flight. A named predicate because it is both `advance`'s "keep
+    /// playing steps" condition and `next_event`'s "the turn is spent" stop
+    /// — a clause dropped from either ends turns early or never.
+    fn nothing_more_to_play(&self) -> bool {
+        self.pending.is_empty()
+            && self.waiting_on.is_none()
+            && self.stall.is_none()
+            && self.pending_call.is_none()
+            && self.in_flight_call.is_none()
+    }
+
     /// Turns a finished call's outcome into stream events.
     fn finish_horde_call(
         &mut self,
@@ -605,20 +634,8 @@ impl AgentSession for FakeSession {
             if let Some(call) = self.pending_call.take() {
                 self.launch_horde_call(call);
             }
-            if let Some(in_flight) = self.in_flight_call.as_mut() {
-                // Awaited by `&mut`, never taken first: if this await loses
-                // the pump's select race, the handle stays here and the next
-                // `next_event` resumes it — the call itself never dies with
-                // the future (see `InFlightCall`).
-                let outcome = match (&mut in_flight.task).await {
-                    Ok(outcome) => outcome,
-                    Err(join_error) => Err(format!("the endpoint call died: {join_error}")),
-                };
-                if let Some(finished) = self.in_flight_call.take() {
-                    // Cloned out rather than moved: the guard's Drop (an
-                    // abort, a no-op on this finished task) keeps the field.
-                    self.finish_horde_call(finished.tool_call_id.clone(), outcome);
-                }
+            if self.in_flight_call.is_some() {
+                self.settle_horde_call().await;
                 continue;
             }
 
@@ -627,12 +644,7 @@ impl AgentSession for FakeSession {
             }
             self.advance();
 
-            if self.pending.is_empty()
-                && self.stall.is_none()
-                && self.waiting_on.is_none()
-                && self.pending_call.is_none()
-                && self.in_flight_call.is_none()
-            {
+            if self.nothing_more_to_play() {
                 // `advance` ran the turn to its end and produced nothing more.
                 return Ok(None);
             }
