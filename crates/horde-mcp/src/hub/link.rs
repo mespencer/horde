@@ -140,6 +140,19 @@ pub fn result_from_json(json: &str) -> Result<CallToolResult, serde_json::Error>
     serde_json::from_str(json)
 }
 
+/// The text of a result's first content block — the line a model (and every
+/// assertion about one) reads first. `None` when the result leads with
+/// something that is not text, which callers must not conflate with empty
+/// text.
+#[must_use]
+pub fn first_text(result: &CallToolResult) -> Option<&str> {
+    result
+        .content
+        .first()
+        .and_then(|block| block.as_text())
+        .map(|text| text.text.as_str())
+}
+
 /// A hub failure the model should read, as a tool result.
 ///
 /// The in-band half of `hub::endpoint::render_failure`'s split: everything
@@ -194,7 +207,16 @@ mod tests {
         let back =
             super::result_from_json(&json).unwrap_or_else(|error| panic!("decodes: {error}"));
         assert_eq!(back.is_error, Some(true));
-        assert!(format!("{:?}", back.content).contains("rate limited"));
+        assert_eq!(
+            super::first_text(&back),
+            Some("rate limited"),
+            "the first text block survives the wire and reads back whole"
+        );
+        assert_eq!(
+            super::first_text(&rmcp::model::CallToolResult::success(vec![])),
+            None,
+            "no leading text block is None, never empty text"
+        );
     }
 
     /// The argument wire keeps MCP's two no-ish states distinct, keeps

@@ -1071,6 +1071,59 @@ mod tests {
         );
     }
 
+    /// The hub-forwarding RPCs themselves, over a real upstream child: the
+    /// listing carries the agent's namespaced toolset and the call carries
+    /// the upstream's own answer — neither is a defaultable empty response.
+    #[tokio::test]
+    async fn the_hub_rpcs_answer_with_the_real_toolset_and_result() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+        use horde_proto::v1::{AgentId, SessionId, WorkerId};
+
+        let core = core();
+        crate::forward::testfix::placed_expose(&core.log, "s1", "agent-1", "w1").await;
+        crate::hub::testfix::seed_catalog(
+            &core.log,
+            crate::hub::testfix::stub_config("stub", "hub", false, &[]).await,
+        )
+        .await;
+        let facing = super::WorkerFacing::new(core);
+
+        let listed = facing
+            .list_hub_tools(tonic::Request::new(horde_proto::v1::ListHubToolsRequest {
+                worker_id: Some(WorkerId::new("w1")),
+                session_id: Some(SessionId::new("s1")),
+                agent_id: Some(AgentId::new("agent-1")),
+            }))
+            .await
+            .expect("the listing answers")
+            .into_inner();
+        assert!(
+            listed
+                .tools_json
+                .iter()
+                .any(|json| json.contains("stub__echo")),
+            "the RPC must carry the agent's real toolset: {:?}",
+            listed.tools_json
+        );
+
+        let called = facing
+            .call_hub_tool(tonic::Request::new(horde_proto::v1::CallHubToolRequest {
+                worker_id: Some(WorkerId::new("w1")),
+                session_id: Some(SessionId::new("s1")),
+                agent_id: Some(AgentId::new("agent-1")),
+                tool_name: "stub__echo".to_owned(),
+                arguments_json: r#"{"message":"over the spine"}"#.to_owned(),
+            }))
+            .await
+            .expect("the call answers")
+            .into_inner();
+        assert!(
+            called.result_json.contains("echo:over the spine"),
+            "the RPC must carry the upstream's own answer: {}",
+            called.result_json
+        );
+    }
+
     /// One agent placed on `worker`, exposing — the pump tests' log fixture.
     async fn forward_core(worker: &str) -> ServerCore {
         let core = ServerCore::new(crate::log::EventLog::in_memory().expect("log"));

@@ -775,6 +775,129 @@ mod harness {
 }
 
 #[cfg(test)]
+mod horde_call_tests {
+    use std::time::Duration;
+
+    use horde_adapter::{ProviderSessionId, ToolCallId};
+
+    use super::{FakeAdapter, FakeSession, InFlightCall};
+    use crate::Script;
+
+    /// A bare session with no endpoint and nothing pending — the state the
+    /// direct field-level tests arrange from.
+    fn session() -> FakeSession {
+        FakeAdapter::new(Script::echoing()).session(ProviderSessionId::new("fake-s1"), 0, None)
+    }
+
+    /// Dropping an in-flight call aborts its task — kill by handle, the
+    /// workspace rule. A `Drop` that silently did nothing would leave a
+    /// detached HTTP wait running past the session (archive, shutdown).
+    #[tokio::test]
+    async fn dropping_an_in_flight_call_aborts_its_task() {
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(String::new())
+        });
+        let abort = task.abort_handle();
+        drop(InFlightCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            task,
+        });
+
+        // Count-bounded: the abort resolves at the sleep's next poll.
+        for _ in 0..200_u32 {
+            if abort.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("dropping the guard must abort the task it holds");
+    }
+
+    /// Settling a finished call clears the slot and reports the outcome as
+    /// events — directly, so the mutant that replaces the settle with a
+    /// no-op fails here in milliseconds instead of spinning `next_event`
+    /// into a timeout nobody can read.
+    #[tokio::test]
+    async fn settling_a_finished_call_clears_the_slot_and_reports() {
+        let mut session = session();
+        session.in_flight_call = Some(InFlightCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            task: tokio::spawn(async { Ok("echo:done".to_owned()) }),
+        });
+
+        session.settle_horde_call().await;
+
+        assert!(
+            session.in_flight_call.is_none(),
+            "a settled call must vacate the slot"
+        );
+        let rendered = format!("{:?}", session.pending);
+        assert!(
+            rendered.contains("echo:done"),
+            "the outcome must become events the pump can read: {rendered}"
+        );
+        assert!(
+            rendered.contains("ToolCompleted"),
+            "the completion must follow the output: {rendered}"
+        );
+
+        // And with nothing in flight, settling is a no-op, not a hang.
+        let mut idle = session;
+        idle.pending.clear();
+        idle.settle_horde_call().await;
+        assert!(idle.pending.is_empty());
+    }
+
+    /// The spent-turn predicate's truth table, one clause at a time. It is
+    /// both `advance`'s "keep playing" condition and `next_event`'s stop:
+    /// a predicate stuck false spins `next_event` forever, stuck true ends
+    /// every turn before its steps — this table fails both in microseconds.
+    #[tokio::test]
+    async fn the_spent_turn_predicate_reads_every_clause() {
+        let fresh = session();
+        assert!(fresh.nothing_more_to_play(), "a bare session is spent");
+
+        let mut with_pending = session();
+        with_pending
+            .pending
+            .push_back(horde_adapter::AgentEvent::Output {
+                turn_id: horde_adapter::TurnId::new("t1"),
+                channel: horde_adapter::OutputChannel::Assistant,
+                text: "queued".to_owned(),
+                chunk_index: 0,
+            });
+        assert!(!with_pending.nothing_more_to_play(), "queued events count");
+
+        let mut waiting = session();
+        waiting.waiting_on = Some(ToolCallId::new("call-1"));
+        assert!(!waiting.nothing_more_to_play(), "a pending decision counts");
+
+        let mut stalled = session();
+        stalled.stall = Some(Duration::from_millis(1));
+        assert!(!stalled.nothing_more_to_play(), "a stall counts");
+
+        let mut scheduled = session();
+        scheduled.pending_call = Some(super::PendingCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            tool_name: "report_result".to_owned(),
+            input: serde_json::json!({}),
+        });
+        assert!(!scheduled.nothing_more_to_play(), "a scheduled call counts");
+
+        let mut in_flight = session();
+        in_flight.in_flight_call = Some(InFlightCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            task: tokio::spawn(async { Ok(String::new()) }),
+        });
+        assert!(
+            !in_flight.nothing_more_to_play(),
+            "an in-flight call counts"
+        );
+    }
+}
+
+#[cfg(test)]
 mod guard_tests {
     use horde_adapter::{Adapter, Capabilities, Capability, Delivery, TurnInput};
 

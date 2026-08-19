@@ -13,7 +13,7 @@ use horde_worker::hub::ForwardedHubLink;
 use crate::support::within;
 
 /// The stub MCP server the hub connects to, as a journaled catalog config.
-async fn stub_config(name: &str, allowed: &[&str]) -> McpServerConfig {
+async fn stub_config(name: &str, local: bool, allowed: &[&str]) -> McpServerConfig {
     let binary = horde_server_testkit::process::product_binary("horde-mcp", "mcp_stub_server")
         .await
         .expect("the stub server binary exists");
@@ -24,7 +24,7 @@ async fn stub_config(name: &str, allowed: &[&str]) -> McpServerConfig {
             args: Vec::new(),
             env: [].into(),
         })),
-        local: false,
+        local,
         allowed_agent_types: allowed.iter().map(|s| (*s).to_owned()).collect(),
         etag: String::new(),
     }
@@ -39,10 +39,10 @@ async fn arranged() -> (horde_server::EventLog, tonic::transport::Channel) {
     horde_server_testkit::place_agent(&log, "s1", "agent-1", "w1", "go")
         .await
         .expect("the placement seeds");
-    horde_server_testkit::seed_mcp_server(&log, stub_config("stub", &[]).await)
+    horde_server_testkit::seed_mcp_server(&log, stub_config("stub", false, &[]).await)
         .await
         .expect("the open server seeds");
-    horde_server_testkit::seed_mcp_server(&log, stub_config("scoped", &["reviewer"]).await)
+    horde_server_testkit::seed_mcp_server(&log, stub_config("scoped", false, &["reviewer"]).await)
         .await
         .expect("the scoped server seeds");
 
@@ -51,16 +51,6 @@ async fn arranged() -> (horde_server::EventLog, tonic::transport::Channel) {
         .expect("a dialable endpoint")
         .connect_lazy();
     (log, channel)
-}
-
-/// The text of a result's first content block — what the model would read.
-fn first_text(result: &horde_mcp::rmcp::model::CallToolResult) -> String {
-    result
-        .content
-        .first()
-        .and_then(|block| block.as_text())
-        .map(|text| text.text.clone())
-        .unwrap_or_default()
 }
 
 /// The whole forwarded path, nothing faked: the link fetches exactly the
@@ -98,7 +88,10 @@ async fn a_forwarded_hub_call_round_trips_and_visibility_fails_closed() {
     .await
     .expect("the forwarded call answers");
     assert_ne!(answered.is_error, Some(true), "{answered:?}");
-    assert_eq!(first_text(&answered), "echo:through the forwarded path");
+    assert_eq!(
+        horde_mcp::hub::link::first_text(&answered),
+        Some("echo:through the forwarded path")
+    );
 
     for unroutable in ["stub__no_such_tool", "scoped__echo", "unknown__echo"] {
         let refused = within("the refusal answers", link.call(unroutable, None))
@@ -153,7 +146,7 @@ async fn revocation_severs_the_forwarded_hub_path() {
     horde_server_testkit::place_agent(&secured.log, "s1", "agent-1", "w1", "go")
         .await
         .expect("the placement seeds");
-    horde_server_testkit::seed_mcp_server(&secured.log, stub_config("stub", &[]).await)
+    horde_server_testkit::seed_mcp_server(&secured.log, stub_config("stub", false, &[]).await)
         .await
         .expect("the catalog seeds");
 
@@ -185,7 +178,10 @@ async fn revocation_severs_the_forwarded_hub_path() {
     )
     .await
     .expect("the enrolled worker's call answers");
-    assert_eq!(first_text(&answered), "echo:before revocation");
+    assert_eq!(
+        horde_mcp::hub::link::first_text(&answered),
+        Some("echo:before revocation")
+    );
 
     let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w1")
         .expect("a valid name");
@@ -212,4 +208,60 @@ async fn revocation_severs_the_forwarded_hub_path() {
         matches!(&severed, HubError::Upstream { message, .. } if message.contains("revoked")),
         "the refusal carries the door's reason: {severed:?}"
     );
+}
+
+/// The surface assembly, from the endpoint manager's side: a local-only
+/// surface spawns its `local` child and serves its namespaced tools on the
+/// agent's endpoint — over a channel that dials NOTHING, which is the proof
+/// no hub fetch happens when no hub server is visible (an agent with only
+/// local tools must not need the server at spawn).
+#[tokio::test]
+async fn a_local_only_surface_assembles_without_dialing_the_hub() {
+    let dead_channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let manager = horde_worker::endpoint::EndpointManager::new(dead_channel, "w1");
+    let journal = horde_worker::journal::Journal::in_memory().expect("an in-memory journal");
+    let sink = horde_worker::StampingSink::new(
+        journal.sink(),
+        std::sync::Arc::new(horde_worker::ShareBroker::new(None)),
+    );
+
+    let surface = horde_worker::endpoint::AgentMcpSurface {
+        local: vec![stub_config("loc", true, &[]).await],
+        visible_hub: Vec::new(),
+    };
+
+    let endpoint = within(
+        "the local-only surface assembles",
+        manager.endpoint_for("s1", "agent-1", sink, &surface),
+    )
+    .await
+    .expect("no visible hub server means no hub dial, so the dead channel is never used");
+
+    // The endpoint actually serves the child's tools to this agent.
+    let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
+        panic!("the worker serves HTTP");
+    };
+    // The minted headers ride wholesale as custom headers — the endpoint
+    // manager already shaped them exactly as a harness would send them.
+    let header_pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let dialed = within(
+        "the agent's client dials its endpoint",
+        horde_mcp::hub::Upstream::dial("horde", &url, None, &header_pairs),
+    )
+    .await
+    .expect("the minted pair authenticates");
+    let names: Vec<&str> = dialed
+        .tools()
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect();
+    assert!(
+        names.contains(&"loc__echo"),
+        "the local child's tools ride the endpoint, namespaced: {names:?}"
+    );
+
+    assert_eq!(manager.shutdown().await, 1, "the endpoint reaps");
 }

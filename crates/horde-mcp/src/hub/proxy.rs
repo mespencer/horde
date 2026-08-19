@@ -459,6 +459,16 @@ mod tests {
             proxies.for_agent("agent-1").tools().is_empty(),
             "a removed agent falls back to the empty proxy"
         );
+
+        // The shutdown sweep: after clear, nobody is registered — a clear
+        // that silently kept entries would keep `local` children alive past
+        // the manager that spawned them.
+        proxies.clear();
+        assert!(proxies.all().is_empty(), "clear must forget every agent");
+        assert!(
+            proxies.for_agent("agent-2").tools().is_empty(),
+            "a cleared registry serves the empty proxy to everyone"
+        );
     }
 
     /// A link whose snapshot is fixed — the pure-registry tests need a

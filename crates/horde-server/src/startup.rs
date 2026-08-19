@@ -284,6 +284,11 @@ pub struct RunningServer {
     pub bootstrap_code: Option<MintedCode>,
     /// The mounted git Relay, when `--relay-bind` asked for one.
     pub relay: Option<crate::relay::MountedRelay>,
+    /// One line per hub-placed MCP server the startup warm-up touched
+    /// (ADR-0004): connected with its tool count, or unavailable with the
+    /// cause. On the operator interface rather than only in tracing, because
+    /// a misconfigured upstream must surface where the operator is looking.
+    pub hub_lines: Vec<String>,
     /// The permission chain driver (DESIGN §10, wave-7 fix a5): layers 1–2
     /// live in a deployed server, not only in tests. Held so its lifetime is
     /// the server's.
@@ -350,7 +355,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     };
 
     let relay = mounted_relay(config, &core).await?;
-    warm_hub(&core).await?;
+    let hub_lines = warm_hub(&core).await?;
 
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
@@ -361,6 +366,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         server_fingerprint,
         bootstrap_code,
         relay,
+        hub_lines,
         permission_chain,
     })
 }
@@ -392,14 +398,18 @@ async fn mounted_relay(
 /// because a dead user server must not hold the control plane down, and the
 /// connect is retried at the next forwarded call anyway.
 ///
+/// The lines come back (for [`operator_lines`]) as well as being traced: an
+/// effect that only tracing sees is one no test can hold.
+///
 /// # Errors
 ///
 /// Only the log failing to yield the catalog.
-async fn warm_hub(core: &ServerCore) -> Result<(), ServerError> {
-    for line in crate::hub::warm(core).await? {
+async fn warm_hub(core: &ServerCore) -> Result<Vec<String>, ServerError> {
+    let lines = crate::hub::warm(core).await?;
+    for line in &lines {
         tracing::info!("{line}");
     }
-    Ok(())
+    Ok(lines)
 }
 
 /// The persisted CA, or a fresh one persisted on first start.
@@ -439,6 +449,7 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
     if let Some(relay) = &running.relay {
         lines.push(format!("listening relay={}", relay.server.addr()));
     }
+    lines.extend(running.hub_lines.iter().cloned());
     if let Some(code) = &running.bootstrap_code {
         lines.push(format!("bootstrap-client-code {}", code.join_code()));
     }
@@ -632,14 +643,14 @@ mod tests {
         );
     }
 
-    /// The serving path, end to end: CA created and persisted, both
-    /// listeners bound, the bootstrap code minted exactly when no client is
-    /// enrolled. The certificates it issues are proven against real
-    /// handshakes in `tests/enrollment.rs`; this holds the startup wiring.
-    #[tokio::test]
-    async fn serve_stands_up_and_bootstraps_exactly_once() {
-        let directory = tempfile::tempdir().expect("a temp dir");
-        let config = super::ServeConfig {
+    /// A serve config rooted in `directory`: OS-chosen loopback ports, the
+    /// relay bound only when a bind is given — the shape every serving test
+    /// opens with.
+    fn config_in(
+        directory: &tempfile::TempDir,
+        relay_bind: Option<std::net::SocketAddr>,
+    ) -> super::ServeConfig {
+        super::ServeConfig {
             database: directory
                 .path()
                 .join("horde.db")
@@ -650,8 +661,67 @@ mod tests {
             enrollment_bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             subject_names: Vec::new(),
             blob_max_bytes: None,
-            relay_bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-        };
+            relay_bind,
+        }
+    }
+
+    /// The hub warm-up's effect is on the operator interface: a server
+    /// started over a catalog whose upstream cannot spawn reports the
+    /// unavailable line on stdout — not only in tracing, where no operator
+    /// (and no test) would hold it.
+    #[tokio::test]
+    async fn serve_reports_the_hub_warm_up_on_the_operator_interface() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let database = directory
+            .path()
+            .join("horde.db")
+            .to_string_lossy()
+            .into_owned();
+
+        // The catalog exists before this start — journaled by an earlier
+        // `horde mcp add`, replayed here by opening the same log first.
+        let log = super::open_log(&database).expect("the log opens");
+        crate::hub::testfix::seed_catalog(
+            &log,
+            horde_proto::v1::McpServerConfig {
+                name: "ghost".to_owned(),
+                transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+                    horde_proto::v1::McpStdioTransport {
+                        command: "horde-no-such-binary".to_owned(),
+                        args: Vec::new(),
+                        env: [].into(),
+                    },
+                )),
+                local: false,
+                allowed_agent_types: Vec::new(),
+                etag: String::new(),
+            },
+        )
+        .await;
+        drop(log);
+
+        let config = config_in(&directory, None);
+        let running = super::serve(&config).await.expect("the server comes up");
+        assert!(
+            super::operator_lines(&running)
+                .iter()
+                .any(|line| line.starts_with("hub-server ghost unavailable:")),
+            "the warm-up's outcome must reach the operator: {:?}",
+            super::operator_lines(&running)
+        );
+    }
+
+    /// The serving path, end to end: CA created and persisted, both
+    /// listeners bound, the bootstrap code minted exactly when no client is
+    /// enrolled. The certificates it issues are proven against real
+    /// handshakes in `tests/enrollment.rs`; this holds the startup wiring.
+    #[tokio::test]
+    async fn serve_stands_up_and_bootstraps_exactly_once() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(
+            &directory,
+            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        );
 
         let running = super::serve(&config).await.expect("the server comes up");
         assert_ne!(running.main.addr.port(), 0, "the OS chose a real port");

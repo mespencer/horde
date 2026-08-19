@@ -296,9 +296,78 @@ async fn catalog(core: &ServerCore) -> Result<McpServerCatalog, ServerError> {
     McpServerCatalog::project(&core.log.read_all(MCP_CATALOG_STREAM).await?)
 }
 
+/// Log fixtures the hub suites share (this module's, the worker spine's, and
+/// startup's): one journaled catalog entry, and the stub MCP server to point
+/// it at — kept here so none of them restates the arrangement (the
+/// duplication gate's rule applies to test code too). Integration tests use
+/// `horde_server_testkit::seed_mcp_server` instead; a lib test cannot, since
+/// its cfg(test) `crate::` types are not the testkit's plain-build ones.
+#[cfg(test)]
+pub(crate) mod testfix {
+    use horde_proto::v1::McpServerConfig;
+    use prost::Message;
+
+    use crate::log::{EventLog, PendingEvent};
+
+    pub(crate) async fn seed_catalog(log: &EventLog, config: McpServerConfig) {
+        let name = config.name.clone();
+        let kind = horde_proto::v1::event::Kind::McpServerConfigChanged(
+            horde_proto::v1::McpServerConfigChanged {
+                config: Some(config),
+                deleted: false,
+            },
+        );
+        let payload = horde_proto::v1::Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: format!("mcp:{name}"),
+            kind: Some(kind),
+        }
+        .encode_to_vec();
+        log.append(PendingEvent {
+            session_id: crate::mcp::MCP_CATALOG_STREAM.to_owned(),
+            origin_worker_id: String::new(),
+            journal_sequence: None,
+            idempotency_key: format!("mcp:{name}"),
+            payload,
+        })
+        .await
+        .expect("the catalog change appends");
+    }
+
+    /// The stub MCP server as a hub-placed catalog config: `name` is the
+    /// namespace prefix, `identity` what its `whoami` tool answers, `allowed`
+    /// the agent-type allowlist.
+    pub(crate) async fn stub_config(
+        name: &str,
+        identity: &str,
+        local: bool,
+        allowed: &[&str],
+    ) -> McpServerConfig {
+        let binary = horde_server_testkit::process::product_binary("horde-mcp", "mcp_stub_server")
+            .await
+            .expect("the stub server binary exists");
+        McpServerConfig {
+            name: name.to_owned(),
+            transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+                horde_proto::v1::McpStdioTransport {
+                    command: binary.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    env: [("HORDE_STUB_IDENTITY".to_owned(), identity.to_owned())].into(),
+                },
+            )),
+            local,
+            allowed_agent_types: allowed.iter().map(|s| (*s).to_owned()).collect(),
+            etag: String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use horde_proto::v1::{McpServerConfig, McpStdioTransport, mcp_server_config::Transport};
+
+    use horde_mcp::hub::link;
 
     use super::{holds_agent, routed_config};
     use crate::error::ServerError;
@@ -398,16 +467,22 @@ mod tests {
         ));
     }
 
+    /// One core over an in-memory log with agent-1 placed on w1 — the
+    /// arrangement every forwarded-surface test opens with.
+    async fn placed_core() -> crate::service::ServerCore {
+        let core = crate::service::ServerCore::new(
+            crate::log::EventLog::in_memory().expect("an in-memory log"),
+        );
+        crate::forward::testfix::placed_expose(&core.log, "s1", "agent-1", "w1").await;
+        core
+    }
+
     /// The caller gate, over a projected session: the placed worker passes,
     /// everyone else's refusal names what failed — wrong worker, unknown
     /// agent, unknown session.
     #[tokio::test]
     async fn the_caller_gate_admits_only_the_placed_worker() {
-        let core = crate::service::ServerCore::new(
-            crate::log::EventLog::in_memory().expect("an in-memory log"),
-        );
-        crate::forward::testfix::placed_expose(&core.log, "s1", "agent-1", "w1").await;
-
+        let core = placed_core().await;
         let admitted = super::admitted_caller(&core, "w1", "s1", "agent-1")
             .await
             .unwrap_or_else(|error| panic!("the placed worker passes: {error}"));
@@ -447,4 +522,115 @@ mod tests {
     // testkit owns a helper for — and the testkit's `horde_server` is the
     // plain build, which a lib test's cfg(test) `crate::` types cannot meet
     // — so it lives in `tests/server_suite/mcp_catalog.rs` instead.
+
+    /// The connection cache's whole contract, behaviorally: connected once
+    /// per config version — the same etag reuses the live session even if
+    /// the config bytes changed underneath (the catalog's etag is the truth
+    /// about versions), and a moved etag reconnects under the new config.
+    /// The stub's `whoami` answers its spawn-time env, so which *process*
+    /// answered is observable.
+    #[tokio::test]
+    async fn upstreams_connect_once_per_etag_and_reconnect_when_it_moves() {
+        let hub = super::HubUpstreams::new();
+        let mut first = super::testfix::stub_config("stub", "first", false, &[]).await;
+        first.etag = "1".to_owned();
+
+        let connected = hub
+            .upstream_for(&first)
+            .await
+            .unwrap_or_else(|error| panic!("the stub connects: {error}"));
+        let answered = connected
+            .call("whoami", None)
+            .await
+            .unwrap_or_else(|error| panic!("whoami answers: {error}"));
+        assert_eq!(link::first_text(&answered), Some("first"));
+
+        // Same etag, different env: the cached connection must answer —
+        // "authenticated exactly once" means no second child.
+        let mut same_version = super::testfix::stub_config("stub", "second", false, &[]).await;
+        same_version.etag = "1".to_owned();
+        let cached = hub
+            .upstream_for(&same_version)
+            .await
+            .unwrap_or_else(|error| panic!("the cache answers: {error}"));
+        let answered = cached
+            .call("whoami", None)
+            .await
+            .unwrap_or_else(|error| panic!("whoami answers: {error}"));
+        assert_eq!(
+            link::first_text(&answered),
+            Some("first"),
+            "an unchanged etag must reuse the live connection, never respawn"
+        );
+
+        // The etag moved: the change that produced it deserves a fresh
+        // connection under the new config.
+        let mut next_version = super::testfix::stub_config("stub", "second", false, &[]).await;
+        next_version.etag = "2".to_owned();
+        let reconnected = hub
+            .upstream_for(&next_version)
+            .await
+            .unwrap_or_else(|error| panic!("the new version connects: {error}"));
+        let answered = reconnected
+            .call("whoami", None)
+            .await
+            .unwrap_or_else(|error| panic!("whoami answers: {error}"));
+        assert_eq!(
+            link::first_text(&answered),
+            Some("second"),
+            "a moved etag must reconnect under the new config"
+        );
+    }
+
+    /// The forwarded surface against real upstream children, both verbs:
+    /// the listing is exactly the visible hub server's namespaced tools —
+    /// `local` placements and scoped servers filtered out — and a call
+    /// round-trips to the upstream's own answer.
+    #[tokio::test]
+    async fn forwarded_listing_and_calls_route_real_upstreams_and_fail_closed() {
+        let core = placed_core().await;
+        for config in [
+            super::testfix::stub_config("stub", "hub", false, &[]).await,
+            super::testfix::stub_config("loc", "loc", true, &[]).await,
+            super::testfix::stub_config("scoped", "scoped", false, &["reviewer"]).await,
+        ] {
+            super::testfix::seed_catalog(&core.log, config).await;
+        }
+
+        let listed = super::list_hub_tools(&core, "w1", "s1", "agent-1")
+            .await
+            .unwrap_or_else(|error| panic!("the listing answers: {error}"));
+        let names: Vec<String> = listed
+            .iter()
+            .map(|json| {
+                horde_mcp::hub::link::tool_from_json(json)
+                    .unwrap_or_else(|error| panic!("a listed tool decodes: {error}"))
+                    .name
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            names.contains(&"stub__echo".to_owned()),
+            "the visible hub server's tools are listed, namespaced: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| name.starts_with("stub__")),
+            "local placements and scoped servers must not be listed: {names:?}"
+        );
+
+        let result_json = super::call_hub_tool(
+            &core,
+            "w1",
+            "s1",
+            "agent-1",
+            "stub__echo",
+            r#"{"message":"across the seam"}"#,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the call answers: {error}"));
+        let result = horde_mcp::hub::link::result_from_json(&result_json)
+            .unwrap_or_else(|error| panic!("the result decodes: {error}"));
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(link::first_text(&result), Some("echo:across the seam"));
+    }
 }

@@ -373,6 +373,72 @@ mod tests {
         StampingSink::new(journal.sink(), std::sync::Arc::new(ShareBroker::new(None)))
     }
 
+    /// The empty-surface shortcut's truth table: only a surface with neither
+    /// `local` configs nor visible hub servers is empty. Each false clause
+    /// alone must flip it — a surface wrongly judged empty silently strips a
+    /// promised toolset, wrongly judged non-empty costs every plain spawn a
+    /// hub round trip.
+    #[test]
+    fn a_surface_is_empty_only_with_neither_half() {
+        let local = horde_proto::v1::McpServerConfig {
+            name: "browser".to_owned(),
+            ..horde_proto::v1::McpServerConfig::default()
+        };
+
+        assert!(super::AgentMcpSurface::default().is_empty());
+        assert!(
+            !super::AgentMcpSurface {
+                local: vec![local.clone()],
+                visible_hub: Vec::new(),
+            }
+            .is_empty(),
+            "a local config alone is a surface"
+        );
+        assert!(
+            !super::AgentMcpSurface {
+                local: Vec::new(),
+                visible_hub: vec!["linear".to_owned()],
+            }
+            .is_empty(),
+            "a visible hub server alone is a surface"
+        );
+        assert!(
+            !super::AgentMcpSurface {
+                local: vec![local],
+                visible_hub: vec!["linear".to_owned()],
+            }
+            .is_empty()
+        );
+    }
+
+    /// A surface whose `local` config cannot even convert fails the endpoint
+    /// (and so the spawn) loudly — a register step that silently succeeded
+    /// would launch the agent missing its promised toolset, ADR-0004's
+    /// dreaded failure shape.
+    #[tokio::test]
+    async fn an_unusable_local_config_fails_the_endpoint() {
+        let manager = manager();
+        let surface = super::AgentMcpSurface {
+            local: vec![horde_proto::v1::McpServerConfig {
+                name: "browser".to_owned(),
+                // No transport at all: the conversion refuses it.
+                ..horde_proto::v1::McpServerConfig::default()
+            }],
+            visible_hub: Vec::new(),
+        };
+
+        let refused = manager
+            .endpoint_for("s1", "agent-1", sink(), &surface)
+            .await
+            .expect_err("an unusable local config must fail the spawn");
+        assert!(
+            matches!(&refused, crate::error::WorkerError::McpSurface(_)),
+            "got {refused:?}"
+        );
+
+        assert_eq!(manager.shutdown().await, 1, "the session endpoint reaps");
+    }
+
     /// The Session mapping: two agents of one Session share its endpoint
     /// (one AgentContext binds one Session), while a second Session gets its
     /// own — its verbs journal into and follow a different log.

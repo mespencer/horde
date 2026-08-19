@@ -402,3 +402,49 @@ async fn a_permission_server_answers_from_the_configured_mode() {
         "the decision must come from the chain the harness was told to run"
     );
 }
+
+/// The catalog seeder lands exactly one entry in the reserved stream, keyed:
+/// a second seed of the same server dedupes rather than double-journaling,
+/// and the folded catalog holds the config it carried. Field-deletion
+/// mutants each break one leg — no session id strands the event outside the
+/// catalog stream, no key journals it twice, no payload folds to nothing.
+#[tokio::test]
+async fn seed_mcp_server_lands_one_decodable_catalog_entry() {
+    let log = horde_server::EventLog::in_memory().expect("an in-memory log");
+    let config = || horde_proto::v1::McpServerConfig {
+        name: "linear".to_owned(),
+        transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+            horde_proto::v1::McpStdioTransport {
+                command: "linear-mcp".to_owned(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+            },
+        )),
+        local: false,
+        allowed_agent_types: Vec::new(),
+        etag: String::new(),
+    };
+
+    horde_server_testkit::seed_mcp_server(&log, config())
+        .await
+        .expect("the first seed appends");
+    horde_server_testkit::seed_mcp_server(&log, config())
+        .await
+        .expect("the repeated seed is deduplicated, not refused");
+
+    let events = log
+        .read_all(horde_server::mcp::MCP_CATALOG_STREAM)
+        .await
+        .expect("the catalog stream reads");
+    assert_eq!(
+        events.len(),
+        1,
+        "one keyed entry: absent from the stream means the session id was \
+         dropped, two entries mean the idempotency key was"
+    );
+    let catalog = horde_server::mcp::McpServerCatalog::project(&events).expect("the catalog folds");
+    let folded = catalog
+        .get("linear")
+        .unwrap_or_else(|| panic!("the config must fold back out of the payload"));
+    assert!(!folded.local);
+}

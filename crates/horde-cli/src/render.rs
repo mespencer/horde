@@ -1783,6 +1783,48 @@ mod tests {
         assert_eq!(human, human.trim_end(), "got {human:?}");
     }
 
+    /// A rendered escalation carries the id `horde approve` needs and the
+    /// tool the approver is judging — a follower that cannot learn either
+    /// from the stream cannot answer at all (the deployed-stack hub e2e
+    /// approves by exactly this field).
+    #[test]
+    fn a_permission_request_renders_its_id_and_tool() {
+        use horde_proto::v1::{
+            PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall,
+        };
+
+        let requested = envelope(Some(Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new("call-9")),
+                agent_id: None,
+                tool_call: Some(ProposedToolCall {
+                    tool_name: "linear__create".to_owned(),
+                    input: None,
+                    rendered: String::new(),
+                }),
+                tree_path: Vec::new(),
+                permission_mode: String::new(),
+                escalated_from: 0,
+                expires_at: None,
+                forward: None,
+            }),
+        })));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&requested, Format::Json)).expect("json");
+        assert_eq!(parsed["detail"]["request_id"], "call-9");
+        assert_eq!(parsed["detail"]["tool"], "linear__create");
+
+        let bare = envelope(Some(Kind::PermissionRequested(PermissionRequested {
+            request: None,
+        })));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&bare, Format::Json)).expect("json");
+        assert_eq!(
+            parsed["detail"], "",
+            "a malformed request renders empty rather than panicking"
+        );
+    }
+
     /// Every arm of `detail` must be pinned by an assertion on the text it
     /// extracts. Mutation testing deletes arms one at a time, and a fall-through
     /// to the empty default is invisible unless the text itself is checked —
