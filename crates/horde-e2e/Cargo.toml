@@ -9,6 +9,13 @@ description = "The end-to-end tier: horde-server, horde-worker and horde as real
 [lints]
 workspace = true
 
+# The scripted provider login command the login scenarios relay to
+# (DESIGN §4). std-only on purpose, so the bin target costs a plain build
+# nothing; it lives here because the e2e tier is its only consumer.
+[[bin]]
+name = "fake-login"
+path = "src/bin/fake_login.rs"
+
 # Everything lives in dev-dependencies: this crate is its test suite. The
 # library target exists only to give the suite a crate to belong to, so a
 # plain `cargo build` never pays for the e2e harness.
@@ -18,6 +25,9 @@ workspace = true
 # types and no client library of its own (the raw-client stand-ins left with
 # fix a12).
 horde-server-testkit = { workspace = true }
+# The login scenarios drive the real `horde worker login` inside a pty —
+# the raw-mode terminal shell is part of what they hold to account.
+portable-pty = "0.9.0"
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time"] }

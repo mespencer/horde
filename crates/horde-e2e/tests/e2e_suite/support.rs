@@ -45,6 +45,23 @@ impl System {
     pub(crate) fn worker_binary(&self) -> PathBuf {
         self.worker_bin.clone()
     }
+
+    /// The `horde` CLI binary — for scenarios that must run it somewhere
+    /// [`Self::cli`] cannot, like inside a pty.
+    pub(crate) fn horde_binary(&self) -> PathBuf {
+        self.horde.clone()
+    }
+
+    /// The operator flags every `horde` invocation carries, for callers
+    /// assembling their own command around [`Self::horde_binary`].
+    pub(crate) fn operator_args(&self) -> Vec<String> {
+        vec![
+            "--endpoint".to_owned(),
+            self.main.clone(),
+            "--identity".to_owned(),
+            self.operator.to_string_lossy().into_owned(),
+        ]
+    }
 }
 
 /// The `https://localhost:PORT` form of a printed `IP:PORT` listener line.
