@@ -41,6 +41,7 @@ Dependencies flow downward; items within a wave run in parallel worktrees.
 | 6 | MCP hub + `local` servers; blob store; usage/tiers/headroom; OTLP | wave 5 | delivered |
 | 7 | Fault-injection suite; Gherkin features; full e2e hardening; DESIGN.md conformance audit | all | delivered (audit fixes in flight) |
 | 8 | Port forwards: expose/inject relayed through the server (ADR-0006) | wave 7 | — |
+| 9 | **W9a** Interactive-auth relay: `horde worker login` remote PTY + ephemeral callback expose (DESIGN §4) | wave 8 | delivered |
 
 Wave contents will be refined as reality reports back; the dependency spine holds.
 
