@@ -192,7 +192,11 @@ async fn attempt(
             "runner: registered resume_from={}",
             registration.resume_from_journal_sequence
         );
-        let outcome = connection.run(journal, runtime).await;
+        let logins = std::sync::Arc::new(horde_worker::login::LoginPlane::from_adapters(
+            runtime.adapters(),
+            std::sync::Arc::new(|line| println!("{line}")),
+        ));
+        let outcome = connection.run(journal, runtime, logins).await;
         eprintln!("runner: connection over: {outcome:?}");
     }
 }

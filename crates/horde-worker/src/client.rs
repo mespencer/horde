@@ -208,10 +208,13 @@ impl Connection {
         &mut self,
         journal: &Journal,
         target: &mut dyn ApplyCommand,
+        logins: std::sync::Arc<crate::login::LoginPlane>,
     ) -> Result<(), WorkerError> {
         let mut push_side = self.clone();
         let forward_client = self.service_client();
         let forward_worker = self.worker_id.clone();
+        let login_client = self.service_client();
+        let login_worker = self.worker_id.clone();
         tokio::select! {
             outcome = self.feed_commands(journal, target) => outcome,
             outcome = push_side.push_events(journal) => outcome,
@@ -220,6 +223,11 @@ impl Connection {
             // and the select dropping this future is what tears every
             // listener down at partition.
             outcome = crate::forward::serve(forward_client, &forward_worker) => outcome,
+            // The login plane (DESIGN §4) rides the same lifecycle. The
+            // dispatch stream dies here; each live login session is a
+            // detached task that ends itself through its own tunnel dying —
+            // via kill-and-reap, never around it (see `login`'s module docs).
+            outcome = crate::login::serve(login_client, &login_worker, logins) => outcome,
         }
     }
 

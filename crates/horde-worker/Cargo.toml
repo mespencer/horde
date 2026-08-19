@@ -36,6 +36,9 @@ horde-proto = { workspace = true }
 # stage/obtain halves of moving a commit between checkouts (DESIGN §5, §8).
 horde-relay = { workspace = true }
 horde-wire = { workspace = true }
+# The interactive-auth relay's PTY (DESIGN §4): provider login commands run
+# in a real terminal the client's keystrokes are relayed into.
+portable-pty = "0.9.0"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

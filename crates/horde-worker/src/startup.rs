@@ -103,6 +103,17 @@ pub struct WorkerConfig {
     pub adapters: Vec<AdapterChoice>,
     /// A JSON script for the fake adapter; absent means the echo script.
     pub fake_script: Option<PathBuf>,
+    /// The fake adapter's login command (DESIGN §4's relay, hermetically):
+    /// a program the login PTY spawns instead of a real provider CLI.
+    pub fake_login: Option<PathBuf>,
+    /// The browser-facing callback port the fake login recipe declares —
+    /// what the client binds exactly and the URL the command prints names.
+    pub fake_login_callback_port: Option<u16>,
+    /// Where the fake login command actually listens on this machine, when
+    /// it differs from the callback port. The hermetic e2e needs the split:
+    /// on one machine, one port cannot be both the client's listener and
+    /// the worker's.
+    pub fake_login_listen_port: Option<u16>,
     /// Enables workspace support rooted here.
     pub workspace_root: Option<PathBuf>,
     /// The git Relay payload shares stage to and fetch through.
@@ -125,6 +136,9 @@ struct ParsedFlags {
     enrollment: Option<String>,
     name: Option<String>,
     adapters: Vec<AdapterChoice>,
+    fake_login: Option<PathBuf>,
+    fake_login_callback_port: Option<u16>,
+    fake_login_listen_port: Option<u16>,
     fake_script: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     relay: Option<String>,
@@ -148,6 +162,9 @@ fn takes_value(flag: &str) -> bool {
             | "--name"
             | "--adapter"
             | "--fake-script"
+            | "--fake-login"
+            | "--fake-login-callback-port"
+            | "--fake-login-listen-port"
             | "--workspace-root"
             | "--relay"
             | "--tag"
@@ -209,6 +226,19 @@ impl ParsedFlags {
                 self.adapters.push(choice);
             }
             "--fake-script" => self.fake_script = Some(PathBuf::from(value)),
+            "--fake-login" => self.fake_login = Some(PathBuf::from(value)),
+            "--fake-login-callback-port" => {
+                let port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("--fake-login-callback-port is not a port: {value}"))?;
+                self.fake_login_callback_port = Some(port);
+            }
+            "--fake-login-listen-port" => {
+                let port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("--fake-login-listen-port is not a port: {value}"))?;
+                self.fake_login_listen_port = Some(port);
+            }
             "--workspace-root" => self.workspace_root = Some(PathBuf::from(value)),
             "--relay" => self.relay = Some(value),
             "--tag" => self.tags.push(value),
@@ -233,6 +263,9 @@ impl ParsedFlags {
             name: self.name,
             adapters: self.adapters,
             fake_script: self.fake_script,
+            fake_login: self.fake_login,
+            fake_login_callback_port: self.fake_login_callback_port,
+            fake_login_listen_port: self.fake_login_listen_port,
             workspace_root: self.workspace_root,
             relay: self.relay,
             tags: self.tags,
@@ -262,6 +295,15 @@ impl WorkerConfig {
         }
         if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
             return Err("--fake-script needs --adapter fake".to_owned());
+        }
+        if self.fake_login.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
+            return Err("--fake-login needs --adapter fake".to_owned());
+        }
+        if self.fake_login_callback_port.is_some() && self.fake_login.is_none() {
+            return Err("--fake-login-callback-port needs --fake-login".to_owned());
+        }
+        if self.fake_login_listen_port.is_some() && self.fake_login_callback_port.is_none() {
+            return Err("--fake-login-listen-port needs --fake-login-callback-port".to_owned());
         }
         if self.insecure && !self.server.starts_with("http://") {
             return Err(format!(
@@ -576,6 +618,10 @@ pub struct PreparedWorker {
     pub identity: Option<StoredIdentity>,
     /// The id claimed at registration and the display name in the hello.
     pub name: String,
+    /// Where the login plane's operator lines go (`login spawned …`,
+    /// `login reaped …`). Stdout by default — the operator interface — and
+    /// injectable so in-process suites can read the reap witness.
+    pub login_announce: crate::login::Announce,
 }
 
 impl std::fmt::Debug for PreparedWorker {
@@ -626,6 +672,7 @@ pub async fn prepare(
         server: config.server.clone(),
         identity,
         name,
+        login_announce: Arc::new(|line| println!("{line}")),
     })
 }
 
@@ -650,7 +697,11 @@ fn build_runtime(
     for adapter in &config.adapters {
         runtime = match adapter {
             AdapterChoice::Fake => {
-                runtime.with_adapter(Arc::new(FakeAdapter::new(configured_script(config)?)))
+                let mut fake = FakeAdapter::new(configured_script(config)?);
+                if let Some(recipe) = configured_fake_login(config) {
+                    fake = fake.with_login_recipe(recipe);
+                }
+                runtime.with_adapter(Arc::new(fake))
             }
             AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new())),
             AdapterChoice::Codex => runtime.with_adapter(Arc::new(crate::CodexAdapter::new())),
@@ -664,6 +715,29 @@ fn build_runtime(
         runtime = runtime.with_relay(horde_relay::RelayLocation::new(relay));
     }
     Ok(runtime)
+}
+
+/// The fake adapter's login recipe, when `--fake-login` gave it one. The
+/// ports ride both halves of the recipe: declared (so the relay exposes the
+/// callback and the worker dials the listener) and passed to the command as
+/// argv (so it binds and prints the same ports).
+pub fn configured_fake_login(config: &WorkerConfig) -> Option<horde_adapter::LoginRecipe> {
+    let program = config.fake_login.as_ref()?;
+    let program = program.to_string_lossy().into_owned();
+    let Some(callback) = config.fake_login_callback_port else {
+        return Some(horde_adapter::LoginRecipe::terminal_only(
+            program,
+            Vec::new(),
+        ));
+    };
+    let mut args = vec!["--callback-port".to_owned(), callback.to_string()];
+    let mut recipe = horde_adapter::LoginRecipe::with_callback(program, Vec::new(), callback);
+    if let Some(listen) = config.fake_login_listen_port {
+        args.extend(["--listen-port".to_owned(), listen.to_string()]);
+        recipe = recipe.listening_on(listen);
+    }
+    recipe.args = args;
+    Some(recipe)
 }
 
 /// The fake adapter's script: the file's, or the echo default.
@@ -881,9 +955,16 @@ async fn connection_loop(
             registration.resume_from_journal_sequence
         ));
 
+        // Rebuilt per connection from the registered adapters: recipes are
+        // static data, and collecting them here keeps the borrow on the
+        // runtime out of the mutable run below.
+        let logins = Arc::new(crate::login::LoginPlane::from_adapters(
+            prepared.runtime.adapters(),
+            prepared.login_announce.clone(),
+        ));
         let ended = tokio::select! {
             () = shutdown.as_mut() => return None,
-            ended = connection.run(&prepared.journal, &mut prepared.runtime) => ended,
+            ended = connection.run(&prepared.journal, &mut prepared.runtime, logins) => ended,
         };
         match fate_of(&ended) {
             Fate::Fatal(reason) => return Some(reason),

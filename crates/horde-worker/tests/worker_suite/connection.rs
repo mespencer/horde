@@ -64,7 +64,11 @@ mod harness {
         let journal = journal.clone();
         let task = tokio::spawn(async move {
             let mut runtime = runtime;
-            connection.run(&journal, &mut runtime).await
+            let logins = std::sync::Arc::new(horde_worker::login::LoginPlane::from_adapters(
+                runtime.adapters(),
+                std::sync::Arc::new(|_line| {}),
+            ));
+            connection.run(&journal, &mut runtime, logins).await
         });
         (task, registration)
     }
