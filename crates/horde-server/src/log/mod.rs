@@ -1189,7 +1189,20 @@ mod tests {
         // hang it. An unbounded wait converts a clear failure into a suite that
         // never reports, which is strictly worse.
         let mut seen: Vec<u64> = history.iter().map(|event| event.sequence).collect();
+        // The ceiling is a count, not the clock below: a defect that makes
+        // `next_batch` resolve instantly with an empty batch never yields, so
+        // the timeout wrapped around it is never polled and cannot fire
+        // (QUALITY_GATES, "a clock cannot bound a loop that fails to make
+        // progress"). Every healthy batch carries at least one new event, so
+        // 25 events can never need more than 25 batches.
+        let mut rounds = 0_u32;
         while seen.last().copied().unwrap_or(0) < 25 {
+            rounds += 1;
+            assert!(
+                rounds <= 25,
+                "{rounds} batches without reaching sequence 25: an empty or \
+                 repeated batch is a defect, not something to wait out"
+            );
             let batch =
                 tokio::time::timeout(std::time::Duration::from_millis(500), tail.next_batch())
                     .await
