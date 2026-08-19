@@ -23,3 +23,24 @@ pub(crate) fn scripted_leg() -> (
     };
     (io, inbound_tx, outbound_rx)
 }
+
+/// One scripted leg's handles: its feed, its outbound, its task.
+pub(crate) type ScriptedPeer = (
+    tokio::sync::mpsc::Sender<Result<LoginFrame, Status>>,
+    tokio::sync::mpsc::Receiver<LoginFrame>,
+    tokio::task::JoinHandle<()>,
+);
+
+/// The worker tunnel driver run as `caller` over a scripted leg — the
+/// shared opening of every tunnel-answering test, in both login suites.
+pub(crate) fn answering_tunnel(
+    logins: &super::registry::LoginRegistry,
+    caller: crate::forward::registry::TunnelPrincipal,
+) -> ScriptedPeer {
+    let (io, feed, out) = scripted_leg();
+    let logins = logins.clone();
+    let task = tokio::spawn(async move {
+        super::relay::run_worker_login_tunnel(&logins, caller, io).await;
+    });
+    (feed, out, task)
+}

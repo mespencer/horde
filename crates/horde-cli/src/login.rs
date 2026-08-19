@@ -246,27 +246,7 @@ pub async fn run_interactive(
 ) -> Result<(), ClientError> {
     let (cols, rows) = terminal_size();
     let opened = open_login(client, worker, provider, cols, rows).await?;
-
-    // The callback expose realizes before any byte flows, so the URL the
-    // login command prints first is already reachable when it paints.
-    let realized = match &opened.callback {
-        Some((forward_id, port)) => Some(
-            crate::forward::realize_expose_exact(
-                client,
-                forward_id,
-                &format!("{provider}-login-callback"),
-                *port,
-            )
-            .await
-            .map_err(|error| {
-                ClientError::Login(format!(
-                    "could not bind the callback port {port} on this machine: {error} \
-                     (the provider's redirect URI is port-exact, so there is no fallback)"
-                ))
-            })?,
-        ),
-        None => None,
-    };
+    let realized = realize_callback(client, provider, &opened.callback).await?;
     println!(
         "{}",
         started_line(
@@ -278,9 +258,67 @@ pub async fn run_interactive(
         )
     );
 
-    // Keystrokes: a blocking stdin reader thread. It ends with the process;
-    // a blocked terminal read cannot be cancelled portably, and this process
-    // exits as soon as the login ends.
+    let (typed, resizes, winch) = terminal_feeds();
+    let end = {
+        let _raw = RawModeGuard::enable_if_terminal();
+        let mut stdout = std::io::stdout();
+        pump_login(opened.stream, typed, resizes, &mut stdout).await
+        // _raw drops here: the terminal is sane again before anything prints.
+    };
+    winch.abort();
+    if let Some(realized) = realized {
+        realized.stop().await;
+    }
+
+    match verdict(end) {
+        Ok(code) => {
+            println!("{}", exited_line(&opened.login_id, code, format));
+            Ok(())
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Realizes the callback expose before any byte flows, so the URL the login
+/// command prints first is already reachable when it paints — on exactly
+/// the recipe's port, because a redirect URI admits no fallback.
+async fn realize_callback(
+    client: &Client,
+    provider: &str,
+    callback: &Option<(String, u16)>,
+) -> Result<Option<crate::forward::RealizedExpose>, ClientError> {
+    let Some((forward_id, port)) = callback else {
+        return Ok(None);
+    };
+    crate::forward::realize_expose_exact(
+        client,
+        forward_id,
+        &format!("{provider}-login-callback"),
+        *port,
+    )
+    .await
+    .map(Some)
+    .map_err(|error| {
+        ClientError::Login(format!(
+            "could not bind the callback port {port} on this machine: {error} \
+             (the provider's redirect URI is port-exact, so there is no fallback)"
+        ))
+    })
+}
+
+/// This terminal's live inputs, as the pump's channels: the typed bytes,
+/// the resizes, and the SIGWINCH watcher's handle for the caller to abort.
+type TerminalFeeds = (
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<(u16, u16)>,
+    tokio::task::JoinHandle<()>,
+);
+
+/// Feeds the pump from this terminal: a blocking stdin reader thread (it
+/// ends with the process — a blocked terminal read cannot be cancelled
+/// portably, and this process exits as soon as the login ends) and a
+/// SIGWINCH watcher.
+fn terminal_feeds() -> TerminalFeeds {
     let (typed_tx, typed) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     std::thread::spawn(move || {
         use std::io::Read;
@@ -293,7 +331,6 @@ pub async fn run_interactive(
         }
     });
 
-    // Terminal resizes, relayed as frames (unix: SIGWINCH).
     let (resize_tx, resizes) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
     let winch = tokio::spawn(async move {
         let Ok(mut signals) =
@@ -307,23 +344,15 @@ pub async fn run_interactive(
             }
         }
     });
+    (typed, resizes, winch)
+}
 
-    let end = {
-        let _raw = RawModeGuard::enable_if_terminal();
-        let mut stdout = std::io::stdout();
-        pump_login(opened.stream, typed, resizes, &mut stdout).await
-        // _raw drops here: the terminal is sane again before anything prints.
-    };
-    winch.abort();
-    if let Some(realized) = realized {
-        realized.stop().await;
-    }
-
+/// The verb's verdict on how the pump ended: the clean exit code to print,
+/// or the failure in the operator's words. Pure, so its table is pinned by
+/// unit tests rather than staged through a terminal.
+fn verdict(end: LoginEnd) -> Result<u32, ClientError> {
     match end {
-        LoginEnd::Exited(0) => {
-            println!("{}", exited_line(&opened.login_id, 0, format));
-            Ok(())
-        }
+        LoginEnd::Exited(0) => Ok(0),
         LoginEnd::Exited(code) => Err(ClientError::Login(format!(
             "the login command exited with {code}"
         ))),
@@ -400,6 +429,20 @@ mod tests {
             feed,
             sent,
         )
+    }
+
+    /// The verdict table, pinned pure: only exit 0 succeeds, and every
+    /// failure names its cause in the operator's words.
+    #[test]
+    fn only_a_clean_exit_is_a_successful_verdict() {
+        assert_eq!(super::verdict(LoginEnd::Exited(0)).ok(), Some(0));
+        let nonzero = super::verdict(LoginEnd::Exited(3)).expect_err("3 is a failure");
+        assert!(nonzero.to_string().contains("exited with 3"), "{nonzero}");
+        let refused = super::verdict(LoginEnd::Refused("busy".to_owned()))
+            .expect_err("a refusal is a failure");
+        assert!(refused.to_string().contains("busy"), "{refused}");
+        let ended = super::verdict(LoginEnd::ServerEnded).expect_err("a lost relay is a failure");
+        assert!(ended.to_string().contains("mid-login"), "{ended}");
     }
 
     /// The callback table: both halves present and sane, or no callback.
@@ -735,7 +778,9 @@ mod tests {
         let outcome = run_interactively(u32::from(taken), Vec::new()).await;
         let refused = outcome.expect_err("a taken redirect port cannot fall back");
         assert!(
-            refused.to_string().contains("could not bind the callback port"),
+            refused
+                .to_string()
+                .contains("could not bind the callback port"),
             "{refused}"
         );
         drop(occupant);

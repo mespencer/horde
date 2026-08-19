@@ -327,7 +327,7 @@ mod tests {
     use crate::forward::registry::TunnelPrincipal;
     use crate::forward::testfix::within;
     use crate::login::registry::LoginRegistry;
-    use crate::login::testfix::scripted_leg;
+    use crate::login::testfix::{answering_tunnel, scripted_leg};
 
     /// The opener ruling, all three principals: the refusal the spec demands
     /// (non-Client refused) and the two channels that may drive a login.
@@ -484,18 +484,8 @@ mod tests {
         assert_eq!((dispatched.cols, dispatched.rows), (80, 24));
 
         // The worker answers: a tunnel whose first frame attaches.
-        let (worker_io, worker_feed, mut worker_out) = scripted_leg();
-        let tunnel = {
-            let logins = logins.clone();
-            tokio::spawn(async move {
-                super::run_worker_login_tunnel(
-                    &logins,
-                    TunnelPrincipal::Worker("w1".to_owned()),
-                    worker_io,
-                )
-                .await;
-            })
-        };
+        let (worker_feed, mut worker_out, tunnel) =
+            answering_tunnel(&logins, TunnelPrincipal::Worker("w1".to_owned()));
         worker_feed
             .send(Ok(login_attach_frame(&dispatched.login_id, 0, 0)))
             .await
@@ -550,13 +540,7 @@ mod tests {
     async fn a_tunnel_for_an_unknown_or_misdirected_login_is_refused() {
         let logins = LoginRegistry::new();
 
-        let (io, feed, mut out) = scripted_leg();
-        let task = {
-            let logins = logins.clone();
-            tokio::spawn(async move {
-                super::run_worker_login_tunnel(&logins, TunnelPrincipal::Ambient, io).await;
-            })
-        };
+        let (feed, mut out, task) = answering_tunnel(&logins, TunnelPrincipal::Ambient);
         feed.send(Ok(login_attach_frame("login-none", 0, 0)))
             .await
             .expect("send");
@@ -568,18 +552,8 @@ mod tests {
         task.abort();
 
         let begun = logins.begin("w1", "fake").expect("begins");
-        let (io, feed, mut out) = scripted_leg();
-        let task = {
-            let logins = logins.clone();
-            tokio::spawn(async move {
-                super::run_worker_login_tunnel(
-                    &logins,
-                    TunnelPrincipal::Worker("w2".to_owned()),
-                    io,
-                )
-                .await;
-            })
-        };
+        let (feed, mut out, task) =
+            answering_tunnel(&logins, TunnelPrincipal::Worker("w2".to_owned()));
         feed.send(Ok(login_attach_frame(&begun.login_id, 0, 0)))
             .await
             .expect("send");
@@ -603,10 +577,7 @@ mod tests {
     #[tokio::test]
     async fn a_tunnel_opening_without_an_attach_is_refused() {
         let logins = LoginRegistry::new();
-        let (io, feed, mut out) = scripted_leg();
-        let task = tokio::spawn(async move {
-            super::run_worker_login_tunnel(&logins, TunnelPrincipal::Ambient, io).await;
-        });
+        let (feed, mut out, task) = answering_tunnel(&logins, TunnelPrincipal::Ambient);
         feed.send(Ok(login_output_frame(b"early".to_vec())))
             .await
             .expect("send");

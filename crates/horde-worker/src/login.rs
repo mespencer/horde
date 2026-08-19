@@ -91,6 +91,13 @@ impl LoginPlane {
         Self { recipes, announce }
     }
 
+    /// A plane whose operator lines go nowhere — for in-process test
+    /// workers, which have no stdout an operator reads.
+    #[must_use]
+    pub fn discarding<'a>(adapters: impl IntoIterator<Item = &'a dyn Adapter>) -> Arc<Self> {
+        Arc::new(Self::from_adapters(adapters, Arc::new(|_line| {})))
+    }
+
     /// The recipe a provider name resolves to, if this Worker can log it in.
     #[must_use]
     pub fn recipe_for(&self, provider: &str) -> Option<&LoginRecipe> {
@@ -466,11 +473,13 @@ mod tests {
         )
     }
 
-    /// A ceilinged wait for this suite.
+    /// A ceilinged wait for this suite, on the reap deadline's own budget —
+    /// the slowest thing any of these tests wait on is a reap.
     async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(10), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
+        match tokio::time::timeout(super::REAP_DEADLINE, future).await {
+            Ok(value) => value,
+            Err(_elapsed) => panic!("{what}: nothing within the ceiling"),
+        }
     }
 
     #[test]
@@ -691,35 +700,47 @@ mod tests {
         assert!(line.contains("spawn-failed"), "{line}");
     }
 
+    /// One recipe dispatched through the production `answer_dispatch` over
+    /// a scripted tunnel, with the attach already read — the arrangement
+    /// the full-relay and fault tests share.
+    async fn dispatched(
+        recipe: LoginRecipe,
+    ) -> (
+        tokio::sync::mpsc::Sender<Result<LoginFrame, tonic::Status>>,
+        tokio::sync::mpsc::Receiver<LoginFrame>,
+        tokio::task::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+        LoginFrame,
+    ) {
+        let (announce, lines) = announcing();
+        let mut recipes = BTreeMap::new();
+        recipes.insert("fake".to_owned(), recipe);
+        let plane = LoginPlane::new(recipes, announce);
+        let (tunnel, feed, mut sent) = scripted_tunnel();
+        let answering = tokio::spawn(async move {
+            super::answer_dispatch(tunnel, request("fake"), &plane).await;
+        });
+        let attach = within("the attach", sent.recv()).await.expect("a frame");
+        (feed, sent, answering, lines, attach)
+    }
+
     /// The full dispatch over a scripted tunnel: attach carries the recipe's
     /// callback port, the PTY's prompt crosses as output, typed input
     /// reaches the command, the exit frame carries the code, and the exited
     /// announce line lands — the whole worker half without a server.
     #[tokio::test]
     async fn a_dispatched_login_relays_prompts_input_and_exit() {
-        let (announce, lines) = announcing();
-        let mut recipes = BTreeMap::new();
-        recipes.insert(
-            "fake".to_owned(),
-            LoginRecipe {
-                program: "/bin/sh".to_owned(),
-                args: vec![
-                    "-c".to_owned(),
-                    "printf 'account? '; read account; printf 'signed in as %s\\n' \"$account\"; exit 0"
-                        .to_owned(),
-                ],
-                callback_port: Some(14555),
-                listen_port: None,
-            },
-        );
-        let plane = LoginPlane::new(recipes, announce);
-        let (tunnel, feed, mut sent) = scripted_tunnel();
-
-        let answering = tokio::spawn(async move {
-            super::answer_dispatch(tunnel, request("fake"), &plane).await;
-        });
-
-        let attach = within("the attach", sent.recv()).await.expect("a frame");
+        let recipe = LoginRecipe {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'account? '; read account; printf 'signed in as %s\\n' \"$account\"; exit 0"
+                    .to_owned(),
+            ],
+            callback_port: Some(14555),
+            listen_port: None,
+        };
+        let (feed, mut sent, answering, lines, attach) = dispatched(recipe).await;
         assert!(
             matches!(attach.frame, Some(Frame::Attach(attach)) if attach.callback_port == 14555),
             "the attach carries the recipe's callback port"
@@ -775,22 +796,11 @@ mod tests {
     /// the wait returned — the owned reap witness, no OS state asserted.
     #[tokio::test]
     async fn a_vanished_client_kills_and_provably_reaps_the_login() {
-        let (announce, lines) = announcing();
-        let mut recipes = BTreeMap::new();
-        recipes.insert(
-            "fake".to_owned(),
-            LoginRecipe::terminal_only(
-                "/bin/sh",
-                vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
-            ),
+        let recipe = LoginRecipe::terminal_only(
+            "/bin/sh",
+            vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
         );
-        let plane = LoginPlane::new(recipes, announce);
-        let (tunnel, feed, mut sent) = scripted_tunnel();
-
-        let answering = tokio::spawn(async move {
-            super::answer_dispatch(tunnel, request("fake"), &plane).await;
-        });
-        let attach = within("the attach", sent.recv()).await.expect("a frame");
+        let (feed, _sent, answering, lines, attach) = dispatched(recipe).await;
         assert!(matches!(attach.frame, Some(Frame::Attach(_))));
 
         // The client vanishes: the relay leg closes.

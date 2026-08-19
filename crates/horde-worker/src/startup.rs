@@ -172,6 +172,13 @@ fn takes_value(flag: &str) -> bool {
     )
 }
 
+/// A flag's value as a TCP port, refused with the flag's own name.
+fn parsed_port(flag: &str, value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("{flag} is not a port: {value}"))
+}
+
 /// Consumes the next argument as `flag`'s value, refusing blanks.
 fn take_value(flag: &str, arguments: &mut impl Iterator<Item = String>) -> Result<String, String> {
     arguments
@@ -215,7 +222,9 @@ impl ParsedFlags {
         Ok(())
     }
 
-    /// Applies the flags that decide what this Worker runs.
+    /// Applies the flags that decide what this Worker runs; the fake login
+    /// recipe's fall through to [`Self::apply_login_value`]. Split by
+    /// subject so neither half outgrows the complexity bar.
     fn apply_runtime_value(&mut self, flag: &str, value: String) -> Result<(), String> {
         match flag {
             "--adapter" => {
@@ -226,24 +235,27 @@ impl ParsedFlags {
                 self.adapters.push(choice);
             }
             "--fake-script" => self.fake_script = Some(PathBuf::from(value)),
-            "--fake-login" => self.fake_login = Some(PathBuf::from(value)),
-            "--fake-login-callback-port" => {
-                let port = value
-                    .parse::<u16>()
-                    .map_err(|_| format!("--fake-login-callback-port is not a port: {value}"))?;
-                self.fake_login_callback_port = Some(port);
-            }
-            "--fake-login-listen-port" => {
-                let port = value
-                    .parse::<u16>()
-                    .map_err(|_| format!("--fake-login-listen-port is not a port: {value}"))?;
-                self.fake_login_listen_port = Some(port);
-            }
             "--workspace-root" => self.workspace_root = Some(PathBuf::from(value)),
             "--relay" => self.relay = Some(value),
             "--tag" => self.tags.push(value),
             "--advertise-remote" => self.advertised_remotes.push(value),
-            // Unreachable while `takes_value` and these two matches agree;
+            _ => return self.apply_login_value(flag, value),
+        }
+        Ok(())
+    }
+
+    /// Applies the flags that shape the fake adapter's login recipe
+    /// (DESIGN §4's relay, hermetically).
+    fn apply_login_value(&mut self, flag: &str, value: String) -> Result<(), String> {
+        match flag {
+            "--fake-login" => self.fake_login = Some(PathBuf::from(value)),
+            "--fake-login-callback-port" => {
+                self.fake_login_callback_port = Some(parsed_port(flag, &value)?);
+            }
+            "--fake-login-listen-port" => {
+                self.fake_login_listen_port = Some(parsed_port(flag, &value)?);
+            }
+            // Unreachable while `takes_value` and these matches agree;
             // refusing (rather than ignoring) is what keeps a future drift
             // between them loud.
             other => return Err(format!("unknown argument {other}")),
@@ -293,18 +305,7 @@ impl WorkerConfig {
         if self.join.is_some() && self.insecure {
             return Err("--join enrolls an identity; it cannot combine with --insecure".to_owned());
         }
-        if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
-            return Err("--fake-script needs --adapter fake".to_owned());
-        }
-        if self.fake_login.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
-            return Err("--fake-login needs --adapter fake".to_owned());
-        }
-        if self.fake_login_callback_port.is_some() && self.fake_login.is_none() {
-            return Err("--fake-login-callback-port needs --fake-login".to_owned());
-        }
-        if self.fake_login_listen_port.is_some() && self.fake_login_callback_port.is_none() {
-            return Err("--fake-login-listen-port needs --fake-login-callback-port".to_owned());
-        }
+        self.check_fake_shape()?;
         if self.insecure && !self.server.starts_with("http://") {
             return Err(format!(
                 "--insecure dials plaintext, so --server must be http://…, not {}",
@@ -317,6 +318,25 @@ impl WorkerConfig {
                  (or pass --insecure for a plaintext test server)",
                 self.server
             ));
+        }
+        Ok(())
+    }
+
+    /// The fake adapter's own shape rules: scripts and login recipes
+    /// configure nothing without the adapter they belong to, and the login
+    /// ports form a dependency chain (listen needs callback needs command).
+    fn check_fake_shape(&self) -> Result<(), String> {
+        if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
+            return Err("--fake-script needs --adapter fake".to_owned());
+        }
+        if self.fake_login.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
+            return Err("--fake-login needs --adapter fake".to_owned());
+        }
+        if self.fake_login_callback_port.is_some() && self.fake_login.is_none() {
+            return Err("--fake-login-callback-port needs --fake-login".to_owned());
+        }
+        if self.fake_login_listen_port.is_some() && self.fake_login_callback_port.is_none() {
+            return Err("--fake-login-listen-port needs --fake-login-callback-port".to_owned());
         }
         Ok(())
     }
@@ -1016,6 +1036,82 @@ mod tests {
         assert!(config.join.is_none() && config.enrollment.is_none());
         assert!(config.workspace_root.is_none() && config.relay.is_none());
         assert!(config.tags.is_empty() && config.advertised_remotes.is_empty());
+    }
+
+    /// The fake login recipe's flags, whole: parsed into the config, turned
+    /// into the recipe with the split listener, and each dependency rule
+    /// refusing by name — port typos included.
+    #[test]
+    fn the_fake_login_flags_parse_validate_and_build_the_recipe() {
+        let config = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-callback-port",
+            "14555",
+            "--fake-login-listen-port",
+            "14556",
+        ])
+        .expect("the login flags parse");
+        assert_eq!(config.fake_login_callback_port, Some(14555));
+        assert_eq!(config.fake_login_listen_port, Some(14556));
+        let recipe = super::configured_fake_login(&config).expect("a recipe");
+        assert_eq!(recipe.program, "/tmp/fake-login");
+        assert_eq!(recipe.callback_port, Some(14555));
+        assert_eq!(recipe.listen_port, Some(14556));
+        assert_eq!(
+            recipe.args,
+            vec!["--callback-port", "14555", "--listen-port", "14556"],
+            "the command binds and prints the same ports the recipe declares"
+        );
+
+        // A command without ports is a terminal-only recipe; no flags at
+        // all is no recipe.
+        let bare = parsed(&["--adapter", "fake", "--fake-login", "/tmp/fake-login"])
+            .expect("a portless login parses");
+        let recipe = super::configured_fake_login(&bare).expect("a recipe");
+        assert_eq!((recipe.callback_port, recipe.listen_port), (None, None));
+        assert!(recipe.args.is_empty());
+        let none = parsed(&["--adapter", "fake"]).expect("parses");
+        assert!(super::configured_fake_login(&none).is_none());
+
+        // The refusal ladder, each rule by name.
+        let refused = parsed(&["--fake-login", "/tmp/fake-login"]).expect_err("needs the adapter");
+        assert!(refused.contains("--adapter fake"), "{refused}");
+        let refused = parsed(&["--adapter", "fake", "--fake-login-callback-port", "1"])
+            .expect_err("a port without a command configures nothing");
+        assert!(refused.contains("needs --fake-login"), "{refused}");
+        let refused = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-listen-port",
+            "1",
+        ])
+        .expect_err("a listener without a redirect is meaningless");
+        assert!(
+            refused.contains("needs --fake-login-callback-port"),
+            "{refused}"
+        );
+        let refused = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-callback-port",
+            "not-a-port",
+        ])
+        .expect_err("a port typo is the typist's, by name");
+        assert!(
+            refused.contains("--fake-login-callback-port is not a port"),
+            "{refused}"
+        );
+        let refused = super::parsed_port("--fake-login-listen-port", "70000")
+            .expect_err("no TCP port is that big");
+        assert!(refused.contains("not a port"), "{refused}");
+        assert_eq!(super::parsed_port("--x", "8080"), Ok(8080));
     }
 
     #[test]

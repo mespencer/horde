@@ -1391,6 +1391,7 @@ dependencies = [
  "horde-observe",
  "horde-proto",
  "horde-server",
+ "portable-pty",
  "tempfile",
  "tokio",
  "tokio-stream",

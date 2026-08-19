@@ -9,31 +9,11 @@
 //! never an assertion about OS process or port state), and a second login
 //! for a busy worker+provider is refused.
 
-use std::io::{Read, Write};
-
 use crate::support::System;
-
-/// A `horde worker login` process running inside a pty.
-struct PtyLogin {
-    /// Chunks of terminal output, as the child paints them.
-    output: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    /// Everything read so far, accumulated across waits.
-    seen: String,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-}
+use horde_server_testkit::pty::PtyProcess;
 
 /// Spawns the real CLI's login verb in an 80×24 pty.
-fn spawn_pty_login(system: &System, worker: &str, provider: &str) -> PtyLogin {
-    let pair = portable_pty::native_pty_system()
-        .openpty(portable_pty::PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("a pty opens");
-
+fn spawn_pty_login(system: &System, worker: &str, provider: &str) -> PtyProcess {
     let mut command = portable_pty::CommandBuilder::new(system.horde_binary());
     for argument in system.operator_args() {
         command.arg(argument);
@@ -41,75 +21,7 @@ fn spawn_pty_login(system: &System, worker: &str, provider: &str) -> PtyLogin {
     for argument in ["worker", "login", worker, provider] {
         command.arg(argument);
     }
-    command.env("TERM", "xterm-256color");
-
-    let child = pair.slave.spawn_command(command).expect("the CLI spawns");
-    // The slave side belongs to the child now; holding it open here would
-    // keep the pty from ever reporting EOF.
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().expect("a reader");
-    let writer = pair.master.take_writer().expect("a writer");
-    let (sender, output) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        while let Ok(count) = reader.read(&mut buffer) {
-            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
-                return;
-            }
-        }
-    });
-
-    PtyLogin {
-        output,
-        seen: String::new(),
-        writer,
-        child,
-    }
-}
-
-impl PtyLogin {
-    /// Reads until the terminal has shown `needle`, within a ceiling.
-    async fn await_painted(&mut self, needle: &str) {
-        let deadline = std::time::Duration::from_secs(30);
-        let step = async {
-            while !self.seen.contains(needle) {
-                match self.output.recv().await {
-                    Some(chunk) => self.seen.push_str(&String::from_utf8_lossy(&chunk)),
-                    None => panic!(
-                        "the pty closed before painting {needle:?}; saw: {:?}",
-                        self.seen
-                    ),
-                }
-            }
-        };
-        tokio::time::timeout(deadline, step)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{needle:?} never painted within the ceiling; saw: {:?}",
-                    self.seen
-                )
-            });
-    }
-
-    /// Types at the child, as an operator would.
-    fn type_str(&mut self, typed: &str) {
-        self.writer
-            .write_all(typed.as_bytes())
-            .and_then(|()| self.writer.flush())
-            .expect("the pty accepts input");
-    }
-
-    /// Waits (bounded, on a blocking thread) for the child to exit.
-    async fn await_exit(mut self) -> portable_pty::ExitStatus {
-        let waited =
-            tokio::task::spawn_blocking(move || self.child.wait().expect("the wait returns"));
-        tokio::time::timeout(std::time::Duration::from_secs(30), waited)
-            .await
-            .expect("the CLI must exit rather than hang")
-            .expect("the wait thread must not panic")
-    }
+    PtyProcess::spawn(command).expect("the CLI spawns in a pty")
 }
 
 /// Two distinct free loopback ports, found by binding `:0` twice and
@@ -190,14 +102,18 @@ async fn an_interactive_login_relays_the_pty_and_its_oauth_callback() {
 
     // The prompt was painted by the fake provider on the WORKER and crossed
     // the relay into this pty.
-    login.await_painted("account?").await;
-    login.type_str("tester\r");
+    login
+        .await_painted("account?")
+        .await
+        .expect("the prompt crosses the relay");
+    login.type_bytes(b"tester\r").expect("typing lands");
 
     // The provider's flow reaches its browser step; the URL names the
     // browser-facing port, which the client realized locally.
     login
         .await_painted(&format!("visit http://localhost:{callback}/auth"))
-        .await;
+        .await
+        .expect("the browser step paints with the redirect port");
 
     // The browser's callback, played from the client machine: through the
     // ephemeral expose to the fake provider's listener on the worker.
@@ -208,9 +124,15 @@ async fn an_interactive_login_relays_the_pty_and_its_oauth_callback() {
     );
 
     // The flow completes; the exit code rides home; the CLI says so.
-    login.await_painted("login complete for tester").await;
-    login.await_painted("login finished with exit code 0").await;
-    let status = login.await_exit().await;
+    login
+        .await_painted("login complete for tester")
+        .await
+        .expect("the flow completes");
+    login
+        .await_painted("login finished with exit code 0")
+        .await
+        .expect("the CLI reports the exit");
+    let status = login.exit_status().await.expect("the CLI exits");
     assert!(status.success(), "the login verb exits 0 on success");
 
     // The worker's own account of the same story.

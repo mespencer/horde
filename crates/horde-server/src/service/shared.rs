@@ -197,6 +197,28 @@ pub(crate) async fn run_severable<T, F>(
     }
 }
 
+/// Lifts bare frames into a spine's wrapped response type on their way to
+/// the peer, until either side hangs up. One task shape for every relayed
+/// stream — the forward tunnels and the login legs — so the wrapper
+/// plumbing cannot drift between them.
+pub(crate) fn lift_frames<F, T, W>(
+    mut frames: tokio::sync::mpsc::Receiver<F>,
+    typed: tokio::sync::mpsc::Sender<Result<T, tonic::Status>>,
+    wrap: W,
+) where
+    F: Send + 'static,
+    T: Send + 'static,
+    W: Fn(F) -> T + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            if typed.send(Ok(wrap(frame))).await.is_err() {
+                return; // The peer hung up; the relay sees the channel close.
+            }
+        }
+    });
+}
+
 /// Below this, a peer is refused outright (DESIGN.md §2). Enforced by
 /// [`version_gate`] at both handshakes — `Hello` on the control plane and
 /// `RegisterWorker` on the worker spine.

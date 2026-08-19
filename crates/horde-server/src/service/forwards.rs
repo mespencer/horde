@@ -356,19 +356,12 @@ where
     W: Fn(horde_proto::v1::ForwardTunnelFrame) -> T + Send + 'static,
 {
     let (typed, stream) = tokio::sync::mpsc::channel(16);
-    let (frames, mut frame_rx) = tokio::sync::mpsc::channel(16);
+    let (frames, frame_rx) = tokio::sync::mpsc::channel(16);
     let log = core.log.clone();
     let registry = core.forwards.clone();
     let logins = core.logins.clone();
 
-    let lift = typed.clone();
-    tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if lift.send(Ok(wrap(frame))).await.is_err() {
-                return; // The peer hung up; the relay sees the channel close.
-            }
-        }
-    });
+    super::shared::lift_frames(frame_rx, typed.clone(), wrap);
     tokio::spawn(async move {
         let pump = crate::forward::relay::run_tunnel(
             &log,

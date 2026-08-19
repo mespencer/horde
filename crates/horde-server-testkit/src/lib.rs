@@ -30,6 +30,7 @@
 //! returned value.
 
 pub mod process;
+pub mod pty;
 pub mod secure;
 
 use horde_cli::Client;

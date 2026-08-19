@@ -236,16 +236,9 @@ where
         .map(move |message| message.map(&unwrap));
 
     let (typed, stream) = tokio::sync::mpsc::channel(16);
-    let (frames, mut frame_rx) = tokio::sync::mpsc::channel(16);
+    let (frames, frame_rx) = tokio::sync::mpsc::channel(16);
 
-    let lift = typed.clone();
-    tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if lift.send(Ok(wrap(frame))).await.is_err() {
-                return; // The peer hung up; the driver sees the channel close.
-            }
-        }
-    });
+    super::shared::lift_frames(frame_rx, typed.clone(), wrap);
     tokio::spawn(async move {
         let pump = drive(
             caller,
@@ -312,10 +305,29 @@ mod tests {
     use super::super::shared::ServerCore;
     use crate::forward::registry::TunnelPrincipal;
     use crate::forward::testfix::within;
-    use crate::login::testfix::scripted_leg;
+    use crate::login::testfix::{answering_tunnel, scripted_leg};
 
     fn core() -> ServerCore {
         ServerCore::new(crate::log::EventLog::in_memory().expect("an in-memory log"))
+    }
+
+    /// The client driver spawned as `caller` over a scripted leg, its open
+    /// for `w1`/`provider` already sent — the shared arrangement every
+    /// driver test opens with.
+    async fn driven(
+        core: &ServerCore,
+        caller: TunnelPrincipal,
+        provider: &str,
+    ) -> crate::login::testfix::ScriptedPeer {
+        let (io, feed, out) = scripted_leg();
+        let core = core.clone();
+        let driver = tokio::spawn(async move {
+            super::run_client_login(&core, caller, io).await;
+        });
+        feed.send(Ok(login_open_frame("w1", provider, 80, 24)))
+            .await
+            .expect("the open sends");
+        (feed, out, driver)
     }
 
     /// The kinds journaled into the reserved login stream, decoded.
@@ -342,35 +354,14 @@ mod tests {
         let core = core();
         let (_epoch, mut lane) = core.logins.register_worker("w1");
 
-        let (io, client_feed, mut client_out) = scripted_leg();
-        let driver = {
-            let core = core.clone();
-            tokio::spawn(async move {
-                super::run_client_login(&core, TunnelPrincipal::Client("laptop".to_owned()), io)
-                    .await;
-            })
-        };
-        client_feed
-            .send(Ok(login_open_frame("w1", "fake", 80, 24)))
-            .await
-            .expect("the open sends");
-
+        let (_client_feed, mut client_out, driver) =
+            driven(&core, TunnelPrincipal::Client("laptop".to_owned()), "fake").await;
         let dispatched = within("the dispatch", &mut lane).await;
         let login_id = dispatched.login_id.clone();
 
         // The worker's tunnel: attach with a callback port, then exit 0.
-        let (worker_io, worker_feed, _worker_out) = scripted_leg();
-        let tunnel = {
-            let logins = core.logins.clone();
-            tokio::spawn(async move {
-                crate::login::relay::run_worker_login_tunnel(
-                    &logins,
-                    TunnelPrincipal::Worker("w1".to_owned()),
-                    worker_io,
-                )
-                .await;
-            })
-        };
+        let (worker_feed, _worker_out, tunnel) =
+            answering_tunnel(&core.logins, TunnelPrincipal::Worker("w1".to_owned()));
         worker_feed
             .send(Ok(login_attach_frame(&login_id, 14555, 0)))
             .await
@@ -437,17 +428,8 @@ mod tests {
     async fn a_worker_principal_is_refused_with_nothing_journaled() {
         let core = core();
         let (_epoch, mut lane) = core.logins.register_worker("w1");
-        let (io, feed, mut out) = scripted_leg();
-
-        let driver = {
-            let core = core.clone();
-            tokio::spawn(async move {
-                super::run_client_login(&core, TunnelPrincipal::Worker("w2".to_owned()), io).await;
-            })
-        };
-        feed.send(Ok(login_open_frame("w1", "fake", 80, 24)))
-            .await
-            .expect("send");
+        let (_feed, mut out, driver) =
+            driven(&core, TunnelPrincipal::Worker("w2".to_owned()), "fake").await;
 
         let refused = within("the refusal", &mut out).await;
         assert_eq!(
@@ -476,17 +458,7 @@ mod tests {
     async fn an_unanswered_dispatch_refuses_and_frees_the_slot() {
         let core = core();
         let (_epoch, mut lane) = core.logins.register_worker("w1");
-        let (io, feed, mut out) = scripted_leg();
-
-        let driver = {
-            let core = core.clone();
-            tokio::spawn(async move {
-                super::run_client_login(&core, TunnelPrincipal::Ambient, io).await;
-            })
-        };
-        feed.send(Ok(login_open_frame("w1", "fake", 80, 24)))
-            .await
-            .expect("send");
+        let (_feed, mut out, driver) = driven(&core, TunnelPrincipal::Ambient, "fake").await;
         let dispatched = within("the dispatch", &mut lane).await;
 
         // The worker's tunnel claims and immediately dies: the dropped
@@ -523,34 +495,14 @@ mod tests {
     async fn a_worker_refusal_reaches_the_client_verbatim() {
         let core = core();
         let (_epoch, mut lane) = core.logins.register_worker("w1");
-        let (io, feed, mut out) = scripted_leg();
-
-        let driver = {
-            let core = core.clone();
-            tokio::spawn(async move {
-                super::run_client_login(&core, TunnelPrincipal::Ambient, io).await;
-            })
-        };
-        feed.send(Ok(login_open_frame("w1", "nope", 80, 24)))
-            .await
-            .expect("send");
+        let (_feed, mut out, driver) = driven(&core, TunnelPrincipal::Ambient, "nope").await;
         let dispatched = within("the dispatch", &mut lane).await;
 
         // The worker claims, then refuses instead of attaching. On the wire
         // the worker's first tunnel frame is always the attach; the refusal
         // follows it. The pairing carries both across in order.
-        let (worker_io, worker_feed, _worker_out) = scripted_leg();
-        let tunnel = {
-            let logins = core.logins.clone();
-            tokio::spawn(async move {
-                crate::login::relay::run_worker_login_tunnel(
-                    &logins,
-                    TunnelPrincipal::Worker("w1".to_owned()),
-                    worker_io,
-                )
-                .await;
-            })
-        };
+        let (worker_feed, _worker_out, tunnel) =
+            answering_tunnel(&core.logins, TunnelPrincipal::Worker("w1".to_owned()));
         worker_feed
             .send(Ok(login_attach_frame(&dispatched.login_id, 0, 0)))
             .await
