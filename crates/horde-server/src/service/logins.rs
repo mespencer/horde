@@ -306,38 +306,16 @@ pub(crate) async fn pump_logins(
 #[cfg(test)]
 mod tests {
     use horde_proto::login::{login_attach_frame, login_open_frame, login_refusal_in};
-    use horde_proto::v1::{LoginFrame, LoginRefusalReason, login_frame::Frame};
+    use horde_proto::v1::{LoginRefusalReason, login_frame::Frame};
     use prost::Message as _;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tonic::Status;
 
     use super::super::shared::ServerCore;
     use crate::forward::registry::TunnelPrincipal;
-    use crate::login::relay::LoginLegIo;
+    use crate::forward::testfix::within;
+    use crate::login::testfix::scripted_leg;
 
     fn core() -> ServerCore {
         ServerCore::new(crate::log::EventLog::in_memory().expect("an in-memory log"))
-    }
-
-    fn scripted_leg() -> (
-        LoginLegIo,
-        tokio::sync::mpsc::Sender<Result<LoginFrame, Status>>,
-        tokio::sync::mpsc::Receiver<LoginFrame>,
-    ) {
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
-        let io = LoginLegIo {
-            inbound: Box::pin(ReceiverStream::new(inbound_rx)),
-            outbound: outbound_tx,
-        };
-        (io, inbound_tx, outbound_rx)
-    }
-
-    async fn within<T>(what: &str, receiver: &mut tokio::sync::mpsc::Receiver<T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing arrived within the ceiling"))
-            .unwrap_or_else(|| panic!("{what}: the channel closed instead"))
     }
 
     /// The kinds journaled into the reserved login stream, decoded.

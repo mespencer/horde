@@ -321,37 +321,13 @@ mod tests {
         login_attach_frame, login_input_frame, login_open_frame, login_output_frame,
         login_refusal_in,
     };
-    use horde_proto::v1::{LoginFrame, LoginRefusalReason};
-    use tokio_stream::wrappers::ReceiverStream;
-    use tonic::Status;
+    use horde_proto::v1::LoginRefusalReason;
 
-    use super::{LoginLegIo, SpliceEnd, may_open_login, worker_end};
+    use super::{SpliceEnd, may_open_login, worker_end};
     use crate::forward::registry::TunnelPrincipal;
+    use crate::forward::testfix::within;
     use crate::login::registry::LoginRegistry;
-
-    /// A [`LoginLegIo`] the test plays the peer of: feed the returned
-    /// sender, read the returned receiver.
-    fn scripted_leg() -> (
-        LoginLegIo,
-        tokio::sync::mpsc::Sender<Result<LoginFrame, Status>>,
-        tokio::sync::mpsc::Receiver<LoginFrame>,
-    ) {
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
-        let io = LoginLegIo {
-            inbound: Box::pin(ReceiverStream::new(inbound_rx)),
-            outbound: outbound_tx,
-        };
-        (io, inbound_tx, outbound_rx)
-    }
-
-    /// A ceilinged receive: the positive wait this suite is allowed.
-    async fn within<T>(what: &str, receiver: &mut tokio::sync::mpsc::Receiver<T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing arrived within the ceiling"))
-            .unwrap_or_else(|| panic!("{what}: the channel closed instead"))
-    }
+    use crate::login::testfix::scripted_leg;
 
     /// The opener ruling, all three principals: the refusal the spec demands
     /// (non-Client refused) and the two channels that may drive a login.

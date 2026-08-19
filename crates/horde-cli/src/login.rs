@@ -382,6 +382,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::{LoginEnd, LoginStream, callback_of, pump_login};
+    use crate::forward::testing::within;
 
     /// The scripted relay: feed frames in, observe what the client sent.
     fn scripted_stream() -> (
@@ -399,12 +400,6 @@ mod tests {
             feed,
             sent,
         )
-    }
-
-    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(10), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing within the ceiling"))
     }
 
     /// The callback table: both halves present and sane, or no callback.
@@ -663,5 +658,86 @@ mod tests {
             "{refused}"
         );
         drop(busy);
+    }
+
+    /// One free loopback port, found by binding `:0` and releasing.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a free port")
+            .local_addr()
+            .expect("an addr")
+            .port()
+    }
+
+    /// Arranges one whole `run_interactive` call against the real relay:
+    /// the test plays the worker, attaching with `callback_port` and then
+    /// sending `frames` — the shared shape of the interactive-runner tests.
+    async fn run_interactively(
+        callback_port: u32,
+        frames: Vec<horde_proto::v1::LoginFrame>,
+    ) -> Result<(), crate::client::ClientError> {
+        let (core, mut client, endpoint) = crate::forward::testing::served_with_endpoint().await;
+        let (_epoch, mut lane) = core.logins.register_worker("w1");
+
+        let running = tokio::spawn(async move {
+            super::run_interactive(&mut client, "w1", "fake", crate::render::Format::Json).await
+        });
+        let dispatched = within("the dispatch reaches the lane", lane.recv())
+            .await
+            .expect("a login request");
+
+        let mut scripted = vec![horde_proto::login::login_attach_frame(
+            &dispatched.login_id,
+            callback_port,
+            0,
+        )];
+        scripted.extend(frames);
+        let (_worker_send, _worker_inbound) = worker_tunnel(&endpoint, scripted).await;
+
+        within("the runner finishes", running)
+            .await
+            .expect("no panic")
+    }
+
+    /// The whole interactive runner against the real relay: callback expose
+    /// realized on the exact port, exit 0 → Ok — the glue the e2e drives
+    /// through a pty, held here where coverage can see it. (Raw mode is
+    /// skipped by the runner itself: a test's stdin is no terminal.)
+    #[tokio::test]
+    async fn the_interactive_runner_completes_a_clean_login() {
+        let outcome = run_interactively(
+            u32::from(free_port()),
+            vec![
+                login_output_frame(b"visit the url\r\n".to_vec()),
+                login_exit_frame(0),
+            ],
+        )
+        .await;
+        assert!(outcome.is_ok(), "a clean exit is success: {outcome:?}");
+    }
+
+    /// A login command that exits nonzero surfaces as a failure naming the
+    /// code — never a silent success.
+    #[tokio::test]
+    async fn the_interactive_runner_reports_a_nonzero_exit() {
+        let outcome = run_interactively(0, vec![login_exit_frame(3)]).await;
+        let refused = outcome.expect_err("a nonzero exit is a failure");
+        assert!(refused.to_string().contains("exited with 3"), "{refused}");
+    }
+
+    /// A taken callback port refuses in the operator's words — no ephemeral
+    /// fallback, because the provider's redirect URI is port-exact.
+    #[tokio::test]
+    async fn the_interactive_runner_refuses_a_taken_callback_port() {
+        let occupant = std::net::TcpListener::bind("127.0.0.1:0").expect("the occupant binds");
+        let taken = occupant.local_addr().expect("an addr").port();
+
+        let outcome = run_interactively(u32::from(taken), Vec::new()).await;
+        let refused = outcome.expect_err("a taken redirect port cannot fall back");
+        assert!(
+            refused.to_string().contains("could not bind the callback port"),
+            "{refused}"
+        );
+        drop(occupant);
     }
 }

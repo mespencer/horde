@@ -18,6 +18,8 @@
 
 pub mod registry;
 pub mod relay;
+#[cfg(test)]
+pub(crate) mod testfix;
 
 /// The reserved stream login audit events live in, like enrollment's.
 ///

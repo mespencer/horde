@@ -397,6 +397,7 @@ mod tests {
 
     use super::super::registry::{PassiveTarget, TunnelPrincipal};
     use super::{Refusal, ResolvedForward, originate_ruling, splice};
+    use crate::forward::testfix::within;
 
     fn resolved(
         direction: ForwardDirection,
@@ -567,14 +568,6 @@ mod tests {
             outbound: outbound_rx,
             task,
         }
-    }
-
-    /// A ceilinged receive: the positive wait this suite is allowed.
-    async fn within<T>(what: &str, receiver: &mut tokio::sync::mpsc::Receiver<T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing arrived within the ceiling"))
-            .unwrap_or_else(|| panic!("{what}: the channel closed instead"))
     }
 
     #[tokio::test]
