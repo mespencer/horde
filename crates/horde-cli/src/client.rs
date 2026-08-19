@@ -103,6 +103,14 @@ pub enum ClientError {
     #[error("{given:?} is not a blob address (expected sha256:<64 lowercase hex>)")]
     BlobAddress { given: String },
 
+    /// An interactive login could not run, was refused, or ended in failure.
+    ///
+    /// Always in the operator's words — the relay's refusal detail, a taken
+    /// callback port, the login command's nonzero exit — because every one
+    /// of them has a different remedy and none of them is a transport fault.
+    #[error("login failed: {0}")]
+    Login(String),
+
     /// The terminal itself failed the TUI — raw mode refused, a draw failed.
     ///
     /// Its own variant because the remedy is different in kind: every other
@@ -619,6 +627,23 @@ impl Client {
             .serve_forwards(horde_proto::v1::ServeForwardsRequest {})
             .await?
             .into_inner())
+    }
+
+    /// Opens the interactive-login stream (DESIGN §4), stripped to bare
+    /// frames: the caller sends `open` first and pumps keystrokes and PTY
+    /// bytes until the login ends.
+    pub async fn worker_login(&mut self) -> Result<crate::login::LoginStream, ClientError> {
+        use tokio_stream::StreamExt as _;
+        let (to_relay, outbound) = tokio::sync::mpsc::channel(16);
+        let requests = tokio_stream::wrappers::ReceiverStream::new(outbound)
+            .map(|frame| horde_proto::v1::WorkerLoginRequest { frame: Some(frame) });
+        let inbound = self.inner.worker_login(requests).await?.into_inner();
+        Ok(crate::login::LoginStream {
+            to_relay,
+            from_relay: Box::pin(
+                inbound.map(|message| message.map(|reply| reply.frame.unwrap_or_default())),
+            ),
+        })
     }
 
     /// Opens one tunnel leg, stripped to bare frames for the pump.

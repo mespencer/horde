@@ -287,6 +287,17 @@ pub enum WorkerCommand {
         #[arg(long, default_value = "")]
         reason: String,
     },
+    /// Sign a provider's CLI into an account on a worker: the provider's
+    /// login command runs in a PTY there with this terminal attached, and
+    /// any OAuth-callback port the provider needs is relayed from this
+    /// machine's localhost for the login's duration (DESIGN §4).
+    Login {
+        /// The worker to sign in on.
+        worker: String,
+        /// The provider whose adapter carries the login recipe, e.g.
+        /// `claude`.
+        provider: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1091,6 +1102,9 @@ async fn run_worker(
                 )
                 .await?;
             println!("{}", render::revoked(name, &serials, format));
+        }
+        WorkerCommand::Login { worker, provider } => {
+            crate::login::run_interactive(client, worker, provider, format).await?;
         }
     }
     Ok(())

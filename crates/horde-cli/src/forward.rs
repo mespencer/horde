@@ -359,6 +359,44 @@ pub async fn realize_expose(
     client_port: u32,
 ) -> std::io::Result<RealizedExpose> {
     let bound = bind_with_fallback(requested_local_port(worker_port, client_port)).await?;
+    realized(bound, client, forward_id, name)
+}
+
+/// Realizes an expose on **exactly** this local port — no ephemeral
+/// fallback. The interactive login's callback expose comes through here: an
+/// OAuth redirect URI is port-exact, so a fallback listener would accept
+/// connections no browser will ever make, and a clear refusal beats that.
+///
+/// # Errors
+///
+/// The bind error — typically the port being taken, which the caller
+/// reports as "free the port or finish the other login".
+pub async fn realize_expose_exact(
+    client: &crate::client::Client,
+    forward_id: &str,
+    name: &str,
+    port: u16,
+) -> std::io::Result<RealizedExpose> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    realized(
+        BoundListener {
+            listener,
+            fell_back: false,
+        },
+        client,
+        forward_id,
+        name,
+    )
+}
+
+/// The realization both binders share: local address read, accept loop
+/// spawned, handles packed.
+fn realized(
+    bound: BoundListener,
+    client: &crate::client::Client,
+    forward_id: &str,
+    name: &str,
+) -> std::io::Result<RealizedExpose> {
     let local_addr = bound.listener.local_addr()?;
     let accept_task = tokio::spawn(accept_loop(
         bound.listener,
@@ -1064,6 +1102,14 @@ pub(crate) mod testing {
     /// A server whose core the test holds — the registry is how a test
     /// plays the far side of the relay — and a client dialed into it.
     pub(crate) async fn served() -> (horde_server::service::ServerCore, crate::Client) {
+        let (core, client, _endpoint) = served_with_endpoint().await;
+        (core, client)
+    }
+
+    /// [`served`], keeping the endpoint — for suites (the login engine's)
+    /// that also dial the worker spine of the same server.
+    pub(crate) async fn served_with_endpoint()
+    -> (horde_server::service::ServerCore, crate::Client, String) {
         let core = horde_server::service::ServerCore::new(
             horde_server::EventLog::in_memory().expect("an in-memory log"),
         );
@@ -1073,7 +1119,7 @@ pub(crate) mod testing {
         let client = crate::Client::connect(&endpoint)
             .await
             .expect("the client dials");
-        (core, client)
+        (core, client, endpoint)
     }
 
     /// A guarded realization: the accept task holds the oneshot's sender,
