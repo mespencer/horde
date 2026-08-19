@@ -1,0 +1,191 @@
+// The interactive-auth relay (DESIGN §4): a remote PTY attaching a Client
+// terminal to a provider's login command running on a Worker, plus an
+// ephemeral expose of the provider's OAuth-callback port for the login's
+// duration. Together the two primitives cover nearly any CLI login flow with
+// zero per-provider code — the adapter contributes only a recipe (argv +
+// callback port).
+//
+// A login is EPHEMERAL intent, unlike a forward's durable one: it is
+// journaled as WorkerLoginStarted / WorkerLoginEnded for the audit trail,
+// but nothing folds it into revivable state. A PTY cannot be replayed into
+// existence, and half a login is worth nothing — so liveness is in-memory
+// pairing on the Server, dying with either peer's stream, and nothing
+// re-realizes after a partition. The operator simply runs the verb again.
+syntax = "proto3";
+
+package horde.v1;
+
+import "horde/v1/id.proto";
+
+// Why a login was refused. A code, not prose, so the client can branch —
+// and so the refusals the spec demands (non-Client principals, one login
+// per worker+provider) are distinguishable from transport weather.
+enum LoginRefusalReason {
+  LOGIN_REFUSAL_REASON_UNSPECIFIED = 0;
+
+  // The caller's channel names a principal that may not drive a login —
+  // a Worker certificate. Logins are operator acts on Client channels.
+  LOGIN_REFUSAL_REASON_NOT_A_CLIENT = 1;
+
+  // The named Worker holds no live login stream.
+  LOGIN_REFUSAL_REASON_WORKER_UNREACHABLE = 2;
+
+  // A login for this worker+provider is already in flight. One at a time:
+  // two PTYs racing one credential store would corrupt it.
+  LOGIN_REFUSAL_REASON_ALREADY_IN_PROGRESS = 3;
+
+  // The Worker has no adapter (or no login recipe) for that provider.
+  LOGIN_REFUSAL_REASON_UNKNOWN_PROVIDER = 4;
+
+  // The Worker could not spawn the recipe's command.
+  LOGIN_REFUSAL_REASON_SPAWN_FAILED = 5;
+
+  // A tunnel named a login the Server is not holding open — never begun,
+  // already over, or claimed by a peer it was not dispatched to.
+  LOGIN_REFUSAL_REASON_UNKNOWN_LOGIN = 6;
+}
+
+// First frame of a Client's WorkerLogin stream: which worker, which
+// provider, and how big the terminal is right now.
+message LoginOpen {
+  WorkerId worker_id = 1;
+
+  // The adapter key, e.g. "claude" — the recipe lives worker-side.
+  string provider = 2;
+
+  uint32 cols = 3;
+  uint32 rows = 4;
+}
+
+// First frame of a Worker's login tunnel: which dispatched login this stream
+// answers, and where the provider's OAuth callback listens.
+message LoginAttach {
+  string login_id = 1;
+
+  // The browser-facing OAuth-callback port the recipe declares — the port
+  // in the flow's redirect URI, which the Client must bind exactly; zero
+  // when the flow needs none. Reported by the Worker (the recipe lives
+  // beside the adapter), then realized client-side as an ephemeral expose
+  // for the login's duration.
+  uint32 callback_port = 2;
+
+  // The Worker-loopback port the flow's local server actually listens on,
+  // when it differs from callback_port; zero means the same. Separable
+  // because the relay itself is a port-forward: the browser's port and the
+  // listener's port only have to agree when nothing sits between them.
+  uint32 listen_port = 3;
+}
+
+// The Server's answer to the Client once both legs are paired: bytes may
+// flow, and here is the callback expose to realize.
+message LoginAccepted {
+  string login_id = 1;
+
+  // The ephemeral forward id the Client's callback listener opens tunnels
+  // under. Unset when callback_port is zero. Never journaled: the intent it
+  // names lives exactly as long as the login does.
+  ForwardId callback_forward_id = 2;
+
+  // Echo of the recipe's callback port. The Client must bind exactly this
+  // port — an OAuth redirect URI is port-exact — so unlike a forward expose
+  // there is no ephemeral-port fallback, only a clear refusal.
+  uint32 callback_port = 3;
+}
+
+// Terminal, in either direction.
+message LoginRefusal {
+  LoginRefusalReason reason = 1;
+
+  // Human-readable: names the busy provider, the missing recipe, the spawn
+  // error.
+  string detail = 2;
+}
+
+// The Client terminal changed size; the Worker resizes the PTY.
+message LoginResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+// The login command ended. The login is over; both streams close after it.
+message LoginExit {
+  // The exit code as the PTY reports it (a signal death surfaces as the
+  // platform's convention, e.g. 128+n).
+  uint32 code = 1;
+}
+
+// One frame of a login stream, any leg, either direction — the same
+// single-vocabulary shape as ForwardTunnelFrame.
+message LoginFrame {
+  oneof frame {
+    // Client → Server, first frame.
+    LoginOpen open = 1;
+
+    // Worker → Server, first frame of a tunnel.
+    LoginAttach attach = 2;
+
+    // Server → Client, once paired.
+    LoginAccepted accepted = 3;
+
+    // Terminal, any direction.
+    LoginRefusal refused = 4;
+
+    // Client keystrokes → the PTY.
+    bytes input = 5;
+
+    // PTY output → the Client terminal.
+    bytes output = 6;
+
+    LoginResize resize = 7;
+
+    // Worker → Client: the command ended.
+    LoginExit exited = 8;
+  }
+}
+
+// The Server asking a Worker to start one login: spawn the provider's
+// recipe in a PTY of this size and open a login tunnel echoing login_id.
+// Sent down a StreamLogins stream; never journaled.
+message LoginSessionRequest {
+  string login_id = 1;
+
+  string provider = 2;
+
+  uint32 cols = 3;
+  uint32 rows = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Audit events — journaled into the reserved horde-logins stream
+// ---------------------------------------------------------------------------
+
+// A login PTY came alive on a Worker. Audit trail only: nothing folds this
+// into revivable state, because the realization (two live streams and a
+// child process) cannot be replayed into existence.
+message WorkerLoginStarted {
+  string login_id = 1;
+
+  WorkerId worker_id = 2;
+
+  string provider = 3;
+
+  // The Client that drove it, when the channel named one.
+  Actor opened_by = 4;
+
+  // The callback port the recipe declared; zero when none.
+  uint32 callback_port = 5;
+}
+
+// A login ended — command exit, client disconnect, or worker loss — and its
+// ephemeral callback expose died with it.
+message WorkerLoginEnded {
+  string login_id = 1;
+
+  WorkerId worker_id = 2;
+
+  string provider = 3;
+
+  // Why it ended, e.g. "the command exited with 0" or "the client
+  // disconnected mid-login".
+  string reason = 4;
+}

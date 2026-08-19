@@ -21,6 +21,7 @@ import "horde/v1/agent.proto";
 import "horde/v1/forward.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
+import "horde/v1/login.proto";
 import "horde/v1/mcp.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/usage.proto";
@@ -261,6 +262,13 @@ message Event {
     // only; the tunnel plane realizing it never touches the log.
     ForwardOpened forward_opened = 29;
     ForwardClosed forward_closed = 30;
+
+    // An interactive login started or ended on a Worker (DESIGN §4). Lives
+    // in a reserved stream like enrollment; audit trail only — a login is
+    // EPHEMERAL intent whose liveness is the relay's in-memory pairing,
+    // never a fold over these.
+    WorkerLoginStarted worker_login_started = 31;
+    WorkerLoginEnded worker_login_ended = 32;
   }
 }
 
