@@ -1,0 +1,1 @@
+[2m2026-08-19T19:31:24.539013Z[0m [31mERROR[0m [2mcodex_core::tools::router[0m[2m:[0m [3merror[0m[2m=[0mexec_command failed for `/bin/zsh -lc "printf '%s\\n' ESCALATED > horde-escalation-probe.txt"`: CreateProcess { message: "Rejected(\"rejected by user\")" }
