@@ -252,6 +252,27 @@ mod harness {
         .join("\n")
     }
 
+    /// A session on `script` with a control log, its opening message already
+    /// sent — the arrangement every approval-shaped test shares. The tempdirs
+    /// ride along because dropping them deletes the files under the child.
+    pub(crate) async fn approval_session(
+        script: &str,
+    ) -> (
+        Box<dyn AgentSession>,
+        std::path::PathBuf,
+        (tempfile::TempDir, tempfile::TempDir),
+    ) {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let (mut session, dir) = session_on(
+            script,
+            &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        (session, log_path, (log, dir))
+    }
+
     /// Drains to the permission request, under the ceiling.
     pub(crate) async fn surfaced_request(
         session: &mut Box<dyn AgentSession>,
@@ -364,9 +385,6 @@ async fn the_sandbox_tier_choice_is_journaled_on_the_first_turn() {
 /// vocabulary, and the turn finishes.
 #[tokio::test]
 async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
     let elicitation = json!({
         "threadId": "stub-thread",
         "turnId": "turn-1",
@@ -397,26 +415,9 @@ async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
     ]
     .join("\n");
 
-    let (mut session, _dir) = session_on(
-        &script,
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session.send(TurnInput::queued("go")).await.expect("sends");
+    let (mut session, log_path, _dirs) = harness::approval_session(&script).await;
 
-    // Drain to the permission request.
-    let request = within("the request surfaces", async {
-        loop {
-            match session.next_event().await {
-                Ok(Some(AgentEvent::PermissionRequested { request, .. })) => return Some(request),
-                Ok(Some(_)) => continue,
-                Ok(None) | Err(_) => return None,
-            }
-        }
-    })
-    .await
-    .expect("the elicitation must surface as a permission request");
-
+    let request = surfaced_request(&mut session).await;
     assert_eq!(request.tool_name, "horde/spawn_agent");
     assert_eq!(request.input, json!({"task": "review"}));
 
@@ -449,15 +450,8 @@ async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
 /// `action` — and the turn finishes clean.
 #[tokio::test]
 async fn an_exec_approval_surfaces_and_the_accept_reaches_the_wire() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
-    let (mut session, _dir) = session_on(
-        &exec_approval_script("completed", Some(0)),
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session.send(TurnInput::queued("go")).await.expect("sends");
+    let (mut session, log_path, _dirs) =
+        harness::approval_session(&exec_approval_script("completed", Some(0))).await;
 
     let request = surfaced_request(&mut session).await;
     assert_eq!(request.tool_name, "exec");
@@ -495,15 +489,8 @@ async fn an_exec_approval_surfaces_and_the_accept_reaches_the_wire() {
 /// `{"decision":"decline"}` and the refusal is the turn's denial record.
 #[tokio::test]
 async fn a_denied_exec_approval_declines_on_the_wire_and_records_the_denial() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
-    let (mut session, _dir) = session_on(
-        &exec_approval_script("declined", None),
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session.send(TurnInput::queued("go")).await.expect("sends");
+    let (mut session, log_path, _dirs) =
+        harness::approval_session(&exec_approval_script("declined", None)).await;
 
     let request = surfaced_request(&mut session).await;
     session
@@ -531,15 +518,8 @@ async fn a_denied_exec_approval_declines_on_the_wire_and_records_the_denial() {
 /// remembered-allow layer.
 #[tokio::test]
 async fn a_remembering_allow_becomes_accept_for_session_on_the_wire() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
-    let (mut session, _dir) = session_on(
-        &exec_approval_script("completed", Some(0)),
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session.send(TurnInput::queued("go")).await.expect("sends");
+    let (mut session, log_path, _dirs) =
+        harness::approval_session(&exec_approval_script("completed", Some(0))).await;
 
     let request = surfaced_request(&mut session).await;
     session
@@ -569,9 +549,6 @@ async fn a_remembering_allow_becomes_accept_for_session_on_the_wire() {
 /// harness from waiting, and the withdrawn question is not a denial.
 #[tokio::test]
 async fn an_interrupt_cancels_a_parked_exec_approval_before_the_turn_dies() {
-    let log = tempfile::tempdir().expect("a scratch dir");
-    let log_path = log.path().join("control.log");
-
     // Block 1 parks on the approval; block 2 — played on the interrupt — is
     // the idle that closes the cancelled turn (transcript 11's shape).
     let script = [
@@ -585,12 +562,7 @@ async fn an_interrupt_cancels_a_parked_exec_approval_before_the_turn_dies() {
     ]
     .join("\n\n");
 
-    let (mut session, _dir) = session_on(
-        &script,
-        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-    )
-    .await;
-    session.send(TurnInput::queued("go")).await.expect("sends");
+    let (mut session, log_path, _dirs) = harness::approval_session(&script).await;
     let _request = surfaced_request(&mut session).await;
 
     session.interrupt().await.expect("the cancel is writable");
@@ -624,8 +596,8 @@ async fn an_interrupt_cancels_a_parked_exec_approval_before_the_turn_dies() {
 /// unanswered approval would park the harness forever.
 #[tokio::test]
 async fn a_narrowing_decision_is_refused_not_widened_and_stays_answerable() {
-    let (mut session, _dir) = session_on(&exec_approval_script("declined", None), &[]).await;
-    session.send(TurnInput::queued("go")).await.expect("sends");
+    let (mut session, _log_path, _dirs) =
+        harness::approval_session(&exec_approval_script("declined", None)).await;
     let request = surfaced_request(&mut session).await;
 
     // A real rewrite: the chain narrowed to a different command, which the

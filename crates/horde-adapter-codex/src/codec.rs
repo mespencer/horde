@@ -452,8 +452,11 @@ mod tests {
     /// The approval policy is the one measured to route elicitations, always.
     /// Plain "on-request" parks the thread at waitingOnApproval forever
     /// (transcript 19), so sending anything else here is a hang in waiting.
+    /// And the reviewer is pinned to `user` on the same requests — the
+    /// structural half of the transcript-23 pin: the codec can never emit
+    /// `auto_review`, because the value is a constant, not a field.
     #[test]
-    fn every_thread_is_started_with_the_elicitation_routing_policy() {
+    fn every_thread_is_started_with_the_routing_policy_and_the_pinned_reviewer() {
         let config = super::ThreadConfig {
             cwd: Some("/work".to_owned()),
             sandbox: crate::sandbox::SandboxTier::WorkspaceWrite,
@@ -478,6 +481,11 @@ mod tests {
             assert!(
                 params.get("baseInstructions").is_none(),
                 "replacing the harness prompt would break its tools"
+            );
+            assert_eq!(params["approvalsReviewer"], "user");
+            assert!(
+                !encoded.contains("auto_review"),
+                "the self-approving reviewer must be unrepresentable: {encoded}"
             );
         }
     }
@@ -618,25 +626,6 @@ mod tests {
         let unknown = approvals_reviewer_from_config(Some("committee"))
             .expect_err("unmeasured values fail closed");
         assert!(unknown.contains("transcript 23"), "{unknown}");
-    }
-
-    /// The codec can never emit `auto_review`: every thread request carries
-    /// the pinned reviewer, whatever the config held. This is the structural
-    /// half of the transcript-23 pin — the value is a constant, not a field.
-    #[test]
-    fn every_thread_request_pins_the_reviewer_to_user() {
-        let config = super::ThreadConfig::default();
-        for encoded in [
-            super::encode_thread_start(1, &config),
-            super::encode_thread_resume(2, "t1", &config),
-        ] {
-            let value: Value = serde_json::from_str(&encoded).expect("we produced this");
-            assert_eq!(value["params"]["approvalsReviewer"], "user");
-            assert!(
-                !encoded.contains("auto_review"),
-                "the self-approving reviewer must be unrepresentable: {encoded}"
-            );
-        }
     }
 
     /// An unanswerable server request gets an error reply, never silence —

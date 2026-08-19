@@ -617,11 +617,38 @@ impl LiveCodexSession {
         self.write(&encode_turn_start(id, &thread, text)).await
     }
 
+    /// Offers a request on an adjudicable method to the assembler; what could
+    /// not become a permission event is refused in its own vocabulary.
+    ///
+    /// The refusal exists because a non-tool-call elicitation, or an approval
+    /// whose shape drifted past recognition, still holds the harness: nothing
+    /// in Horde can answer it, and leaving it unanswered parks the thread
+    /// forever (transcript 19).
+    async fn adjudicate_server_request(
+        &mut self,
+        id: u64,
+        method: String,
+        params: serde_json::Value,
+    ) -> Result<()> {
+        let events = self.assembler.feed(&Frame::ServerRequest {
+            id,
+            method: method.clone(),
+            params,
+        });
+        if events.is_empty() {
+            tracing::warn!(method, id, "declining an unadjudicable approval request");
+            return self.write(&unadjudicable_refusal(id, &method)).await;
+        }
+        self.pending.extend(events);
+        Ok(())
+    }
+
     /// Handles one frame that is not the reply the caller was waiting on.
     ///
     /// This is the wire discipline in one place: notifications feed the
-    /// assembler; elicitations become permission events; every other server
-    /// request is refused; replies to our own requests settle their follow-up.
+    /// assembler; elicitations and exec approvals become permission events;
+    /// every other server request is refused; replies to our own requests
+    /// settle their follow-up.
     async fn route_frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
             Frame::Notification(_) => {
@@ -641,32 +668,10 @@ impl LiveCodexSession {
                 }
                 Ok(())
             }
-            Frame::ServerRequest { id, method, params } => {
-                if method == MCP_ELICITATION_METHOD || method == EXEC_APPROVAL_METHOD {
-                    let events = self.assembler.feed(&Frame::ServerRequest {
-                        id,
-                        method: method.clone(),
-                        params,
-                    });
-                    if events.is_empty() {
-                        // A request on an adjudicable method that could not
-                        // become a permission event — a non-tool-call
-                        // elicitation, or an approval whose shape drifted past
-                        // recognition. Nothing in Horde can answer it, and
-                        // leaving it unanswered parks the harness (transcript
-                        // 19), so it is refused in its own vocabulary.
-                        tracing::warn!(method, id, "declining an unadjudicable approval request");
-                        let refusal = if method == MCP_ELICITATION_METHOD {
-                            encode_elicitation_response(id, false)
-                        } else {
-                            encode_decision_decline(id)
-                        };
-                        self.write(&refusal).await?;
-                    } else {
-                        self.pending.extend(events);
-                    }
-                    return Ok(());
-                }
+            Frame::ServerRequest { id, method, params } if is_adjudicable_method(&method) => {
+                self.adjudicate_server_request(id, method, params).await
+            }
+            Frame::ServerRequest { id, method, .. } => {
                 let reply = refusal_for(id, &method);
                 tracing::warn!(
                     method,
@@ -705,6 +710,30 @@ impl LiveCodexSession {
                 }
             }
         }
+    }
+}
+
+/// Whether a server request is one the assembler may turn into a permission
+/// event — the two methods the §10 chain has a seam for.
+///
+/// Named predicate: everything else is refused outright, so widening this by
+/// accident would offer the chain requests it has no vocabulary to answer.
+fn is_adjudicable_method(method: &str) -> bool {
+    method == MCP_ELICITATION_METHOD || method == EXEC_APPROVAL_METHOD
+}
+
+/// The refusal an adjudicable-method request gets when it could not become a
+/// permission event, in that method's own reply vocabulary.
+///
+/// The split is the same one `refusal_for` exists for, in the other
+/// direction: an elicitation answered with `decision` (or an exec approval
+/// answered with `action`) deserializes to nothing server-side, and then
+/// nothing was answered at all — the transcript-19 park.
+fn unadjudicable_refusal(id: u64, method: &str) -> String {
+    if method == MCP_ELICITATION_METHOD {
+        encode_elicitation_response(id, false)
+    } else {
+        encode_decision_decline(id)
     }
 }
 
@@ -1025,6 +1054,64 @@ mod tests {
             }
             other => panic!("a missing binary must claim nothing, got {other:?}"),
         }
+    }
+
+    /// The probe builder records its verdict on the adapter it was called on
+    /// — not on a fresh default, which would silently discard the program,
+    /// the policy, and every other field the caller configured.
+    #[tokio::test]
+    async fn the_probe_builder_keeps_the_adapter_it_probed() {
+        let mut adapter = CodexAdapter::new().with_program("/nonexistent/horde-test-codex");
+        adapter.response_ceiling = std::time::Duration::from_secs(2);
+        adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
+
+        let probed = adapter.probe_exec_interception().await;
+
+        assert_eq!(
+            probed.program, "/nonexistent/horde-test-codex",
+            "the probed binary is the configured one, not a default"
+        );
+        assert_eq!(
+            probed.extra_env,
+            vec![("MARKER".to_owned(), "kept".to_owned())],
+            "unrelated configuration survives the probe"
+        );
+        match &probed.exec_interception {
+            super::ExecInterception::SandboxOnly { reason } => assert!(
+                reason.contains("/nonexistent/horde-test-codex"),
+                "the verdict names the binary that was actually probed: {reason}"
+            ),
+            other => panic!("a missing binary must claim nothing, got {other:?}"),
+        }
+    }
+
+    /// The unadjudicable refusal speaks each method's own reply vocabulary —
+    /// swapped, either reply deserializes to nothing server-side and the
+    /// harness parks (transcript 19). And only the two chain-seam methods are
+    /// adjudicable at all.
+    #[test]
+    fn unadjudicable_refusals_speak_the_asking_methods_vocabulary() {
+        use horde_adapter_codex::wire::{EXEC_APPROVAL_METHOD, MCP_ELICITATION_METHOD};
+
+        let elicitation: serde_json::Value =
+            serde_json::from_str(&super::unadjudicable_refusal(3, MCP_ELICITATION_METHOD))
+                .expect("we produced this");
+        assert_eq!(elicitation["result"]["action"], "decline");
+        assert!(elicitation["result"].get("decision").is_none());
+
+        let exec: serde_json::Value =
+            serde_json::from_str(&super::unadjudicable_refusal(4, EXEC_APPROVAL_METHOD))
+                .expect("we produced this");
+        assert_eq!(exec["result"]["decision"], "decline");
+        assert!(exec["result"].get("action").is_none());
+
+        assert!(super::is_adjudicable_method(MCP_ELICITATION_METHOD));
+        assert!(super::is_adjudicable_method(EXEC_APPROVAL_METHOD));
+        assert!(
+            !super::is_adjudicable_method("item/fileChange/requestApproval"),
+            "file-change approvals have no chain seam (transcripts 28/31)"
+        );
+        assert!(!super::is_adjudicable_method("attestation/generate"));
     }
 
     /// The enforcement audit line each verdict journals at spawn.

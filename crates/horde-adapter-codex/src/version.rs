@@ -99,4 +99,16 @@ mod tests {
         );
         assert_eq!(parse_first_version("1.2.3.4"), None, "too many parts");
     }
+
+    /// Each split delimiter must work alone: a version wrapped in parens with
+    /// no adjoining whitespace is still found. This is the corner that
+    /// separates `||` from `&&` in the tokenizer — a character is a delimiter
+    /// if it is *any* of them, never all of them at once.
+    #[test]
+    fn a_parenthesized_version_is_still_found() {
+        assert_eq!(parse_first_version("codex(0.147.0)"), Some((0, 147, 0)));
+        assert_eq!(parse_first_version("(0.148.0"), Some((0, 148, 0)));
+        assert_eq!(parse_first_version("0.149.0)"), Some((0, 149, 0)));
+        assert!(routes_exec_approvals("codex(0.147.0)"));
+    }
 }

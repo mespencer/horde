@@ -18,6 +18,23 @@ use horde_adapter::{
 };
 use horde_worker::{ClaudeAdapter, CodexAdapter, ExecInterception};
 
+/// A codex session rooted in its own scratch cwd — the shape every codex
+/// live test shares, so the sandbox tier judges a throwaway directory.
+async fn codex_session_in_scratch(
+    adapter: &CodexAdapter,
+) -> Result<(tempfile::TempDir, Box<dyn AgentSession>), String> {
+    let scratch = tempfile::tempdir().map_err(|error| format!("no scratch cwd: {error}"))?;
+    let spec = AgentSpec {
+        cwd: Some(scratch.path().to_path_buf()),
+        ..AgentSpec::default()
+    };
+    let session = adapter
+        .spawn(&spec)
+        .await
+        .map_err(|error| format!("codex must be on PATH: {error}"))?;
+    Ok((scratch, session))
+}
+
 /// Drains one turn: everything streamed (assistant and diagnostics apart),
 /// and the outcome that closed it.
 async fn stream_turn(
@@ -83,13 +100,9 @@ async fn the_real_binary_still_streams_a_turn_through_the_supervisor() {
 #[ignore = "spends real subscription quota and needs a ChatGPT login"]
 async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
     let adapter = CodexAdapter::new();
-    let scratch = tempfile::tempdir().expect("a scratch cwd");
-    let spec = AgentSpec {
-        cwd: Some(scratch.path().to_path_buf()),
-        ..AgentSpec::default()
-    };
-
-    let mut session = adapter.spawn(&spec).await.expect("codex must be on PATH");
+    let (_scratch, mut session) = codex_session_in_scratch(&adapter)
+        .await
+        .expect("a codex session in a scratch cwd");
     assert!(
         session.provider_session_id().is_some(),
         "the thread id arrives at spawn, before any turn"
@@ -146,12 +159,9 @@ async fn the_real_codex_routes_an_exec_approval_and_honors_both_verdicts() {
         (PermissionDecision::deny("live smoke decline"), false),
         (PermissionDecision::allow(), true),
     ] {
-        let scratch = tempfile::tempdir().expect("a scratch cwd");
-        let spec = AgentSpec {
-            cwd: Some(scratch.path().to_path_buf()),
-            ..AgentSpec::default()
-        };
-        let mut session = adapter.spawn(&spec).await.expect("codex must be on PATH");
+        let (scratch, mut session) = codex_session_in_scratch(&adapter)
+            .await
+            .expect("a codex session in a scratch cwd");
         session
             .send(TurnInput::queued(
                 "Create a file named horde-live-approval.txt in the current directory \

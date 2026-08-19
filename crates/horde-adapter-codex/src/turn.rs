@@ -1388,6 +1388,52 @@ mod tests {
         assert!(!outcome.is_clean_success());
     }
 
+    /// `approval_input` hands back exactly the arguments the request was
+    /// surfaced with — this is what a narrowing decision is compared against,
+    /// so a wrong bag (or a fabricated empty one) would misclassify a real
+    /// rewrite as a restatement and run it.
+    #[test]
+    fn approval_input_returns_the_surfaced_arguments_verbatim() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let events = feed(&mut assembler, exec_approval_request(6));
+        let request = requested(&events, "surfaces");
+
+        assert_eq!(
+            assembler.approval_input(&request.tool_call_id),
+            Some(&request.input),
+            "the stored bag is the surfaced bag, byte for byte"
+        );
+        assert_eq!(
+            assembler.approval_input(&horde_adapter::ToolCallId::new("exec-nobody")),
+            None,
+            "an unknown call has no arguments to compare against"
+        );
+
+        assembler.resolve_approval(&request.tool_call_id, true);
+        assert_eq!(
+            assembler.approval_input(&request.tool_call_id),
+            None,
+            "a resolved approval is no longer comparable"
+        );
+    }
+
+    /// An exec approval whose item id is present but *empty* still mints an
+    /// id — an empty-string identity would collide every such approval onto
+    /// one key and mis-correlate their answers.
+    #[test]
+    fn an_empty_item_id_mints_an_identity_instead_of_using_the_blank() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let events = feed(
+            &mut assembler,
+            json!({"id":11,"method":"item/commandExecution/requestApproval",
+                   "params":{"itemId":"","command":"true","cwd":"/w"}}),
+        );
+        let request = requested(&events, "surfaces despite the blank id");
+        assert_eq!(request.tool_call_id.as_str(), "exec-approval-11");
+    }
+
     /// An exec approval that names no turn the assembler knows produces no
     /// event — the caller declines it on the wire — and one whose params fit
     /// but whose item id is missing still surfaces under a minted id, because
