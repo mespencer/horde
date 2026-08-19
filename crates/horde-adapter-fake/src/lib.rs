@@ -223,6 +223,13 @@ struct CurrentTurn {
     cost_usd: f64,
 }
 
+/// How many passes one `next_event` call may make without returning.
+///
+/// See the loop's own comment: the bound is by count because the failure it
+/// guards against — a pass that changes nothing — is an awaitless busy spin
+/// that starves every clock.
+const EVENT_LOOP_CEILING: u32 = 10_000;
+
 /// A live scripted agent.
 pub struct FakeSession {
     script: Script,
@@ -615,7 +622,16 @@ impl AgentSession for FakeSession {
         // duration behind for this loop to await. Looping — rather than
         // sleeping once at the top — is what keeps a stall from truncating the
         // turn: after waking, there is still a turn to play out.
-        loop {
+        //
+        // Count-bounded, not clock-bounded: every pass returns, sleeps a
+        // stall, launches or settles a call, or plays script steps, so a
+        // real script is served in a handful of passes and the ceiling is
+        // orders of magnitude above all of them. A pass that changes
+        // *nothing* is a defect — and an unbounded no-progress pass here is
+        // a busy spin with no await point, which starves the runtime's
+        // timers, so no wrapping timeout can catch it; only a count can
+        // (docs/QUALITY_GATES.md: a clock cannot bound a hot spin).
+        for _ in 0..EVENT_LOOP_CEILING {
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(event));
             }
@@ -649,6 +665,13 @@ impl AgentSession for FakeSession {
                 return Ok(None);
             }
         }
+        Err(AdapterError::Protocol {
+            message: format!(
+                "the scripted session made {EVENT_LOOP_CEILING} event-loop passes without \
+                 producing an event; a pass that changes nothing is a defect"
+            ),
+            raw: String::new(),
+        })
     }
 
     async fn answer_permission(
