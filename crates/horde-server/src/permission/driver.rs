@@ -1178,11 +1178,23 @@ mod tests {
             if let Some(found) = decision_in(history) {
                 return Some(found);
             }
+            // Counted, because the clock around this loop cannot bound it: a
+            // defect that makes `next_batch` resolve instantly with an empty
+            // batch never yields, so the 5s timeout is never polled and never
+            // fires. The session holds a handful of events; a healthy tail
+            // reaches the decision in a handful of non-empty batches.
+            let mut batches = 0_u32;
             loop {
                 let batch = match tail.next_batch().await {
                     Some(Ok(batch)) => batch,
                     _ => return None,
                 };
+                batches += 1;
+                assert!(
+                    batches < 64,
+                    "{batches} batches without a decision: an empty batch from \
+                     the tail is a defect, not something to wait out"
+                );
                 if let Some(found) = decision_in(batch) {
                     return Some(found);
                 }

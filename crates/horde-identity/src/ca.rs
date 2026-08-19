@@ -289,8 +289,18 @@ fn common_name(name: &str) -> DistinguishedName {
 fn random_serial() -> Result<(SerialNumber, String), IdentityError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| IdentityError::Randomness(e.to_string()))?;
-    bytes[0] = (bytes[0] & 0x7f).max(1);
+    bytes[0] = mask_random_serial(bytes[0]);
     Ok((SerialNumber::from(bytes.to_vec()), hex::encode(bytes)))
+}
+
+/// Clamps a serial's first byte into `0x01..=0x7f`.
+///
+/// Extracted from [`random_serial`] because the randomness there has no seam:
+/// on random bytes `&` and a wrong operator agree almost always, and only the
+/// top-bit-set inputs separate them. As a pure function the worst case is a
+/// constant a test can feed deterministically.
+fn mask_random_serial(first: u8) -> u8 {
+    (first & 0x7f).max(1)
 }
 
 /// `[now - backdate, now + lifetime]` as rcgen wants it.
@@ -310,7 +320,7 @@ fn validity(
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKDATE_MS, CertificateAuthority, PRINCIPAL_VALIDITY_MS};
+    use super::{BACKDATE_MS, CertificateAuthority, PRINCIPAL_VALIDITY_MS, mask_random_serial};
     use crate::enroll::generate_csr;
     use crate::principal::{PeerIdentity, Principal, PrincipalRole, peer_identity};
 
@@ -331,6 +341,40 @@ mod tests {
         CertificateDer::from_pem_slice(pem.as_bytes())
             .expect("issued PEM must parse")
             .to_vec()
+    }
+
+    /// The serial mask clamps every first byte into `0x01..=0x7f`.
+    ///
+    /// The boundaries are pinned exactly because random input cannot tell the
+    /// right operator from a wrong one: with `&` misread as `^`, `0xff` maps
+    /// to `0x80` — a negative DER integer — and `0x80` maps to `0xff` instead
+    /// of `0x01`. The worst cases are fed deterministically here.
+    #[test]
+    fn the_serial_mask_clamps_every_first_byte_into_the_positive_range() {
+        assert_eq!(mask_random_serial(0x00), 0x01, "zero is lifted to one");
+        assert_eq!(mask_random_serial(0x01), 0x01);
+        assert_eq!(
+            mask_random_serial(0x7f),
+            0x7f,
+            "the top of the range survives"
+        );
+        assert_eq!(
+            mask_random_serial(0x80),
+            0x01,
+            "a bare top bit clears, then lifts"
+        );
+        assert_eq!(
+            mask_random_serial(0xff),
+            0x7f,
+            "all-ones is the mask's worst case"
+        );
+        for byte in u8::MIN..=u8::MAX {
+            let masked = mask_random_serial(byte);
+            assert!(
+                (0x01..=0x7f).contains(&masked),
+                "{byte:#04x} mapped to {masked:#04x}, outside 0x01..=0x7f"
+            );
+        }
     }
 
     #[test]
