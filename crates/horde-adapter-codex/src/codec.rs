@@ -53,6 +53,45 @@ pub fn decode_line(line: &str) -> Result<Frame> {
     }
 }
 
+/// The one `approvalsReviewer` this codec will ever send.
+///
+/// `auto_review` is the transcript-23 hazard: under it, codex's own review
+/// subagent approved a sandbox escalation and the write RAN under a read-only
+/// sandbox, with no client-facing request at all — the entire permission chain
+/// silently bypassed by codex reviewing itself. `user` (also the measured
+/// default when unset, transcript 22) routes every approval to this client.
+/// The value is a constant rather than a field so no configuration path can
+/// ever reach the wire with anything else; [`approvals_reviewer_from_config`]
+/// is the parse-time gate for anyone adding such a path.
+pub const APPROVALS_REVIEWER: &str = "user";
+
+/// Validates an operator-supplied `approvalsReviewer`, admitting only the
+/// value the codec sends anyway.
+///
+/// # Errors
+///
+/// Anything but `None` or `"user"` — `auto_review` and `guardian` by name,
+/// and unknown values by refusal to guess — with an error naming the
+/// measurement, so the config that tried it learns *why* the door is shut.
+pub fn approvals_reviewer_from_config(
+    requested: Option<&str>,
+) -> core::result::Result<&'static str, String> {
+    match requested {
+        None | Some("user") => Ok(APPROVALS_REVIEWER),
+        Some(hazard @ ("auto_review" | "guardian")) => Err(format!(
+            "approvalsReviewer {hazard:?} is refused: under auto_review codex's own subagent \
+             approved a sandbox escalation and the write ran under a read-only sandbox with no \
+             client-facing request (docs/spikes/codex-app-server/transcripts/\
+             23-exec-autoreview-onrequest-ro-horde-write.jsonl). Only \"user\" routes approvals \
+             to Horde's permission chain."
+        )),
+        Some(other) => Err(format!(
+            "approvalsReviewer {other:?} is not a value any spike measured; only \"user\" is \
+             accepted (see transcript 23 for why this knob fails closed)"
+        )),
+    }
+}
+
 /// What one thread is started (or resumed) with.
 ///
 /// The approval policy is deliberately not a field. The only policy measured
@@ -60,7 +99,8 @@ pub fn decode_line(line: &str) -> Result<Frame> {
 /// `mcp_elicitations: true` — under plain `"on-request"` the thread parks at
 /// `waitingOnApproval` forever and the turn never completes (transcript 19).
 /// A configurable policy would be a knob whose other settings are all broken,
-/// so the encoder always sends the one that works.
+/// so the encoder always sends the one that works. The reviewer is likewise
+/// pinned to [`APPROVALS_REVIEWER`] — see transcript 23 for the hazard.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadConfig {
     /// The agent's working directory — half of the real enforcement, with the
@@ -91,7 +131,7 @@ impl ThreadConfig {
                     "sandbox_approval": true,
                 }
             },
-            "approvalsReviewer": "user",
+            "approvalsReviewer": APPROVALS_REVIEWER,
             "sandbox": self.sandbox.wire_name(),
         });
         if let Some(cwd) = &self.cwd {
@@ -168,15 +208,84 @@ pub fn encode_elicitation_response(id: u64, allow: bool) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
+/// One of codex's `decision`-vocabulary answers to an exec approval request.
+///
+/// The full set the re-probe measured or the schema advertises
+/// (`availableDecisions`, transcripts 20–33): `accept` ran the command
+/// (transcript 29), `acceptWithExecpolicyAmendment` ran it and persisted the
+/// echoed argv as a rule a second turn no longer asked about (transcript 30),
+/// `decline` blocked it with `status: "declined"` and no exit code
+/// (transcripts 20–22, 25–27), and `cancel` appears in every recorded
+/// `availableDecisions` list. `acceptForSession` is the session-scoped grant
+/// in the same vocabulary — the encoding for a chain allow that carried
+/// `remember_for_session`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecDecision {
+    /// Run the command, this once.
+    Accept,
+    /// Run it, and let codex cache the grant for the rest of the session.
+    AcceptForSession,
+    /// Run it, and persist this argv as an execpolicy rule. Broader than a
+    /// session grant — the rule outlives the session — so it is only encoded
+    /// when the chain's narrowing named exactly this argv.
+    AcceptWithExecpolicyAmendment {
+        /// The rule to persist, echoed from `proposedExecpolicyAmendment`.
+        execpolicy_amendment: Vec<String>,
+    },
+    /// Refuse the command. The exec item completes as `declined`.
+    Decline,
+    /// Withdraw the question — the encoding for an interrupt that found an
+    /// approval still parked.
+    Cancel,
+}
+
+impl ExecDecision {
+    /// The wire name (or shape) this decision serializes as, for journals.
+    #[must_use]
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::AcceptForSession => "acceptForSession",
+            Self::AcceptWithExecpolicyAmendment { .. } => "acceptWithExecpolicyAmendment",
+            Self::Decline => "decline",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    fn wire_value(&self) -> Value {
+        match self {
+            Self::AcceptWithExecpolicyAmendment {
+                execpolicy_amendment,
+            } => json!({
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": execpolicy_amendment,
+                }
+            }),
+            unit => json!(unit.wire_name()),
+        }
+    }
+}
+
+/// The reply to an exec approval request, in the `decision` vocabulary.
+///
+/// Never the elicitation `action` — the wrong shape fails to deserialize
+/// server-side and then nothing was answered at all, which parks the harness
+/// at `waitingOnApproval` forever (the transcript-19 hang, same mechanism).
+#[must_use]
+pub fn encode_exec_approval_response(id: u64, decision: &ExecDecision) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "result": { "decision": decision.wire_value() } })
+        .to_string()
+}
+
 /// The deny-by-default reply to a sandbox/exec approval request.
 ///
-/// These use the `decision` shape, not the elicitation `action`. Horde has no
-/// per-call chain for codex exec (ADR-0005), so any approval that does reach
-/// the client is refused: the sandbox tier is the granted authority, and an
-/// escape hatch nobody can adjudicate stays shut.
+/// These use the `decision` shape, not the elicitation `action`. Kept for the
+/// approval kinds Horde still cannot adjudicate (file changes, and anything a
+/// future codex invents): whatever reaches the client without a chain seam is
+/// refused, so the sandbox tier stays the only granted authority.
 #[must_use]
 pub fn encode_decision_decline(id: u64) -> String {
-    json!({ "jsonrpc": "2.0", "id": id, "result": { "decision": "decline" } }).to_string()
+    encode_exec_approval_response(id, &ExecDecision::Decline)
 }
 
 /// A JSON-RPC error reply for a server request this codec cannot answer.
@@ -423,6 +532,111 @@ mod tests {
             serde_json::from_str(&super::encode_decision_decline(4)).expect("we produced this");
         assert_eq!(refused["result"]["decision"], "decline");
         assert!(refused["result"].get("action").is_none());
+    }
+
+    /// All five exec decisions encode in the `decision` vocabulary, unit
+    /// variants as the bare strings the schema's `availableDecisions` lists
+    /// and the amendment as the echo-back object transcript 30 proved is
+    /// honored. None of them may leak the elicitation `action` shape.
+    #[test]
+    fn every_exec_decision_encodes_in_the_decision_vocabulary() {
+        use super::ExecDecision;
+
+        let argv = vec![
+            "/bin/zsh".to_owned(),
+            "-lc".to_owned(),
+            "printf ESCALATED > probe.txt".to_owned(),
+        ];
+        let cases: [(ExecDecision, Value); 5] = [
+            (ExecDecision::Accept, json!("accept")),
+            (ExecDecision::AcceptForSession, json!("acceptForSession")),
+            (
+                ExecDecision::AcceptWithExecpolicyAmendment {
+                    execpolicy_amendment: argv.clone(),
+                },
+                json!({"acceptWithExecpolicyAmendment": {"execpolicy_amendment": argv}}),
+            ),
+            (ExecDecision::Decline, json!("decline")),
+            (ExecDecision::Cancel, json!("cancel")),
+        ];
+
+        for (decision, expected) in cases {
+            let encoded: Value =
+                serde_json::from_str(&super::encode_exec_approval_response(7, &decision))
+                    .expect("we produced this");
+            assert_eq!(encoded["id"], 7, "{decision:?} must correlate");
+            assert_eq!(encoded["result"]["decision"], expected, "{decision:?}");
+            assert!(
+                encoded["result"].get("action").is_none(),
+                "{decision:?}: the elicitation vocabulary deserializes to \
+                 nothing on this method"
+            );
+        }
+    }
+
+    /// The wire names the journal quotes must match what actually went out.
+    #[test]
+    fn exec_decision_wire_names_match_their_encodings() {
+        use super::ExecDecision;
+        for decision in [
+            ExecDecision::Accept,
+            ExecDecision::AcceptForSession,
+            ExecDecision::Decline,
+            ExecDecision::Cancel,
+            ExecDecision::AcceptWithExecpolicyAmendment {
+                execpolicy_amendment: vec!["true".to_owned()],
+            },
+        ] {
+            let encoded = super::encode_exec_approval_response(1, &decision);
+            assert!(
+                encoded.contains(decision.wire_name()),
+                "the journaled name {} must appear in {encoded}",
+                decision.wire_name()
+            );
+        }
+    }
+
+    /// The transcript-23 hazard stays parse-refused: only `user` (or nothing)
+    /// passes, `auto_review` and `guardian` are named refusals that cite the
+    /// measurement, and unknown values fail closed rather than reach codex.
+    #[test]
+    fn the_reviewer_gate_admits_user_and_refuses_the_self_approval_hazard() {
+        use super::approvals_reviewer_from_config;
+
+        assert_eq!(approvals_reviewer_from_config(None), Ok("user"));
+        assert_eq!(approvals_reviewer_from_config(Some("user")), Ok("user"));
+
+        for hazard in ["auto_review", "guardian"] {
+            let refusal = approvals_reviewer_from_config(Some(hazard))
+                .expect_err("the self-approval reviewer must be refused");
+            assert!(
+                refusal.contains("23-exec-autoreview-onrequest-ro-horde-write"),
+                "the refusal names the transcript that measured the hazard: {refusal}"
+            );
+        }
+
+        let unknown = approvals_reviewer_from_config(Some("committee"))
+            .expect_err("unmeasured values fail closed");
+        assert!(unknown.contains("transcript 23"), "{unknown}");
+    }
+
+    /// The codec can never emit `auto_review`: every thread request carries
+    /// the pinned reviewer, whatever the config held. This is the structural
+    /// half of the transcript-23 pin — the value is a constant, not a field.
+    #[test]
+    fn every_thread_request_pins_the_reviewer_to_user() {
+        let config = super::ThreadConfig::default();
+        for encoded in [
+            super::encode_thread_start(1, &config),
+            super::encode_thread_resume(2, "t1", &config),
+        ] {
+            let value: Value = serde_json::from_str(&encoded).expect("we produced this");
+            assert_eq!(value["params"]["approvalsReviewer"], "user");
+            assert!(
+                !encoded.contains("auto_review"),
+                "the self-approving reviewer must be unrepresentable: {encoded}"
+            );
+        }
     }
 
     /// An unanswerable server request gets an error reply, never silence —

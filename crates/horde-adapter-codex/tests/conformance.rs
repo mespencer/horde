@@ -253,21 +253,91 @@ fn every_codex_transcript_decodes() {
     }
 }
 
-/// The exec-approval recordings prove the negative ADR-0005 rests on — for
-/// shell/exec it stands, unmoved by the amendment that reversed the MCP half.
+/// An exec recording that carried no approval request still produces none —
+/// the assembler surfaces what the wire routed, never what it wishes had
+/// been. Transcript 04 is the only exec recording that is genuinely
+/// request-free (a trivially safe `echo` under `untrusted`, auto-approved);
+/// even 06 and 10, whose W2c summaries said "no request", turn out to carry
+/// late-routed frames in their preserved bytes.
 #[test]
-fn no_exec_recording_ever_produced_a_permission_request() {
+fn an_exec_recording_without_an_approval_frame_produces_no_request() {
+    let (events, _) = replay("04-approval-echo-untrusted.jsonl");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PermissionRequested { .. })),
+        "04: no approval frame was recorded, so none may be invented"
+    );
+}
+
+/// The correction the re-probe forced on W2c's own analysis: transcript 06's
+/// bytes (codex-cli 0.145.0, granular) contain one `item/commandExecution/
+/// requestApproval`, routed 182 seconds after the exec item started — which
+/// the spike's summary wrote off as "no request". The assembler surfaces what
+/// the bytes say. The claim stays version-gated at 0.147 regardless: a
+/// three-minute internal retry loop before the question is not interception
+/// worth advertising, and the re-probe's bounded matrix is the measurement.
+#[test]
+fn the_late_routed_0145_approval_in_transcript_06_surfaces_as_the_bytes_say() {
+    let (events, _) = replay("06-approval-write-granular.jsonl");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PermissionRequested { .. })),
+        "the recording carries the frame, so the replay must carry the event"
+    );
+}
+
+/// The exec interception seam against the recorded bytes — the 2026-08-19
+/// re-probe's finding, replayed. Transcript 25 (codex-cli 0.148.0, granular,
+/// read-only) routes `item/commandExecution/requestApproval` before the
+/// command completes; the surfaced proposal carries the command and cwd the
+/// chain's rules match on, and the exec item is still unresolved when the
+/// question arrives.
+#[test]
+fn a_recorded_exec_approval_surfaces_before_the_command_resolves() {
     for name in [
-        "04-approval-echo-untrusted.jsonl",
-        "06-approval-write-granular.jsonl",
-        "10-approval-with-experimental-flags.jsonl",
+        "25-exec-user-granular-ro-horde-write.jsonl",
+        "33-0147-exec-user-granular-ro-horde-write.jsonl",
     ] {
-        let (events, _) = replay(name);
+        let (events, assembler) = replay(name);
+
+        let request_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::PermissionRequested { .. }))
+            .unwrap_or_else(|| panic!("{name}: the recorded approval must surface"));
+        let request = match &events[request_at] {
+            AgentEvent::PermissionRequested { request, .. } => request,
+            _ => unreachable!("indexed by position"),
+        };
+        assert_eq!(request.tool_name, "exec", "{name}");
+        let command = request.input["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name}: the command must be rule-matchable text"));
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::PermissionRequested { .. })),
-            "{name}: Codex routes no shell/exec approvals to the client (ADR-0005)"
+            command.contains("horde-escalation-probe.txt"),
+            "{name}: the chain sees what codex will run: {command}"
+        );
+        assert!(
+            request.input["cwd"]
+                .as_str()
+                .is_some_and(|cwd| cwd.starts_with("/private/tmp/")),
+            "{name}: the cwd rides as a rule-matchable argument"
+        );
+
+        let completed_before_request = events[..request_at].iter().any(|event| {
+            matches!(event, AgentEvent::ToolCompleted { tool_call_id, .. }
+                    if tool_call_id == &request.tool_call_id)
+        });
+        assert!(
+            !completed_before_request,
+            "{name}: the question precedes the verdict — that is the seam"
+        );
+        assert!(
+            assembler.awaiting_decision().is_some(),
+            "{name}: the recording ends with answers still owed by the \
+             replayer (the probe answered on the wire, which a replay cannot \
+             see; the model may have retried and asked more than once)"
         );
     }
 }

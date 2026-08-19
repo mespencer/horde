@@ -14,7 +14,12 @@
 //!   `!ELICIT ` sends the rest as an `mcpServer/elicitation/request` server
 //!   request and **waits for the client's reply** before continuing — the
 //!   block behind the marker stands in for what the harness does once
-//!   answered.
+//!   answered. `!EXEC_APPROVAL ` does the same on
+//!   `item/commandExecution/requestApproval`, the exec seam the 2026-08-19
+//!   re-probe measured.
+//! * `codex-stub-harness --version` prints `HORDE_CODEX_STUB_VERSION` (default
+//!   `codex-cli 0.148.0`) and exits — the version probe's happy path, without
+//!   a script.
 //! * `HORDE_CODEX_STUB_CONTROL_LOG` — append every stdin line to this file.
 //!   The client's elicitation answers and steer/interrupt requests are only
 //!   observable here, which is the point: a test watching the event stream
@@ -34,6 +39,12 @@
 use std::io::{BufRead, Write};
 
 fn main() -> std::process::ExitCode {
+    if std::env::args().any(|argument| argument == "--version") {
+        let version = std::env::var("HORDE_CODEX_STUB_VERSION")
+            .unwrap_or_else(|_| "codex-cli 0.148.0".to_owned());
+        println!("{version}");
+        return std::process::ExitCode::SUCCESS;
+    }
     let Some(contents) = script() else {
         return std::process::ExitCode::FAILURE;
     };
@@ -222,14 +233,15 @@ fn next_message(stdin: &mut impl BufRead) -> Option<serde_json::Value> {
     }
 }
 
-/// Plays one block: raw lines are emitted; an `!ELICIT` marker sends a server
-/// request and blocks until the client answers it.
+/// Plays one block: raw lines are emitted; an `!ELICIT` or `!EXEC_APPROVAL`
+/// marker sends a server request on its method and blocks until the client
+/// answers it.
 fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u64) {
     for line in block {
-        match line.strip_prefix("!ELICIT ") {
-            Some(params) => {
+        match server_request_marker(line) {
+            Some((method, params)) => {
                 *next_server_id += 1;
-                emit(&elicitation_line(*next_server_id, params));
+                emit(&server_request_line(*next_server_id, method, params));
                 await_reply(*next_server_id, stdin);
             }
             None => emit(line),
@@ -237,11 +249,21 @@ fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u
     }
 }
 
-fn elicitation_line(id: u64, params: &str) -> String {
+/// The method a marker line asks for, with its params — or `None` for a raw
+/// line.
+fn server_request_marker(line: &str) -> Option<(&'static str, &str)> {
+    if let Some(params) = line.strip_prefix("!ELICIT ") {
+        return Some(("mcpServer/elicitation/request", params));
+    }
+    line.strip_prefix("!EXEC_APPROVAL ")
+        .map(|params| ("item/commandExecution/requestApproval", params))
+}
+
+fn server_request_line(id: u64, method: &str, params: &str) -> String {
     let params: serde_json::Value = serde_json::from_str(params).unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "jsonrpc":"2.0","id":id,
-        "method":"mcpServer/elicitation/request","params":params
+        "method":method,"params":params
     })
     .to_string()
 }
@@ -482,6 +504,27 @@ mod tests {
             &mut next_server_id,
         );
         assert!(remaining.next().is_some(), "the block is still unplayed");
+    }
+
+    /// The marker table: each directive names its own method, and a raw line
+    /// is no directive at all.
+    #[test]
+    fn markers_name_their_methods_and_raw_lines_are_raw() {
+        assert_eq!(
+            super::server_request_marker("!ELICIT {\"serverName\":\"s\"}"),
+            Some(("mcpServer/elicitation/request", "{\"serverName\":\"s\"}"))
+        );
+        assert_eq!(
+            super::server_request_marker("!EXEC_APPROVAL {\"command\":\"true\"}"),
+            Some((
+                "item/commandExecution/requestApproval",
+                "{\"command\":\"true\"}"
+            ))
+        );
+        assert_eq!(
+            super::server_request_marker("{\"method\":\"turn/started\"}"),
+            None
+        );
     }
 
     #[test]

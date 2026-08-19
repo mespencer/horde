@@ -56,7 +56,7 @@ impl PromptRequest {
 #[must_use]
 pub fn encode_decision(decision: &PermissionDecision, proposed_input: &Value) -> String {
     let body = match decision {
-        PermissionDecision::Allow { updated_input } => json!({
+        PermissionDecision::Allow { updated_input, .. } => json!({
             "behavior": "allow",
             // The harness runs whatever is in `updatedInput`, so an unmodified
             // allow must echo the proposal back rather than omit the field.

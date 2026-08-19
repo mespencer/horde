@@ -114,6 +114,11 @@ pub struct WorkerConfig {
     pub advertised_remotes: Vec<String>,
     /// Dial plaintext with no identity — the in-process-test-server shape.
     pub insecure: bool,
+    /// The codex `approvalsReviewer`, already validated at parse: only
+    /// `"user"` survives [`horde_adapter_codex::approvals_reviewer_from_config`].
+    /// `auto_review` is the transcript-23 self-approval hazard and is refused
+    /// before any process starts.
+    pub codex_approvals_reviewer: Option<String>,
 }
 
 /// What the flags said, before the shape rules are applied.
@@ -131,6 +136,7 @@ struct ParsedFlags {
     tags: Vec<String>,
     advertised_remotes: Vec<String>,
     insecure: bool,
+    codex_approvals_reviewer: Option<String>,
 }
 
 /// Whether `flag` is one of the daemon's value-carrying flags.
@@ -152,6 +158,7 @@ fn takes_value(flag: &str) -> bool {
             | "--relay"
             | "--tag"
             | "--advertise-remote"
+            | "--codex-approvals-reviewer"
     )
 }
 
@@ -213,6 +220,14 @@ impl ParsedFlags {
             "--relay" => self.relay = Some(value),
             "--tag" => self.tags.push(value),
             "--advertise-remote" => self.advertised_remotes.push(value),
+            "--codex-approvals-reviewer" => {
+                // Rejected at parse, not at spawn: `auto_review` had codex's
+                // own subagent approve a sandbox escalation and run the write
+                // under a read-only sandbox (transcript 23). The validator
+                // admits only "user", which the codec pins anyway.
+                horde_adapter_codex::approvals_reviewer_from_config(Some(&value))?;
+                self.codex_approvals_reviewer = Some(value);
+            }
             // Unreachable while `takes_value` and these two matches agree;
             // refusing (rather than ignoring) is what keeps a future drift
             // between them loud.
@@ -238,6 +253,7 @@ impl ParsedFlags {
             tags: self.tags,
             advertised_remotes: self.advertised_remotes,
             insecure: self.insecure,
+            codex_approvals_reviewer: self.codex_approvals_reviewer,
         };
         config.check_shape()?;
         Ok(config)
@@ -262,6 +278,10 @@ impl WorkerConfig {
         }
         if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
             return Err("--fake-script needs --adapter fake".to_owned());
+        }
+        if self.codex_approvals_reviewer.is_some() && !self.adapters.contains(&AdapterChoice::Codex)
+        {
+            return Err("--codex-approvals-reviewer needs --adapter codex".to_owned());
         }
         if self.insecure && !self.server.starts_with("http://") {
             return Err(format!(
@@ -615,7 +635,7 @@ pub async fn prepare(
     let journal = Journal::open(&config.journal_path())
         .map_err(|error| format!("could not open the journal: {error}"))?;
 
-    let runtime = build_runtime(config, identity.as_ref(), &name, journal.clone())?;
+    let runtime = build_runtime(config, identity.as_ref(), &name, journal.clone()).await?;
     Ok(PreparedWorker {
         runtime,
         journal,
@@ -630,7 +650,11 @@ pub async fn prepare(
 }
 
 /// Assembles the Runtime a configuration asks for.
-fn build_runtime(
+///
+/// Async for one reason: the codex adapter probes its binary's version before
+/// claiming exec interception, and a probe is a bounded child process, not a
+/// guess.
+async fn build_runtime(
     config: &WorkerConfig,
     identity: Option<&StoredIdentity>,
     name: &str,
@@ -653,7 +677,19 @@ fn build_runtime(
                 runtime.with_adapter(Arc::new(FakeAdapter::new(configured_script(config)?)))
             }
             AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new())),
-            AdapterChoice::Codex => runtime.with_adapter(Arc::new(crate::CodexAdapter::new())),
+            AdapterChoice::Codex => {
+                // Belt and braces on the transcript-23 hazard: the flag was
+                // validated at parse, and the value is re-validated here so a
+                // config constructed programmatically gets the same gate. The
+                // codec pins the wire value regardless.
+                horde_adapter_codex::approvals_reviewer_from_config(
+                    config.codex_approvals_reviewer.as_deref(),
+                )?;
+                // Probed, not assumed: the exec-gating capability claim is
+                // version-gated (ADR-0005, 2026-08-19 amendment).
+                let adapter = crate::CodexAdapter::new().probe_exec_interception().await;
+                runtime.with_adapter(Arc::new(adapter))
+            }
         };
     }
 
@@ -935,6 +971,30 @@ mod tests {
         assert!(config.join.is_none() && config.enrollment.is_none());
         assert!(config.workspace_root.is_none() && config.relay.is_none());
         assert!(config.tags.is_empty() && config.advertised_remotes.is_empty());
+    }
+
+    /// The transcript-23 pin at the config seam: `user` (with the codex
+    /// adapter) parses; the self-approval reviewers are refused by name,
+    /// citing the measurement; and the flag without the adapter it configures
+    /// is a refusal too.
+    #[test]
+    fn the_codex_reviewer_flag_admits_user_and_refuses_the_hazard() {
+        let config = parsed(&["--adapter", "codex", "--codex-approvals-reviewer", "user"])
+            .expect("user is the one reviewer that routes approvals to the chain");
+        assert_eq!(config.codex_approvals_reviewer.as_deref(), Some("user"));
+
+        for hazard in ["auto_review", "guardian"] {
+            let refusal = parsed(&["--adapter", "codex", "--codex-approvals-reviewer", hazard])
+                .expect_err("the self-approving reviewer must be refused at parse");
+            assert!(
+                refusal.contains("23-exec-autoreview-onrequest-ro-horde-write"),
+                "the refusal cites the transcript that measured the hazard: {refusal}"
+            );
+        }
+
+        let orphaned = parsed(&["--adapter", "fake", "--codex-approvals-reviewer", "user"])
+            .expect_err("a reviewer without the codex adapter configures nothing");
+        assert!(orphaned.contains("--adapter codex"), "{orphaned}");
     }
 
     #[test]

@@ -590,9 +590,19 @@ impl AgentSession for FakeSession {
         let turn_id = self.turn_id();
 
         match decision {
-            PermissionDecision::Allow { updated_input } => {
-                let rendered = updated_input
+            PermissionDecision::Allow {
+                updated_input,
+                remember_for_session,
+            } => {
+                // The remember bit is rendered so an orchestration test can
+                // see the adapter received the session-grant scope — the fake
+                // models what a codex-shaped harness encodes as
+                // `acceptForSession`.
+                let mut rendered = updated_input
                     .map_or_else(|| "allowed".to_owned(), |input| format!("allowed {input}"));
+                if remember_for_session {
+                    rendered.push_str(" (remembered for session)");
+                }
                 self.emit_output(OutputChannel::ToolResult, rendered);
                 self.pending.push_back(AgentEvent::ToolCompleted {
                     turn_id,
@@ -928,6 +938,34 @@ mod permission_path_tests {
             .answer_permission(&ToolCallId::new("call-1"), PermissionDecision::allow())
             .await
             .expect("a decision carrying no rewrite needs no rewrite capability");
+    }
+
+    /// A remembering allow is accepted and observably remembered: the tool
+    /// result names the session scope, so an orchestration test can assert
+    /// the adapter received what a codex-shaped harness would encode as
+    /// `acceptForSession` — the fake models the decision shape end to end.
+    #[tokio::test]
+    async fn a_remembering_allow_is_rendered_with_its_session_scope() {
+        let mut session =
+            waiting_session(Capabilities::none().with(Capability::PreAuthorizeToolCalls)).await;
+
+        session
+            .answer_permission(
+                &ToolCallId::new("call-1"),
+                PermissionDecision::allow().remembered(),
+            )
+            .await
+            .expect("the remember bit needs no extra capability");
+
+        let next = session.next_event().await.expect("no error");
+        match next {
+            Some(AgentEvent::Output {
+                channel: OutputChannel::ToolResult,
+                text,
+                ..
+            }) => assert_eq!(text, "allowed (remembered for session)"),
+            other => panic!("the tool result must name the scope, got {other:?}"),
+        }
     }
 
     /// A rewriting allow must be refused by an adapter that cannot rewrite.

@@ -54,13 +54,16 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
         // scheduler that learns to place high-trust work will want to see it.
         // It stays off the wire until something reads it.
         //
-        // `PreAuthorizeMcpToolCalls` (ADR-0005 amendment: Codex intercepts MCP
-        // calls but not exec) stays off the wire for the same reason and one
-        // more: mapping it to TOOL_CALL_GATING would overstate it — placement
-        // reads that flag as "high-trust work can land here", which is exactly
-        // what ungated exec forbids. It graduates as its own wire value when
-        // placement learns to match per call kind (W5d's seam), not before.
+        // `PreAuthorizeMcpToolCalls` and `PreAuthorizeExecCommands` (ADR-0005
+        // amendments: Codex intercepts MCP calls, and shell/exec at 0.147+,
+        // but never file changes) stay off the wire for the same reason and
+        // one more: mapping either to TOOL_CALL_GATING would overstate it —
+        // placement reads that flag as "high-trust work can land here", which
+        // is exactly what ungated file changes forbid. They graduate as their
+        // own wire values when placement learns to match per call kind (W5d's
+        // seam), not before.
         Capability::PreAuthorizeMcpToolCalls
+        | Capability::PreAuthorizeExecCommands
         | Capability::SandboxTierAtSpawn
         | Capability::ReportsHeadroom
         | Capability::SystemPromptOverlay
@@ -133,16 +136,20 @@ mod tests {
         for capability in Capability::ALL {
             let _ = capability_to_wire(capability);
         }
-        assert_eq!(Capability::ALL.len(), 11);
+        assert_eq!(Capability::ALL.len(), 12);
     }
 
-    /// The scoped MCP-gating claim must never widen into the wire's blanket
-    /// gating flag: placement reads TOOL_CALL_GATING as "high-trust work can
-    /// land here", which ungated exec forbids.
+    /// The scoped per-kind gating claims must never widen into the wire's
+    /// blanket gating flag: placement reads TOOL_CALL_GATING as "high-trust
+    /// work can land here", which ungated file changes forbid.
     #[test]
-    fn scoped_mcp_gating_does_not_advertise_as_blanket_gating() {
+    fn scoped_per_kind_gating_does_not_advertise_as_blanket_gating() {
         assert_eq!(
             capability_to_wire(Capability::PreAuthorizeMcpToolCalls),
+            None
+        );
+        assert_eq!(
+            capability_to_wire(Capability::PreAuthorizeExecCommands),
             None
         );
     }

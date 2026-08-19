@@ -206,11 +206,75 @@ mod harness {
     /// Bounded control-log polling, shared with the claude suite — see
     /// `support::control_log_reaches`.
     pub(crate) use crate::support::control_log_reaches as control_log_shows;
+
+    /// The exec-approval params the re-probe recorded (transcript 20's
+    /// shape), pointed at a stub item.
+    pub(crate) fn exec_approval_params() -> serde_json::Value {
+        json!({
+            "threadId": "stub-thread",
+            "turnId": "turn-1",
+            "itemId": "exec-9",
+            "reason": "Allow me to write probe.txt?",
+            "command": "/bin/zsh -lc \"printf ESCALATED > probe.txt\"",
+            "cwd": "/work",
+            "commandActions": [{"type": "unknown", "command": "printf ESCALATED > probe.txt"}],
+            "proposedExecpolicyAmendment": ["/bin/zsh", "-lc", "printf ESCALATED > probe.txt"],
+            "availableDecisions": ["accept", "cancel"]
+        })
+    }
+
+    /// One scripted turn whose exec item asks for approval and then completes
+    /// as `completed_status`, exit `exit_code` — the stub parks on the marker
+    /// until the session answers, exactly as codex does.
+    pub(crate) fn exec_approval_script(completed_status: &str, exit_code: Option<i64>) -> String {
+        let mut completed_item = json!({
+            "type": "commandExecution", "id": "exec-9",
+            "command": "/bin/zsh -lc \"printf ESCALATED > probe.txt\"",
+            "status": completed_status,
+        });
+        if let Some(code) = exit_code {
+            completed_item["exitCode"] = json!(code);
+        }
+        [
+            thread_started(),
+            turn_started("turn-1"),
+            json!({"method":"item/started","params":{"turnId":"turn-1","item":{
+                "type":"commandExecution","id":"exec-9",
+                "command":"/bin/zsh -lc \"printf ESCALATED > probe.txt\"",
+                "status":"inProgress"}}})
+            .to_string(),
+            format!("!EXEC_APPROVAL {}", exec_approval_params()),
+            json!({"method":"item/completed",
+                   "params":{"turnId":"turn-1","item": completed_item}})
+            .to_string(),
+            turn_completed("turn-1"),
+        ]
+        .join("\n")
+    }
+
+    /// Drains to the permission request, under the ceiling.
+    pub(crate) async fn surfaced_request(
+        session: &mut Box<dyn AgentSession>,
+    ) -> horde_adapter::ProposedToolCall {
+        within("the request surfaces", async {
+            loop {
+                match session.next_event().await {
+                    Ok(Some(AgentEvent::PermissionRequested { request, .. })) => {
+                        return Some(request);
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .expect("the exec approval must surface as a permission request")
+    }
 }
 
 use harness::{
-    adapter_for, basic_turn, control_log_shows, events_through_turn_end, mid_turn, session_on,
-    within,
+    adapter_for, basic_turn, control_log_shows, events_through_turn_end, exec_approval_params,
+    exec_approval_script, mid_turn, session_on, surfaced_request, within,
 };
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSpec, OutputChannel, PermissionDecision,
@@ -379,17 +443,197 @@ async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
     session.shutdown().await.expect("shuts down");
 }
 
-/// A narrowing decision must be refused loudly — the elicitation reply cannot
+/// The exec-approval flow end to end over a real process: the request
+/// surfaces with the command and cwd the chain's rules match on, the allow
+/// reaches the child as `{"decision":"accept"}` — never the elicitation
+/// `action` — and the turn finishes clean.
+#[tokio::test]
+async fn an_exec_approval_surfaces_and_the_accept_reaches_the_wire() {
+    let log = tempfile::tempdir().expect("a scratch dir");
+    let log_path = log.path().join("control.log");
+
+    let (mut session, _dir) = session_on(
+        &exec_approval_script("completed", Some(0)),
+        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+    )
+    .await;
+    session.send(TurnInput::queued("go")).await.expect("sends");
+
+    let request = surfaced_request(&mut session).await;
+    assert_eq!(request.tool_name, "exec");
+    assert_eq!(request.tool_call_id.as_str(), "exec-9");
+    assert_eq!(request.input["command"], "printf ESCALATED > probe.txt");
+    assert_eq!(request.input["cwd"], "/work");
+
+    session
+        .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+        .await
+        .expect("the answer is writable");
+
+    let recorded =
+        control_log_shows(&log_path, |log| log.contains("\"decision\":\"accept\"")).await;
+    assert!(
+        !recorded.contains("\"action\""),
+        "the elicitation vocabulary would deserialize to nothing here: {recorded}"
+    );
+
+    let (events, outcome) = events_through_turn_end(&mut session).await;
+    let outcome = outcome.expect("the turn finishes after the allow");
+    assert!(outcome.denials.is_empty(), "an allow is not a refusal");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Output { text, .. }
+                if text.contains("chain allow") && text.contains("accept")
+        )),
+        "the decision is journaled with its codex encoding: {events:?}"
+    );
+    session.shutdown().await.expect("shuts down");
+}
+
+/// The decline path: the chain's deny reaches the child as
+/// `{"decision":"decline"}` and the refusal is the turn's denial record.
+#[tokio::test]
+async fn a_denied_exec_approval_declines_on_the_wire_and_records_the_denial() {
+    let log = tempfile::tempdir().expect("a scratch dir");
+    let log_path = log.path().join("control.log");
+
+    let (mut session, _dir) = session_on(
+        &exec_approval_script("declined", None),
+        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+    )
+    .await;
+    session.send(TurnInput::queued("go")).await.expect("sends");
+
+    let request = surfaced_request(&mut session).await;
+    session
+        .answer_permission(
+            &request.tool_call_id,
+            PermissionDecision::deny("not in this mode"),
+        )
+        .await
+        .expect("the answer is writable");
+
+    let recorded =
+        control_log_shows(&log_path, |log| log.contains("\"decision\":\"decline\"")).await;
+    assert!(recorded.contains("\"decision\":\"decline\""), "{recorded}");
+
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    let outcome = outcome.expect("the turn finishes after the decline");
+    assert_eq!(outcome.denials.len(), 1, "the refusal is the audit record");
+    assert_eq!(outcome.denials[0].tool_name, "exec");
+    assert!(!outcome.is_clean_success());
+    session.shutdown().await.expect("shuts down");
+}
+
+/// A remembering allow reaches the child as `acceptForSession` — the
+/// session-scoped grant in codex's own vocabulary, mirroring the Server's
+/// remembered-allow layer.
+#[tokio::test]
+async fn a_remembering_allow_becomes_accept_for_session_on_the_wire() {
+    let log = tempfile::tempdir().expect("a scratch dir");
+    let log_path = log.path().join("control.log");
+
+    let (mut session, _dir) = session_on(
+        &exec_approval_script("completed", Some(0)),
+        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+    )
+    .await;
+    session.send(TurnInput::queued("go")).await.expect("sends");
+
+    let request = surfaced_request(&mut session).await;
+    session
+        .answer_permission(
+            &request.tool_call_id,
+            PermissionDecision::allow().remembered(),
+        )
+        .await
+        .expect("the answer is writable");
+
+    let recorded = control_log_shows(&log_path, |log| {
+        log.contains("\"decision\":\"acceptForSession\"")
+    })
+    .await;
+    assert!(
+        recorded.contains("\"decision\":\"acceptForSession\""),
+        "{recorded}"
+    );
+
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    assert!(outcome.is_some(), "the turn finishes after the grant");
+    session.shutdown().await.expect("shuts down");
+}
+
+/// An interrupt that finds an approval parked answers it with `cancel` —
+/// before the `turn/interrupt` — because the dying turn does not release the
+/// harness from waiting, and the withdrawn question is not a denial.
+#[tokio::test]
+async fn an_interrupt_cancels_a_parked_exec_approval_before_the_turn_dies() {
+    let log = tempfile::tempdir().expect("a scratch dir");
+    let log_path = log.path().join("control.log");
+
+    // Block 1 parks on the approval; block 2 — played on the interrupt — is
+    // the idle that closes the cancelled turn (transcript 11's shape).
+    let script = [
+        [
+            harness::thread_started(),
+            harness::turn_started("turn-1"),
+            format!("!EXEC_APPROVAL {}", exec_approval_params()),
+        ]
+        .join("\n"),
+        harness::idle(),
+    ]
+    .join("\n\n");
+
+    let (mut session, _dir) = session_on(
+        &script,
+        &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+    )
+    .await;
+    session.send(TurnInput::queued("go")).await.expect("sends");
+    let _request = surfaced_request(&mut session).await;
+
+    session.interrupt().await.expect("the cancel is writable");
+
+    let recorded = control_log_shows(&log_path, |log| log.contains("turn/interrupt")).await;
+    let cancel_at = recorded.find("\"decision\":\"cancel\"");
+    let interrupt_at = recorded.find("turn/interrupt");
+    match (cancel_at, interrupt_at) {
+        (Some(cancel), Some(interrupt)) => assert!(
+            cancel < interrupt,
+            "the parked approval is answered before the turn is torn down: {recorded}"
+        ),
+        other => panic!("both frames must reach the wire, got {other:?}: {recorded}"),
+    }
+
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    let outcome = outcome.expect("idle closes the interrupted turn");
+    assert_eq!(outcome.status, TurnStatus::Interrupted);
+    assert!(
+        outcome.denials.is_empty(),
+        "a withdrawal is not a chain refusal: {:?}",
+        outcome.denials
+    );
+    session.shutdown().await.expect("shuts down");
+}
+
+/// A narrowing decision must be refused loudly — neither reply vocabulary can
 /// carry replacement arguments, and a narrowing that silently widened into a
 /// plain allow is the failure the capability advertisement exists to prevent.
+/// The refusal must also leave the request outstanding: a consumed-but-
+/// unanswered approval would park the harness forever.
 #[tokio::test]
-async fn a_narrowing_decision_is_refused_not_widened() {
-    let (mut session, _dir) = session_on(&basic_turn(), &[]).await;
+async fn a_narrowing_decision_is_refused_not_widened_and_stays_answerable() {
+    let (mut session, _dir) = session_on(&exec_approval_script("declined", None), &[]).await;
+    session.send(TurnInput::queued("go")).await.expect("sends");
+    let request = surfaced_request(&mut session).await;
 
+    // A real rewrite: the chain narrowed to a different command, which the
+    // decision vocabulary cannot express.
     let refused = session
         .answer_permission(
-            &ToolCallId::new("exec-1"),
-            PermissionDecision::allow_with(json!({"task": "narrower"})),
+            &request.tool_call_id,
+            PermissionDecision::allow_with(json!({"command": "true", "cwd": "/work"})),
         )
         .await;
     assert!(
@@ -397,9 +641,21 @@ async fn a_narrowing_decision_is_refused_not_widened() {
         "got {refused:?}"
     );
 
+    // The refusal consumed nothing: the same request still takes an
+    // expressible answer, and the turn completes on it.
+    session
+        .answer_permission(
+            &request.tool_call_id,
+            PermissionDecision::deny("narrowing could not apply"),
+        )
+        .await
+        .expect("the request must still be answerable after the refusal");
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    assert!(outcome.is_some(), "the turn ends once a real answer landed");
+
     // And an answer for a call nobody proposed is an error, never a no-op.
     let stray = session
-        .answer_permission(&ToolCallId::new("exec-1"), PermissionDecision::allow())
+        .answer_permission(&ToolCallId::new("exec-nobody"), PermissionDecision::allow())
         .await;
     assert!(
         matches!(stray, Err(AdapterError::UnknownPermissionRequest { .. })),
@@ -574,6 +830,228 @@ async fn interrupt_puts_the_cancel_on_the_wire_and_idle_closes_the_turn() {
     assert_eq!(outcome.status, TurnStatus::Interrupted);
     assert_eq!(outcome.text, None, "a cancelled turn has no answer");
     session.shutdown().await.expect("shuts down");
+}
+
+/// The full permission loop, every hop real: the daemon binary spawns the
+/// codex-shaped stub, the stub asks an exec approval, the worker journals a
+/// `PermissionRequested` that rides to the server log, the *actual*
+/// `ChainDriver` rules on the command prefix, the decision commands its way
+/// back to the daemon, the encoded `decision` reaches the stub's stdin, and
+/// the outcome lands in the server log.
+#[cfg(test)]
+mod full_loop {
+    use std::sync::Arc;
+
+    use horde_proto::v1::{PermissionLayer, PermissionOutcome, event::Kind};
+    use horde_server::EventLog;
+    use horde_server::permission::{PermissionMode, PermissionModes, Rule};
+    use horde_server::service::ServerCore;
+    use horde_server_testkit::process::SpawnedProcess;
+
+    use crate::support;
+
+    /// A directory whose `codex` is the stub binary, for the daemon's `PATH`.
+    fn stub_on_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        std::os::unix::fs::symlink(super::harness::stub_binary(), dir.path().join("codex"))
+            .expect("the stub links as `codex`");
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (dir, path)
+    }
+
+    /// Bounded wait for a session-log predicate, notification-driven.
+    async fn log_satisfying(
+        log: &EventLog,
+        what: &str,
+        holds: impl Fn(&[horde_proto::v1::Event]) -> bool,
+    ) -> Vec<horde_proto::v1::Event> {
+        let mut notifications = log.subscribe();
+        for _ in 0_u32..256 {
+            let events = support::decoded_session_log(log, "s-cx").await;
+            if holds(&events) {
+                return events;
+            }
+            let _ = tokio::time::timeout(core::time::Duration::from_secs(5), notifications.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{what}: the server log stalled"));
+        }
+        panic!("{what}: never appeared in the session log");
+    }
+
+    /// One whole loop under `modes`, returning the session events once the
+    /// chain's decision and the turn's ending are both in the log, plus the
+    /// stub's control log for the wire-level assertion.
+    async fn run_loop(
+        modes: PermissionModes,
+        script: &str,
+        decided: impl Fn(&[horde_proto::v1::Event]) -> bool,
+    ) -> (Vec<horde_proto::v1::Event>, String) {
+        let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
+        let endpoint = support::serve(core.clone()).await;
+        // The real chain, over the real log — the seam under test.
+        let chain = horde_server::permission::spawn(&core.log, Arc::new(modes), None);
+        support::place_agent(
+            &core.log,
+            "s-cx",
+            "agent-cx",
+            "w-cx",
+            "write the probe file",
+        )
+        .await;
+
+        let state = tempfile::tempdir().expect("a temp dir");
+        let script_file = state.path().join("stub-script.jsonl");
+        std::fs::write(&script_file, script).expect("the script writes");
+        let control_log = state.path().join("control.log");
+        let (_stub_dir, path) = stub_on_path();
+
+        let mut daemon = SpawnedProcess::spawn(
+            "horde-worker",
+            std::path::Path::new(env!("CARGO_BIN_EXE_horde-worker")),
+            &[
+                "--insecure",
+                "--server",
+                &endpoint,
+                "--name",
+                "w-cx",
+                "--adapter",
+                "codex",
+                "--state-dir",
+                &state.path().to_string_lossy(),
+            ],
+            &[
+                ("PATH", path.as_str()),
+                ("HORDE_CODEX_STUB_SCRIPT", &script_file.to_string_lossy()),
+                (
+                    "HORDE_CODEX_STUB_CONTROL_LOG",
+                    &control_log.to_string_lossy(),
+                ),
+            ],
+        )
+        .expect("the daemon spawns");
+        daemon
+            .await_stdout("the registration line", |out| {
+                out.contains("registered worker=w-cx")
+            })
+            .await
+            .expect("the plaintext dial registers");
+
+        let events = log_satisfying(
+            &core.log,
+            "the chain's decision and the outcome",
+            |events| decided(events),
+        )
+        .await;
+
+        daemon.terminate().await.expect("SIGTERM sends");
+        let _ = daemon.wait().await;
+        chain.abort();
+
+        let recorded = std::fs::read_to_string(&control_log).unwrap_or_default();
+        (events, recorded)
+    }
+
+    fn requested_in(
+        events: &[horde_proto::v1::Event],
+    ) -> Option<&horde_proto::v1::ProposedToolCall> {
+        events.iter().find_map(|event| match &event.kind {
+            Some(Kind::PermissionRequested(requested)) => requested
+                .request
+                .as_ref()
+                .and_then(|r| r.tool_call.as_ref()),
+            _ => None,
+        })
+    }
+
+    fn decision_in(
+        events: &[horde_proto::v1::Event],
+    ) -> Option<&horde_proto::v1::PermissionDecision> {
+        events.iter().find_map(|event| match &event.kind {
+            Some(Kind::PermissionDecided(decided)) => decided.decision.as_ref(),
+            _ => None,
+        })
+    }
+
+    fn turn_ended(events: &[horde_proto::v1::Event]) -> bool {
+        events.iter().any(|event| {
+            matches!(&event.kind, Some(Kind::UsageRecorded(usage))
+                if usage.record.as_ref().is_some_and(|r| !r.turn_id.is_empty()))
+        })
+    }
+
+    /// The deterministic-deny layer refuses the command by prefix, and the
+    /// refusal reaches the stub as `{"decision":"decline"}`.
+    #[tokio::test]
+    async fn a_deny_rule_blocks_the_exec_command_end_to_end() {
+        let modes =
+            PermissionModes::default().with_default(PermissionMode::escalate_everything().deny(
+                Rule::tool("exec").where_input_starts_with("command", "printf"),
+                "probe writes are refused in this mode",
+            ));
+        let (events, recorded) = run_loop(
+            modes,
+            &super::harness::exec_approval_script("declined", None),
+            |events| decision_in(events).is_some() && turn_ended(events),
+        )
+        .await;
+
+        let requested = requested_in(&events).expect("the escalation reached the server log");
+        assert_eq!(requested.tool_name, "exec");
+        assert!(
+            requested.rendered.contains("printf"),
+            "the approver-facing rendering names the command: {}",
+            requested.rendered
+        );
+
+        let decision = decision_in(&events).expect("the chain decided");
+        assert_eq!(decision.outcome, i32::from(PermissionOutcome::Deny));
+        assert_eq!(
+            decision.decided_by,
+            i32::from(PermissionLayer::DeterministicDeny),
+            "the rule decided — no judge, no human"
+        );
+
+        assert!(
+            recorded.contains("\"decision\":\"decline\""),
+            "the deny must reach the stub in the decision vocabulary: {recorded}"
+        );
+        assert!(
+            !recorded.contains("\"decision\":\"accept\""),
+            "and nothing may have accepted it: {recorded}"
+        );
+    }
+
+    /// The deterministic-allow layer passes the command by prefix, and the
+    /// grant reaches the stub as `{"decision":"accept"}`.
+    #[tokio::test]
+    async fn an_allow_rule_passes_the_exec_command_end_to_end() {
+        let modes = PermissionModes::default().with_default(
+            PermissionMode::escalate_everything()
+                .allow(Rule::tool("exec").where_input_starts_with("command", "printf")),
+        );
+        let (events, recorded) = run_loop(
+            modes,
+            &super::harness::exec_approval_script("completed", Some(0)),
+            |events| decision_in(events).is_some() && turn_ended(events),
+        )
+        .await;
+
+        let decision = decision_in(&events).expect("the chain decided");
+        assert_eq!(decision.outcome, i32::from(PermissionOutcome::Allow));
+        assert_eq!(
+            decision.decided_by,
+            i32::from(PermissionLayer::DeterministicAllow)
+        );
+
+        assert!(
+            recorded.contains("\"decision\":\"accept\""),
+            "the allow must reach the stub in the decision vocabulary: {recorded}"
+        );
+    }
 }
 
 /// A harness that answers nothing must become a spawn error on the response

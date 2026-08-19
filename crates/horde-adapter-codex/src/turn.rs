@@ -14,8 +14,16 @@ use horde_adapter::{
 };
 
 use crate::wire::{
-    ErrorBody, Frame, Item, MCP_ELICITATION_METHOD, McpElicitation, Notification, TokenCounts,
+    EXEC_APPROVAL_METHOD, ErrorBody, ExecApprovalRequest, Frame, Item, MCP_ELICITATION_METHOD,
+    McpElicitation, Notification, TokenCounts,
 };
+
+/// The tool name an exec approval surfaces under.
+///
+/// Codex's exec calls have no tool name of their own — the approval names a
+/// command, a cwd, and an item id — so the chain needs one to write rules
+/// against: `Rule::tool("exec").where_input_starts_with("command", "git ")`.
+pub const EXEC_TOOL_NAME: &str = "exec";
 
 /// Turns a stream of frames into agent events.
 #[derive(Debug, Default)]
@@ -38,22 +46,54 @@ pub struct TurnAssembler {
     /// consumed by the next turn and cleared when a turn closes, so it can
     /// never leak into a later, unrelated turn.
     interrupt_pending: bool,
-    /// Elicitations awaiting Horde's answer, by the tool-call id the
+    /// Approvals awaiting Horde's answer, by the tool-call id the
     /// [`AgentEvent::PermissionRequested`] carried. The value holds the JSON-RPC
-    /// request id the reply must correlate to, plus what a denial record needs.
-    outstanding: BTreeMap<ToolCallId, OutstandingElicitation>,
+    /// request id the reply must correlate to, which vocabulary the reply must
+    /// speak, plus what a denial record needs.
+    outstanding: BTreeMap<ToolCallId, OutstandingApproval>,
     /// Spawn-time facts to journal on the first turn — see
     /// [`Self::note_startup_diagnostic`].
     startup_diagnostics: Vec<String>,
 }
 
-/// One elicitation Horde has been offered and not yet answered.
+/// One approval Horde has been offered and not yet answered.
 #[derive(Debug)]
-struct OutstandingElicitation {
+struct OutstandingApproval {
     /// The server->client JSON-RPC id the reply correlates to.
     rpc_id: u64,
     tool_name: String,
     input: serde_json::Value,
+    /// Which reply vocabulary the request speaks — see [`ApprovalKind`].
+    kind: ApprovalKind,
+}
+
+/// Which of codex's two approval surfaces a request arrived on.
+///
+/// The split is load-bearing: the reply vocabularies are disjoint (`action`
+/// for elicitations, `decision` for exec approvals), and the wrong shape
+/// deserializes to nothing server-side — the request is then unanswered and
+/// the harness parks forever (transcript 19's hang, either direction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// `mcpServer/elicitation/request`: answered with `{"action": …}`.
+    McpElicitation,
+    /// `item/commandExecution/requestApproval`: answered with
+    /// `{"decision": …}`.
+    ExecCommand {
+        /// The execpolicy rule codex proposed to persist, kept so an
+        /// `acceptWithExecpolicyAmendment` echoes codex's own argv rather
+        /// than inventing one (transcript 30's honored shape).
+        proposed_amendment: Option<Vec<String>>,
+    },
+}
+
+/// An answered approval: what the caller needs to put the reply on the wire.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedApproval {
+    /// The JSON-RPC id the reply must correlate to.
+    pub rpc_id: u64,
+    /// The vocabulary the reply must speak.
+    pub kind: ApprovalKind,
 }
 
 /// An `mcpToolCall` item that has started and may be about to elicit.
@@ -151,16 +191,19 @@ impl TurnAssembler {
 
     /// Feeds one frame, returning the events it produced.
     ///
-    /// A [`Frame::ServerRequest`] carrying an MCP tool-call elicitation
-    /// becomes an [`AgentEvent::PermissionRequested`] and is tracked until
-    /// [`Self::resolve_elicitation`] answers it. Every other server request
-    /// produces nothing here — the caller owns the wire and must reply to it
-    /// (deny-by-default), or the harness parks forever (transcript 19).
+    /// A [`Frame::ServerRequest`] carrying an MCP tool-call elicitation or an
+    /// exec approval becomes an [`AgentEvent::PermissionRequested`] and is
+    /// tracked until [`Self::resolve_approval`] answers it. Every other server
+    /// request produces nothing here — the caller owns the wire and must reply
+    /// to it (deny-by-default), or the harness parks forever (transcript 19).
     pub fn feed(&mut self, frame: &Frame) -> Vec<AgentEvent> {
         match frame {
             Frame::Notification(notification) => self.feed_notification(notification),
             Frame::ServerRequest { id, method, params } if method == MCP_ELICITATION_METHOD => {
                 self.feed_elicitation(*id, params)
+            }
+            Frame::ServerRequest { id, method, params } if method == EXEC_APPROVAL_METHOD => {
+                self.feed_exec_approval(*id, params)
             }
             // Responses correlate to requests the Worker made and carry nothing
             // the event stream needs; other server requests are the caller's to
@@ -170,13 +213,30 @@ impl TurnAssembler {
     }
 
     /// The JSON-RPC id the answer to `tool_call_id` must correlate to, while
-    /// that elicitation is still outstanding.
+    /// that approval is still outstanding.
     #[must_use]
     pub fn elicitation_rpc_id(&self, tool_call_id: &ToolCallId) -> Option<u64> {
         self.outstanding.get(tool_call_id).map(|e| e.rpc_id)
     }
 
-    /// The elicitation the session is blocked on, if any.
+    /// Which vocabulary the outstanding approval under `tool_call_id` speaks,
+    /// while it is still unanswered — the peek a caller needs *before*
+    /// resolving, because a decision it cannot encode must leave the request
+    /// outstanding rather than consume it.
+    #[must_use]
+    pub fn approval_kind(&self, tool_call_id: &ToolCallId) -> Option<&ApprovalKind> {
+        self.outstanding.get(tool_call_id).map(|e| &e.kind)
+    }
+
+    /// The arguments the outstanding approval was surfaced with — what a
+    /// narrowing decision's `updated_input` is compared against, since a
+    /// "narrowing" that restates the proposal verbatim is not a rewrite.
+    #[must_use]
+    pub fn approval_input(&self, tool_call_id: &ToolCallId) -> Option<&serde_json::Value> {
+        self.outstanding.get(tool_call_id).map(|e| &e.input)
+    }
+
+    /// The approval the session is blocked on, if any.
     ///
     /// The harness will not run the call — or write the frames behind it —
     /// until this is answered, so a caller that keeps polling for events while
@@ -186,14 +246,19 @@ impl TurnAssembler {
         self.outstanding.keys().next().cloned()
     }
 
-    /// Records Horde's answer to an outstanding elicitation, returning the
-    /// JSON-RPC id the caller must reply to — `None` means nothing was waiting
-    /// under that id, which the caller reports as an error rather than a no-op.
+    /// Records Horde's answer to an outstanding approval, returning what the
+    /// reply needs — `None` means nothing was waiting under that id, which the
+    /// caller reports as an error rather than a no-op.
     ///
     /// A denial is recorded on the open turn, because "the chain refused a
     /// call" is part of the turn's outcome (`TurnOutcome::denials`) — the
-    /// harness itself only ever shows the agent the fixed rejection string.
-    pub fn resolve_elicitation(&mut self, tool_call_id: &ToolCallId, allowed: bool) -> Option<u64> {
+    /// harness itself only ever shows the agent the fixed rejection string
+    /// (MCP) or a `declined` item status (exec).
+    pub fn resolve_approval(
+        &mut self,
+        tool_call_id: &ToolCallId,
+        allowed: bool,
+    ) -> Option<ResolvedApproval> {
         let outstanding = self.outstanding.remove(tool_call_id)?;
         if !allowed && let Some(turn) = self.turn.as_mut() {
             turn.denials.push(PermissionDenial {
@@ -202,7 +267,123 @@ impl TurnAssembler {
                 attempted_input: outstanding.input.clone(),
             });
         }
-        Some(outstanding.rpc_id)
+        Some(ResolvedApproval {
+            rpc_id: outstanding.rpc_id,
+            kind: outstanding.kind,
+        })
+    }
+
+    /// Withdraws every outstanding approval, returning what each reply needs.
+    ///
+    /// The interrupt path: a parked approval must still be answered (silence
+    /// parks the harness even as the turn dies), but a withdrawal is not a
+    /// chain refusal, so — unlike [`Self::resolve_approval`] with `false` —
+    /// nothing lands in the turn's denials.
+    pub fn withdraw_outstanding(&mut self) -> Vec<ResolvedApproval> {
+        core::mem::take(&mut self.outstanding)
+            .into_values()
+            .map(|outstanding| ResolvedApproval {
+                rpc_id: outstanding.rpc_id,
+                kind: outstanding.kind,
+            })
+            .collect()
+    }
+
+    /// Emits a decision's audit line on the open turn's diagnostic channel —
+    /// how "the chain said X, codex was told Y" reaches the journal. Falls
+    /// back to the startup queue when no turn is open (an answer racing the
+    /// turn's close), so the line is delayed rather than lost.
+    pub fn note_decision(&mut self, text: String) -> Option<AgentEvent> {
+        match self.turn.as_mut() {
+            Some(turn) => Some(AgentEvent::Output {
+                turn_id: turn.id.clone(),
+                channel: OutputChannel::HarnessDiagnostic,
+                chunk_index: turn.next_chunk_index(OutputChannel::HarnessDiagnostic),
+                text,
+            }),
+            None => {
+                self.startup_diagnostics.push(text);
+                None
+            }
+        }
+    }
+
+    /// An exec approval: the shell/exec interception point, as an event.
+    ///
+    /// The proposed call carries the command and cwd as arguments so the
+    /// chain's deterministic rules can match them
+    /// (`where_input_starts_with("command", …)`), under the fixed tool name
+    /// [`EXEC_TOOL_NAME`]. When codex's parse of the invocation differs from
+    /// the raw shell-wrapped form, both ride: `command` is what rules match,
+    /// `raw_command` is what will actually be exec'd.
+    fn feed_exec_approval(&mut self, rpc_id: u64, params: &serde_json::Value) -> Vec<AgentEvent> {
+        let Ok(request) = serde_json::from_value::<ExecApprovalRequest>(params.clone()) else {
+            return Vec::new();
+        };
+
+        let turn_id = self
+            .turn
+            .as_ref()
+            .map(|turn| turn.id.clone())
+            .or_else(|| request.turn_id.as_deref().map(TurnId::new));
+        let Some(turn_id) = turn_id else {
+            // No turn to attribute the request to — nothing downstream could
+            // journal or answer it coherently. The caller declines it.
+            return Vec::new();
+        };
+
+        let tool_call_id = match &request.item_id {
+            Some(item_id) if !item_id.is_empty() => ToolCallId::new(item_id.clone()),
+            // Shape drift tolerated the same way the elicitation path does:
+            // an approval the chain can act on beats a dropped frame.
+            _ => ToolCallId::new(format!("exec-approval-{rpc_id}")),
+        };
+
+        let mut fields = serde_json::Map::new();
+        if let Some(command) = request.effective_command() {
+            fields.insert(
+                "command".to_owned(),
+                serde_json::Value::String(command.to_owned()),
+            );
+        }
+        if let Some(raw) = request.command.as_deref()
+            && request.effective_command() != Some(raw)
+        {
+            fields.insert(
+                "raw_command".to_owned(),
+                serde_json::Value::String(raw.to_owned()),
+            );
+        }
+        if let Some(cwd) = &request.cwd {
+            fields.insert("cwd".to_owned(), serde_json::Value::String(cwd.clone()));
+        }
+        if let Some(reason) = &request.reason {
+            fields.insert(
+                "reason".to_owned(),
+                serde_json::Value::String(reason.clone()),
+            );
+        }
+        let input = serde_json::Value::Object(fields);
+
+        self.outstanding.insert(
+            tool_call_id.clone(),
+            OutstandingApproval {
+                rpc_id,
+                tool_name: EXEC_TOOL_NAME.to_owned(),
+                input: input.clone(),
+                kind: ApprovalKind::ExecCommand {
+                    proposed_amendment: request.proposed_execpolicy_amendment.clone(),
+                },
+            },
+        );
+        vec![AgentEvent::PermissionRequested {
+            turn_id,
+            request: ProposedToolCall {
+                tool_call_id,
+                tool_name: EXEC_TOOL_NAME.to_owned(),
+                input,
+            },
+        }]
     }
 
     /// An MCP tool-call elicitation: the interception point, as an event.
@@ -252,10 +433,11 @@ impl TurnAssembler {
 
         self.outstanding.insert(
             tool_call_id.clone(),
-            OutstandingElicitation {
+            OutstandingApproval {
                 rpc_id,
                 tool_name: tool_name.clone(),
                 input: input.clone(),
+                kind: ApprovalKind::McpElicitation,
             },
         );
         vec![AgentEvent::PermissionRequested {
@@ -744,12 +926,17 @@ mod tests {
             Some(7),
             "the reply must correlate to the server's request id"
         );
+        let resolved = assembler
+            .resolve_approval(&request.tool_call_id, true)
+            .expect("the outstanding request resolves");
+        assert_eq!(resolved.rpc_id, 7);
         assert_eq!(
-            assembler.resolve_elicitation(&request.tool_call_id, true),
-            Some(7)
+            resolved.kind,
+            super::ApprovalKind::McpElicitation,
+            "an elicitation must be answered in the action vocabulary"
         );
         assert_eq!(
-            assembler.resolve_elicitation(&request.tool_call_id, true),
+            assembler.resolve_approval(&request.tool_call_id, true),
             None,
             "an answer consumes the outstanding request; a second one has \
              nothing to go to"
@@ -766,7 +953,12 @@ mod tests {
         let events = feed(&mut assembler, elicitation_request(3));
         let tool_call_id = requested(&events, "the request surfaces").tool_call_id;
 
-        assert_eq!(assembler.resolve_elicitation(&tool_call_id, false), Some(3));
+        assert_eq!(
+            assembler
+                .resolve_approval(&tool_call_id, false)
+                .map(|resolved| resolved.rpc_id),
+            Some(3)
+        );
 
         let events = feed(
             &mut assembler,
@@ -791,7 +983,7 @@ mod tests {
         feed(&mut clean, mcp_started("exec-1"));
         let events = feed(&mut clean, elicitation_request(4));
         let id = requested(&events, "surfaces").tool_call_id;
-        clean.resolve_elicitation(&id, true);
+        clean.resolve_approval(&id, true);
         let events = feed(
             &mut clean,
             json!({"method":"turn/completed",
@@ -1018,7 +1210,7 @@ mod tests {
             "the outstanding request is the stall"
         );
 
-        assembler.resolve_elicitation(&id, true);
+        assembler.resolve_approval(&id, true);
         assert_eq!(
             assembler.awaiting_decision(),
             None,
@@ -1104,5 +1296,206 @@ mod tests {
         let ended = closed(events, "turn/completed closes the turn");
         assert_eq!(ended.status, TurnStatus::Completed);
         assert_eq!(ended.duration.as_millis(), 6101);
+    }
+
+    /// The transcript-20/25 exec approval request, as the stub and the live
+    /// harness both send it.
+    fn exec_approval_request(rpc_id: u64) -> serde_json::Value {
+        json!({"id":rpc_id,"method":"item/commandExecution/requestApproval","params":{
+            "threadId":"t1","turnId":"turn-1","itemId":"exec-77",
+            "reason":"command failed; retry without sandbox?",
+            "command":"/bin/zsh -lc \"git push origin main\"",
+            "cwd":"/work/atlas",
+            "commandActions":[{"type":"unknown","command":"git push origin main"}],
+            "proposedExecpolicyAmendment":["/bin/zsh","-lc","git push origin main"],
+            "availableDecisions":["accept","cancel"]}})
+    }
+
+    /// The exec interception seam in the assembler: the approval surfaces as a
+    /// proposed call under the fixed `exec` tool name, carrying the parsed
+    /// command, the raw invocation, and the cwd as rule-matchable arguments,
+    /// and the answer correlates back to the JSON-RPC id in the `decision`
+    /// vocabulary with codex's proposed amendment preserved.
+    #[test]
+    fn an_exec_approval_surfaces_with_rule_matchable_arguments() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let events = feed(&mut assembler, exec_approval_request(6));
+        let request = requested(&events, "the exec approval must surface");
+
+        assert_eq!(request.tool_call_id.as_str(), "exec-77");
+        assert_eq!(request.tool_name, super::EXEC_TOOL_NAME);
+        assert_eq!(
+            request.input["command"], "git push origin main",
+            "rules match codex's parse of the inner command"
+        );
+        assert_eq!(
+            request.input["raw_command"], "/bin/zsh -lc \"git push origin main\"",
+            "and the shell-wrapped form that will actually run rides beside it"
+        );
+        assert_eq!(request.input["cwd"], "/work/atlas");
+
+        assert_eq!(
+            assembler.approval_kind(&request.tool_call_id),
+            Some(&super::ApprovalKind::ExecCommand {
+                proposed_amendment: Some(vec![
+                    "/bin/zsh".to_owned(),
+                    "-lc".to_owned(),
+                    "git push origin main".to_owned(),
+                ]),
+            }),
+            "the peek names the vocabulary and keeps codex's own argv"
+        );
+        let resolved = assembler
+            .resolve_approval(&request.tool_call_id, true)
+            .expect("resolves once");
+        assert_eq!(resolved.rpc_id, 6);
+        assert!(matches!(
+            resolved.kind,
+            super::ApprovalKind::ExecCommand { .. }
+        ));
+        assert_eq!(
+            assembler.resolve_approval(&request.tool_call_id, true),
+            None,
+            "an answer consumes the outstanding approval"
+        );
+    }
+
+    /// A denied exec approval is the turn's refusal record, exactly like a
+    /// denied elicitation — `is_clean_success` must stay honest for exec too.
+    #[test]
+    fn a_denied_exec_approval_lands_in_the_turn_outcomes_denials() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let events = feed(&mut assembler, exec_approval_request(4));
+        let tool_call_id = requested(&events, "surfaces").tool_call_id;
+
+        assembler.resolve_approval(&tool_call_id, false);
+
+        let events = feed(
+            &mut assembler,
+            json!({"method":"turn/completed",
+                   "params":{"turn":{"id":"turn-1","status":"completed"}}}),
+        );
+        let outcome = closed(events, "the turn closes");
+        assert_eq!(outcome.denials.len(), 1);
+        assert_eq!(outcome.denials[0].tool_name, super::EXEC_TOOL_NAME);
+        assert_eq!(
+            outcome.denials[0].attempted_input["command"],
+            "git push origin main"
+        );
+        assert!(!outcome.is_clean_success());
+    }
+
+    /// An exec approval that names no turn the assembler knows produces no
+    /// event — the caller declines it on the wire — and one whose params fit
+    /// but whose item id is missing still surfaces under a minted id, because
+    /// an approval the chain can act on beats a dropped frame.
+    #[test]
+    fn exec_approval_shape_drift_degrades_the_same_way_elicitations_do() {
+        let mut turnless = TurnAssembler::new();
+        let events = turnless.feed(
+            &decode_line(
+                &json!({"id":5,"method":"item/commandExecution/requestApproval",
+                        "params":{"command":"true"}})
+                .to_string(),
+            )
+            .expect("decodes"),
+        );
+        assert!(events.is_empty(), "no turn to attribute to: {events:?}");
+        assert_eq!(turnless.awaiting_decision(), None);
+
+        let mut minted = TurnAssembler::new();
+        open_turn(&mut minted);
+        let events = feed(
+            &mut minted,
+            json!({"id":9,"method":"item/commandExecution/requestApproval",
+                   "params":{"command":"true","cwd":"/w"}}),
+        );
+        let request = requested(&events, "an id is minted for a drifted shape");
+        assert_eq!(request.tool_call_id.as_str(), "exec-approval-9");
+        assert_eq!(request.input["command"], "true");
+        assert!(
+            request.input.get("raw_command").is_none(),
+            "identical forms are not repeated"
+        );
+    }
+
+    /// Withdrawing outstanding approvals (the interrupt path) hands back every
+    /// reply correlation without recording a denial — a withdrawal is not a
+    /// chain refusal.
+    #[test]
+    fn withdrawing_outstanding_approvals_answers_them_without_denials() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        feed(&mut assembler, mcp_started("exec-1"));
+        feed(&mut assembler, elicitation_request(3));
+        feed(&mut assembler, exec_approval_request(4));
+
+        let mut withdrawn = assembler.withdraw_outstanding();
+        withdrawn.sort_by_key(|resolved| resolved.rpc_id);
+        assert_eq!(withdrawn.len(), 2, "both kinds are handed back");
+        assert_eq!(withdrawn[0].rpc_id, 3);
+        assert_eq!(withdrawn[0].kind, super::ApprovalKind::McpElicitation);
+        assert_eq!(withdrawn[1].rpc_id, 4);
+        assert!(matches!(
+            withdrawn[1].kind,
+            super::ApprovalKind::ExecCommand { .. }
+        ));
+        assert_eq!(assembler.awaiting_decision(), None, "nothing stays parked");
+
+        let outcome = closed(
+            feed(
+                &mut assembler,
+                json!({"method":"turn/completed","params":{"turn":{"id":"turn-1"}}}),
+            ),
+            "closes",
+        );
+        assert!(
+            outcome.denials.is_empty(),
+            "a withdrawal is not a refusal: {:?}",
+            outcome.denials
+        );
+    }
+
+    /// A decision's audit line rides the open turn's diagnostic channel, and
+    /// one racing the turn's close is delayed to the next turn, never lost.
+    #[test]
+    fn a_decision_note_reaches_the_diagnostic_channel_now_or_next_turn() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+
+        let event = assembler
+            .note_decision("exec approval exec-77: chain allow → accept".to_owned())
+            .expect("an open turn carries the note now");
+        match event {
+            AgentEvent::Output { channel, text, .. } => {
+                assert_eq!(channel, horde_adapter::OutputChannel::HarnessDiagnostic);
+                assert!(text.contains("accept"), "{text}");
+            }
+            other => panic!("expected a diagnostic output, got {other:?}"),
+        }
+
+        feed(
+            &mut assembler,
+            json!({"method":"turn/completed","params":{"turn":{"id":"turn-1"}}}),
+        );
+        assert_eq!(
+            assembler.note_decision("late note".to_owned()),
+            None,
+            "between turns the note is queued, not emitted"
+        );
+        let next_turn = feed(
+            &mut assembler,
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-2"}}}),
+        );
+        assert!(
+            next_turn.iter().any(|event| matches!(
+                event,
+                AgentEvent::Output { text, .. } if text == "late note"
+            )),
+            "the delayed note rides the next turn: {next_turn:?}"
+        );
     }
 }
