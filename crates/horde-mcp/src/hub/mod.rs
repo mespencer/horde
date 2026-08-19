@@ -17,12 +17,19 @@
 //! * [`upstream`] — one live connection to one MCP server, as a client:
 //!   a stdio child (spawned here, killed by handle on drop) or a streamable
 //!   HTTP peer.
+//! * [`link`] — the seam the hub is reached through. Production is the
+//!   Worker's forwarded link over its authenticated channel (the 2026-08-19
+//!   amendment); a directly dialed [`Upstream`] implements the same trait
+//!   for the protocol-level tests.
 //! * [`proxy`] — the aggregation an endpoint serves from: local upstreams
 //!   namespaced here, plus the hub link whose tools arrive pre-namespaced
-//!   and are filtered to the server names this Agent may see.
-//! * [`endpoint`] — the hub's own serving surface at the Server: the same
-//!   dual-era `StreamableHttpService` the agent endpoint uses, gated by the
-//!   same identity layer, reached by Workers over the authenticated channel.
+//!   and are filtered to the server names this Agent may see — held
+//!   per-Agent in an [`AgentProxies`] registry, because one Session endpoint
+//!   serves many Agents whose toolsets differ.
+//! * [`endpoint`] — the hub's serving surface as an MCP server. Deliberately
+//!   unmounted in production (the amendment: forwarded calls made serving it
+//!   theater); its listing and failure-rendering helpers are the agent
+//!   endpoint's too, and the struct itself keeps the protocol e2e honest.
 //!
 //! # Where the permission chain sits
 //!
@@ -36,12 +43,14 @@
 
 pub mod config;
 pub mod endpoint;
+pub mod link;
 pub mod names;
 pub mod proxy;
 pub mod upstream;
 
 pub use config::{HubServerConfig, HubTransport, Placement};
 pub use endpoint::HubEndpoint;
+pub use link::HubLink;
 pub use names::{namespaced, split_namespaced};
-pub use proxy::ToolProxy;
+pub use proxy::{AgentProxies, ToolProxy};
 pub use upstream::{HubError, Upstream};

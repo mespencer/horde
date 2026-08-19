@@ -11,10 +11,12 @@
 //! because a misroute here runs one server's tool with another's arguments
 //! and no error anywhere.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 
+use super::link::HubLink;
 use super::names::{namespaced, split_namespaced};
 use super::upstream::{HubError, Upstream};
 
@@ -29,11 +31,52 @@ enum Naming {
     Passthrough { visible: BTreeSet<String> },
 }
 
-/// One upstream and how its tools are named.
+/// One source and how its tools are named.
 #[derive(Debug, Clone)]
 struct Source {
     naming: Naming,
-    upstream: Upstream,
+    body: SourceBody,
+}
+
+/// What actually answers a source's calls.
+///
+/// Directly connected servers are always [`Upstream`]s — the proxy's host
+/// spawned or dialed them itself. The hub link is a [`HubLink`] because the
+/// wire it rides is the host's business: the Worker forwards over its
+/// authenticated channel, a test dials an upstream straight.
+#[derive(Debug, Clone)]
+enum SourceBody {
+    Server(Upstream),
+    Link(Arc<dyn HubLink>),
+}
+
+impl SourceBody {
+    /// The name prefixed sources namespace under. The hub link's tools arrive
+    /// pre-namespaced, so its own name never reaches a tool.
+    fn server(&self) -> &str {
+        match self {
+            Self::Server(upstream) => upstream.server(),
+            Self::Link(_) => "hub",
+        }
+    }
+
+    fn tools(&self) -> &[Tool] {
+        match self {
+            Self::Server(upstream) => upstream.tools(),
+            Self::Link(link) => link.tools(),
+        }
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, HubError> {
+        match self {
+            Self::Server(upstream) => upstream.call(name, arguments).await,
+            Self::Link(link) => link.call(name, arguments).await,
+        }
+    }
 }
 
 /// The proxied half of an endpoint's toolset.
@@ -54,12 +97,12 @@ impl ToolProxy {
     pub fn with_server(mut self, upstream: Upstream) -> Self {
         self.sources.push(Source {
             naming: Naming::Prefixed,
-            upstream,
+            body: SourceBody::Server(upstream),
         });
         self
     }
 
-    /// Adds the hub link: an upstream whose tools are already namespaced,
+    /// Adds the hub link: a source whose tools are already namespaced,
     /// admitted only for the `visible` server names.
     ///
     /// The filter is the Agent's resolved visibility (computed server-side
@@ -68,14 +111,14 @@ impl ToolProxy {
     #[must_use]
     pub fn with_hub_link(
         mut self,
-        upstream: Upstream,
+        link: impl HubLink + 'static,
         visible: impl IntoIterator<Item = String>,
     ) -> Self {
         self.sources.push(Source {
             naming: Naming::Passthrough {
                 visible: visible.into_iter().collect(),
             },
-            upstream,
+            body: SourceBody::Link(Arc::new(link)),
         });
         self
     }
@@ -86,11 +129,7 @@ impl ToolProxy {
         self.sources
             .iter()
             .flat_map(|source| {
-                visible_tools(
-                    &source.naming,
-                    source.upstream.server(),
-                    source.upstream.tools(),
-                )
+                visible_tools(&source.naming, source.body.server(), source.body.tools())
             })
             .collect()
     }
@@ -112,24 +151,93 @@ impl ToolProxy {
         name: &str,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, HubError> {
-        let (upstream, upstream_name) =
-            self.resolve(name).ok_or_else(|| HubError::UnknownTool {
-                name: name.to_owned(),
-            })?;
-        upstream.call(&upstream_name, arguments).await
+        let (body, upstream_name) = self.resolve(name).ok_or_else(|| HubError::UnknownTool {
+            name: name.to_owned(),
+        })?;
+        body.call(&upstream_name, arguments).await
     }
 
-    /// The upstream serving `name`, and the name to call it by there.
-    fn resolve(&self, name: &str) -> Option<(&Upstream, String)> {
+    /// The source serving `name`, and the name to call it by there.
+    fn resolve(&self, name: &str) -> Option<(&SourceBody, String)> {
         self.sources.iter().find_map(|source| {
             route(
                 &source.naming,
-                source.upstream.server(),
-                source.upstream.tools(),
+                source.body.server(),
+                source.body.tools(),
                 name,
             )
-            .map(|upstream_name| (&source.upstream, upstream_name))
+            .map(|upstream_name| (&source.body, upstream_name))
         })
+    }
+}
+
+/// One endpoint's proxies, per Agent.
+///
+/// A Session's endpoint serves many Agents on one port (identity rides every
+/// request), but the proxied half of the toolset is per-Agent: `local`
+/// servers are spawned one instance per Agent, and hub visibility is resolved
+/// per Agent's type. This registry is the mapping — interior-mutable for the
+/// same reason [`crate::AgentRegistry`] is: agents are spawned and archived
+/// while the endpoint is already serving.
+///
+/// An unregistered agent gets the empty proxy: exactly the verbs, no proxied
+/// tools — fail closed, never another agent's toolset.
+#[derive(Debug, Default)]
+pub struct AgentProxies {
+    proxies: std::sync::RwLock<BTreeMap<String, Arc<ToolProxy>>>,
+}
+
+impl AgentProxies {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one Agent's proxied toolset, replacing any previous one —
+    /// a revival's fresh `local` children must not serve beside the old.
+    pub fn insert(&self, agent_id: impl Into<String>, proxy: Arc<ToolProxy>) {
+        self.write().insert(agent_id.into(), proxy);
+    }
+
+    /// Forgets an Agent. Dropping the last clone of its proxy drops its
+    /// `local` upstreams, which kills their child processes by handle.
+    pub fn remove(&self, agent_id: &str) {
+        self.write().remove(agent_id);
+    }
+
+    /// Forgets every Agent — the shutdown sweep, so no `local` child
+    /// outlives the manager that spawned it.
+    pub fn clear(&self) {
+        self.write().clear();
+    }
+
+    /// The proxy serving `agent_id`, or the empty one.
+    #[must_use]
+    pub fn for_agent(&self, agent_id: &str) -> Arc<ToolProxy> {
+        self.read().get(agent_id).cloned().unwrap_or_default()
+    }
+
+    /// Every registered proxy, for the identity-free lookups (`get_tool`)
+    /// rmcp makes outside any request. Advisory only: authorization happens
+    /// per call against [`Self::for_agent`].
+    #[must_use]
+    pub fn all(&self) -> Vec<Arc<ToolProxy>> {
+        self.read().values().cloned().collect()
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<ToolProxy>>> {
+        // A poisoned lock means a panic mid-insert; the map itself is still
+        // coherent (single-key operations), and refusing every later request
+        // would turn one panic into a dead endpoint.
+        self.proxies
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, Arc<ToolProxy>>> {
+        self.proxies
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -294,6 +402,97 @@ mod tests {
             None,
             "visible server, unadvertised tool"
         );
+    }
+
+    /// The per-Agent registry's whole contract: an unregistered agent gets
+    /// the empty proxy (the verbs and nothing else), a registered one gets
+    /// exactly its own, a re-insert replaces, and a remove forgets — each of
+    /// which, done wrong, serves one agent another agent's toolset.
+    #[test]
+    fn agent_proxies_fail_closed_and_never_cross_agents() {
+        let proxies = super::AgentProxies::new();
+        assert!(
+            proxies.for_agent("agent-1").tools().is_empty(),
+            "an unregistered agent must get the empty proxy"
+        );
+        assert!(proxies.all().is_empty());
+
+        let visible = |names: &[&str]| {
+            super::ToolProxy::new().with_hub_link(
+                StaticLink {
+                    tools: names.iter().map(|name| tool(name)).collect(),
+                },
+                names
+                    .iter()
+                    .filter_map(|name| crate::hub::split_namespaced(name))
+                    .map(|(server, _)| server.to_owned()),
+            )
+        };
+        proxies.insert("agent-1", Arc::new(visible(&["linear__create"])));
+        proxies.insert("agent-2", Arc::new(visible(&["payments__refund"])));
+
+        let listed = |agent: &str| {
+            proxies
+                .for_agent(agent)
+                .tools()
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed("agent-1"), vec!["linear__create"]);
+        assert_eq!(
+            listed("agent-2"),
+            vec!["payments__refund"],
+            "each agent sees its own proxy, never a sibling's"
+        );
+        assert_eq!(proxies.all().len(), 2);
+
+        proxies.insert("agent-1", Arc::new(visible(&["grafana__query"])));
+        assert_eq!(
+            listed("agent-1"),
+            vec!["grafana__query"],
+            "a re-insert replaces the previous incarnation's toolset"
+        );
+
+        proxies.remove("agent-1");
+        assert!(
+            proxies.for_agent("agent-1").tools().is_empty(),
+            "a removed agent falls back to the empty proxy"
+        );
+
+        // The shutdown sweep: after clear, nobody is registered — a clear
+        // that silently kept entries would keep `local` children alive past
+        // the manager that spawned them.
+        proxies.clear();
+        assert!(proxies.all().is_empty(), "clear must forget every agent");
+        assert!(
+            proxies.for_agent("agent-2").tools().is_empty(),
+            "a cleared registry serves the empty proxy to everyone"
+        );
+    }
+
+    /// A link whose snapshot is fixed — the pure-registry tests need a
+    /// `HubLink` with no wire behind it.
+    #[derive(Debug)]
+    struct StaticLink {
+        tools: Vec<Tool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hub::HubLink for StaticLink {
+        fn tools(&self) -> &[Tool] {
+            &self.tools
+        }
+
+        async fn call(
+            &self,
+            name: &str,
+            _arguments: Option<rmcp::model::JsonObject>,
+        ) -> Result<rmcp::model::CallToolResult, crate::hub::HubError> {
+            Err(crate::hub::HubError::UnknownTool {
+                name: name.to_owned(),
+            })
+        }
     }
 
     /// The allowlist's own truth table, including the malformed case.
