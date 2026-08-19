@@ -63,10 +63,18 @@ async fn an_upstream_lists_and_calls_a_real_server() {
 /// handle when the upstream drops.
 #[tokio::test]
 async fn a_stdio_config_spawns_a_child_and_its_env_reaches_it() {
+    // The OS validates a freshly built binary on its first-ever exec, and on
+    // a loaded machine (a cargo-mutants scratch tree, say) that can outlast
+    // any protocol ceiling. Pay it here, named, before the handshake that
+    // this test is actually about.
+    stub_mcp::warm()
+        .await
+        .expect("the stub binary's first launch must complete");
+
     let config = HubServerConfig {
         name: "browser".to_owned(),
         transport: HubTransport::Stdio {
-            command: env!("CARGO_BIN_EXE_mcp_stub_server").to_owned(),
+            command: stub_mcp::BINARY.to_owned(),
             args: Vec::new(),
             env: [(
                 "HORDE_STUB_IDENTITY".to_owned(),

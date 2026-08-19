@@ -10,6 +10,12 @@ use horde_proto::v1::{Event, event::Kind};
 use prost::Message;
 
 use crate::error::ServerError;
+// The child module directly, not `forward`'s re-export: `forward::intent`
+// imports this module's append helpers, so going through the parent would
+// close a module cycle (QUALITY_GATES: mod.rs declares and re-exports; a
+// parent that both re-exports a child and defines what a sibling imports is
+// a knot).
+use crate::forward::registry::ForwardRegistry;
 use crate::log::store::Appended;
 use crate::log::{EventLog, PendingEvent};
 use crate::scheduler::{CapabilityScheduler, Scheduler, WorkerRegistry};
@@ -43,6 +49,11 @@ pub struct ServerCore {
     /// project-then-append atomic per decision. It guards no data, so a
     /// restart losing it loses nothing.
     pub placement_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The forward plane's connection-liveness state (ADR-0006): which
+    /// workers and clients hold live forward streams, and the tunnel legs
+    /// awaiting their pair. Ephemeral on purpose — realization is tied to
+    /// connections, so a restart honestly forgetting all of it is correct.
+    pub forwards: ForwardRegistry,
 }
 
 impl ServerCore {
@@ -59,6 +70,7 @@ impl ServerCore {
             scheduler,
             blobs: None,
             placement_lock: Arc::new(tokio::sync::Mutex::new(())),
+            forwards: ForwardRegistry::new(),
         }
     }
 
@@ -89,6 +101,27 @@ impl std::fmt::Debug for ServerCore {
 
 /// This build's semver, echoed in every handshake.
 pub const SERVER_SEMVER: &str = env!("CARGO_PKG_VERSION");
+
+/// A unique-enough identifier without pulling in a uuid dependency.
+///
+/// Ids are opaque to every consumer; the only requirement is that two calls
+/// never collide within a server's lifetime, which a monotonic counter over a
+/// process-start nonce satisfies.
+pub(crate) fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    let start = *START.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64)
+    });
+    let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{start:x}-{ordinal:x}")
+}
 
 /// How often a long-lived stream re-checks the deny-list.
 ///
@@ -253,6 +286,24 @@ pub async fn append_server_event(
     idempotency_key: &str,
     event: Event,
 ) -> Result<u64, ServerError> {
+    append_server_event_returning(log, session_id, idempotency_key, event)
+        .await
+        .map(|appended| appended.sequence)
+}
+
+/// [`append_server_event`], keeping the whole [`Appended`] — for callers that
+/// must read a deduplicated original back (a retried `OpenForward` returns
+/// the forward id the *stored* event minted, not a fresh one).
+///
+/// # Errors
+///
+/// Exactly [`append_server_event`]'s.
+pub async fn append_server_event_returning(
+    log: &EventLog,
+    session_id: &str,
+    idempotency_key: &str,
+    event: Event,
+) -> Result<Appended, ServerError> {
     refuse_inline_bulk(&event)?;
     let appended = log
         .append(PendingEvent {
@@ -265,7 +316,7 @@ pub async fn append_server_event(
         .await?;
 
     refuse_kind_collision(&appended, session_id, idempotency_key, &event)?;
-    Ok(appended.sequence)
+    Ok(appended)
 }
 
 /// Refuses an event that smuggles attachment bulk past the inline threshold.
@@ -474,6 +525,8 @@ mod tests {
             Kind::EnrollmentCodeMinted(EnrollmentCodeMinted::default()),
             Kind::IdentityEnrolled(IdentityEnrolled::default()),
             Kind::EnrollmentRevoked(EnrollmentRevoked::default()),
+            Kind::ForwardOpened(ForwardOpened::default()),
+            Kind::ForwardClosed(ForwardClosed::default()),
         ];
 
         let mut seen = std::collections::BTreeSet::new();

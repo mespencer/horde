@@ -40,6 +40,12 @@ pub enum Update {
     /// that. Carries the time so the judgment is a pure function a test can
     /// drive.
     Tick { now: std::time::Instant },
+    /// A `ListForwards` answer (ADR-0006): the live intents plus the
+    /// realization overlay — reachability and backing — that only the
+    /// server's connection registry can know. An RPC answer like
+    /// [`Update::Sessions`], not a fold: the log deliberately carries no
+    /// listener state, so a fold could never say "unbacked".
+    Forwards(Vec<horde_proto::v1::ForwardStatus>),
 }
 
 /// How long the stream may say nothing — no events, no heartbeats — before
@@ -66,10 +72,21 @@ fn is_stale(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
     RefreshSessions,
-    Approve { request_id: String },
-    Deny { request_id: String },
-    SendAssignment { agent_id: String, text: String },
-    Interrupt { agent_id: String },
+    /// Ask the server for the live forwards and their realization overlay.
+    RefreshForwards,
+    Approve {
+        request_id: String,
+    },
+    Deny {
+        request_id: String,
+    },
+    SendAssignment {
+        agent_id: String,
+        text: String,
+    },
+    Interrupt {
+        agent_id: String,
+    },
 }
 
 /// Which screen is showing.
@@ -78,6 +95,8 @@ pub enum Screen {
     Overview,
     Session,
     Inbox,
+    /// The forward panel: named forwards with backer/unbacked state.
+    Forwards,
 }
 
 /// What the client is attached to: a session, optionally scoped to one agent.
@@ -106,6 +125,11 @@ pub struct App {
     attachment: Option<Attachment>,
     overview_selected: usize,
     inbox_selected: usize,
+    forwards_selected: usize,
+    /// The last `ListForwards` answer, whole. Held rather than folded
+    /// because backing and reachability are connection facts the log cannot
+    /// carry; `r` re-asks.
+    forwards: Vec<horde_proto::v1::ForwardStatus>,
     /// The session view's compose line.
     input: String,
     /// How many feed lines back from the tail the session view is scrolled.
@@ -134,6 +158,8 @@ impl App {
             attachment: None,
             overview_selected: 0,
             inbox_selected: 0,
+            forwards_selected: 0,
+            forwards: Vec::new(),
             input: String::new(),
             scroll: 0,
             status: String::new(),
@@ -214,6 +240,17 @@ impl App {
     #[must_use]
     pub fn inbox_selected(&self) -> usize {
         self.inbox_selected
+    }
+
+    #[must_use]
+    pub fn forwards_selected(&self) -> usize {
+        self.forwards_selected
+    }
+
+    /// The forward panel's rows: the last `ListForwards` answer, verbatim.
+    #[must_use]
+    pub fn forwards(&self) -> &[horde_proto::v1::ForwardStatus] {
+        &self.forwards
     }
 
     /// A server refusal worth showing; the TUI outlives it (multi-attach means
@@ -314,6 +351,12 @@ impl App {
             Update::Tick { now } => {
                 self.stream_stale = is_stale(self.last_stream_activity, now);
             }
+            Update::Forwards(forwards) => {
+                self.forwards = forwards;
+                self.forwards_selected = self
+                    .forwards_selected
+                    .min(self.forwards.len().saturating_sub(1));
+            }
         }
     }
 
@@ -364,6 +407,7 @@ impl App {
             Screen::Overview => self.overview_key(key),
             Screen::Inbox => self.inbox_key(key),
             Screen::Session => self.session_key(key),
+            Screen::Forwards => self.forwards_key(key),
         }
     }
 
@@ -372,6 +416,13 @@ impl App {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('r') => return vec![Directive::RefreshSessions],
             KeyCode::Char('i') => self.screen = Screen::Inbox,
+            KeyCode::Char('f') => {
+                // Entering the panel asks for fresh state: backing and
+                // reachability are connection facts that a stale copy lies
+                // about.
+                self.screen = Screen::Forwards;
+                return vec![Directive::RefreshForwards];
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.overview_selected = step_back(self.overview_selected);
             }
@@ -430,6 +481,22 @@ impl App {
                 if let Some(entry) = selected_entry(&entries, self.inbox_selected) {
                     self.attach_to(entry.session_id.clone());
                 }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn forwards_key(&mut self, key: &KeyEvent) -> Vec<Directive> {
+        match key.code {
+            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Esc | KeyCode::Char('o') => self.screen = Screen::Overview,
+            KeyCode::Char('r') => return vec![Directive::RefreshForwards],
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.forwards_selected = step_back(self.forwards_selected);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.forwards_selected = step_forward(self.forwards_selected, self.forwards.len());
             }
             _ => {}
         }
@@ -682,6 +749,75 @@ mod tests {
 
         assert!(app.on_input(&key(KeyCode::Char('q'))).is_empty());
         assert!(app.should_quit());
+    }
+
+    /// One forward panel row per status, for the key tests.
+    fn forward_rows(count: usize) -> Vec<horde_proto::v1::ForwardStatus> {
+        (0..count)
+            .map(|ordinal| horde_proto::v1::ForwardStatus {
+                intent: Some(horde_proto::v1::ForwardIntent {
+                    forward_id: Some(horde_proto::v1::ForwardId::new(format!("fwd-{ordinal}"))),
+                    ..horde_proto::v1::ForwardIntent::default()
+                }),
+                worker_reachable: true,
+                backed: false,
+            })
+            .collect()
+    }
+
+    /// The forward panel's whole key table (ADR-0006): entry refreshes,
+    /// `r` re-asks, the selection moves and clamps, `o`/Esc leave, and `q`
+    /// quits — each arm asserted, because a dropped arm is a dead key that
+    /// no snapshot notices.
+    #[test]
+    fn the_forward_panel_keys_refresh_move_leave_and_quit() {
+        let mut app = App::overview();
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('f'))),
+            vec![Directive::RefreshForwards],
+            "entering the panel asks for fresh backing state"
+        );
+        assert_eq!(app.screen(), Screen::Forwards);
+
+        app.apply(Update::Forwards(forward_rows(2)));
+        assert_eq!(app.forwards_selected(), 0);
+        assert!(app.on_input(&key(KeyCode::Down)).is_empty());
+        assert_eq!(app.forwards_selected(), 1);
+        assert!(app.on_input(&key(KeyCode::Up)).is_empty());
+        assert_eq!(app.forwards_selected(), 0);
+
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('r'))),
+            vec![Directive::RefreshForwards],
+            "r re-asks without leaving"
+        );
+        assert_eq!(app.screen(), Screen::Forwards);
+
+        assert!(app.on_input(&key(KeyCode::Char('o'))).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+
+        app.on_input(&key(KeyCode::Char('f')));
+        assert!(app.on_input(&key(KeyCode::Esc)).is_empty());
+        assert_eq!(app.screen(), Screen::Overview);
+
+        app.on_input(&key(KeyCode::Char('f')));
+        assert!(app.on_input(&key(KeyCode::Char('q'))).is_empty());
+        assert!(app.should_quit());
+    }
+
+    /// A shrinking answer clamps the selection instead of leaving it past
+    /// the end — the row under the cursor may be the one that closed.
+    #[test]
+    fn a_shrinking_forward_list_clamps_the_selection() {
+        let mut app = App::overview();
+        app.on_input(&key(KeyCode::Char('f')));
+        app.apply(Update::Forwards(forward_rows(3)));
+        app.on_input(&key(KeyCode::Down));
+        app.on_input(&key(KeyCode::Down));
+        assert_eq!(app.forwards_selected(), 2);
+
+        app.apply(Update::Forwards(forward_rows(1)));
+        assert_eq!(app.forwards_selected(), 0, "clamped to the last real row");
     }
 
     #[test]

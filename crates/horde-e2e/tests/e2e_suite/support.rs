@@ -227,6 +227,21 @@ impl System {
         self.cli_field(&["worker", "enroll", name], "code").await
     }
 
+    /// Starts a long-running `horde` invocation as the operator — for verbs
+    /// that hold the foreground (`attach`, `forward expose`). The caller
+    /// reads its stdout and decides when it dies; [`Self::cli`] stays the
+    /// shape for verbs that finish.
+    pub(crate) fn spawn_cli(&self, name: &str, args: &[&str]) -> SpawnedProcess {
+        let identity = self.operator.to_string_lossy().into_owned();
+        let mut full: Vec<String> = ["--endpoint", &self.main, "--json", "--identity", &identity]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        full.extend(args.iter().map(ToString::to_string));
+        let borrowed: Vec<&str> = full.iter().map(String::as_str).collect();
+        SpawnedProcess::spawn(name, &self.horde, &borrowed, &[]).expect("the CLI spawns")
+    }
+
     /// Writes `script_json` beside the state and starts a worker named
     /// `name` running it — the arrangement every scripted scenario opens
     /// with.

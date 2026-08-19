@@ -154,6 +154,13 @@ impl Connection {
         &self.worker_id
     }
 
+    /// The raw service client, for the forward plane's own streams. A clone
+    /// shares the underlying channel; no second dial happens.
+    #[must_use]
+    pub fn service_client(&self) -> WorkerServiceClient<Channel> {
+        self.client.clone()
+    }
+
     /// Streams commands into `target` until the Server closes the stream.
     ///
     /// Resumes from the journal's applied-command watermark plus one — the
@@ -203,9 +210,16 @@ impl Connection {
         target: &mut dyn ApplyCommand,
     ) -> Result<(), WorkerError> {
         let mut push_side = self.clone();
+        let forward_client = self.service_client();
+        let forward_worker = self.worker_id.clone();
         tokio::select! {
             outcome = self.feed_commands(journal, target) => outcome,
             outcome = push_side.push_events(journal) => outcome,
+            // The forward plane (ADR-0006) lives and dies with this
+            // connection on purpose: realization is tied to its liveness,
+            // and the select dropping this future is what tears every
+            // listener down at partition.
+            outcome = crate::forward::serve(forward_client, &forward_worker) => outcome,
         }
     }
 

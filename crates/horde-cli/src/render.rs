@@ -709,6 +709,135 @@ pub fn stashed(stored: &horde_proto::v1::UploadBlobResponse, format: Format) -> 
     }
 }
 
+/// One `forward ls` answer: names, directions, ports, and the realization
+/// overlay only the server's registry can vouch for.
+#[must_use]
+pub fn forwards(statuses: &[horde_proto::v1::ForwardStatus], format: Format) -> String {
+    match format {
+        Format::Json => {
+            let rows: Vec<_> = statuses.iter().map(forward_json).collect();
+            json!(rows).to_string()
+        }
+        Format::Human => {
+            if statuses.is_empty() {
+                return "no live forwards".to_owned();
+            }
+            statuses
+                .iter()
+                .map(forward_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+}
+
+fn forward_json(status: &horde_proto::v1::ForwardStatus) -> serde_json::Value {
+    let intent = status.intent.clone().unwrap_or_default();
+    let spec = intent.spec.unwrap_or_default();
+    json!({
+        "forward_id": intent.forward_id.map(|id| id.to_string()).unwrap_or_default(),
+        "session_id": intent.session_id.map(|id| id.to_string()).unwrap_or_default(),
+        "agent_id": intent.agent_id.map(|id| id.to_string()).unwrap_or_default(),
+        "name": spec.name,
+        "direction": direction_word(spec.direction),
+        "worker_port": spec.worker_port,
+        "client_port": spec.client_port,
+        "backer": intent.backer_client_id.map(|id| id.to_string()),
+        "worker_reachable": status.worker_reachable,
+        "backed": status.backed,
+    })
+}
+
+fn forward_line(status: &horde_proto::v1::ForwardStatus) -> String {
+    let intent = status.intent.clone().unwrap_or_default();
+    let spec = intent.spec.unwrap_or_default();
+    let mut line = format!(
+        "{}  {} {}  session {}  {}",
+        spec.name,
+        direction_word(spec.direction),
+        spec.worker_port,
+        intent
+            .session_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        if status.worker_reachable {
+            "worker ok"
+        } else {
+            "worker unreachable"
+        },
+    );
+    if direction_word(spec.direction) == "inject" {
+        let backer = intent
+            .backer_client_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        if status.backed {
+            line.push_str(&format!("  backed by {backer}"));
+        } else {
+            line.push_str(&format!("  UNBACKED ({backer} detached)"));
+        }
+    }
+    line
+}
+
+use horde_proto::forward::direction_name as direction_word;
+
+/// A realized expose: the mapping the ADR promises, fallback named when the
+/// requested port was taken.
+#[must_use]
+pub fn forward_realized(
+    name: &str,
+    forward_id: &str,
+    local_addr: std::net::SocketAddr,
+    fell_back: bool,
+    format: Format,
+) -> String {
+    match format {
+        Format::Json => json!({
+            "forward_id": forward_id,
+            "name": name,
+            "local_addr": local_addr.to_string(),
+            "fell_back": fell_back,
+        })
+        .to_string(),
+        Format::Human => {
+            let mut line = format!("{name} → {local_addr}  ({forward_id})");
+            if fell_back {
+                line.push_str("  [requested port was taken; ephemeral fallback]");
+            }
+            line
+        }
+    }
+}
+
+/// A backed inject: what this client serves, and where it lands worker-side.
+#[must_use]
+pub fn forward_backing(
+    name: &str,
+    forward_id: &str,
+    local_port: u16,
+    worker_port: u16,
+    format: Format,
+) -> String {
+    match format {
+        Format::Json => json!({
+            "forward_id": forward_id,
+            "name": name,
+            "local_port": local_port,
+            "worker_port": worker_port,
+        })
+        .to_string(),
+        Format::Human => format!(
+            "backing {name}: 127.0.0.1:{local_port} here → worker localhost{}  ({forward_id})",
+            if worker_port == 0 {
+                String::new()
+            } else {
+                format!(":{worker_port}")
+            }
+        ),
+    }
+}
+
 /// Renders a fetched blob: where the verified bytes landed.
 #[must_use]
 pub fn fetched(address: &str, out: &std::path::Path, size_bytes: u64, format: Format) -> String {
@@ -2034,5 +2163,140 @@ mod usage_tests {
         assert_eq!(UsageGrouping::Tree.word(), "tree path");
         assert_eq!(UsageGrouping::Account.word(), "provider account");
         assert_eq!(UsageGrouping::Model.word(), "model");
+    }
+
+    // -- forwards (ADR-0006) -------------------------------------------------
+
+    fn forward_status(
+        name: &str,
+        direction: horde_proto::v1::ForwardDirection,
+        backer: Option<&str>,
+        worker_reachable: bool,
+        backed: bool,
+    ) -> horde_proto::v1::ForwardStatus {
+        horde_proto::v1::ForwardStatus {
+            intent: Some(horde_proto::v1::ForwardIntent {
+                forward_id: Some(horde_proto::v1::ForwardId::new(format!("fwd-{name}"))),
+                session_id: Some(horde_proto::v1::SessionId::new("s1")),
+                agent_id: Some(horde_proto::v1::AgentId::new("a1")),
+                spec: Some(horde_proto::v1::ForwardSpec {
+                    direction: direction as i32,
+                    name: name.to_owned(),
+                    worker_port: 5173,
+                    client_port: 5432,
+                }),
+                backer_client_id: backer.map(horde_proto::v1::ClientId::new),
+            }),
+            worker_reachable,
+            backed,
+        }
+    }
+
+    /// The three row shapes an operator reads: a reachable expose, a backed
+    /// inject, and an unbacked inject naming the detached backer — whose
+    /// return is the remedy, which is why the name must survive the state.
+    #[test]
+    fn the_forward_list_says_reachability_and_backing_in_words() {
+        use horde_proto::v1::ForwardDirection;
+
+        let rendered = super::forwards(
+            &[
+                forward_status("vite", ForwardDirection::Expose, None, true, false),
+                forward_status("db", ForwardDirection::Inject, Some("laptop"), true, true),
+                forward_status(
+                    "cache",
+                    ForwardDirection::Inject,
+                    Some("desk"),
+                    false,
+                    false,
+                ),
+            ],
+            Format::Human,
+        );
+        assert!(rendered.contains("vite  expose 5173"), "{rendered}");
+        assert!(rendered.contains("worker ok"), "{rendered}");
+        assert!(rendered.contains("backed by laptop"), "{rendered}");
+        assert!(rendered.contains("worker unreachable"), "{rendered}");
+        assert!(rendered.contains("UNBACKED (desk detached)"), "{rendered}");
+        assert!(
+            !rendered.contains("vite")
+                || !rendered.lines().next().unwrap_or("").contains("UNBACKED"),
+            "an expose has no backing state to claim: {rendered}"
+        );
+
+        assert_eq!(super::forwards(&[], Format::Human), "no live forwards");
+    }
+
+    #[test]
+    fn the_forward_list_renders_json_rows_scripts_can_read() {
+        use horde_proto::v1::ForwardDirection;
+
+        let rendered = super::forwards(
+            &[forward_status(
+                "db",
+                ForwardDirection::Inject,
+                Some("laptop"),
+                true,
+                false,
+            )],
+            Format::Json,
+        );
+        let rows: serde_json::Value = serde_json::from_str(&rendered).expect("one JSON value");
+        assert_eq!(rows[0]["name"], "db");
+        assert_eq!(rows[0]["direction"], "inject");
+        assert_eq!(rows[0]["worker_port"], 5173);
+        assert_eq!(rows[0]["client_port"], 5432);
+        assert_eq!(rows[0]["backer"], "laptop");
+        assert_eq!(rows[0]["worker_reachable"], true);
+        assert_eq!(rows[0]["backed"], false);
+        assert_eq!(rows[0]["session_id"], "s1");
+    }
+
+    /// The mapping line is the whole point of the fallback: it must say when
+    /// the address is not the one asked for.
+    #[test]
+    fn a_realized_expose_prints_its_mapping_and_names_a_fallback() {
+        let addr: std::net::SocketAddr = "127.0.0.1:49152".parse().expect("an address");
+
+        let exact = super::forward_realized("vite", "fwd-1", addr, false, Format::Human);
+        assert!(exact.contains("vite → 127.0.0.1:49152"), "{exact}");
+        assert!(!exact.contains("fallback"), "{exact}");
+
+        let fallback = super::forward_realized("vite", "fwd-1", addr, true, Format::Human);
+        assert!(fallback.contains("ephemeral fallback"), "{fallback}");
+
+        let json: serde_json::Value = serde_json::from_str(&super::forward_realized(
+            "vite",
+            "fwd-1",
+            addr,
+            true,
+            Format::Json,
+        ))
+        .expect("one JSON value");
+        assert_eq!(json["local_addr"], "127.0.0.1:49152");
+        assert_eq!(json["fell_back"], true);
+    }
+
+    /// The backing line names both ends; an unknown worker port (serve mode)
+    /// stays honest rather than printing `:0`.
+    #[test]
+    fn a_backing_line_names_both_ends_or_neither() {
+        let both = super::forward_backing("db", "fwd-1", 5432, 15432, Format::Human);
+        assert!(both.contains("127.0.0.1:5432 here"), "{both}");
+        assert!(both.contains("worker localhost:15432"), "{both}");
+
+        let unknown = super::forward_backing("db", "fwd-1", 5432, 0, Format::Human);
+        assert!(!unknown.contains(":0"), "{unknown}");
+
+        let json: serde_json::Value = serde_json::from_str(&super::forward_backing(
+            "db",
+            "fwd-1",
+            5432,
+            15432,
+            Format::Json,
+        ))
+        .expect("one JSON value");
+        assert_eq!(json["local_port"], 5432);
+        assert_eq!(json["worker_port"], 15432);
     }
 }

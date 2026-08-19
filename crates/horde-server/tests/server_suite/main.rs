@@ -18,6 +18,7 @@ mod binary;
 mod blobs;
 mod contracts;
 mod enrollment;
+mod forwards;
 mod mcp_catalog;
 mod placement;
 mod services;

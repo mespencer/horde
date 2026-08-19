@@ -6,6 +6,7 @@ package horde.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
+import "horde/v1/forward.proto";
 import "horde/v1/id.proto";
 
 // The layers, in evaluation order. Used both for "who decided" and for "which
@@ -56,6 +57,14 @@ message PermissionRequest {
 
   // After this, the request is dead and the Agent is unblocked as a denial.
   google.protobuf.Timestamp expires_at = 7;
+
+  // Set when the proposal is a port forward (ADR-0006): an ALLOW on this
+  // request is what journals the ForwardOpened. For an EXPOSE the chain's
+  // modes apply like any proposed action; for an INJECT the chain always
+  // escalates, because acceptance and backing are one act and only a
+  // Client's connection can back one — the first Client to accept becomes
+  // the backer.
+  ForwardSpec forward = 8;
 }
 
 message PermissionDecision {

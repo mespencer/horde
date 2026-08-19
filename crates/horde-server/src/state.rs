@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use horde_proto::prost_types::Struct;
 use horde_proto::v1::{
-    AgentLifecycleState, AgentSpec, Event, PlacementState, ProposedToolCall, SessionLifecycleState,
-    event::Kind as EventKind,
+    Actor, AgentLifecycleState, AgentSpec, Event, ForwardSpec, PlacementState, ProposedToolCall,
+    SessionLifecycleState, event::Kind as EventKind,
 };
 use prost::Message;
 
@@ -60,6 +60,33 @@ pub struct PendingPermission {
     /// record *what* was allowed — the decision event alone names only the
     /// request id.
     pub tool_call: Option<ProposedToolCall>,
+    /// The forward this request proposes, when it proposes one (ADR-0006).
+    /// Kept because the settling decision is what journals the
+    /// `ForwardOpened`, and the decision event alone names only the request
+    /// id — the same reasoning as `tool_call`.
+    pub forward: Option<ForwardSpec>,
+}
+
+/// One forward intent, as the log describes it (ADR-0006).
+///
+/// Deliberately durable-intent-only: nothing here says whether a listener is
+/// bound anywhere, because realization is tied to live connections and a
+/// projection replayed after a restart must not claim listeners back into
+/// existence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardState {
+    pub forward_id: String,
+    /// The owning agent. The intent's liveness is derived from this agent's
+    /// lifecycle — dead with `Failed`/`Archived`, alive again with revival —
+    /// which is why closure-by-agent-death is never journaled.
+    pub agent_id: String,
+    pub spec: Option<ForwardSpec>,
+    pub opened_by: Option<Actor>,
+    /// INJECT only: the principal whose machine serves the traffic.
+    pub backer_client_id: Option<String>,
+    /// An explicit `ForwardClosed` was folded. The entry stays for audit;
+    /// [`SessionState::live_forwards`] excludes it.
+    pub closed: bool,
 }
 
 /// The identity of a proposed call, for remember-for-session matching.
@@ -114,6 +141,8 @@ pub struct SessionState {
     /// This is the widened deterministic-allow layer from
     /// `PermissionDecision.remember_for_session`.
     pub remembered_allows: BTreeMap<RememberedCall, Option<Struct>>,
+    /// Forward intents by id, closed ones included (ADR-0006).
+    pub forwards: BTreeMap<String, ForwardState>,
 }
 
 impl SessionState {
@@ -159,6 +188,8 @@ impl SessionState {
             }
             EventKind::PermissionRequested(requested) => self.permission_requested(requested),
             EventKind::PermissionDecided(decided) => self.permission_decided(decided),
+            EventKind::ForwardOpened(opened) => self.forward_opened(agent_id, opened),
+            EventKind::ForwardClosed(closed) => self.forward_closed(&closed),
             // Output chunks, messages, results, usage, and workspace progress
             // are journal content rather than tree structure. They are replayed
             // to clients verbatim and do not change the projection.
@@ -272,6 +303,7 @@ impl SessionState {
                 PendingPermission {
                     agent_id,
                     tool_call: request.tool_call,
+                    forward: request.forward,
                 },
             );
         }
@@ -319,6 +351,78 @@ impl SessionState {
             .values()
             .filter(move |agent| agent.parent_agent_id.as_deref() == parent)
     }
+
+    /// Records a forward intent (ADR-0006). Event.agent_id is the owner.
+    fn forward_opened(&mut self, agent_id: Option<String>, opened: horde_proto::v1::ForwardOpened) {
+        let Some(forward_id) = opened.forward_id.as_ref().map(ToString::to_string) else {
+            // An intent with no identity can never be tunneled to or closed;
+            // like a spawn with no agent, one bad event must not sink the
+            // projection.
+            return;
+        };
+        // First writer wins: a keyed re-append deduplicates before the fold,
+        // so a second `ForwardOpened` under one id is a collision, and the
+        // backer recorded by the first must not be silently replaced.
+        self.forwards
+            .entry(forward_id.clone())
+            .or_insert(ForwardState {
+                forward_id,
+                agent_id: agent_id.unwrap_or_default(),
+                backer_client_id: opened.backer_client_id.as_ref().map(ToString::to_string),
+                spec: opened.spec,
+                opened_by: opened.opened_by,
+                closed: false,
+            });
+    }
+
+    /// Settles an explicit close. Unknown ids are ignored, closed stays
+    /// closed: the fold is total and a close can never re-open anything.
+    fn forward_closed(&mut self, closed: &horde_proto::v1::ForwardClosed) {
+        if let Some(id) = closed.forward_id.as_ref().map(ToString::to_string)
+            && let Some(forward) = self.forwards.get_mut(&id)
+        {
+            forward.closed = true;
+        }
+    }
+
+    /// The forward intents currently in force: opened, never explicitly
+    /// closed, and owned by an agent still able to carry them.
+    pub fn live_forwards(&self) -> impl Iterator<Item = &ForwardState> {
+        self.forwards
+            .values()
+            .filter(|forward| forward_is_live(forward, &self.agents))
+    }
+}
+
+/// Whether a forward intent is in force (ADR-0006).
+///
+/// Both halves are load-bearing and neither is separately reachable inline:
+/// an explicit close usually outlives its agent anyway, and an agent death
+/// usually has no explicit close racing it — so `&&` versus `||` here decides
+/// whether revival restores intents (it must: liveness is *derived* from the
+/// agent, never re-journaled) and whether a closed forward stays closed.
+#[must_use]
+pub fn forward_is_live(forward: &ForwardState, agents: &BTreeMap<String, AgentState>) -> bool {
+    let agent_carries = agents
+        .get(&forward.agent_id)
+        .is_some_and(|agent| agent_carries_forwards(agent.lifecycle));
+    !forward.closed && agent_carries
+}
+
+/// Whether an agent in this lifecycle state can carry forward intents.
+///
+/// `Failed` and `Archived` cannot: the process behind the port is gone, so
+/// the forward has nothing left to mean. Every other state can — including
+/// `Idle`, whose context (and processes) are retained, and `Queued`, whose
+/// realization simply has no placed worker yet. Revival is why this is a
+/// predicate over the *current* state rather than a journaled closure: an
+/// agent leaving `Failed` brings its intents back without re-declaration.
+#[must_use]
+pub fn agent_carries_forwards(state: AgentLifecycleState) -> bool {
+    !matches!(
+        state,
+        AgentLifecycleState::Failed | AgentLifecycleState::Archived
+    )
 }
 
 /// Whether a spawn event is the one a session may take its display name
@@ -738,6 +842,7 @@ mod permission_fold_tests {
             Some(&PendingPermission {
                 agent_id: "agent-1".to_owned(),
                 tool_call: Some(call("/etc/hosts")),
+                forward: None,
             })
         );
     }
@@ -893,5 +998,261 @@ mod permission_fold_tests {
 
         assert_eq!(state.remembered_narrowing(&bare), Some(&None));
         assert_eq!(state.remembered_narrowing(&empty), None);
+    }
+}
+
+#[cfg(test)]
+mod forward_fold_tests {
+    use horde_proto::v1::{
+        AgentId, AgentLifecycleChanged, AgentLifecycleState, ClientId, Event, ForwardClosed,
+        ForwardDirection, ForwardId, ForwardOpened, ForwardSpec, event::Kind,
+    };
+    use prost::Message;
+
+    use super::{SessionState, agent_carries_forwards, forward_is_live};
+    use crate::log::StoredEvent;
+
+    fn stored(sequence: u64, agent: Option<&str>, kind: Kind) -> StoredEvent {
+        StoredEvent {
+            session_id: "s1".to_owned(),
+            sequence,
+            recorded_at_unix_ms: 0,
+            payload: Event {
+                agent_id: agent.map(AgentId::new),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(kind),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    fn spawned(agent: &str) -> StoredEvent {
+        stored(
+            1,
+            Some(agent),
+            Kind::AgentSpawned(horde_proto::v1::AgentSpawned::default()),
+        )
+    }
+
+    fn spec(direction: ForwardDirection, name: &str) -> ForwardSpec {
+        ForwardSpec {
+            direction: direction as i32,
+            name: name.to_owned(),
+            worker_port: 5173,
+            client_port: 0,
+        }
+    }
+
+    fn opened(forward_id: &str, backer: Option<&str>) -> Kind {
+        Kind::ForwardOpened(ForwardOpened {
+            forward_id: Some(ForwardId::new(forward_id)),
+            spec: Some(spec(ForwardDirection::Expose, "vite")),
+            opened_by: None,
+            backer_client_id: backer.map(ClientId::new),
+        })
+    }
+
+    fn closed(forward_id: &str) -> Kind {
+        Kind::ForwardClosed(ForwardClosed {
+            forward_id: Some(ForwardId::new(forward_id)),
+            closed_by: None,
+            reason: String::new(),
+        })
+    }
+
+    fn lifecycle(state: AgentLifecycleState) -> Kind {
+        Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+            previous_state: AgentLifecycleState::Running as i32,
+            state: state as i32,
+            reason: String::new(),
+        })
+    }
+
+    #[test]
+    fn an_opened_forward_is_live_and_carries_its_spec_and_backer() {
+        let events = vec![
+            spawned("agent-1"),
+            stored(2, Some("agent-1"), opened("fwd-1", Some("laptop"))),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+
+        let live: Vec<&str> = state
+            .live_forwards()
+            .map(|forward| forward.forward_id.as_str())
+            .collect();
+        assert_eq!(live, vec!["fwd-1"]);
+
+        let forward = &state.forwards["fwd-1"];
+        assert_eq!(forward.agent_id, "agent-1");
+        assert_eq!(forward.backer_client_id.as_deref(), Some("laptop"));
+        assert_eq!(
+            forward.spec.as_ref().map(|spec| spec.name.as_str()),
+            Some("vite")
+        );
+    }
+
+    #[test]
+    fn an_explicit_close_settles_the_intent_for_good() {
+        let events = vec![
+            spawned("agent-1"),
+            stored(2, Some("agent-1"), opened("fwd-1", None)),
+            stored(3, Some("agent-1"), closed("fwd-1")),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+
+        assert_eq!(state.live_forwards().count(), 0);
+        assert!(
+            state.forwards["fwd-1"].closed,
+            "the entry stays, closed, for audit"
+        );
+    }
+
+    /// The intent dies with the agent and revives with revival — derived from
+    /// the agent's lifecycle, never re-journaled (ADR-0006).
+    #[test]
+    fn the_intent_follows_the_owning_agents_lifecycle() {
+        let events = vec![
+            spawned("agent-1"),
+            stored(2, Some("agent-1"), opened("fwd-1", None)),
+            stored(3, Some("agent-1"), lifecycle(AgentLifecycleState::Failed)),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(
+            state.live_forwards().count(),
+            0,
+            "the process behind the port is gone, so the forward has nothing left to mean"
+        );
+
+        let revived = vec![
+            spawned("agent-1"),
+            stored(2, Some("agent-1"), opened("fwd-1", None)),
+            stored(3, Some("agent-1"), lifecycle(AgentLifecycleState::Failed)),
+            stored(4, Some("agent-1"), lifecycle(AgentLifecycleState::Running)),
+        ];
+        let state = SessionState::project("s1", &revived).expect("project");
+        assert_eq!(
+            state.live_forwards().count(),
+            1,
+            "revival restores the intent without re-declaration"
+        );
+    }
+
+    #[test]
+    fn a_forward_whose_agent_the_log_never_spawned_is_not_live() {
+        let events = vec![stored(1, Some("ghost"), opened("fwd-1", None))];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.live_forwards().count(), 0);
+    }
+
+    #[test]
+    fn a_forward_with_no_id_is_ignored_rather_than_sinking_the_fold() {
+        let kind = Kind::ForwardOpened(ForwardOpened::default());
+        let events = vec![spawned("agent-1"), stored(2, Some("agent-1"), kind)];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert!(state.forwards.is_empty());
+    }
+
+    #[test]
+    fn a_close_for_an_unknown_forward_is_ignored() {
+        let events = vec![stored(1, None, closed("never-opened"))];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert!(state.forwards.is_empty());
+    }
+
+    /// First writer wins: a second `ForwardOpened` under one id must not
+    /// silently replace the backer the first recorded.
+    #[test]
+    fn a_reopened_id_keeps_the_first_backer() {
+        let events = vec![
+            spawned("agent-1"),
+            stored(2, Some("agent-1"), opened("fwd-1", Some("laptop"))),
+            stored(3, Some("agent-1"), opened("fwd-1", Some("impostor"))),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(
+            state.forwards["fwd-1"].backer_client_id.as_deref(),
+            Some("laptop")
+        );
+    }
+
+    /// A close must also be final against a later re-open of the same id.
+    #[test]
+    fn a_closed_forward_cannot_be_reopened_under_the_same_id() {
+        let events = vec![
+            spawned("agent-1"),
+            stored(2, Some("agent-1"), opened("fwd-1", None)),
+            stored(3, Some("agent-1"), closed("fwd-1")),
+            stored(4, Some("agent-1"), opened("fwd-1", None)),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(state.live_forwards().count(), 0);
+    }
+
+    /// Every lifecycle state, so the boundary between "carries" and "cannot"
+    /// is pinned rather than implied.
+    #[test]
+    fn only_failed_and_archived_agents_drop_their_forwards() {
+        for (state, carries) in [
+            (AgentLifecycleState::Unspecified, true),
+            (AgentLifecycleState::Queued, true),
+            (AgentLifecycleState::Starting, true),
+            (AgentLifecycleState::Running, true),
+            (AgentLifecycleState::WaitingOnChild, true),
+            (AgentLifecycleState::WaitingOnHuman, true),
+            (AgentLifecycleState::Idle, true),
+            (AgentLifecycleState::Archived, false),
+            (AgentLifecycleState::Failed, false),
+        ] {
+            assert_eq!(
+                agent_carries_forwards(state),
+                carries,
+                "{state:?} must {}carry forwards",
+                if carries { "" } else { "not " }
+            );
+        }
+    }
+
+    /// The `&&`'s truth table. The mixed rows are the ones an `||` would get
+    /// wrong, and neither is reachable end-to-end: an explicit close rarely
+    /// races its agent's death.
+    #[test]
+    fn a_forward_is_live_only_while_open_and_carried() {
+        use std::collections::BTreeMap;
+
+        let agents_in = |lifecycle| {
+            let mut agents = BTreeMap::new();
+            agents.insert(
+                "agent-1".to_owned(),
+                super::AgentState {
+                    agent_id: "agent-1".to_owned(),
+                    parent_agent_id: None,
+                    lifecycle,
+                    tree_path: Vec::new(),
+                    agent_type: String::new(),
+                    permission_mode: String::new(),
+                    worker_id: None,
+                    spec: None,
+                    placement_state: horde_proto::v1::PlacementState::Unspecified,
+                    queued_at_unix_ms: None,
+                },
+            );
+            agents
+        };
+        let forward = |closed| super::ForwardState {
+            forward_id: "fwd-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            spec: None,
+            opened_by: None,
+            backer_client_id: None,
+            closed,
+        };
+
+        let running = agents_in(AgentLifecycleState::Running);
+        let failed = agents_in(AgentLifecycleState::Failed);
+        assert!(forward_is_live(&forward(false), &running));
+        assert!(!forward_is_live(&forward(true), &running));
+        assert!(!forward_is_live(&forward(false), &failed));
+        assert!(!forward_is_live(&forward(true), &failed));
     }
 }

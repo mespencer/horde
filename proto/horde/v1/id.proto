@@ -44,6 +44,11 @@ message PermissionRequestId {
   string value = 1;
 }
 
+// One port-forward intent (ADR-0006).
+message ForwardId {
+  string value = 1;
+}
+
 // Whoever caused an event. Multi-attach means several Clients can drive one
 // Session, so "the user did it" is not specific enough to render or audit.
 message Actor {

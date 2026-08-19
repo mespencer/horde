@@ -1,0 +1,197 @@
+// Port forwards (ADR-0006): durable intent, ephemeral realization.
+//
+// A forward lets a Worker port reach a Client machine (expose) or a Client
+// port reach a Worker (inject). Both directions relay byte streams through the
+// Server over the existing authenticated channels — Client ↔ Server ↔ Worker,
+// two hops — because Workers and Clients only ever dial the Server.
+//
+// The intent ("agent A exposes 5173 as `vite`") is journaled as
+// ForwardOpened / ForwardClosed and folded into Session state like everything
+// else. The realization — an actual bound listener — is tied to a live
+// connection and is deliberately NOT log state: a listener cannot be replayed
+// into existence. Nothing in this file's tunnel messages ever reaches the
+// event log.
+syntax = "proto3";
+
+package horde.v1;
+
+import "horde/v1/id.proto";
+
+// Which way the bytes ultimately flow. Direction decides policy (ADR-0006):
+// expose flows the permission chain; inject is human-gated by physics, because
+// only a Client connection can back one.
+enum ForwardDirection {
+  FORWARD_DIRECTION_UNSPECIFIED = 0;
+
+  // A Worker port reaches Client machines: every realizing Client binds a
+  // loopback listener, and the Worker dials its local port once per tunneled
+  // connection.
+  FORWARD_DIRECTION_EXPOSE = 1;
+
+  // A Client port reaches the Worker: the Worker binds a loopback listener
+  // for the intent, and the backing Client dials its local port once per
+  // tunneled connection. A v1 inject listener is loopback-wide on the Worker —
+  // scoping it to one Agent's processes needs namespaces the Workers don't
+  // have, and pretending otherwise would be a lie in the trust story.
+  FORWARD_DIRECTION_INJECT = 2;
+}
+
+// What a forward is, minus its identity and its lifecycle. Forwards are
+// named, not numbered: Agents declare `expose 5173 as "vite"` and Clients
+// render `vite → localhost:5173`.
+message ForwardSpec {
+  ForwardDirection direction = 1;
+
+  // Display name, e.g. "vite". Required; unique among a Session's live
+  // forwards.
+  string name = 2;
+
+  // The port on the Worker's machine. For EXPOSE, the loopback port the
+  // Worker dials per tunneled connection — the Agent's server. For INJECT,
+  // the loopback port the Worker binds for Agent processes to dial. Never
+  // zero: a realized port that the log cannot name would be ephemeral state
+  // smuggled into the durable intent.
+  uint32 worker_port = 3;
+
+  // The port on a Client's machine. For EXPOSE, the port a realizing Client
+  // tries to bind; zero means "same as worker_port", and a Client that cannot
+  // bind it falls back to an ephemeral port and prints the mapping. For
+  // INJECT, the loopback port the backer dials per tunneled connection —
+  // never zero.
+  uint32 client_port = 4;
+}
+
+// A forward intent came into existence. Event.agent_id is the owning Agent:
+// the intent dies with it (Failed, archived) and revives with its revival —
+// derived from the Agent's lifecycle, never re-journaled.
+message ForwardOpened {
+  ForwardId forward_id = 1;
+
+  ForwardSpec spec = 2;
+
+  Actor opened_by = 3;
+
+  // INJECT only: the principal whose machine serves the traffic. For a
+  // Client-initiated inject, the initiator. For an Agent-initiated inject,
+  // the first Client to accept the escalation — acceptance and backing are
+  // one act, on the accepter's own connection.
+  ClientId backer_client_id = 4;
+}
+
+// A forward intent was explicitly closed. Agent death needs no such event:
+// liveness is derived from the Agent's lifecycle so that revival restores the
+// intent without re-declaration.
+message ForwardClosed {
+  ForwardId forward_id = 1;
+
+  Actor closed_by = 2;
+
+  string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Tunnel plane — ephemeral, never journaled
+// ---------------------------------------------------------------------------
+
+// Why a tunnel was refused. A code, not prose, so a Worker can tell an
+// unbacked inject from a vanished forward without parsing a message.
+enum ForwardRefusalReason {
+  FORWARD_REFUSAL_REASON_UNSPECIFIED = 0;
+
+  // No live intent by that id: never opened, closed, or its Agent is gone.
+  FORWARD_REFUSAL_REASON_UNKNOWN_FORWARD = 1;
+
+  // EXPOSE: the Worker holding the target port has no live forward stream.
+  // The detail names the Worker, because a fast explained refusal beats a
+  // hang.
+  FORWARD_REFUSAL_REASON_WORKER_UNREACHABLE = 2;
+
+  // INJECT: the backer is detached. The intent survives; the backer's return
+  // re-backs it.
+  FORWARD_REFUSAL_REASON_UNBACKED = 3;
+
+  // The far end answered but could not dial its local target port.
+  FORWARD_REFUSAL_REASON_TARGET_DIAL_FAILED = 4;
+
+  // The caller is not a principal this forward's tunnel would ever involve —
+  // e.g. a Worker originating on an EXPOSE, or answering a connection that
+  // was dispatched to somebody else.
+  FORWARD_REFUSAL_REASON_WRONG_PRINCIPAL = 5;
+}
+
+// First frame from whichever peer opens a tunnel stream. The originating side
+// (a Client for EXPOSE, the Worker for INJECT) mints connection_id; the
+// passive side answers a ForwardConnectionRequest by echoing it.
+message ForwardTunnelOpen {
+  ForwardId forward_id = 1;
+
+  // Pairs the two legs of one TCP connection at the relay.
+  string connection_id = 2;
+}
+
+// The relay joined both legs; bytes may flow. Sent to the originator, whose
+// accepted TCP connection was waiting on exactly this.
+message ForwardTunnelAccepted {}
+
+// The sender will write no more bytes on this tunnel. TCP half-close: reads
+// continue until the other direction ends too.
+message ForwardTunnelEof {}
+
+message ForwardTunnelRefusal {
+  ForwardRefusalReason reason = 1;
+
+  // Human-readable: names the unreachable Worker, the detached backer, the
+  // dial error.
+  string detail = 2;
+}
+
+// One frame of a tunnel stream, either direction, either leg.
+message ForwardTunnelFrame {
+  oneof frame {
+    // First frame from the peer that opened the stream.
+    ForwardTunnelOpen open = 1;
+
+    ForwardTunnelAccepted accepted = 2;
+
+    // Terminal, in either direction.
+    ForwardTunnelRefusal refused = 3;
+
+    bytes data = 4;
+
+    ForwardTunnelEof eof = 5;
+  }
+}
+
+// The relay asking the passive side of a forward to carry one new connection:
+// dial your local target and open a tunnel echoing this connection_id. Sent
+// down a serve stream; never journaled.
+message ForwardConnectionRequest {
+  ForwardId forward_id = 1;
+
+  string connection_id = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Intent read model
+// ---------------------------------------------------------------------------
+
+// One live forward intent, as folded from the log.
+message ForwardIntent {
+  ForwardId forward_id = 1;
+
+  SessionId session_id = 2;
+
+  // The owning Agent, whose lifecycle the intent's own is derived from.
+  AgentId agent_id = 3;
+
+  ForwardSpec spec = 4;
+
+  // INJECT only: the backing principal.
+  ClientId backer_client_id = 5;
+}
+
+// The full set of intents a Worker should realize. Sent whole rather than as
+// deltas, so a reconnecting Worker converges without replaying history.
+message ForwardIntentSet {
+  repeated ForwardIntent intents = 1;
+}

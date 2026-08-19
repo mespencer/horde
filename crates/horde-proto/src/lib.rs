@@ -24,6 +24,7 @@ pub mod v1 {
 }
 
 pub mod blob;
+pub mod forward;
 mod ids;
 mod names;
 

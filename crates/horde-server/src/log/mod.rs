@@ -203,6 +203,21 @@ impl EventLog {
             .await
     }
 
+    /// The event already stored under `(session_id, key)`: its sequence and
+    /// payload. `None` for an empty key — the log's "never deduplicate".
+    pub async fn stored_under_key(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>, ServerError> {
+        let session_id = session_id.to_owned();
+        let key = key.to_owned();
+        self.with_connection(move |connection| {
+            store::stored_under_key(connection, &session_id, &key)
+        })
+        .await
+    }
+
     /// The highest journal sequence durably stored for a worker.
     pub async fn worker_journal_watermark(&self, worker_id: &str) -> Result<u64, ServerError> {
         let worker_id = worker_id.to_owned();

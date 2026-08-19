@@ -332,11 +332,46 @@ fn machinery_line(kind: &Kind) -> (&'static str, String) {
                 }),
         ),
         Kind::TurnInterrupted(interrupted) => ("interrupt", interrupted.reason.clone()),
+        Kind::ForwardOpened(opened) => ("forward", forward_opened_text(opened)),
+        Kind::ForwardClosed(closed) => (
+            "forward",
+            joined(
+                &format!(
+                    "closed {}",
+                    closed
+                        .forward_id
+                        .as_ref()
+                        .map_or_else(String::new, ToString::to_string)
+                ),
+                &closed.reason,
+            ),
+        ),
         // Only reachable for a conversational kind handed here directly; the
         // dispatcher never does, but a total answer beats a panic.
         _ => ("unknown", String::new()),
     }
 }
+
+/// One opened forward as feed text: `vite → localhost:5173 (expose)`, the
+/// rendering ADR-0006 promises, with the backer named when there is one.
+fn forward_opened_text(opened: &horde_proto::v1::ForwardOpened) -> String {
+    let Some(spec) = opened.spec.as_ref() else {
+        return String::new();
+    };
+    let direction = forward_direction_name(spec.direction);
+    let mut text = format!(
+        "{} → localhost:{} ({direction})",
+        spec.name, spec.worker_port
+    );
+    if let Some(backer) = opened.backer_client_id.as_ref() {
+        text.push_str(&format!(", backed by {backer}"));
+    }
+    text
+}
+
+/// The wire direction as the word the panel and the feed print — the schema
+/// crate's own vocabulary, re-exported so the fold and the views share it.
+pub use horde_proto::forward::direction_name as forward_direction_name;
 
 /// One journaled usage record as feed text: the *measured* facts only —
 /// token counts as journaled, and a rate-window statement as the provider
@@ -1204,5 +1239,74 @@ mod tests {
         );
         assert_eq!(account_of("", ""), None);
         assert_eq!(super::account_of(None), None);
+    }
+
+    /// The forward feed lines (ADR-0006): an open renders the ADR's own
+    /// `name → localhost:port` shape with the backer named, and a close
+    /// names what closed and why.
+    #[test]
+    fn forward_events_render_as_the_adr_promises() {
+        use horde_proto::v1::{
+            ClientId, ForwardClosed, ForwardDirection, ForwardId, ForwardOpened, ForwardSpec,
+        };
+
+        let opened = Kind::ForwardOpened(ForwardOpened {
+            forward_id: Some(ForwardId::new("fwd-1")),
+            spec: Some(ForwardSpec {
+                direction: ForwardDirection::Inject as i32,
+                name: "db".to_owned(),
+                worker_port: 15432,
+                client_port: 5432,
+            }),
+            opened_by: None,
+            backer_client_id: Some(ClientId::new("laptop")),
+        });
+        let (label, text) = super::describe(Some(&opened));
+        assert_eq!(label, "forward");
+        assert_eq!(text, "db → localhost:15432 (inject), backed by laptop");
+
+        let unbacked = Kind::ForwardOpened(ForwardOpened {
+            forward_id: Some(ForwardId::new("fwd-2")),
+            spec: Some(ForwardSpec {
+                direction: ForwardDirection::Expose as i32,
+                name: "vite".to_owned(),
+                worker_port: 5173,
+                client_port: 0,
+            }),
+            opened_by: None,
+            backer_client_id: None,
+        });
+        let (_label, text) = super::describe(Some(&unbacked));
+        assert_eq!(text, "vite → localhost:5173 (expose)");
+
+        let specless = Kind::ForwardOpened(ForwardOpened::default());
+        let (_label, text) = super::describe(Some(&specless));
+        assert_eq!(
+            text, "",
+            "a specless open renders nothing rather than lying"
+        );
+
+        let closed = Kind::ForwardClosed(ForwardClosed {
+            forward_id: Some(ForwardId::new("fwd-1")),
+            closed_by: None,
+            reason: "done".to_owned(),
+        });
+        let (label, text) = super::describe(Some(&closed));
+        assert_eq!(label, "forward");
+        assert_eq!(text, "closed fwd-1: done");
+    }
+
+    #[test]
+    fn forward_directions_name_themselves() {
+        use horde_proto::v1::ForwardDirection;
+        assert_eq!(
+            super::forward_direction_name(ForwardDirection::Expose as i32),
+            "expose"
+        );
+        assert_eq!(
+            super::forward_direction_name(ForwardDirection::Inject as i32),
+            "inject"
+        );
+        assert_eq!(super::forward_direction_name(99), "unspecified");
     }
 }

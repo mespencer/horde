@@ -143,6 +143,29 @@ pub async fn serve_core(core: ServerCore) -> Setup<String> {
     Ok(format!("http://{address}"))
 }
 
+/// A TCP echo server on a loopback port the caller owns — the workspace (or
+/// backer-machine) process every forward scenario stands in front of
+/// (ADR-0006). Bound on `:0`, address passed back, never a claim about any
+/// port the test does not hold; the accept loop ends when its listener dies
+/// with the test.
+///
+/// # Errors
+///
+/// The bind failing.
+pub async fn echo_server() -> Setup<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        while let Ok((socket, _peer)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut read, mut write) = socket.into_split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    Ok((addr, task))
+}
+
 /// Opens a journal stream and announces the worker's journal position.
 ///
 /// Returns the sender and the ack stream with the first ack unread: the caller

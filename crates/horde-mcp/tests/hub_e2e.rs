@@ -45,44 +45,86 @@ fn modes() -> PermissionModes {
     )
 }
 
+/// Stands the whole stack up in named, individually bounded stages.
+///
+/// One shared ceiling over all eight hops is what failed here once: a
+/// cargo-mutants scratch baseline on a loaded machine starved the stand-up
+/// (dominated by the freshly linked stub binary's first-exec validation —
+/// see `stub_mcp::warm`) and every test reported only that "the stack" hung,
+/// naming no hop. Each hop now carries its own ceiling-bounded stage, so a
+/// hang is a named failure, and the one environment-priced cost is paid
+/// once, up front, under its own explicit bound.
 async fn stack() -> Setup<Stack> {
-    let horde = harness_with_permissions(modes(), None).await?;
+    let horde = common::stage(
+        "the permissioned server stands up",
+        harness_with_permissions(modes(), None),
+    )
+    .await?;
+
+    // The one cost here that belongs to the environment rather than the
+    // code: the stub binary's first launch. Paid before any handshake
+    // depends on it, once per test process.
+    stub_mcp::warm().await?;
 
     // -- The hub, at the "server": two user servers, connected once. --------
     let hub_proxy = ToolProxy::new()
-        .with_server(stub_mcp::upstream("linear").await?)
-        .with_server(stub_mcp::upstream("payments").await?);
+        .with_server(
+            common::stage(
+                "the hub's linear upstream connects",
+                stub_mcp::upstream("linear"),
+            )
+            .await?,
+        )
+        .with_server(
+            common::stage(
+                "the hub's payments upstream connects",
+                stub_mcp::upstream("payments"),
+            )
+            .await?,
+        );
     let hub_registry = AgentRegistry::new();
     hub_registry.insert(&horde.agent_id, HUB_TOKEN);
-    let (hub_address, hub_serving) = serve(
-        &EndpointConfig::loopback(0),
-        Arc::new(hub_registry),
-        HubEndpoint::new(Arc::new(hub_proxy)),
-    )
+    let (hub_address, hub_serving) = common::stage("the hub endpoint serves", async {
+        Ok(serve(
+            &EndpointConfig::loopback(0),
+            Arc::new(hub_registry),
+            HubEndpoint::new(Arc::new(hub_proxy)),
+        )
+        .await?)
+    })
     .await?;
 
     // -- The agent's endpoint, at the "worker". ------------------------------
     // The hub link rides the agent's own identity pair, the loopback+bearer
     // local mode; `visible` is what the spawn command resolved for this
     // agent — payments is deliberately absent.
-    let hub_link = Upstream::dial(
-        "hub",
-        &format!("http://{hub_address}/mcp"),
-        Some(HUB_TOKEN),
-        &[("x-horde-agent", &horde.agent_id)],
-    )
+    let hub_link = common::stage("the hub link dials", async {
+        Ok(Upstream::dial(
+            "hub",
+            &format!("http://{hub_address}/mcp"),
+            Some(HUB_TOKEN),
+            &[("x-horde-agent", &horde.agent_id)],
+        )
+        .await?)
+    })
     .await?;
     // The `local` server: a real child process, spawned per-agent from the
     // journaled config's command and env.
-    let local = Upstream::connect(&HubServerConfig {
-        name: "browser".to_owned(),
-        transport: HubTransport::Stdio {
-            command: env!("CARGO_BIN_EXE_mcp_stub_server").to_owned(),
-            args: Vec::new(),
-            env: [].into(),
+    let local = common::stage(
+        "the local child process spawns and completes its handshake",
+        async {
+            Ok(Upstream::connect(&HubServerConfig {
+                name: "browser".to_owned(),
+                transport: HubTransport::Stdio {
+                    command: stub_mcp::BINARY.to_owned(),
+                    args: Vec::new(),
+                    env: [].into(),
+                },
+                placement: Placement::Local,
+            })
+            .await?)
         },
-        placement: Placement::Local,
-    })
+    )
     .await?;
 
     let proxy = ToolProxy::new()
@@ -92,14 +134,21 @@ async fn stack() -> Setup<Stack> {
 
     let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, AGENT_TOKEN);
-    let (address, endpoint_serving) = serve(
-        &EndpointConfig::loopback(0),
-        Arc::new(registry),
-        endpoint.clone(),
-    )
+    let (address, endpoint_serving) = common::stage("the agent endpoint serves", async {
+        Ok(serve(
+            &EndpointConfig::loopback(0),
+            Arc::new(registry),
+            endpoint.clone(),
+        )
+        .await?)
+    })
     .await?;
 
-    let client = McpClient::connect(address, &horde.agent_id, AGENT_TOKEN).await?;
+    let client = common::stage(
+        "the MCP client initializes",
+        McpClient::connect(address, &horde.agent_id, AGENT_TOKEN),
+    )
+    .await?;
     Ok(Stack {
         horde,
         client,
@@ -143,9 +192,7 @@ async fn chain_saw(stack: &Stack, tool_name: &str) -> Setup<bool> {
 
 #[tokio::test]
 async fn the_listed_toolset_is_the_verbs_plus_exactly_what_this_agent_may_see() {
-    let stack = within("the stack stands up", stack())
-        .await
-        .expect("every hop must come up");
+    let stack = stack().await.expect("every hop must come up");
     let names = stack
         .client
         .list_tool_names()
@@ -174,9 +221,7 @@ async fn the_listed_toolset_is_the_verbs_plus_exactly_what_this_agent_may_see() 
 
 #[tokio::test]
 async fn an_allowed_hub_call_round_trips_and_the_chain_was_in_its_path() {
-    let stack = within("the stack stands up", stack())
-        .await
-        .expect("every hop must come up");
+    let stack = stack().await.expect("every hop must come up");
 
     let answer = within(
         "the call crosses endpoint, chain, hub, and upstream",
@@ -200,9 +245,7 @@ async fn an_allowed_hub_call_round_trips_and_the_chain_was_in_its_path() {
 
 #[tokio::test]
 async fn a_denied_hub_call_is_stopped_at_the_endpoint_with_the_rules_reason() {
-    let stack = within("the stack stands up", stack())
-        .await
-        .expect("every hop must come up");
+    let stack = stack().await.expect("every hop must come up");
 
     let rpc = within(
         "the denial answers",
@@ -227,9 +270,7 @@ async fn a_denied_hub_call_is_stopped_at_the_endpoint_with_the_rules_reason() {
 
 #[tokio::test]
 async fn an_invisible_hub_tool_is_unroutable_not_merely_unlisted() {
-    let stack = within("the stack stands up", stack())
-        .await
-        .expect("every hop must come up");
+    let stack = stack().await.expect("every hop must come up");
 
     let rpc = within(
         "the refusal answers",
@@ -259,9 +300,7 @@ async fn an_invisible_hub_tool_is_unroutable_not_merely_unlisted() {
 
 #[tokio::test]
 async fn a_local_servers_tool_rides_the_same_endpoint_and_the_same_chain() {
-    let stack = within("the stack stands up", stack())
-        .await
-        .expect("every hop must come up");
+    let stack = stack().await.expect("every hop must come up");
 
     let answer = within(
         "the local call crosses endpoint, chain, and child process",
@@ -288,9 +327,7 @@ async fn a_local_servers_tool_rides_the_same_endpoint_and_the_same_chain() {
 async fn get_tool_answers_for_exactly_the_tools_this_agent_may_see() {
     use rmcp::ServerHandler;
 
-    let stack = within("the stack stands up", stack())
-        .await
-        .expect("every hop must come up");
+    let stack = stack().await.expect("every hop must come up");
 
     let verb = stack
         .endpoint

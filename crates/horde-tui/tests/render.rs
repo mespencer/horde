@@ -90,6 +90,7 @@ fn escalation(request_id: &str, rendered: &str, tree_path: &[&str]) -> Kind {
             permission_mode: "cautious".to_owned(),
             escalated_from: 0,
             expires_at: None,
+            forward: None,
         }),
     })
 }
@@ -264,5 +265,61 @@ fn a_refusal_shows_in_the_header_without_costing_the_screen() {
     busy_session(&mut app);
     press(&mut app, KeyCode::Enter);
     app.report_error("no permission request req-1 is awaiting a decision");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+/// One forward of each shape (ADR-0006): a reachable expose, a backed
+/// inject, and an unbacked inject whose row names the detached backer —
+/// because the unbacked state's remedy is that principal's return.
+#[test]
+fn the_forward_panel_shows_names_reachability_and_backing() {
+    use horde_proto::v1::{
+        ClientId, ForwardDirection, ForwardId, ForwardIntent, ForwardSpec, ForwardStatus,
+    };
+
+    let forward = |name: &str, direction: ForwardDirection, backer: Option<&str>| ForwardIntent {
+        forward_id: Some(ForwardId::new(format!("fwd-{name}"))),
+        session_id: Some(SessionId::new("s1")),
+        agent_id: Some(AgentId::new("root-1")),
+        spec: Some(ForwardSpec {
+            direction: direction as i32,
+            name: name.to_owned(),
+            worker_port: match direction {
+                ForwardDirection::Expose => 5173,
+                _ => 15432,
+            },
+            client_port: 5432,
+        }),
+        backer_client_id: backer.map(ClientId::new),
+    };
+
+    let mut app = App::overview();
+    busy_session(&mut app);
+    press(&mut app, KeyCode::Char('f'));
+    app.apply(Update::Forwards(vec![
+        ForwardStatus {
+            intent: Some(forward("vite", ForwardDirection::Expose, None)),
+            worker_reachable: true,
+            backed: false,
+        },
+        ForwardStatus {
+            intent: Some(forward("db", ForwardDirection::Inject, Some("laptop"))),
+            worker_reachable: true,
+            backed: true,
+        },
+        ForwardStatus {
+            intent: Some(forward("cache", ForwardDirection::Inject, Some("desk"))),
+            worker_reachable: false,
+            backed: false,
+        },
+    ]));
+    press(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn an_empty_forward_panel_says_so() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('f'));
     insta::assert_snapshot!(drawn(&app));
 }

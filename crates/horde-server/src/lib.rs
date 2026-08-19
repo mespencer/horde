@@ -13,6 +13,7 @@
 pub mod blob;
 pub mod enrollment;
 pub mod error;
+pub mod forward;
 pub mod log;
 pub mod mcp;
 pub mod permission;

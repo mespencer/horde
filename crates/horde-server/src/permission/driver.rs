@@ -172,8 +172,10 @@ impl ChainDriver {
         loop {
             let page = self.log.read_global_from(self.cursor, PAGE).await?;
             // Terminates on the page it read: the rows this loop itself
-            // appends are decisions and enriched re-raises, and `consider`
-            // appends nothing for either, so the tail it chases is finite.
+            // appends are decisions, enriched re-raises, and the forward
+            // opens a settling decision produces — and `consider` appends
+            // nothing for a re-raise or a `ForwardOpened`, while a decision
+            // appends at most one open, so the tail it chases is finite.
             let Some(last) = page.last() else {
                 return Ok(appended);
             };
@@ -187,6 +189,15 @@ impl ChainDriver {
 
     /// Acts on one log row, returning how many events it appended.
     async fn consider(&self, global: &GlobalEvent) -> Result<u64, ServerError> {
+        // A settling decision may open the forward it approved (ADR-0006).
+        // Routed through this driver — the one log-ordered writer — so the
+        // first acceptance *in the log* is the one whose principal backs an
+        // inject, however the racing RPCs interleaved. The appended
+        // `ForwardOpened` triggers nothing further, so the tail this fold
+        // chases stays finite.
+        if let Some(decision) = crate::forward::intent::settled_in(global) {
+            return crate::forward::intent::open_for_settled(&self.log, global, &decision).await;
+        }
         let Some(request) = raised_in(global) else {
             return Ok(0);
         };
@@ -231,9 +242,18 @@ impl ChainDriver {
         );
         let ancestry = ancestry(state, &pending.agent_id);
 
-        let settled = self
-            .ruling_for(mode_name, pending.tool_call.as_ref(), &ancestry, state)
-            .await;
+        // An inject skips every automatic layer (ADR-0006): acceptance and
+        // backing are one act, and only a client's connection can back one —
+        // a rule or judge that "allowed" it would open an intent nothing can
+        // ever serve.
+        let settled = if crate::forward::intent::forward_needs_human(pending) {
+            Settled::Escalate {
+                from: PermissionLayer::DeterministicAllow,
+            }
+        } else {
+            self.ruling_for(mode_name, pending.tool_call.as_ref(), &ancestry, state)
+                .await
+        };
 
         let (key, event) = match settled {
             Settled::Decided {
@@ -1285,6 +1305,306 @@ mod tests {
             ancestry(&state, "a"),
             vec!["b-type".to_owned(), "a-type".to_owned()],
             "each agent contributes once, and the walk ends"
+        );
+    }
+
+    // -- forwards through the chain (ADR-0006) -------------------------------
+
+    fn forward_spec(
+        direction: horde_proto::v1::ForwardDirection,
+        name: &str,
+    ) -> horde_proto::v1::ForwardSpec {
+        horde_proto::v1::ForwardSpec {
+            direction: direction as i32,
+            name: name.to_owned(),
+            worker_port: 5173,
+            client_port: if direction == horde_proto::v1::ForwardDirection::Inject {
+                5432
+            } else {
+                0
+            },
+        }
+    }
+
+    /// A `PermissionRequested` proposing a forward: [`requested`]'s shape —
+    /// the tool call the rules match on — plus the spec the opener journals.
+    fn forward_requested(
+        agent: &str,
+        request_id: &str,
+        spec: horde_proto::v1::ForwardSpec,
+    ) -> Event {
+        let call = ProposedToolCall {
+            tool_name: "expose".to_owned(),
+            input: None,
+            rendered: format!("{} {}", spec.name, spec.worker_port),
+        };
+        let mut event = requested(agent, request_id, Some(call));
+        if let Some(Kind::PermissionRequested(raised)) = event.kind.as_mut()
+            && let Some(request) = raised.request.as_mut()
+        {
+            request.forward = Some(spec);
+        }
+        event
+    }
+
+    /// [`human_decided`], attributed to a client principal — the shape
+    /// `AnswerPermission` writes, and what backs an inject.
+    fn client_decided(agent: &str, request_id: &str, client: &str) -> Event {
+        let mut event = human_decided(agent, request_id, false);
+        if let Some(Kind::PermissionDecided(decided)) = event.kind.as_mut()
+            && let Some(decision) = decided.decision.as_mut()
+        {
+            decision.decided_by_actor = Some(horde_proto::v1::Actor {
+                actor: Some(horde_proto::v1::actor::Actor::ClientId(
+                    horde_proto::v1::ClientId::new(client),
+                )),
+            });
+        }
+        event
+    }
+
+    async fn forwards_in(log: &EventLog, session: &str) -> Vec<horde_proto::v1::ForwardOpened> {
+        events_in(log, session)
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                Some(Kind::ForwardOpened(opened)) => Some(opened),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A mode that deterministically allows the expose verb — the "expected
+    /// mode auto-allows within a named policy" path of ADR-0006.
+    fn allows_expose() -> PermissionModes {
+        PermissionModes::default().with_mode(
+            "forwarding",
+            PermissionMode::escalate_everything().allow(Rule::tool("expose")),
+        )
+    }
+
+    async fn one_forward_request(log: &EventLog, spec: horde_proto::v1::ForwardSpec) {
+        append(
+            log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "forwarding", &["ci-fix"]),
+        )
+        .await;
+        append(log, "s1", "req-1", forward_requested("root", "req-1", spec)).await;
+    }
+
+    /// One forward request under `allows_expose`, accepted by these clients
+    /// in log order, then one full chain pass — the arrangement every
+    /// settled-forward test shares.
+    async fn settled_forward_run(
+        spec: horde_proto::v1::ForwardSpec,
+        accepting_clients: &[&str],
+    ) -> EventLog {
+        let log = EventLog::in_memory().expect("log");
+        one_forward_request(&log, spec).await;
+        for (ordinal, client) in accepting_clients.iter().enumerate() {
+            append(
+                &log,
+                "s1",
+                &format!("human-{ordinal}"),
+                client_decided("root", "req-1", client),
+            )
+            .await;
+        }
+        run_chain(&log, allows_expose(), None).await;
+        log
+    }
+
+    #[tokio::test]
+    async fn an_allowed_expose_opens_its_forward_with_no_backer() {
+        let log = settled_forward_run(
+            forward_spec(horde_proto::v1::ForwardDirection::Expose, "vite"),
+            &[],
+        )
+        .await;
+
+        let opened = forwards_in(&log, "s1").await;
+        assert_eq!(opened.len(), 1, "one settling allow, one open");
+        assert_eq!(
+            opened[0].forward_id.as_ref().map(ToString::to_string),
+            Some("fwd-req-1".to_owned()),
+            "the id derives from the request, so restarts deduplicate"
+        );
+        assert_eq!(
+            opened[0].backer_client_id, None,
+            "an expose has no backer; every client realizes it independently"
+        );
+        assert_eq!(
+            opened[0].spec.as_ref().map(|spec| spec.name.clone()),
+            Some("vite".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_expose_opens_nothing() {
+        let log = EventLog::in_memory().expect("log");
+        one_forward_request(
+            &log,
+            forward_spec(horde_proto::v1::ForwardDirection::Expose, "vite"),
+        )
+        .await;
+        // The mode denies the verb outright.
+        let modes = PermissionModes::default().with_mode(
+            "forwarding",
+            PermissionMode::escalate_everything().deny(Rule::tool("expose"), "no forwards here"),
+        );
+
+        run_chain(&log, modes, None).await;
+
+        assert_eq!(decisions_in(&log, "s1").await.len(), 1, "denied");
+        assert!(forwards_in(&log, "s1").await.is_empty());
+    }
+
+    /// The physics gate, through the whole driver: an inject escalates even
+    /// under a mode that would allow the verb, because no automatic layer
+    /// can back one.
+    #[tokio::test]
+    async fn an_inject_escalates_past_every_automatic_layer() {
+        let log = settled_forward_run(
+            forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &[],
+        )
+        .await;
+
+        assert!(
+            decisions_in(&log, "s1").await.is_empty(),
+            "no rule and no judge may settle an inject"
+        );
+        let requests = requests_in(&log, "s1").await;
+        assert_eq!(requests.len(), 2, "escalated to the inbox instead");
+        assert_eq!(
+            requests[1].forward.as_ref().map(|spec| spec.direction),
+            Some(horde_proto::v1::ForwardDirection::Inject as i32),
+            "the escalation still carries the spec the acceptance will open"
+        );
+    }
+
+    /// Acceptance and backing are one act: the accepting client's principal
+    /// is journaled as the backer.
+    #[tokio::test]
+    async fn a_humans_acceptance_opens_the_inject_and_backs_it() {
+        let log = settled_forward_run(
+            forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &["laptop"],
+        )
+        .await;
+
+        let opened = forwards_in(&log, "s1").await;
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            opened[0].backer_client_id.as_ref().map(ToString::to_string),
+            Some("laptop".to_owned())
+        );
+    }
+
+    /// The first-accept-backs race: whichever acceptance settled the request
+    /// in the log is the backer, and the loser opens nothing.
+    #[tokio::test]
+    async fn racing_acceptances_back_the_first_in_the_log() {
+        let log = settled_forward_run(
+            forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &["laptop", "desk"],
+        )
+        .await;
+
+        let opened = forwards_in(&log, "s1").await;
+        assert_eq!(opened.len(), 1, "one open, however many answers raced");
+        assert_eq!(
+            opened[0].backer_client_id.as_ref().map(ToString::to_string),
+            Some("laptop".to_owned()),
+            "log order, not RPC arrival, elects the backer"
+        );
+    }
+
+    /// A decision that is not a client's cannot back an inject; the intent
+    /// is not opened at all rather than opened unbackable.
+    #[tokio::test]
+    async fn a_server_attributed_allow_cannot_back_an_inject() {
+        let log = settled_forward_run(
+            forward_spec(horde_proto::v1::ForwardDirection::Inject, "db"),
+            &[],
+        )
+        .await;
+        append(&log, "s1", "human-1", human_decided("root", "req-1", false)).await;
+        run_chain(&log, allows_expose(), None).await;
+
+        assert!(
+            forwards_in(&log, "s1").await.is_empty(),
+            "an unattributed allow opens nothing"
+        );
+    }
+
+    /// The restart property: re-reading the whole log must deduplicate into
+    /// the same single open.
+    #[tokio::test]
+    async fn a_restarted_driver_does_not_open_twice() {
+        let log = settled_forward_run(
+            forward_spec(horde_proto::v1::ForwardDirection::Expose, "vite"),
+            &[],
+        )
+        .await;
+        let second = run_chain(&log, allows_expose(), None).await;
+
+        assert_eq!(forwards_in(&log, "s1").await.len(), 1);
+        assert_eq!(second, 0, "a second full pass appends nothing");
+    }
+
+    /// A name that went live while the request waited is not silently
+    /// doubled: the approval opens nothing.
+    #[tokio::test]
+    async fn an_approval_cannot_double_a_live_name() {
+        let log = EventLog::in_memory().expect("log");
+        append(
+            &log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "forwarding", &["ci-fix"]),
+        )
+        .await;
+        // A forward named "vite" is already live.
+        append(
+            &log,
+            "s1",
+            "open-existing",
+            agent_event(
+                "root",
+                Kind::ForwardOpened(horde_proto::v1::ForwardOpened {
+                    forward_id: Some(horde_proto::v1::ForwardId::new("fwd-existing")),
+                    spec: Some(forward_spec(
+                        horde_proto::v1::ForwardDirection::Expose,
+                        "vite",
+                    )),
+                    opened_by: None,
+                    backer_client_id: None,
+                }),
+            ),
+        )
+        .await;
+        append(
+            &log,
+            "s1",
+            "req-1",
+            forward_requested(
+                "root",
+                "req-1",
+                forward_spec(horde_proto::v1::ForwardDirection::Expose, "vite"),
+            ),
+        )
+        .await;
+
+        run_chain(&log, allows_expose(), None).await;
+
+        let opened = forwards_in(&log, "s1").await;
+        assert_eq!(opened.len(), 1, "only the pre-existing forward");
+        assert_eq!(
+            opened[0].forward_id.as_ref().map(ToString::to_string),
+            Some("fwd-existing".to_owned())
         );
     }
 

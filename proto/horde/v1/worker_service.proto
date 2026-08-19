@@ -15,6 +15,7 @@ package horde.v1;
 
 import "horde/v1/agent.proto";
 import "horde/v1/event.proto";
+import "horde/v1/forward.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
 import "horde/v1/mcp.proto";
@@ -43,6 +44,22 @@ service WorkerService {
   // is how the Server's cache is corrected after a wiped disk or an
   // out-of-band deletion.
   rpc ReportWorkspaceInstances(ReportWorkspaceInstancesRequest) returns (ReportWorkspaceInstancesResponse);
+
+  // -- Port forwards (ADR-0006) ---------------------------------------------
+  //
+  // Deliberately NOT the command stream: realization is tied to connection
+  // liveness, so intents ride an ephemeral stream that dying takes the
+  // realization with it, and reconnecting re-sends the whole set.
+
+  // Subscribe to the forward plane. The Server pushes the full intent set for
+  // Agents placed here (on subscribe and on every change), plus one
+  // ForwardConnectionRequest per Client-side connection to an EXPOSE.
+  rpc StreamForwards(StreamForwardsRequest) returns (stream StreamForwardsResponse);
+
+  // One TCP connection's bytes, Worker leg. Opened per
+  // ForwardConnectionRequest (EXPOSE), or per accepted connection on an
+  // INJECT listener.
+  rpc WorkerForwardTunnel(stream WorkerForwardTunnelRequest) returns (stream WorkerForwardTunnelResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +249,38 @@ message PushEventsResponse {
     PushEventsAccepted accepted = 1;
     JournalAck ack = 2;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Port forwards
+// ---------------------------------------------------------------------------
+
+message StreamForwardsRequest {
+  WorkerId worker_id = 1;
+}
+
+message StreamForwardsResponse {
+  oneof update {
+    // Complete replacement, not a delta — the same reasoning as
+    // ReportCapabilities: partial updates are how a Worker ends up realizing
+    // intents that stopped being true.
+    ForwardIntentSet intents = 1;
+
+    // EXPOSE: dial the target port and answer with a WorkerForwardTunnel
+    // echoing this connection_id.
+    ForwardConnectionRequest connection = 2;
+  }
+}
+
+// One frame of the Worker leg, either direction. Wrappers for the same
+// reason as the Client leg's: buf wants RPC-named, RPC-unique types, and the
+// frame vocabulary lives in forward.proto.
+message WorkerForwardTunnelRequest {
+  ForwardTunnelFrame frame = 1;
+}
+
+message WorkerForwardTunnelResponse {
+  ForwardTunnelFrame frame = 1;
 }
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "horde/v1/agent.proto";
 import "horde/v1/event.proto";
+import "horde/v1/forward.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
 import "horde/v1/mcp.proto";
@@ -91,6 +92,31 @@ service ControlPlaneService {
   // -- Usage ----------------------------------------------------------------
 
   rpc QueryUsage(QueryUsageRequest) returns (QueryUsageResponse);
+
+  // -- Port forwards (ADR-0006) ---------------------------------------------
+
+  // Journal a forward intent. Client-initiated: an expose needs no chain (a
+  // human is already the authority), and a client-initiated inject has no
+  // selection problem — the initiator is the backer.
+  rpc OpenForward(OpenForwardRequest) returns (OpenForwardResponse);
+
+  rpc CloseForward(CloseForwardRequest) returns (CloseForwardResponse);
+
+  // Live intents plus the realization overlay the log deliberately does not
+  // carry: whether the placed Worker is reachable and whether an inject is
+  // currently backed.
+  rpc ListForwards(ListForwardsRequest) returns (ListForwardsResponse);
+
+  // Back this Client's inject forwards: the relay pushes one
+  // ForwardConnectionRequest per Worker-side connection, and the Client
+  // answers each with a ForwardTunnel dial of its local target. Backing IS
+  // this stream's liveness — its drop is what "unbacked" means, and the
+  // owning Client's return re-backs without re-declaration.
+  rpc ServeForwards(ServeForwardsRequest) returns (stream ServeForwardsResponse);
+
+  // One TCP connection's bytes, Client leg. Opened by the Client per accepted
+  // local connection (EXPOSE), or per ForwardConnectionRequest (INJECT).
+  rpc ForwardTunnel(stream ForwardTunnelRequest) returns (stream ForwardTunnelResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +509,82 @@ message RevokeEnrollmentRequest {
 message RevokeEnrollmentResponse {
   // Certificate serial added to the deny-list.
   string revoked_serial = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Port forwards
+// ---------------------------------------------------------------------------
+
+message OpenForwardRequest {
+  SessionId session_id = 1;
+
+  // The owning Agent: the intent's liveness is derived from its lifecycle.
+  AgentId agent_id = 2;
+
+  ForwardSpec spec = 3;
+
+  // Makes retry after a lost response safe.
+  string idempotency_key = 4;
+}
+
+message OpenForwardResponse {
+  ForwardId forward_id = 1;
+
+  // Log position of the ForwardOpened event.
+  uint64 sequence = 2;
+}
+
+message CloseForwardRequest {
+  SessionId session_id = 1;
+
+  ForwardId forward_id = 2;
+
+  string reason = 3;
+}
+
+message CloseForwardResponse {
+  uint64 sequence = 1;
+}
+
+message ListForwardsRequest {
+  // Empty means every Session.
+  SessionId session_id = 1;
+}
+
+// One live intent plus its ephemeral realization state. The overlay comes
+// from the relay's registry, never the log — which is exactly why this RPC
+// exists instead of a fold every client repeats.
+message ForwardStatus {
+  ForwardIntent intent = 1;
+
+  // EXPOSE: the placed Worker has a live forward serve stream, so a tunnel
+  // opened now would relay rather than refuse.
+  bool worker_reachable = 2;
+
+  // INJECT: the backer principal has a live serve stream. False is the
+  // unbacked state the Worker-side listener refuses in.
+  bool backed = 3;
+}
+
+message ListForwardsResponse {
+  repeated ForwardStatus forwards = 1;
+}
+
+message ServeForwardsRequest {}
+
+message ServeForwardsResponse {
+  ForwardConnectionRequest connection = 1;
+}
+
+// One frame of the Client leg, either direction. Wrappers rather than the
+// bare frame because buf's STANDARD ruleset wants RPC-named, RPC-unique
+// request and response types; the frame vocabulary lives in forward.proto.
+message ForwardTunnelRequest {
+  ForwardTunnelFrame frame = 1;
+}
+
+message ForwardTunnelResponse {
+  ForwardTunnelFrame frame = 1;
 }
 
 // ---------------------------------------------------------------------------

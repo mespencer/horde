@@ -333,6 +333,62 @@ impl WorkerService for WorkerFacing {
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
+    type StreamForwardsStream =
+        Pin<Box<dyn Stream<Item = Result<horde_proto::v1::StreamForwardsResponse, Status>> + Send>>;
+
+    /// The forward plane's worker leg (ADR-0006). Deliberately NOT the
+    /// command stream: intents ride this ephemeral stream so that its death
+    /// takes the realization with it, and a reconnect re-sends the whole set.
+    #[instrument(skip_all)]
+    async fn stream_forwards(
+        &self,
+        request: Request<horde_proto::v1::StreamForwardsRequest>,
+    ) -> Result<Response<Self::StreamForwardsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
+        let worker_id = forward_worker_id(&request);
+        if worker_id.is_empty() {
+            return Err(Status::from(ServerError::Invalid(
+                "a forward stream must name its worker".to_owned(),
+            )));
+        }
+
+        let (epoch, lane) = self.core.forwards.register_worker(&worker_id);
+        // Subscribe before the first computation, so an intent appended
+        // during it is either in the set or in the channel.
+        let notifications = self.core.log.subscribe();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let deny = self.deny.clone();
+        let core = self.core.clone();
+        tokio::spawn(async move {
+            let pump = pump_forwards(&core, &worker_id, lane, notifications, &sender);
+            super::shared::run_severable(pump, deny, serial, &sender).await;
+            core.forwards
+                .deregister_worker_if_current(&worker_id, epoch);
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    type WorkerForwardTunnelStream = Pin<
+        Box<dyn Stream<Item = Result<horde_proto::v1::WorkerForwardTunnelResponse, Status>> + Send>,
+    >;
+
+    #[instrument(skip_all)]
+    async fn worker_forward_tunnel(
+        &self,
+        request: Request<Streaming<horde_proto::v1::WorkerForwardTunnelRequest>>,
+    ) -> Result<Response<Self::WorkerForwardTunnelStream>, Status> {
+        Ok(super::forwards::tunnel_response(
+            &self.core,
+            self.deny.clone(),
+            request,
+            |message: horde_proto::v1::WorkerForwardTunnelRequest| {
+                message.frame.unwrap_or_default()
+            },
+            |frame| horde_proto::v1::WorkerForwardTunnelResponse { frame: Some(frame) },
+        ))
+    }
+
     #[instrument(skip_all)]
     async fn report_capabilities(
         &self,
@@ -464,6 +520,139 @@ async fn handle_start(
             resume_from_journal_sequence: stored.saturating_add(1),
         })),
     })
+}
+
+/// The worker a forward stream serves: the mTLS principal when the channel
+/// names a worker (certificates are authoritative), else the id the request
+/// claims — the same plaintext-bootstrap trust `RegisterWorker` extends.
+fn forward_worker_id(request: &Request<horde_proto::v1::StreamForwardsRequest>) -> String {
+    if let crate::forward::registry::TunnelPrincipal::Worker(name) =
+        super::forwards::tunnel_principal_of(request)
+    {
+        return name;
+    }
+    request
+        .get_ref()
+        .worker_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default()
+}
+
+/// How many queued notifications one recompute may absorb. A bound, not a
+/// deadline: the drain is by count, and anything past it simply wakes the
+/// next iteration.
+const NOTIFICATION_DRAIN: u32 = 256;
+
+/// The forward stream's life: push the current intent set, then re-push on
+/// every intent-moving append and relay connection requests as they arrive.
+async fn pump_forwards(
+    core: &ServerCore,
+    worker_id: &str,
+    mut lane: tokio::sync::mpsc::Receiver<horde_proto::v1::ForwardConnectionRequest>,
+    mut notifications: tokio::sync::broadcast::Receiver<crate::log::Notification>,
+    sender: &tokio::sync::mpsc::Sender<Result<horde_proto::v1::StreamForwardsResponse, Status>>,
+) {
+    // The first send is unconditional, empty set included: a reconnecting
+    // worker must learn "you have no intents" to drop stale listeners.
+    let mut last_sent: Option<Vec<horde_proto::v1::ForwardIntent>> = None;
+    if !push_intents(core, worker_id, &mut last_sent, sender).await {
+        return;
+    }
+    loop {
+        tokio::select! {
+            // The worker hung up. Noticed here rather than on the next failed
+            // send, because deregistration is what turns tunnel opens into
+            // fast WORKER_UNREACHABLE refusals instead of pairing-deadline
+            // stalls.
+            () = sender.closed() => return,
+            connection = lane.recv() => {
+                // A closed lane means a newer stream replaced this one; the
+                // replacement carries the intents from here on.
+                let Some(connection) = connection else { return };
+                let update = horde_proto::v1::StreamForwardsResponse {
+                    update: Some(horde_proto::v1::stream_forwards_response::Update::Connection(
+                        connection,
+                    )),
+                };
+                if sender.send(Ok(update)).await.is_err() {
+                    return;
+                }
+            }
+            first = notifications.recv() => {
+                let mut notes = Vec::new();
+                let lagged_first = match first {
+                    Ok(note) => {
+                        notes.push(note);
+                        false
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    // Lagged: the hint channel overflowed. The log is the
+                    // truth, so recompute unconditionally.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                };
+                let lagged = drain_notifications(&mut notifications, &mut notes) || lagged_first;
+                // A lag means rows were missed, so the filter cannot vouch
+                // for them; a read error is treated the same, conservatively.
+                let recompute = lagged
+                    || super::forwards::any_affects_forwards(core, &notes)
+                        .await
+                        .unwrap_or(true);
+                if recompute && !push_intents(core, worker_id, &mut last_sent, sender).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Drains queued notifications into `notes`, count-bounded. Returns whether
+/// the drain itself demands a recompute — it lagged, so rows were missed and
+/// the filter cannot vouch for them.
+fn drain_notifications(
+    notifications: &mut tokio::sync::broadcast::Receiver<crate::log::Notification>,
+    notes: &mut Vec<crate::log::Notification>,
+) -> bool {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let mut lagged = false;
+    for _ in 0..NOTIFICATION_DRAIN {
+        match notifications.try_recv() {
+            Ok(note) => notes.push(note),
+            Err(TryRecvError::Lagged(_)) => lagged = true,
+            Err(_) => break,
+        }
+    }
+    lagged
+}
+
+/// Recomputes and pushes the intent set if it changed since the last push.
+/// Returns whether the stream is still worth pumping.
+async fn push_intents(
+    core: &ServerCore,
+    worker_id: &str,
+    last_sent: &mut Option<Vec<horde_proto::v1::ForwardIntent>>,
+    sender: &tokio::sync::mpsc::Sender<Result<horde_proto::v1::StreamForwardsResponse, Status>>,
+) -> bool {
+    let intents = match crate::forward::intent::intents_for_worker(&core.log, worker_id).await {
+        Ok(intents) => intents,
+        Err(error) => {
+            let _ = sender.send(Err(Status::from(error))).await;
+            return false;
+        }
+    };
+    if last_sent.as_ref() == Some(&intents) {
+        return true;
+    }
+    let update = horde_proto::v1::StreamForwardsResponse {
+        update: Some(horde_proto::v1::stream_forwards_response::Update::Intents(
+            horde_proto::v1::ForwardIntentSet {
+                intents: intents.clone(),
+            },
+        )),
+    };
+    let delivered = sender.send(Ok(update)).await.is_ok();
+    *last_sent = Some(intents);
+    delivered
 }
 
 #[cfg(test)]
@@ -659,6 +848,188 @@ mod tests {
             }
             other => panic!("expected Accepted, got {other:?}"),
         }
+    }
+
+    /// The certificate outranks the request, and the request fills in for
+    /// plaintext bootstrap — with a client cert naming nothing, because a
+    /// client is not a worker.
+    #[test]
+    fn the_forward_stream_takes_its_worker_from_cert_then_request() {
+        use horde_identity::{PeerIdentity, Principal, PrincipalRole};
+
+        let request = |identity: Option<PrincipalRole>, claimed: Option<&str>| {
+            let mut request = tonic::Request::new(horde_proto::v1::StreamForwardsRequest {
+                worker_id: claimed.map(horde_proto::v1::WorkerId::new),
+            });
+            if let Some(role) = identity {
+                request.extensions_mut().insert(PeerIdentity {
+                    principal: Principal::new(role, "gpu-box").expect("a valid name"),
+                    serial_hex: "0a".to_owned(),
+                });
+            }
+            request
+        };
+
+        assert_eq!(
+            super::forward_worker_id(&request(Some(PrincipalRole::Worker), Some("claimed"))),
+            "gpu-box",
+            "the certificate is authoritative over the claim"
+        );
+        assert_eq!(
+            super::forward_worker_id(&request(None, Some("claimed"))),
+            "claimed",
+            "plaintext bootstrap trusts the request, as RegisterWorker does"
+        );
+        assert_eq!(
+            super::forward_worker_id(&request(Some(PrincipalRole::Client), Some("claimed"))),
+            "claimed",
+            "a client certificate names no worker; the claim fills in"
+        );
+        assert_eq!(super::forward_worker_id(&request(None, None)), "");
+    }
+
+    /// One agent placed on `worker`, exposing — the pump tests' log fixture.
+    async fn forward_core(worker: &str) -> ServerCore {
+        let core = ServerCore::new(crate::log::EventLog::in_memory().expect("log"));
+        crate::forward::testfix::placed_expose(&core.log, "s1", "agent-1", worker).await;
+        core
+    }
+
+    fn intents_of(
+        update: &horde_proto::v1::StreamForwardsResponse,
+    ) -> Option<&horde_proto::v1::ForwardIntentSet> {
+        match update.update.as_ref() {
+            Some(horde_proto::v1::stream_forwards_response::Update::Intents(set)) => Some(set),
+            _ => None,
+        }
+    }
+
+    /// The pump's opening move and its whole life: the current set arrives
+    /// first (even before any log movement), and a connection request pushed
+    /// down the lane is relayed after it — which a pump that returned after
+    /// its first successful push (the deleted-`!` mutant) never does.
+    #[tokio::test]
+    async fn the_forward_pump_sends_the_set_then_relays_connections() {
+        let core = forward_core("w1").await;
+        let (epoch, lane) = core.forwards.register_worker("w1");
+        let lane_feed = core
+            .forwards
+            .lane_to(&crate::forward::registry::PassiveTarget::Worker(
+                "w1".to_owned(),
+            ))
+            .expect("the lane is registered");
+        let notifications = core.log.subscribe();
+        let (sender, mut updates) = tokio::sync::mpsc::channel(8);
+
+        let pump_core = core.clone();
+        let pump = tokio::spawn(async move {
+            super::pump_forwards(&pump_core, "w1", lane, notifications, &sender).await;
+        });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), updates.recv())
+            .await
+            .expect("the set must arrive")
+            .expect("an update")
+            .expect("an ok update");
+        let set = intents_of(&first).expect("the first update is the whole set");
+        assert_eq!(set.intents.len(), 1);
+        assert_eq!(
+            set.intents[0].forward_id.as_ref().map(ToString::to_string),
+            Some("fwd-agent-1".to_owned())
+        );
+
+        lane_feed
+            .try_send(horde_proto::v1::ForwardConnectionRequest {
+                forward_id: Some(horde_proto::v1::ForwardId::new("fwd-agent-1")),
+                connection_id: "c1".to_owned(),
+            })
+            .expect("the lane takes the request");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), updates.recv())
+            .await
+            .expect("the connection must arrive")
+            .expect("an update")
+            .expect("an ok update");
+        match second.update {
+            Some(horde_proto::v1::stream_forwards_response::Update::Connection(request)) => {
+                assert_eq!(request.connection_id, "c1");
+            }
+            other => panic!("expected the relayed connection, got {other:?}"),
+        }
+
+        pump.abort();
+        core.forwards.deregister_worker_if_current("w1", epoch);
+    }
+
+    /// The drain is a bounded collector and a lag detector, both directions:
+    /// an intact queue drains false, an overflowed one reports the lag that
+    /// forces an unconditional recompute.
+    #[test]
+    fn draining_notifications_collects_and_reports_lag() {
+        let (sender, mut intact) = tokio::sync::broadcast::channel(16);
+        sender
+            .send(crate::log::Notification {
+                session_id: "s1".to_owned(),
+                sequence: 1,
+            })
+            .expect("send");
+        let mut notes = Vec::new();
+        assert!(
+            !super::drain_notifications(&mut intact, &mut notes),
+            "nothing was missed"
+        );
+        assert_eq!(notes.len(), 1, "the queued note was collected");
+
+        let (sender, mut lagged) = tokio::sync::broadcast::channel(1);
+        for sequence in 1..=3 {
+            sender
+                .send(crate::log::Notification {
+                    session_id: "s1".to_owned(),
+                    sequence,
+                })
+                .expect("send");
+        }
+        let mut notes = Vec::new();
+        assert!(
+            super::drain_notifications(&mut lagged, &mut notes),
+            "an overflowed hint channel cannot vouch for what it dropped"
+        );
+    }
+
+    /// The push's table: a first push sends and returns true; an unchanged
+    /// recompute sends nothing (the `==` the resend mutant flips); a closed
+    /// peer returns false, which is what ends the pump.
+    #[tokio::test]
+    async fn push_intents_sends_changes_only_and_reports_a_dead_peer() {
+        let core = forward_core("w1").await;
+        let (sender, mut updates) = tokio::sync::mpsc::channel(8);
+        let mut last_sent = None;
+
+        assert!(super::push_intents(&core, "w1", &mut last_sent, &sender).await);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), updates.recv())
+            .await
+            .expect("the set arrives")
+            .expect("an update")
+            .expect("ok");
+        assert_eq!(
+            intents_of(&first).map(|set| set.intents.len()),
+            Some(1),
+            "the first push carries the whole set"
+        );
+
+        assert!(
+            super::push_intents(&core, "w1", &mut last_sent, &sender).await,
+            "an unchanged set is still a healthy stream"
+        );
+        assert!(
+            updates.try_recv().is_err(),
+            "an unchanged set must not be re-sent"
+        );
+
+        drop(updates);
+        assert!(
+            !super::push_intents(&core, "w2", &mut last_sent, &sender).await,
+            "a hung-up peer ends the pump"
+        );
     }
 
     /// Renumbering would forge history and defeat the dedupe index, so a worker

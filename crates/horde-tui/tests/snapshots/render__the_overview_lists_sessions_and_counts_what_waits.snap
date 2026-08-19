@@ -25,4 +25,4 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"[enter] attach  [i] inbox  [r] refresh  [q] quit                                "
+"[enter] attach  [i] inbox  [f] forwards  [r] refresh  [q] quit                  "

@@ -23,6 +23,11 @@ mod attachments;
 mod codex_supervision;
 mod connection;
 mod daemon;
+// Gated like `support`: this suite keeps its helpers as free functions, and
+// the lint policy exempts them under `cfg(test)` — which an integration test
+// binary always compiles with (docs/QUALITY_GATES.md, the clippy section).
+#[cfg(test)]
+mod forwards;
 mod payload_share;
 mod supervision;
 mod workspaces;

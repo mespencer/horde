@@ -83,6 +83,72 @@ pub enum Command {
     /// This machine's own identity: joining, and client codes for others.
     #[command(subcommand)]
     Enroll(EnrollCommand),
+    /// Port forwards (ADR-0006): expose worker ports here, inject local
+    /// ports there.
+    #[command(subcommand)]
+    Forward(ForwardCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ForwardCommand {
+    /// Declare an expose and realize it here: the agent's worker port
+    /// appears on this machine's localhost until ctrl-c. The requested local
+    /// port falls back to an ephemeral one, with the mapping printed.
+    Expose(ForwardExposeArgs),
+    /// Declare an inject and back it here: a local port appears on the
+    /// agent's worker loopback, served by this process until ctrl-c. The
+    /// initiator is the backer.
+    Inject(ForwardInjectArgs),
+    /// Live forwards, with worker reachability and backing.
+    Ls {
+        /// Restrict to one session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Close a forward intent for good.
+    Close {
+        session_id: String,
+        forward_id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Realize every live forward in scope: bind a listener per expose, and
+    /// back the injects this client's principal owns. Reattach = rerun.
+    Serve {
+        /// Restrict to one session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct ForwardExposeArgs {
+    pub session_id: String,
+    /// The owning agent; the intent lives and dies with its lifecycle.
+    pub agent_id: String,
+    /// The port on the agent's worker.
+    pub port: u16,
+    /// The forward's name — forwards are named, not numbered.
+    #[arg(long = "as", default_value = "")]
+    pub name: String,
+    /// The local port to bind; defaults to the worker port.
+    #[arg(long)]
+    pub local_port: Option<u16>,
+}
+
+#[derive(Args, Debug)]
+pub struct ForwardInjectArgs {
+    pub session_id: String,
+    pub agent_id: String,
+    /// The local port whose service the agent should reach.
+    pub port: u16,
+    /// The forward's name — forwards are named, not numbered.
+    #[arg(long = "as", default_value = "")]
+    pub name: String,
+    /// The worker-loopback port where the service appears; defaults to the
+    /// local port.
+    #[arg(long)]
+    pub worker_port: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -644,6 +710,19 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
+        // Routed here rather than through the admin table because serving
+        // needs the invocation's identity: backing is keyed to the enrolled
+        // principal, which only the flags know.
+        Some(Command::Forward(command)) => {
+            run_forward(
+                client,
+                command,
+                cli.identity.as_deref(),
+                format,
+                ctrl_c_ends(),
+            )
+            .await
+        }
         Some(command) => dispatch_admin(client, command, format).await,
     }
 }
@@ -1049,6 +1128,276 @@ async fn run_enroll(
             println!("{}", render::revoked(name, &serials, format));
             Ok(())
         }
+    }
+}
+
+// -- Port forwards (ADR-0006) -------------------------------------------------
+
+/// The foreground verbs' lifetime: until ctrl-c. Injected as a future —
+/// exactly the worker daemon's shutdown shape — so the flows are testable
+/// without a signal.
+async fn ctrl_c_ends() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn run_forward(
+    client: &mut Client,
+    command: &ForwardCommand,
+    identity: Option<&std::path::Path>,
+    format: Format,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ClientError> {
+    match command {
+        ForwardCommand::Expose(args) => run_forward_expose(client, args, format, shutdown).await,
+        ForwardCommand::Inject(args) => run_forward_inject(client, args, format, shutdown).await,
+        ForwardCommand::Ls { session } => {
+            let forwards = client.list_forwards(session.as_deref()).await?;
+            println!("{}", render::forwards(&forwards, format));
+            Ok(())
+        }
+        ForwardCommand::Close {
+            session_id,
+            forward_id,
+            reason,
+        } => {
+            let sequence = client.close_forward(session_id, forward_id, reason).await?;
+            println!("{}", render::sequence("closed", sequence, format));
+            Ok(())
+        }
+        ForwardCommand::Serve { session } => {
+            run_forward_serve(client, session.as_deref(), identity, format, shutdown)
+                .await
+                .map(drop)
+        }
+    }
+}
+
+/// The forward's display name: what `--as` said, or `port-<port>` — a
+/// default rather than a refusal, because the CLI mirrors the agent verb
+/// where the name is likewise the declarer's choice.
+#[must_use]
+pub fn forward_name_or_default(name: &str, port: u16) -> String {
+    if name.is_empty() {
+        format!("port-{port}")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Journals one declaration and returns the id the log minted — the shared
+/// opening move of both foreground forward verbs.
+async fn declare(
+    client: &mut Client,
+    session_id: &str,
+    agent_id: &str,
+    spec: horde_proto::v1::ForwardSpec,
+) -> Result<String, ClientError> {
+    let opened = client.open_forward(session_id, agent_id, spec, "").await?;
+    Ok(opened
+        .forward_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default())
+}
+
+async fn run_forward_expose(
+    client: &mut Client,
+    args: &ForwardExposeArgs,
+    format: Format,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ClientError> {
+    let name = forward_name_or_default(&args.name, args.port);
+    let local_port = u32::from(args.local_port.unwrap_or(0));
+    let spec = horde_proto::v1::ForwardSpec {
+        direction: horde_proto::v1::ForwardDirection::Expose as i32,
+        name: name.clone(),
+        worker_port: u32::from(args.port),
+        client_port: local_port,
+    };
+    let forward_id = declare(client, &args.session_id, &args.agent_id, spec).await?;
+
+    let realized = crate::forward::realize_expose(
+        client,
+        &forward_id,
+        &name,
+        u32::from(args.port),
+        local_port,
+    )
+    .await
+    .map_err(|source| ClientError::File {
+        path: std::path::PathBuf::from("127.0.0.1"),
+        source,
+    })?;
+    println!(
+        "{}",
+        render::forward_realized(
+            &name,
+            &forward_id,
+            realized.local_addr,
+            realized.fell_back,
+            format
+        )
+    );
+
+    // Foreground until the operator says otherwise — a listener is only as
+    // alive as the process holding it, and exiting silently would be a
+    // realization lying about itself.
+    shutdown.await;
+    realized.stop().await;
+    Ok(())
+}
+
+async fn run_forward_inject(
+    client: &mut Client,
+    args: &ForwardInjectArgs,
+    format: Format,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ClientError> {
+    let name = forward_name_or_default(&args.name, args.port);
+    let worker_port = args.worker_port.unwrap_or(args.port);
+    let spec = horde_proto::v1::ForwardSpec {
+        direction: horde_proto::v1::ForwardDirection::Inject as i32,
+        name: name.clone(),
+        worker_port: u32::from(worker_port),
+        client_port: u32::from(args.port),
+    };
+    let forward_id = declare(client, &args.session_id, &args.agent_id, spec).await?;
+
+    println!(
+        "{}",
+        render::forward_backing(&name, &forward_id, args.port, worker_port, format)
+    );
+
+    let targets: crate::forward::InjectTargets = std::sync::Arc::default();
+    if let Ok(mut map) = targets.write() {
+        map.insert(
+            forward_id,
+            crate::forward::InjectTarget {
+                name,
+                client_port: args.port,
+            },
+        );
+    }
+    serve_until_interrupted(client, targets, shutdown).await
+}
+
+/// Serves until shutdown, returning how many exposes were realized — the
+/// one observable fact a headless caller (and a test) can hold this whole
+/// foreground verb to.
+async fn run_forward_serve(
+    client: &mut Client,
+    session: Option<&str>,
+    identity: Option<&std::path::Path>,
+    format: Format,
+    shutdown: impl Future<Output = ()>,
+) -> Result<usize, ClientError> {
+    let statuses = client.list_forwards(session).await?;
+    let principal = enrolled_principal(identity);
+    let plan = crate::forward::ServePlan::from_statuses(&statuses, principal.as_deref());
+
+    let realized = realize_planned(client, &plan.exposes, format).await;
+    for line in backing_lines(&plan.injects, format) {
+        println!("{line}");
+    }
+    let outcome = serve_until_interrupted(client, plan.injects.clone(), shutdown).await;
+    let count = realized.len();
+    stop_all(realized).await;
+    outcome.map(|()| count)
+}
+
+/// Realizes every planned expose; a bind failure costs that one forward,
+/// loudly, never the rest.
+async fn realize_planned(
+    client: &Client,
+    exposes: &[crate::forward::PlannedExpose],
+    format: Format,
+) -> Vec<crate::forward::RealizedExpose> {
+    let mut realized = Vec::new();
+    for expose in exposes {
+        if let Some(listener) = realize_one(client, expose, format).await {
+            realized.push(listener);
+        }
+    }
+    realized
+}
+
+/// One planned expose realized and announced, or a loud `None`.
+async fn realize_one(
+    client: &Client,
+    expose: &crate::forward::PlannedExpose,
+    format: Format,
+) -> Option<crate::forward::RealizedExpose> {
+    match crate::forward::realize_expose(
+        client,
+        &expose.forward_id,
+        &expose.name,
+        expose.worker_port,
+        expose.client_port,
+    )
+    .await
+    {
+        Ok(listener) => {
+            println!(
+                "{}",
+                render::forward_realized(
+                    &expose.name,
+                    &expose.forward_id,
+                    listener.local_addr,
+                    listener.fell_back,
+                    format
+                )
+            );
+            Some(listener)
+        }
+        Err(error) => {
+            eprintln!("could not realize {}: {error}", expose.name);
+            None
+        }
+    }
+}
+
+/// What this invocation backs, rendered — returned rather than printed so
+/// the lines are assertable; the caller owns the printing.
+fn backing_lines(targets: &crate::forward::InjectTargets, format: Format) -> Vec<String> {
+    read_targets(targets)
+        .into_iter()
+        .map(|(forward_id, target)| {
+            render::forward_backing(&target.name, &forward_id, target.client_port, 0, format)
+        })
+        .collect()
+}
+
+/// Backs `targets` until ctrl-c or the serve stream dies — serving IS
+/// backing, so returning is the moment the server counts this client
+/// unbacked.
+async fn serve_until_interrupted(
+    client: &Client,
+    targets: crate::forward::InjectTargets,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ClientError> {
+    tokio::select! {
+        outcome = crate::forward::serve_backing(client, targets) => outcome,
+        () = shutdown => Ok(()),
+    }
+}
+
+/// Tears every realization down, waiting for each accept loop to be gone.
+async fn stop_all(realized: Vec<crate::forward::RealizedExpose>) {
+    for listener in realized {
+        listener.stop().await;
+    }
+}
+
+/// A snapshot of the inject targets, for printing without holding the lock.
+fn read_targets(
+    targets: &crate::forward::InjectTargets,
+) -> Vec<(String, crate::forward::InjectTarget)> {
+    match targets.read() {
+        Ok(map) => map
+            .iter()
+            .map(|(id, target)| (id.clone(), target.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -1880,5 +2229,346 @@ mod enrollment_tests {
             None,
             "an unreadable directory enriches nothing and refuses nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, ForwardCommand, forward_name_or_default};
+
+    /// Forwards are named, not numbered — but the CLI defaults rather than
+    /// refuses, mirroring the agent verb where the name is the declarer's
+    /// choice.
+    #[test]
+    fn a_nameless_forward_defaults_to_its_port() {
+        assert_eq!(forward_name_or_default("vite", 5173), "vite");
+        assert_eq!(forward_name_or_default("", 5173), "port-5173");
+    }
+
+    /// The verb surface, as ADR-0006 names it: `expose <port> --as <name>`,
+    /// `inject` with the worker port defaulted, `ls`, `close`, `serve`.
+    #[test]
+    fn the_forward_verbs_parse_as_the_adr_names_them() {
+        let cli = Cli::try_parse_from([
+            "horde", "forward", "expose", "s1", "agent-1", "5173", "--as", "vite",
+        ])
+        .expect("the expose verb parses");
+        match cli.command {
+            Some(Command::Forward(ForwardCommand::Expose(args))) => {
+                assert_eq!(args.session_id, "s1");
+                assert_eq!(args.agent_id, "agent-1");
+                assert_eq!(args.port, 5173);
+                assert_eq!(args.name, "vite");
+                assert_eq!(
+                    args.local_port, None,
+                    "the local port is the client's choice"
+                );
+            }
+            other => panic!("expected forward expose, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["horde", "forward", "inject", "s1", "agent-1", "5432"])
+            .expect("the inject verb parses");
+        match cli.command {
+            Some(Command::Forward(ForwardCommand::Inject(args))) => {
+                assert_eq!(args.port, 5432);
+                assert_eq!(
+                    args.worker_port, None,
+                    "the worker port defaults to the local one"
+                );
+            }
+            other => panic!("expected forward inject, got {other:?}"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["horde", "forward", "ls"])
+                .expect("ls parses")
+                .command,
+            Some(Command::Forward(ForwardCommand::Ls { session: None }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["horde", "forward", "close", "s1", "fwd-1"])
+                .expect("close parses")
+                .command,
+            Some(Command::Forward(ForwardCommand::Close { .. }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["horde", "forward", "serve", "--session", "s1"])
+                .expect("serve parses")
+                .command,
+            Some(Command::Forward(ForwardCommand::Serve { session: Some(_) }))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod forward_flow_tests {
+    //! The foreground forward verbs, driven whole against a real server —
+    //! the shutdown is an injected future (the worker daemon's own shape),
+    //! which is what makes "until ctrl-c" testable without a signal.
+
+    use horde_proto::v1::{ForwardDirection, ForwardSpec};
+
+    use crate::forward::testing::within;
+
+    use super::{Format, ForwardCommand, run_forward};
+
+    /// One foreground verb driven to completion with an instant shutdown —
+    /// the shared shape of every flow case here.
+    async fn run_headless(
+        client: &mut crate::Client,
+        command: ForwardCommand,
+    ) -> Result<(), crate::ClientError> {
+        within(
+            "the flow completes",
+            run_forward(
+                client,
+                &command,
+                None,
+                Format::Human,
+                std::future::ready(()),
+            ),
+        )
+        .await
+    }
+
+    async fn placed_server() -> (horde_server::service::ServerCore, crate::Client) {
+        let (core, client) = crate::forward::testing::served().await;
+        horde_server_testkit::place_agent(&core.log, "s1", "agent-1", "w1", "serve")
+            .await
+            .expect("the placement seeds");
+        (core, client)
+    }
+
+    fn named(forwards: &[horde_proto::v1::ForwardStatus]) -> Vec<String> {
+        forwards
+            .iter()
+            .filter_map(|status| status.intent.as_ref())
+            .filter_map(|intent| intent.spec.as_ref())
+            .map(|spec| spec.name.clone())
+            .collect()
+    }
+
+    /// The dispatch reports refusals rather than swallowing them: closing a
+    /// forward nobody opened must come back as the server's error.
+    #[tokio::test]
+    async fn the_forward_dispatch_reports_refusals() {
+        let (_core, mut client) = placed_server().await;
+        let refused = run_headless(
+            &mut client,
+            ForwardCommand::Close {
+                session_id: "s1".to_owned(),
+                forward_id: "fwd-none".to_owned(),
+                reason: String::new(),
+            },
+        )
+        .await;
+        assert!(refused.is_err(), "a refused verb must not report success");
+    }
+
+    /// The whole expose verb: declared on the server, realized locally, and
+    /// torn down at shutdown — the journaled intent is the proof the flow
+    /// ran, and it must carry the name the arguments chose.
+    #[tokio::test]
+    async fn the_expose_verb_declares_and_realizes_until_shutdown() {
+        let (_core, mut client) = placed_server().await;
+        run_headless(
+            &mut client,
+            ForwardCommand::Expose(super::ForwardExposeArgs {
+                session_id: "s1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                port: 4242,
+                name: "vite".to_owned(),
+                local_port: None,
+            }),
+        )
+        .await
+        .expect("the flow succeeds");
+
+        let listed = client.list_forwards(Some("s1")).await.expect("the list");
+        assert_eq!(
+            named(&listed),
+            vec!["vite".to_owned()],
+            "the verb's whole point is the journaled intent"
+        );
+    }
+
+    /// The inject verb under a real identity: the initiator is journaled as
+    /// the backer — the acceptance-and-backing-are-one-act rule, spelled by
+    /// the CLI.
+    #[tokio::test]
+    async fn the_inject_verb_backs_under_its_own_principal() {
+        let harness = horde_server_testkit::secure::serve_secured()
+            .await
+            .expect("the secured server starts");
+        let identity = harness
+            .enroll(horde_identity::PrincipalRole::Client, "laptop")
+            .await
+            .expect("the client enrolls");
+        horde_server_testkit::place_agent(&harness.log, "s1", "agent-1", "w1", "reach")
+            .await
+            .expect("the placement seeds");
+        // Dialed with this crate's own client type: the testkit's helper
+        // returns its *own* horde-cli dependency's `Client`, which is a
+        // different crate instance inside this crate's tests.
+        let mut client = crate::Client::connect_with_identity(&harness.main_endpoint(), &identity)
+            .await
+            .expect("the enrolled client dials");
+
+        run_headless(
+            &mut client,
+            ForwardCommand::Inject(super::ForwardInjectArgs {
+                session_id: "s1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                port: 5432,
+                name: "db".to_owned(),
+                worker_port: None,
+            }),
+        )
+        .await
+        .expect("the flow succeeds");
+
+        let listed = client.list_forwards(Some("s1")).await.expect("the list");
+        assert_eq!(named(&listed), vec!["db".to_owned()]);
+        assert_eq!(
+            listed[0]
+                .intent
+                .as_ref()
+                .and_then(|intent| intent.backer_client_id.as_ref())
+                .map(ToString::to_string),
+            Some("laptop".to_owned()),
+            "the initiator is the backer"
+        );
+    }
+
+    /// Serve realizes exactly the live exposes and says how many — the one
+    /// observable a headless caller can hold the verb to.
+    #[tokio::test]
+    async fn serve_counts_what_it_realized() {
+        let (_core, mut client) = placed_server().await;
+        client
+            .open_forward(
+                "s1",
+                "agent-1",
+                ForwardSpec {
+                    direction: ForwardDirection::Expose as i32,
+                    name: "vite".to_owned(),
+                    worker_port: 4242,
+                    client_port: 0,
+                },
+                "open-1",
+            )
+            .await
+            .expect("the intent journals");
+
+        let realized = within(
+            "the serve flow completes",
+            super::run_forward_serve(
+                &mut client,
+                Some("s1"),
+                None,
+                Format::Human,
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("the flow succeeds");
+        assert_eq!(realized, 1, "one live expose, one realization");
+    }
+
+    /// Backing over a plaintext channel is refused by the server, and the
+    /// verb reports it — a serve that cannot back must not claim it did.
+    #[tokio::test]
+    async fn an_unbackable_serve_reports_the_refusal() {
+        let (_core, mut client) = placed_server().await;
+        let outcome = within(
+            "the serve returns",
+            super::run_forward_serve(
+                &mut client,
+                Some("s1"),
+                None,
+                Format::Human,
+                std::future::pending(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the unauthenticated serve stream's refusal must surface"
+        );
+    }
+
+    /// The backing lines are the operator's map of what this process is
+    /// serving; returned rather than printed so they are assertable.
+    #[test]
+    fn backing_lines_render_what_is_backed() {
+        let targets: crate::forward::InjectTargets = std::sync::Arc::default();
+        assert!(super::backing_lines(&targets, Format::Human).is_empty());
+
+        targets.write().expect("writable").insert(
+            "fwd-db".to_owned(),
+            crate::forward::InjectTarget {
+                name: "db".to_owned(),
+                client_port: 5432,
+            },
+        );
+        assert_eq!(
+            super::read_targets(&targets).len(),
+            1,
+            "the snapshot carries the map"
+        );
+        let lines = super::backing_lines(&targets, Format::Human);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("db"), "{}", lines[0]);
+        assert!(lines[0].contains("5432"), "{}", lines[0]);
+    }
+
+    /// Stopping every realization is provable, twice over: the port stops
+    /// answering, and — through an owned witness — the accept loop is
+    /// already gone when `stop_all` returns. The second half is what
+    /// separates a real stop from `Drop`'s fire-and-forget abort: on a
+    /// current-thread runtime, an un-awaited abort has not run when the
+    /// assertion looks.
+    #[tokio::test]
+    async fn stop_all_reaps_every_listener() {
+        let (_core, client) = placed_server().await;
+        let realized = crate::forward::realize_expose(&client, "fwd-x", "x", 4242, 0)
+            .await
+            .expect("the listener binds");
+        let local_addr = realized.local_addr;
+
+        super::stop_all(vec![realized]).await;
+        assert!(
+            tokio::net::TcpStream::connect(local_addr).await.is_err(),
+            "a stopped listener must not keep its port"
+        );
+
+        let (guarded, mut reaped) = crate::forward::testing::guarded_realization();
+        super::stop_all(vec![guarded]).await;
+        assert!(
+            matches!(
+                reaped.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "stop_all must return only after every loop is gone"
+        );
+    }
+
+    /// The foreground lifetime ends on the signal and nothing else: a wait
+    /// that completed with nobody sending one would turn every foreground
+    /// verb into an instant exit. Biased order makes the probe
+    /// deterministic — the wait is polled first, and only its pending-ness
+    /// lets the ready arm win.
+    #[tokio::test]
+    async fn the_foreground_wait_outlives_a_ready_future() {
+        tokio::select! {
+            biased;
+            () = super::ctrl_c_ends() => {
+                panic!("nobody sent a signal, so the wait must not end")
+            }
+            () = std::future::ready(()) => {}
+        }
     }
 }
