@@ -135,3 +135,83 @@ while building it, against **codex-cli 0.147.0**:
   `SandboxPolicy` (unknown or absent modes fail closed to `read-only`;
   `danger-full-access` is unrepresentable), and the chosen tier plus its
   reason is journaled on the agent's first turn.
+
+## Amendment, 2026-08-19: exec approvals route on current codex; the exception is now scoped to file changes
+
+The outstanding debt is paid. The exec/shell re-probe (`drive_approvals.py`,
+transcripts 20–33) ran the configuration matrix against codex-cli **0.148.0**
+and **0.147.0** under fresh per-run `CODEX_HOME`s and throwaway cwds, every
+turn bounded. **For shell/exec commands, the "cannot intercept before they run"
+finding is superseded on any codex this project supports.** What was measured:
+
+- `item/commandExecution/requestApproval` reaches the client **before** the
+  command executes: at 0.147.0 under the granular approval policy this adapter
+  always sends (transcript 33; plain `on-request` still parks there,
+  transcript 32), and at 0.148.0 under either policy (20–22, 25–27). The
+  request carries `reason`, the raw `command`, `cwd`, codex's parse in
+  `commandActions`, a `proposedExecpolicyAmendment` argv, and an advisory
+  `availableDecisions` list — advisory, because transcript 25's list omits
+  `decline` and declining still blocked the command.
+- The decision vocabulary is honored end to end: `decline` completes the exec
+  item as `declined` with no exit code (20–22, 25–27), `accept` runs it
+  (exit 0, transcript 29), `acceptWithExecpolicyAmendment` echoing codex's own
+  argv runs it **and** persists a rule a second turn no longer asked about
+  (transcript 30), and `acceptForSession` is the same vocabulary's
+  session-scoped grant. `cancel` withdraws the question.
+- **`approvalsReviewer: "auto_review"` is a security hazard, not a feature.**
+  Under it codex's own review subagent approved the escalation and the write
+  RAN under a read-only sandbox with no client-facing request at all
+  (transcript 23) — the entire §10 chain bypassed by codex reviewing itself.
+  `user` is the measured default when unset (transcript 22), and the client
+  name is not a gate (20 vs 21).
+- **File-change approvals never route.** An `apply_patch` under a tier that
+  blocks it emits `item/started [fileChange]` with the full diff and then
+  parks at `waitingOnApproval` forever, under `on-request` and granular alike
+  (transcripts 28, 31). The park is stable — the thread idles rather than
+  corrupts — and `turn/interrupt` remains the recovery.
+- A correction the re-probe forced on the original spike: transcript 06's own
+  bytes (0.145.0, granular) contain one exec approval, routed 182 seconds
+  after the exec item started, which W2c's analysis wrote off as "no request".
+  The zero-of-six claim above was an analysis error for that one
+  configuration; the conclusion it fed — do not build on 0.145's routing —
+  still stands, because a three-minute internal retry loop before the
+  question is not interception worth advertising.
+
+What is built on this (W9c):
+
+- The adapter surfaces an exec approval as a `ProposedToolCall` under the
+  fixed tool name **`exec`**, carrying `command` (codex's parse of the inner
+  command when unambiguous, else the raw invocation), `raw_command` (when the
+  two differ), `cwd`, and `reason` — so §10's deterministic rules match
+  command prefixes naturally, and the same chain that gates Claude's calls
+  gates these: deterministic deny/allow, the judge seam, human escalation via
+  the inbox. A chain-held approval holds the turn, exactly as with Claude;
+  codex tolerates the parked request indefinitely (the transcript 25/28
+  shape), and an interrupt answers anything still parked with `cancel` before
+  `turn/interrupt` — an unanswered request would park the thread even as the
+  turn died.
+- The decision mapping, journaled per decision with the encoding used:
+  chain DENY → `decline`; ALLOW → `accept`; ALLOW with remember-for-session →
+  `acceptForSession` (never the amendment, which would outlive the session);
+  ALLOW whose narrowing restates the proposal verbatim →
+  `acceptWithExecpolicyAmendment` echoing codex's proposed argv when one was
+  offered, plain `accept` otherwise; a narrowing that actually rewrites
+  arguments is refused (`RewritesToolInput` stays unclaimed), never downgraded
+  to running the un-narrowed original.
+- The reviewer is pinned: the codec sends `approvalsReviewer: "user"` as a
+  constant no configuration reaches, and the worker's config parse refuses
+  `auto_review`/`guardian` by name, citing transcript 23.
+- The capability is **version-gated per call kind**. The worker probes the
+  launched binary (`codex --version`) at adapter construction;
+  `PreAuthorizeExecCommands` is claimed only at 0.147+, and
+  `permission_enforcement_for(ExecCommand)` answers `PerCall` only then.
+  `ToolCallKind` now separates `ExecCommand` from `FileChange`: file changes
+  keep `SandboxAtSpawn` on every version, so the kind-blind floor — and the
+  wire advertisement, which still carries no blanket `TOOL_CALL_GATING` —
+  are unchanged. The per-kind claims graduate to the wire when placement
+  learns to match per call kind, not before.
+
+The consequences above are re-scoped accordingly: "Codex agents get a coarser
+permission story" is now true only of **file changes** on 0.147+, and of
+everything on older CLIs. The sandbox tier and `cwd` remain the enforcement
+floor beneath the chain either way, and the tier-choice journaling stands.
