@@ -367,14 +367,13 @@ mod tests {
         assert_eq!(scoped.name, "payments");
 
         for (agent_type, tool) in [
-            ("", "bare-name"),          // no namespace at all
-            ("", "grafana__query"),     // no such server
-            ("", "browser__echo"),      // local-placed: not the hub's to route
-            ("", "payments__refund"),   // scoped server, untyped agent
+            ("", "bare-name"),              // no namespace at all
+            ("", "grafana__query"),         // no such server
+            ("", "browser__echo"),          // local-placed: not the hub's to route
+            ("", "payments__refund"),       // scoped server, untyped agent
             ("intern", "payments__refund"), // scoped server, wrong type
         ] {
-            let refused = routed_config(&catalog, agent_type, tool)
-                .expect_err("must not route");
+            let refused = routed_config(&catalog, agent_type, tool).expect_err("must not route");
             assert!(
                 matches!(&refused, ServerError::NoSuchHubTool { name } if name == tool),
                 "{tool} for {agent_type:?} must be the uniform refusal, got {refused:?}"
@@ -417,10 +416,7 @@ mod tests {
         let wrong_worker = super::admitted_caller(&core, "w2", "s1", "agent-1")
             .await
             .expect_err("another worker must not speak for this agent");
-        assert!(matches!(
-            wrong_worker,
-            ServerError::AgentNotOnWorker { .. }
-        ));
+        assert!(matches!(wrong_worker, ServerError::AgentNotOnWorker { .. }));
 
         let unknown_agent = super::admitted_caller(&core, "w1", "s1", "agent-9")
             .await
@@ -430,10 +426,7 @@ mod tests {
         let unknown_session = super::admitted_caller(&core, "w1", "s9", "agent-1")
             .await
             .expect_err("an unknown session is refused");
-        assert!(matches!(
-            unknown_session,
-            ServerError::NoSuchSession { .. }
-        ));
+        assert!(matches!(unknown_session, ServerError::NoSuchSession { .. }));
     }
 
     /// An empty catalog warms to no lines and no failures — the fresh-server
@@ -456,8 +449,7 @@ mod tests {
         let core = crate::service::ServerCore::new(
             crate::log::EventLog::in_memory().expect("an in-memory log"),
         );
-        let config = server("linear", false, &[]);
-        append_catalog_change(&core, &config).await;
+        seed_catalog(&core, server("linear", false, &[])).await;
 
         let lines = super::warm(&core)
             .await
@@ -469,8 +461,11 @@ mod tests {
         );
     }
 
-    /// One catalog change, journaled the way `ConfigureMcpServer` journals it.
-    async fn append_catalog_change(core: &crate::service::ServerCore, config: &McpServerConfig) {
+    /// One catalog change, journaled the way `ConfigureMcpServer` journals
+    /// it. Local rather than the testkit's `seed_mcp_server` because a lib
+    /// test's `crate::` types are the cfg(test) build, which the testkit's
+    /// `horde_server` (the plain build) cannot hand events to.
+    async fn seed_catalog(core: &crate::service::ServerCore, config: McpServerConfig) {
         use prost::Message;
         let event = horde_proto::v1::Event {
             agent_id: None,
@@ -478,7 +473,7 @@ mod tests {
             idempotency_key: format!("mcp:{}", config.name),
             kind: Some(horde_proto::v1::event::Kind::McpServerConfigChanged(
                 horde_proto::v1::McpServerConfigChanged {
-                    config: Some(config.clone()),
+                    config: Some(config),
                     deleted: false,
                 },
             )),

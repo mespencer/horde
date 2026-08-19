@@ -151,10 +151,9 @@ impl ToolProxy {
         name: &str,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, HubError> {
-        let (body, upstream_name) =
-            self.resolve(name).ok_or_else(|| HubError::UnknownTool {
-                name: name.to_owned(),
-            })?;
+        let (body, upstream_name) = self.resolve(name).ok_or_else(|| HubError::UnknownTool {
+            name: name.to_owned(),
+        })?;
         body.call(&upstream_name, arguments).await
     }
 

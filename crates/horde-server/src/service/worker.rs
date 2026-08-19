@@ -12,12 +12,12 @@
 use std::pin::Pin;
 
 use horde_proto::v1::{
-    CallHubToolRequest, CallHubToolResponse, JournalAck, ListHubToolsRequest,
-    ListHubToolsResponse, PushEventsAccepted, PushEventsRequest, PushEventsResponse,
-    RegisterWorkerRequest, RegisterWorkerResponse, ReportCapabilitiesRequest,
-    ReportCapabilitiesResponse, ReportWorkspaceInstancesRequest,
-    ReportWorkspaceInstancesResponse, ServerHello, StreamCommandsRequest, StreamCommandsResponse,
-    WorkerId, push_events_request, push_events_response, worker_service_server::WorkerService,
+    CallHubToolRequest, CallHubToolResponse, JournalAck, ListHubToolsRequest, ListHubToolsResponse,
+    PushEventsAccepted, PushEventsRequest, PushEventsResponse, RegisterWorkerRequest,
+    RegisterWorkerResponse, ReportCapabilitiesRequest, ReportCapabilitiesResponse,
+    ReportWorkspaceInstancesRequest, ReportWorkspaceInstancesResponse, ServerHello,
+    StreamCommandsRequest, StreamCommandsResponse, WorkerId, push_events_request,
+    push_events_response, worker_service_server::WorkerService,
 };
 use prost::Message;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
@@ -400,12 +400,12 @@ impl WorkerService for WorkerFacing {
     ) -> Result<Response<ListHubToolsResponse>, Status> {
         let worker_id = forwarding_worker_id(&request, request.get_ref().worker_id.as_ref());
         let inner = request.into_inner();
-        let (session_id, agent_id) = hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
+        let (session_id, agent_id) =
+            hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
 
-        let tools_json =
-            crate::hub::list_hub_tools(&self.core, &worker_id, &session_id, &agent_id)
-                .await
-                .map_err(Status::from)?;
+        let tools_json = crate::hub::list_hub_tools(&self.core, &worker_id, &session_id, &agent_id)
+            .await
+            .map_err(Status::from)?;
         Ok(Response::new(ListHubToolsResponse { tools_json }))
     }
 
@@ -419,7 +419,8 @@ impl WorkerService for WorkerFacing {
     ) -> Result<Response<CallHubToolResponse>, Status> {
         let worker_id = forwarding_worker_id(&request, request.get_ref().worker_id.as_ref());
         let inner = request.into_inner();
-        let (session_id, agent_id) = hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
+        let (session_id, agent_id) =
+            hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
 
         let result_json = crate::hub::call_hub_tool(
             &self.core,

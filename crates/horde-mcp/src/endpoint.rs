@@ -777,9 +777,22 @@ impl ServerHandler for HordeEndpoint {
         let identity = Self::caller(&context)?;
         let proxy = self.proxies.for_agent(identity.agent_id());
         if proxy.serves(&request.name) {
-            let request_id = self.request_id_for(&identity, request.meta.as_ref());
+            // The harness's `_meta` is read off the *context*, not the params:
+            // rmcp moves a request's `_meta` into `RequestContext.meta`
+            // (service/server.rs, `std::mem::take(request.get_meta_mut())`),
+            // so by the time a handler sees the params their `meta` is always
+            // empty. Measured the hard way: the deployed-stack e2e's approve
+            // targets the script's tool-use id, and reading `request.meta`
+            // here left every proxied call under a minted id instead.
+            let request_id = self.request_id_for(&identity, Some(&context.meta));
             let result = self
-                .call_proxied(&proxy, &identity, &request.name, request.arguments, request_id)
+                .call_proxied(
+                    &proxy,
+                    &identity,
+                    &request.name,
+                    request.arguments,
+                    request_id,
+                )
                 .await?;
             return Ok(CallToolResponse::Complete(result));
         }

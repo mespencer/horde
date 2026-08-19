@@ -485,7 +485,10 @@ mod tests {
         // own API is refused, not freshly bound. Owned state again — no
         // other process on the machine can make this call succeed or fail.
         assert!(
-            manager.endpoint_for("s1", "agent-2", sink(), &bare()).await.is_err(),
+            manager
+                .endpoint_for("s1", "agent-2", sink(), &bare())
+                .await
+                .is_err(),
             "a shut-down manager must refuse to serve new endpoints"
         );
     }

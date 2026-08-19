@@ -109,6 +109,7 @@ impl FakeAdapter {
             provider_session_id,
             endpoint,
             pending_call: None,
+            in_flight_call: None,
             announced: false,
             turns_taken,
             // The script resumes where the conversation left off, and turn
@@ -190,6 +191,29 @@ struct PendingCall {
     input: serde_json::Value,
 }
 
+/// A Horde endpoint call already launched, running in its own task.
+///
+/// A task rather than an inline await because `next_event` is raced against
+/// the control channel in the Worker's pump (`tokio::select!`), and a select
+/// arm that loses is *dropped*: an inline HTTP call would be severed mid-wait
+/// by any control message — exactly what a permission decision's delivery is.
+/// A real harness is its own process and cannot be cancelled that way; the
+/// fake owes the same shape. Awaiting the `JoinHandle` by `&mut` is
+/// cancellation-safe: losing the race leaves the task running, and the next
+/// `next_event` resumes waiting on it.
+struct InFlightCall {
+    tool_call_id: ToolCallId,
+    task: tokio::task::JoinHandle<core::result::Result<String, String>>,
+}
+
+impl Drop for InFlightCall {
+    fn drop(&mut self) {
+        // A session dropped mid-call (archive, shutdown) takes the call with
+        // it: kill by handle, never leave a detached HTTP wait behind.
+        self.task.abort();
+    }
+}
+
 /// The turn currently being played.
 struct CurrentTurn {
     turn_id: TurnId,
@@ -208,9 +232,12 @@ pub struct FakeSession {
     /// The Horde endpoint this agent was spawned with, when the Worker
     /// supplied one. Makes [`Step::UseHordeTool`] a real MCP call.
     endpoint: Option<horde_adapter::McpEndpoint>,
-    /// A verb call `advance` scheduled; executed by `next_event`, which is
+    /// A verb call `advance` scheduled; launched by `next_event`, which is
     /// where the session is allowed to be async — the same shape as `stall`.
     pending_call: Option<PendingCall>,
+    /// The launched call being awaited. Held here rather than on the stack so
+    /// a cancelled `next_event` resumes it instead of losing it.
+    in_flight_call: Option<InFlightCall>,
     announced: bool,
     turns_taken: u64,
     /// Which scripted turn the next send consumes. Distinct from
@@ -265,6 +292,7 @@ impl FakeSession {
             && self.waiting_on.is_none()
             && self.stall.is_none()
             && self.pending_call.is_none()
+            && self.in_flight_call.is_none()
         {
             let Some(step) = self.steps.pop_front() else {
                 self.end_turn();
@@ -436,10 +464,33 @@ impl FakeSession {
     /// Dials the endpoint for one scheduled verb call and turns the verdict
     /// into stream events: the result text (or refusal) as tool output, and
     /// a completion whose error bit is the verdict.
-    async fn execute_horde_call(&mut self, call: PendingCall) {
-        let outcome =
-            endpoint_client::call_horde_tool(self.endpoint.as_ref(), &call.tool_name, &call.input)
-                .await;
+    ///
+    /// Launched into its own task — see [`InFlightCall`] on why an inline
+    /// await here would be severed by the Worker pump's `select!`.
+    fn launch_horde_call(&mut self, call: PendingCall) {
+        let endpoint = self.endpoint.clone();
+        let tool_call_id = call.tool_call_id.clone();
+        let task = tokio::spawn(async move {
+            endpoint_client::call_horde_tool(
+                endpoint.as_ref(),
+                &call.tool_name,
+                &call.input,
+                // The script's id rides `_meta` the way the real harness's
+                // does, so a proxied call's permission request is
+                // addressable by it.
+                &call.tool_call_id.to_string(),
+            )
+            .await
+        });
+        self.in_flight_call = Some(InFlightCall { tool_call_id, task });
+    }
+
+    /// Turns a finished call's outcome into stream events.
+    fn finish_horde_call(
+        &mut self,
+        tool_call_id: ToolCallId,
+        outcome: core::result::Result<String, String>,
+    ) {
         let turn_id = self.turn_id();
         let (text, is_error) = match outcome {
             Ok(text) => (text, false),
@@ -448,7 +499,7 @@ impl FakeSession {
         self.emit_output(OutputChannel::ToolResult, text);
         self.pending.push_back(AgentEvent::ToolCompleted {
             turn_id,
-            tool_call_id: call.tool_call_id,
+            tool_call_id,
             is_error,
         });
     }
@@ -458,6 +509,11 @@ impl FakeSession {
         self.waiting_on = None;
         self.stall = None;
         self.pending_call = None;
+        // An interrupted call must actually stop: aborting the task drops
+        // the HTTP wait, the way killing a real harness would.
+        if let Some(in_flight) = self.in_flight_call.take() {
+            in_flight.task.abort();
+        }
         if let Some(current) = self.current.as_mut() {
             current.status = TurnStatus::Interrupted;
             current.text = None;
@@ -547,7 +603,22 @@ impl AgentSession for FakeSession {
             }
 
             if let Some(call) = self.pending_call.take() {
-                self.execute_horde_call(call).await;
+                self.launch_horde_call(call);
+            }
+            if let Some(in_flight) = self.in_flight_call.as_mut() {
+                // Awaited by `&mut`, never taken first: if this await loses
+                // the pump's select race, the handle stays here and the next
+                // `next_event` resumes it — the call itself never dies with
+                // the future (see `InFlightCall`).
+                let outcome = match (&mut in_flight.task).await {
+                    Ok(outcome) => outcome,
+                    Err(join_error) => Err(format!("the endpoint call died: {join_error}")),
+                };
+                if let Some(finished) = self.in_flight_call.take() {
+                    // Cloned out rather than moved: the guard's Drop (an
+                    // abort, a no-op on this finished task) keeps the field.
+                    self.finish_horde_call(finished.tool_call_id.clone(), outcome);
+                }
                 continue;
             }
 
@@ -560,6 +631,7 @@ impl AgentSession for FakeSession {
                 && self.stall.is_none()
                 && self.waiting_on.is_none()
                 && self.pending_call.is_none()
+                && self.in_flight_call.is_none()
             {
                 // `advance` ran the turn to its end and produced nothing more.
                 return Ok(None);

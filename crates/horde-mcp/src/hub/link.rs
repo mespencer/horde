@@ -115,9 +115,7 @@ pub fn arguments_from_json(json: &str) -> Result<Option<JsonObject>, String> {
     }
     match serde_json::from_str(json) {
         Ok(serde_json::Value::Object(fields)) => Ok(Some(fields)),
-        Ok(other) => Err(format!(
-            "tool arguments must be a JSON object, got {other}"
-        )),
+        Ok(other) => Err(format!("tool arguments must be a JSON object, got {other}")),
         Err(error) => Err(format!("tool arguments are not JSON: {error}")),
     }
 }

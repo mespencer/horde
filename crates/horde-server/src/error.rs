@@ -61,10 +61,7 @@ pub enum ServerError {
     /// The worker's channel authenticates the *worker*; this is what stops an
     /// authenticated worker from speaking as somebody else's agent.
     #[error("agent {agent_id} is not placed on worker {worker_id}")]
-    AgentNotOnWorker {
-        agent_id: String,
-        worker_id: String,
-    },
+    AgentNotOnWorker { agent_id: String, worker_id: String },
 
     /// A create would shadow a live MCP server's name.
     #[error("an MCP server named {name} already exists; supply its etag to update it")]

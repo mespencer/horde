@@ -343,6 +343,44 @@ pub async fn seed_agent(
     Ok(())
 }
 
+/// Journals one MCP Hub catalog entry, the way `ConfigureMcpServer` does:
+/// a `McpServerConfigChanged` in the reserved catalog stream.
+///
+/// Precondition seeding for suites whose subject is what *consumes* the
+/// catalog — the hub's forwarded routing, an agent's endpoint surface — not
+/// a second implementation of the authoring RPC, which validates and etags
+/// through `horde_server::mcp` and is tested there.
+///
+/// # Errors
+///
+/// The append failing.
+pub async fn seed_mcp_server(
+    log: &EventLog,
+    config: horde_proto::v1::McpServerConfig,
+) -> Setup<()> {
+    use horde_proto::prost::Message;
+
+    let event = Event {
+        agent_id: None,
+        occurred_at: None,
+        idempotency_key: format!("mcp:{}", config.name),
+        kind: Some(horde_proto::v1::event::Kind::McpServerConfigChanged(
+            horde_proto::v1::McpServerConfigChanged {
+                config: Some(config),
+                deleted: false,
+            },
+        )),
+    };
+    log.append(horde_server::log::PendingEvent {
+        session_id: horde_server::mcp::MCP_CATALOG_STREAM.to_owned(),
+        idempotency_key: event.idempotency_key.clone(),
+        payload: event.encode_to_vec(),
+        ..horde_server::log::PendingEvent::default()
+    })
+    .await?;
+    Ok(())
+}
+
 /// [`seed_agent`], placed on `worker` — the common case.
 ///
 /// # Errors

@@ -197,6 +197,26 @@ fn detail(kind: Option<&Kind>) -> Value {
                 })
             },
         ),
+        // Structured for the same W7b reason as the result: the id is what
+        // `horde approve` needs, and a follower that cannot learn it from
+        // the stream cannot answer at all.
+        Some(Kind::PermissionRequested(requested)) => requested.request.as_ref().map_or_else(
+            || Value::String(String::new()),
+            |request| {
+                json!({
+                    "request_id": request
+                        .request_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    "tool": request
+                        .tool_call
+                        .as_ref()
+                        .map(|call| call.tool_name.clone())
+                        .unwrap_or_default(),
+                })
+            },
+        ),
         Some(Kind::PermissionDecided(decided)) => decided.decision.as_ref().map_or_else(
             || Value::String(String::new()),
             |decision| {
