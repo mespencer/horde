@@ -442,51 +442,9 @@ mod tests {
         assert!(lines.is_empty());
     }
 
-    /// A catalog whose server cannot spawn warms to a failure *line*, not a
-    /// failed startup — and the line names the server and the cause.
-    #[tokio::test]
-    async fn warming_reports_an_unspawnable_server_without_failing() {
-        let core = crate::service::ServerCore::new(
-            crate::log::EventLog::in_memory().expect("an in-memory log"),
-        );
-        seed_catalog(&core, server("linear", false, &[])).await;
-
-        let lines = super::warm(&core)
-            .await
-            .unwrap_or_else(|error| panic!("warming survives a dead upstream: {error}"));
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].starts_with("hub-server linear unavailable:"),
-            "{lines:?}"
-        );
-    }
-
-    /// One catalog change, journaled the way `ConfigureMcpServer` journals
-    /// it. Local rather than the testkit's `seed_mcp_server` because a lib
-    /// test's `crate::` types are the cfg(test) build, which the testkit's
-    /// `horde_server` (the plain build) cannot hand events to.
-    async fn seed_catalog(core: &crate::service::ServerCore, config: McpServerConfig) {
-        use prost::Message;
-        let event = horde_proto::v1::Event {
-            agent_id: None,
-            occurred_at: None,
-            idempotency_key: format!("mcp:{}", config.name),
-            kind: Some(horde_proto::v1::event::Kind::McpServerConfigChanged(
-                horde_proto::v1::McpServerConfigChanged {
-                    config: Some(config),
-                    deleted: false,
-                },
-            )),
-        };
-        core.log
-            .append(crate::log::PendingEvent {
-                session_id: crate::mcp::MCP_CATALOG_STREAM.to_owned(),
-                origin_worker_id: String::new(),
-                journal_sequence: None,
-                idempotency_key: event.idempotency_key.clone(),
-                payload: event.encode_to_vec(),
-            })
-            .await
-            .expect("the catalog change appends");
-    }
+    // A catalog whose server cannot spawn warms to a failure *line*, not a
+    // failed startup. That case seeds the journaled catalog, which the
+    // testkit owns a helper for — and the testkit's `horde_server` is the
+    // plain build, which a lib test's cfg(test) `crate::` types cannot meet
+    // — so it lives in `tests/server_suite/mcp_catalog.rs` instead.
 }

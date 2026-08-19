@@ -398,10 +398,7 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<ListHubToolsRequest>,
     ) -> Result<Response<ListHubToolsResponse>, Status> {
-        let worker_id = forwarding_worker_id(&request, request.get_ref().worker_id.as_ref());
-        let inner = request.into_inner();
-        let (session_id, agent_id) =
-            hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
+        let (worker_id, session_id, agent_id) = hub_caller(&request)?;
 
         let tools_json = crate::hub::list_hub_tools(&self.core, &worker_id, &session_id, &agent_id)
             .await
@@ -417,11 +414,9 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<CallHubToolRequest>,
     ) -> Result<Response<CallHubToolResponse>, Status> {
-        let worker_id = forwarding_worker_id(&request, request.get_ref().worker_id.as_ref());
-        let inner = request.into_inner();
-        let (session_id, agent_id) =
-            hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
+        let (worker_id, session_id, agent_id) = hub_caller(&request)?;
 
+        let inner = request.get_ref();
         let result_json = crate::hub::call_hub_tool(
             &self.core,
             &worker_id,
@@ -568,26 +563,57 @@ async fn handle_start(
     })
 }
 
-/// The worker a forwarded hub call speaks as: the mTLS principal when the
-/// channel names a worker (certificates are authoritative), else the id the
-/// request claims — the same rule as [`forward_worker_id`], generic because
-/// two request shapes carry the claim. An empty answer fails the placement
-/// gate downstream rather than being refused here, so the refusal names the
-/// agent it was about.
-fn forwarding_worker_id<T>(request: &Request<T>, claimed: Option<&WorkerId>) -> String {
-    if let crate::forward::registry::TunnelPrincipal::Worker(name) =
-        super::forwards::tunnel_principal_of(request)
-    {
-        return name;
-    }
-    claimed.map(ToString::to_string).unwrap_or_default()
+/// The identity fields both hub-forwarding request shapes carry, so
+/// [`hub_caller`] can read them without a per-handler unpacking dance.
+trait HubForwardRequest {
+    fn ids(
+        &self,
+    ) -> (
+        Option<&WorkerId>,
+        Option<&horde_proto::v1::SessionId>,
+        Option<&horde_proto::v1::AgentId>,
+    );
 }
 
-/// The session and agent ids a hub-forwarding request must carry.
-fn hub_call_ids(
-    session_id: Option<&horde_proto::v1::SessionId>,
-    agent_id: Option<&horde_proto::v1::AgentId>,
-) -> Result<(String, String), Status> {
+/// One accessor body for every hub-forwarding request shape: a macro rather
+/// than two hand-written impls, so the field wiring cannot drift between
+/// them (and the duplication gate has nothing to find).
+macro_rules! hub_forward_request {
+    ($($request:ty),+ $(,)?) => {$(
+        impl HubForwardRequest for $request {
+            fn ids(
+                &self,
+            ) -> (
+                Option<&WorkerId>,
+                Option<&horde_proto::v1::SessionId>,
+                Option<&horde_proto::v1::AgentId>,
+            ) {
+                (
+                    self.worker_id.as_ref(),
+                    self.session_id.as_ref(),
+                    self.agent_id.as_ref(),
+                )
+            }
+        }
+    )+};
+}
+
+hub_forward_request!(ListHubToolsRequest, CallHubToolRequest);
+
+/// The attribution triple every hub-forwarding RPC opens with: the worker
+/// from the channel (the mTLS principal outranks the request's claim, the
+/// same rule as [`forward_worker_id`]), the session and agent from the
+/// request — refused when either is unnamed. An empty worker fails the
+/// placement gate downstream rather than being refused here, so the refusal
+/// names the agent it was about.
+fn hub_caller<T: HubForwardRequest>(
+    request: &Request<T>,
+) -> Result<(String, String, String), Status> {
+    let (claimed, session_id, agent_id) = request.get_ref().ids();
+    let worker_id = match super::forwards::tunnel_principal_of(request) {
+        crate::forward::registry::TunnelPrincipal::Worker(name) => name,
+        _ => claimed.map(ToString::to_string).unwrap_or_default(),
+    };
     let session_id = session_id
         .map(ToString::to_string)
         .filter(|id| !id.is_empty())
@@ -604,7 +630,7 @@ fn hub_call_ids(
                 "a hub call must name its agent".to_owned(),
             ))
         })?;
-    Ok((session_id, agent_id))
+    Ok((worker_id, session_id, agent_id))
 }
 
 /// The worker a forward stream serves: the mTLS principal when the channel
@@ -940,19 +966,15 @@ mod tests {
     /// client is not a worker.
     #[test]
     fn the_forward_stream_takes_its_worker_from_cert_then_request() {
-        use horde_identity::{PeerIdentity, Principal, PrincipalRole};
+        use horde_identity::PrincipalRole;
 
         let request = |identity: Option<PrincipalRole>, claimed: Option<&str>| {
-            let mut request = tonic::Request::new(horde_proto::v1::StreamForwardsRequest {
-                worker_id: claimed.map(horde_proto::v1::WorkerId::new),
-            });
-            if let Some(role) = identity {
-                request.extensions_mut().insert(PeerIdentity {
-                    principal: Principal::new(role, "gpu-box").expect("a valid name"),
-                    serial_hex: "0a".to_owned(),
-                });
-            }
-            request
+            as_peer(
+                horde_proto::v1::StreamForwardsRequest {
+                    worker_id: claimed.map(horde_proto::v1::WorkerId::new),
+                },
+                identity,
+            )
         };
 
         assert_eq!(
@@ -971,6 +993,82 @@ mod tests {
             "a client certificate names no worker; the claim fills in"
         );
         assert_eq!(super::forward_worker_id(&request(None, None)), "");
+    }
+
+    /// A request with an optional peer identity stamped, the way the mTLS
+    /// interceptor stamps one — shared by every principal-resolution test.
+    fn as_peer<T>(body: T, identity: Option<horde_identity::PrincipalRole>) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(body);
+        if let Some(role) = identity {
+            request
+                .extensions_mut()
+                .insert(horde_identity::PeerIdentity {
+                    principal: horde_identity::Principal::new(role, "gpu-box")
+                        .expect("a valid name"),
+                    serial_hex: "0a".to_owned(),
+                });
+        }
+        request
+    }
+
+    /// The hub-forwarding preamble's whole table: the certificate outranks
+    /// the claim (a client cert names no worker), and a call naming no
+    /// session or no agent is refused before anything reads the log.
+    #[test]
+    fn a_hub_call_takes_its_worker_from_cert_then_claim_and_demands_both_ids() {
+        use horde_identity::PrincipalRole;
+        use horde_proto::v1::{AgentId, CallHubToolRequest, SessionId, WorkerId};
+
+        let body =
+            |worker: Option<&str>, session: Option<&str>, agent: Option<&str>| CallHubToolRequest {
+                worker_id: worker.map(WorkerId::new),
+                session_id: session.map(SessionId::new),
+                agent_id: agent.map(AgentId::new),
+                ..CallHubToolRequest::default()
+            };
+        let complete = || body(Some("claimed"), Some("s1"), Some("agent-1"));
+
+        let from_cert = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Worker)))
+            .expect("a complete call passes");
+        assert_eq!(
+            from_cert,
+            ("gpu-box".to_owned(), "s1".to_owned(), "agent-1".to_owned()),
+            "the certificate is authoritative over the claim"
+        );
+        let from_claim =
+            super::hub_caller(&as_peer(complete(), None)).expect("plaintext bootstrap");
+        assert_eq!(from_claim.0, "claimed");
+        let client_cert = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Client)))
+            .expect("a client cert names no worker; the claim fills in");
+        assert_eq!(client_cert.0, "claimed");
+
+        let no_session =
+            super::hub_caller(&as_peer(body(Some("claimed"), None, Some("agent-1")), None))
+                .expect_err("a call naming no session is refused");
+        assert_eq!(no_session.code(), tonic::Code::InvalidArgument);
+        assert!(no_session.message().contains("session"), "{no_session}");
+
+        let no_agent = super::hub_caller(&as_peer(body(Some("claimed"), Some("s1"), None), None))
+            .expect_err("a call naming no agent is refused");
+        assert_eq!(no_agent.code(), tonic::Code::InvalidArgument);
+        assert!(no_agent.message().contains("agent"), "{no_agent}");
+
+        let anonymous = super::hub_caller(&as_peer(body(None, Some("s1"), Some("agent-1")), None))
+            .expect("no worker anywhere is an empty id, refused by the placement gate");
+        assert_eq!(anonymous.0, "");
+
+        // Both request shapes read the same fields; the listing shape's
+        // accessor is pinned here so a field mix-up in either impl fails.
+        let listing = horde_proto::v1::ListHubToolsRequest {
+            worker_id: Some(WorkerId::new("claimed")),
+            session_id: Some(SessionId::new("s1")),
+            agent_id: Some(AgentId::new("agent-1")),
+        };
+        let listed = super::hub_caller(&as_peer(listing, None)).expect("the listing shape passes");
+        assert_eq!(
+            listed,
+            ("claimed".to_owned(), "s1".to_owned(), "agent-1".to_owned())
+        );
     }
 
     /// One agent placed on `worker`, exposing — the pump tests' log fixture.

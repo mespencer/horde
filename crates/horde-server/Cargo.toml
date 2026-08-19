@@ -24,7 +24,6 @@ horde-proto = { workspace = true }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time", "process"] }
 tokio-stream = "0.1.19"
