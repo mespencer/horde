@@ -148,6 +148,18 @@ impl Adapter for ClaudeAdapter {
         horde_adapter_claude::capabilities()
     }
 
+    fn login_recipe(&self) -> Option<horde_adapter::LoginRecipe> {
+        // The command DESIGN §4 names, against this adapter's own binary so
+        // stubs stay reachable in tests. Terminal-only: Claude's flow can
+        // finish with a pasted code, so no callback port is promised —
+        // PROVISIONAL until verified against the live CLI (see the W9a
+        // handoff flags).
+        Some(horde_adapter::LoginRecipe::terminal_only(
+            self.program.clone(),
+            vec!["login".to_owned()],
+        ))
+    }
+
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
         self.start(spec, Vec::new(), TurnAssembler::new())
     }

@@ -50,6 +50,7 @@ pub struct FakeAdapter {
     provider: String,
     capabilities: Capabilities,
     script: Script,
+    login: Option<horde_adapter::LoginRecipe>,
     next_session: AtomicU64,
 }
 
@@ -68,6 +69,7 @@ impl FakeAdapter {
                 .with(Capability::SystemPromptOverlay)
                 .with(Capability::ModelSelection),
             script,
+            login: None,
             next_session: AtomicU64::new(1),
         }
     }
@@ -88,6 +90,15 @@ impl FakeAdapter {
     #[must_use]
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
+        self
+    }
+
+    /// Gives this fake an interactive login recipe — the scripted stand-in
+    /// for a provider CLI's login command, so the interactive-auth relay
+    /// (DESIGN §4) is testable without a provider account.
+    #[must_use]
+    pub fn with_login_recipe(mut self, recipe: horde_adapter::LoginRecipe) -> Self {
+        self.login = Some(recipe);
         self
     }
 
@@ -145,6 +156,10 @@ impl Adapter for FakeAdapter {
 
     fn capabilities(&self) -> Capabilities {
         self.capabilities.clone()
+    }
+
+    fn login_recipe(&self) -> Option<horde_adapter::LoginRecipe> {
+        self.login.clone()
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {

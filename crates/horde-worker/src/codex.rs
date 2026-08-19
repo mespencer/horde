@@ -211,6 +211,17 @@ impl Adapter for CodexAdapter {
         horde_adapter_codex::capabilities()
     }
 
+    fn login_recipe(&self) -> Option<horde_adapter::LoginRecipe> {
+        // `codex login` runs a local OAuth-callback server on loopback port
+        // 1455, fixed by the CLI. PROVISIONAL until verified against the
+        // live CLI (see the W9a handoff flags).
+        Some(horde_adapter::LoginRecipe::with_callback(
+            self.program.clone(),
+            vec!["login".to_owned()],
+            1455,
+        ))
+    }
+
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
         self.start(spec, None).await
     }
