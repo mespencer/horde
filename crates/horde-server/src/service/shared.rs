@@ -54,6 +54,11 @@ pub struct ServerCore {
     /// awaiting their pair. Ephemeral on purpose — realization is tied to
     /// connections, so a restart honestly forgetting all of it is correct.
     pub forwards: ForwardRegistry,
+    /// The MCP Hub's connected upstreams (ADR-0004): hub-placed user servers,
+    /// each authenticated exactly once and multiplexed to every forwarding
+    /// worker. Honestly a cache of connections — which servers *exist* is the
+    /// journaled catalog's to say, re-read per call.
+    pub hub: Arc<crate::hub::HubUpstreams>,
 }
 
 impl ServerCore {
@@ -71,6 +76,7 @@ impl ServerCore {
             blobs: None,
             placement_lock: Arc::new(tokio::sync::Mutex::new(())),
             forwards: ForwardRegistry::new(),
+            hub: Arc::new(crate::hub::HubUpstreams::new()),
         }
     }
 

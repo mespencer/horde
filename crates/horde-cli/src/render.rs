@@ -197,6 +197,26 @@ fn detail(kind: Option<&Kind>) -> Value {
                 })
             },
         ),
+        // Structured for the same W7b reason as the result: the id is what
+        // `horde approve` needs, and a follower that cannot learn it from
+        // the stream cannot answer at all.
+        Some(Kind::PermissionRequested(requested)) => requested.request.as_ref().map_or_else(
+            || Value::String(String::new()),
+            |request| {
+                json!({
+                    "request_id": request
+                        .request_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    "tool": request
+                        .tool_call
+                        .as_ref()
+                        .map(|call| call.tool_name.clone())
+                        .unwrap_or_default(),
+                })
+            },
+        ),
         Some(Kind::PermissionDecided(decided)) => decided.decision.as_ref().map_or_else(
             || Value::String(String::new()),
             |decision| {
@@ -1761,6 +1781,48 @@ mod tests {
         };
         let human = session(&untitled, Format::Human);
         assert_eq!(human, human.trim_end(), "got {human:?}");
+    }
+
+    /// A rendered escalation carries the id `horde approve` needs and the
+    /// tool the approver is judging — a follower that cannot learn either
+    /// from the stream cannot answer at all (the deployed-stack hub e2e
+    /// approves by exactly this field).
+    #[test]
+    fn a_permission_request_renders_its_id_and_tool() {
+        use horde_proto::v1::{
+            PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall,
+        };
+
+        let requested = envelope(Some(Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new("call-9")),
+                agent_id: None,
+                tool_call: Some(ProposedToolCall {
+                    tool_name: "linear__create".to_owned(),
+                    input: None,
+                    rendered: String::new(),
+                }),
+                tree_path: Vec::new(),
+                permission_mode: String::new(),
+                escalated_from: 0,
+                expires_at: None,
+                forward: None,
+            }),
+        })));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&requested, Format::Json)).expect("json");
+        assert_eq!(parsed["detail"]["request_id"], "call-9");
+        assert_eq!(parsed["detail"]["tool"], "linear__create");
+
+        let bare = envelope(Some(Kind::PermissionRequested(PermissionRequested {
+            request: None,
+        })));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event(&bare, Format::Json)).expect("json");
+        assert_eq!(
+            parsed["detail"], "",
+            "a malformed request renders empty rather than panicking"
+        );
     }
 
     /// Every arm of `detail` must be pinned by an assertion on the text it

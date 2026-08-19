@@ -644,8 +644,10 @@ fn build_runtime(
     let mut runtime = Runtime::new(journal)
         .with_blob_service(channel.clone())
         // The wire ADR-0004 left to the Worker: every spawned agent gets its
-        // Session's MCP endpoint and a minted identity pair.
-        .with_agent_endpoints(channel);
+        // Session's MCP endpoint and a minted identity pair — and its hub
+        // tools forwarded over this same channel, attributed under this
+        // Worker's name (the certificate outranks the claim at the Server).
+        .with_agent_endpoints(channel, name);
 
     for adapter in &config.adapters {
         runtime = match adapter {

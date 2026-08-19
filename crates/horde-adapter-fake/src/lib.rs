@@ -109,6 +109,7 @@ impl FakeAdapter {
             provider_session_id,
             endpoint,
             pending_call: None,
+            in_flight_call: None,
             announced: false,
             turns_taken,
             // The script resumes where the conversation left off, and turn
@@ -190,6 +191,29 @@ struct PendingCall {
     input: serde_json::Value,
 }
 
+/// A Horde endpoint call already launched, running in its own task.
+///
+/// A task rather than an inline await because `next_event` is raced against
+/// the control channel in the Worker's pump (`tokio::select!`), and a select
+/// arm that loses is *dropped*: an inline HTTP call would be severed mid-wait
+/// by any control message — exactly what a permission decision's delivery is.
+/// A real harness is its own process and cannot be cancelled that way; the
+/// fake owes the same shape. Awaiting the `JoinHandle` by `&mut` is
+/// cancellation-safe: losing the race leaves the task running, and the next
+/// `next_event` resumes waiting on it.
+struct InFlightCall {
+    tool_call_id: ToolCallId,
+    task: tokio::task::JoinHandle<core::result::Result<String, String>>,
+}
+
+impl Drop for InFlightCall {
+    fn drop(&mut self) {
+        // A session dropped mid-call (archive, shutdown) takes the call with
+        // it: kill by handle, never leave a detached HTTP wait behind.
+        self.task.abort();
+    }
+}
+
 /// The turn currently being played.
 struct CurrentTurn {
     turn_id: TurnId,
@@ -198,6 +222,13 @@ struct CurrentTurn {
     tokens: TokenUsage,
     cost_usd: f64,
 }
+
+/// How many passes one `next_event` call may make without returning.
+///
+/// See the loop's own comment: the bound is by count because the failure it
+/// guards against — a pass that changes nothing — is an awaitless busy spin
+/// that starves every clock.
+const EVENT_LOOP_CEILING: u32 = 10_000;
 
 /// A live scripted agent.
 pub struct FakeSession {
@@ -208,9 +239,12 @@ pub struct FakeSession {
     /// The Horde endpoint this agent was spawned with, when the Worker
     /// supplied one. Makes [`Step::UseHordeTool`] a real MCP call.
     endpoint: Option<horde_adapter::McpEndpoint>,
-    /// A verb call `advance` scheduled; executed by `next_event`, which is
+    /// A verb call `advance` scheduled; launched by `next_event`, which is
     /// where the session is allowed to be async — the same shape as `stall`.
     pending_call: Option<PendingCall>,
+    /// The launched call being awaited. Held here rather than on the stack so
+    /// a cancelled `next_event` resumes it instead of losing it.
+    in_flight_call: Option<InFlightCall>,
     announced: bool,
     turns_taken: u64,
     /// Which scripted turn the next send consumes. Distinct from
@@ -261,11 +295,7 @@ impl FakeSession {
     /// Plays steps until the queue produces an event, a decision is needed, or
     /// the turn runs out of steps and ends.
     fn advance(&mut self) {
-        while self.pending.is_empty()
-            && self.waiting_on.is_none()
-            && self.stall.is_none()
-            && self.pending_call.is_none()
-        {
+        while self.nothing_more_to_play() {
             let Some(step) = self.steps.pop_front() else {
                 self.end_turn();
                 return;
@@ -436,10 +466,67 @@ impl FakeSession {
     /// Dials the endpoint for one scheduled verb call and turns the verdict
     /// into stream events: the result text (or refusal) as tool output, and
     /// a completion whose error bit is the verdict.
-    async fn execute_horde_call(&mut self, call: PendingCall) {
-        let outcome =
-            endpoint_client::call_horde_tool(self.endpoint.as_ref(), &call.tool_name, &call.input)
-                .await;
+    ///
+    /// Launched into its own task — see [`InFlightCall`] on why an inline
+    /// await here would be severed by the Worker pump's `select!`.
+    fn launch_horde_call(&mut self, call: PendingCall) {
+        let endpoint = self.endpoint.clone();
+        let tool_call_id = call.tool_call_id.clone();
+        let task = tokio::spawn(async move {
+            endpoint_client::call_horde_tool(
+                endpoint.as_ref(),
+                &call.tool_name,
+                &call.input,
+                // The script's id rides `_meta` the way the real harness's
+                // does, so a proxied call's permission request is
+                // addressable by it.
+                &call.tool_call_id.to_string(),
+            )
+            .await
+        });
+        self.in_flight_call = Some(InFlightCall { tool_call_id, task });
+    }
+
+    /// Waits out the launched call and turns its outcome into events.
+    ///
+    /// The `&mut` await on the *stored* handle is the cancellation-safety:
+    /// losing the pump's select race drops this future, but the handle stays
+    /// in `in_flight_call` and the next `next_event` resumes it — the call
+    /// itself never dies with the future (see [`InFlightCall`]).
+    async fn settle_horde_call(&mut self) {
+        let Some(in_flight) = self.in_flight_call.as_mut() else {
+            return;
+        };
+        let outcome = match (&mut in_flight.task).await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(format!("the endpoint call died: {join_error}")),
+        };
+        if let Some(finished) = self.in_flight_call.take() {
+            // Cloned out rather than moved: the guard's Drop (an abort, a
+            // no-op on this finished task) keeps the field.
+            self.finish_horde_call(finished.tool_call_id.clone(), outcome);
+        }
+    }
+
+    /// Whether the turn has nothing left to deliver or wait on: no queued
+    /// events, no pending decision, no stall, no call scheduled or in
+    /// flight. A named predicate because it is both `advance`'s "keep
+    /// playing steps" condition and `next_event`'s "the turn is spent" stop
+    /// — a clause dropped from either ends turns early or never.
+    fn nothing_more_to_play(&self) -> bool {
+        self.pending.is_empty()
+            && self.waiting_on.is_none()
+            && self.stall.is_none()
+            && self.pending_call.is_none()
+            && self.in_flight_call.is_none()
+    }
+
+    /// Turns a finished call's outcome into stream events.
+    fn finish_horde_call(
+        &mut self,
+        tool_call_id: ToolCallId,
+        outcome: core::result::Result<String, String>,
+    ) {
         let turn_id = self.turn_id();
         let (text, is_error) = match outcome {
             Ok(text) => (text, false),
@@ -448,7 +535,7 @@ impl FakeSession {
         self.emit_output(OutputChannel::ToolResult, text);
         self.pending.push_back(AgentEvent::ToolCompleted {
             turn_id,
-            tool_call_id: call.tool_call_id,
+            tool_call_id,
             is_error,
         });
     }
@@ -458,6 +545,11 @@ impl FakeSession {
         self.waiting_on = None;
         self.stall = None;
         self.pending_call = None;
+        // An interrupted call must actually stop: aborting the task drops
+        // the HTTP wait, the way killing a real harness would.
+        if let Some(in_flight) = self.in_flight_call.take() {
+            in_flight.task.abort();
+        }
         if let Some(current) = self.current.as_mut() {
             current.status = TurnStatus::Interrupted;
             current.text = None;
@@ -530,7 +622,16 @@ impl AgentSession for FakeSession {
         // duration behind for this loop to await. Looping — rather than
         // sleeping once at the top — is what keeps a stall from truncating the
         // turn: after waking, there is still a turn to play out.
-        loop {
+        //
+        // Count-bounded, not clock-bounded: every pass returns, sleeps a
+        // stall, launches or settles a call, or plays script steps, so a
+        // real script is served in a handful of passes and the ceiling is
+        // orders of magnitude above all of them. A pass that changes
+        // *nothing* is a defect — and an unbounded no-progress pass here is
+        // a busy spin with no await point, which starves the runtime's
+        // timers, so no wrapping timeout can catch it; only a count can
+        // (docs/QUALITY_GATES.md: a clock cannot bound a hot spin).
+        for _ in 0..EVENT_LOOP_CEILING {
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(event));
             }
@@ -547,7 +648,10 @@ impl AgentSession for FakeSession {
             }
 
             if let Some(call) = self.pending_call.take() {
-                self.execute_horde_call(call).await;
+                self.launch_horde_call(call);
+            }
+            if self.in_flight_call.is_some() {
+                self.settle_horde_call().await;
                 continue;
             }
 
@@ -556,15 +660,18 @@ impl AgentSession for FakeSession {
             }
             self.advance();
 
-            if self.pending.is_empty()
-                && self.stall.is_none()
-                && self.waiting_on.is_none()
-                && self.pending_call.is_none()
-            {
+            if self.nothing_more_to_play() {
                 // `advance` ran the turn to its end and produced nothing more.
                 return Ok(None);
             }
         }
+        Err(AdapterError::Protocol {
+            message: format!(
+                "the scripted session made {EVENT_LOOP_CEILING} event-loop passes without \
+                 producing an event; a pass that changes nothing is a defect"
+            ),
+            raw: String::new(),
+        })
     }
 
     async fn answer_permission(
@@ -687,6 +794,129 @@ mod harness {
         let mut session = adapter.spawn(&spec()).await.expect("spawns");
         session.send(TurnInput::queued("go")).await.expect("sends");
         session
+    }
+}
+
+#[cfg(test)]
+mod horde_call_tests {
+    use std::time::Duration;
+
+    use horde_adapter::{ProviderSessionId, ToolCallId};
+
+    use super::{FakeAdapter, FakeSession, InFlightCall};
+    use crate::Script;
+
+    /// A bare session with no endpoint and nothing pending — the state the
+    /// direct field-level tests arrange from.
+    fn session() -> FakeSession {
+        FakeAdapter::new(Script::echoing()).session(ProviderSessionId::new("fake-s1"), 0, None)
+    }
+
+    /// Dropping an in-flight call aborts its task — kill by handle, the
+    /// workspace rule. A `Drop` that silently did nothing would leave a
+    /// detached HTTP wait running past the session (archive, shutdown).
+    #[tokio::test]
+    async fn dropping_an_in_flight_call_aborts_its_task() {
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(String::new())
+        });
+        let abort = task.abort_handle();
+        drop(InFlightCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            task,
+        });
+
+        // Count-bounded: the abort resolves at the sleep's next poll.
+        for _ in 0..200_u32 {
+            if abort.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("dropping the guard must abort the task it holds");
+    }
+
+    /// Settling a finished call clears the slot and reports the outcome as
+    /// events — directly, so the mutant that replaces the settle with a
+    /// no-op fails here in milliseconds instead of spinning `next_event`
+    /// into a timeout nobody can read.
+    #[tokio::test]
+    async fn settling_a_finished_call_clears_the_slot_and_reports() {
+        let mut session = session();
+        session.in_flight_call = Some(InFlightCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            task: tokio::spawn(async { Ok("echo:done".to_owned()) }),
+        });
+
+        session.settle_horde_call().await;
+
+        assert!(
+            session.in_flight_call.is_none(),
+            "a settled call must vacate the slot"
+        );
+        let rendered = format!("{:?}", session.pending);
+        assert!(
+            rendered.contains("echo:done"),
+            "the outcome must become events the pump can read: {rendered}"
+        );
+        assert!(
+            rendered.contains("ToolCompleted"),
+            "the completion must follow the output: {rendered}"
+        );
+
+        // And with nothing in flight, settling is a no-op, not a hang.
+        let mut idle = session;
+        idle.pending.clear();
+        idle.settle_horde_call().await;
+        assert!(idle.pending.is_empty());
+    }
+
+    /// The spent-turn predicate's truth table, one clause at a time. It is
+    /// both `advance`'s "keep playing" condition and `next_event`'s stop:
+    /// a predicate stuck false spins `next_event` forever, stuck true ends
+    /// every turn before its steps — this table fails both in microseconds.
+    #[tokio::test]
+    async fn the_spent_turn_predicate_reads_every_clause() {
+        let fresh = session();
+        assert!(fresh.nothing_more_to_play(), "a bare session is spent");
+
+        let mut with_pending = session();
+        with_pending
+            .pending
+            .push_back(horde_adapter::AgentEvent::Output {
+                turn_id: horde_adapter::TurnId::new("t1"),
+                channel: horde_adapter::OutputChannel::Assistant,
+                text: "queued".to_owned(),
+                chunk_index: 0,
+            });
+        assert!(!with_pending.nothing_more_to_play(), "queued events count");
+
+        let mut waiting = session();
+        waiting.waiting_on = Some(ToolCallId::new("call-1"));
+        assert!(!waiting.nothing_more_to_play(), "a pending decision counts");
+
+        let mut stalled = session();
+        stalled.stall = Some(Duration::from_millis(1));
+        assert!(!stalled.nothing_more_to_play(), "a stall counts");
+
+        let mut scheduled = session();
+        scheduled.pending_call = Some(super::PendingCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            tool_name: "report_result".to_owned(),
+            input: serde_json::json!({}),
+        });
+        assert!(!scheduled.nothing_more_to_play(), "a scheduled call counts");
+
+        let mut in_flight = session();
+        in_flight.in_flight_call = Some(InFlightCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            task: tokio::spawn(async { Ok(String::new()) }),
+        });
+        assert!(
+            !in_flight.nothing_more_to_play(),
+            "an in-flight call counts"
+        );
     }
 }
 

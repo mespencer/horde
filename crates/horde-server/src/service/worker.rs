@@ -12,7 +12,8 @@
 use std::pin::Pin;
 
 use horde_proto::v1::{
-    JournalAck, PushEventsAccepted, PushEventsRequest, PushEventsResponse, RegisterWorkerRequest,
+    CallHubToolRequest, CallHubToolResponse, JournalAck, ListHubToolsRequest, ListHubToolsResponse,
+    PushEventsAccepted, PushEventsRequest, PushEventsResponse, RegisterWorkerRequest,
     RegisterWorkerResponse, ReportCapabilitiesRequest, ReportCapabilitiesResponse,
     ReportWorkspaceInstancesRequest, ReportWorkspaceInstancesResponse, ServerHello,
     StreamCommandsRequest, StreamCommandsResponse, WorkerId, push_events_request,
@@ -389,6 +390,46 @@ impl WorkerService for WorkerFacing {
         ))
     }
 
+    /// The hub tools one Agent may see (ADR-0004's forwarded path): worker
+    /// identity from the channel, agent identity from the request, visibility
+    /// and placement re-checked in `crate::hub` against the log.
+    #[instrument(skip_all)]
+    async fn list_hub_tools(
+        &self,
+        request: Request<ListHubToolsRequest>,
+    ) -> Result<Response<ListHubToolsResponse>, Status> {
+        let (worker_id, session_id, agent_id) = hub_caller(&request)?;
+
+        let tools_json = crate::hub::list_hub_tools(&self.core, &worker_id, &session_id, &agent_id)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(ListHubToolsResponse { tools_json }))
+    }
+
+    /// One Agent's forwarded hub call. The permission chain already gated it
+    /// at the Agent's endpoint; this leg is attribution (the placed worker),
+    /// visibility (fails closed), and routing to the connected upstream.
+    #[instrument(skip_all)]
+    async fn call_hub_tool(
+        &self,
+        request: Request<CallHubToolRequest>,
+    ) -> Result<Response<CallHubToolResponse>, Status> {
+        let (worker_id, session_id, agent_id) = hub_caller(&request)?;
+
+        let inner = request.get_ref();
+        let result_json = crate::hub::call_hub_tool(
+            &self.core,
+            &worker_id,
+            &session_id,
+            &agent_id,
+            &inner.tool_name,
+            &inner.arguments_json,
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(CallHubToolResponse { result_json }))
+    }
+
     #[instrument(skip_all)]
     async fn report_capabilities(
         &self,
@@ -520,6 +561,76 @@ async fn handle_start(
             resume_from_journal_sequence: stored.saturating_add(1),
         })),
     })
+}
+
+/// The identity fields both hub-forwarding request shapes carry, so
+/// [`hub_caller`] can read them without a per-handler unpacking dance.
+trait HubForwardRequest {
+    fn ids(
+        &self,
+    ) -> (
+        Option<&WorkerId>,
+        Option<&horde_proto::v1::SessionId>,
+        Option<&horde_proto::v1::AgentId>,
+    );
+}
+
+/// One accessor body for every hub-forwarding request shape: a macro rather
+/// than two hand-written impls, so the field wiring cannot drift between
+/// them (and the duplication gate has nothing to find).
+macro_rules! hub_forward_request {
+    ($($request:ty),+ $(,)?) => {$(
+        impl HubForwardRequest for $request {
+            fn ids(
+                &self,
+            ) -> (
+                Option<&WorkerId>,
+                Option<&horde_proto::v1::SessionId>,
+                Option<&horde_proto::v1::AgentId>,
+            ) {
+                (
+                    self.worker_id.as_ref(),
+                    self.session_id.as_ref(),
+                    self.agent_id.as_ref(),
+                )
+            }
+        }
+    )+};
+}
+
+hub_forward_request!(ListHubToolsRequest, CallHubToolRequest);
+
+/// The attribution triple every hub-forwarding RPC opens with: the worker
+/// from the channel (the mTLS principal outranks the request's claim, the
+/// same rule as [`forward_worker_id`]), the session and agent from the
+/// request — refused when either is unnamed. An empty worker fails the
+/// placement gate downstream rather than being refused here, so the refusal
+/// names the agent it was about.
+fn hub_caller<T: HubForwardRequest>(
+    request: &Request<T>,
+) -> Result<(String, String, String), Status> {
+    let (claimed, session_id, agent_id) = request.get_ref().ids();
+    let worker_id = match super::forwards::tunnel_principal_of(request) {
+        crate::forward::registry::TunnelPrincipal::Worker(name) => name,
+        _ => claimed.map(ToString::to_string).unwrap_or_default(),
+    };
+    let session_id = session_id
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Status::from(ServerError::Invalid(
+                "a hub call must name its session".to_owned(),
+            ))
+        })?;
+    let agent_id = agent_id
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Status::from(ServerError::Invalid(
+                "a hub call must name its agent".to_owned(),
+            ))
+        })?;
+    Ok((worker_id, session_id, agent_id))
 }
 
 /// The worker a forward stream serves: the mTLS principal when the channel
@@ -855,19 +966,15 @@ mod tests {
     /// client is not a worker.
     #[test]
     fn the_forward_stream_takes_its_worker_from_cert_then_request() {
-        use horde_identity::{PeerIdentity, Principal, PrincipalRole};
+        use horde_identity::PrincipalRole;
 
         let request = |identity: Option<PrincipalRole>, claimed: Option<&str>| {
-            let mut request = tonic::Request::new(horde_proto::v1::StreamForwardsRequest {
-                worker_id: claimed.map(horde_proto::v1::WorkerId::new),
-            });
-            if let Some(role) = identity {
-                request.extensions_mut().insert(PeerIdentity {
-                    principal: Principal::new(role, "gpu-box").expect("a valid name"),
-                    serial_hex: "0a".to_owned(),
-                });
-            }
-            request
+            as_peer(
+                horde_proto::v1::StreamForwardsRequest {
+                    worker_id: claimed.map(horde_proto::v1::WorkerId::new),
+                },
+                identity,
+            )
         };
 
         assert_eq!(
@@ -886,6 +993,135 @@ mod tests {
             "a client certificate names no worker; the claim fills in"
         );
         assert_eq!(super::forward_worker_id(&request(None, None)), "");
+    }
+
+    /// A request with an optional peer identity stamped, the way the mTLS
+    /// interceptor stamps one — shared by every principal-resolution test.
+    fn as_peer<T>(body: T, identity: Option<horde_identity::PrincipalRole>) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(body);
+        if let Some(role) = identity {
+            request
+                .extensions_mut()
+                .insert(horde_identity::PeerIdentity {
+                    principal: horde_identity::Principal::new(role, "gpu-box")
+                        .expect("a valid name"),
+                    serial_hex: "0a".to_owned(),
+                });
+        }
+        request
+    }
+
+    /// The hub-forwarding preamble's whole table: the certificate outranks
+    /// the claim (a client cert names no worker), and a call naming no
+    /// session or no agent is refused before anything reads the log.
+    #[test]
+    fn a_hub_call_takes_its_worker_from_cert_then_claim_and_demands_both_ids() {
+        use horde_identity::PrincipalRole;
+        use horde_proto::v1::{AgentId, CallHubToolRequest, SessionId, WorkerId};
+
+        let body =
+            |worker: Option<&str>, session: Option<&str>, agent: Option<&str>| CallHubToolRequest {
+                worker_id: worker.map(WorkerId::new),
+                session_id: session.map(SessionId::new),
+                agent_id: agent.map(AgentId::new),
+                ..CallHubToolRequest::default()
+            };
+        let complete = || body(Some("claimed"), Some("s1"), Some("agent-1"));
+
+        let from_cert = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Worker)))
+            .expect("a complete call passes");
+        assert_eq!(
+            from_cert,
+            ("gpu-box".to_owned(), "s1".to_owned(), "agent-1".to_owned()),
+            "the certificate is authoritative over the claim"
+        );
+        let from_claim =
+            super::hub_caller(&as_peer(complete(), None)).expect("plaintext bootstrap");
+        assert_eq!(from_claim.0, "claimed");
+        let client_cert = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Client)))
+            .expect("a client cert names no worker; the claim fills in");
+        assert_eq!(client_cert.0, "claimed");
+
+        let no_session =
+            super::hub_caller(&as_peer(body(Some("claimed"), None, Some("agent-1")), None))
+                .expect_err("a call naming no session is refused");
+        assert_eq!(no_session.code(), tonic::Code::InvalidArgument);
+        assert!(no_session.message().contains("session"), "{no_session}");
+
+        let no_agent = super::hub_caller(&as_peer(body(Some("claimed"), Some("s1"), None), None))
+            .expect_err("a call naming no agent is refused");
+        assert_eq!(no_agent.code(), tonic::Code::InvalidArgument);
+        assert!(no_agent.message().contains("agent"), "{no_agent}");
+
+        let anonymous = super::hub_caller(&as_peer(body(None, Some("s1"), Some("agent-1")), None))
+            .expect("no worker anywhere is an empty id, refused by the placement gate");
+        assert_eq!(anonymous.0, "");
+
+        // Both request shapes read the same fields; the listing shape's
+        // accessor is pinned here so a field mix-up in either impl fails.
+        let listing = horde_proto::v1::ListHubToolsRequest {
+            worker_id: Some(WorkerId::new("claimed")),
+            session_id: Some(SessionId::new("s1")),
+            agent_id: Some(AgentId::new("agent-1")),
+        };
+        let listed = super::hub_caller(&as_peer(listing, None)).expect("the listing shape passes");
+        assert_eq!(
+            listed,
+            ("claimed".to_owned(), "s1".to_owned(), "agent-1".to_owned())
+        );
+    }
+
+    /// The hub-forwarding RPCs themselves, over a real upstream child: the
+    /// listing carries the agent's namespaced toolset and the call carries
+    /// the upstream's own answer — neither is a defaultable empty response.
+    #[tokio::test]
+    async fn the_hub_rpcs_answer_with_the_real_toolset_and_result() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+        use horde_proto::v1::{AgentId, SessionId, WorkerId};
+
+        let core = core();
+        crate::forward::testfix::placed_expose(&core.log, "s1", "agent-1", "w1").await;
+        crate::hub::testfix::seed_catalog(
+            &core.log,
+            crate::hub::testfix::stub_config("stub", "hub", false, &[]).await,
+        )
+        .await;
+        let facing = super::WorkerFacing::new(core);
+
+        let listed = facing
+            .list_hub_tools(tonic::Request::new(horde_proto::v1::ListHubToolsRequest {
+                worker_id: Some(WorkerId::new("w1")),
+                session_id: Some(SessionId::new("s1")),
+                agent_id: Some(AgentId::new("agent-1")),
+            }))
+            .await
+            .expect("the listing answers")
+            .into_inner();
+        assert!(
+            listed
+                .tools_json
+                .iter()
+                .any(|json| json.contains("stub__echo")),
+            "the RPC must carry the agent's real toolset: {:?}",
+            listed.tools_json
+        );
+
+        let called = facing
+            .call_hub_tool(tonic::Request::new(horde_proto::v1::CallHubToolRequest {
+                worker_id: Some(WorkerId::new("w1")),
+                session_id: Some(SessionId::new("s1")),
+                agent_id: Some(AgentId::new("agent-1")),
+                tool_name: "stub__echo".to_owned(),
+                arguments_json: r#"{"message":"over the spine"}"#.to_owned(),
+            }))
+            .await
+            .expect("the call answers")
+            .into_inner();
+        assert!(
+            called.result_json.contains("echo:over the spine"),
+            "the RPC must carry the upstream's own answer: {}",
+            called.result_json
+        );
     }
 
     /// One agent placed on `worker`, exposing — the pump tests' log fixture.

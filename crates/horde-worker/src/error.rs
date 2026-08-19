@@ -108,6 +108,14 @@ pub enum WorkerError {
     #[error("the agent's MCP endpoint could not be served: {0}")]
     EndpointUnavailable(String),
 
+    /// The agent's proxied MCP surface could not be assembled: a `local`
+    /// server failed to spawn or connect, or the hub link could not be
+    /// fetched over the Worker's channel. Fails the spawn rather than
+    /// launching a degraded agent — an agent silently missing a promised
+    /// toolset is the failure shape ADR-0004's audit warned about.
+    #[error("the agent's MCP surface could not be assembled: {0}")]
+    McpSurface(String),
+
     /// A workspace checkout could not be produced for an agent.
     ///
     /// This is the *spawn's* failure, not the Worker's: the runtime journals

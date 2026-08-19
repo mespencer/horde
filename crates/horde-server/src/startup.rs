@@ -284,6 +284,11 @@ pub struct RunningServer {
     pub bootstrap_code: Option<MintedCode>,
     /// The mounted git Relay, when `--relay-bind` asked for one.
     pub relay: Option<crate::relay::MountedRelay>,
+    /// One line per hub-placed MCP server the startup warm-up touched
+    /// (ADR-0004): connected with its tool count, or unavailable with the
+    /// cause. On the operator interface rather than only in tracing, because
+    /// a misconfigured upstream must surface where the operator is looking.
+    pub hub_lines: Vec<String>,
     /// The permission chain driver (DESIGN §10, wave-7 fix a5): layers 1–2
     /// live in a deployed server, not only in tests. Held so its lifetime is
     /// the server's.
@@ -349,12 +354,8 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         ),
     };
 
-    // The Relay (fix a10), before the gRPC listeners so a bad relay bind
-    // fails startup whole rather than leaving a half-up server.
-    let relay = match config.relay_bind {
-        Some(bind) => Some(crate::relay::mount(bind, &config.state_dir, &core.log).await?),
-        None => None,
-    };
+    let relay = mounted_relay(config, &core).await?;
+    let hub_lines = warm_hub(&core).await?;
 
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
@@ -365,8 +366,50 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         server_fingerprint,
         bootstrap_code,
         relay,
+        hub_lines,
         permission_chain,
     })
+}
+
+/// The Relay, when `--relay-bind` asked for one (DESIGN §8, fix a10) —
+/// mounted before the gRPC listeners so a bad relay bind fails startup whole
+/// rather than leaving a half-up server.
+///
+/// # Errors
+///
+/// The mount failing: the bind, or the relay's own state directory.
+async fn mounted_relay(
+    config: &ServeConfig,
+    core: &ServerCore,
+) -> Result<Option<crate::relay::MountedRelay>, ServerError> {
+    match config.relay_bind {
+        Some(bind) => Ok(Some(
+            crate::relay::mount(bind, &config.state_dir, &core.log).await?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Warms the MCP Hub's upstreams (ADR-0004, 2026-08-19 amendment) from the
+/// journaled catalog — there is deliberately no flag for this: which servers
+/// exist is `horde mcp add`'s to say, and the catalog rides the same log as
+/// everything else. Warmed at startup so a misconfigured upstream surfaces
+/// where the operator is looking; a failure is a reported line, not fatal,
+/// because a dead user server must not hold the control plane down, and the
+/// connect is retried at the next forwarded call anyway.
+///
+/// The lines come back (for [`operator_lines`]) as well as being traced: an
+/// effect that only tracing sees is one no test can hold.
+///
+/// # Errors
+///
+/// Only the log failing to yield the catalog.
+async fn warm_hub(core: &ServerCore) -> Result<Vec<String>, ServerError> {
+    let lines = crate::hub::warm(core).await?;
+    for line in &lines {
+        tracing::info!("{line}");
+    }
+    Ok(lines)
 }
 
 /// The persisted CA, or a fresh one persisted on first start.
@@ -406,6 +449,7 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
     if let Some(relay) = &running.relay {
         lines.push(format!("listening relay={}", relay.server.addr()));
     }
+    lines.extend(running.hub_lines.iter().cloned());
     if let Some(code) = &running.bootstrap_code {
         lines.push(format!("bootstrap-client-code {}", code.join_code()));
     }
@@ -599,14 +643,14 @@ mod tests {
         );
     }
 
-    /// The serving path, end to end: CA created and persisted, both
-    /// listeners bound, the bootstrap code minted exactly when no client is
-    /// enrolled. The certificates it issues are proven against real
-    /// handshakes in `tests/enrollment.rs`; this holds the startup wiring.
-    #[tokio::test]
-    async fn serve_stands_up_and_bootstraps_exactly_once() {
-        let directory = tempfile::tempdir().expect("a temp dir");
-        let config = super::ServeConfig {
+    /// A serve config rooted in `directory`: OS-chosen loopback ports, the
+    /// relay bound only when a bind is given — the shape every serving test
+    /// opens with.
+    fn config_in(
+        directory: &tempfile::TempDir,
+        relay_bind: Option<std::net::SocketAddr>,
+    ) -> super::ServeConfig {
+        super::ServeConfig {
             database: directory
                 .path()
                 .join("horde.db")
@@ -617,8 +661,67 @@ mod tests {
             enrollment_bind: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             subject_names: Vec::new(),
             blob_max_bytes: None,
-            relay_bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-        };
+            relay_bind,
+        }
+    }
+
+    /// The hub warm-up's effect is on the operator interface: a server
+    /// started over a catalog whose upstream cannot spawn reports the
+    /// unavailable line on stdout — not only in tracing, where no operator
+    /// (and no test) would hold it.
+    #[tokio::test]
+    async fn serve_reports_the_hub_warm_up_on_the_operator_interface() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let database = directory
+            .path()
+            .join("horde.db")
+            .to_string_lossy()
+            .into_owned();
+
+        // The catalog exists before this start — journaled by an earlier
+        // `horde mcp add`, replayed here by opening the same log first.
+        let log = super::open_log(&database).expect("the log opens");
+        crate::hub::testfix::seed_catalog(
+            &log,
+            horde_proto::v1::McpServerConfig {
+                name: "ghost".to_owned(),
+                transport: Some(horde_proto::v1::mcp_server_config::Transport::Stdio(
+                    horde_proto::v1::McpStdioTransport {
+                        command: "horde-no-such-binary".to_owned(),
+                        args: Vec::new(),
+                        env: [].into(),
+                    },
+                )),
+                local: false,
+                allowed_agent_types: Vec::new(),
+                etag: String::new(),
+            },
+        )
+        .await;
+        drop(log);
+
+        let config = config_in(&directory, None);
+        let running = super::serve(&config).await.expect("the server comes up");
+        assert!(
+            super::operator_lines(&running)
+                .iter()
+                .any(|line| line.starts_with("hub-server ghost unavailable:")),
+            "the warm-up's outcome must reach the operator: {:?}",
+            super::operator_lines(&running)
+        );
+    }
+
+    /// The serving path, end to end: CA created and persisted, both
+    /// listeners bound, the bootstrap code minted exactly when no client is
+    /// enrolled. The certificates it issues are proven against real
+    /// handshakes in `tests/enrollment.rs`; this holds the startup wiring.
+    #[tokio::test]
+    async fn serve_stands_up_and_bootstraps_exactly_once() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(
+            &directory,
+            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        );
 
         let running = super::serve(&config).await.expect("the server comes up");
         assert_ne!(running.main.addr.port(), 0, "the OS chose a real port");
@@ -695,10 +798,20 @@ mod tests {
 
         // Second start, same state: the CA loads, and no client is enrolled
         // yet (a minted code is not an enrollment), so bootstrap re-offers.
-        let again = super::serve(&config).await.expect("a restart comes up");
+        // This restart also drops `--relay-bind`: no relay is mounted and no
+        // relay line is owed — the other half of `mounted_relay`'s table.
+        let mut without_relay = config.clone();
+        without_relay.relay_bind = None;
+        let again = super::serve(&without_relay)
+            .await
+            .expect("a restart comes up");
         assert!(
             again.bootstrap_code.is_some(),
             "an unredeemed bootstrap code must not close the bootstrap door"
+        );
+        assert!(
+            again.relay.is_none(),
+            "no --relay-bind mounts no relay, quietly"
         );
     }
 }

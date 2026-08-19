@@ -28,6 +28,9 @@ mod daemon;
 // binary always compiles with (docs/QUALITY_GATES.md, the clippy section).
 #[cfg(test)]
 mod forwards;
+// Gated like `forwards`, for the same free-helper reason.
+#[cfg(test)]
+mod hub_link;
 mod payload_share;
 mod supervision;
 mod workspaces;

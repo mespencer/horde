@@ -586,6 +586,21 @@ precise answer: it is *contained* (per-call identity on the endpoint, `local`
 valve, permission gate per call) but not *mitigated* — no per-agent upstream
 session, no serialization, no concurrency test.
 
+**Addendum, 2026-08-19 (W9b).** Three of the open items above are closed by
+the ADR's 2026-08-19 amendment: hub identity travels as worker-forwarded
+calls (`WorkerService.ListHubTools`/`CallHubTool`) over the worker's existing
+mTLS channel — no client-side hub dial exists because no hub dial exists;
+worker-runtime wiring is done (the spawn command's `local` configs are
+spawned per agent and the hub link fetched, both registered per-agent in
+`AgentProxies`, `horde-worker/src/endpoint.rs`); and `--serve` wires the hub
+from the journaled catalog (`startup.rs` warms `crate::hub`), with
+`HubEndpoint`'s unmounted state recorded as a decision. Attribution and
+visibility are re-checked server-side per forwarded call
+(`horde-server/src/hub.rs`), revocation severs the forwarded path with the
+channel, and the whole wire is proven against real processes in
+`horde-e2e`'s hub scenario. Secrets in journaled `env`, multiplexing under
+concurrency, and `tools/list_changed` remain open.
+
 ## §10 Permissions — PARTIAL
 
 - **Chain order: CONFORMS, verified in the function.** `chain::evaluate` runs
