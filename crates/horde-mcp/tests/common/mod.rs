@@ -540,9 +540,7 @@ mod bounds {
     {
         match tokio::time::timeout(CEILING, future).await {
             Ok(result) => result,
-            Err(_elapsed) => {
-                Err(format!("{what} did not finish within {CEILING:?}").into())
-            }
+            Err(_elapsed) => Err(format!("{what} did not finish within {CEILING:?}").into()),
         }
     }
 }
