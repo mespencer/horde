@@ -50,6 +50,12 @@ pub mod server;
 mod testing;
 pub mod verbs;
 
+// Re-exported because the pinned rmcp version is this crate's contract:
+// hosts implementing hub seams (the Worker's forwarded link, the Server's
+// routing) name its model types through here rather than pinning a second
+// copy that could drift from the audited one.
+pub use rmcp;
+
 pub use identity::{AgentIdentity, AgentRegistry, IdentityError};
 pub use journal::{JournalEntry, JournalError, JournalSink};
 pub use server::{EndpointConfig, RequireIdentity};

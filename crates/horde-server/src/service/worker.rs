@@ -12,11 +12,12 @@
 use std::pin::Pin;
 
 use horde_proto::v1::{
-    JournalAck, PushEventsAccepted, PushEventsRequest, PushEventsResponse, RegisterWorkerRequest,
-    RegisterWorkerResponse, ReportCapabilitiesRequest, ReportCapabilitiesResponse,
-    ReportWorkspaceInstancesRequest, ReportWorkspaceInstancesResponse, ServerHello,
-    StreamCommandsRequest, StreamCommandsResponse, WorkerId, push_events_request,
-    push_events_response, worker_service_server::WorkerService,
+    CallHubToolRequest, CallHubToolResponse, JournalAck, ListHubToolsRequest,
+    ListHubToolsResponse, PushEventsAccepted, PushEventsRequest, PushEventsResponse,
+    RegisterWorkerRequest, RegisterWorkerResponse, ReportCapabilitiesRequest,
+    ReportCapabilitiesResponse, ReportWorkspaceInstancesRequest,
+    ReportWorkspaceInstancesResponse, ServerHello, StreamCommandsRequest, StreamCommandsResponse,
+    WorkerId, push_events_request, push_events_response, worker_service_server::WorkerService,
 };
 use prost::Message;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
@@ -389,6 +390,50 @@ impl WorkerService for WorkerFacing {
         ))
     }
 
+    /// The hub tools one Agent may see (ADR-0004's forwarded path): worker
+    /// identity from the channel, agent identity from the request, visibility
+    /// and placement re-checked in `crate::hub` against the log.
+    #[instrument(skip_all)]
+    async fn list_hub_tools(
+        &self,
+        request: Request<ListHubToolsRequest>,
+    ) -> Result<Response<ListHubToolsResponse>, Status> {
+        let worker_id = forwarding_worker_id(&request, request.get_ref().worker_id.as_ref());
+        let inner = request.into_inner();
+        let (session_id, agent_id) = hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
+
+        let tools_json =
+            crate::hub::list_hub_tools(&self.core, &worker_id, &session_id, &agent_id)
+                .await
+                .map_err(Status::from)?;
+        Ok(Response::new(ListHubToolsResponse { tools_json }))
+    }
+
+    /// One Agent's forwarded hub call. The permission chain already gated it
+    /// at the Agent's endpoint; this leg is attribution (the placed worker),
+    /// visibility (fails closed), and routing to the connected upstream.
+    #[instrument(skip_all)]
+    async fn call_hub_tool(
+        &self,
+        request: Request<CallHubToolRequest>,
+    ) -> Result<Response<CallHubToolResponse>, Status> {
+        let worker_id = forwarding_worker_id(&request, request.get_ref().worker_id.as_ref());
+        let inner = request.into_inner();
+        let (session_id, agent_id) = hub_call_ids(inner.session_id.as_ref(), inner.agent_id.as_ref())?;
+
+        let result_json = crate::hub::call_hub_tool(
+            &self.core,
+            &worker_id,
+            &session_id,
+            &agent_id,
+            &inner.tool_name,
+            &inner.arguments_json,
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(CallHubToolResponse { result_json }))
+    }
+
     #[instrument(skip_all)]
     async fn report_capabilities(
         &self,
@@ -520,6 +565,45 @@ async fn handle_start(
             resume_from_journal_sequence: stored.saturating_add(1),
         })),
     })
+}
+
+/// The worker a forwarded hub call speaks as: the mTLS principal when the
+/// channel names a worker (certificates are authoritative), else the id the
+/// request claims — the same rule as [`forward_worker_id`], generic because
+/// two request shapes carry the claim. An empty answer fails the placement
+/// gate downstream rather than being refused here, so the refusal names the
+/// agent it was about.
+fn forwarding_worker_id<T>(request: &Request<T>, claimed: Option<&WorkerId>) -> String {
+    if let crate::forward::registry::TunnelPrincipal::Worker(name) =
+        super::forwards::tunnel_principal_of(request)
+    {
+        return name;
+    }
+    claimed.map(ToString::to_string).unwrap_or_default()
+}
+
+/// The session and agent ids a hub-forwarding request must carry.
+fn hub_call_ids(
+    session_id: Option<&horde_proto::v1::SessionId>,
+    agent_id: Option<&horde_proto::v1::AgentId>,
+) -> Result<(String, String), Status> {
+    let session_id = session_id
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Status::from(ServerError::Invalid(
+                "a hub call must name its session".to_owned(),
+            ))
+        })?;
+    let agent_id = agent_id
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Status::from(ServerError::Invalid(
+                "a hub call must name its agent".to_owned(),
+            ))
+        })?;
+    Ok((session_id, agent_id))
 }
 
 /// The worker a forward stream serves: the mTLS principal when the channel

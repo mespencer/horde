@@ -60,6 +60,25 @@ service WorkerService {
   // ForwardConnectionRequest (EXPOSE), or per accepted connection on an
   // INJECT listener.
   rpc WorkerForwardTunnel(stream WorkerForwardTunnelRequest) returns (stream WorkerForwardTunnelResponse);
+
+  // -- MCP Hub forwarding (ADR-0004, 2026-08-19 amendment) ------------------
+  //
+  // Hub-placed MCP servers run at the Server; their tools reach each Agent
+  // through the Agent's endpoint on its Worker. The Worker forwards those
+  // calls here, over its own authenticated mTLS channel, with the Agent's
+  // identity riding the request — the same way every other subsystem
+  // attributes agent traffic. No per-agent hub token exists anywhere.
+
+  // The hub tools one Agent may see, namespaced `{server}__{tool}` and
+  // filtered to the Agent's visibility (per-agent-type allowlists, resolved
+  // against the journaled catalog). Called at Agent spawn; the answer is the
+  // endpoint's connect-time snapshot, like any upstream's.
+  rpc ListHubTools(ListHubToolsRequest) returns (ListHubToolsResponse);
+
+  // One Agent's call to one hub tool. The permission chain has already
+  // gated it at the Agent's endpoint (DESIGN §10); the Server re-checks
+  // visibility (fails closed) and routes it to the configured upstream.
+  rpc CallHubTool(CallHubToolRequest) returns (CallHubToolResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +300,63 @@ message WorkerForwardTunnelRequest {
 
 message WorkerForwardTunnelResponse {
   ForwardTunnelFrame frame = 1;
+}
+
+// ---------------------------------------------------------------------------
+// MCP Hub forwarding
+// ---------------------------------------------------------------------------
+//
+// MCP payloads ride as JSON text, deliberately unlike ProposedToolCall's
+// google.protobuf.Struct: the chain's rules and the Policy Judge read a
+// proposal's *values*, but nothing Server-side reads these — they are opaque
+// transit between an Agent's harness and an upstream MCP server, both of
+// which speak JSON natively. A Struct detour would also corrupt them: Struct
+// numbers are doubles, so an integer argument (`"limit": 3`) would reach the
+// upstream as `3.0` and fail its schema.
+
+message ListHubToolsRequest {
+  // The Worker's own claim; the Server trusts the mTLS certificate over
+  // this field, exactly like RegisterWorker.
+  WorkerId worker_id = 1;
+
+  // The Session whose log holds the Agent's spawn — where the Server reads
+  // the Agent's type (for visibility) and its placement (which must be the
+  // calling Worker).
+  SessionId session_id = 2;
+
+  AgentId agent_id = 3;
+}
+
+message ListHubToolsResponse {
+  // MCP Tool objects (name, description, inputSchema, …), JSON-encoded one
+  // per entry, names already namespaced `{server}__{tool}`. The whole
+  // objects rather than a projection, because the schema inside is what the
+  // model reads.
+  repeated string tools_json = 1;
+}
+
+message CallHubToolRequest {
+  WorkerId worker_id = 1;
+
+  SessionId session_id = 2;
+
+  AgentId agent_id = 3;
+
+  // Namespaced `{server}__{tool}`. An unroutable or invisible name is
+  // NOT_FOUND — invisible hub tools are unlisted *and* unroutable.
+  string tool_name = 4;
+
+  // The call's arguments as a JSON object, after the permission chain has
+  // spoken (a narrowing is already applied). Empty means "called with no
+  // arguments".
+  string arguments_json = 5;
+}
+
+message CallHubToolResponse {
+  // The MCP CallToolResult, JSON-encoded verbatim — an upstream failure is
+  // a result with isError inside it, not an RPC error, because the model is
+  // the one who must read it and adjust.
+  string result_json = 1;
 }
 
 // ---------------------------------------------------------------------------

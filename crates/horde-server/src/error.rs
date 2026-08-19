@@ -50,6 +50,22 @@ pub enum ServerError {
     #[error("no MCP server named {name}")]
     NoSuchMcpServer { name: String },
 
+    /// A worker-forwarded hub call named a tool nothing routes for this
+    /// caller. One refusal for unknown, deleted, `local`-placed, and
+    /// invisible alike: invisible hub tools are unlisted *and* unroutable,
+    /// and a distinct message would reveal what the allowlist hides.
+    #[error("no hub tool named {name}")]
+    NoSuchHubTool { name: String },
+
+    /// A worker forwarded a hub call for an agent the log places elsewhere.
+    /// The worker's channel authenticates the *worker*; this is what stops an
+    /// authenticated worker from speaking as somebody else's agent.
+    #[error("agent {agent_id} is not placed on worker {worker_id}")]
+    AgentNotOnWorker {
+        agent_id: String,
+        worker_id: String,
+    },
+
     /// A create would shadow a live MCP server's name.
     #[error("an MCP server named {name} already exists; supply its etag to update it")]
     McpServerNameTaken { name: String },
@@ -161,7 +177,12 @@ impl From<ServerError> for Status {
             ServerError::NoSuchSession { .. }
             | ServerError::NoSuchAgent { .. }
             | ServerError::NoSuchWorkspace { .. }
-            | ServerError::NoSuchMcpServer { .. } => Code::NotFound,
+            | ServerError::NoSuchMcpServer { .. }
+            | ServerError::NoSuchHubTool { .. } => Code::NotFound,
+            // The caller is authenticated (it passed the mTLS door); what it
+            // asked for is not its to ask. Not Unauthenticated — the channel
+            // is fine — and not NotFound, which would invite retries.
+            ServerError::AgentNotOnWorker { .. } => Code::PermissionDenied,
             ServerError::WorkspaceNameTaken { .. } | ServerError::McpServerNameTaken { .. } => {
                 Code::AlreadyExists
             }

@@ -130,7 +130,11 @@ async fn stack() -> Setup<Stack> {
     let proxy = ToolProxy::new()
         .with_hub_link(hub_link, ["linear".to_owned()])
         .with_server(local);
-    let endpoint = HordeEndpoint::new(horde.context().await?).with_proxy(Arc::new(proxy));
+    // The per-agent registry the Worker's endpoint manager populates in
+    // production: this agent's proxy under this agent's id, nobody else's.
+    let proxies = Arc::new(horde_mcp::hub::AgentProxies::new());
+    proxies.insert(&horde.agent_id, Arc::new(proxy));
+    let endpoint = HordeEndpoint::new(horde.context().await?).with_agent_proxies(proxies);
 
     let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, AGENT_TOKEN);

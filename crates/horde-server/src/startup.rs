@@ -356,6 +356,17 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         None => None,
     };
 
+    // The MCP Hub's upstreams (ADR-0004, 2026-08-19 amendment), from the
+    // journaled catalog — there is deliberately no flag for this: which
+    // servers exist is `horde mcp add`'s to say, and the catalog rides the
+    // same log as everything else. Warmed here so a misconfigured upstream
+    // surfaces where the operator is looking; a failure is reported, not
+    // fatal, because a dead user server must not hold the control plane
+    // down, and the connect is retried at the next forwarded call.
+    for line in crate::hub::warm(&core).await? {
+        tracing::info!("{line}");
+    }
+
     let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
     let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
 

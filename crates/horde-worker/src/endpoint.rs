@@ -28,19 +28,54 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use horde_adapter::McpEndpoint;
+use horde_mcp::hub::{AgentProxies, HubServerConfig, ToolProxy, Upstream};
 use horde_mcp::{AgentRegistry, EndpointConfig, JournalEntry, JournalError, JournalSink};
 
 use crate::error::WorkerError;
+use crate::hub::ForwardedHubLink;
 use crate::share::StampingSink;
+
+/// The proxied MCP surface one spawn command resolved for its Agent
+/// (ADR-0004): the `local` configs to spawn beside it, and the hub servers
+/// whose forwarded tools it may see. Both halves were resolved Server-side
+/// against the journaled catalog and the Agent's type; the Worker consumes
+/// them without a second opinion.
+#[derive(Debug, Clone, Default)]
+pub struct AgentMcpSurface {
+    /// Full configs — the Worker must spawn them without a round trip.
+    pub local: Vec<horde_proto::v1::McpServerConfig>,
+    /// Hub server names, by which the endpoint filters the forwarded link.
+    pub visible_hub: Vec<String>,
+}
+
+impl AgentMcpSurface {
+    /// Whether this Agent gets any proxied tools at all. Named because the
+    /// empty case skips real work (no hub listing RPC, no registry entry),
+    /// and an inverted condition would silently cost every spawn a round
+    /// trip — or every hub-visible agent its toolset.
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.local.is_empty() && self.visible_hub.is_empty()
+    }
+}
 
 /// Serves the per-Session endpoints and owns the per-Agent tokens.
 pub struct EndpointManager {
     /// The Worker's authenticated channel to the Server — the verbs that are
-    /// ControlPlane RPCs ride it, as does the permission wait's sync stream.
+    /// ControlPlane RPCs ride it, the permission wait's sync stream too, and
+    /// (the 2026-08-19 amendment) every forwarded hub call.
     channel: tonic::transport::Channel,
+    /// The identity forwarded hub calls are attributed under. The mTLS
+    /// certificate outranks it at the Server; carrying it keeps the
+    /// plaintext test shape honest, the same way `RegisterWorker` does.
+    worker_id: String,
     /// The tokens the serving gate accepts; shared with every endpoint this
     /// manager serves.
     registry: Arc<AgentRegistry>,
+    /// Each Agent's proxied toolset — hub link plus `local` children —
+    /// shared with every endpoint this manager serves, resolved per request
+    /// by caller identity.
+    proxies: Arc<AgentProxies>,
     served: tokio::sync::Mutex<Served>,
 }
 
@@ -71,10 +106,12 @@ impl std::fmt::Debug for EndpointManager {
 
 impl EndpointManager {
     #[must_use]
-    pub fn new(channel: tonic::transport::Channel) -> Self {
+    pub fn new(channel: tonic::transport::Channel, worker_id: &str) -> Self {
         Self {
             channel,
+            worker_id: worker_id.to_owned(),
             registry: Arc::new(AgentRegistry::new()),
+            proxies: Arc::new(AgentProxies::new()),
             served: tokio::sync::Mutex::new(Served {
                 accepting: true,
                 endpoints: BTreeMap::new(),
@@ -83,22 +120,33 @@ impl EndpointManager {
     }
 
     /// The endpoint one Agent's harness is pointed at: the Session's served
-    /// URL (bound now if this is the Session's first agent) and the identity
-    /// headers minted for exactly this Agent.
+    /// URL (bound now if this is the Session's first agent), the Agent's
+    /// proxied toolset assembled and registered, and the identity headers
+    /// minted for exactly this Agent.
     ///
-    /// Re-minting for the same agent (a revival) replaces the old token —
-    /// the previous incarnation's credential must not outlive it.
+    /// The surface before the token: a `local` server that cannot spawn or a
+    /// hub listing the Server refuses fails the spawn *here*, with no minted
+    /// credential left behind — an agent missing a promised toolset is a
+    /// different (and wrongly-scoped) product, not a degraded one.
+    ///
+    /// Re-minting for the same agent (a revival) replaces the old token and
+    /// the old proxy — the previous incarnation's credential and `local`
+    /// children must not outlive it.
     ///
     /// # Errors
     ///
-    /// [`WorkerError::EndpointUnavailable`] when the loopback bind fails.
+    /// [`WorkerError::EndpointUnavailable`] when the loopback bind fails;
+    /// [`WorkerError::McpSurface`] when the proxied toolset cannot be
+    /// assembled.
     pub async fn endpoint_for(
         &self,
         session_id: &str,
         agent_id: &str,
         sink: StampingSink,
+        surface: &AgentMcpSurface,
     ) -> Result<McpEndpoint, WorkerError> {
         let url = self.session_endpoint(session_id, sink).await?;
+        self.register_surface(session_id, agent_id, surface).await?;
         let token = mint_token();
         self.registry.insert(agent_id, token.clone());
         Ok(McpEndpoint::Http {
@@ -110,9 +158,54 @@ impl EndpointManager {
         })
     }
 
-    /// Revokes an archived Agent's token, effective on its next request.
+    /// Assembles and registers one Agent's proxied toolset: one connected
+    /// [`Upstream`] per `local` config (a real child process, killed by
+    /// handle when the proxy drops), and the forwarded hub link when any hub
+    /// server is visible. An empty surface registers nothing — the endpoint
+    /// falls back to the empty proxy, which serves exactly the verbs.
+    async fn register_surface(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        surface: &AgentMcpSurface,
+    ) -> Result<(), WorkerError> {
+        if surface.is_empty() {
+            // A revival whose surface shrank to nothing must still shed the
+            // previous incarnation's children.
+            self.proxies.remove(agent_id);
+            return Ok(());
+        }
+
+        let mut proxy = ToolProxy::new();
+        for wire in &surface.local {
+            let config = HubServerConfig::try_from(wire)
+                .map_err(|error| WorkerError::McpSurface(error.to_string()))?;
+            let upstream = Upstream::connect(&config)
+                .await
+                .map_err(|error| WorkerError::McpSurface(error.to_string()))?;
+            proxy = proxy.with_server(upstream);
+        }
+        if !surface.visible_hub.is_empty() {
+            let link = ForwardedHubLink::fetch(
+                self.channel.clone(),
+                &self.worker_id,
+                session_id,
+                agent_id,
+            )
+            .await?;
+            proxy = proxy.with_hub_link(link, surface.visible_hub.iter().cloned());
+        }
+
+        self.proxies.insert(agent_id, Arc::new(proxy));
+        Ok(())
+    }
+
+    /// Revokes an archived Agent's token (effective on its next request) and
+    /// drops its proxied toolset — the `local` children die by handle with
+    /// the last clone of their upstreams.
     pub fn forget_agent(&self, agent_id: &str) {
         self.registry.remove(agent_id);
+        self.proxies.remove(agent_id);
     }
 
     /// Stops every serving loop, and does not return until each has actually
@@ -139,6 +232,10 @@ impl EndpointManager {
         served.accepting = false;
         let endpoints = std::mem::take(&mut served.endpoints);
         drop(served);
+
+        // Every agent's proxied toolset goes with the endpoints: no `local`
+        // child may outlive the manager that spawned it.
+        self.proxies.clear();
 
         let mut reaped = 0;
         for (_, endpoint) in endpoints {
@@ -172,7 +269,8 @@ impl EndpointManager {
             horde_cli::client::Client::with_channel(self.channel.clone()),
             session_id,
         );
-        let endpoint = horde_mcp::endpoint::HordeEndpoint::new(context);
+        let endpoint = horde_mcp::endpoint::HordeEndpoint::new(context)
+            .with_agent_proxies(Arc::clone(&self.proxies));
         let (bound, serving) = horde_mcp::server::serve(
             &EndpointConfig::loopback(0),
             Arc::clone(&self.registry),
@@ -262,7 +360,12 @@ mod tests {
 
     fn manager() -> EndpointManager {
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        EndpointManager::new(channel)
+        EndpointManager::new(channel, "w-test")
+    }
+
+    /// No proxied surface: the shape every plain spawn has.
+    fn bare() -> super::AgentMcpSurface {
+        super::AgentMcpSurface::default()
     }
 
     fn sink() -> StampingSink {
@@ -278,15 +381,15 @@ mod tests {
         let manager = manager();
 
         let first = manager
-            .endpoint_for("s1", "agent-1", sink())
+            .endpoint_for("s1", "agent-1", sink(), &bare())
             .await
             .expect("the first endpoint serves");
         let sibling = manager
-            .endpoint_for("s1", "agent-2", sink())
+            .endpoint_for("s1", "agent-2", sink(), &bare())
             .await
             .expect("the sibling shares it");
         let elsewhere = manager
-            .endpoint_for("s2", "agent-3", sink())
+            .endpoint_for("s2", "agent-3", sink(), &bare())
             .await
             .expect("a second session binds its own");
 
@@ -332,7 +435,7 @@ mod tests {
     async fn minted_credentials_dial_until_forgotten_and_the_socket_dies_at_shutdown() {
         let manager = manager();
         let endpoint = manager
-            .endpoint_for("s1", "agent-1", sink())
+            .endpoint_for("s1", "agent-1", sink(), &bare())
             .await
             .expect("the endpoint serves");
         let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
@@ -382,7 +485,7 @@ mod tests {
         // own API is refused, not freshly bound. Owned state again — no
         // other process on the machine can make this call succeed or fail.
         assert!(
-            manager.endpoint_for("s1", "agent-2", sink()).await.is_err(),
+            manager.endpoint_for("s1", "agent-2", sink(), &bare()).await.is_err(),
             "a shut-down manager must refuse to serve new endpoints"
         );
     }
