@@ -19,55 +19,14 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// How many polls a cross-process wait may spend before it is a failure.
 const POLLS: u32 = 300;
 
-/// How long the OS may take to admit one freshly linked binary. Generous on
-/// purpose: this is an admission bound paid once, outside every scenario's
-/// own timing, and a loud failure here beats a scenario's opaque ceiling.
-const FIRST_LAUNCH_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Pays a binary's first-exec cost once per test process, before any
-/// scenario timing starts.
-///
-/// Every cargo-mutants scratch tree links brand-new product binaries, and
-/// macOS admits a freshly linked binary only after validating its signature
-/// — multi-second under load, and paid *inside* whichever scenario wait
-/// happens to spawn it first (the mechanism the hub e2e baseline already
-/// met; see `stub_mcp::warm()` in horde-mcp's tests). Warming here is
-/// serialized by one mutex: the first launch pays per binary, the rest find
-/// the OS's per-file cache.
-///
-/// The probe runs the binary with `--help` and stdio closed: every product
-/// binary refuses or answers that argument immediately, and that the
-/// process *executed* is the whole payment — the exit status is ignored.
+/// Pays a product binary's first-exec cost once per test process, through
+/// the shared admission (the mechanism the hub e2e baseline met first;
+/// `horde_server_testkit::process::admit_binary` owns the story). `--help`
+/// is the probe every product binary answers or refuses immediately.
 pub(crate) async fn admit(binary: &Path) {
-    use std::collections::BTreeSet;
-    static WARMED: tokio::sync::OnceCell<tokio::sync::Mutex<BTreeSet<PathBuf>>> =
-        tokio::sync::OnceCell::const_new();
-    let warmed = WARMED
-        .get_or_init(|| async { tokio::sync::Mutex::new(BTreeSet::new()) })
-        .await;
-    let mut warmed = warmed.lock().await;
-    if warmed.contains(binary) {
-        return;
-    }
-    let run = tokio::process::Command::new(binary)
-        .arg("--help")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let admitted = tokio::time::timeout(FIRST_LAUNCH_CEILING, run).await;
-    match admitted {
-        Ok(executed) => {
-            let _exit_of_a_help_probe = executed.expect("the binary executes");
-        }
-        Err(_elapsed) => panic!(
-            "{}'s first launch did not finish within {FIRST_LAUNCH_CEILING:?}; \
-             the OS admits a freshly built binary only after validating it, \
-             and that validation is starved or stuck",
-            binary.display()
-        ),
-    }
-    warmed.insert(binary.to_path_buf());
+    horde_server_testkit::process::admit_binary(binary, &["--help"])
+        .await
+        .expect("the binary is admitted before any scenario timing starts");
 }
 
 /// A running Horde: the server process, its endpoints, and an enrolled

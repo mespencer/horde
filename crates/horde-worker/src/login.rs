@@ -345,7 +345,13 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     let (input, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         while let Ok(bytes) = input_rx.recv() {
-            if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+            // Two retirements, stated separately: a failed write and a
+            // failed flush each mean the PTY is gone, and neither may be
+            // asked to vouch for the other.
+            if writer.write_all(&bytes).is_err() {
+                return;
+            }
+            if writer.flush().is_err() {
                 return;
             }
         }

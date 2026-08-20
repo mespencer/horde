@@ -341,9 +341,112 @@ impl SpawnedProcess {
     }
 }
 
+/// How long the OS may take to admit one freshly linked binary. An OS
+/// bound, deliberately distinct from every scenario's own wait ceiling: the
+/// cost it bounds is real and was measured — macOS validates a freshly
+/// linked binary on its first-ever exec (code-signature and XProtect
+/// assessment, cached per file afterwards), 327ms against 8ms warm on an
+/// idle machine and multi-second when the validation service is contended
+/// by concurrent builds minting new binaries, exactly what a cargo-mutants
+/// run does.
+const FIRST_LAUNCH_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pays a binary's first-exec cost once per test process, before any
+/// scenario timing exists to eat it.
+///
+/// Every cargo-mutants scratch tree links its binaries brand-new, so a
+/// suite that spawns them inside ceilinged waits pays the OS's validation
+/// *inside* those ceilings — the mechanism that failed the hub e2e baseline
+/// first and the lifecycle baseline after it, each in its own copy of this
+/// fix until it earned one home. Warming is serialized by one lock and
+/// deduplicated per binary path: the first launch pays, the rest find the
+/// OS's per-file cache.
+///
+/// `args` is the probe that makes the binary exit promptly — `--help` for
+/// the product binaries, nothing for stubs that exit on stdin's EOF. The
+/// exit status is deliberately ignored: that the process *executed* is the
+/// whole payment.
+///
+/// # Errors
+///
+/// The binary failing to execute at all, or the OS not admitting it within
+/// [`FIRST_LAUNCH_CEILING`] — both named, neither a hang.
+pub async fn admit_binary(binary: &Path, args: &[&str]) -> Setup<()> {
+    use std::collections::BTreeSet;
+    static WARMED: tokio::sync::OnceCell<tokio::sync::Mutex<BTreeSet<PathBuf>>> =
+        tokio::sync::OnceCell::const_new();
+    let warmed = WARMED
+        .get_or_init(|| async { tokio::sync::Mutex::new(BTreeSet::new()) })
+        .await;
+    let mut warmed = warmed.lock().await;
+    if warmed.contains(binary) {
+        return Ok(());
+    }
+    let run = tokio::process::Command::new(binary)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match tokio::time::timeout(FIRST_LAUNCH_CEILING, run).await {
+        Ok(executed) => {
+            let _exit_of_a_probe = executed?;
+        }
+        Err(_elapsed) => {
+            return Err(format!(
+                "{}'s first launch did not finish within {FIRST_LAUNCH_CEILING:?}; the OS \
+                 admits a freshly built binary only after validating it, and that validation \
+                 is starved or stuck",
+                binary.display()
+            )
+            .into());
+        }
+    }
+    warmed.insert(binary.to_path_buf());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SpawnedProcess, binary_candidates, value_after};
+    use super::{SpawnedProcess, admit_binary, binary_candidates, value_after};
+
+    /// The admission, observed through its probe's own side effect: a
+    /// `touch` probe leaves its file, so a warm-up hollowed to nothing
+    /// leaves none — and the second call on the same binary is deduplicated,
+    /// so its differently-named file must never appear.
+    #[tokio::test]
+    async fn admission_executes_the_probe_once_per_binary() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let first = scratch.path().join("first-admission");
+        let second = scratch.path().join("second-admission");
+        let touch = std::path::Path::new("/usr/bin/touch");
+
+        admit_binary(touch, &[&first.to_string_lossy()])
+            .await
+            .expect("the probe executes");
+        assert!(
+            first.is_file(),
+            "the admission must actually run the binary"
+        );
+
+        admit_binary(touch, &[&second.to_string_lossy()])
+            .await
+            .expect("a deduplicated admission still answers Ok");
+        assert!(
+            !second.is_file(),
+            "one payment per binary: the second call must not execute"
+        );
+    }
+
+    /// A binary that cannot execute is a named error, not a hang.
+    #[tokio::test]
+    async fn an_unexecutable_binary_refuses_admission() {
+        let missing = std::path::Path::new("/nonexistent/never-a-binary");
+        assert!(
+            admit_binary(missing, &[]).await.is_err(),
+            "executing nothing is not a payment"
+        );
+    }
 
     #[test]
     fn candidates_cover_the_profile_dir_and_the_debug_fallback() {
