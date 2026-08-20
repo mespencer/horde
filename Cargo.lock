@@ -1220,6 +1220,7 @@ name = "horde-e2e"
 version = "0.1.0"
 dependencies = [
  "horde-server-testkit",
+ "portable-pty",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1391,6 +1392,7 @@ dependencies = [
  "horde-observe",
  "horde-proto",
  "horde-server",
+ "portable-pty",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1448,6 +1450,7 @@ dependencies = [
  "horde-server-testkit",
  "horde-testkit",
  "horde-wire",
+ "portable-pty",
  "rusqlite",
  "serde_json",
  "tempfile",

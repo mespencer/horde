@@ -356,22 +356,17 @@ where
     W: Fn(horde_proto::v1::ForwardTunnelFrame) -> T + Send + 'static,
 {
     let (typed, stream) = tokio::sync::mpsc::channel(16);
-    let (frames, mut frame_rx) = tokio::sync::mpsc::channel(16);
+    let (frames, frame_rx) = tokio::sync::mpsc::channel(16);
     let log = core.log.clone();
     let registry = core.forwards.clone();
+    let logins = core.logins.clone();
 
-    let lift = typed.clone();
-    tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if lift.send(Ok(wrap(frame))).await.is_err() {
-                return; // The peer hung up; the relay sees the channel close.
-            }
-        }
-    });
+    super::shared::lift_frames(frame_rx, typed.clone(), wrap);
     tokio::spawn(async move {
         let pump = crate::forward::relay::run_tunnel(
             &log,
             &registry,
+            &logins,
             caller,
             crate::forward::relay::LegIo {
                 inbound,
@@ -399,6 +394,12 @@ pub fn affects_forwards(kind: Option<&Kind>) -> bool {
                 | Kind::ForwardClosed(_)
                 | Kind::AgentLifecycleChanged(_)
                 | Kind::PlacementChanged(_)
+                // Login lifecycle moves the ephemeral callback expose in and
+                // out of the merged intent set (DESIGN §4): the started
+                // append is deliberately what wakes the push that makes the
+                // worker's dialable map carry the callback port.
+                | Kind::WorkerLoginStarted(_)
+                | Kind::WorkerLoginEnded(_)
         )
     )
 }

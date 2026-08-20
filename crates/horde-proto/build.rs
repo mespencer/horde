@@ -22,6 +22,7 @@ const PROTO_FILES: &[&str] = &[
     "horde/v1/forward.proto",
     "horde/v1/handshake.proto",
     "horde/v1/id.proto",
+    "horde/v1/login.proto",
     "horde/v1/mcp.proto",
     "horde/v1/payload.proto",
     "horde/v1/permission.proto",

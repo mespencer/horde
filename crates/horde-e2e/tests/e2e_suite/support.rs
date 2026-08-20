@@ -19,6 +19,16 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// How many polls a cross-process wait may spend before it is a failure.
 const POLLS: u32 = 300;
 
+/// Pays a product binary's first-exec cost once per test process, through
+/// the shared admission (the mechanism the hub e2e baseline met first;
+/// `horde_server_testkit::process::admit_binary` owns the story). `--help`
+/// is the probe every product binary answers or refuses immediately.
+pub(crate) async fn admit(binary: &Path) {
+    horde_server_testkit::process::admit_binary(binary, &["--help"])
+        .await
+        .expect("the binary is admitted before any scenario timing starts");
+}
+
 /// A running Horde: the server process, its endpoints, and an enrolled
 /// operator identity.
 pub(crate) struct System {
@@ -44,6 +54,23 @@ impl System {
     /// The worker daemon binary this system spawns workers from.
     pub(crate) fn worker_binary(&self) -> PathBuf {
         self.worker_bin.clone()
+    }
+
+    /// The `horde` CLI binary — for scenarios that must run it somewhere
+    /// [`Self::cli`] cannot, like inside a pty.
+    pub(crate) fn horde_binary(&self) -> PathBuf {
+        self.horde.clone()
+    }
+
+    /// The operator flags every `horde` invocation carries, for callers
+    /// assembling their own command around [`Self::horde_binary`].
+    pub(crate) fn operator_args(&self) -> Vec<String> {
+        vec![
+            "--endpoint".to_owned(),
+            self.main.clone(),
+            "--identity".to_owned(),
+            self.operator.to_string_lossy().into_owned(),
+        ]
     }
 }
 
@@ -71,6 +98,13 @@ impl System {
         let worker_bin = product_binary("horde-worker", "horde-worker")
             .await
             .expect("the worker binary exists");
+
+        // Every scenario opens through here, so this is the one choke point
+        // where the three binaries' first-exec admission can be paid before
+        // any timed wait exists to eat it.
+        admit(&server_bin).await;
+        admit(&horde).await;
+        admit(&worker_bin).await;
 
         let state = tempfile::tempdir().expect("a state directory");
         let db = state.path().join("horde.db");

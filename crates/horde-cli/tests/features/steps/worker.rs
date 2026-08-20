@@ -76,9 +76,12 @@ async fn join_with(world: &mut HordeWorld, script: Script) -> StepResult {
         identity: None,
     };
     let (mut connection, _registration) = horde_worker::Connection::dial(&config).await?;
+    // Built before the spawn: the scripted worker's login plane is static
+    // data, and nothing in a feature scenario reads its operator lines.
+    let logins = horde_worker::login::LoginPlane::discarding(runtime.adapters());
     let task = tokio::spawn(async move {
         let mut runtime = runtime;
-        connection.run(&journal, &mut runtime).await
+        connection.run(&journal, &mut runtime, logins).await
     });
     world.worker = Some(RunningWorker::new(task, journal_dir));
 

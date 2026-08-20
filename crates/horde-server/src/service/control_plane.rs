@@ -1497,6 +1497,32 @@ impl ControlPlaneService for ControlPlane {
             |frame| horde_proto::v1::ForwardTunnelResponse { frame: Some(frame) },
         ))
     }
+
+    type WorkerLoginStream =
+        Pin<Box<dyn Stream<Item = Result<horde_proto::v1::WorkerLoginResponse, Status>> + Send>>;
+
+    #[instrument(skip_all)]
+    async fn worker_login(
+        &self,
+        request: Request<tonic::Streaming<horde_proto::v1::WorkerLoginRequest>>,
+    ) -> Result<Response<Self::WorkerLoginStream>, Status> {
+        let deny = self
+            .enrollment
+            .as_ref()
+            .map(|authority| authority.deny_list());
+        let core = self.core.clone();
+        Ok(super::logins::login_response(
+            deny,
+            request,
+            |message: horde_proto::v1::WorkerLoginRequest| message.frame.unwrap_or_default(),
+            |frame| horde_proto::v1::WorkerLoginResponse { frame: Some(frame) },
+            Box::new(move |caller, io| {
+                Box::pin(async move {
+                    super::logins::run_client_login(&core, caller, io).await;
+                })
+            }),
+        ))
+    }
 }
 
 /// The actor a request's channel identity names, for event attribution.

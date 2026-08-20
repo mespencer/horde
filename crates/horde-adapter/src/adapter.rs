@@ -10,6 +10,7 @@ use crate::capability::Capabilities;
 use crate::error::Result;
 use crate::event::AgentEvent;
 use crate::ids::{ProviderSessionId, ToolCallId};
+use crate::login::LoginRecipe;
 use crate::permission::PermissionDecision;
 use crate::spec::{AgentSpec, TurnInput};
 
@@ -22,6 +23,16 @@ pub trait Adapter: Send + Sync {
 
     /// What this harness can do. Callers are entitled to rely on this.
     fn capabilities(&self) -> Capabilities;
+
+    /// How an operator signs this provider's CLI into an account over the
+    /// interactive-auth relay (DESIGN §4), when the provider has an
+    /// interactive login at all.
+    ///
+    /// `None` — the default — honestly refuses `horde worker login` for
+    /// this provider rather than spawning a command that does not exist.
+    fn login_recipe(&self) -> Option<LoginRecipe> {
+        None
+    }
 
     /// Starts a new conversation.
     ///

@@ -54,6 +54,11 @@ pub struct ServerCore {
     /// awaiting their pair. Ephemeral on purpose — realization is tied to
     /// connections, so a restart honestly forgetting all of it is correct.
     pub forwards: ForwardRegistry,
+    /// The login plane's state (DESIGN §4): worker login-dispatch lanes and
+    /// the logins alive right now, callback exposes included. Ephemeral for
+    /// the same reason as `forwards`, and more so — a login has no durable
+    /// intent at all, only its audit events.
+    pub logins: crate::login::registry::LoginRegistry,
     /// The MCP Hub's connected upstreams (ADR-0004): hub-placed user servers,
     /// each authenticated exactly once and multiplexed to every forwarding
     /// worker. Honestly a cache of connections — which servers *exist* is the
@@ -76,6 +81,7 @@ impl ServerCore {
             blobs: None,
             placement_lock: Arc::new(tokio::sync::Mutex::new(())),
             forwards: ForwardRegistry::new(),
+            logins: crate::login::registry::LoginRegistry::new(),
             hub: Arc::new(crate::hub::HubUpstreams::new()),
         }
     }
@@ -195,6 +201,28 @@ pub(crate) async fn run_severable<T, F>(
             let _ = sender.send(Err(severed_status(serial.as_deref()))).await;
         }
     }
+}
+
+/// Lifts bare frames into a spine's wrapped response type on their way to
+/// the peer, until either side hangs up. One task shape for every relayed
+/// stream — the forward tunnels and the login legs — so the wrapper
+/// plumbing cannot drift between them.
+pub(crate) fn lift_frames<F, T, W>(
+    mut frames: tokio::sync::mpsc::Receiver<F>,
+    typed: tokio::sync::mpsc::Sender<Result<T, tonic::Status>>,
+    wrap: W,
+) where
+    F: Send + 'static,
+    T: Send + 'static,
+    W: Fn(F) -> T + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            if typed.send(Ok(wrap(frame))).await.is_err() {
+                return; // The peer hung up; the relay sees the channel close.
+            }
+        }
+    });
 }
 
 /// Below this, a peer is refused outright (DESIGN.md §2). Enforced by
@@ -405,6 +433,31 @@ pub fn refuse_kind_collision(
 #[cfg(test)]
 mod tests {
     use super::{ServerCore, kind_name, refuse_kind_collision};
+
+    /// The one lift shape every relayed stream shares: frames cross wrapped,
+    /// in order, and the source closing ends the task. Hollowed to nothing,
+    /// every tunnel and login leg would go silent — which is why the kill
+    /// lives here beside the helper.
+    #[tokio::test]
+    async fn lifted_frames_cross_wrapped_until_the_source_closes() {
+        let (frames_tx, frames) = tokio::sync::mpsc::channel::<u8>(4);
+        let (typed, mut received) = tokio::sync::mpsc::channel(4);
+        super::lift_frames(frames, typed, |frame| format!("wrapped-{frame}"));
+
+        frames_tx.send(7).await.expect("the frame queues");
+        let lifted = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+            .await
+            .expect("the lift must move the frame")
+            .expect("the channel is open")
+            .expect("an Ok item");
+        assert_eq!(lifted, "wrapped-7");
+
+        drop(frames_tx);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+            .await
+            .expect("the closed source must close the lifted side");
+        assert!(closed.is_none(), "the task ends with its source");
+    }
     use crate::error::ServerError;
     use crate::log::EventLog;
     use crate::log::store::Appended;

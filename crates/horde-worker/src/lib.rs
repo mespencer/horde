@@ -32,6 +32,7 @@ pub mod error;
 pub mod forward;
 pub mod hub;
 pub mod journal;
+pub mod login;
 pub mod process;
 pub mod runtime;
 pub mod share;

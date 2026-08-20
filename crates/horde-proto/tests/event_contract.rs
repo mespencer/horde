@@ -14,9 +14,10 @@ use horde_proto::v1::{
     McpServerConfigChanged, Note, NoteSent, Payload, PermissionDecided, PermissionDecision,
     PermissionRequest, PermissionRequested, Placement, PlacementChanged, PlacementState,
     ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged, SessionLifecycleState,
-    TurnInterrupted, UsageRecord, UsageRecorded, WorkerId, WorkspaceDefinition,
-    WorkspaceDefinitionChanged, WorkspaceDefinitionId, WorkspaceInstanceChanged,
-    WorkspaceInstanceReport, WorkspacePrewarmRequested, event, mcp_server_config,
+    TurnInterrupted, UsageRecord, UsageRecorded, WorkerId, WorkerLoginEnded, WorkerLoginStarted,
+    WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
+    WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
+    mcp_server_config,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:
@@ -37,6 +38,9 @@ use horde_proto::v1::{
 ///   stream like the Definition catalog's.
 /// * Port-forward intents (ADR-0006): opened and closed. Durable intent
 ///   only — the tunnel plane realizing a forward never touches the log.
+/// * Interactive logins (DESIGN §4): started and ended, in a reserved stream
+///   like enrollment's. Audit trail only — a login is EPHEMERAL intent whose
+///   liveness is the relay's in-memory pairing, never a fold over these.
 const EVENT_VOCABULARY: &[&str] = &[
     "agent_output_chunk",
     "agent_spawned",
@@ -59,6 +63,8 @@ const EVENT_VOCABULARY: &[&str] = &[
     "mcp_server_config_changed",
     "forward_opened",
     "forward_closed",
+    "worker_login_started",
+    "worker_login_ended",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -88,6 +94,8 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::McpServerConfigChanged(_) => "mcp_server_config_changed",
         event::Kind::ForwardOpened(_) => "forward_opened",
         event::Kind::ForwardClosed(_) => "forward_closed",
+        event::Kind::WorkerLoginStarted(_) => "worker_login_started",
+        event::Kind::WorkerLoginEnded(_) => "worker_login_ended",
     }
 }
 
@@ -232,6 +240,19 @@ fn every_kind() -> Vec<event::Kind> {
             closed_by: None,
             reason: "done with the database".to_owned(),
         }),
+        event::Kind::WorkerLoginStarted(WorkerLoginStarted {
+            login_id: "login-1".to_owned(),
+            worker_id: Some(WorkerId::new("mac-studio")),
+            provider: "claude".to_owned(),
+            opened_by: None,
+            callback_port: 1455,
+        }),
+        event::Kind::WorkerLoginEnded(WorkerLoginEnded {
+            login_id: "login-1".to_owned(),
+            worker_id: Some(WorkerId::new("mac-studio")),
+            provider: "claude".to_owned(),
+            reason: "the command exited with 0".to_owned(),
+        }),
     ]
 }
 
@@ -342,7 +363,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 21] = [
+    let expected: [(&str, i32); 23] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -364,6 +385,8 @@ fn event_kind_tags_are_stable() {
         ("mcp_server_config_changed", 28),
         ("forward_opened", 29),
         ("forward_closed", 30),
+        ("worker_login_started", 31),
+        ("worker_login_ended", 32),
     ];
 
     let expected: Vec<(String, i32)> = expected

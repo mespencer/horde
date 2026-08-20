@@ -26,6 +26,7 @@ pub mod v1 {
 pub mod blob;
 pub mod forward;
 mod ids;
+pub mod login;
 mod names;
 
 pub use names::kind_field_name;

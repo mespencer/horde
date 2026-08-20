@@ -186,7 +186,8 @@ pub(crate) fn supervise_worker(
                 ),
             );
             if let Ok((mut connection, _)) = Connection::dial(&config).await {
-                let _ = connection.run(&journal, &mut runtime).await;
+                let logins = horde_worker::login::LoginPlane::discarding(runtime.adapters());
+                let _ = connection.run(&journal, &mut runtime, logins).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

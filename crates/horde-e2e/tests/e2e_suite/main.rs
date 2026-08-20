@@ -18,6 +18,8 @@ mod hub;
 #[cfg(test)]
 mod lifecycle;
 #[cfg(test)]
+mod logins;
+#[cfg(test)]
 mod relay_payload;
 #[cfg(test)]
 mod resilience;

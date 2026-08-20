@@ -103,6 +103,17 @@ pub struct WorkerConfig {
     pub adapters: Vec<AdapterChoice>,
     /// A JSON script for the fake adapter; absent means the echo script.
     pub fake_script: Option<PathBuf>,
+    /// The fake adapter's login command (DESIGN §4's relay, hermetically):
+    /// a program the login PTY spawns instead of a real provider CLI.
+    pub fake_login: Option<PathBuf>,
+    /// The browser-facing callback port the fake login recipe declares —
+    /// what the client binds exactly and the URL the command prints names.
+    pub fake_login_callback_port: Option<u16>,
+    /// Where the fake login command actually listens on this machine, when
+    /// it differs from the callback port. The hermetic e2e needs the split:
+    /// on one machine, one port cannot be both the client's listener and
+    /// the worker's.
+    pub fake_login_listen_port: Option<u16>,
     /// Enables workspace support rooted here.
     pub workspace_root: Option<PathBuf>,
     /// The git Relay payload shares stage to and fetch through.
@@ -130,6 +141,9 @@ struct ParsedFlags {
     enrollment: Option<String>,
     name: Option<String>,
     adapters: Vec<AdapterChoice>,
+    fake_login: Option<PathBuf>,
+    fake_login_callback_port: Option<u16>,
+    fake_login_listen_port: Option<u16>,
     fake_script: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     relay: Option<String>,
@@ -154,12 +168,22 @@ fn takes_value(flag: &str) -> bool {
             | "--name"
             | "--adapter"
             | "--fake-script"
+            | "--fake-login"
+            | "--fake-login-callback-port"
+            | "--fake-login-listen-port"
             | "--workspace-root"
             | "--relay"
             | "--tag"
             | "--advertise-remote"
             | "--codex-approvals-reviewer"
     )
+}
+
+/// A flag's value as a TCP port, refused with the flag's own name.
+fn parsed_port(flag: &str, value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("{flag} is not a port: {value}"))
 }
 
 /// Consumes the next argument as `flag`'s value, refusing blanks.
@@ -205,7 +229,9 @@ impl ParsedFlags {
         Ok(())
     }
 
-    /// Applies the flags that decide what this Worker runs.
+    /// Applies the flags that decide what this Worker runs; the fake login
+    /// recipe's fall through to [`Self::apply_login_value`]. Split by
+    /// subject so neither half outgrows the complexity bar.
     fn apply_runtime_value(&mut self, flag: &str, value: String) -> Result<(), String> {
         match flag {
             "--adapter" => {
@@ -228,7 +254,23 @@ impl ParsedFlags {
                 horde_adapter_codex::approvals_reviewer_from_config(Some(&value))?;
                 self.codex_approvals_reviewer = Some(value);
             }
-            // Unreachable while `takes_value` and these two matches agree;
+            _ => return self.apply_login_value(flag, value),
+        }
+        Ok(())
+    }
+
+    /// Applies the flags that shape the fake adapter's login recipe
+    /// (DESIGN §4's relay, hermetically).
+    fn apply_login_value(&mut self, flag: &str, value: String) -> Result<(), String> {
+        match flag {
+            "--fake-login" => self.fake_login = Some(PathBuf::from(value)),
+            "--fake-login-callback-port" => {
+                self.fake_login_callback_port = Some(parsed_port(flag, &value)?);
+            }
+            "--fake-login-listen-port" => {
+                self.fake_login_listen_port = Some(parsed_port(flag, &value)?);
+            }
+            // Unreachable while `takes_value` and these matches agree;
             // refusing (rather than ignoring) is what keeps a future drift
             // between them loud.
             other => return Err(format!("unknown argument {other}")),
@@ -248,6 +290,9 @@ impl ParsedFlags {
             name: self.name,
             adapters: self.adapters,
             fake_script: self.fake_script,
+            fake_login: self.fake_login,
+            fake_login_callback_port: self.fake_login_callback_port,
+            fake_login_listen_port: self.fake_login_listen_port,
             workspace_root: self.workspace_root,
             relay: self.relay,
             tags: self.tags,
@@ -276,9 +321,7 @@ impl WorkerConfig {
         if self.join.is_some() && self.insecure {
             return Err("--join enrolls an identity; it cannot combine with --insecure".to_owned());
         }
-        if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
-            return Err("--fake-script needs --adapter fake".to_owned());
-        }
+        self.check_fake_shape()?;
         if self.codex_approvals_reviewer.is_some() && !self.adapters.contains(&AdapterChoice::Codex)
         {
             return Err("--codex-approvals-reviewer needs --adapter codex".to_owned());
@@ -295,6 +338,25 @@ impl WorkerConfig {
                  (or pass --insecure for a plaintext test server)",
                 self.server
             ));
+        }
+        Ok(())
+    }
+
+    /// The fake adapter's own shape rules: scripts and login recipes
+    /// configure nothing without the adapter they belong to, and the login
+    /// ports form a dependency chain (listen needs callback needs command).
+    fn check_fake_shape(&self) -> Result<(), String> {
+        if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
+            return Err("--fake-script needs --adapter fake".to_owned());
+        }
+        if self.fake_login.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
+            return Err("--fake-login needs --adapter fake".to_owned());
+        }
+        if self.fake_login_callback_port.is_some() && self.fake_login.is_none() {
+            return Err("--fake-login-callback-port needs --fake-login".to_owned());
+        }
+        if self.fake_login_listen_port.is_some() && self.fake_login_callback_port.is_none() {
+            return Err("--fake-login-listen-port needs --fake-login-callback-port".to_owned());
         }
         Ok(())
     }
@@ -596,6 +658,10 @@ pub struct PreparedWorker {
     pub identity: Option<StoredIdentity>,
     /// The id claimed at registration and the display name in the hello.
     pub name: String,
+    /// Where the login plane's operator lines go (`login spawned …`,
+    /// `login reaped …`). Stdout by default — the operator interface — and
+    /// injectable so in-process suites can read the reap witness.
+    pub login_announce: crate::login::Announce,
 }
 
 impl std::fmt::Debug for PreparedWorker {
@@ -646,6 +712,7 @@ pub async fn prepare(
         server: config.server.clone(),
         identity,
         name,
+        login_announce: Arc::new(|line| println!("{line}")),
     })
 }
 
@@ -676,7 +743,11 @@ async fn build_runtime(
     for adapter in &config.adapters {
         runtime = match adapter {
             AdapterChoice::Fake => {
-                runtime.with_adapter(Arc::new(FakeAdapter::new(configured_script(config)?)))
+                let mut fake = FakeAdapter::new(configured_script(config)?);
+                if let Some(recipe) = configured_fake_login(config) {
+                    fake = fake.with_login_recipe(recipe);
+                }
+                runtime.with_adapter(Arc::new(fake))
             }
             AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new())),
             AdapterChoice::Codex => {
@@ -702,6 +773,29 @@ async fn build_runtime(
         runtime = runtime.with_relay(horde_relay::RelayLocation::new(relay));
     }
     Ok(runtime)
+}
+
+/// The fake adapter's login recipe, when `--fake-login` gave it one. The
+/// ports ride both halves of the recipe: declared (so the relay exposes the
+/// callback and the worker dials the listener) and passed to the command as
+/// argv (so it binds and prints the same ports).
+pub fn configured_fake_login(config: &WorkerConfig) -> Option<horde_adapter::LoginRecipe> {
+    let program = config.fake_login.as_ref()?;
+    let program = program.to_string_lossy().into_owned();
+    let Some(callback) = config.fake_login_callback_port else {
+        return Some(horde_adapter::LoginRecipe::terminal_only(
+            program,
+            Vec::new(),
+        ));
+    };
+    let mut args = vec!["--callback-port".to_owned(), callback.to_string()];
+    let mut recipe = horde_adapter::LoginRecipe::with_callback(program, Vec::new(), callback);
+    if let Some(listen) = config.fake_login_listen_port {
+        args.extend(["--listen-port".to_owned(), listen.to_string()]);
+        recipe = recipe.listening_on(listen);
+    }
+    recipe.args = args;
+    Some(recipe)
 }
 
 /// The fake adapter's script: the file's, or the echo default.
@@ -919,9 +1013,16 @@ async fn connection_loop(
             registration.resume_from_journal_sequence
         ));
 
+        // Rebuilt per connection from the registered adapters: recipes are
+        // static data, and collecting them here keeps the borrow on the
+        // runtime out of the mutable run below.
+        let logins = Arc::new(crate::login::LoginPlane::from_adapters(
+            prepared.runtime.adapters(),
+            prepared.login_announce.clone(),
+        ));
         let ended = tokio::select! {
             () = shutdown.as_mut() => return None,
-            ended = connection.run(&prepared.journal, &mut prepared.runtime) => ended,
+            ended = connection.run(&prepared.journal, &mut prepared.runtime, logins) => ended,
         };
         match fate_of(&ended) {
             Fate::Fatal(reason) => return Some(reason),
@@ -973,6 +1074,82 @@ mod tests {
         assert!(config.join.is_none() && config.enrollment.is_none());
         assert!(config.workspace_root.is_none() && config.relay.is_none());
         assert!(config.tags.is_empty() && config.advertised_remotes.is_empty());
+    }
+
+    /// The fake login recipe's flags, whole: parsed into the config, turned
+    /// into the recipe with the split listener, and each dependency rule
+    /// refusing by name — port typos included.
+    #[test]
+    fn the_fake_login_flags_parse_validate_and_build_the_recipe() {
+        let config = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-callback-port",
+            "14555",
+            "--fake-login-listen-port",
+            "14556",
+        ])
+        .expect("the login flags parse");
+        assert_eq!(config.fake_login_callback_port, Some(14555));
+        assert_eq!(config.fake_login_listen_port, Some(14556));
+        let recipe = super::configured_fake_login(&config).expect("a recipe");
+        assert_eq!(recipe.program, "/tmp/fake-login");
+        assert_eq!(recipe.callback_port, Some(14555));
+        assert_eq!(recipe.listen_port, Some(14556));
+        assert_eq!(
+            recipe.args,
+            vec!["--callback-port", "14555", "--listen-port", "14556"],
+            "the command binds and prints the same ports the recipe declares"
+        );
+
+        // A command without ports is a terminal-only recipe; no flags at
+        // all is no recipe.
+        let bare = parsed(&["--adapter", "fake", "--fake-login", "/tmp/fake-login"])
+            .expect("a portless login parses");
+        let recipe = super::configured_fake_login(&bare).expect("a recipe");
+        assert_eq!((recipe.callback_port, recipe.listen_port), (None, None));
+        assert!(recipe.args.is_empty());
+        let none = parsed(&["--adapter", "fake"]).expect("parses");
+        assert!(super::configured_fake_login(&none).is_none());
+
+        // The refusal ladder, each rule by name.
+        let refused = parsed(&["--fake-login", "/tmp/fake-login"]).expect_err("needs the adapter");
+        assert!(refused.contains("--adapter fake"), "{refused}");
+        let refused = parsed(&["--adapter", "fake", "--fake-login-callback-port", "1"])
+            .expect_err("a port without a command configures nothing");
+        assert!(refused.contains("needs --fake-login"), "{refused}");
+        let refused = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-listen-port",
+            "1",
+        ])
+        .expect_err("a listener without a redirect is meaningless");
+        assert!(
+            refused.contains("needs --fake-login-callback-port"),
+            "{refused}"
+        );
+        let refused = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-callback-port",
+            "not-a-port",
+        ])
+        .expect_err("a port typo is the typist's, by name");
+        assert!(
+            refused.contains("--fake-login-callback-port is not a port"),
+            "{refused}"
+        );
+        let refused = super::parsed_port("--fake-login-listen-port", "70000")
+            .expect_err("no TCP port is that big");
+        assert!(refused.contains("not a port"), "{refused}");
+        assert_eq!(super::parsed_port("--x", "8080"), Ok(8080));
     }
 
     /// The transcript-23 pin at the config seam: `user` (with the codex

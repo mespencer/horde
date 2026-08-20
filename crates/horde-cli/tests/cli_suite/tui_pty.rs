@@ -9,118 +9,21 @@
 //! exit.
 //!
 //! Every read is a positive wait with a ceiling, asserting on the bytes that
-//! arrived; a child that outlives its ceiling is killed, not leaked.
-
-use std::io::Read;
-use std::time::Duration;
+//! arrived; a child that outlives its ceiling is killed, not leaked — the
+//! shared [`PtyProcess`] driver's discipline.
 
 use crate::common::{Setup, seeded, serve};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tokio::sync::mpsc;
-
-/// A `horde` process running inside a pty.
-struct PtyHorde {
-    /// Chunks of terminal output, as the child paints them.
-    output: mpsc::UnboundedReceiver<Vec<u8>>,
-    /// Everything read so far, accumulated across waits.
-    seen: String,
-    writer: Box<dyn std::io::Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-}
+use horde_server_testkit::pty::PtyProcess;
 
 /// Spawns the freshly built binary in an 80×24 pty.
-fn spawn_horde(endpoint: &str, args: &[&str]) -> Setup<PtyHorde> {
-    let pair = native_pty_system().openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_horde"));
+fn spawn_horde(endpoint: &str, args: &[&str]) -> Setup<PtyProcess> {
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_horde"));
     command.arg("--endpoint");
     command.arg(endpoint);
     for arg in args {
         command.arg(arg);
     }
-    command.env("TERM", "xterm-256color");
-
-    let child = pair.slave.spawn_command(command)?;
-    // The slave side belongs to the child now; holding it open here would
-    // keep the pty from ever reporting EOF.
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
-    let (sender, output) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        while let Ok(count) = reader.read(&mut buffer) {
-            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
-                return;
-            }
-        }
-    });
-
-    Ok(PtyHorde {
-        output,
-        seen: String::new(),
-        writer,
-        child,
-    })
-}
-
-impl PtyHorde {
-    /// Reads until the screen has shown `needle`, within a ceiling.
-    async fn await_painted(&mut self, needle: &str) -> Setup<()> {
-        let deadline = Duration::from_secs(15);
-        let step = async {
-            while !self.seen.contains(needle) {
-                match self.output.recv().await {
-                    Some(chunk) => self.seen.push_str(&String::from_utf8_lossy(&chunk)),
-                    None => {
-                        return Err(format!(
-                            "the pty closed before painting {needle:?}; saw: {:?}",
-                            self.seen
-                        )
-                        .into());
-                    }
-                }
-            }
-            Ok(())
-        };
-        match tokio::time::timeout(deadline, step).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                // A child that outlives its ceiling is killed, not leaked.
-                let _ = self.child.kill();
-                Err(format!("{needle:?} was never painted; saw: {:?}", self.seen).into())
-            }
-        }
-    }
-
-    fn type_bytes(&mut self, bytes: &[u8]) -> Setup<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
-        Ok(())
-    }
-
-    /// Waits for the child to exit, killing it if it overstays.
-    async fn exit_status(mut self) -> Setup<portable_pty::ExitStatus> {
-        let mut killer = self.child.clone_killer();
-        let waited = tokio::time::timeout(
-            Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || self.child.wait()),
-        )
-        .await;
-        match waited {
-            Ok(joined) => Ok(joined??),
-            Err(_) => {
-                let _ = killer.kill();
-                Err("the TUI did not exit within its ceiling".into())
-            }
-        }
-    }
+    PtyProcess::spawn(command)
 }
 
 #[tokio::test]

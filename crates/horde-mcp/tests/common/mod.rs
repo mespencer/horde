@@ -226,62 +226,18 @@ pub mod stub_mcp {
     /// The stub server binary, where cargo built it for this test run.
     pub const BINARY: &str = env!("CARGO_BIN_EXE_mcp_stub_server");
 
-    /// How long the operating system may take to admit [`BINARY`]'s first
-    /// launch — an OS bound, deliberately distinct from the harness's
-    /// 5-second wait ceiling, which stays for every protocol wait.
-    ///
-    /// The cost this bounds is real and was measured: macOS validates a
-    /// freshly linked binary on its first-ever exec (code-signature and
-    /// XProtect assessment, cached per file afterwards), which took 327ms
-    /// against 8ms warm on an idle machine — and multi-second when the
-    /// validation service is contended by concurrent builds minting new
-    /// binaries, exactly what a cargo-mutants run does. Kept well under
-    /// cargo-mutants' 60-second test floor so a genuinely stuck launch is
-    /// still this harness's loud failure, never the gate's opaque TIMEOUT.
-    const FIRST_LAUNCH_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// Pays [`BINARY`]'s first-launch cost once per test process, before any
-    /// suite puts an MCP handshake behind it.
-    ///
-    /// Every cargo-mutants scratch tree links a brand-new stub binary, so a
-    /// suite whose tests each spawn it concurrently pays the OS's first-exec
-    /// validation *inside* every test's wait ceiling at once — which is how
-    /// the hub e2e baseline failed 0/6 at its ceiling on a loaded machine
-    /// while the same tree passed everywhere warm. Warming is serialized by
-    /// the cell: one launch pays, the rest find the OS's per-file cache.
+    /// Pays [`BINARY`]'s first-launch cost once per test process, before
+    /// any suite puts an MCP handshake behind it — through the shared
+    /// admission (`horde_server_testkit::process::admit_binary`, which owns
+    /// the first-exec-validation story this harness discovered). No probe
+    /// argument: the stub exits on stdin's EOF.
     ///
     /// # Errors
     ///
     /// The binary failing to execute at all, or the OS not admitting it
-    /// within [`FIRST_LAUNCH_CEILING`] — both named, neither a hang.
+    /// within the shared admission bound — both named, neither a hang.
     pub async fn warm() -> Setup<()> {
-        static WARMED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-        WARMED.get_or_try_init(first_launch).await?;
-        Ok(())
-    }
-
-    /// One execution of [`BINARY`] with its stdio closed: the stub sees EOF
-    /// and exits immediately. The exit status is deliberately ignored — that
-    /// the process *executed* is the whole payment.
-    async fn first_launch() -> Setup<()> {
-        let run = tokio::process::Command::new(BINARY)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match tokio::time::timeout(FIRST_LAUNCH_CEILING, run).await {
-            Ok(executed) => {
-                let _exit_of_an_eof_fed_stub = executed?;
-                Ok(())
-            }
-            Err(_elapsed) => Err(format!(
-                "the stub binary's first launch did not finish within \
-                 {FIRST_LAUNCH_CEILING:?} ({BINARY}); the OS admits a freshly \
-                 built binary only after validating it, and that validation \
-                 is starved or stuck"
-            )
-            .into()),
-        }
+        horde_server_testkit::process::admit_binary(std::path::Path::new(BINARY), &[]).await
     }
 
     /// A connected [`Upstream`](horde_mcp::hub::Upstream) over a real rmcp

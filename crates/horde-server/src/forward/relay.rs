@@ -63,6 +63,7 @@ impl LegIo {
 pub async fn run_tunnel(
     log: &EventLog,
     registry: &ForwardRegistry,
+    logins: &crate::login::registry::LoginRegistry,
     caller: TunnelPrincipal,
     mut io: LegIo,
 ) {
@@ -83,7 +84,7 @@ pub async fn run_tunnel(
             ))
             .await;
         }
-        Claim::Unknown => run_originator(log, registry, caller, open, io).await,
+        Claim::Unknown => run_originator(log, registry, logins, caller, open, io).await,
     }
 }
 
@@ -125,11 +126,12 @@ async fn run_passive(pair: tokio::sync::oneshot::Sender<PassiveLeg>, io: LegIo) 
 async fn run_originator(
     log: &EventLog,
     registry: &ForwardRegistry,
+    logins: &crate::login::registry::LoginRegistry,
     caller: TunnelPrincipal,
     open: ForwardTunnelOpen,
     mut io: LegIo,
 ) {
-    let leg = match originate(log, registry, &caller, &open).await {
+    let leg = match originate(log, registry, logins, &caller, &open).await {
         Ok(leg) => leg,
         Err(refusal) => return io.say(refusal).await,
     };
@@ -141,6 +143,7 @@ async fn run_originator(
 async fn originate(
     log: &EventLog,
     registry: &ForwardRegistry,
+    logins: &crate::login::registry::LoginRegistry,
     caller: &TunnelPrincipal,
     open: &ForwardTunnelOpen,
 ) -> Result<PassiveLeg, ForwardTunnelFrame> {
@@ -156,7 +159,12 @@ async fn originate(
                 ForwardRefusalReason::Unspecified,
                 format!("the relay could not read the log: {error}"),
             )
-        })?;
+        })?
+        // Not in the log by design: a live login's callback expose is
+        // ephemeral intent, resolved from the login registry and ruled on
+        // exactly like a journaled expose — clients originate, the placed
+        // (login-hosting) worker carries.
+        .or_else(|| logins.callback_expose(&forward_id).map(callback_resolved));
     let target =
         originate_ruling(resolved.as_ref(), caller).map_err(|refusal| ForwardTunnelFrame {
             frame: Some(Frame::Refused(refusal.into_refusal())),
@@ -180,6 +188,20 @@ async fn originate(
             registry.abandon_pending(&open.connection_id);
             Err(unanswered_refusal(&target))
         }
+    }
+}
+
+/// A live login's callback expose as the ruling sees it: an expose placed
+/// on the login-hosting worker, backed by nobody. `session_id` is empty —
+/// the login owns no session, and nothing in the ruling reads it.
+fn callback_resolved(expose: crate::login::registry::CallbackExpose) -> ResolvedForward {
+    ResolvedForward {
+        forward_id: crate::login::registry::callback_forward_id(&expose.login_id),
+        session_id: String::new(),
+        direction: ForwardDirection::Expose,
+        name: format!("{}-login-callback", expose.provider),
+        placed_worker: Some(expose.worker_id),
+        backer: None,
     }
 }
 
@@ -375,6 +397,7 @@ mod tests {
 
     use super::super::registry::{PassiveTarget, TunnelPrincipal};
     use super::{Refusal, ResolvedForward, originate_ruling, splice};
+    use crate::forward::testfix::within;
 
     fn resolved(
         direction: ForwardDirection,
@@ -547,14 +570,6 @@ mod tests {
         }
     }
 
-    /// A ceilinged receive: the positive wait this suite is allowed.
-    async fn within<T>(what: &str, receiver: &mut tokio::sync::mpsc::Receiver<T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{what}: nothing arrived within the ceiling"))
-            .unwrap_or_else(|| panic!("{what}: the channel closed instead"))
-    }
-
     #[tokio::test]
     async fn frames_flow_both_ways_through_a_splice() {
         let mut harness = spliced();
@@ -666,7 +681,8 @@ mod tests {
         let log = log.clone();
         let registry = registry.clone();
         let task = tokio::spawn(async move {
-            super::run_tunnel(&log, &registry, caller, io).await;
+            let logins = crate::login::registry::LoginRegistry::new();
+            super::run_tunnel(&log, &registry, &logins, caller, io).await;
         });
         (feed, out, task)
     }

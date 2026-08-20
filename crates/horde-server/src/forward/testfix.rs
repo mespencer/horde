@@ -30,6 +30,16 @@ pub(crate) async fn append(log: &EventLog, session: &str, key: &str, agent: &str
     .expect("the fixture appends");
 }
 
+/// A ceilinged receive: the one positive channel wait the relay suites —
+/// forward and login alike — are allowed, kept here per the duplication
+/// gate's rule that test code shares its shapes too.
+pub(crate) async fn within<T>(what: &str, receiver: &mut tokio::sync::mpsc::Receiver<T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: nothing arrived within the ceiling"))
+        .unwrap_or_else(|| panic!("{what}: the channel closed instead"))
+}
+
 /// An expose named "vite" from worker port 5173.
 pub(crate) fn expose_spec() -> ForwardSpec {
     ForwardSpec {

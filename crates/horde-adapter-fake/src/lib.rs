@@ -50,6 +50,7 @@ pub struct FakeAdapter {
     provider: String,
     capabilities: Capabilities,
     script: Script,
+    login: Option<horde_adapter::LoginRecipe>,
     next_session: AtomicU64,
 }
 
@@ -68,6 +69,7 @@ impl FakeAdapter {
                 .with(Capability::SystemPromptOverlay)
                 .with(Capability::ModelSelection),
             script,
+            login: None,
             next_session: AtomicU64::new(1),
         }
     }
@@ -88,6 +90,15 @@ impl FakeAdapter {
     #[must_use]
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
+        self
+    }
+
+    /// Gives this fake an interactive login recipe — the scripted stand-in
+    /// for a provider CLI's login command, so the interactive-auth relay
+    /// (DESIGN §4) is testable without a provider account.
+    #[must_use]
+    pub fn with_login_recipe(mut self, recipe: horde_adapter::LoginRecipe) -> Self {
+        self.login = Some(recipe);
         self
     }
 
@@ -146,6 +157,10 @@ impl Adapter for FakeAdapter {
 
     fn capabilities(&self) -> Capabilities {
         self.capabilities.clone()
+    }
+
+    fn login_recipe(&self) -> Option<horde_adapter::LoginRecipe> {
+        self.login.clone()
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
@@ -762,6 +777,41 @@ impl AgentSession for FakeSession {
 /// them, is the shape the duplication gate exists to catch. The fix it asks for
 /// is one shared helper rather than a wider detection window, and putting these
 /// behind `#[cfg(test)] mod` is also what lets them use `expect`.
+#[cfg(test)]
+mod login_recipe_tests {
+    use horde_adapter::{Adapter, LoginRecipe};
+
+    use super::FakeAdapter;
+
+    /// The recipe surface, both truths: a bare fake honestly refuses to be
+    /// loginable, and an injected recipe comes back exactly as given — the
+    /// worker's login plane resolves providers through this answer, so a
+    /// defaulted or dropped recipe would silently unplug the whole relay.
+    #[test]
+    fn the_injected_login_recipe_is_carried_and_none_is_honest() {
+        let bare = FakeAdapter::default();
+        assert_eq!(bare.login_recipe(), None, "no recipe was injected");
+
+        let recipe = LoginRecipe::with_callback(
+            "/tmp/fake-login",
+            vec!["--callback-port".to_owned(), "14555".to_owned()],
+            14555,
+        )
+        .listening_on(14556);
+        let loginable = FakeAdapter::default().with_login_recipe(recipe.clone());
+        assert_eq!(
+            loginable.login_recipe(),
+            Some(recipe),
+            "the recipe must come back exactly as injected"
+        );
+        assert_eq!(
+            loginable.provider(),
+            "fake",
+            "with_login_recipe must not reset the adapter it builds on"
+        );
+    }
+}
+
 #[cfg(test)]
 mod harness {
     use horde_adapter::{Adapter, AgentSession, AgentSpec, TurnInput};
