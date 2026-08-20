@@ -285,6 +285,82 @@ impl McpElicitation {
 /// The method elicitations arrive on.
 pub const MCP_ELICITATION_METHOD: &str = "mcpServer/elicitation/request";
 
+/// The method exec approvals arrive on — the shell/exec interception point.
+///
+/// Routed to the client *before* the command executes (re-probe transcripts
+/// 20–33, codex-cli 0.148.0 and 0.147.0): the exec item starts, parks in
+/// `inProgress`, and completes as `declined` or with an exit code only after
+/// this request is answered. At 0.147 only the granular approval policy routes
+/// it; at 0.148 plain `on-request` does too. At 0.146 and below nothing does.
+pub const EXEC_APPROVAL_METHOD: &str = "item/commandExecution/requestApproval";
+
+/// `item/commandExecution/requestApproval` — a shell command awaiting Horde's
+/// verdict, as recorded in transcripts 20–33.
+///
+/// The reply speaks the `decision` vocabulary (never the elicitation
+/// `action`): `"accept"`, `"acceptForSession"`, `"decline"`, `"cancel"`, or
+/// `{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": [argv…]}}`.
+/// The recorded `availableDecisions` list is advisory, not exhaustive —
+/// transcript 25's list omits `decline`, yet declining blocked the command.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ExecApprovalRequest {
+    #[serde(rename = "threadId", default)]
+    pub thread_id: Option<String>,
+    #[serde(rename = "turnId", default)]
+    pub turn_id: Option<String>,
+    /// The commandExecution item this approval gates. Codex numbers its own
+    /// items, so this is the tool-call identity downstream.
+    #[serde(rename = "itemId", default)]
+    pub item_id: Option<String>,
+    /// Codex's own words for why it is asking, e.g. "command failed; retry
+    /// without sandbox?" — display context, not rule input.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The full invocation as codex will run it, shell wrapper included:
+    /// `/bin/zsh -lc "printf …"`.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Codex's parse of the invocation into user-level actions; the inner
+    /// command without the shell wrapper lives here.
+    #[serde(rename = "commandActions", default)]
+    pub command_actions: Vec<CommandAction>,
+    /// The execpolicy rule codex proposes to persist on
+    /// `acceptWithExecpolicyAmendment`, as an argv (transcript 30 proves the
+    /// echo-back shape deserializes and is honored).
+    #[serde(rename = "proposedExecpolicyAmendment", default)]
+    pub proposed_execpolicy_amendment: Option<Vec<String>>,
+}
+
+/// One parsed action inside an [`ExecApprovalRequest`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CommandAction {
+    /// The action's command text, when codex parsed one (`type: "unknown"`
+    /// still carries it — transcript 20).
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl ExecApprovalRequest {
+    /// The command deterministic rules should match on: codex's own parse of
+    /// the inner command when the invocation reduced to exactly one, else the
+    /// raw invocation.
+    ///
+    /// The raw form is shell-wrapped (`/bin/zsh -lc "git status"`), which no
+    /// prefix rule authored as `git ` would ever match; the single parsed
+    /// action is codex's statement of what actually runs. Ambiguity — zero or
+    /// several actions — falls back to the raw form, because a rule must never
+    /// match a fragment of a compound command.
+    #[must_use]
+    pub fn effective_command(&self) -> Option<&str> {
+        match self.command_actions.as_slice() {
+            [only] => only.command.as_deref().or(self.command.as_deref()),
+            _ => self.command.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TokenUsageUpdated {
     #[serde(rename = "threadId", default)]
@@ -519,6 +595,85 @@ mod tests {
             }
             other => panic!("expected an error notification, got {other:?}"),
         }
+    }
+
+    /// The recorded exec-approval shape (transcript 20), field for field: the
+    /// raw invocation is shell-wrapped, the parsed action carries the inner
+    /// command, and the proposed amendment is an argv.
+    #[test]
+    fn the_recorded_exec_approval_shape_parses_and_names_its_command() {
+        let request: super::ExecApprovalRequest = serde_json::from_value(json!({
+            "threadId": "01a01b80-1d2d-7f60-99de-5b47a62a0631",
+            "turnId": "01a01b80-1d55-7611-84f5-e65b521eaea9",
+            "itemId": "exec-1f1c062e-6400-4e6f-9ba3-b919696784e7",
+            "startedAtMs": 1_787_167_782_287_u64,
+            "environmentId": "local",
+            "reason": "Allow me to create horde-escalation-probe.txt?",
+            "command": "/bin/zsh -lc \"printf '%s\\n' ESCALATED > horde-escalation-probe.txt\"",
+            "cwd": "/private/tmp/horde-appr-20",
+            "commandActions": [
+                {"type": "unknown",
+                 "command": "printf '%s\n' ESCALATED > horde-escalation-probe.txt"}
+            ],
+            "proposedExecpolicyAmendment":
+                ["/bin/zsh", "-lc", "printf '%s\n' ESCALATED > horde-escalation-probe.txt"],
+            "availableDecisions": ["accept",
+                {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": []}}, "cancel"]
+        }))
+        .expect("the recorded shape must parse");
+
+        assert_eq!(
+            request.item_id.as_deref(),
+            Some("exec-1f1c062e-6400-4e6f-9ba3-b919696784e7")
+        );
+        assert_eq!(request.cwd.as_deref(), Some("/private/tmp/horde-appr-20"));
+        assert_eq!(
+            request.effective_command(),
+            Some("printf '%s\n' ESCALATED > horde-escalation-probe.txt"),
+            "one parsed action means rules match the inner command"
+        );
+        assert_eq!(
+            request
+                .proposed_execpolicy_amendment
+                .as_deref()
+                .map(<[String]>::len),
+            Some(3)
+        );
+    }
+
+    /// The effective command's fallbacks: a compound invocation (several
+    /// actions) and an unparsed one (none) both fall back to the raw form —
+    /// a rule must never match a fragment of a compound command.
+    #[test]
+    fn the_effective_command_falls_back_to_the_raw_invocation_on_ambiguity() {
+        let parse = |value: serde_json::Value| -> super::ExecApprovalRequest {
+            serde_json::from_value(value).expect("parses")
+        };
+
+        let compound = parse(json!({
+            "command": "/bin/zsh -lc \"cd /x && git push\"",
+            "commandActions": [{"command": "cd /x"}, {"command": "git push"}]
+        }));
+        assert_eq!(
+            compound.effective_command(),
+            Some("/bin/zsh -lc \"cd /x && git push\"")
+        );
+
+        let unparsed = parse(json!({"command": "/bin/zsh -lc true"}));
+        assert_eq!(unparsed.effective_command(), Some("/bin/zsh -lc true"));
+
+        let action_without_text = parse(json!({
+            "command": "/bin/zsh -lc true",
+            "commandActions": [{"type": "unknown"}]
+        }));
+        assert_eq!(
+            action_without_text.effective_command(),
+            Some("/bin/zsh -lc true"),
+            "a single action with no text still falls back to the raw form"
+        );
+
+        let bare = parse(json!({}));
+        assert_eq!(bare.effective_command(), None, "nothing to match on");
     }
 
     #[test]

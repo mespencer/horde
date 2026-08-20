@@ -42,7 +42,7 @@ pub mod workspace;
 pub use blob::AttachmentBroker;
 pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use client::{ApplyCommand, Connection, DialConfig};
-pub use codex::{CodexAdapter, LiveCodexSession};
+pub use codex::{CodexAdapter, ExecInterception, LiveCodexSession};
 pub use error::WorkerError;
 pub use journal::{
     AgentBookkeeping, AgentProgress, CommandApplication, Journal, JournalEntry, JournalSink,

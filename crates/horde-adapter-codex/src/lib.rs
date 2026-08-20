@@ -49,17 +49,20 @@ pub mod identity;
 pub mod replay;
 pub mod sandbox;
 pub mod turn;
+pub mod version;
 pub mod wire;
 
 pub use codec::{
-    ThreadConfig, decode_line, encode_decision_decline, encode_elicitation_response,
+    APPROVALS_REVIEWER, ExecDecision, ThreadConfig, approvals_reviewer_from_config, decode_line,
+    encode_decision_decline, encode_elicitation_response, encode_exec_approval_response,
     encode_initialize, encode_initialized, encode_interrupt, encode_method_not_found, encode_steer,
     encode_thread_resume, encode_thread_start, encode_turn_start,
 };
 pub use identity::RevivalIdentity;
 pub use replay::{ReplaySession, replay};
 pub use sandbox::{SandboxPolicy, SandboxTier, TierChoice};
-pub use turn::TurnAssembler;
+pub use turn::{ApprovalKind, EXEC_TOOL_NAME, ResolvedApproval, TurnAssembler};
+pub use version::routes_exec_approvals;
 
 use horde_adapter::{Capabilities, Capability};
 
@@ -84,9 +87,18 @@ pub const PROVIDER: &str = "codex";
 /// `permission_enforcement()` (the kind-blind floor) still reads
 /// `SandboxAtSpawn`.
 ///
-/// [`Capability::RewritesToolInput`] stays absent: the elicitation reply is
-/// accept-or-decline, with nowhere to carry replacement arguments, so a
-/// narrowing decision must be refused rather than silently widened.
+/// For **shell/exec** the 2026-08-19 re-probe (transcripts 20–33) reversed it
+/// again — but only from codex-cli 0.147.0 under the granular policy this
+/// codec always sends. That claim is therefore **not** in this baseline set:
+/// it is version-gated, and only [`capabilities_with_exec_interception`] holds
+/// it, for an adapter that has probed the launched binary
+/// ([`version::routes_exec_approvals`]). File-change approvals never route in
+/// any measured configuration — they park the thread instead (transcripts
+/// 28/31) — so no version lifts the kind-blind floor above `SandboxAtSpawn`.
+///
+/// [`Capability::RewritesToolInput`] stays absent: both reply vocabularies
+/// are accept-or-decline-shaped, with nowhere to carry replacement arguments,
+/// so a narrowing decision must be refused rather than silently widened.
 #[must_use]
 pub fn capabilities() -> Capabilities {
     Capabilities::none()
@@ -103,6 +115,19 @@ pub fn capabilities() -> Capabilities {
         .with(Capability::SystemPromptOverlay)
         .with(Capability::ModelSelection)
         .with(Capability::AccountIsolation)
+}
+
+/// [`capabilities`], plus the exec-interception claim a 0.147+ binary earns.
+///
+/// Held only after the launched codex's version has actually been probed —
+/// the gate is [`version::routes_exec_approvals`] over the binary's own
+/// `--version` output, never an assumption. On older CLIs the request this
+/// claim promises simply never arrives (transcript 32's park is the closest
+/// 0.147 `on-request` gets, and 0.145 routed nothing at all), so holding the
+/// claim unprobed would advertise a chain that silently gates nothing.
+#[must_use]
+pub fn capabilities_with_exec_interception() -> Capabilities {
+    capabilities().with(Capability::PreAuthorizeExecCommands)
 }
 
 #[cfg(test)]
@@ -145,22 +170,40 @@ mod tests {
 
     /// The kind-blind answer must stay `SandboxAtSpawn` — not `Unenforced`,
     /// which would understate what Codex does, and not `PerCall`, which the
-    /// MCP-only claim must never inflate into. Per kind, MCP is `PerCall`.
+    /// per-kind claims must never inflate into. Per kind, MCP is `PerCall`;
+    /// exec is `PerCall` only for the probed 0.147+ set; file changes never
+    /// are, on any version — their approval parks instead of routing
+    /// (transcripts 28/31).
     #[test]
-    fn permission_enforcement_reads_as_sandbox_at_spawn_with_mcp_gated() {
+    fn permission_enforcement_reads_as_sandbox_at_spawn_with_per_kind_gates() {
         use horde_adapter::ToolCallKind;
 
+        for claimed in [capabilities(), super::capabilities_with_exec_interception()] {
+            assert_eq!(
+                claimed.permission_enforcement(),
+                PermissionEnforcement::SandboxAtSpawn,
+                "no version lifts the kind-blind floor"
+            );
+            assert_eq!(
+                claimed.permission_enforcement_for(ToolCallKind::Mcp),
+                PermissionEnforcement::PerCall
+            );
+            assert_eq!(
+                claimed.permission_enforcement_for(ToolCallKind::FileChange),
+                PermissionEnforcement::SandboxAtSpawn
+            );
+        }
+
         assert_eq!(
-            capabilities().permission_enforcement(),
-            PermissionEnforcement::SandboxAtSpawn
+            capabilities().permission_enforcement_for(ToolCallKind::ExecCommand),
+            PermissionEnforcement::SandboxAtSpawn,
+            "unprobed, the exec claim is not held"
         );
         assert_eq!(
-            capabilities().permission_enforcement_for(ToolCallKind::Mcp),
-            PermissionEnforcement::PerCall
-        );
-        assert_eq!(
-            capabilities().permission_enforcement_for(ToolCallKind::Exec),
-            PermissionEnforcement::SandboxAtSpawn
+            super::capabilities_with_exec_interception()
+                .permission_enforcement_for(ToolCallKind::ExecCommand),
+            PermissionEnforcement::PerCall,
+            "a probed 0.147+ binary earns per-call exec gating (transcripts 25/33)"
         );
     }
 

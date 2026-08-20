@@ -41,8 +41,8 @@ impl LineDecoder for AppServerFrames {
     }
 
     fn no_permission_channel(&self, tool_call_id: &ToolCallId) -> AdapterError {
-        // Exec approvals never reach the client (ADR-0005), and an MCP
-        // elicitation that is not outstanding is not answerable either way.
+        // An approval that is not outstanding — never surfaced, or already
+        // answered — is not answerable, whichever kind it would have been.
         AdapterError::UnknownPermissionRequest {
             tool_call_id: tool_call_id.clone(),
         }
@@ -54,9 +54,9 @@ impl LineDecoder for AppServerFrames {
         decision: &PermissionDecision,
     ) -> Result<()> {
         // The same two rules a live session applies. A narrowing decision is
-        // refused — the elicitation reply is accept-or-decline with nowhere to
-        // carry replacement arguments — and an answer for a call that is not
-        // waiting is an error, never a no-op.
+        // refused — neither reply vocabulary can carry replacement arguments —
+        // and an answer for a call that is not waiting is an error, never a
+        // no-op.
         if decision.updated_input().is_some() {
             return Err(AdapterError::Unsupported {
                 provider: crate::PROVIDER.to_owned(),
@@ -65,11 +65,11 @@ impl LineDecoder for AppServerFrames {
         }
         match self
             .assembler
-            .resolve_elicitation(tool_call_id, decision.is_allow())
+            .resolve_approval(tool_call_id, decision.is_allow())
         {
             // On a recording there is no wire to write the reply to; the
             // recorded continuation is the harness's reaction to it.
-            Some(_rpc_id) => Ok(()),
+            Some(_resolved) => Ok(()),
             None => Err(self.no_permission_channel(tool_call_id)),
         }
     }

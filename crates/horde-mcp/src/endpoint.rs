@@ -646,7 +646,7 @@ impl HordeEndpoint {
                     rmcp::model::ContentBlock::text(format!("permission denied: {message}")),
                 ]))
             }
-            horde_adapter::PermissionDecision::Allow { updated_input } => {
+            horde_adapter::PermissionDecision::Allow { updated_input, .. } => {
                 let forwarded = match narrowed_arguments(arguments, updated_input) {
                     Ok(forwarded) => forwarded,
                     Err(refusal) => {
@@ -1078,9 +1078,7 @@ mod tests {
         assert_eq!(prompt.input["port"], "5173", "ports ride as strings");
 
         let granted = super::declared_result(
-            &horde_adapter::PermissionDecision::Allow {
-                updated_input: None,
-            },
+            &horde_adapter::PermissionDecision::allow(),
             "expose",
             "vite",
             5173,

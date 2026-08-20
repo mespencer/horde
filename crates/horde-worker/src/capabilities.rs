@@ -157,12 +157,32 @@ mod tests {
         );
     }
 
-    /// The codex advertisement must NOT carry blanket tool-call gating: its
-    /// exec calls cannot be pre-authorized (ADR-0005), and TOOL_CALL_GATING is
-    /// what placement reads as "high-trust work can land here". The MCP-only
-    /// gating stays off the wire until placement can match per call kind.
+    /// The codex advertisement must NOT carry blanket tool-call gating: even
+    /// a probed 0.147+ binary leaves file-change approvals unroutable (they
+    /// park — transcripts 28/31), and TOOL_CALL_GATING is what placement
+    /// reads as "high-trust work can land here". The per-kind MCP and exec
+    /// gating stay off the wire until placement can match per call kind.
     #[test]
     fn a_registered_codex_adapter_advertises_without_blanket_gating() {
+        let mut codex = crate::codex::CodexAdapter::new();
+        for interception in [
+            crate::codex::ExecInterception::SandboxOnly {
+                reason: "unprobed".to_owned(),
+            },
+            crate::codex::ExecInterception::Routed {
+                version: "codex-cli 0.148.0".to_owned(),
+            },
+        ] {
+            codex.exec_interception = interception;
+            let capabilities = advertise([&codex as &dyn Adapter], None, &DeclaredFacts::default());
+            assert!(
+                !capabilities.harnesses[0]
+                    .capabilities
+                    .contains(&i32::from(AdapterCapability::ToolCallGating)),
+                "no probe verdict may advertise blanket gating: file changes stay ungated"
+            );
+        }
+
         let codex = crate::codex::CodexAdapter::new();
         let capabilities = advertise([&codex as &dyn Adapter], None, &DeclaredFacts::default());
 
