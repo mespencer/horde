@@ -49,6 +49,10 @@ async fn spawn_login_worker(
     let fake_login = horde_server_testkit::process::product_binary("horde-e2e", "fake-login")
         .await
         .expect("the fake-login binary exists");
+    // The scripted provider pays its first-exec admission like the product
+    // binaries — it is spawned inside the worker's PTY, where the cost
+    // would land in a login scenario's own ceiling.
+    crate::support::admit(&fake_login).await;
     system
         .spawn_worker(
             name,

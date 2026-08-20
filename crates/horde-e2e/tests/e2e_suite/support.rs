@@ -19,6 +19,57 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// How many polls a cross-process wait may spend before it is a failure.
 const POLLS: u32 = 300;
 
+/// How long the OS may take to admit one freshly linked binary. Generous on
+/// purpose: this is an admission bound paid once, outside every scenario's
+/// own timing, and a loud failure here beats a scenario's opaque ceiling.
+const FIRST_LAUNCH_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pays a binary's first-exec cost once per test process, before any
+/// scenario timing starts.
+///
+/// Every cargo-mutants scratch tree links brand-new product binaries, and
+/// macOS admits a freshly linked binary only after validating its signature
+/// — multi-second under load, and paid *inside* whichever scenario wait
+/// happens to spawn it first (the mechanism the hub e2e baseline already
+/// met; see `stub_mcp::warm()` in horde-mcp's tests). Warming here is
+/// serialized by one mutex: the first launch pays per binary, the rest find
+/// the OS's per-file cache.
+///
+/// The probe runs the binary with `--help` and stdio closed: every product
+/// binary refuses or answers that argument immediately, and that the
+/// process *executed* is the whole payment — the exit status is ignored.
+pub(crate) async fn admit(binary: &Path) {
+    use std::collections::BTreeSet;
+    static WARMED: tokio::sync::OnceCell<tokio::sync::Mutex<BTreeSet<PathBuf>>> =
+        tokio::sync::OnceCell::const_new();
+    let warmed = WARMED
+        .get_or_init(|| async { tokio::sync::Mutex::new(BTreeSet::new()) })
+        .await;
+    let mut warmed = warmed.lock().await;
+    if warmed.contains(binary) {
+        return;
+    }
+    let run = tokio::process::Command::new(binary)
+        .arg("--help")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let admitted = tokio::time::timeout(FIRST_LAUNCH_CEILING, run).await;
+    match admitted {
+        Ok(executed) => {
+            let _exit_of_a_help_probe = executed.expect("the binary executes");
+        }
+        Err(_elapsed) => panic!(
+            "{}'s first launch did not finish within {FIRST_LAUNCH_CEILING:?}; \
+             the OS admits a freshly built binary only after validating it, \
+             and that validation is starved or stuck",
+            binary.display()
+        ),
+    }
+    warmed.insert(binary.to_path_buf());
+}
+
 /// A running Horde: the server process, its endpoints, and an enrolled
 /// operator identity.
 pub(crate) struct System {
@@ -88,6 +139,13 @@ impl System {
         let worker_bin = product_binary("horde-worker", "horde-worker")
             .await
             .expect("the worker binary exists");
+
+        // Every scenario opens through here, so this is the one choke point
+        // where the three binaries' first-exec admission can be paid before
+        // any timed wait exists to eat it.
+        admit(&server_bin).await;
+        admit(&horde).await;
+        admit(&worker_bin).await;
 
         let state = tempfile::tempdir().expect("a state directory");
         let db = state.path().join("horde.db");
