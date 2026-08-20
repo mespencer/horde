@@ -31,6 +31,9 @@ mod forwards;
 // Gated like `forwards`, for the same free-helper reason.
 #[cfg(test)]
 mod hub_link;
+// Gated like `forwards`, for the same free-helper reason.
+#[cfg(test)]
+mod logins;
 mod payload_share;
 mod supervision;
 mod workspaces;

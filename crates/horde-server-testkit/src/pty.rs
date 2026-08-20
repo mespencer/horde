@@ -54,9 +54,17 @@ impl PtyProcess {
         let (sender, output) = tokio::sync::mpsc::unbounded_channel();
         std::thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
-            while let Ok(count) = reader.read(&mut buffer) {
-                if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
-                    return;
+            loop {
+                // EOF and error retire the reader alike — a closed pty
+                // reports either, platform's choice — and only real bytes
+                // are worth a send.
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => {
+                        if sender.send(buffer[..count].to_vec()).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -130,5 +138,72 @@ impl PtyProcess {
                 Err("the child did not exit within its ceiling".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PtyProcess;
+
+    /// The driver against a real child: a paint that arrives *late* is
+    /// still awaited (a wait that returned without reading would miss it),
+    /// everything painted accumulates in `seen`, and the exit is collected.
+    #[tokio::test]
+    async fn painted_output_is_awaited_accumulated_and_the_exit_collected() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("printf one; sleep 0.3; printf two");
+        let mut child = PtyProcess::spawn(command).expect("the shell spawns");
+
+        child
+            .await_painted("two")
+            .await
+            .expect("the late paint must be waited for, not assumed");
+        assert!(
+            child.seen.contains("one") && child.seen.contains("two"),
+            "everything painted accumulates: {:?}",
+            child.seen
+        );
+
+        let status = child.exit_status().await.expect("the shell exits");
+        assert!(status.success());
+    }
+
+    /// A child that exits without painting the needle: the closed pty must
+    /// answer as an error naming what was seen — not hang, not succeed.
+    #[tokio::test]
+    async fn a_closed_pty_fails_an_unpainted_wait_with_what_it_saw() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("printf only-this");
+        let mut child = PtyProcess::spawn(command).expect("the shell spawns");
+
+        let missing = child
+            .await_painted("never-painted")
+            .await
+            .expect_err("a closed pty cannot paint it");
+        assert!(
+            missing.to_string().contains("closed"),
+            "the failure names the closed pty, promptly — a reader thread \
+             that survives EOF turns this into a full-ceiling hang: {missing}"
+        );
+        assert!(child.seen.contains("only-this"));
+    }
+
+    /// Typed bytes reach the child — the half `type_bytes` owns.
+    #[tokio::test]
+    async fn typed_bytes_reach_the_child() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("read line; printf \"got %s\" \"$line\"");
+        let mut child = PtyProcess::spawn(command).expect("the shell spawns");
+
+        child.type_bytes(b"hello\r").expect("typing lands");
+        child
+            .await_painted("got hello")
+            .await
+            .expect("the child heard what was typed");
+        let status = child.exit_status().await.expect("the shell exits");
+        assert!(status.success());
     }
 }

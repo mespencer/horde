@@ -433,6 +433,31 @@ pub fn refuse_kind_collision(
 #[cfg(test)]
 mod tests {
     use super::{ServerCore, kind_name, refuse_kind_collision};
+
+    /// The one lift shape every relayed stream shares: frames cross wrapped,
+    /// in order, and the source closing ends the task. Hollowed to nothing,
+    /// every tunnel and login leg would go silent — which is why the kill
+    /// lives here beside the helper.
+    #[tokio::test]
+    async fn lifted_frames_cross_wrapped_until_the_source_closes() {
+        let (frames_tx, frames) = tokio::sync::mpsc::channel::<u8>(4);
+        let (typed, mut received) = tokio::sync::mpsc::channel(4);
+        super::lift_frames(frames, typed, |frame| format!("wrapped-{frame}"));
+
+        frames_tx.send(7).await.expect("the frame queues");
+        let lifted = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+            .await
+            .expect("the lift must move the frame")
+            .expect("the channel is open")
+            .expect("an Ok item");
+        assert_eq!(lifted, "wrapped-7");
+
+        drop(frames_tx);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+            .await
+            .expect("the closed source must close the lifted side");
+        assert!(closed.is_none(), "the task ends with its source");
+    }
     use crate::error::ServerError;
     use crate::log::EventLog;
     use crate::log::store::Appended;

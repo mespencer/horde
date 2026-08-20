@@ -991,6 +991,25 @@ mod tests {
         CodexAdapter, is_approval_method, is_auth_failure, mcp_server_overrides, toml_string,
     };
 
+    /// The login recipe rides the adapter's own binary with codex's
+    /// documented 1455 callback — the port the relay's ephemeral expose
+    /// binds exactly. `None` here would silently unplug
+    /// `horde worker login <w> codex`.
+    #[test]
+    fn the_login_recipe_runs_this_adapters_own_binary_with_its_callback() {
+        let recipe = CodexAdapter::new()
+            .with_program("/stub/codex")
+            .login_recipe()
+            .expect("codex is loginable");
+        assert_eq!(recipe.program, "/stub/codex");
+        assert_eq!(recipe.args, vec!["login".to_owned()]);
+        assert_eq!(recipe.callback_port, Some(1455));
+        assert_eq!(
+            recipe.listen_port, None,
+            "stock CLIs listen where they redirect"
+        );
+    }
+
     #[test]
     fn the_adapter_reports_the_provider_key_the_wire_contract_uses() {
         assert_eq!(CodexAdapter::new().provider(), "codex");

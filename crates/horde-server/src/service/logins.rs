@@ -532,6 +532,105 @@ mod tests {
         tunnel.abort();
     }
 
+    /// A worker leg whose FIRST frame is a refusal — no attach at all, the
+    /// shape a future worker could send — is forwarded to the client
+    /// verbatim, not blurred into "ended before it attached". Staged through
+    /// the registry's own claim, because the wire's tunnel driver always
+    /// attaches first.
+    #[tokio::test]
+    async fn a_refusal_first_worker_leg_reaches_the_client_verbatim() {
+        let core = core();
+        let (_epoch, mut lane) = core.logins.register_worker("w1");
+        let (_feed, mut out, driver) = driven(&core, TunnelPrincipal::Ambient, "fake").await;
+        let dispatched = within("the dispatch", &mut lane).await;
+
+        // Claim as the worker would, then pair a leg whose first frame is
+        // the refusal itself.
+        let pair = match core
+            .logins
+            .claim(&dispatched.login_id, &TunnelPrincipal::Ambient)
+        {
+            crate::login::registry::LoginClaim::Matched(pair) => pair,
+            other => panic!("the dispatched login must be claimable: {other:?}"),
+        };
+        let (to_client, from_worker) = tokio::sync::mpsc::channel(8);
+        let (to_worker, _from_client) = tokio::sync::mpsc::channel(8);
+        to_client
+            .send(horde_proto::login::login_refusal_frame(
+                LoginRefusalReason::SpawnFailed,
+                "could not spawn the recipe",
+            ))
+            .await
+            .expect("the refusal queues");
+        pair.send(crate::login::registry::LoginLeg {
+            to_worker,
+            from_worker,
+        })
+        .expect("the pairing resolves");
+
+        let refused = within("the refusal crosses verbatim", &mut out).await;
+        let refusal = login_refusal_in(&refused).expect("a refusal");
+        assert_eq!(refusal.reason, LoginRefusalReason::SpawnFailed as i32);
+        assert_eq!(
+            refusal.detail, "could not spawn the recipe",
+            "the worker's own words, not the relay's unreachable blur"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("the driver ends on the refusal")
+            .expect("no panic");
+        assert!(login_kinds(&core).await.is_empty(), "no PTY ever lived");
+    }
+
+    /// The worker id a login stream speaks for, both sources: the request's
+    /// claim on a plaintext channel, and nothing when it names nobody — the
+    /// handler refuses an empty answer, so a defaulted or invented id here
+    /// is a stream registered under the wrong key.
+    #[test]
+    fn the_login_streams_worker_id_comes_from_the_request_on_plaintext() {
+        let named = tonic::Request::new(horde_proto::v1::StreamLoginsRequest {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w9")),
+        });
+        assert_eq!(super::login_worker_id(&named), "w9");
+
+        let nameless =
+            tonic::Request::new(horde_proto::v1::StreamLoginsRequest { worker_id: None });
+        assert_eq!(super::login_worker_id(&nameless), "");
+    }
+
+    /// The dispatch pump, both directions of its life: requests cross into
+    /// wrapped responses, and the lane closing ends it — a pump hollowed to
+    /// nothing forwards no login ever.
+    #[tokio::test]
+    async fn the_login_pump_forwards_dispatches_until_the_lane_closes() {
+        let (lane_tx, lane) = tokio::sync::mpsc::channel(4);
+        let (sender, mut received) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn(async move { super::pump_logins(lane, &sender).await });
+
+        lane_tx
+            .send(horde_proto::v1::LoginSessionRequest {
+                login_id: "login-7".to_owned(),
+                provider: "fake".to_owned(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("the dispatch queues");
+        let update = within("the dispatch crosses", &mut received)
+            .await
+            .expect("an Ok update");
+        assert_eq!(
+            update.request.map(|request| request.login_id),
+            Some("login-7".to_owned())
+        );
+
+        drop(lane_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+            .await
+            .expect("the closed lane ends the pump")
+            .expect("no panic");
+    }
+
     /// The exit-code vocabulary the audit trail and fault suites grep.
     #[test]
     fn the_ended_reason_carries_the_exit_code() {

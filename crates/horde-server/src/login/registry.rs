@@ -360,6 +360,12 @@ mod tests {
         let other_worker = registry
             .begin("w2", "claude")
             .expect("a different worker is a different machine");
+        assert_ne!(
+            first.login_id, other_provider.login_id,
+            "every begin mints its own id: a repeated id would let one \
+             login's tunnel claim another's pairing"
+        );
+        assert_ne!(other_provider.login_id, other_worker.login_id);
 
         assert!(registry.end(&first.login_id).is_some());
         let freed = registry.begin("w1", "claude");

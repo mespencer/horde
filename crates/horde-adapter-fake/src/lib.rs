@@ -778,6 +778,41 @@ impl AgentSession for FakeSession {
 /// is one shared helper rather than a wider detection window, and putting these
 /// behind `#[cfg(test)] mod` is also what lets them use `expect`.
 #[cfg(test)]
+mod login_recipe_tests {
+    use horde_adapter::{Adapter, LoginRecipe};
+
+    use super::FakeAdapter;
+
+    /// The recipe surface, both truths: a bare fake honestly refuses to be
+    /// loginable, and an injected recipe comes back exactly as given — the
+    /// worker's login plane resolves providers through this answer, so a
+    /// defaulted or dropped recipe would silently unplug the whole relay.
+    #[test]
+    fn the_injected_login_recipe_is_carried_and_none_is_honest() {
+        let bare = FakeAdapter::default();
+        assert_eq!(bare.login_recipe(), None, "no recipe was injected");
+
+        let recipe = LoginRecipe::with_callback(
+            "/tmp/fake-login",
+            vec!["--callback-port".to_owned(), "14555".to_owned()],
+            14555,
+        )
+        .listening_on(14556);
+        let loginable = FakeAdapter::default().with_login_recipe(recipe.clone());
+        assert_eq!(
+            loginable.login_recipe(),
+            Some(recipe),
+            "the recipe must come back exactly as injected"
+        );
+        assert_eq!(
+            loginable.provider(),
+            "fake",
+            "with_login_recipe must not reset the adapter it builds on"
+        );
+    }
+}
+
+#[cfg(test)]
 mod harness {
     use horde_adapter::{Adapter, AgentSession, AgentSpec, TurnInput};
     use serde_json::json;

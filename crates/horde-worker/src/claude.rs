@@ -390,6 +390,23 @@ mod tests {
 
     use super::ClaudeAdapter;
 
+    /// The login recipe rides the adapter's own binary — terminal-only, per
+    /// DESIGN §4's example — so a stubbed adapter logs in through the same
+    /// stub it spawns with. `None` here would silently unplug
+    /// `horde worker login <w> claude`.
+    #[test]
+    fn the_login_recipe_runs_this_adapters_own_binary() {
+        let recipe = ClaudeAdapter::with_program("/stub/claude")
+            .login_recipe()
+            .expect("claude is loginable");
+        assert_eq!(recipe.program, "/stub/claude");
+        assert_eq!(recipe.args, vec!["login".to_owned()]);
+        assert_eq!(
+            recipe.callback_port, None,
+            "terminal-only until the live CLI's callback is verified"
+        );
+    }
+
     /// The flags W1c established as the minimum for a usable stream.
     ///
     /// `--verbose` is the one that bites: without it alongside `-p`, the harness

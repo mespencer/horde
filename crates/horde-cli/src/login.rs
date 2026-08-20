@@ -79,36 +79,14 @@ pub async fn open_login(
         .await
         .map_err(|_| ClientError::Login("the login stream closed before the open".to_owned()))?;
 
-    let answer = tokio::time::timeout(ACCEPT_DEADLINE, async {
-        let mut seen = 0_u32;
-        while seen < ACCEPT_FRAME_BOUND {
-            match stream.from_relay.next().await {
-                Some(Ok(LoginFrame {
-                    frame: Some(Frame::Accepted(accepted)),
-                })) => return Ok(accepted),
-                Some(Ok(LoginFrame {
-                    frame: Some(Frame::Refused(refusal)),
-                })) => return Err(refusal_error(&refusal)),
-                Some(Ok(_)) => seen += 1,
-                Some(Err(status)) => return Err(ClientError::Rpc(status)),
-                None => {
-                    return Err(ClientError::Login(
-                        "the relay ended the stream without an answer".to_owned(),
-                    ));
-                }
-            }
-        }
-        Err(ClientError::Login(
-            "the relay babbled instead of answering".to_owned(),
-        ))
-    })
-    .await
-    .map_err(|_elapsed| {
-        ClientError::Login(format!(
-            "the relay did not answer within {}s",
-            ACCEPT_DEADLINE.as_secs()
-        ))
-    })??;
+    let answer = tokio::time::timeout(ACCEPT_DEADLINE, await_accept(&mut stream))
+        .await
+        .map_err(|_elapsed| {
+            ClientError::Login(format!(
+                "the relay did not answer within {}s",
+                ACCEPT_DEADLINE.as_secs()
+            ))
+        })??;
 
     Ok(OpenedLogin {
         stream,
@@ -118,6 +96,40 @@ pub async fn open_login(
             answer.callback_port,
         ),
     })
+}
+
+/// Waits (count-bounded; the caller holds the clock) for the relay's answer
+/// to an open: accepted, a coded refusal, or one of the ways a stream stops
+/// being an answer.
+///
+/// # Errors
+///
+/// The refusal's detail, the transport failure, a stream that ended silent,
+/// or a peer that babbled past the frame budget.
+async fn await_accept(
+    stream: &mut LoginStream,
+) -> Result<horde_proto::v1::LoginAccepted, ClientError> {
+    let mut seen = 0_u32;
+    while seen < ACCEPT_FRAME_BOUND {
+        match stream.from_relay.next().await {
+            Some(Ok(LoginFrame {
+                frame: Some(Frame::Accepted(accepted)),
+            })) => return Ok(accepted),
+            Some(Ok(LoginFrame {
+                frame: Some(Frame::Refused(refusal)),
+            })) => return Err(refusal_error(&refusal)),
+            Some(Ok(_)) => seen += 1,
+            Some(Err(status)) => return Err(ClientError::Rpc(status)),
+            None => {
+                return Err(ClientError::Login(
+                    "the relay ended the stream without an answer".to_owned(),
+                ));
+            }
+        }
+    }
+    Err(ClientError::Login(
+        "the relay babbled instead of answering".to_owned(),
+    ))
 }
 
 /// The callback an accepted frame names, when it names a whole one.
@@ -324,9 +336,16 @@ fn terminal_feeds() -> TerminalFeeds {
         use std::io::Read;
         let mut stdin = std::io::stdin();
         let mut buffer = [0_u8; 1024];
-        while let Ok(count) = stdin.read(&mut buffer) {
-            if count == 0 || typed_tx.blocking_send(buffer[..count].to_vec()).is_err() {
-                return;
+        loop {
+            // EOF and error retire the reader alike; only real bytes are
+            // worth a send, and a closed pump retires it too.
+            match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(count) => {
+                    if typed_tx.blocking_send(buffer[..count].to_vec()).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -429,6 +448,57 @@ mod tests {
             feed,
             sent,
         )
+    }
+
+    /// The stream's debug view names the type without dumping frames — the
+    /// same contract every relay handle in this workspace keeps.
+    #[test]
+    fn the_stream_debugs_as_its_own_name() {
+        let (stream, _feed, _sent) = scripted_stream();
+        assert!(format!("{stream:?}").contains("LoginStream"));
+    }
+
+    /// The acceptance wait's count bound, frame-exact: sixteen non-answers
+    /// are tolerated and the seventeenth is left unread. A widened bound or
+    /// a broken counter consumes it — or never returns at all.
+    #[tokio::test]
+    async fn the_accept_wait_reads_exactly_its_frame_budget() {
+        let (mut stream, feed, _sent) = scripted_stream();
+        // Fed concurrently: the scripted channel is shallower than the
+        // budget plus one, so a sequential feed would deadlock against the
+        // consumer it is arranging.
+        let feeding = tokio::spawn(async move {
+            for ordinal in 0..=u8::try_from(super::ACCEPT_FRAME_BOUND).expect("small bound") {
+                if feed
+                    .send(Ok(login_output_frame(vec![ordinal])))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            // Held open so the leftover frame stays readable below.
+            std::future::pending::<()>().await;
+        });
+
+        let gave_up = within("the bound gives up", super::await_accept(&mut stream))
+            .await
+            .expect_err("babble is not an answer");
+        assert!(gave_up.to_string().contains("babbled"), "{gave_up}");
+
+        use tokio_stream::StreamExt as _;
+        let leftover = within("the frame past the budget", stream.from_relay.next())
+            .await
+            .expect("a frame")
+            .expect("ok");
+        assert_eq!(
+            leftover,
+            login_output_frame(vec![
+                u8::try_from(super::ACCEPT_FRAME_BOUND).expect("small bound")
+            ]),
+            "exactly the budget was consumed, not one frame more"
+        );
+        feeding.abort();
     }
 
     /// The verdict table, pinned pure: only exit 0 succeeds, and every

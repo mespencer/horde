@@ -323,9 +323,17 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     let (output_tx, output) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
-        while let Ok(count) = reader.read(&mut buffer) {
-            if count == 0 || output_tx.blocking_send(buffer[..count].to_vec()).is_err() {
-                return;
+        loop {
+            // EOF and error retire the reader alike — a closed pty reports
+            // either, platform's choice — and only real bytes are worth a
+            // send; a closed pump retires it too.
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(count) => {
+                    if output_tx.blocking_send(buffer[..count].to_vec()).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -426,14 +434,14 @@ async fn pump_login(
 }
 
 /// Kills the child by handle and waits for the reap, draining whatever
-/// output the PTY still held (count-bounded) so the reader thread can end.
+/// output the PTY still held (count-bounded by the loop's own range — a
+/// clock cannot bound a loop that reads without waiting) so the reader
+/// thread can end.
 async fn kill_and_reap(session: &mut PtySession) -> Option<u32> {
     let _ = session.killer.kill();
-    let mut drained = 0_u32;
-    while drained < DRAIN_CHUNK_BOUND {
-        match session.output.try_recv() {
-            Ok(_) => drained += 1,
-            Err(_) => break,
+    for _ in 0..DRAIN_CHUNK_BOUND {
+        if session.output.try_recv().is_err() {
+            break;
         }
     }
     await_reap(&mut session.reaped).await
@@ -640,6 +648,34 @@ mod tests {
             cols: 80,
             rows: 24,
         }
+    }
+
+    /// A finishing tunnel closes its send half first and keeps draining the
+    /// receive half until the relay closes it — a finish hollowed down to a
+    /// drop lets both halves die at once, which is exactly the race that
+    /// loses the queued refusal this method exists to deliver.
+    #[tokio::test]
+    async fn a_finishing_tunnel_drains_until_the_relay_ends() {
+        let (tunnel, feed, mut sent) = scripted_tunnel();
+        let finishing = tokio::spawn(tunnel.finish());
+
+        within("the send half closes first", async {
+            assert!(
+                sent.recv().await.is_none(),
+                "finish transmits by closing, not by sending"
+            );
+        })
+        .await;
+        feed.send(Ok(horde_proto::login::login_output_frame(
+            b"trailing".to_vec(),
+        )))
+        .await
+        .expect("the drain must still hold the receiver open");
+
+        drop(feed);
+        within("the finish returns once the relay closes", finishing)
+            .await
+            .expect("no panic");
     }
 
     /// A dispatched provider with no recipe answers attach + refusal — the
