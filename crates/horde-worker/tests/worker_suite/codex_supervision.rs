@@ -174,12 +174,12 @@ mod harness {
         .join("\n")
     }
 
-    /// A session already mid-turn: spawned on `script` (whose first block must
-    /// stream a delta), its opening message sent, and drained until output
-    /// proved the turn open — the precondition every steering-shaped test
-    /// shares. Returns the control-log path the stub records to; the tempdirs
-    /// ride along because dropping them deletes the files under the child.
-    pub(crate) async fn mid_turn(
+    /// A session on `script` with the stub's control log wired and its
+    /// opening message sent — the arrangement the steering-shaped and
+    /// approval-shaped tests both build on. Returns the control-log path the
+    /// stub records to; the tempdirs ride along because dropping them deletes
+    /// the files under the child.
+    async fn logged_session(
         script: &str,
         steer_mode: Option<&str>,
     ) -> (
@@ -199,8 +199,24 @@ mod harness {
             .send(TurnInput::queued("start"))
             .await
             .expect("sends");
-        drain_until_output(&mut session).await;
         (session, log_path, (log, dir))
+    }
+
+    /// A session already mid-turn: [`logged_session`], drained until output
+    /// proved the turn open — the precondition every steering-shaped test
+    /// shares. A mid-turn send before that point would honestly (and
+    /// correctly) start a turn rather than steer one.
+    pub(crate) async fn mid_turn(
+        script: &str,
+        steer_mode: Option<&str>,
+    ) -> (
+        Box<dyn AgentSession>,
+        std::path::PathBuf,
+        (tempfile::TempDir, tempfile::TempDir),
+    ) {
+        let (mut session, log_path, dirs) = logged_session(script, steer_mode).await;
+        drain_until_output(&mut session).await;
+        (session, log_path, dirs)
     }
 
     /// Bounded control-log polling, shared with the claude suite — see
@@ -253,8 +269,9 @@ mod harness {
     }
 
     /// A session on `script` with a control log, its opening message already
-    /// sent — the arrangement every approval-shaped test shares. The tempdirs
-    /// ride along because dropping them deletes the files under the child.
+    /// sent — the arrangement every approval-shaped test shares. Exactly
+    /// [`logged_session`] without a steer mode; named for what the callers
+    /// mean rather than for what the plumbing does.
     pub(crate) async fn approval_session(
         script: &str,
     ) -> (
@@ -262,15 +279,7 @@ mod harness {
         std::path::PathBuf,
         (tempfile::TempDir, tempfile::TempDir),
     ) {
-        let log = tempfile::tempdir().expect("a scratch dir");
-        let log_path = log.path().join("control.log");
-        let (mut session, dir) = session_on(
-            script,
-            &[("HORDE_CODEX_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-        )
-        .await;
-        session.send(TurnInput::queued("go")).await.expect("sends");
-        (session, log_path, (log, dir))
+        logged_session(script, None).await
     }
 
     /// Drains to the permission request, under the ceiling.
@@ -441,6 +450,46 @@ async fn an_elicitation_surfaces_and_the_accept_reaches_the_wire() {
     let (_, outcome) = events_through_turn_end(&mut session).await;
     let outcome = outcome.expect("the turn finishes after the allow");
     assert!(outcome.denials.is_empty(), "an allow is not a refusal");
+    session.shutdown().await.expect("shuts down");
+}
+
+/// The boundary of `is_adjudicable_method`, held over a real process: a
+/// server request on a method outside the chain's two seams takes the refusal
+/// path, never adjudication. The two paths are observably different — the
+/// refusal is a JSON-RPC method-not-found error naming the method, while a
+/// request wrongly fed to the adjudicator would come back as a `decision`
+/// decline (its empty feed falls back to that vocabulary) — so a guard that
+/// quietly widened to everything changes the bytes on the wire.
+#[tokio::test]
+async fn a_non_adjudicable_server_request_is_refused_not_adjudicated() {
+    let script = [
+        harness::thread_started(),
+        harness::turn_started("turn-1"),
+        json!({"id": 900, "method": "attestation/generate", "params": {}}).to_string(),
+        harness::final_answer("turn-1", "i1", "done"),
+        harness::turn_completed("turn-1"),
+    ]
+    .join("\n");
+
+    let (mut session, log_path, _dirs) = harness::approval_session(&script).await;
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    assert!(
+        outcome.is_some(),
+        "a stray server request must not derail the turn"
+    );
+
+    // The refusal names the method inside the error reply — the only line in
+    // this exchange that carries the method back toward the stub.
+    let recorded = control_log_shows(&log_path, |log| log.contains("attestation/generate")).await;
+    assert!(
+        recorded.contains("-32601"),
+        "the refusal is a method-not-found error: {recorded}"
+    );
+    assert!(
+        !recorded.contains("\"decision\""),
+        "adjudication's decline vocabulary must never answer an unknown \
+         method: {recorded}"
+    );
     session.shutdown().await.expect("shuts down");
 }
 
