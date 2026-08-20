@@ -203,3 +203,22 @@ async fn the_catalog_stream_never_appears_as_a_session() {
         .sessions;
     assert_eq!(sessions, Vec::new(), "no session was ever created here");
 }
+
+/// `--serve`'s hub warm-up (the 2026-08-19 amendment): a catalog whose
+/// server cannot spawn warms to a failure *line* naming the server and the
+/// cause — never a failed startup, because one dead user server must not
+/// keep the control plane down.
+#[tokio::test]
+async fn warming_reports_an_unspawnable_hub_server_without_failing() -> Setup<()> {
+    let core = horde_server::service::ServerCore::new(horde_server::EventLog::in_memory()?);
+    // `stdio_config`'s command names no real binary, which is the point.
+    horde_server_testkit::seed_mcp_server(&core.log, stdio_config("linear")).await?;
+
+    let lines = horde_server::hub::warm(&core).await?;
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].starts_with("hub-server linear unavailable:"),
+        "{lines:?}"
+    );
+    Ok(())
+}

@@ -196,15 +196,15 @@ pub fn proposed_tool_call_to_wire(
 
 /// Domain → wire.
 ///
-/// Fills only what the domain owns: the outcome, the denial message, and any
-/// replacement arguments. `request_id`, `decided_by`, `decided_by_actor`, and
-/// `remember_for_session` belong to the Server that ran the permission chain
-/// and are left at their defaults for it to set.
+/// Fills only what the domain owns: the outcome, the denial message, any
+/// replacement arguments, and the remember-for-session bit. `request_id`,
+/// `decided_by`, and `decided_by_actor` belong to the Server that ran the
+/// permission chain and are left at their defaults for it to set.
 pub fn permission_decision_to_wire(
     decision: &PermissionDecision,
 ) -> Result<WirePermissionDecision, ConversionError> {
     let (outcome, reason, updated_input) = match decision {
-        PermissionDecision::Allow { updated_input } => {
+        PermissionDecision::Allow { updated_input, .. } => {
             let rewritten = match updated_input {
                 Some(JsonValue::Object(map)) => Some(object_to_struct(map)?),
                 Some(_) => return Err(ConversionError::NotAnObject),
@@ -219,6 +219,7 @@ pub fn permission_decision_to_wire(
         outcome: outcome.into(),
         reason,
         updated_input,
+        remember_for_session: decision.remembers_for_session(),
         ..WirePermissionDecision::default()
     })
 }
@@ -237,15 +238,25 @@ pub fn permission_decision_from_wire(
         .map_err(|_| ConversionError::UnusableOutcome(decision.outcome))?;
 
     match outcome {
-        PermissionOutcome::Allow => match &decision.updated_input {
-            Some(rewritten) => {
-                if !can_rewrite_input {
-                    return Err(ConversionError::RewriteUnsupported);
+        PermissionOutcome::Allow => {
+            let allowed = match &decision.updated_input {
+                Some(rewritten) => {
+                    if !can_rewrite_input {
+                        return Err(ConversionError::RewriteUnsupported);
+                    }
+                    PermissionDecision::allow_with(struct_to_json(rewritten))
                 }
-                Ok(PermissionDecision::allow_with(struct_to_json(rewritten)))
-            }
-            None => Ok(PermissionDecision::allow()),
-        },
+                None => PermissionDecision::allow(),
+            };
+            // The Server owns the session memory either way; the bit rides to
+            // the adapter so a harness with its own session-grant vocabulary
+            // (codex's `acceptForSession`) can encode the same scope.
+            Ok(if decision.remember_for_session {
+                allowed.remembered()
+            } else {
+                allowed
+            })
+        }
         PermissionOutcome::Deny => Ok(PermissionDecision::deny(decision.reason.clone())),
         PermissionOutcome::Unspecified => Err(ConversionError::UnusableOutcome(decision.outcome)),
     }
@@ -281,11 +292,39 @@ mod tests {
     fn a_bare_allow_stays_bare() {
         let wire = permission_decision_to_wire(&PermissionDecision::allow()).expect("converts");
         assert_eq!(wire.updated_input, None);
+        assert!(!wire.remember_for_session, "nobody asked to remember");
         assert_eq!(
             permission_decision_from_wire(&wire, false),
             Ok(PermissionDecision::allow()),
             "no rewrite means no capability is needed"
         );
+    }
+
+    /// The remember bit crosses the seam in both directions. Without it, an
+    /// adapter whose harness caches session grants itself (codex's
+    /// `acceptForSession`) could never learn the human asked for that scope.
+    #[test]
+    fn remember_for_session_survives_both_directions() {
+        let remembered = PermissionDecision::allow().remembered();
+        let wire = permission_decision_to_wire(&remembered).expect("converts");
+        assert!(wire.remember_for_session);
+        assert_eq!(
+            permission_decision_from_wire(&wire, false),
+            Ok(remembered),
+            "the bit must reach the adapter, not just the Server's memory"
+        );
+
+        // And a denial never smuggles one, whatever the wire claims: the
+        // domain type cannot represent a remembered refusal.
+        let denial_claiming_memory = WirePermissionDecision {
+            outcome: PermissionOutcome::Deny.into(),
+            reason: "no".to_owned(),
+            remember_for_session: true,
+            ..WirePermissionDecision::default()
+        };
+        let decoded =
+            permission_decision_from_wire(&denial_claiming_memory, false).expect("decodes");
+        assert!(!decoded.remembers_for_session());
     }
 
     #[test]

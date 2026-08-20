@@ -59,6 +59,11 @@ pub struct ServerCore {
     /// the same reason as `forwards`, and more so — a login has no durable
     /// intent at all, only its audit events.
     pub logins: crate::login::registry::LoginRegistry,
+    /// The MCP Hub's connected upstreams (ADR-0004): hub-placed user servers,
+    /// each authenticated exactly once and multiplexed to every forwarding
+    /// worker. Honestly a cache of connections — which servers *exist* is the
+    /// journaled catalog's to say, re-read per call.
+    pub hub: Arc<crate::hub::HubUpstreams>,
 }
 
 impl ServerCore {
@@ -77,6 +82,7 @@ impl ServerCore {
             placement_lock: Arc::new(tokio::sync::Mutex::new(())),
             forwards: ForwardRegistry::new(),
             logins: crate::login::registry::LoginRegistry::new(),
+            hub: Arc::new(crate::hub::HubUpstreams::new()),
         }
     }
 

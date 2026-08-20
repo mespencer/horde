@@ -1,0 +1,1 @@
+[2m2026-08-19T19:42:38.810487Z[0m [31mERROR[0m [2mcodex_models_manager::manager[0m[2m:[0m failed to load models cache: missing field `supports_parallel_tool_calls` at line 97 column 5

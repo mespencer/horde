@@ -17,6 +17,12 @@ use horde_adapter::McpEndpoint;
 /// Calls one tool on the agent's Horde endpoint, answering with the text of
 /// the result's first content block.
 ///
+/// `tool_use_id` rides `_meta.claudecode/toolUseId`, because that is what
+/// the real harness does on every `tools/call` (dual-era spike §2) and the
+/// endpoint builds on it: the id becomes the permission-request id for a
+/// proxied call, which is what lets a script (or a human at `horde approve`)
+/// address the request by a name the script chose.
+///
 /// # Errors
 ///
 /// A refusal in words the script's output can carry: no HTTP endpoint, an
@@ -25,6 +31,7 @@ pub(crate) async fn call_horde_tool(
     endpoint: Option<&McpEndpoint>,
     tool: &str,
     arguments: &serde_json::Value,
+    tool_use_id: &str,
 ) -> Result<String, String> {
     let Some(McpEndpoint::Http { url, headers }) = endpoint else {
         return Err("this agent was spawned with no Horde HTTP endpoint".to_owned());
@@ -80,7 +87,11 @@ pub(crate) async fn call_horde_tool(
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments },
+            "params": {
+                "name": tool,
+                "arguments": arguments,
+                "_meta": { "claudecode/toolUseId": tool_use_id },
+            },
         }),
     )
     .await?;
@@ -296,6 +307,7 @@ mod tests {
             Some(&endpoint(url)),
             "report_result",
             &serde_json::json!({"status": "success", "summary": "done"}),
+            "call-report",
         )
         .await
         .expect("the flow completes");
@@ -312,14 +324,14 @@ mod tests {
     async fn each_refused_hop_names_itself() {
         // initialize refused.
         let url = serve(vec![http("500 Internal Server Error", None, "boom")]).await;
-        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}), "call-t")
             .await
             .expect_err("a refused initialize is an error");
         assert!(refused.contains("initialize was refused"), "{refused}");
 
         // initialize accepted but no session assigned.
         let url = serve(vec![http("200 OK", None, "{}")]).await;
-        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}), "call-t")
             .await
             .expect_err("a sessionless initialize is an error");
         assert!(refused.contains("Mcp-Session-Id"), "{refused}");
@@ -330,7 +342,7 @@ mod tests {
             http("500 Internal Server Error", None, ""),
         ])
         .await;
-        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}), "call-t")
             .await
             .expect_err("a refused initialized is an error");
         assert!(refused.contains("notifications/initialized"), "{refused}");
@@ -342,7 +354,7 @@ mod tests {
             http("500 Internal Server Error", None, "no"),
         ])
         .await;
-        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}))
+        let refused = call_horde_tool(Some(&endpoint(url)), "t", &serde_json::json!({}), "call-t")
             .await
             .expect_err("a refused call is an error");
         assert!(refused.contains("tools/call was refused"), "{refused}");
@@ -350,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_without_an_http_endpoint_refuses_the_call() {
-        let refused = call_horde_tool(None, "t", &serde_json::json!({}))
+        let refused = call_horde_tool(None, "t", &serde_json::json!({}), "call-t")
             .await
             .expect_err("no endpoint is a refusal, not a fabricated result");
         assert!(refused.contains("no Horde HTTP endpoint"), "{refused}");

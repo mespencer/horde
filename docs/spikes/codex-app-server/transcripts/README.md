@@ -31,6 +31,34 @@ JSONL with no envelope — a different and much thinner schema.
 | `18-mcp-elicitation-decline.jsonl` | same flow answered `{"action":"decline"}` → **no byte reaches the MCP server**, `item/completed [mcpToolCall]` reports `status: "failed"`, `error.message: "user rejected MCP tool call"` |
 | `19-mcp-elicitation-onrequest.jsonl` | the negative control: under plain `approvalPolicy: "on-request"` **no elicitation is ever routed** — the thread parks at `status: active, activeFlags: ["waitingOnApproval"]` and the turn never completes. Granular `mcp_elicitations` is required, not optional |
 
+Files 20–33 are the **exec/shell approval re-probe** (`drive_approvals.py`),
+recorded 2026-08-19 against **codex-cli 0.148.0** (downloaded package binary)
+and **0.147.0** (the installed Homebrew cask), both under the same ChatGPT
+login. Each run gets a fresh throwaway cwd under `/private/tmp` and a fresh
+`CODEX_HOME` holding only a copy of `auth.json`, so the user's MCP servers,
+hooks, and per-project trust are out of the loop (a `-c mcp_servers={}` override
+was tried first and does **not** remove configured servers — see the two 20-*
+runs). Every turn is bounded at 60s; a config that never completes is recorded
+as a HANG, not waited out. The `dir:"meta"` lines carry the config and the
+distilled finding.
+
+| File | ver | config | observed |
+|---|---|---|---|
+| `20-exec-user-onrequest-ro-vscode-write.jsonl` | 0.148 | reviewer=user, on-request, read-only, client=`codex_vscode`, write, **decline** | `item/commandExecution/requestApproval` **before** exec; declined → `status:"declined"`, no file written |
+| `21-exec-user-onrequest-ro-horde-write.jsonl` | 0.148 | same but client=`horde-worker` | identical — client name is **not** a gate; approval fired, declined, blocked |
+| `22-exec-unset-onrequest-ro-horde-write.jsonl` | 0.148 | reviewer **unset**, on-request, read-only, write, decline | approval fired, declined, blocked — `approvalsReviewer` defaults to `user` |
+| `23-exec-autoreview-onrequest-ro-horde-write.jsonl` | 0.148 | reviewer=**`auto_review`**, on-request, read-only, write, decline | **NO client request. Codex's own subagent approved the escalation and the write RAN (`exitCode:0`) under a read-only sandbox.** The security hazard |
+| `24-exec-user-untrusted-ro-horde-echo.jsonl` | 0.148 | reviewer=user, **untrusted**, read-only, echo, decline | no request; a trivially-safe `echo` is auto-approved and runs. `untrusted` still asks nothing for safe reads |
+| `25-exec-user-granular-ro-horde-write.jsonl` | 0.148 | reviewer=user, **granular** (Horde's shipping policy), read-only, write, decline | `item/commandExecution/requestApproval` before exec (`reason:"command failed; retry without sandbox?"`), declined, blocked |
+| `26-exec-user-onrequest-ww-horde-escape.jsonl` | 0.148 | on-request, **workspace-write**, write to `$HOME`, decline | approval fired for the out-of-workspace escape, declined, blocked |
+| `27-exec-user-onrequest-ww-horde-net.jsonl` | 0.148 | on-request, workspace-write, `curl`, decline | sandboxed attempt runs first and **fails exit 6** (DNS blocked); codex then asks to retry outside sandbox; declined. `exec_done_before_ask` is the failed in-sandbox try, not a gate miss |
+| `28-filechange-user-onrequest-ro-horde-patch.jsonl` | 0.148 | on-request, read-only, **apply_patch**, decline | `item/started[fileChange]` carries the full diff, then **parks at `waitingOnApproval` forever** — no `item/fileChange/requestApproval` is routed |
+| `29-…-write-accept.jsonl` | 0.148 | on-request, read-only, write, **accept** | approval fired; **accepted → write RAN `exitCode:0`**. Proves accept is honored end-to-end |
+| `30-…-write-amend.jsonl` | 0.148 | on-request, read-only, write, **acceptWithExecpolicyAmendment** | amendment accepted, write ran; a **second turn** re-ran the same command and completed — the amendment shape deserializes and is honored |
+| `31-filechange-user-granular-ro-horde-patch.jsonl` | 0.148 | **granular**, read-only, apply_patch, decline | same park as 28 — granular does not unpark file-change; the fileChange approval never reaches the client in either policy |
+| `32-0147-exec-user-onrequest-ro-horde-write.jsonl` | **0.147** | on-request, read-only, write, decline | **NO request — parks at `waitingOnApproval`.** At 0.147 `on-request` does not route exec approvals |
+| `33-0147-exec-user-granular-ro-horde-write.jsonl` | **0.147** | **granular**, read-only, write, decline | `item/commandExecution/requestApproval` **does** fire and decline blocks it. Granular already routed exec at 0.147; only `on-request` changed at 0.148 |
+
 Files 17–19 were recorded by `drive_mcp.py` with `mcp_stub.py` as the upstream
 MCP server (configured per-process via `-c mcp_servers.…` overrides, so the
 user's `config.toml` is never touched — verified unchanged by diff). They
@@ -43,4 +71,7 @@ the request in the same turn.
 
 Redaction: account email, account/installation ids, and the scratch session path
 are replaced; third-party MCP tool schemas are elided to a count. No credentials
-appear — `auth.json` was never read into a transcript.
+appear — `auth.json` was never read into a transcript. In files 20–33 the
+`installationId`, `serverName` (hostname), `userAgent`, and the temp
+`CODEX_HOME` path are likewise scrubbed. The `auth.json` copied into the probe
+`CODEX_HOME` is not part of any transcript.

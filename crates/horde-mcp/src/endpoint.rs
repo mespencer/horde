@@ -37,7 +37,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router
 use serde::{Deserialize, Serialize};
 
 use crate::context::AgentContext;
-use crate::hub::ToolProxy;
+use crate::hub::{AgentProxies, ToolProxy};
 use crate::identity::AgentIdentity;
 use crate::permission::PermissionBroker;
 use crate::verbs::{MessageKind, Verbs};
@@ -288,10 +288,14 @@ pub fn message_kind_for(note: bool) -> MessageKind {
 pub struct HordeEndpoint {
     context: AgentContext,
     tool_router: ToolRouter<Self>,
-    /// The proxied half of the toolset (DESIGN §5 items 2 and 3): the hub
-    /// link and this Agent's `local` servers. Empty by default — an endpoint
-    /// with no hub configured serves exactly the verbs.
-    proxy: Arc<ToolProxy>,
+    /// The proxied half of the toolset (DESIGN §5 items 2 and 3), per Agent:
+    /// each Agent's hub link and its own `local` servers. One endpoint serves
+    /// a whole Session's agents, and their proxied toolsets differ — by
+    /// visibility and by which `local` children are theirs — so the mapping
+    /// is per caller, resolved from the request's authenticated identity.
+    /// Empty by default: an endpoint with no proxies registered serves
+    /// exactly the verbs.
+    proxies: Arc<AgentProxies>,
     /// Ordinal for minted permission-request ids, when a caller's `_meta`
     /// carries no correlation id of its own.
     minted: Arc<AtomicU64>,
@@ -312,31 +316,32 @@ impl HordeEndpoint {
         Self {
             context,
             tool_router: Self::tool_router(),
-            proxy: Arc::new(ToolProxy::new()),
+            proxies: Arc::new(AgentProxies::new()),
             minted: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Attaches the proxied toolset: the hub link and the Agent's `local`
-    /// servers, already connected.
+    /// Attaches the per-Agent proxied toolsets. The registry stays shared
+    /// with whoever registers agents into it (the Worker's endpoint manager),
+    /// so spawning and archiving reshape a serving endpoint's surface live.
     #[must_use]
-    pub fn with_proxy(mut self, proxy: Arc<ToolProxy>) -> Self {
-        self.proxy = proxy;
+    pub fn with_agent_proxies(mut self, proxies: Arc<AgentProxies>) -> Self {
+        self.proxies = proxies;
         self
     }
 
-    /// The tool names this endpoint serves — the verbs and every proxied
-    /// tool under its namespaced name.
+    /// The tool names this endpoint serves to `agent_id` — the verbs and
+    /// every proxied tool the agent may see, under its namespaced name.
     ///
     /// Reads the router the `#[tool_handler]` macro dispatches through, so a
     /// test can assert on *this instance's* surface rather than on what the
     /// static constructor would have built.
     #[must_use]
-    pub fn tool_names(&self) -> Vec<String> {
+    pub fn tool_names_for(&self, agent_id: &str) -> Vec<String> {
         self.tool_router
             .list_all()
             .into_iter()
-            .chain(self.proxy.tools())
+            .chain(self.proxies.for_agent(agent_id).tools())
             .map(|tool| tool.name.to_string())
             .collect()
     }
@@ -614,6 +619,7 @@ impl HordeEndpoint {
     /// covers both gates.
     async fn call_proxied(
         &self,
+        proxy: &ToolProxy,
         identity: &AgentIdentity,
         name: &str,
         arguments: Option<JsonObject>,
@@ -640,7 +646,7 @@ impl HordeEndpoint {
                     rmcp::model::ContentBlock::text(format!("permission denied: {message}")),
                 ]))
             }
-            horde_adapter::PermissionDecision::Allow { updated_input } => {
+            horde_adapter::PermissionDecision::Allow { updated_input, .. } => {
                 let forwarded = match narrowed_arguments(arguments, updated_input) {
                     Ok(forwarded) => forwarded,
                     Err(refusal) => {
@@ -652,7 +658,7 @@ impl HordeEndpoint {
                         ]));
                     }
                 };
-                self.proxy
+                proxy
                     .call(name, forwarded)
                     .await
                     .map_or_else(crate::hub::endpoint::render_failure, Ok)
@@ -765,11 +771,28 @@ impl ServerHandler for HordeEndpoint {
             return self.tool_router.call(tcc).await;
         }
 
-        if self.proxy.serves(&request.name) {
-            let identity = Self::caller(&context)?;
-            let request_id = self.request_id_for(&identity, request.meta.as_ref());
+        // Everything past the verbs is per-caller: which proxy serves the
+        // name depends on who is asking, so an unidentified caller is refused
+        // here rather than answered from anybody's toolset.
+        let identity = Self::caller(&context)?;
+        let proxy = self.proxies.for_agent(identity.agent_id());
+        if proxy.serves(&request.name) {
+            // The harness's `_meta` is read off the *context*, not the params:
+            // rmcp moves a request's `_meta` into `RequestContext.meta`
+            // (service/server.rs, `std::mem::take(request.get_meta_mut())`),
+            // so by the time a handler sees the params their `meta` is always
+            // empty. Measured the hard way: the deployed-stack e2e's approve
+            // targets the script's tool-use id, and reading `request.meta`
+            // here left every proxied call under a minted id instead.
+            let request_id = self.request_id_for(&identity, Some(&context.meta));
             let result = self
-                .call_proxied(&identity, &request.name, request.arguments, request_id)
+                .call_proxied(
+                    &proxy,
+                    &identity,
+                    &request.name,
+                    request.arguments,
+                    request_id,
+                )
                 .await?;
             return Ok(CallToolResponse::Complete(result));
         }
@@ -781,22 +804,30 @@ impl ServerHandler for HordeEndpoint {
         ))
     }
 
-    /// The verbs plus every proxied tool this Agent may see.
+    /// The verbs plus every proxied tool this caller may see. A listing with
+    /// no authenticated caller shows the verbs alone — fail closed, since a
+    /// proxied toolset is somebody's in particular.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let mut tools = self.tool_router.list_all();
-        tools.extend(self.proxy.tools());
+        if let Ok(identity) = Self::caller(&context) {
+            tools.extend(self.proxies.for_agent(identity.agent_id()).tools());
+        }
         Ok(crate::hub::endpoint::listing(tools, &context))
     }
 
+    /// Identity-free by rmcp's signature, so the proxied half searches every
+    /// registered proxy. Advisory metadata only: authorization stays in
+    /// `call_tool`, which resolves the *caller's* proxy before dispatching.
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tool_router.get(name).cloned().or_else(|| {
-            self.proxy
-                .tools()
+            self.proxies
+                .all()
                 .into_iter()
+                .flat_map(|proxy| proxy.tools())
                 .find(|tool| tool.name == name)
         })
     }
@@ -1047,9 +1078,7 @@ mod tests {
         assert_eq!(prompt.input["port"], "5173", "ports ride as strings");
 
         let granted = super::declared_result(
-            &horde_adapter::PermissionDecision::Allow {
-                updated_input: None,
-            },
+            &horde_adapter::PermissionDecision::allow(),
             "expose",
             "vite",
             5173,
@@ -1094,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_tool_names_are_the_ones_agents_are_told_about() {
-        let names = endpoint().tool_names();
+        let names = endpoint().tool_names_for("agent-42");
 
         for expected in [
             "approve",

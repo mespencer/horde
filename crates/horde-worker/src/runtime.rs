@@ -176,10 +176,18 @@ impl Runtime {
     /// Enables the per-agent MCP endpoint (DESIGN §5): every spawned or
     /// revived agent gets its Session's loopback endpoint and a freshly
     /// minted identity pair. `channel` is the Worker's authenticated channel
-    /// to the Server, which the orchestrator verbs issue their RPCs over.
+    /// to the Server — the orchestrator verbs issue their RPCs over it, and
+    /// the endpoint's hub link forwards hub tool calls over it too
+    /// (ADR-0004's 2026-08-19 amendment), attributed under `worker_id`.
     #[must_use]
-    pub fn with_agent_endpoints(mut self, channel: tonic::transport::Channel) -> Self {
-        self.endpoints = Some(Arc::new(crate::endpoint::EndpointManager::new(channel)));
+    pub fn with_agent_endpoints(
+        mut self,
+        channel: tonic::transport::Channel,
+        worker_id: &str,
+    ) -> Self {
+        self.endpoints = Some(Arc::new(crate::endpoint::EndpointManager::new(
+            channel, worker_id,
+        )));
         self
     }
 
@@ -346,7 +354,10 @@ impl Runtime {
         // The endpoint before the harness: an agent launched without its
         // verbs and permission prompt tool is not degraded, it is a different
         // (and unpermissioned) product — so a bind failure fails the spawn.
-        let endpoint = match self.agent_endpoint(&session_id, &agent_id).await {
+        // Its MCP surface rides the same rule: a `local` server that cannot
+        // spawn, or a hub listing the Server refuses, fails the spawn loudly
+        // rather than launching an agent missing a promised toolset.
+        let endpoint = match self.agent_endpoint(&session_id, &agent_id, &spawn).await {
             Ok(endpoint) => endpoint,
             Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
         };
@@ -413,17 +424,24 @@ impl Runtime {
     }
 
     /// The endpoint one agent's harness is pointed at, or `None` when this
-    /// Runtime serves no endpoints (the pre-wiring test shape).
+    /// Runtime serves no endpoints (the pre-wiring test shape). The spawn
+    /// command's resolved MCP surface — `local` configs in full, visible hub
+    /// servers by name — is consumed here, per ADR-0004.
     async fn agent_endpoint(
         &self,
         session_id: &str,
         agent_id: &str,
+        spawn: &SpawnAgentCommand,
     ) -> Result<Option<horde_adapter::McpEndpoint>, WorkerError> {
         let Some(endpoints) = &self.endpoints else {
             return Ok(None);
         };
+        let surface = crate::endpoint::AgentMcpSurface {
+            local: spawn.local_mcp_servers.clone(),
+            visible_hub: spawn.visible_hub_mcp_servers.clone(),
+        };
         endpoints
-            .endpoint_for(session_id, agent_id, self.stamping_sink())
+            .endpoint_for(session_id, agent_id, self.stamping_sink(), &surface)
             .await
             .map(Some)
     }
@@ -696,7 +714,11 @@ impl Runtime {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        let endpoint = self.agent_endpoint(&record.session_id, &agent_id).await?;
+        // A revival re-assembles the MCP surface too: fresh `local` children
+        // for the new incarnation, and the hub link re-fetched.
+        let endpoint = self
+            .agent_endpoint(&record.session_id, &agent_id, &record.spawn)
+            .await?;
         // One past the recorded count: a turn that died half-journaled has
         // already spent its ordinal, and reusing it would hand the revived
         // turn journal keys the Server has partially seen. Turn ids need
@@ -1636,7 +1658,7 @@ mod tests {
                 input: json!({ "status": "success", "summary": "the work is done" }),
             }),
         ]))
-        .with_agent_endpoints(channel);
+        .with_agent_endpoints(channel, "w-test");
 
         runtime
             .apply(spawn_command(1, "agent-1", "go"))
