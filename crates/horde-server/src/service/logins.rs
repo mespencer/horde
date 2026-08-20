@@ -330,6 +330,30 @@ mod tests {
         (feed, out, driver)
     }
 
+    /// A driven login whose dispatch the test itself has claimed as the
+    /// worker — the shared opening of the pairing-fault tests: the client
+    /// leg's feed (held open; its drop would end the client side first),
+    /// its outbound, the driver, and the claimed pairing sender.
+    async fn claimed(
+        core: &ServerCore,
+    ) -> (
+        tokio::sync::mpsc::Sender<Result<horde_proto::v1::LoginFrame, tonic::Status>>,
+        tokio::sync::mpsc::Receiver<horde_proto::v1::LoginFrame>,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<crate::login::registry::LoginLeg>,
+    ) {
+        let (_epoch, mut lane) = core.logins.register_worker("w1");
+        let (feed, out, driver) = driven(core, TunnelPrincipal::Ambient, "fake").await;
+        let dispatched = within("the dispatch", &mut lane).await;
+        match core
+            .logins
+            .claim(&dispatched.login_id, &TunnelPrincipal::Ambient)
+        {
+            crate::login::registry::LoginClaim::Matched(pair) => (feed, out, driver, pair),
+            other => panic!("the dispatched login must be claimable: {other:?}"),
+        }
+    }
+
     /// The kinds journaled into the reserved login stream, decoded.
     async fn login_kinds(core: &ServerCore) -> Vec<horde_proto::v1::event::Kind> {
         core.log
@@ -457,19 +481,10 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_dispatch_refuses_and_frees_the_slot() {
         let core = core();
-        let (_epoch, mut lane) = core.logins.register_worker("w1");
-        let (_feed, mut out, driver) = driven(&core, TunnelPrincipal::Ambient, "fake").await;
-        let dispatched = within("the dispatch", &mut lane).await;
-
         // The worker's tunnel claims and immediately dies: the dropped
         // pairing sender is what the arrange hears.
-        match core
-            .logins
-            .claim(&dispatched.login_id, &TunnelPrincipal::Ambient)
-        {
-            crate::login::registry::LoginClaim::Matched(pair) => drop(pair),
-            other => panic!("the dispatched login must be claimable: {other:?}"),
-        }
+        let (_feed, mut out, driver, pair) = claimed(&core).await;
+        drop(pair);
 
         let refused = within("the refusal", &mut out).await;
         assert_eq!(
@@ -540,19 +555,9 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_first_worker_leg_reaches_the_client_verbatim() {
         let core = core();
-        let (_epoch, mut lane) = core.logins.register_worker("w1");
-        let (_feed, mut out, driver) = driven(&core, TunnelPrincipal::Ambient, "fake").await;
-        let dispatched = within("the dispatch", &mut lane).await;
-
         // Claim as the worker would, then pair a leg whose first frame is
         // the refusal itself.
-        let pair = match core
-            .logins
-            .claim(&dispatched.login_id, &TunnelPrincipal::Ambient)
-        {
-            crate::login::registry::LoginClaim::Matched(pair) => pair,
-            other => panic!("the dispatched login must be claimable: {other:?}"),
-        };
+        let (_feed, mut out, driver, pair) = claimed(&core).await;
         let (to_client, from_worker) = tokio::sync::mpsc::channel(8);
         let (to_worker, _from_client) = tokio::sync::mpsc::channel(8);
         to_client
