@@ -1254,12 +1254,14 @@ mod engine_tests {
             .expect("the read lands");
         assert_eq!(&echoed, b"pong");
 
-        // Stop is reaped, and provably: the port stops answering.
+        // Stop is reaped — proven by the owned witnesses below
+        // (`stop_joins_the_accept_loop_before_returning`,
+        // `dropping_a_realization_reaps_its_accept_loop`), never by probing
+        // the freed port: an ephemeral port is the OS's to rebind the
+        // instant it is free, and a suite that binds many (this one does)
+        // will eventually rebind exactly this one between the stop and the
+        // probe. Asserting OS port state here was that flake.
         realized.stop().await;
-        assert!(
-            tokio::net::TcpStream::connect(local_addr).await.is_err(),
-            "a stopped realization must not keep its port"
-        );
     }
 
     use super::testing::guarded_realization;
