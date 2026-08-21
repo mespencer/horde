@@ -61,6 +61,7 @@ async fn an_agent_calls_a_hub_tool_through_the_deployed_stack() {
     let events = system
         .sync_until(&session_id, "the hub call's escalation", |events| {
             has_kind(events, "permission_requested")
+                && outputs(events).iter().any(|text| text == "calling the hub")
         })
         .await;
     assert!(
@@ -102,6 +103,7 @@ async fn an_agent_calls_a_hub_tool_through_the_deployed_stack() {
             outputs(events)
                 .iter()
                 .any(|text| text == "echo:through the deployed hub")
+                && has_kind(events, "permission_decided")
         })
         .await;
     assert!(
@@ -114,7 +116,11 @@ async fn an_agent_calls_a_hub_tool_through_the_deployed_stack() {
     // the chain — and the turn still finishes.
     let events = system
         .sync_until(&session_id, "the finished turn", |events| {
-            outputs(events).iter().any(|text| text == "hub answered")
+            let texts = outputs(events);
+            texts.iter().any(|text| text == "hub answered")
+                && texts
+                    .iter()
+                    .any(|text| text.contains("no tool named stub__no_such_tool"))
         })
         .await;
     assert!(
@@ -182,7 +188,11 @@ async fn a_scoped_hub_server_is_unroutable_to_other_agents() {
 
     let events = system
         .sync_until(&session_id, "the finished turn", |events| {
-            outputs(events).iter().any(|text| text == "turn finished")
+            let texts = outputs(events);
+            texts.iter().any(|text| text == "turn finished")
+                && texts
+                    .iter()
+                    .any(|text| text.contains("no tool named scoped__echo"))
         })
         .await;
     assert!(
