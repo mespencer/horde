@@ -26,7 +26,12 @@ async fn the_full_lifecycle_runs_over_real_processes() {
     // to an unplaced agent would sit in the log with nobody to deliver to.
     let events = system
         .sync_until(&session_id, "the root agent's placement", |events| {
-            has_kind(events, "placement_changed")
+            events.iter().any(|event| {
+                event["kind"] == "placement_changed"
+                    && event["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("placed"))
+            })
         })
         .await;
     assert!(
@@ -40,12 +45,20 @@ async fn the_full_lifecycle_runs_over_real_processes() {
     );
 
     // First assignment: the echo coming back proves the whole delivery and
-    // journaling path, not just the RPC's ack.
+    // journaling path, not just the RPC's ack. The output chunk and the
+    // turn's usage journal as separate transactions, so the wait names every
+    // fact the assertions below consume — wait on the fact, not the count.
     system.cli_json(&["send", &root, "hello horde"]).await;
     let events = system
-        .sync_until(&session_id, "the first echo", |events| {
-            outputs(events).iter().any(|text| text == "hello horde")
-        })
+        .sync_until(
+            &session_id,
+            "the first echo and its turn's facts",
+            |events| {
+                outputs(events).iter().any(|text| text == "hello horde")
+                    && has_kind(events, "agent_lifecycle_changed")
+                    && has_kind(events, "usage_recorded")
+            },
+        )
         .await;
     assert!(
         has_kind(&events, "agent_lifecycle_changed"),
@@ -108,6 +121,7 @@ async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
                 .filter(|event| event["kind"] == "agent_spawned")
                 .count()
                 >= 2
+                && outputs(events).iter().any(|text| text == "delegating")
         })
         .await;
     assert!(
@@ -119,7 +133,10 @@ async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
     // event of record, attributed to the reporting agent.
     let events = system
         .sync_until(&session_id, "the reported result", |events| {
-            has_kind(events, "result_reported")
+            events.iter().any(|event| {
+                event["kind"] == "result_reported"
+                    && event["agent_id"].as_str() == Some(root.as_str())
+            })
         })
         .await;
     assert!(
@@ -169,6 +186,9 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     let events = system
         .sync_until(&session_id, "the permission escalation", |events| {
             has_kind(events, "permission_requested")
+                && outputs(events)
+                    .iter()
+                    .any(|text| text == "checking the blast radius")
         })
         .await;
     assert!(
@@ -198,6 +218,7 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
             outputs(events)
                 .iter()
                 .any(|text| text == "approved and done")
+                && has_kind(events, "permission_decided")
         })
         .await;
     assert!(
@@ -214,6 +235,11 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
             outputs(events)
                 .iter()
                 .any(|text| text == "remembered and done")
+                && events
+                    .iter()
+                    .filter(|event| event["kind"] == "permission_decided")
+                    .count()
+                    >= 2
         })
         .await;
     assert_eq!(
