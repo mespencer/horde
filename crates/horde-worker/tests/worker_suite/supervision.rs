@@ -20,9 +20,12 @@ mod harness {
     use horde_adapter::{Adapter, AgentEvent, AgentSession, AgentSpec, TurnOutcome};
     use horde_worker::ClaudeAdapter;
 
-    /// The stub binary cargo built alongside this test.
+    /// The stub binary cargo built alongside this test, its first-exec
+    /// admission paid (`support::admitted_binary`) so the suite's bounded
+    /// waits never absorb the OS's first-launch validation. No probe
+    /// arguments: without a transcript the stub refuses and exits at once.
     pub(crate) fn stub_binary() -> PathBuf {
-        crate::support::built_binary("stub-harness")
+        crate::support::admitted_binary("stub-harness", &[])
     }
 
     /// A spec whose child gets extra environment, for scripting the stub.

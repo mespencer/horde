@@ -372,27 +372,48 @@ const FIRST_LAUNCH_CEILING: std::time::Duration = std::time::Duration::from_secs
 /// The binary failing to execute at all, or the OS not admitting it within
 /// [`FIRST_LAUNCH_CEILING`] — both named, neither a hang.
 pub async fn admit_binary(binary: &Path, args: &[&str]) -> Setup<()> {
+    let binary = binary.to_path_buf();
+    let args: Vec<String> = args.iter().map(|&arg| arg.to_owned()).collect();
+    tokio::task::spawn_blocking(move || {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        admit_binary_blocking(&binary, &borrowed)
+    })
+    .await?
+}
+
+/// [`admit_binary`] for a caller without an async context — the worker
+/// suite's synchronous binary locators run before any adapter exists to
+/// await anything. Same lock, same per-binary dedup, same admission bound;
+/// the async form delegates here through `spawn_blocking`, so the two entry
+/// points cannot drift into two mechanisms.
+///
+/// # Errors
+///
+/// The binary failing to execute at all, or the OS not admitting it within
+/// [`FIRST_LAUNCH_CEILING`] — both named, neither a hang.
+pub fn admit_binary_blocking(binary: &Path, args: &[&str]) -> Setup<()> {
     use std::collections::BTreeSet;
-    static WARMED: tokio::sync::OnceCell<tokio::sync::Mutex<BTreeSet<PathBuf>>> =
-        tokio::sync::OnceCell::const_new();
-    let warmed = WARMED
-        .get_or_init(|| async { tokio::sync::Mutex::new(BTreeSet::new()) })
-        .await;
-    let mut warmed = warmed.lock().await;
+    static WARMED: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    let mut warmed = WARMED
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if warmed.contains(binary) {
         return Ok(());
     }
-    let run = tokio::process::Command::new(binary)
+    let mut probe = std::process::Command::new(binary)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    match tokio::time::timeout(FIRST_LAUNCH_CEILING, run).await {
-        Ok(executed) => {
-            let _exit_of_a_probe = executed?;
+        .spawn()?;
+    let deadline = std::time::Instant::now() + FIRST_LAUNCH_CEILING;
+    loop {
+        if let Some(_exit_of_a_probe) = probe.try_wait()? {
+            break;
         }
-        Err(_elapsed) => {
+        if std::time::Instant::now() >= deadline {
+            let _kill_a_stuck_probe = probe.kill();
             return Err(format!(
                 "{}'s first launch did not finish within {FIRST_LAUNCH_CEILING:?}; the OS \
                  admits a freshly built binary only after validating it, and that validation \
@@ -401,6 +422,7 @@ pub async fn admit_binary(binary: &Path, args: &[&str]) -> Setup<()> {
             )
             .into());
         }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     warmed.insert(binary.to_path_buf());
     Ok(())

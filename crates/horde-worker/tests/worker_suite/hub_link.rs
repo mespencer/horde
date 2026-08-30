@@ -17,6 +17,13 @@ async fn stub_config(name: &str, local: bool, allowed: &[&str]) -> McpServerConf
     let binary = horde_server_testkit::process::product_binary("horde-mcp", "mcp_stub_server")
         .await
         .expect("the stub server binary exists");
+    // First-exec admission (see `support::admitted_binary`): the server
+    // spawns this child inside `within`-bounded waits, and a fresh tree's
+    // first launch must pay macOS validation before those ceilings start.
+    // No probe arguments: the stub exits on stdin's EOF.
+    horde_server_testkit::process::admit_binary(&binary, &[])
+        .await
+        .expect("the stub server's first-exec admission");
     McpServerConfig {
         name: name.to_owned(),
         transport: Some(Transport::Stdio(McpStdioTransport {
