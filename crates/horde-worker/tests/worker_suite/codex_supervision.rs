@@ -15,9 +15,12 @@ mod harness {
     use horde_worker::CodexAdapter;
     use serde_json::json;
 
-    /// The stub binary cargo built alongside this test.
+    /// The stub binary cargo built alongside this test, its first-exec
+    /// admission paid (`support::admitted_binary`) so the adapter's 2s
+    /// response ceiling never absorbs the OS's first-launch validation.
+    /// `--version` is the stub's documented prompt-exit probe.
     pub(crate) fn stub_binary() -> PathBuf {
-        crate::support::built_binary("codex-stub-harness")
+        crate::support::admitted_binary("codex-stub-harness", &["--version"])
     }
 
     // -- Script lines, one builder per frame kind ------------------------------
@@ -930,9 +933,13 @@ mod full_loop {
         let control_log = state.path().join("control.log");
         let (_stub_dir, path) = stub_on_path();
 
+        // First-exec admission before the watched spawn, so a fresh tree's
+        // validation never lands inside this scenario's bounded waits.
+        let daemon_binary = std::path::Path::new(env!("CARGO_BIN_EXE_horde-worker"));
+        support::admit(daemon_binary, &["--help"]);
         let mut daemon = SpawnedProcess::spawn(
             "horde-worker",
-            std::path::Path::new(env!("CARGO_BIN_EXE_horde-worker")),
+            daemon_binary,
             &[
                 "--insecure",
                 "--server",

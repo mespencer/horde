@@ -19,10 +19,25 @@ mod harness {
     /// copy on `PATH`.
     pub(crate) const DAEMON: &str = env!("CARGO_BIN_EXE_horde-worker");
 
+    /// [`DAEMON`], its first-exec admission paid (`support::admitted_binary`
+    /// explains the mechanism): the refusal tests below run the binary under
+    /// the suite's 5s ceiling, and a fresh tree's first launch pays macOS
+    /// validation that must not land inside that bound. `--help` is not a
+    /// flag the daemon knows, so the probe refuses and exits at once.
+    pub(crate) fn admitted_daemon() -> &'static str {
+        crate::support::admit(std::path::Path::new(DAEMON), &["--help"]);
+        DAEMON
+    }
+
     /// Spawns the daemon with `args`, watched.
     pub(crate) fn daemon(args: &[&str]) -> SpawnedProcess {
-        SpawnedProcess::spawn("horde-worker", std::path::Path::new(DAEMON), args, &[])
-            .expect("the daemon spawns")
+        SpawnedProcess::spawn(
+            "horde-worker",
+            std::path::Path::new(admitted_daemon()),
+            args,
+            &[],
+        )
+        .expect("the daemon spawns")
     }
 
     /// The insecure fake-adapter shape both in-process loop tests drive:
@@ -67,7 +82,7 @@ use crate::support;
 async fn wrong_flags_refuse_by_name_from_the_binary() {
     let output = support::within(
         "a refused parse must exit, not run",
-        tokio::process::Command::new(harness::DAEMON)
+        tokio::process::Command::new(harness::admitted_daemon())
             .arg("--bogus")
             .output(),
     )
@@ -93,7 +108,7 @@ async fn a_missing_identity_refuses_startup_naming_the_fix() {
     let state = tempfile::tempdir().expect("a temp dir");
     let output = support::within(
         "a refused startup must exit, not run",
-        tokio::process::Command::new(harness::DAEMON)
+        tokio::process::Command::new(harness::admitted_daemon())
             .args(["--state-dir", &state.path().to_string_lossy()])
             .output(),
     )

@@ -16,6 +16,32 @@ pub(crate) fn built_binary(name: &str) -> PathBuf {
     path.join(name)
 }
 
+/// [`built_binary`], with its first-exec admission paid.
+///
+/// macOS admits a freshly linked binary only after validating it — code
+/// signature and XProtect, cached per file afterwards — and that validation
+/// serializes machine-wide, so a fresh target tree (a first coverage run, a
+/// mutants scratch tree) turns every test's concurrent first spawn of the
+/// same never-executed stub into a multi-second queue behind syspolicyd.
+/// Paying the admission here, under the testkit's generous first-launch
+/// bound, keeps it out of the adapters' deliberately tight response
+/// ceilings, which are correct once admission is paid
+/// (`horde_server_testkit::process::admit_binary_blocking` owns the
+/// mechanism; the e2e and hub suites pay the same toll).
+pub(crate) fn admitted_binary(name: &str, probe: &[&str]) -> PathBuf {
+    let path = built_binary(name);
+    admit(&path, probe);
+    path
+}
+
+/// Pays `binary`'s first-exec admission — see [`admitted_binary`]. `probe`
+/// is whatever makes the binary exit promptly; its exit status is ignored,
+/// because that the binary *executed* is the whole payment.
+pub(crate) fn admit(binary: &std::path::Path, probe: &[&str]) {
+    horde_server_testkit::process::admit_binary_blocking(binary, probe)
+        .expect("the binary's first-exec admission");
+}
+
 /// How long any wait in a process test may take before it is a failure.
 ///
 /// Generous against a loaded machine, and still three orders of magnitude
