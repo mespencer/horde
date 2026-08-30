@@ -74,7 +74,22 @@ async fn revocation_closes_the_doors_for_worker_and_client_alike() {
     let state = system.state.path().join("w-1");
     let mut worker = system.spawn_worker("w-1", &state, &[]).await;
 
-    // The operator's verb, over the real control plane.
+    // Order matters: the worker is shut down cleanly BEFORE the revocation.
+    // Revoking first would open a race — the server's deny-list re-check
+    // severs a revoked worker's live streams within a beat, and if that
+    // severance beats the SIGTERM the exit is non-zero for the *right*
+    // reason, failing a clean-shutdown assert for the wrong one. With
+    // nothing revoked and nothing in flight, the signalled shutdown is
+    // deterministic.
+    worker.terminate().await.expect("SIGTERM sends");
+    let (status, _, _) = worker.wait().await.expect("the worker exits");
+    assert!(
+        status.success(),
+        "the signalled shutdown itself stays clean"
+    );
+
+    // The operator's verb, over the real control plane. The certificate
+    // outlives the process, so revocation by name still finds serials.
     let revoked = system.cli_json(&["worker", "revoke", "w-1"]).await;
     assert!(
         revoked["serials"]
@@ -83,16 +98,8 @@ async fn revocation_closes_the_doors_for_worker_and_client_alike() {
         "the worker held a certificate to revoke: {revoked}"
     );
 
-    // The running process holds open streams; the deny-list bites at the
-    // next RPC. The deterministic observation is the next incarnation:
-    // same identity, refused at the door, daemon stops instead of spinning.
-    worker.terminate().await.expect("SIGTERM sends");
-    let (status, _, _) = worker.wait().await.expect("the worker exits");
-    assert!(
-        status.success(),
-        "the signalled shutdown itself stays clean"
-    );
-
+    // The deterministic observation of the closed door: the next incarnation
+    // — same identity, refused at the door, daemon stops instead of spinning.
     let refused_life = system.spawn_worker_expecting_refusal(&state).await;
     assert!(
         !refused_life.0.success(),
