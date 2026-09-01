@@ -17,6 +17,7 @@ pub mod forward;
 pub mod login;
 pub mod render;
 pub mod tui;
+pub mod up;
 
 pub use client::{Client, ClientError, SyncOptions};
 pub use render::Format;

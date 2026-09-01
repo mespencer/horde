@@ -87,6 +87,11 @@ pub enum Command {
     /// This machine's own identity: joining, and client codes for others.
     #[command(subcommand)]
     Enroll(EnrollCommand),
+    /// Stand up this machine (ADR-0007): start a server if none is running,
+    /// enroll the local client if none exists, mint-and-join a local
+    /// worker, and hold everything until ctrl-c — which tears down only
+    /// what this invocation started.
+    Up(crate::up::UpArgs),
     /// Port forwards (ADR-0006): expose worker ports here, inject local
     /// ports there.
     #[command(subcommand)]
@@ -690,6 +695,11 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     // than the control plane.
     if let Some(Command::Enroll(EnrollCommand::Join { token })) = &cli.command {
         return run_join(cli, token, format).await;
+    }
+    // `up` orchestrates its own enrollments and connections, starting from
+    // a machine that may hold nothing yet.
+    if let Some(Command::Up(args)) = &cli.command {
+        return crate::up::run(args).await;
     }
 
     let resolved = resolve_connection(
@@ -2380,6 +2390,48 @@ mod enrollment_tests {
             std::path::PathBuf::from(".horde-identity"),
             "no HOME still yields a deterministic, local place"
         );
+    }
+
+    /// The `up` verb's flags reach it (each would otherwise parse cleanly
+    /// and be silently ignored), and a bare `horde up` is valid.
+    #[test]
+    fn up_flags_reach_the_command() {
+        let cli = Cli::try_parse_from([
+            "horde",
+            "up",
+            "--state-dir",
+            "/tmp/h",
+            "--adapter",
+            "claude",
+            "--adapter",
+            "fake",
+            "--name",
+            "den",
+            "--bind",
+            "127.0.0.1:0",
+            "--enrollment-bind",
+            "127.0.0.1:0",
+        ])
+        .expect("a full up line parses");
+        let Some(Command::Up(args)) = &cli.command else {
+            panic!("expected up, got {:?}", cli.command);
+        };
+        assert_eq!(
+            args.state_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/h"))
+        );
+        assert_eq!(args.adapters, vec!["claude", "fake"]);
+        assert_eq!(args.name.as_deref(), Some("den"));
+        assert_eq!(args.bind, "127.0.0.1:0");
+        assert_eq!(args.enrollment_bind, "127.0.0.1:0");
+
+        let bare = Cli::try_parse_from(["horde", "up"]).expect("bare up parses");
+        let Some(Command::Up(args)) = &bare.command else {
+            panic!("expected up, got {:?}", bare.command);
+        };
+        assert_eq!(args.bind, "127.0.0.1:7777", "the day-one default port");
+        assert_eq!(args.enrollment_bind, "127.0.0.1:7778");
+        assert!(args.adapters.is_empty() && args.state_dir.is_none());
     }
 
     /// ADR-0007's endpoint precedence, whole: explicit beats stored beats
