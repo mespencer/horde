@@ -94,13 +94,20 @@ pub fn generate(seed: u64, taken: &[String]) -> Option<String> {
 
 /// A seed for interactive draws. Entropy, not cryptography: two humans
 /// creating sessions in the same instant still land on different names via
-/// the collision redraw, so nanoseconds xor the process id is plenty.
+/// the collision redraw, so nanoseconds mixed with the process id is plenty.
 #[must_use]
 pub fn entropy_seed() -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    (nanos as u64) ^ u64::from(std::process::id()).rotate_left(32)
+    seed_from(nanos as u64, std::process::id())
+}
+
+/// The mixing rule, split from the clock so it is a fact a test can state:
+/// the pid occupies the high half (nanosecond ticks touch the low bits), and
+/// the combination is xor, so neither input can mask the other.
+fn seed_from(nanos: u64, pid: u32) -> u64 {
+    nanos ^ u64::from(pid).rotate_left(32)
 }
 
 /// The combination one index names: adjectives major, nouns minor.
@@ -186,6 +193,47 @@ mod tests {
             generate(7, &[]),
             generate(8, &[]),
             "different seeds must be able to draw differently"
+        );
+    }
+
+    /// The draws for fixed seeds, as golden values: a seedable generator's
+    /// contract IS its exact output, so any change to the mixer, the
+    /// shuffle, or the index-to-combination rule shows up here by name.
+    #[test]
+    fn fixed_seeds_draw_their_golden_names() {
+        for (seed, expected) in [
+            (0, "kindled-charge"),
+            (1, "dusky-company"),
+            (7, "kindled-patrol"),
+            (42, "wary-foray"),
+        ] {
+            assert_eq!(
+                generate(seed, &[]).as_deref(),
+                Some(expected),
+                "seed {seed}"
+            );
+        }
+    }
+
+    /// The entropy seed mixes the pid into the high half by xor: the clock
+    /// cannot be masked by the pid, nor the pid by the clock — and two
+    /// consecutive real draws differ, because the nanosecond clock moved.
+    #[test]
+    fn the_entropy_seed_mixes_pid_and_clock_without_masking() {
+        assert_eq!(super::seed_from(0, 1), 1_u64.rotate_left(32));
+        assert_eq!(
+            super::seed_from(u64::MAX, 1),
+            u64::MAX ^ 1_u64.rotate_left(32),
+            "xor flips the pid bit; an or would saturate, an and would erase"
+        );
+        // The clock's tick may be coarser than one call, so the draw is
+        // re-read until it moves — a frozen constant never would.
+        let first = super::entropy_seed();
+        assert!(
+            std::iter::repeat_with(super::entropy_seed)
+                .take(1_000_000)
+                .any(|seed| seed != first),
+            "the seed must follow the clock, not freeze on a constant"
         );
     }
 

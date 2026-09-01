@@ -156,10 +156,12 @@ async fn live_newest_first(client: &mut Client) -> Result<Vec<SessionSummary>, C
     Ok(sessions)
 }
 
-/// Newest first by creation time; the sort is stable, so summaries the
-/// server never stamped keep their listed order at the tail.
+/// Newest first by creation time. Two creates can land in one millisecond,
+/// so the id breaks ties — determinism beats a coin flip when the picker's
+/// row order is what Enter acts on. Summaries the server never stamped sink
+/// to the tail.
 pub fn sort_newest_first(sessions: &mut [SessionSummary]) {
-    sessions.sort_by_key(|summary| std::cmp::Reverse(created_ms(summary)));
+    sessions.sort_by_key(|summary| std::cmp::Reverse((created_ms(summary), id_of(summary))));
 }
 
 fn created_ms(summary: &SessionSummary) -> i64 {
@@ -249,7 +251,10 @@ mod tests {
     }
 
     /// Newest first is by creation time, not list order — and a summary
-    /// with no stamp sinks to the tail instead of poisoning the sort.
+    /// with no stamp sinks to the tail instead of poisoning the sort. The
+    /// old/new pair differs only inside one second (1.9s vs 2.0s), so the
+    /// nanosecond half of the stamp must be *divided* into milliseconds:
+    /// mis-scaled nanos would out-weigh the seconds and flip the order.
     #[test]
     fn sessions_sort_newest_first_by_creation_time() {
         let unstamped = SessionSummary {
@@ -258,8 +263,8 @@ mod tests {
         };
         let mut sessions = vec![
             unstamped,
-            session("session-old", 1_000),
-            session("session-new", 9_000),
+            session("session-old", 1_900),
+            session("session-new", 2_000),
         ];
         sort_newest_first(&mut sessions);
         let ids: Vec<_> = sessions
@@ -271,5 +276,51 @@ mod tests {
             vec!["session-new", "session-old", "session-unstamped"],
             "newest first, unstamped last"
         );
+    }
+
+    /// The archived-while-you-chose race, against a real server: a live
+    /// session passes the check, and the same session archived is refused
+    /// *by name* — an explained refusal beats a TUI over a dead session.
+    #[tokio::test]
+    async fn the_archived_while_you_chose_race_is_refused_by_name() {
+        let (_core, mut client) = crate::forward::testing::served().await;
+        let (summary, _root) = client
+            .create_session("Done Work", "key-1")
+            .await
+            .expect("a session creates");
+        let id = summary.session_id.map(|id| id.to_string()).expect("an id");
+
+        super::refuse_archived(&mut client, &id)
+            .await
+            .expect("a live session attaches");
+
+        client
+            .archive_session(&id, "wrapped up")
+            .await
+            .expect("it archives");
+        let refused = super::refuse_archived(&mut client, &id)
+            .await
+            .expect_err("the race gets the fast refusal");
+        assert!(
+            refused.to_string().contains("done-work"),
+            "the refusal names the session: {refused}"
+        );
+    }
+
+    /// Two creates in one millisecond still order deterministically — the
+    /// id breaks the tie, so the picker's rows cannot shuffle between the
+    /// paint and the Enter.
+    #[test]
+    fn a_creation_time_tie_breaks_on_the_id_deterministically() {
+        let mut sessions = vec![
+            session("session-key-1", 5_000),
+            session("session-key-2", 5_000),
+        ];
+        sort_newest_first(&mut sessions);
+        let ids: Vec<_> = sessions
+            .iter()
+            .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(ids, vec!["session-key-2", "session-key-1"]);
     }
 }

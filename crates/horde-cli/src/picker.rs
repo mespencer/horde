@@ -7,7 +7,8 @@
 //! a "new session" top row, and a key loop with the same seam the TUI has —
 //! [`drive`] is generic over the terminal backend and takes its input as a
 //! channel, so tests run the whole loop on a `TestBackend` with scripted
-//! keys, and [`launch`] is only the raw-terminal shell around it.
+//! keys. The raw-terminal shell around it lives in `front_door`, which owns
+//! one terminal session across choosing and attaching.
 
 use horde_proto::v1::SessionSummary;
 use ratatui::Frame;
@@ -243,6 +244,37 @@ mod tests {
             press(&mut picker, KeyCode::Char('q')),
             Some(Choice::Dismissed)
         );
+    }
+
+    /// The cursor marker is a real glyph on exactly the selected row —
+    /// without it, every row of the picker reads as equally chosen.
+    #[tokio::test]
+    async fn the_cursor_marker_paints_on_exactly_the_selected_row() {
+        let terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("a test terminal always constructs");
+        let (keys, mut receiver) = tokio::sync::mpsc::channel(4);
+        keys.send(TermEvent::Key(KeyEvent::from(KeyCode::Enter)))
+            .await
+            .expect("the loop is about to listen");
+
+        let (terminal, choice) = super::drive(terminal, &mut receiver, picker(), |_| {})
+            .await
+            .expect("the loop finishes");
+        assert_eq!(choice, Choice::NewSession);
+
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("> new session"),
+            "the selected row carries the marker: {screen}"
+        );
+        for line in screen.lines() {
+            if line.contains("session-1") || line.contains("session-2") {
+                assert!(
+                    !line.trim_start().starts_with('>'),
+                    "an unselected row must not claim the cursor: {line:?}"
+                );
+            }
+        }
     }
 
     /// A key release is not a keypress: terminals that report both would

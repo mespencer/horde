@@ -132,6 +132,70 @@ async fn bare_horde_with_several_sessions_opens_the_picker_and_enter_attaches() 
     assert!(status.success(), "got {status:?}");
 }
 
+/// The picker's top row: Enter on "new session" creates an auto-named
+/// session and attaches to it — the create arm, reached through choosing.
+#[tokio::test]
+async fn the_pickers_top_row_creates_and_attaches_a_new_session() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, _, _) = seeded(&endpoint, "old-one")
+        .await
+        .expect("a seeded session");
+    client
+        .create_session("old-two", "key-2")
+        .await
+        .expect("a second session");
+
+    let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("pick")
+        .await
+        .expect("the picker paints");
+    // Enter with the cursor still on the top row: the "new session" create.
+    horde.type_bytes(b"\r").expect("enter reaches the pty");
+    horde
+        .await_painted("attached:")
+        .await
+        .expect("the top row creates and attaches");
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    let status = horde.exit_status().await.expect("the TUI exits");
+    assert!(status.success(), "got {status:?}");
+
+    let sessions = client.list_sessions(false).await.expect("the list");
+    assert_eq!(sessions.len(), 3, "choosing \"new session\" created one");
+    assert!(
+        sessions.iter().any(|summary| {
+            summary
+                .title
+                .split_once('-')
+                .is_some_and(|(adjective, noun)| {
+                    horde_cli::names::ADJECTIVES.contains(&adjective)
+                        && horde_cli::names::NOUNS.contains(&noun)
+                })
+        }),
+        "the created session is auto-named from the word list"
+    );
+}
+
+/// `horde new <title>` with a terminal: create, then attach — one motion.
+#[tokio::test]
+async fn horde_new_with_a_terminal_creates_and_attaches() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let mut horde =
+        spawn_horde(&endpoint, &["new", "fresh-start"]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("attached:")
+        .await
+        .expect("new is create-then-attach");
+    horde
+        .await_painted("fresh-start")
+        .await
+        .expect("the attached session is the one just created");
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    let status = horde.exit_status().await.expect("the TUI exits");
+    assert!(status.success(), "got {status:?}");
+}
+
 /// Esc in the picker leaves without entering anything — cleanly, because a
 /// dismissal is a decision, not a failure.
 #[tokio::test]

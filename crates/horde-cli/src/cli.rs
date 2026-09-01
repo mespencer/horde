@@ -2680,6 +2680,38 @@ mod forward_flow_tests {
         );
     }
 
+    /// The `--session` filter resolves like every other session reference
+    /// (ADR-0008): a name becomes the id, absence stays absent, and an
+    /// unmatched reference passes through for the server to refuse.
+    #[tokio::test]
+    async fn the_session_filter_resolves_names_and_absence_stays_absent() {
+        let (_core, mut client) = crate::forward::testing::served().await;
+        let (summary, _root) = client
+            .create_session("Fwd Home", "key-9")
+            .await
+            .expect("a session creates");
+        let id = summary.session_id.map(|id| id.to_string()).expect("an id");
+
+        assert_eq!(
+            super::resolved_filter(&mut client, Some("fwd-home"))
+                .await
+                .expect("a name resolves"),
+            Some(id)
+        );
+        assert_eq!(
+            super::resolved_filter(&mut client, None)
+                .await
+                .expect("no filter is no filter"),
+            None
+        );
+        assert_eq!(
+            super::resolved_filter(&mut client, Some("session-nope"))
+                .await
+                .expect("unmatched passes through"),
+            Some("session-nope".to_owned())
+        );
+    }
+
     /// The backing lines are the operator's map of what this process is
     /// serving; returned rather than printed so they are assertable.
     #[test]

@@ -1395,6 +1395,30 @@ mod tests {
             "0s",
             "clock skew must not print a negative age"
         );
+
+        // Sub-second nanos participate as whole milliseconds — divided into
+        // the stamp, not multiplied through it and not reduced modulo it.
+        let with_nanos =
+            |seconds: i64, nanos: i32| horde_proto::prost_types::Timestamp { seconds, nanos };
+        assert_eq!(
+            super::age(60_500, &with_nanos(0, 500_000_000)),
+            "1m",
+            "half a second of nanos is 500ms of stamp"
+        );
+        assert_eq!(
+            super::age(60_998, &with_nanos(0, 999_000_000)),
+            "59s",
+            "999ms of nanos holds the age just under the minute"
+        );
+    }
+
+    /// The human list's wall clock is a real clock: after this test was
+    /// written, never before it — a frozen or negative clock would render
+    /// every session as decades old or freshly born.
+    #[test]
+    fn the_wall_clock_reads_as_the_present() {
+        // 2024-01-01T00:00:00Z, safely before any run of this suite.
+        assert!(super::now_unix_ms() > 1_704_067_200_000);
     }
 
     /// The short id never lies: an id that is a full prefix of a sibling
