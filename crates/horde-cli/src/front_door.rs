@@ -252,9 +252,10 @@ mod tests {
 
     /// Newest first is by creation time, not list order — and a summary
     /// with no stamp sinks to the tail instead of poisoning the sort. The
-    /// old/new pair differs only inside one second (1.9s vs 2.0s), so the
-    /// nanosecond half of the stamp must be *divided* into milliseconds:
-    /// mis-scaled nanos would out-weigh the seconds and flip the order.
+    /// stamps differ only inside one second, so the nanosecond half must be
+    /// *divided* into milliseconds: multiplied through, nanos out-weigh the
+    /// seconds; reduced modulo, one-millisecond neighbors (1.999s vs
+    /// 1.998s) collapse to a tie and the id — the wrong key — decides.
     #[test]
     fn sessions_sort_newest_first_by_creation_time() {
         let unstamped = SessionSummary {
@@ -264,6 +265,8 @@ mod tests {
         let mut sessions = vec![
             unstamped,
             session("session-old", 1_900),
+            session("session-b", 1_998),
+            session("session-a", 1_999),
             session("session-new", 2_000),
         ];
         sort_newest_first(&mut sessions);
@@ -273,7 +276,13 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["session-new", "session-old", "session-unstamped"],
+            vec![
+                "session-new",
+                "session-a",
+                "session-b",
+                "session-old",
+                "session-unstamped"
+            ],
             "newest first, unstamped last"
         );
     }
