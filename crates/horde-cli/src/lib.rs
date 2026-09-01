@@ -14,8 +14,12 @@
 pub mod cli;
 pub mod client;
 pub mod forward;
+pub mod front_door;
 pub mod login;
+pub mod names;
+pub mod picker;
 pub mod render;
+pub mod resolve;
 pub mod tui;
 pub mod up;
 

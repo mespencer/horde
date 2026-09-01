@@ -36,6 +36,9 @@ pub fn session(summary: &SessionSummary, format: Format) -> String {
     match format {
         Format::Json => json!({
             "session_id": id(summary.session_id.as_ref().map(ToString::to_string)),
+            // The handle resolution accepts (ADR-0008): JSON carries both id
+            // and name so scripts never re-resolve.
+            "name": crate::resolve::name_of(summary),
             "title": summary.title,
             "root_agent_id": id(summary.root_agent_id.as_ref().map(ToString::to_string)),
             "state": session_state(summary.state),
@@ -80,12 +83,107 @@ pub fn sessions(summaries: &[SessionSummary], format: Format) -> String {
                 // a swallowed error look identical otherwise.
                 return "no sessions".to_owned();
             }
-            summaries
-                .iter()
-                .map(|summary| session(summary, Format::Human))
-                .collect::<Vec<_>>()
-                .join("\n")
+            session_rows(summaries, now_unix_ms()).join("\n")
         }
+    }
+}
+
+/// The one row format `session list` and the picker share (ADR-0008):
+/// name, short id, status, agent count, last-activity age. Choosing and
+/// listing look identical because they are this same function.
+///
+/// Column widths come from the set, so the rows align without a fixed
+/// budget; `now_unix_ms` is a parameter so a test's ages are facts.
+#[must_use]
+pub fn session_rows(summaries: &[SessionSummary], now_unix_ms: i64) -> Vec<String> {
+    let ids: Vec<String> = summaries
+        .iter()
+        .map(|summary| {
+            summary
+                .session_id
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string)
+        })
+        .collect();
+    let names: Vec<String> = summaries
+        .iter()
+        .map(|summary| {
+            let name = crate::resolve::name_of(summary);
+            if name.is_empty() {
+                "-".to_owned()
+            } else {
+                name
+            }
+        })
+        .collect();
+    let shorts: Vec<String> = ids.iter().map(|one| short_id(one, &ids)).collect();
+    let name_width = names.iter().map(String::len).max().unwrap_or(0);
+    let short_width = shorts.iter().map(String::len).max().unwrap_or(0);
+
+    summaries
+        .iter()
+        .zip(names.iter().zip(shorts))
+        .map(|(summary, (name, short))| {
+            format!(
+                "{name:<name_width$}  {short:<short_width$}  {:<8}  agents={}  {}",
+                session_state(summary.state),
+                summary.agent_count,
+                summary
+                    .last_activity_at
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), |at| age(now_unix_ms, at)),
+            )
+        })
+        .collect()
+}
+
+/// The shortest prefix of `id` that no sibling shares, floored at twelve
+/// characters so a row's short id never degenerates to the `session-` stem.
+/// An id that is itself a prefix of a sibling stays full — a short id must
+/// always resolve back to its own session, or it is a trap in a monospace
+/// costume.
+fn short_id(id: &str, all: &[String]) -> String {
+    let floor = 12.min(id.len());
+    for length in floor..id.len() {
+        if !id.is_char_boundary(length) {
+            continue;
+        }
+        let prefix = &id[..length];
+        if all
+            .iter()
+            .all(|other| other == id || !other.starts_with(prefix))
+        {
+            return prefix.to_owned();
+        }
+    }
+    id.to_owned()
+}
+
+/// A duration since `at`, in the coarsest single unit that is not zero —
+/// ages are for scanning a list, not for arithmetic.
+fn age(now_unix_ms: i64, at: &horde_proto::prost_types::Timestamp) -> String {
+    let at_ms = at
+        .seconds
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(at.nanos) / 1_000_000);
+    let seconds = (now_unix_ms.saturating_sub(at_ms)).max(0) / 1_000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+/// The wall clock, for the human list and the front door's rows; everything
+/// assertable goes through [`session_rows`]'s parameter instead.
+pub(crate) fn now_unix_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        // A clock past what i64 milliseconds can hold saturates; a clock
+        // before 1970 renders every age as fresh — the least wrong things a
+        // display-only clock can do.
+        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
     }
 }
 
@@ -1188,6 +1286,7 @@ mod tests {
             created_at: None,
             head_sequence: 12,
             agent_count: 3,
+            last_activity_at: None,
         }
     }
 
@@ -1215,6 +1314,137 @@ mod tests {
         assert_eq!(parsed["state"], "active");
         assert_eq!(parsed["head_sequence"], 12);
         assert_eq!(parsed["agent_count"], 3);
+        assert_eq!(
+            parsed["name"], "ci-fix",
+            "JSON carries both id and name so scripts never re-resolve (ADR-0008)"
+        );
+    }
+
+    /// A multi-word title's JSON name is its slug — the handle every verb
+    /// resolves — not the raw title, which rides in its own field.
+    #[test]
+    fn the_json_name_is_the_slugified_title() {
+        let mut titled = summary();
+        titled.title = "Fix Auth Timeout".to_owned();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&session(&titled, Format::Json)).expect("valid JSON");
+        assert_eq!(parsed["name"], "fix-auth-timeout");
+        assert_eq!(parsed["title"], "Fix Auth Timeout");
+    }
+
+    fn listed(id: &str, title: &str, agents: u32, last_activity_ms: i64) -> SessionSummary {
+        SessionSummary {
+            session_id: Some(SessionId::new(id)),
+            title: title.to_owned(),
+            state: SessionLifecycleState::Active as i32,
+            agent_count: agents,
+            last_activity_at: Some(horde_proto::prost_types::Timestamp {
+                seconds: last_activity_ms.div_euclid(1_000),
+                nanos: i32::try_from(last_activity_ms.rem_euclid(1_000)).unwrap_or(0) * 1_000_000,
+            }),
+            ..SessionSummary::default()
+        }
+    }
+
+    /// The one row format (ADR-0008): name, short id, status, agent count,
+    /// last-activity age — with the short id an actual unique prefix, and
+    /// the untitled session shown honestly rather than blank.
+    #[test]
+    fn session_rows_carry_name_short_id_status_agents_and_age() {
+        let now = 3_600_000_i64;
+        let rows = super::session_rows(
+            &[
+                listed("session-a1f0aa-0", "Fix Auth Timeout", 3, now - 90_000),
+                listed("session-b2e1bb-0", "brisk-warband", 1, now - 5_000),
+                listed("session-b2e1bb-1", "", 2, now - 7_200_000),
+            ],
+            now,
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows[0].contains("fix-auth-timeout"),
+            "the name is the slug: {}",
+            rows[0]
+        );
+        assert!(
+            rows[0].contains("session-a1f0") && !rows[0].contains("session-a1f0aa-0"),
+            "the short id is a shortened unique prefix: {}",
+            rows[0]
+        );
+        assert!(rows[0].contains("active"));
+        assert!(rows[0].contains("agents=3"));
+        assert!(rows[0].contains("1m"), "90s ago is 1m: {}", rows[0]);
+        assert!(rows[1].contains("5s"), "{}", rows[1]);
+        assert!(
+            rows[2].contains("session-b2e1bb-1"),
+            "an id that only differs at its tail keeps enough to stay unique: {}",
+            rows[2]
+        );
+        assert!(
+            rows[2].starts_with("-"),
+            "untitled shows a dash: {}",
+            rows[2]
+        );
+    }
+
+    /// The age vocabulary, one boundary per unit — a list is scanned, not
+    /// computed with.
+    #[test]
+    fn ages_use_the_coarsest_nonzero_unit() {
+        let at = |ms: i64| horde_proto::prost_types::Timestamp {
+            seconds: ms / 1_000,
+            nanos: 0,
+        };
+        assert_eq!(super::age(59_000, &at(0)), "59s");
+        assert_eq!(super::age(60_000, &at(0)), "1m");
+        assert_eq!(super::age(3_599_000, &at(0)), "59m");
+        assert_eq!(super::age(3_600_000, &at(0)), "1h");
+        assert_eq!(super::age(86_400_000, &at(0)), "1d");
+        assert_eq!(
+            super::age(0, &at(5_000)),
+            "0s",
+            "clock skew must not print a negative age"
+        );
+
+        // Sub-second nanos participate as whole milliseconds — divided into
+        // the stamp, not multiplied through it and not reduced modulo it.
+        let with_nanos =
+            |seconds: i64, nanos: i32| horde_proto::prost_types::Timestamp { seconds, nanos };
+        assert_eq!(
+            super::age(60_500, &with_nanos(0, 500_000_000)),
+            "1m",
+            "half a second of nanos is 500ms of stamp"
+        );
+        assert_eq!(
+            super::age(60_998, &with_nanos(0, 999_000_000)),
+            "59s",
+            "999ms of nanos holds the age just under the minute"
+        );
+    }
+
+    /// The human list's wall clock is a real clock: after this test was
+    /// written, never before it — a frozen or negative clock would render
+    /// every session as decades old or freshly born.
+    #[test]
+    fn the_wall_clock_reads_as_the_present() {
+        // 2024-01-01T00:00:00Z, safely before any run of this suite.
+        assert!(super::now_unix_ms() > 1_704_067_200_000);
+    }
+
+    /// The short id never lies: an id that is a full prefix of a sibling
+    /// stays whole, because a shorter form would resolve to the wrong one.
+    #[test]
+    fn a_short_id_that_would_be_anothers_prefix_stays_full() {
+        let ids = vec!["session-key-1".to_owned(), "session-key-12".to_owned()];
+        assert_eq!(super::short_id("session-key-1", &ids), "session-key-1");
+        assert_eq!(super::short_id("session-key-12", &ids), "session-key-12");
+
+        let lone = vec!["session-18f3a2b4c5d6-0".to_owned()];
+        assert_eq!(
+            super::short_id("session-18f3a2b4c5d6-0", &lone),
+            "session-18f3",
+            "the floor keeps the short id past the shared session- stem"
+        );
     }
 
     #[test]

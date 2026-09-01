@@ -40,9 +40,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// No verb opens the interactive multi-session overview (DESIGN.md §11:
-    /// two zoom levels, one binary — `horde` is the overview, `horde attach`
-    /// the per-session view).
+    /// No verb is the front door (ADR-0008): no live sessions creates one,
+    /// auto-named, and attaches; exactly one attaches it; several open the
+    /// picker. Headless or `--json`, it fails fast with the candidates.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -51,6 +51,9 @@ pub struct Cli {
 pub enum Command {
     /// Handshake with the server and print what it is.
     Hello,
+    /// Create a session and attach to it — the explicit spelling of the
+    /// front door. `session new` remains the headless create.
+    New(NewArgs),
     /// Session lifecycle.
     #[command(subcommand)]
     Session(SessionCommand),
@@ -335,11 +338,26 @@ pub enum EnrollCommand {
     },
 }
 
+/// `horde new [title]`: create, then attach.
+#[derive(Args, Debug)]
+pub struct NewArgs {
+    /// The session's title. Omitted, a thematic `adjective-noun` name is
+    /// drawn, collision-checked against the live sessions.
+    pub title: Option<String>,
+    /// What the root agent is: type, tier, workspace, mode, first task.
+    #[command(flatten)]
+    pub spec: SpecArgs,
+    /// Create without attaching — the scripting form.
+    #[arg(long)]
+    pub detach: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum SessionCommand {
     /// Create a session and its top-level agent.
     New {
-        title: String,
+        /// The session's title; omitted draws a thematic name.
+        title: Option<String>,
         /// What the root agent is: type, tier, workspace, mode, first task.
         #[command(flatten)]
         spec: SpecArgs,
@@ -352,8 +370,13 @@ pub enum SessionCommand {
         #[arg(long)]
         include_archived: bool,
     },
-    /// Show one session.
-    Get { session_id: String },
+    /// Show one session, by name, id, or unique id prefix.
+    Get {
+        session_id: String,
+        /// Resolve against archived sessions too.
+        #[arg(long)]
+        all: bool,
+    },
     /// Archive a session. This, not a result, is what ends its agents.
     Archive {
         session_id: String,
@@ -364,6 +387,7 @@ pub enum SessionCommand {
 
 #[derive(Args, Debug)]
 pub struct SyncArgs {
+    /// The session, by name, id, or unique id prefix.
     pub session_id: String,
     /// First sequence wanted; 0 replays from the beginning.
     #[arg(long, default_value_t = 0)]
@@ -371,10 +395,15 @@ pub struct SyncArgs {
     /// Keep listening after the replay instead of exiting.
     #[arg(long)]
     pub follow: bool,
+    /// Resolve against archived sessions too.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct SendArgs {
+    /// The agent, by id — or a session name, which addresses that session's
+    /// root agent (ADR-0008: "talk to the session" needs no second id).
     pub agent_id: String,
     pub text: String,
     /// Send a note (owes no result) instead of an assignment.
@@ -459,6 +488,8 @@ pub fn payload_from(args: &SendArgs) -> Result<Option<horde_proto::v1::Payload>,
 
 #[derive(Args, Debug)]
 pub struct InterruptArgs {
+    /// The agent, by id — or a session name, which addresses that session's
+    /// root agent.
     pub agent_id: String,
     #[arg(long, default_value = "")]
     pub reason: String,
@@ -488,11 +519,16 @@ pub struct ApproveArgs {
 
 #[derive(Args, Debug)]
 pub struct AttachArgs {
+    /// The session, by name, id, or unique id prefix.
     pub session_id: String,
     /// Scope the view to this agent's subtree instead of the whole session.
-    /// Prompts from elsewhere show only as a passive badge.
+    /// Prompts from elsewhere show only as a passive badge. A session name
+    /// here scopes to that session's root agent.
     #[arg(long)]
     pub agent: Option<String>,
+    /// Resolve against archived sessions too.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]
@@ -724,17 +760,19 @@ async fn dispatch(
     format: Format,
 ) -> Result<(), ClientError> {
     match &cli.command {
-        None => crate::tui::launch(client.clone(), crate::tui::Launch::Overview).await,
-        Some(Command::Attach(args)) => {
-            crate::tui::launch(
-                client.clone(),
-                crate::tui::Launch::Attach {
-                    session_id: args.session_id.clone(),
-                    agent_id: args.agent.clone(),
-                },
+        None => crate::front_door::enter(client, interactive(cli)).await,
+        Some(Command::New(args)) => {
+            crate::front_door::new_session(
+                client,
+                args.title.as_deref(),
+                spec_from(&args.spec)?,
+                args.detach,
+                format,
+                interactive(cli),
             )
             .await
         }
+        Some(Command::Attach(args)) => run_attach(client, args).await,
         Some(Command::Hello) => run_hello(client, format).await,
         Some(Command::Session(command)) => run_session(client, command, format).await,
         Some(Command::Sync(args)) => run_sync(client, args, format).await,
@@ -784,6 +822,32 @@ async fn dispatch_admin(
             "verb dispatched to the wrong table: {other:?}"
         )))),
     }
+}
+
+/// Whether this invocation may prompt (ADR-0008): stdin a TTY, `--json`
+/// absent. Everything that would have prompted fails fast otherwise.
+fn interactive(cli: &Cli) -> bool {
+    use std::io::IsTerminal;
+    !cli.json && std::io::stdin().is_terminal()
+}
+
+/// Attaches, with the reference resolved: a name, id, or unique id prefix
+/// names the session, and a session name under `--agent` scopes to that
+/// session's root agent.
+async fn run_attach(client: &mut Client, args: &AttachArgs) -> Result<(), ClientError> {
+    let session_id = crate::resolve::session_id(client, &args.session_id, args.all).await?;
+    let agent_id = match &args.agent {
+        Some(reference) => Some(crate::resolve::agent_id(client, reference).await?),
+        None => None,
+    };
+    crate::tui::launch(
+        client.clone(),
+        crate::tui::Launch::Attach {
+            session_id,
+            agent_id,
+        },
+    )
+    .await
 }
 
 /// One invocation's connection facts, decided before any dial.
@@ -1332,9 +1396,16 @@ async fn run_forward(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ClientError> {
     match command {
-        ForwardCommand::Expose(args) => run_forward_expose(client, args, format, shutdown).await,
-        ForwardCommand::Inject(args) => run_forward_inject(client, args, format, shutdown).await,
+        ForwardCommand::Expose(args) => {
+            let session_id = crate::resolve::session_id(client, &args.session_id, false).await?;
+            run_forward_expose(client, args, &session_id, format, shutdown).await
+        }
+        ForwardCommand::Inject(args) => {
+            let session_id = crate::resolve::session_id(client, &args.session_id, false).await?;
+            run_forward_inject(client, args, &session_id, format, shutdown).await
+        }
         ForwardCommand::Ls { session } => {
+            let session = resolved_filter(client, session.as_deref()).await?;
             let forwards = client.list_forwards(session.as_deref()).await?;
             println!("{}", render::forwards(&forwards, format));
             Ok(())
@@ -1344,15 +1415,32 @@ async fn run_forward(
             forward_id,
             reason,
         } => {
-            let sequence = client.close_forward(session_id, forward_id, reason).await?;
+            let session_id = crate::resolve::session_id(client, session_id, false).await?;
+            let sequence = client
+                .close_forward(&session_id, forward_id, reason)
+                .await?;
             println!("{}", render::sequence("closed", sequence, format));
             Ok(())
         }
         ForwardCommand::Serve { session } => {
+            let session = resolved_filter(client, session.as_deref()).await?;
             run_forward_serve(client, session.as_deref(), identity, format, shutdown)
                 .await
                 .map(drop)
         }
+    }
+}
+
+/// An optional `--session` filter, resolved when present.
+async fn resolved_filter(
+    client: &mut Client,
+    session: Option<&str>,
+) -> Result<Option<String>, ClientError> {
+    match session {
+        Some(reference) => Ok(Some(
+            crate::resolve::session_id(client, reference, false).await?,
+        )),
+        None => Ok(None),
     }
 }
 
@@ -1387,6 +1475,7 @@ async fn declare(
 async fn run_forward_expose(
     client: &mut Client,
     args: &ForwardExposeArgs,
+    session_id: &str,
     format: Format,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ClientError> {
@@ -1398,7 +1487,7 @@ async fn run_forward_expose(
         worker_port: u32::from(args.port),
         client_port: local_port,
     };
-    let forward_id = declare(client, &args.session_id, &args.agent_id, spec).await?;
+    let forward_id = declare(client, session_id, &args.agent_id, spec).await?;
 
     let realized = crate::forward::realize_expose(
         client,
@@ -1434,6 +1523,7 @@ async fn run_forward_expose(
 async fn run_forward_inject(
     client: &mut Client,
     args: &ForwardInjectArgs,
+    session_id: &str,
     format: Format,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ClientError> {
@@ -1445,7 +1535,7 @@ async fn run_forward_inject(
         worker_port: u32::from(worker_port),
         client_port: u32::from(args.port),
     };
-    let forward_id = declare(client, &args.session_id, &args.agent_id, spec).await?;
+    let forward_id = declare(client, session_id, &args.agent_id, spec).await?;
 
     println!(
         "{}",
@@ -1619,7 +1709,8 @@ async fn run_interrupt(
     args: &InterruptArgs,
     format: Format,
 ) -> Result<(), ClientError> {
-    let sequence = client.interrupt(&args.agent_id, &args.reason).await?;
+    let agent_id = crate::resolve::agent_id(client, &args.agent_id).await?;
+    let sequence = client.interrupt(&agent_id, &args.reason).await?;
     println!("{}", render::sequence("interrupted", sequence, format));
     Ok(())
 }
@@ -1629,9 +1720,10 @@ async fn run_spawn(
     args: &SpawnArgs,
     format: Format,
 ) -> Result<(), ClientError> {
+    let session_id = crate::resolve::session_id(client, &args.session_id, false).await?;
     let response = client
         .spawn_agent_with_spec(
-            &args.session_id,
+            &session_id,
             args.parent.as_deref(),
             spec_from(&args.spec)?,
             &args.idempotency_key,
@@ -1668,21 +1760,27 @@ async fn run_session(
             spec,
             idempotency_key,
         } => {
-            let (summary, root) = client
-                .create_session_with(title, spec_from(spec)?, idempotency_key)
-                .await?;
+            let (summary, root) = crate::front_door::create(
+                client,
+                title.as_deref(),
+                spec_from(spec)?,
+                idempotency_key,
+            )
+            .await?;
             println!("{}", render::created(&summary, &root, format));
         }
         SessionCommand::List { include_archived } => {
             let summaries = client.list_sessions(*include_archived).await?;
             println!("{}", render::sessions(&summaries, format));
         }
-        SessionCommand::Get { session_id } => {
-            let summary = client.get_session(session_id).await?;
+        SessionCommand::Get { session_id, all } => {
+            let session_id = crate::resolve::session_id(client, session_id, *all).await?;
+            let summary = client.get_session(&session_id).await?;
             println!("{}", render::session(&summary, format));
         }
         SessionCommand::Archive { session_id, reason } => {
-            let summary = client.archive_session(session_id, reason).await?;
+            let session_id = crate::resolve::session_id(client, session_id, false).await?;
+            let summary = client.archive_session(&session_id, reason).await?;
             println!("{}", render::session(&summary, format));
         }
     }
@@ -1690,7 +1788,8 @@ async fn run_session(
 }
 
 async fn run_sync(client: &mut Client, args: &SyncArgs, format: Format) -> Result<(), ClientError> {
-    let options = SyncOptions::new(args.session_id.clone())
+    let session_id = crate::resolve::session_id(client, &args.session_id, args.all).await?;
+    let options = SyncOptions::new(session_id)
         .from_sequence(args.from)
         .following(args.follow);
     let follow = args.follow;
@@ -1715,9 +1814,10 @@ async fn run_sync(client: &mut Client, args: &SyncArgs, format: Format) -> Resul
 }
 
 async fn run_send(client: &mut Client, args: &SendArgs, format: Format) -> Result<(), ClientError> {
+    let agent_id = crate::resolve::agent_id(client, &args.agent_id).await?;
     let response = client
         .send_with_payload(
-            &args.agent_id,
+            &agent_id,
             args.note,
             &args.text,
             payload_from(args)?,
@@ -1763,7 +1863,7 @@ mod tests {
     use clap::Parser;
     use horde_proto::v1::{DeliveryMode, PermissionOutcome};
 
-    use super::{Cli, Command, SessionCommand, delivery_for, outcome_for};
+    use super::{AttachArgs, Cli, Command, SessionCommand, SyncArgs, delivery_for, outcome_for};
 
     #[test]
     fn delivery_defaults_to_the_turn_boundary_and_flips_only_when_asked() {
@@ -2299,6 +2399,7 @@ mod tests {
             Some(Command::Attach(args)) => {
                 assert_eq!(args.session_id, "s1");
                 assert_eq!(args.agent.as_deref(), Some("a9"));
+                assert!(!args.all, "live-only resolution is the default");
             }
             other => panic!("expected attach, got {other:?}"),
         }
@@ -2307,6 +2408,71 @@ mod tests {
             Cli::try_parse_from(["horde", "attach"]).is_err(),
             "attach needs a session"
         );
+    }
+
+    /// `horde new [title]` is the explicit front door: the title is
+    /// optional, the root spec rides along, and `--detach` is the scripting
+    /// form (ADR-0008).
+    #[test]
+    fn new_takes_an_optional_title_a_spec_and_detach() {
+        let bare = Cli::try_parse_from(["horde", "new"]).expect("titleless new parses");
+        match bare.command {
+            Some(Command::New(args)) => {
+                assert_eq!(args.title, None, "an omitted title draws a name");
+                assert!(!args.detach, "attach is the default");
+            }
+            other => panic!("expected new, got {other:?}"),
+        }
+
+        let full = Cli::try_parse_from([
+            "horde", "new", "ci fix", "--type", "reviewer", "--tier", "deep", "--detach",
+        ])
+        .expect("a full new parses");
+        match full.command {
+            Some(Command::New(args)) => {
+                assert_eq!(args.title.as_deref(), Some("ci fix"));
+                assert_eq!(args.spec.agent_type.as_deref(), Some("reviewer"));
+                assert_eq!(args.spec.tier.as_deref(), Some("deep"));
+                assert!(args.detach);
+            }
+            other => panic!("expected new, got {other:?}"),
+        }
+    }
+
+    /// `session new`'s title is optional everywhere now — the headless
+    /// create draws the same thematic name the front door does.
+    #[test]
+    fn session_new_no_longer_requires_a_title() {
+        let cli = Cli::try_parse_from(["horde", "session", "new"]).expect("titleless create");
+        match cli.command {
+            Some(Command::Session(SessionCommand::New { title, .. })) => {
+                assert_eq!(title, None);
+            }
+            other => panic!("expected session new, got {other:?}"),
+        }
+    }
+
+    /// `--all` widens resolution to archived sessions on the verbs that can
+    /// sensibly reach one; each flag must land on its own struct.
+    #[test]
+    fn the_all_flag_reaches_attach_sync_and_get() {
+        let attach = Cli::try_parse_from(["horde", "attach", "s1", "--all"]).expect("parses");
+        assert!(matches!(
+            attach.command,
+            Some(Command::Attach(AttachArgs { all: true, .. }))
+        ));
+
+        let sync = Cli::try_parse_from(["horde", "sync", "s1", "--all"]).expect("parses");
+        assert!(matches!(
+            sync.command,
+            Some(Command::Sync(SyncArgs { all: true, .. }))
+        ));
+
+        let get = Cli::try_parse_from(["horde", "session", "get", "s1", "--all"]).expect("parses");
+        assert!(matches!(
+            get.command,
+            Some(Command::Session(SessionCommand::Get { all: true, .. }))
+        ));
     }
 }
 
@@ -2875,6 +3041,38 @@ mod forward_flow_tests {
         assert!(
             outcome.is_err(),
             "the unauthenticated serve stream's refusal must surface"
+        );
+    }
+
+    /// The `--session` filter resolves like every other session reference
+    /// (ADR-0008): a name becomes the id, absence stays absent, and an
+    /// unmatched reference passes through for the server to refuse.
+    #[tokio::test]
+    async fn the_session_filter_resolves_names_and_absence_stays_absent() {
+        let (_core, mut client) = crate::forward::testing::served().await;
+        let (summary, _root) = client
+            .create_session("Fwd Home", "key-9")
+            .await
+            .expect("a session creates");
+        let id = summary.session_id.map(|id| id.to_string()).expect("an id");
+
+        assert_eq!(
+            super::resolved_filter(&mut client, Some("fwd-home"))
+                .await
+                .expect("a name resolves"),
+            Some(id)
+        );
+        assert_eq!(
+            super::resolved_filter(&mut client, None)
+                .await
+                .expect("no filter is no filter"),
+            None
+        );
+        assert_eq!(
+            super::resolved_filter(&mut client, Some("session-nope"))
+                .await
+                .expect("unmatched passes through"),
+            Some("session-nope".to_owned())
         );
     }
 

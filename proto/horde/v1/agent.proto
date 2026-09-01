@@ -282,4 +282,8 @@ message SessionSummary {
   uint64 head_sequence = 7;
 
   uint32 agent_count = 8;
+
+  // When the newest event in this Session's log was recorded — what a Client
+  // renders as the last-activity age, and never guesses from head_sequence.
+  google.protobuf.Timestamp last_activity_at = 9;
 }

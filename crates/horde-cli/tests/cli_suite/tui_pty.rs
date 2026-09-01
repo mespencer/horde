@@ -26,10 +26,12 @@ fn spawn_horde(endpoint: &str, args: &[&str]) -> Setup<PtyProcess> {
     PtyProcess::spawn(command)
 }
 
+/// ADR-0008's front door, arm two: exactly one live session skips the picker
+/// and attaches — bare `horde` puts the human in front of that session.
 #[tokio::test]
-async fn the_overview_paints_on_a_real_terminal_and_q_exits_cleanly() {
+async fn bare_horde_with_one_session_attaches_it_directly() {
     let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-pty-overview")
+    let (_, session_id, _) = seeded(&endpoint, "tui-pty-only")
         .await
         .expect("a seeded session");
 
@@ -37,21 +39,192 @@ async fn the_overview_paints_on_a_real_terminal_and_q_exits_cleanly() {
     // Needles are single words: the terminal skips blank cells with cursor
     // moves, so a phrase never paints as one contiguous byte run.
     horde
-        .await_painted("horde")
+        .await_painted("attached:")
         .await
-        .expect("the overview header must reach the real terminal");
+        .expect("one live session means the session view, no picker");
     horde
-        .await_painted("tui-pty-overview")
+        .await_painted("tui-pty-only")
         .await
-        .expect("the seeded session must be painted");
+        .expect("the attached session is the seeded one");
     assert!(
         horde.seen.contains(&session_id),
-        "the session id is the row a user copies from"
+        "the header names the session that was entered"
     );
 
-    horde.type_bytes(b"q").expect("q reaches the pty");
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
     let status = horde.exit_status().await.expect("the TUI exits");
-    assert!(status.success(), "q must be a clean exit, got {status:?}");
+    assert!(
+        status.success(),
+        "ctrl-c must be a clean exit, got {status:?}"
+    );
+}
+
+/// Arm one: no live sessions means create one, auto-named, and attach. The
+/// name is checked against the word list through a client, because the
+/// binary owns its own entropy.
+#[tokio::test]
+async fn bare_horde_with_no_sessions_creates_an_auto_named_session_and_attaches() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("attached:")
+        .await
+        .expect("an empty server still puts the human in front of a session");
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    let status = horde.exit_status().await.expect("the TUI exits");
+    assert!(status.success(), "got {status:?}");
+
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("a client dials");
+    let sessions = client.list_sessions(false).await.expect("the list");
+    assert_eq!(sessions.len(), 1, "the front door created exactly one");
+    let (adjective, noun) = sessions[0]
+        .title
+        .split_once('-')
+        .expect("an auto-name is adjective-noun");
+    assert!(
+        horde_cli::names::ADJECTIVES.contains(&adjective)
+            && horde_cli::names::NOUNS.contains(&noun),
+        "the drawn name comes from the fixed word list: {:?}",
+        sessions[0].title
+    );
+}
+
+/// Arm three: several live sessions open the picker — rendered rows on a
+/// real terminal — and Enter on a session row attaches it.
+#[tokio::test]
+async fn bare_horde_with_several_sessions_opens_the_picker_and_enter_attaches() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, _, _) = seeded(&endpoint, "pick-one")
+        .await
+        .expect("a seeded session");
+    client
+        .create_session("pick-two", "key-2")
+        .await
+        .expect("a second session");
+
+    let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("pick")
+        .await
+        .expect("several sessions mean the picker, not a silent attach");
+    horde
+        .await_painted("pick-one")
+        .await
+        .expect("every live session is a row");
+    horde
+        .await_painted("pick-two")
+        .await
+        .expect("both rows paint");
+
+    // Down once: past the "new session" top row, onto the newest session.
+    horde.type_bytes(b"j").expect("j reaches the pty");
+    horde.type_bytes(b"\r").expect("enter reaches the pty");
+    horde
+        .await_painted("attached:")
+        .await
+        .expect("enter on a session row attaches it");
+
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    let status = horde.exit_status().await.expect("the TUI exits");
+    assert!(status.success(), "got {status:?}");
+}
+
+/// The picker's top row: Enter on "new session" creates an auto-named
+/// session and attaches to it — the create arm, reached through choosing.
+#[tokio::test]
+async fn the_pickers_top_row_creates_and_attaches_a_new_session() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, _, _) = seeded(&endpoint, "old-one")
+        .await
+        .expect("a seeded session");
+    client
+        .create_session("old-two", "key-2")
+        .await
+        .expect("a second session");
+
+    let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("pick")
+        .await
+        .expect("the picker paints");
+    // Enter with the cursor still on the top row: the "new session" create.
+    horde.type_bytes(b"\r").expect("enter reaches the pty");
+    horde
+        .await_painted("attached:")
+        .await
+        .expect("the top row creates and attaches");
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    let status = horde.exit_status().await.expect("the TUI exits");
+    assert!(status.success(), "got {status:?}");
+
+    let sessions = client.list_sessions(false).await.expect("the list");
+    assert_eq!(sessions.len(), 3, "choosing \"new session\" created one");
+    assert!(
+        sessions.iter().any(|summary| {
+            summary
+                .title
+                .split_once('-')
+                .is_some_and(|(adjective, noun)| {
+                    horde_cli::names::ADJECTIVES.contains(&adjective)
+                        && horde_cli::names::NOUNS.contains(&noun)
+                })
+        }),
+        "the created session is auto-named from the word list"
+    );
+}
+
+/// `horde new <title>` with a terminal: create, then attach — one motion.
+#[tokio::test]
+async fn horde_new_with_a_terminal_creates_and_attaches() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let mut horde =
+        spawn_horde(&endpoint, &["new", "fresh-start"]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("attached:")
+        .await
+        .expect("new is create-then-attach");
+    horde
+        .await_painted("fresh-start")
+        .await
+        .expect("the attached session is the one just created");
+    horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    let status = horde.exit_status().await.expect("the TUI exits");
+    assert!(status.success(), "got {status:?}");
+}
+
+/// Esc in the picker leaves without entering anything — cleanly, because a
+/// dismissal is a decision, not a failure.
+#[tokio::test]
+async fn the_picker_dismisses_on_esc_without_attaching() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, _, _) = seeded(&endpoint, "stay-out")
+        .await
+        .expect("a seeded session");
+    client
+        .create_session("stay-away", "key-2")
+        .await
+        .expect("a second session");
+
+    let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
+    horde
+        .await_painted("pick")
+        .await
+        .expect("the picker paints");
+    horde.type_bytes(&[0x1b]).expect("esc reaches the pty");
+    let seen = horde.seen.clone();
+    let status = horde.exit_status().await.expect("the process exits");
+    assert!(
+        status.success(),
+        "a dismissal exits cleanly, got {status:?}"
+    );
+    assert!(
+        !seen.contains("attached:"),
+        "nothing may have been attached: {seen:?}"
+    );
 }
 
 #[tokio::test]
@@ -61,12 +234,19 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
         .await
         .expect("a seeded session");
 
+    // Attached by *name*, not id: the resolution ADR-0008 adds runs in the
+    // real binary's attach path, and the painted header proves it landed on
+    // the session the name meant.
     let mut horde =
-        spawn_horde(&endpoint, &["attach", &session_id]).expect("the binary spawns in a pty");
+        spawn_horde(&endpoint, &["attach", "tui-pty-attach"]).expect("the binary spawns in a pty");
     horde
         .await_painted("attached:")
         .await
         .expect("the session view must reach the real terminal");
+    horde
+        .await_painted(&session_id)
+        .await
+        .expect("the name resolved to the seeded session's id");
     horde
         .await_painted("spawned")
         .await
@@ -83,13 +263,14 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
 /// A typed key must do something *other* than exit — the one effect a broken
 /// input path can fake. Delete `forward_terminal_input` and the reader thread
 /// drops its sender at birth; `drive` sees the closed channel, requests quit,
-/// and exits cleanly — indistinguishable, from outside, from `q` working.
-/// The tests above type `q` and ctrl-c and assert a clean exit, so they pass
-/// either way. Here `i` must swap the overview for the inbox, whose footer
-/// paints "allow" — a word no overview screen ever shows (the seeded session
-/// id is the deterministic `session-key-1`, so no row can collide). Under a
-/// severed input path the process is gone before `i` lands and the wait fails
-/// on the closed pty, without spending its ceiling.
+/// and exits cleanly — indistinguishable, from outside, from ctrl-c working.
+/// The tests above type ctrl-c and assert a clean exit, so they pass either
+/// way. Here Esc must swap the attach view for the overview (which paints
+/// "sessions", a word the session view never shows), and `i` must swap that
+/// for the inbox, whose footer paints "allow". The route also pins that the
+/// overview is still reachable behind the front door: attach first, Esc out.
+/// Under a severed input path the process is gone before Esc lands and the
+/// wait fails on the closed pty, without spending its ceiling.
 #[tokio::test]
 async fn a_typed_key_reaches_the_loop_and_repaints_the_screen() {
     let endpoint = serve().await.expect("a listening server");
@@ -98,18 +279,27 @@ async fn a_typed_key_reaches_the_loop_and_repaints_the_screen() {
         .expect("a seeded session");
 
     let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
-    // Raw mode is on once the overview has painted, so the keystroke below
-    // arrives at the running loop, not a half-initialised terminal.
+    // Raw mode is on once the attach view has painted, so the keystrokes
+    // below arrive at the running loop, not a half-initialised terminal.
     horde
-        .await_painted("sessions")
+        .await_painted("attached:")
         .await
-        .expect("the overview must paint before anything is typed");
+        .expect("one session, so the front door attaches before anything is typed");
+
+    // The needle is the overview footer's "inbox": the header repaints only
+    // the cells that changed under the attach header, so no header word is
+    // guaranteed a contiguous byte run — the footer's new words are.
+    horde.type_bytes(&[0x1b]).expect("esc reaches the pty");
+    horde
+        .await_painted("inbox")
+        .await
+        .expect("esc must detach into the overview — typed bytes must reach the loop");
 
     horde.type_bytes(b"i").expect("i reaches the pty");
     horde
         .await_painted("allow")
         .await
-        .expect("i must swap the overview for the inbox — typed bytes must reach the loop");
+        .expect("i must swap the overview for the inbox");
 
     horde.type_bytes(b"q").expect("q reaches the pty");
     let status = horde.exit_status().await.expect("the TUI exits");
