@@ -6,21 +6,13 @@
 
 use horde_server_testkit::process::{SpawnedProcess, product_binary, value_after};
 
-use crate::support::admit;
-
-/// One bounded `horde` invocation as raw output.
-async fn horde(binary: &std::path::Path, args: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(binary);
-    command.args(args);
-    tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
-        .await
-        .unwrap_or_else(|_| panic!("horde {args:?} must finish rather than hang"))
-        .expect("the CLI runs")
-}
+use crate::support::{admit, bounded_output};
 
 /// A `horde` invocation that must succeed, with its stdout.
 async fn horde_ok(binary: &std::path::Path, args: &[&str]) -> String {
-    let output = horde(binary, args).await;
+    let mut command = tokio::process::Command::new(binary);
+    command.args(args);
+    let output = bounded_output(&format!("horde {args:?}"), command).await;
     assert!(
         output.status.success(),
         "horde {args:?} failed: {}",
@@ -29,12 +21,9 @@ async fn horde_ok(binary: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Server boot → bootstrap-token file → client token join → stored endpoint
-/// → minted worker token → worker `--join` → hello. The chain is the test:
-/// nothing along it takes an endpoint the token (or the identity dir) did
-/// not already carry.
-#[tokio::test]
-async fn one_token_carries_a_machine_from_boot_to_a_working_hello() {
+/// The three product binaries, built if needed and admitted — the opening
+/// both scenarios share.
+async fn binaries() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let server_bin = product_binary("horde-server", "horde-server")
         .await
         .expect("the server binary exists");
@@ -47,6 +36,16 @@ async fn one_token_carries_a_machine_from_boot_to_a_working_hello() {
     admit(&server_bin).await;
     admit(&horde_bin).await;
     admit(&worker_bin).await;
+    (server_bin, horde_bin, worker_bin)
+}
+
+/// Server boot → bootstrap-token file → client token join → stored endpoint
+/// → minted worker token → worker `--join` → hello. The chain is the test:
+/// nothing along it takes an endpoint the token (or the identity dir) did
+/// not already carry.
+#[tokio::test]
+async fn one_token_carries_a_machine_from_boot_to_a_working_hello() {
+    let (server_bin, horde_bin, worker_bin) = binaries().await;
 
     let state = tempfile::tempdir().expect("a state directory");
     let server_state = state.path().join("server-state");
@@ -91,12 +90,13 @@ async fn one_token_carries_a_machine_from_boot_to_a_working_hello() {
         "the stdout line and the file carry the same token"
     );
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&token_file)
-            .expect("the token file exists")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "the token file is user-read-only");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&token_file).expect("the token file exists");
+        assert_eq!(
+            metadata.mode() & 0o777,
+            0o600,
+            "the token file is user-read-only"
+        );
     }
 
     // The client join takes exactly the token — no endpoint flag exists
@@ -201,18 +201,7 @@ async fn one_token_carries_a_machine_from_boot_to_a_working_hello() {
 /// what it started, leaving the port silent.
 #[tokio::test]
 async fn horde_up_stands_up_this_machine_and_tears_it_down() {
-    let server_bin = product_binary("horde-server", "horde-server")
-        .await
-        .expect("the server binary exists");
-    let horde_bin = product_binary("horde-cli", "horde")
-        .await
-        .expect("the CLI binary exists");
-    let worker_bin = product_binary("horde-worker", "horde-worker")
-        .await
-        .expect("the worker binary exists");
-    admit(&server_bin).await;
-    admit(&horde_bin).await;
-    admit(&worker_bin).await;
+    let (_server_bin, horde_bin, _worker_bin) = binaries().await;
 
     let root = tempfile::tempdir().expect("a state directory");
     let mut up = SpawnedProcess::spawn(

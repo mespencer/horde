@@ -427,21 +427,26 @@ mod tests {
 
     use super::MintedCode;
 
-    /// The authority's Debug reaches logs; it must name itself and hold
-    /// everything secret back (it holds the CA's signing key).
-    #[tokio::test]
-    async fn the_authority_debug_names_itself_and_no_material() {
+    /// A bare authority over an in-memory log — the arrangement the
+    /// authority-shape tests below share.
+    async fn bare_authority() -> super::EnrollmentAuthority {
         let now = super::wall_clock_ms();
         let ca = horde_identity::CertificateAuthority::generate(now).expect("a CA generates");
         let credential = ca.issue_localhost_server(now).expect("issues");
-        let authority = super::EnrollmentAuthority::new(
+        super::EnrollmentAuthority::new(
             crate::EventLog::in_memory().expect("a log"),
             ca,
             credential,
         )
         .await
-        .expect("the authority builds");
+        .expect("the authority builds")
+    }
 
+    /// The authority's Debug reaches logs; it must name itself and hold
+    /// everything secret back (it holds the CA's signing key).
+    #[tokio::test]
+    async fn the_authority_debug_names_itself_and_no_material() {
+        let authority = bare_authority().await;
         let debugged = format!("{authority:?}");
         assert!(debugged.contains("EnrollmentAuthority"), "{debugged}");
         assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
@@ -480,17 +485,7 @@ mod tests {
     /// an unadvertised authority honestly says zero.
     #[tokio::test]
     async fn advertised_ports_are_stored_and_default_to_zero() {
-        let now = super::wall_clock_ms();
-        let ca = horde_identity::CertificateAuthority::generate(now).expect("a CA generates");
-        let credential = ca.issue_localhost_server(now).expect("issues");
-        let authority = super::EnrollmentAuthority::new(
-            crate::EventLog::in_memory().expect("a log"),
-            ca,
-            credential,
-        )
-        .await
-        .expect("the authority builds");
-
+        let authority = bare_authority().await;
         assert_eq!(authority.control_plane_port(), 0);
         assert_eq!(authority.enrollment_port(), 0);
         let advertised = authority.advertising_ports(7777, 7778);

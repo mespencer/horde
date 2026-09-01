@@ -957,24 +957,38 @@ pub fn enrolled_principal(identity: Option<&std::path::Path>) -> Option<String> 
         .map(|principal| principal.common_name())
 }
 
-async fn run_join(cli: &Cli, token: &str, format: Format) -> Result<(), ClientError> {
-    // The token's own parse error names the expected horde://join/… shape:
-    // the refusal diagnoses the mistake, not the paste (ADR-0007).
-    let token = horde_identity::JoinToken::parse(token)
-        .map_err(|error| ClientError::Enrollment(error.to_string()))?;
-
-    let enrolled = horde_identity::join(
+/// Redeems a parsed client token: the join dial, introduced with this
+/// CLI's `Hello`. Shared with `horde up`'s bootstrap-file enrollment so
+/// the two joins cannot drift in what they claim to be.
+///
+/// # Errors
+///
+/// The join refusing, wrapped as an enrollment failure.
+pub(crate) async fn redeem_client_token(
+    token: &horde_identity::JoinToken,
+    display_name: &str,
+) -> Result<horde_identity::EnrolledIdentity, ClientError> {
+    horde_identity::join(
         &token.enrollment_endpoint(),
         &token.code,
         horde_proto::v1::Hello {
             semver: env!("CARGO_PKG_VERSION").to_owned(),
             capability_flags: Vec::new(),
             role: horde_proto::v1::Role::Unspecified as i32,
-            display_name: "horde".to_owned(),
+            display_name: display_name.to_owned(),
         },
     )
     .await
-    .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+    .map_err(|error| ClientError::Enrollment(error.to_string()))
+}
+
+async fn run_join(cli: &Cli, token: &str, format: Format) -> Result<(), ClientError> {
+    // The token's own parse error names the expected horde://join/… shape:
+    // the refusal diagnoses the mistake, not the paste (ADR-0007).
+    let token = horde_identity::JoinToken::parse(token)
+        .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+
+    let enrolled = redeem_client_token(&token, "horde").await?;
 
     let directory = cli
         .identity

@@ -14,8 +14,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::AsyncBufReadExt;
-
 use crate::ClientError;
 
 /// The bootstrap-token file's name inside the server's state dir — the
@@ -345,18 +343,7 @@ async fn ensure_client(
     let token = horde_identity::JoinToken::parse(raw.trim())
         .map_err(|error| ClientError::Enrollment(error.to_string()))?;
 
-    let enrolled = horde_identity::join(
-        &token.enrollment_endpoint(),
-        &token.code,
-        horde_proto::v1::Hello {
-            semver: env!("CARGO_PKG_VERSION").to_owned(),
-            capability_flags: Vec::new(),
-            role: horde_proto::v1::Role::Unspecified as i32,
-            display_name: "horde up".to_owned(),
-        },
-    )
-    .await
-    .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+    let enrolled = crate::cli::redeem_client_token(&token, "horde up").await?;
     enrolled
         .identity
         .save(id_dir)
@@ -479,9 +466,14 @@ async fn port_answers(addr: &str) -> bool {
     )
 }
 
-/// The value after `key` on the first line of `text` that starts with it.
+/// The value after `key` on the first *complete* line of `text` that starts
+/// with it. Only newline-terminated lines count, because the buffer fills
+/// in raw chunks and a value read off a half-arrived line would be a
+/// truncated address that parses.
 fn line_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.lines()
+    let complete = &text[..text.rfind('\n').map_or(0, |newline| newline + 1)];
+    complete
+        .lines()
         .find_map(|line| line.strip_prefix(key))
         .map(str::trim)
 }
@@ -528,11 +520,18 @@ impl WatchedChild {
             .ok_or_else(|| spawn_failure(&"no stdout pipe"))?;
         let buffer = Arc::clone(&stdout);
         tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(out).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // Raw chunks rather than a line reader: `line_value` already
+            // refuses to read past the last newline, so nothing here needs
+            // line framing.
+            use tokio::io::AsyncReadExt;
+            let mut out = out;
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = out.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
                 if let Ok(mut buffer) = buffer.lock() {
-                    buffer.push_str(&line);
-                    buffer.push('\n');
+                    buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
                 }
             }
         });
@@ -643,6 +642,19 @@ mod tests {
         assert_eq!(worker_name_from(Some(String::new())), "this-machine");
     }
 
+    /// The probe reports the OS's own answer, asserted against the same
+    /// command the production code runs — the machine's name is the only
+    /// oracle there is, so the one-line re-invocation is the honest test.
+    #[test]
+    fn the_hostname_probe_reports_the_machines_own_name() {
+        let raw = std::process::Command::new("hostname")
+            .output()
+            .expect("hostname runs");
+        let expected = String::from_utf8_lossy(&raw.stdout).trim().to_owned();
+        assert!(!expected.is_empty(), "this machine has a name");
+        assert_eq!(super::hostname().as_deref(), Some(expected.as_str()));
+    }
+
     #[test]
     fn sibling_binaries_are_found_beside_the_own_binary_or_named_missing() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -668,6 +680,11 @@ mod tests {
         assert_eq!(line_value(out, "listening main="), Some("127.0.0.1:7777"));
         assert_eq!(line_value(out, "registered worker=w "), Some("resume=3"));
         assert_eq!(line_value(out, "bootstrap-client-token "), None);
+        assert_eq!(
+            line_value("listening main=127.0.0.1:77", "listening main="),
+            None,
+            "a half-arrived line is a truncated address that parses — refuse it"
+        );
     }
 
     #[tokio::test]
@@ -727,6 +744,42 @@ mod tests {
         dir.join("bin").join(format!("{name}.stopped")).is_file()
     }
 
+    /// Runs the flow with an instant shutdown, collecting announcements —
+    /// how every flow test here drives `stand_up`.
+    async fn stood_up(
+        environment: &UpEnvironment,
+    ) -> (Result<(), crate::ClientError>, Vec<String>) {
+        let mut lines = Vec::new();
+        let outcome = super::stand_up(
+            environment,
+            &mut |line| lines.push(line),
+            std::future::ready(()),
+        )
+        .await;
+        (outcome, lines)
+    }
+
+    /// The environment the flow tests share: scripted daemons under the
+    /// root, the `up-test` worker, and whatever `bind` and `adapters` the
+    /// scenario is about.
+    fn environment_under(
+        root: &std::path::Path,
+        server_binary: std::path::PathBuf,
+        worker_binary: std::path::PathBuf,
+        bind: &str,
+        adapters: Vec<String>,
+    ) -> UpEnvironment {
+        UpEnvironment {
+            server_binary,
+            worker_binary,
+            paths: paths_under(root),
+            bind: bind.to_owned(),
+            enrollment_bind: "127.0.0.1:2".to_owned(),
+            adapters,
+            worker_name: "up-test".to_owned(),
+        }
+    }
+
     /// The whole first boot, in process: a fresh machine, the bootstrap
     /// token riding the filesystem, the client enrolled for real against a
     /// secured server, a worker token minted through the real control plane
@@ -783,24 +836,16 @@ mod tests {
             &["registered worker=up-test resume=0".to_owned()],
         );
 
-        let environment = UpEnvironment {
+        // Nobody listens on port 1, so `up` must start "the server".
+        let environment = environment_under(
+            root.path(),
             server_binary,
             worker_binary,
-            paths: paths.clone(),
-            // Nobody listens on port 1, so `up` must start "the server".
-            bind: "127.0.0.1:1".to_owned(),
-            enrollment_bind: "127.0.0.1:2".to_owned(),
-            adapters: vec!["fake".to_owned()],
-            worker_name: "up-test".to_owned(),
-        };
-        let mut lines = Vec::new();
-        super::stand_up(
-            &environment,
-            &mut |line| lines.push(line),
-            std::future::ready(()),
-        )
-        .await
-        .expect("the machine stands up");
+            "127.0.0.1:1",
+            vec!["fake".to_owned()],
+        );
+        let (outcome, lines) = stood_up(&environment).await;
+        outcome.expect("the machine stands up");
 
         // The ready line, and the steps it summarizes.
         let endpoint = format!("https://127.0.0.1:{main_port}");
@@ -886,23 +931,10 @@ mod tests {
             "",
             &["registered worker=up-test resume=7".to_owned()],
         );
-        let environment = UpEnvironment {
-            server_binary,
-            worker_binary,
-            paths,
-            bind: bind.clone(),
-            enrollment_bind: "127.0.0.1:2".to_owned(),
-            adapters: Vec::new(),
-            worker_name: "up-test".to_owned(),
-        };
-        let mut lines = Vec::new();
-        super::stand_up(
-            &environment,
-            &mut |line| lines.push(line),
-            std::future::ready(()),
-        )
-        .await
-        .expect("the machine stands up");
+        let environment =
+            environment_under(root.path(), server_binary, worker_binary, &bind, Vec::new());
+        let (outcome, lines) = stood_up(&environment).await;
+        outcome.expect("the machine stands up");
 
         assert!(
             lines.contains(&format!("server already-running main={bind}")),
@@ -934,7 +966,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_missing_bootstrap_token_refuses_and_tears_down_the_started_server() {
         let root = tempfile::tempdir().expect("a temp dir");
-        let paths = paths_under(root.path());
         let server_binary = fake_daemon(
             root.path(),
             "server",
@@ -945,23 +976,15 @@ mod tests {
             ],
         );
         let worker_binary = fake_daemon(root.path(), "worker", "", &[]);
-        let environment = UpEnvironment {
+        let environment = environment_under(
+            root.path(),
             server_binary,
             worker_binary,
-            paths: paths.clone(),
-            bind: "127.0.0.1:1".to_owned(),
-            enrollment_bind: "127.0.0.1:2".to_owned(),
-            adapters: Vec::new(),
-            worker_name: "up-test".to_owned(),
-        };
-        let mut lines = Vec::new();
-        let refused = super::stand_up(
-            &environment,
-            &mut |line| lines.push(line),
-            std::future::ready(()),
-        )
-        .await
-        .expect_err("no token file must refuse");
+            "127.0.0.1:1",
+            Vec::new(),
+        );
+        let (outcome, _lines) = stood_up(&environment).await;
+        let refused = outcome.expect_err("no token file must refuse");
         let refusal = refused.to_string();
         assert!(
             refusal.contains("bootstrap-token") && refusal.contains("enroll join"),

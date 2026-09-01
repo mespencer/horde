@@ -174,10 +174,7 @@ impl System {
             .args(["--endpoint", &self.main, "--json"])
             .args(["--identity", &self.operator.to_string_lossy()])
             .args(args);
-        tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
-            .await
-            .unwrap_or_else(|_| panic!("horde {args:?} must finish rather than hang"))
-            .expect("the CLI runs")
+        bounded_output(&format!("horde {args:?}"), command).await
     }
 
     /// Runs a verb that must succeed and prints one JSON line, parsed.
@@ -345,6 +342,18 @@ impl System {
             .expect("the worker registers");
         daemon
     }
+}
+
+/// Runs a prepared command bounded, panicking on a hang — the shared
+/// plumbing of every finishing CLI invocation in this suite.
+pub(crate) async fn bounded_output(
+    what: &str,
+    mut command: tokio::process::Command,
+) -> std::process::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .unwrap_or_else(|_| panic!("{what} must finish rather than hang"))
+        .expect("the command runs")
 }
 
 /// The texts of every output chunk in a replay, in log order.
