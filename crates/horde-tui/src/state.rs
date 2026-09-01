@@ -777,6 +777,7 @@ mod tests {
             created_at: None,
             head_sequence: 12,
             agent_count: 1,
+            last_activity_at: None,
         });
         assert_eq!(state.title, "ci-fix");
         assert_eq!(state.lifecycle, "active");

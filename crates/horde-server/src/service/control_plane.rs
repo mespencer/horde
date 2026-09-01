@@ -301,9 +301,16 @@ impl ControlPlane {
             root_agent_id: state.root_agent_id.clone().map(AgentId::new),
             workspace_definition_id: None,
             state: state.lifecycle as i32,
-            created_at: None,
+            created_at: state
+                .created_at_unix_ms
+                .map(crate::enrollment::ms_to_timestamp),
             head_sequence: state.head_sequence,
             agent_count: u32::try_from(state.agents.len()).unwrap_or(u32::MAX),
+            // A session with no events cannot be projected at all, so a
+            // folded state always has real activity to report.
+            last_activity_at: Some(crate::enrollment::ms_to_timestamp(
+                state.last_activity_unix_ms,
+            )),
         }
     }
 }

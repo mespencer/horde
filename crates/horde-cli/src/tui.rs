@@ -77,8 +77,9 @@ async fn app_for(client: &mut Client, launch: Launch) -> Result<App, ClientError
 
 /// Forwards blocking terminal reads onto a channel the async loop can select
 /// on. The thread ends when the receiver is dropped and the next event
-/// arrives; a leftover blocked read at process exit is harmless.
-fn spawn_input_reader() -> mpsc::Receiver<TermEvent> {
+/// arrives; a leftover blocked read at process exit is harmless. Shared with
+/// the front door's picker, which is the same shell around a smaller loop.
+pub(crate) fn spawn_input_reader() -> mpsc::Receiver<TermEvent> {
     let (sender, receiver) = mpsc::channel(64);
     std::thread::spawn(move || forward_terminal_input(&sender));
     receiver

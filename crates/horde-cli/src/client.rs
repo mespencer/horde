@@ -119,6 +119,57 @@ pub enum ClientError {
     /// dumb terminal, a closed pty).
     #[error("the terminal is not usable for the TUI: {0}")]
     Terminal(#[source] std::io::Error),
+
+    /// A session reference matched more than one session (ADR-0008).
+    ///
+    /// Refused naming every candidate rather than guessed: the next attempt
+    /// can be exact — the full name, or a longer id prefix.
+    #[error(
+        "{reference:?} matches {} sessions:\n{}",
+        candidates.len(),
+        candidates.join("\n")
+    )]
+    AmbiguousSession {
+        reference: String,
+        candidates: Vec<String>,
+    },
+
+    /// A bare invocation arrived with no terminal to pick a session in.
+    ///
+    /// The fast failure ADR-0008 prescribes for headless and `--json`
+    /// invocations that would have prompted: the candidate list rides in the
+    /// error, so the caller's next invocation can name its session.
+    #[error("{}", headless_refusal(candidates))]
+    Headless { candidates: Vec<String> },
+
+    /// The chosen session was archived between listing and attaching.
+    ///
+    /// The archived-while-you-chose race gets a fast named refusal, per the
+    /// ADR-0006 philosophy that an explained refusal beats a hang.
+    #[error("{reference} was archived while you chose; `horde` again to pick from what is live")]
+    ArchivedWhileChoosing { reference: String },
+
+    /// Every name in the word list is taken by a live session.
+    ///
+    /// Reachable only at sixteen hundred live sessions, but a refusal that
+    /// names the remedy still beats an infinite redraw.
+    #[error("every generated name is taken by a live session; pass a title instead")]
+    NamesExhausted,
+}
+
+/// The headless bare-invocation message: what exists, and what to run next —
+/// which differs with whether there is anything to attach at all.
+fn headless_refusal(candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        "no live sessions, and no terminal to create one interactively; \
+         `horde new [title] --detach` creates one"
+            .to_owned()
+    } else {
+        format!(
+            "no terminal to pick a session in; attach one by name or id:\n{}",
+            candidates.join("\n")
+        )
+    }
 }
 
 impl ClientError {

@@ -274,3 +274,245 @@ async fn the_mcp_verbs_round_trip_the_hub_catalog() {
         "an empty catalog says so"
     );
 }
+
+// -- The session front door (ADR-0008) ---------------------------------------
+
+/// A bare invocation with no terminal fails fast, with the candidate list in
+/// the error — never a hang waiting for a picker nobody can see. `output()`
+/// wires stdin to the null device, which is exactly the headless shape.
+#[tokio::test]
+async fn a_headless_bare_horde_fails_fast_with_the_candidates() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let empty = horde(&endpoint, &[]).await.expect("run");
+    assert!(!empty.success, "a headless bare horde must not exit zero");
+    assert!(
+        empty.stderr.contains("horde new"),
+        "with nothing live, the error names the remedy: {:?}",
+        empty.stderr
+    );
+
+    let (_, session_id, _) = common::seeded(&endpoint, "ci-fix").await.expect("seed");
+    let listed = horde(&endpoint, &[]).await.expect("run");
+    assert!(!listed.success);
+    assert!(
+        listed.stderr.contains("ci-fix") && listed.stderr.contains(&session_id[..12]),
+        "the candidates ride in the error so the next invocation can name one: {:?}",
+        listed.stderr
+    );
+    assert!(
+        listed.stdout.trim().is_empty(),
+        "nothing goes to stdout on the refusal"
+    );
+}
+
+/// `session new` without a title draws a thematic name from the word list
+/// and prints it — and `--json` carries both id and name, so the script that
+/// just created the session never re-resolves.
+#[tokio::test]
+async fn session_new_without_a_title_draws_a_thematic_name() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let run = horde(&endpoint, &["--json", "session", "new"])
+        .await
+        .expect("run");
+    assert!(run.success, "stderr was: {}", run.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(run.stdout.trim()).expect("JSON out");
+    let title = parsed["title"].as_str().expect("a generated title");
+    let (adjective, noun) = title.split_once('-').expect("adjective-noun");
+    assert!(
+        horde_cli::names::ADJECTIVES.contains(&adjective)
+            && horde_cli::names::NOUNS.contains(&noun),
+        "the name comes from the fixed word list: {title:?}"
+    );
+    assert_eq!(
+        parsed["name"], title,
+        "a drawn name is already its own handle"
+    );
+    assert!(
+        parsed["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "id and name both ride the JSON"
+    );
+}
+
+/// Wherever a session id is accepted, a name or a unique id prefix resolves
+/// to it, client-side — and ambiguity is an error naming the candidates,
+/// never a guess.
+#[tokio::test]
+async fn session_references_resolve_by_name_and_unique_prefix() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, session_id, _) = common::seeded(&endpoint, "Fix Auth Timeout")
+        .await
+        .expect("seed");
+
+    let by_name = horde(&endpoint, &["--json", "session", "get", "fix-auth-timeout"])
+        .await
+        .expect("run");
+    assert!(by_name.success, "stderr was: {}", by_name.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(by_name.stdout.trim()).expect("JSON");
+    assert_eq!(
+        parsed["session_id"], *session_id,
+        "the slugified title is the handle"
+    );
+
+    let by_prefix = horde(&endpoint, &["--json", "session", "get", "session-key"])
+        .await
+        .expect("run");
+    assert!(by_prefix.success, "a unique prefix resolves git-style");
+
+    let synced = horde(&endpoint, &["sync", "fix-auth-timeout"])
+        .await
+        .expect("run");
+    assert!(
+        synced.success,
+        "sync resolves the same way: {}",
+        synced.stderr
+    );
+
+    client
+        .create_session("Fix Auth Timeout", "key-2")
+        .await
+        .expect("a name twin");
+    let ambiguous = horde(&endpoint, &["session", "get", "fix-auth-timeout"])
+        .await
+        .expect("run");
+    assert!(!ambiguous.success, "two sessions, one name, no guessing");
+    assert!(
+        ambiguous.stderr.contains("session-key-1") && ambiguous.stderr.contains("session-key-2"),
+        "the refusal names the candidates: {:?}",
+        ambiguous.stderr
+    );
+}
+
+/// A session name where an agent is expected addresses the session's root
+/// agent — `send` and `interrupt` need no second id.
+#[tokio::test]
+async fn a_session_name_addresses_its_root_agent_in_send_and_interrupt() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, session_id, root) = common::seeded(&endpoint, "chatty").await.expect("seed");
+
+    let sent = horde(&endpoint, &["--json", "send", "chatty", "hello there"])
+        .await
+        .expect("run");
+    assert!(sent.success, "stderr was: {}", sent.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(sent.stdout.trim()).expect("JSON");
+    assert_eq!(
+        parsed["session_id"], *session_id,
+        "the message landed in the named session"
+    );
+
+    let interrupted = horde(&endpoint, &["interrupt", "chatty"])
+        .await
+        .expect("run");
+    assert!(
+        interrupted.success,
+        "interrupt aliases the same way: {}",
+        interrupted.stderr
+    );
+
+    // The alias really meant the root agent: the send is journaled against it.
+    let events = client.list_sessions(false).await.expect("list");
+    assert_eq!(events.len(), 1);
+    let run = horde(&endpoint, &["--json", "sync", &session_id])
+        .await
+        .expect("run");
+    assert!(
+        run.stdout.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|value| value["agent_id"] == *root)
+        }),
+        "the aliased verbs journaled against the root agent: {}",
+        run.stdout
+    );
+}
+
+/// Archived sessions stay out of name resolution unless `--all` — and a full
+/// id always passes through, so nothing that used to work stops working.
+#[tokio::test]
+async fn archived_sessions_resolve_only_with_all_but_full_ids_always_do() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, _) = common::seeded(&endpoint, "done-work").await.expect("seed");
+
+    let archived = horde(&endpoint, &["session", "archive", "done-work"])
+        .await
+        .expect("run");
+    assert!(
+        archived.success,
+        "a live session archives by name: {}",
+        archived.stderr
+    );
+
+    let hidden = horde(&endpoint, &["session", "get", "done-work"])
+        .await
+        .expect("run");
+    assert!(
+        !hidden.success,
+        "an archived session's name is out of resolution by default"
+    );
+
+    let widened = horde(
+        &endpoint,
+        &["--json", "session", "get", "done-work", "--all"],
+    )
+    .await
+    .expect("run");
+    assert!(widened.success, "--all widens: {}", widened.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(widened.stdout.trim()).expect("JSON");
+    assert_eq!(parsed["state"], "archived");
+
+    let by_id = horde(&endpoint, &["session", "get", &session_id])
+        .await
+        .expect("run");
+    assert!(
+        by_id.success,
+        "the full id reaches an archived session without --all: {}",
+        by_id.stderr
+    );
+}
+
+/// `horde new --detach` is the scripting form: create, print, no attach —
+/// and a headless `horde new` without it refuses *before* creating anything.
+#[tokio::test]
+async fn horde_new_detach_creates_headlessly_and_plain_new_refuses_first() {
+    let endpoint = serve().await.expect("a listening server");
+
+    let refused = horde(&endpoint, &["new", "never-born"]).await.expect("run");
+    assert!(!refused.success, "no terminal, no attach");
+    assert!(
+        refused.stderr.contains("--detach"),
+        "the refusal names the scripting form: {:?}",
+        refused.stderr
+    );
+    let still_empty = horde(&endpoint, &["session", "list"]).await.expect("run");
+    assert_eq!(
+        still_empty.stdout.trim(),
+        "no sessions",
+        "the refusal happened before anything was created"
+    );
+
+    let detached = horde(
+        &endpoint,
+        &[
+            "--json",
+            "new",
+            "night watch",
+            "--type",
+            "reviewer",
+            "--detach",
+        ],
+    )
+    .await
+    .expect("run");
+    assert!(detached.success, "stderr was: {}", detached.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(detached.stdout.trim()).expect("JSON");
+    assert_eq!(parsed["title"], "night watch");
+    assert_eq!(parsed["name"], "night-watch", "the handle is the slug");
+    assert!(
+        parsed["root_agent_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the root agent rides along, same as session new"
+    );
+}
