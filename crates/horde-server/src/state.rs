@@ -126,6 +126,12 @@ pub struct SessionState {
     pub lifecycle: SessionLifecycleState,
     /// Highest sequence folded so far — the client's resume point.
     pub head_sequence: u64,
+    /// When the first folded event was recorded — the session's birth, which
+    /// is what "newest first" orders by.
+    pub created_at_unix_ms: Option<i64>,
+    /// When the newest folded event was recorded — what a client shows as
+    /// the last-activity age. Zero until an event has been folded.
+    pub last_activity_unix_ms: i64,
     /// The session's top-level agent, once one has been spawned.
     pub root_agent_id: Option<String>,
     /// Agents by id, in insertion order of their spawn events.
@@ -168,6 +174,11 @@ impl SessionState {
     /// resuming from a stale head would replay it forever.
     pub fn apply(&mut self, stored: &StoredEvent) -> Result<(), ServerError> {
         self.head_sequence = self.head_sequence.max(stored.sequence);
+        // Every event is activity, modeled or not: an output chunk from an
+        // unknown kind still proves the session moved.
+        self.created_at_unix_ms
+            .get_or_insert(stored.recorded_at_unix_ms);
+        self.last_activity_unix_ms = self.last_activity_unix_ms.max(stored.recorded_at_unix_ms);
 
         let event = Event::decode(stored.payload.as_slice())?;
         let agent_id = event.agent_id.as_ref().map(ToString::to_string);
@@ -546,6 +557,40 @@ mod tests {
         assert_eq!(state.head_sequence, 0);
         assert!(state.agents.is_empty());
         assert_eq!(state.lifecycle, SessionLifecycleState::Active);
+        assert_eq!(state.created_at_unix_ms, None, "no events, no birth time");
+        assert_eq!(state.last_activity_unix_ms, 0);
+    }
+
+    /// The first event's recorded time is the birth and stays the birth; the
+    /// newest recorded time is the activity clock, even for kinds the fold
+    /// does not otherwise model — an output chunk still proves motion.
+    #[test]
+    fn recorded_times_fold_into_birth_and_last_activity() {
+        let at = |mut event: StoredEvent, ms: i64| {
+            event.recorded_at_unix_ms = ms;
+            event
+        };
+        let events = vec![
+            at(stored(1, Some("root"), spawned_named(None, &["ci-fix"])), 1_000),
+            at(
+                stored(
+                    2,
+                    Some("root"),
+                    Kind::AgentOutputChunk(horde_proto::v1::AgentOutputChunk::default()),
+                ),
+                5_000,
+            ),
+        ];
+        let state = SessionState::project("s1", &events).expect("project");
+        assert_eq!(
+            state.created_at_unix_ms,
+            Some(1_000),
+            "the first event is the birth, and a later event must not move it"
+        );
+        assert_eq!(
+            state.last_activity_unix_ms, 5_000,
+            "an unmodeled kind is still activity"
+        );
     }
 
     #[test]

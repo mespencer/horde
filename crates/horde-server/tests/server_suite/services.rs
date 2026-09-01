@@ -388,6 +388,17 @@ async fn sessions_are_listed_and_fetched_from_the_log() {
         fetched.head_sequence, 2,
         "creation writes the root's spawn and its placement answer"
     );
+    let created = fetched
+        .created_at
+        .expect("a projected session has a birth time");
+    let last_activity = fetched
+        .last_activity_at
+        .expect("a projected session has activity — its own creation");
+    assert!(
+        created.seconds > 0 && last_activity.seconds >= created.seconds,
+        "both stamps come from the log's recorded times: \
+         created={created:?} last_activity={last_activity:?}"
+    );
 }
 
 #[tokio::test]
