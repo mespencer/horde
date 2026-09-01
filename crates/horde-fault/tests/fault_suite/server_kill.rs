@@ -142,15 +142,17 @@ async fn a_server_killed_mid_append_restarts_on_its_log_and_everyone_reconciles(
     .expect("the server spawns and announces");
     let announced = server.announcement().clone();
     let bootstrap = announced
-        .bootstrap_code
+        .bootstrap_token
         .as_deref()
-        .expect("a fresh server minted the first client code");
+        .expect("a fresh server minted the first client token");
 
-    // Enroll the operator client through the bootstrap code, and a worker
+    // Enroll the operator client through the bootstrap token, and a worker
     // through a code that client mints — the production issuance paths.
+    let bootstrap =
+        horde_identity::JoinToken::parse(bootstrap).expect("the printed token parses (ADR-0007)");
     let client_identity = join_as(
-        &announced.enrollment_endpoint(),
-        bootstrap,
+        &bootstrap.enrollment_endpoint(),
+        &bootstrap.code.to_string(),
         PrincipalRole::Client,
         "fault-client",
     )

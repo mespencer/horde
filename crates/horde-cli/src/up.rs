@@ -183,10 +183,30 @@ pub async fn run(args: &UpArgs) -> Result<(), ClientError> {
             .clone()
             .unwrap_or_else(|| worker_name_from(hostname())),
     };
-    stand_up(&environment, &mut |line| println!("{line}"), async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    stand_up(
+        &environment,
+        &mut |line| println!("{line}"),
+        until_stopped(),
+    )
     .await
+}
+
+/// Resolves when the operator says stop: ctrl-c, or the SIGTERM a
+/// supervisor sends. Both matter here specifically — a signal death would
+/// skip teardown, and `up`'s whole promise is tearing down what it started.
+async fn until_stopped() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                () = ctrl_c => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(_) => ctrl_c.await,
+    }
 }
 
 /// Stands the machine up, announces one ready line, parks on `shutdown`,
@@ -254,6 +274,14 @@ async fn ensure_server(
         return Ok(environment.bind.clone());
     }
 
+    // The database lives inside the state dir, and SQLite will not invent
+    // the directory around its own file.
+    std::fs::create_dir_all(&environment.paths.server_state).map_err(|error| {
+        ClientError::Enrollment(format!(
+            "could not create {}: {error}",
+            environment.paths.server_state.display()
+        ))
+    })?;
     let db = environment.paths.server_db.display().to_string();
     let state = environment.paths.server_state.display().to_string();
     // Owned before it is awaited on, so a bring-up failure past this point

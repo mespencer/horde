@@ -37,8 +37,6 @@ pub(crate) struct System {
     _server: SpawnedProcess,
     /// The main mTLS endpoint, as `https://localhost:PORT`.
     pub(crate) main: String,
-    /// The TLS-only enrollment endpoint, as `https://localhost:PORT`.
-    pub(crate) enrollment: String,
     /// The server-mounted git Relay, as `http://127.0.0.1:PORT` — the
     /// loopback listener `--relay-bind` stands up (fix a10).
     pub(crate) relay: String,
@@ -128,20 +126,20 @@ impl System {
         )
         .expect("the server spawns");
 
-        // A fresh server has no client, so it must mint the bootstrap code;
-        // its stdout is the root of trust for everything that follows.
+        // A fresh server has no client, so it must mint the bootstrap
+        // token; its stdout is the root of trust for everything that
+        // follows.
         let stdout = server
             .await_stdout("the operator lines", |out| {
-                out.contains("bootstrap-client-code ")
+                out.contains("bootstrap-client-token ")
             })
             .await
             .expect("the server announces itself");
         let main = endpoint_of(value_after(&stdout, "listening main=").expect("a main address"));
-        let enrollment = endpoint_of(
-            value_after(&stdout, "listening enrollment=").expect("an enrollment address"),
-        );
-        let code = value_after(&stdout, "bootstrap-client-code ")
-            .expect("the bootstrap code")
+        // The token carries the enrollment listener itself (ADR-0007), so
+        // nothing here needs the `listening enrollment=` line any more.
+        let token = value_after(&stdout, "bootstrap-client-token ")
+            .expect("the bootstrap token")
             .to_owned();
         let relay = format!(
             "http://{}",
@@ -151,7 +149,6 @@ impl System {
         let system = System {
             _server: server,
             main,
-            enrollment,
             relay,
             operator: state.path().join("operator-identity"),
             state,
@@ -159,10 +156,9 @@ impl System {
             worker_bin,
         };
 
-        // `horde enroll join` — the CLI's own verb, as a real process.
-        let joined = system
-            .cli(&["enroll", "join", &system.enrollment.clone(), &code])
-            .await;
+        // `horde enroll join` — the CLI's own verb, as a real process,
+        // taking exactly the printed token (ADR-0007).
+        let joined = system.cli(&["enroll", "join", &token]).await;
         assert!(
             joined.status.success(),
             "the operator must enroll through the bootstrap code: {}",
@@ -256,9 +252,9 @@ impl System {
         panic!("{what} never appeared in the session log; last replay: {last:?}");
     }
 
-    /// Mints a one-time worker enrollment code, as the operator would.
-    pub(crate) async fn mint_worker_code(&self, name: &str) -> String {
-        self.cli_field(&["worker", "enroll", name], "code").await
+    /// Mints a one-time worker join token, as the operator would.
+    pub(crate) async fn mint_worker_token(&self, name: &str) -> String {
+        self.cli_field(&["worker", "enroll", name], "token").await
     }
 
     /// Starts a long-running `horde` invocation as the operator — for verbs
@@ -328,10 +324,8 @@ impl System {
         .map(ToOwned::to_owned)
         .collect();
         if !state_dir.join("identity").join("identity.pem").is_file() {
-            let code = self.mint_worker_code(name).await;
-            for argument in ["--join", &code, "--enrollment", &self.enrollment] {
-                args.push(argument.to_owned());
-            }
+            let token = self.mint_worker_token(name).await;
+            args.extend(["--join".to_owned(), token]);
         }
         args.extend(extra.iter().map(|s| (*s).to_owned()));
 

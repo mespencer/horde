@@ -16,6 +16,8 @@ mod forwards;
 #[cfg(test)]
 mod hub;
 #[cfg(test)]
+mod joining;
+#[cfg(test)]
 mod lifecycle;
 #[cfg(test)]
 mod logins;

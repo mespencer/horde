@@ -91,8 +91,9 @@ pub struct OperatorAnnouncement {
     pub main: SocketAddr,
     pub enrollment: SocketAddr,
     pub fingerprint: String,
-    /// Present exactly when the server minted a first-client code.
-    pub bootstrap_code: Option<String>,
+    /// The one-token bootstrap line (ADR-0007), present exactly when the
+    /// server minted a first-client code.
+    pub bootstrap_token: Option<String>,
 }
 
 impl OperatorAnnouncement {
@@ -119,8 +120,8 @@ fn fold_operator_line(partial: &mut PartialAnnouncement, line: &str) {
         partial.enrollment = rest.trim().parse().ok();
     } else if let Some(rest) = line.strip_prefix("server-fingerprint ") {
         partial.fingerprint = Some(rest.trim().to_owned());
-    } else if let Some(rest) = line.strip_prefix("bootstrap-client-code ") {
-        partial.bootstrap_code = Some(rest.trim().to_owned());
+    } else if let Some(rest) = line.strip_prefix("bootstrap-client-token ") {
+        partial.bootstrap_token = Some(rest.trim().to_owned());
     }
 }
 
@@ -129,18 +130,18 @@ struct PartialAnnouncement {
     main: Option<SocketAddr>,
     enrollment: Option<SocketAddr>,
     fingerprint: Option<String>,
-    bootstrap_code: Option<String>,
+    bootstrap_token: Option<String>,
 }
 
 impl PartialAnnouncement {
-    /// Whether everything owed has arrived. The bootstrap code is owed only
+    /// Whether everything owed has arrived. The bootstrap token is owed only
     /// when the caller expects one — a restart with an enrolled client prints
     /// three lines and stopping to wait for a fourth would hang on nothing.
     fn complete(&self, expect_bootstrap: bool) -> bool {
         self.main.is_some()
             && self.enrollment.is_some()
             && self.fingerprint.is_some()
-            && (!expect_bootstrap || self.bootstrap_code.is_some())
+            && (!expect_bootstrap || self.bootstrap_token.is_some())
     }
 
     fn conclude(self) -> Option<OperatorAnnouncement> {
@@ -148,7 +149,7 @@ impl PartialAnnouncement {
             main: self.main?,
             enrollment: self.enrollment?,
             fingerprint: self.fingerprint?,
-            bootstrap_code: self.bootstrap_code,
+            bootstrap_token: self.bootstrap_token,
         })
     }
 }
@@ -170,7 +171,7 @@ pub fn parse_operator_lines(
         return Err(FaultHarnessError::Announcement(format!(
             "main={:?} enrollment={:?} fingerprint={:?} bootstrap={:?} (expected bootstrap: \
              {expect_bootstrap}) from {lines:?}",
-            partial.main, partial.enrollment, partial.fingerprint, partial.bootstrap_code
+            partial.main, partial.enrollment, partial.fingerprint, partial.bootstrap_token
         )));
     }
     partial
@@ -492,7 +493,7 @@ mod tests {
                 "listening main=127.0.0.1:7777",
                 "listening enrollment=127.0.0.1:7778",
                 "server-fingerprint abc123",
-                "bootstrap-client-code deadbeef",
+                "bootstrap-client-token deadbeef",
             ]),
             true,
         )
@@ -503,7 +504,7 @@ mod tests {
                 main: "127.0.0.1:7777".parse().expect("an address"),
                 enrollment: "127.0.0.1:7778".parse().expect("an address"),
                 fingerprint: "abc123".to_owned(),
-                bootstrap_code: Some("deadbeef".to_owned()),
+                bootstrap_token: Some("deadbeef".to_owned()),
             }
         );
         assert_eq!(parsed.main_endpoint(), "https://localhost:7777");
@@ -518,7 +519,7 @@ mod tests {
             "server-fingerprint abc123",
         ]);
         let parsed = parse_operator_lines(&three, false).expect("three lines suffice");
-        assert_eq!(parsed.bootstrap_code, None);
+        assert_eq!(parsed.bootstrap_token, None);
 
         // The same three lines are NOT enough when a bootstrap is owed: a
         // fresh server that failed to mint would otherwise pass silently.
