@@ -133,16 +133,34 @@ pub async fn join(
             ca_pem: response.ca_bundle_pem,
         },
         principal,
-        // Zero is proto3's absent, and a listener has no port 0.
-        control_plane_port: u16::try_from(response.control_plane_port)
-            .ok()
-            .filter(|port| *port != 0),
+        control_plane_port: advertised_port(response.control_plane_port),
     })
+}
+
+/// The control-plane port a join answer named, if it named one: proto3's
+/// zero is absent, and no listener has port 0 — so zero (and anything that
+/// cannot be a TCP port) is honestly `None` rather than an endpoint nobody
+/// can dial.
+#[must_use]
+fn advertised_port(wire: u32) -> Option<u16> {
+    u16::try_from(wire).ok().filter(|port| *port != 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::generate_csr;
+
+    /// The wire-to-port mapping's whole table: zero is absent, a real port
+    /// survives, and a value no TCP port can be is refused rather than
+    /// wrapped. (That a live server's answer lands as `Some(main port)` is
+    /// held by `horde-server`'s enrollment suite.)
+    #[test]
+    fn an_advertised_port_is_some_real_port_or_none() {
+        assert_eq!(super::advertised_port(0), None, "proto3 zero is absent");
+        assert_eq!(super::advertised_port(7777), Some(7777));
+        assert_eq!(super::advertised_port(65_535), Some(65_535));
+        assert_eq!(super::advertised_port(65_536), None, "not a TCP port");
+    }
 
     /// The CSR is checked here for shape only; that a CA can actually sign
     /// it — the property that matters — is held by `ca::tests`, and the

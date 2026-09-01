@@ -298,10 +298,11 @@ async fn ensure_server(
             &state,
         ],
     )?);
-    let stdout = await_on_last(owned, "the server's listening lines", |out| {
-        line_value(out, "listening main=").is_some()
-            && line_value(out, "listening enrollment=").is_some()
-    })
+    let stdout = await_on_last(
+        owned,
+        "the server's listening lines",
+        announced_both_listeners,
+    )
     .await?;
 
     // The announced addresses, not the flags: a `:0` bind is only real
@@ -466,12 +467,25 @@ async fn port_answers(addr: &str) -> bool {
     )
 }
 
+/// Whether a server's startup stdout has announced both listeners — the
+/// fact [`ensure_server`] waits on. Both, not either: the main address is
+/// parsed out of the same snapshot, and half an announcement is not yet an
+/// address to dial. A named predicate (not a closure in the wait) so this
+/// truth table is testable in place.
+fn announced_both_listeners(out: &str) -> bool {
+    line_value(out, "listening main=").is_some()
+        && line_value(out, "listening enrollment=").is_some()
+}
+
 /// The value after `key` on the first *complete* line of `text` that starts
 /// with it. Only newline-terminated lines count, because the buffer fills
 /// in raw chunks and a value read off a half-arrived line would be a
 /// truncated address that parses.
 fn line_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let complete = &text[..text.rfind('\n').map_or(0, |newline| newline + 1)];
+    let complete = match text.rfind('\n') {
+        Some(newline) => &text[..newline],
+        None => "",
+    };
     complete
         .lines()
         .find_map(|line| line.strip_prefix(key))
@@ -636,6 +650,11 @@ mod tests {
             "-tudes-box",
             "anything a certificate name refuses maps to a dash"
         );
+        assert_eq!(
+            worker_name_from(Some("a_b-c.9".to_owned())),
+            "a_b-c.9",
+            "every allowed class survives on its own — dot, underscore, dash, digits"
+        );
         assert_eq!(worker_name_from(Some("é é".to_owned())), "this-machine");
         assert_eq!(worker_name_from(Some("a".repeat(80))), "a".repeat(64));
         assert_eq!(worker_name_from(None), "this-machine");
@@ -671,6 +690,56 @@ mod tests {
             refused.to_string().contains("horde-worker")
                 && refused.to_string().contains(&*dir.path().to_string_lossy()),
             "the refusal names the binary and where it looked: {refused}"
+        );
+    }
+
+    /// The server wait's truth table: both listeners announced, or the wait
+    /// is not over — either alone would hand a half-announcement to the
+    /// address parse.
+    #[test]
+    fn the_server_wait_needs_both_listening_lines() {
+        let main = "listening main=127.0.0.1:1\n";
+        let enrollment = "listening enrollment=127.0.0.1:2\n";
+        assert!(super::announced_both_listeners(&format!(
+            "{main}{enrollment}"
+        )));
+        assert!(!super::announced_both_listeners(main));
+        assert!(!super::announced_both_listeners(enrollment));
+        assert!(!super::announced_both_listeners(""));
+    }
+
+    /// The stop wait ends on a signal and nothing else — a wait that
+    /// completed with nobody sending one would tear the machine down the
+    /// moment it was ready. Biased order makes the probe deterministic.
+    #[tokio::test]
+    async fn the_stop_wait_outlives_a_ready_future() {
+        tokio::select! {
+            biased;
+            () = super::until_stopped() => {
+                panic!("nobody sent a signal, so the wait must not end")
+            }
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    /// The whole verb from a bare test binary: resolution succeeds, and the
+    /// missing sibling `horde-server` is the refusal — proof `run` actually
+    /// composes its environment rather than answering Ok to nothing.
+    #[tokio::test]
+    async fn run_without_sibling_binaries_refuses_naming_them() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let refused = super::run(&super::UpArgs {
+            state_dir: Some(root.path().to_path_buf()),
+            adapters: Vec::new(),
+            bind: "127.0.0.1:1".to_owned(),
+            enrollment_bind: "127.0.0.1:2".to_owned(),
+            name: Some("x".to_owned()),
+        })
+        .await
+        .expect_err("a test binary has no product siblings");
+        assert!(
+            refused.to_string().contains("horde-server"),
+            "the refusal names the missing sibling: {refused}"
         );
     }
 
