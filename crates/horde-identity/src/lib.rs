@@ -36,6 +36,7 @@ pub mod principal;
 pub mod revocation;
 pub mod store;
 pub mod tls;
+pub mod token;
 
 pub use ca::{CertificateAuthority, IssuedCertificate, ServerCredential};
 pub use enroll::{EnrolledIdentity, JoinError, join};
@@ -45,3 +46,4 @@ pub use interceptor::require_enrolled;
 pub use principal::{PeerIdentity, Principal, PrincipalRole, principal_of_pem};
 pub use revocation::RevocationList;
 pub use store::StoredIdentity;
+pub use token::{JoinToken, TokenError};

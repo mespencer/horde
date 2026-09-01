@@ -505,6 +505,13 @@ message MintEnrollmentCodeResponse {
   string server_cert_fingerprint = 2;
 
   google.protobuf.Timestamp expires_at = 3;
+
+  // The port of the Server's TLS-only enrollment listener, so the minting
+  // client can print one self-contained `horde://join/<host:port>/<code>`
+  // token (ADR-0007) — the host half is the client's own dialed endpoint,
+  // which the Server cannot know. Zero means the minting listener did not
+  // say.
+  uint32 enrollment_port = 4;
 }
 
 message RevokeEnrollmentRequest {

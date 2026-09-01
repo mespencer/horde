@@ -43,4 +43,10 @@ message JoinResponse {
     WorkerId worker_id = 3;
     ClientId client_id = 4;
   }
+
+  // The port of the Server's main (mTLS) listener, so redeeming a token
+  // teaches the joining machine the control-plane endpoint (ADR-0007): the
+  // host is the one the token already named, this is the port beside it.
+  // Zero means the listener did not say.
+  uint32 control_plane_port = 5;
 }

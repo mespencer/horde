@@ -35,6 +35,10 @@ pub fn generate_csr() -> Result<(String, String), IdentityError> {
 pub struct EnrolledIdentity {
     pub identity: StoredIdentity,
     pub principal: Principal,
+    /// The Server's main (mTLS) listener port, when the answer named it
+    /// (ADR-0007): with the token's host beside it, this is the
+    /// control-plane endpoint the joining machine stores.
+    pub control_plane_port: Option<u16>,
 }
 
 /// What can go wrong joining.
@@ -129,6 +133,10 @@ pub async fn join(
             ca_pem: response.ca_bundle_pem,
         },
         principal,
+        // Zero is proto3's absent, and a listener has no port 0.
+        control_plane_port: u16::try_from(response.control_plane_port)
+            .ok()
+            .filter(|port| *port != 0),
     })
 }
 
