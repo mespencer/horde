@@ -30,7 +30,7 @@ async fn a_join_stores_an_identity_that_opens_the_control_plane() -> Setup<()> {
     let identity_path = identity_dir.path().join("identity");
 
     // A code minted by the authority (the bootstrap shape), joined through
-    // the CLI's own verb — endpoint, code, done.
+    // the CLI's own verb — one token, done (ADR-0007).
     let principal = horde_identity::Principal::new(PrincipalRole::Client, "laptop")?;
     let minted = harness
         .authority
@@ -47,8 +47,7 @@ async fn a_join_stores_an_identity_that_opens_the_control_plane() -> Setup<()> {
             &identity_path.to_string_lossy(),
             "enroll",
             "join",
-            &harness.enrollment_endpoint(),
-            &minted.join_code(),
+            &harness.join_token(&minted).to_string(),
         ]),
     )
     .await??;
@@ -57,17 +56,18 @@ async fn a_join_stores_an_identity_that_opens_the_control_plane() -> Setup<()> {
         horde_identity::StoredIdentity::exists(&identity_path),
         "the join must store a complete identity where --identity points"
     );
+    assert_eq!(
+        horde_identity::store::load_endpoint(&identity_path),
+        Some(harness.main_endpoint()),
+        "the join must store the control-plane endpoint beside the credential"
+    );
 
-    // The stored identity is real: `hello` over mTLS through the dispatch.
+    // The stored identity is real, and the stored endpoint is the server:
+    // `hello` over mTLS through the dispatch with no --endpoint at all —
+    // ADR-0007's bare-invocation-just-works claim, held in process.
     within(
         "the enrolled handshake",
-        invoke(&[
-            "--endpoint",
-            &harness.main_endpoint(),
-            "--identity",
-            &identity_path.to_string_lossy(),
-            "hello",
-        ]),
+        invoke(&["--identity", &identity_path.to_string_lossy(), "hello"]),
     )
     .await??;
     Ok(())

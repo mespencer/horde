@@ -376,26 +376,36 @@ pub fn spawned(response: &horde_proto::v1::SpawnAgentResponse, format: Format) -
     }
 }
 
-/// Renders a minted enrollment code (DESIGN §3).
+/// Renders a minted enrollment code (DESIGN §3, packaged per ADR-0007).
 ///
-/// The code line is the artifact the human carries to the joining machine;
-/// everything else is context.
+/// The token line is the artifact the human carries to the joining machine;
+/// everything else is context. `token` is `None` only when the server named
+/// no enrollment port — an older server — where the bare code is all there
+/// honestly is to print.
 #[must_use]
-pub fn minted(response: &horde_proto::v1::MintEnrollmentCodeResponse, format: Format) -> String {
+pub fn minted(
+    response: &horde_proto::v1::MintEnrollmentCodeResponse,
+    token: Option<&horde_identity::JoinToken>,
+    format: Format,
+) -> String {
     let expires_at_unix_ms = response.expires_at.as_ref().map_or(0, |at| {
         at.seconds.saturating_mul(1_000) + i64::from(at.nanos) / 1_000_000
     });
     match format {
         Format::Json => json!({
+            "token": token.map(ToString::to_string),
             "code": response.code,
             "server_cert_fingerprint": response.server_cert_fingerprint,
             "expires_at_unix_ms": expires_at_unix_ms,
         })
         .to_string(),
-        Format::Human => format!(
-            "code {}\nexpires-at-unix-ms {expires_at_unix_ms}",
-            response.code
-        ),
+        Format::Human => match token {
+            Some(token) => format!("token {token}\nexpires-at-unix-ms {expires_at_unix_ms}"),
+            None => format!(
+                "code {}\nexpires-at-unix-ms {expires_at_unix_ms}",
+                response.code
+            ),
+        },
     }
 }
 
@@ -1917,16 +1927,34 @@ mod enrollment_render_tests {
     }
 
     #[test]
-    fn a_minted_code_prints_the_code_and_its_deadline_in_both_formats() {
-        let human = minted(&response("s.fp"), Format::Human);
-        assert_eq!(human, "code s.fp\nexpires-at-unix-ms 1755500");
+    fn a_minted_code_prints_the_token_and_its_deadline_in_both_formats() {
+        let token = horde_identity::JoinToken::new(
+            "localhost:7778",
+            horde_identity::JoinCode {
+                secret: "00ff".to_owned(),
+                server_fingerprint: "a".repeat(64),
+            },
+        );
+        let human = minted(&response("s.fp"), Some(&token), Format::Human);
+        assert_eq!(human, format!("token {token}\nexpires-at-unix-ms 1755500"));
 
         let json: serde_json::Value =
-            serde_json::from_str(&minted(&response("s.fp"), Format::Json))
+            serde_json::from_str(&minted(&response("s.fp"), Some(&token), Format::Json))
                 .expect("json mode emits json");
+        assert_eq!(json["token"], token.to_string());
         assert_eq!(json["code"], "s.fp");
         assert_eq!(json["expires_at_unix_ms"], 1_755_500);
         assert_eq!(json["server_cert_fingerprint"], "ab".repeat(32));
+
+        // A portless mint (an older server): the bare code is all there
+        // honestly is — a `token` line here would name a listener nobody
+        // declared.
+        let bare = minted(&response("s.fp"), None, Format::Human);
+        assert_eq!(bare, "code s.fp\nexpires-at-unix-ms 1755500");
+        let bare: serde_json::Value =
+            serde_json::from_str(&minted(&response("s.fp"), None, Format::Json))
+                .expect("json mode emits json");
+        assert!(bare["token"].is_null());
     }
 
     #[test]

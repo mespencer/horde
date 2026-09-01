@@ -236,6 +236,15 @@ impl HordeWorld {
         self.capture(&full, &[]).await
     }
 
+    /// [`Self::run_horde_as`] without an endpoint flag — for the verbs whose
+    /// input already carries the server (a join token), and for proving the
+    /// identity dir's stored endpoint answers on its own (ADR-0007).
+    pub(crate) async fn capture_as(&mut self, identity_dir: &str, args: &[&str]) -> StepResult {
+        let mut full: Vec<&str> = vec!["--identity", identity_dir];
+        full.extend_from_slice(args);
+        self.capture(&full, &[]).await
+    }
+
     /// [`Self::run_horde`], speaking as an enrolled identity directory.
     pub(crate) async fn run_horde_as(
         &mut self,

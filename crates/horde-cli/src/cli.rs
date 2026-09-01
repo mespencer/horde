@@ -12,7 +12,9 @@ use horde_proto::v1::{DeliveryMode, PermissionOutcome};
 use crate::client::{PermissionAnswer, SyncOptions};
 use crate::{Client, ClientError, Format, render};
 
-/// Where a server is expected when none is named.
+/// The last-resort plaintext endpoint, used only when no identity exists
+/// anywhere (ADR-0007): a machine that has joined a server never needs it,
+/// and against a secured server it could never connect.
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7777";
 
 #[derive(Parser, Debug)]
@@ -23,9 +25,11 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7777";
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Server address.
-    #[arg(long, global = true, default_value = DEFAULT_ENDPOINT, env = "HORDE_ENDPOINT")]
-    pub endpoint: String,
+    /// Server address. An override, not a requirement (ADR-0007): absent,
+    /// `HORDE_ENDPOINT` is read, then the endpoint the identity dir stored
+    /// at join — so after one join a bare `horde hello` just works.
+    #[arg(long, global = true, env = "HORDE_ENDPOINT")]
+    pub endpoint: Option<String>,
 
     /// Directory holding this machine's enrolled identity (DESIGN §3).
     /// When set, every connection is mTLS; `enroll join` writes here.
@@ -302,14 +306,15 @@ pub enum WorkerCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum EnrollCommand {
-    /// Redeem a one-time code against a server's enrollment listener and
-    /// store the identity in the `--identity` directory. The code embeds the
-    /// server fingerprint this machine pins — nothing else is trusted yet.
+    /// Redeem a one-time join token and store the identity in the
+    /// `--identity` directory (default `~/.horde/id`). The token carries the
+    /// enrollment listener and the server fingerprint this machine pins —
+    /// nothing else is trusted yet — and the join stores the server's
+    /// endpoint beside the credential, so later invocations need no flag.
     Join {
-        /// The enrollment listener, e.g. `https://host:7778`.
-        enrollment_endpoint: String,
-        /// The code exactly as the server printed it: `secret.fingerprint`.
-        code: String,
+        /// The token exactly as the server printed it:
+        /// `horde://join/<host:port>/<secret>.<fingerprint>`.
+        token: String,
     },
     /// Mint a one-time enrollment code for another client machine.
     Client {
@@ -683,16 +688,17 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     // The one verb that must work *before* any identity exists: joining is
     // how this machine gets one, so it dials the enrollment listener rather
     // than the control plane.
-    if let Some(Command::Enroll(EnrollCommand::Join {
-        enrollment_endpoint,
-        code,
-    })) = &cli.command
-    {
-        return run_join(cli, enrollment_endpoint, code, format).await;
+    if let Some(Command::Enroll(EnrollCommand::Join { token })) = &cli.command {
+        return run_join(cli, token, format).await;
     }
 
-    let mut client = connect(cli).await?;
-    dispatch(&mut client, cli, format).await
+    let resolved = resolve_connection(
+        cli.endpoint.as_deref(),
+        cli.identity.as_deref(),
+        std::env::var_os("HOME").map(Into::into),
+    )?;
+    let mut client = connect(&resolved).await?;
+    dispatch(&mut client, cli, &resolved, format).await
 }
 
 /// Dispatches to one handler per verb.
@@ -701,7 +707,12 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
 /// function's branching equal to the number of verbs. An earlier version
 /// inlined each verb's body and scored 164 on CRAP — readable enough in a diff,
 /// impossible to bring under the complexity bar however well it was covered.
-async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), ClientError> {
+async fn dispatch(
+    client: &mut Client,
+    cli: &Cli,
+    resolved: &ResolvedConnection,
+    format: Format,
+) -> Result<(), ClientError> {
     match &cli.command {
         None => crate::tui::launch(client.clone(), crate::tui::Launch::Overview).await,
         Some(Command::Attach(args)) => {
@@ -728,13 +739,13 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
             run_forward(
                 client,
                 command,
-                cli.identity.as_deref(),
+                Some(resolved.identity_dir.as_path()),
                 format,
                 ctrl_c_ends(),
             )
             .await
         }
-        Some(command) => dispatch_admin(client, command, format).await,
+        Some(command) => dispatch_admin(client, command, resolved, format).await,
     }
 }
 
@@ -745,6 +756,7 @@ async fn dispatch(client: &mut Client, cli: &Cli, format: Format) -> Result<(), 
 async fn dispatch_admin(
     client: &mut Client,
     command: &Command,
+    resolved: &ResolvedConnection,
     format: Format,
 ) -> Result<(), ClientError> {
     match command {
@@ -753,8 +765,8 @@ async fn dispatch_admin(
         Command::Usage(args) => run_usage(client, args, format).await,
         Command::Workspace(command) => run_workspace(client, command, format).await,
         Command::Prewarm(args) => run_prewarm(client, args, format).await,
-        Command::Worker(command) => run_worker(client, command, format).await,
-        Command::Enroll(command) => run_enroll(client, command, format).await,
+        Command::Worker(command) => run_worker(client, command, &resolved.endpoint, format).await,
+        Command::Enroll(command) => run_enroll(client, command, &resolved.endpoint, format).await,
         // Unreachable while `dispatch` and this match agree; refusing loudly
         // (rather than a silent no-op) is what keeps a drift between them
         // diagnosable.
@@ -764,33 +776,161 @@ async fn dispatch_admin(
     }
 }
 
-/// Connects as the configured identity, or plaintext when none is set.
+/// One invocation's connection facts, decided before any dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConnection {
+    /// The endpoint this invocation dials.
+    pub endpoint: String,
+    /// The identity directory in effect: the flag's, or the default.
+    pub identity_dir: std::path::PathBuf,
+    /// Whether the directory was named explicitly (`--identity`).
+    pub explicit_identity: bool,
+    /// Whether the directory holds a complete identity.
+    pub enrolled: bool,
+}
+
+/// Resolves where to dial and as whom (ADR-0007).
 ///
-/// No silent fallback in either direction: `--identity` that does not load
-/// is an error naming the directory, never a plaintext connection wearing an
-/// enrolled flag.
-async fn connect(cli: &Cli) -> Result<Client, ClientError> {
-    match &cli.identity {
-        Some(directory) => {
-            let identity = horde_identity::StoredIdentity::load(directory).map_err(|source| {
-                ClientError::Identity {
-                    directory: directory.clone(),
-                    source,
-                }
-            })?;
-            Client::connect_with_identity(&cli.endpoint, &identity).await
-        }
-        None => Client::connect(&cli.endpoint).await,
+/// Endpoint precedence: explicit flag, then environment (clap merges those
+/// two before this runs), then the endpoint the identity dir stored at
+/// join. The plaintext localhost default survives only as the last resort
+/// for a machine with no identity at all — an enrolled machine with no
+/// endpoint from any source is a refusal that says where endpoints come
+/// from, because the old always-there default could never connect to the
+/// server it implied.
+///
+/// # Errors
+///
+/// The enrolled-but-endpointless refusal.
+pub fn resolve_connection(
+    endpoint: Option<&str>,
+    identity: Option<&std::path::Path>,
+    home: Option<std::path::PathBuf>,
+) -> Result<ResolvedConnection, ClientError> {
+    let identity_dir = identity.map_or_else(|| default_identity_dir(home), |dir| dir.to_path_buf());
+    let enrolled = horde_identity::StoredIdentity::exists(&identity_dir);
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint.to_owned(),
+        None => match horde_identity::store::load_endpoint(&identity_dir) {
+            Some(stored) => stored,
+            None if enrolled => {
+                return Err(ClientError::NoEndpoint {
+                    directory: identity_dir,
+                });
+            }
+            None => DEFAULT_ENDPOINT.to_owned(),
+        },
+    };
+    Ok(ResolvedConnection {
+        endpoint,
+        identity_dir,
+        explicit_identity: identity.is_some(),
+        enrolled,
+    })
+}
+
+/// How one resolved invocation authenticates — a decision, as data, so the
+/// truth table is testable without sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Load the identity dir and speak mTLS.
+    Mtls,
+    /// Dial plaintext — an `http://` endpoint asked for exactly that.
+    Plaintext,
+    /// An `https://` endpoint with no identity anywhere: refused with the
+    /// fix, because dialing would fail with a TLS mystery instead.
+    RefusedUnenrolled,
+}
+
+/// The transport a resolution implies.
+///
+/// An explicit `--identity` always speaks mTLS (refusing to load is louder
+/// and better than a plaintext connection wearing an enrolled flag); the
+/// *defaulted* dir is used only against an `https://` endpoint, so an
+/// explicit plaintext endpoint stays plaintext whatever `~/.horde/id`
+/// happens to hold.
+#[must_use]
+pub fn transport_for(resolved: &ResolvedConnection) -> Transport {
+    if resolved.explicit_identity {
+        return Transport::Mtls;
+    }
+    if !resolved.endpoint.starts_with("https://") {
+        return Transport::Plaintext;
+    }
+    if resolved.enrolled {
+        Transport::Mtls
+    } else {
+        Transport::RefusedUnenrolled
     }
 }
 
-/// Where this machine's identity lives when `--identity` does not say.
+/// Connects as the resolution says.
+async fn connect(resolved: &ResolvedConnection) -> Result<Client, ClientError> {
+    match transport_for(resolved) {
+        Transport::Mtls => {
+            let identity =
+                horde_identity::StoredIdentity::load(&resolved.identity_dir).map_err(|source| {
+                    ClientError::Identity {
+                        directory: resolved.identity_dir.clone(),
+                        source,
+                    }
+                })?;
+            Client::connect_with_identity(&resolved.endpoint, &identity).await
+        }
+        Transport::Plaintext => Client::connect(&resolved.endpoint).await,
+        Transport::RefusedUnenrolled => Err(ClientError::Unenrolled {
+            endpoint: resolved.endpoint.clone(),
+            directory: resolved.identity_dir.clone(),
+        }),
+    }
+}
+
+/// Where this machine's identity lives when `--identity` does not say:
+/// `~/.horde/id` (ADR-0007).
 #[must_use]
 pub fn default_identity_dir(home: Option<std::path::PathBuf>) -> std::path::PathBuf {
     home.map_or_else(
         || std::path::PathBuf::from(".horde-identity"),
-        |home| home.join(".horde").join("identity"),
+        |home| home.join(".horde").join("id"),
     )
+}
+
+/// The host component of a dialed endpoint URI: `https://h:1` → `h`.
+///
+/// The one seam where "the server I dialed" becomes "the host a token
+/// names": minting composes the token from this host and the port the
+/// server's answer carried, because the server cannot know the name its
+/// clients dial it by.
+#[must_use]
+pub fn host_of_endpoint(endpoint: &str) -> Option<&str> {
+    let rest = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// The one-token form of a mint answer (ADR-0007): the host this invocation
+/// dialed around the code and port the server named. `None` when the answer
+/// named no enrollment port — composing a token would mean inventing a
+/// listener.
+#[must_use]
+pub fn token_from_mint(
+    dialed_endpoint: &str,
+    response: &horde_proto::v1::MintEnrollmentCodeResponse,
+) -> Option<horde_identity::JoinToken> {
+    let port = u16::try_from(response.enrollment_port)
+        .ok()
+        .filter(|port| *port != 0)?;
+    let host = host_of_endpoint(dialed_endpoint)?;
+    let code = horde_identity::JoinCode::parse(&response.code)?;
+    Some(horde_identity::JoinToken::new(
+        format!("{host}:{port}"),
+        code,
+    ))
 }
 
 /// The principal held by `--identity`'s directory, as its common name
@@ -807,23 +947,15 @@ pub fn enrolled_principal(identity: Option<&std::path::Path>) -> Option<String> 
         .map(|principal| principal.common_name())
 }
 
-async fn run_join(
-    cli: &Cli,
-    enrollment_endpoint: &str,
-    code: &str,
-    format: Format,
-) -> Result<(), ClientError> {
-    let code = horde_identity::JoinCode::parse(code).ok_or_else(|| {
-        ClientError::Enrollment(
-            "the code is malformed; paste it exactly as the server printed it \
-             (secret.fingerprint)"
-                .to_owned(),
-        )
-    })?;
+async fn run_join(cli: &Cli, token: &str, format: Format) -> Result<(), ClientError> {
+    // The token's own parse error names the expected horde://join/… shape:
+    // the refusal diagnoses the mistake, not the paste (ADR-0007).
+    let token = horde_identity::JoinToken::parse(token)
+        .map_err(|error| ClientError::Enrollment(error.to_string()))?;
 
     let enrolled = horde_identity::join(
-        enrollment_endpoint,
-        &code,
+        &token.enrollment_endpoint(),
+        &token.code,
         horde_proto::v1::Hello {
             semver: env!("CARGO_PKG_VERSION").to_owned(),
             capability_flags: Vec::new(),
@@ -842,6 +974,16 @@ async fn run_join(
         .identity
         .save(&directory)
         .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+
+    // The join teaches the machine its server (ADR-0007): the token's host,
+    // the answer's control-plane port, stored beside the credential so a
+    // bare `horde hello` works from here on. An answer without the port
+    // (an older server) stores nothing rather than guessing.
+    if let Some(port) = enrolled.control_plane_port {
+        let endpoint = format!("https://{}:{port}", token.host());
+        horde_identity::store::save_endpoint(&directory, &endpoint)
+            .map_err(|error| ClientError::Enrollment(error.to_string()))?;
+    }
 
     println!(
         "{}",
@@ -1079,6 +1221,7 @@ async fn run_prewarm(
 async fn run_worker(
     client: &mut Client,
     command: &WorkerCommand,
+    endpoint: &str,
     format: Format,
 ) -> Result<(), ClientError> {
     match command {
@@ -1090,7 +1233,8 @@ async fn run_worker(
             let minted = client
                 .mint_enrollment_code(horde_proto::v1::Role::Worker, name, *ttl_minutes)
                 .await?;
-            println!("{}", render::minted(&minted, format));
+            let token = token_from_mint(endpoint, &minted);
+            println!("{}", render::minted(&minted, token.as_ref(), format));
         }
         WorkerCommand::Revoke { name, reason } => {
             let serials = client
@@ -1113,6 +1257,7 @@ async fn run_worker(
 async fn run_enroll(
     client: &mut Client,
     command: &EnrollCommand,
+    endpoint: &str,
     format: Format,
 ) -> Result<(), ClientError> {
     match command {
@@ -1127,7 +1272,8 @@ async fn run_enroll(
             let minted = client
                 .mint_enrollment_code(horde_proto::v1::Role::Client, name, *ttl_minutes)
                 .await?;
-            println!("{}", render::minted(&minted, format));
+            let token = token_from_mint(endpoint, &minted);
+            println!("{}", render::minted(&minted, token.as_ref(), format));
             Ok(())
         }
         EnrollCommand::RevokeClient { name, reason } => {
@@ -2089,11 +2235,17 @@ mod tests {
         }
     }
 
+    /// The endpoint is an override, not a requirement (ADR-0007): a bare
+    /// invocation names none, and resolution decides from there.
     #[test]
-    fn the_endpoint_has_a_localhost_default() {
+    fn the_endpoint_flag_is_optional_and_explicit_when_given() {
         let cli = Cli::try_parse_from(["horde", "hello"]).expect("valid arguments");
-        assert!(cli.endpoint.starts_with("http://127.0.0.1"));
+        assert_eq!(cli.endpoint, None, "no flag means resolution decides");
         assert!(!cli.json, "human output is the default");
+
+        let cli = Cli::try_parse_from(["horde", "--endpoint", "https://h:1", "hello"])
+            .expect("valid arguments");
+        assert_eq!(cli.endpoint.as_deref(), Some("https://h:1"));
     }
 
     /// clap's own invariants: a typo must fail rather than silently selecting
@@ -2140,6 +2292,28 @@ mod enrollment_tests {
 
     use super::{Cli, Command, EnrollCommand, WorkerCommand, default_identity_dir};
 
+    /// Writes a complete, CA-signed `client:laptop` identity into `dir` —
+    /// the production `StoredIdentity` layout, for the tests that need a
+    /// real enrolled directory without a server.
+    fn seeded_identity(dir: &std::path::Path) {
+        let ca = horde_identity::CertificateAuthority::generate(1_754_956_800_000)
+            .expect("a CA generates");
+        let (key_pem, csr_pem) = horde_identity::enroll::generate_csr().expect("a CSR generates");
+        let principal =
+            horde_identity::Principal::new(horde_identity::PrincipalRole::Client, "laptop")
+                .expect("a valid name");
+        let issued = ca
+            .sign_join(&csr_pem, &principal, 1_754_956_800_000)
+            .expect("the CA signs");
+        horde_identity::StoredIdentity {
+            certificate_pem: issued.certificate_pem,
+            key_pem,
+            ca_pem: ca.certificate_pem().to_owned(),
+        }
+        .save(dir)
+        .expect("the identity saves");
+    }
+
     #[test]
     fn the_worker_verbs_parse_as_design_names_them() {
         let cli = Cli::try_parse_from(["horde", "worker", "enroll", "gpu-box"])
@@ -2164,16 +2338,17 @@ mod enrollment_tests {
         }
     }
 
+    /// Join takes exactly the token — one argument, nothing left to swap
+    /// (ADR-0007). Two positionals is the old ceremony and must not parse.
     #[test]
-    fn join_takes_the_enrollment_endpoint_and_the_code() {
+    fn join_takes_the_token_and_nothing_else() {
         let cli = Cli::try_parse_from([
             "horde",
             "--identity",
             "/tmp/id",
             "enroll",
             "join",
-            "https://host:7778",
-            "s.fp",
+            "horde://join/host:7778/s.fp",
         ])
         .expect("a join line parses");
         assert_eq!(
@@ -2181,22 +2356,24 @@ mod enrollment_tests {
             Some(std::path::Path::new("/tmp/id"))
         );
         match cli.command {
-            Some(Command::Enroll(EnrollCommand::Join {
-                enrollment_endpoint,
-                code,
-            })) => {
-                assert_eq!(enrollment_endpoint, "https://host:7778");
-                assert_eq!(code, "s.fp");
+            Some(Command::Enroll(EnrollCommand::Join { token })) => {
+                assert_eq!(token, "horde://join/host:7778/s.fp");
             }
             other => panic!("expected enroll join, got {other:?}"),
         }
+
+        assert!(
+            Cli::try_parse_from(["horde", "enroll", "join", "https://host:7778", "s.fp"]).is_err(),
+            "the old endpoint-and-code pair must be a parse error, not a guess"
+        );
     }
 
     #[test]
     fn the_default_identity_dir_is_under_home_when_there_is_one() {
         assert_eq!(
             default_identity_dir(Some(std::path::PathBuf::from("/Users/me"))),
-            std::path::PathBuf::from("/Users/me/.horde/identity")
+            std::path::PathBuf::from("/Users/me/.horde/id"),
+            "ADR-0007 names ~/.horde/id"
         );
         assert_eq!(
             default_identity_dir(None),
@@ -2205,28 +2382,149 @@ mod enrollment_tests {
         );
     }
 
+    /// ADR-0007's endpoint precedence, whole: explicit beats stored beats
+    /// the last-resort default, the stored endpoint only exists after a
+    /// join, and an enrolled-but-endpointless invocation is a refusal that
+    /// says where endpoints come from.
+    #[test]
+    fn endpoint_resolution_prefers_explicit_then_stored_then_refuses_or_defaults() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let home_path = || Some(home.path().to_path_buf());
+        let id_dir = super::default_identity_dir(home_path());
+
+        // No identity anywhere: the plaintext default is the last resort.
+        let fresh = super::resolve_connection(None, None, home_path()).expect("resolves");
+        assert_eq!(fresh.endpoint, "http://127.0.0.1:7777");
+        assert_eq!(fresh.identity_dir, id_dir);
+        assert!(!fresh.enrolled && !fresh.explicit_identity);
+
+        // An explicit endpoint outranks everything, stored included.
+        horde_identity::store::save_endpoint(&id_dir, "https://stored:7777").expect("saves");
+        let explicit =
+            super::resolve_connection(Some("https://flag:1"), None, home_path()).expect("resolves");
+        assert_eq!(explicit.endpoint, "https://flag:1");
+
+        // Nothing explicit: the identity dir's stored endpoint answers.
+        let stored = super::resolve_connection(None, None, home_path()).expect("resolves");
+        assert_eq!(stored.endpoint, "https://stored:7777");
+
+        // Enrolled with no endpoint from any source: a refusal naming the
+        // sources, never the unusable plaintext default.
+        let enrolled_dir = home.path().join("enrolled");
+        seeded_identity(&enrolled_dir);
+        let refused = super::resolve_connection(None, Some(&enrolled_dir), home_path())
+            .expect_err("an enrolled, endpointless invocation must refuse");
+        let refusal = refused.to_string();
+        assert!(
+            refusal.contains("--endpoint") && refusal.contains("HORDE_ENDPOINT"),
+            "the refusal says where endpoints come from: {refusal}"
+        );
+
+        // The same dir with a stored endpoint resolves, marked explicit.
+        horde_identity::store::save_endpoint(&enrolled_dir, "https://joined:7777").expect("saves");
+        let joined =
+            super::resolve_connection(None, Some(&enrolled_dir), home_path()).expect("resolves");
+        assert_eq!(joined.endpoint, "https://joined:7777");
+        assert!(joined.enrolled && joined.explicit_identity);
+    }
+
+    /// The transport table (ADR-0007): explicit identity always speaks mTLS,
+    /// an `http://` endpoint is plaintext whatever the default dir holds,
+    /// and `https://` needs an identity — enrolled speaks, unenrolled is
+    /// refused with the fix rather than dialed into a TLS mystery.
+    #[test]
+    fn the_transport_table_separates_mtls_plaintext_and_the_refusal() {
+        let resolved = |endpoint: &str, explicit: bool, enrolled: bool| super::ResolvedConnection {
+            endpoint: endpoint.to_owned(),
+            identity_dir: std::path::PathBuf::from("/tmp/id"),
+            explicit_identity: explicit,
+            enrolled,
+        };
+        use super::{Transport, transport_for};
+        assert_eq!(
+            transport_for(&resolved("http://h:1", true, false)),
+            Transport::Mtls,
+            "an explicit --identity is never quietly ignored"
+        );
+        assert_eq!(
+            transport_for(&resolved("http://h:1", false, true)),
+            Transport::Plaintext,
+            "an explicit plaintext endpoint stays plaintext whatever ~/.horde/id holds"
+        );
+        assert_eq!(
+            transport_for(&resolved("https://h:1", false, true)),
+            Transport::Mtls,
+            "the defaulted dir speaks for an mTLS endpoint"
+        );
+        assert_eq!(
+            transport_for(&resolved("https://h:1", false, false)),
+            Transport::RefusedUnenrolled
+        );
+    }
+
+    /// The host seam minting composes tokens from: scheme off, port off,
+    /// path off, and an empty host is nothing rather than an empty token.
+    #[test]
+    fn the_endpoint_host_extracts_or_declines() {
+        use super::host_of_endpoint;
+        assert_eq!(
+            host_of_endpoint("https://horde.example:7777"),
+            Some("horde.example")
+        );
+        assert_eq!(
+            host_of_endpoint("http://127.0.0.1:7777/x"),
+            Some("127.0.0.1")
+        );
+        assert_eq!(host_of_endpoint("localhost:7777"), Some("localhost"));
+        assert_eq!(host_of_endpoint("localhost"), Some("localhost"));
+        assert_eq!(host_of_endpoint("https://"), None);
+        assert_eq!(host_of_endpoint(""), None);
+    }
+
+    /// A mint answer becomes one self-contained token — dialed host, served
+    /// port, unchanged code — and every honest reason not to compose one
+    /// (no port, an unparseable code) is `None`, not a guessed token.
+    #[test]
+    fn a_mint_answer_composes_the_token_or_declines() {
+        let response = |code: &str, port: u32| horde_proto::v1::MintEnrollmentCodeResponse {
+            code: code.to_owned(),
+            server_cert_fingerprint: "a".repeat(64),
+            expires_at: None,
+            enrollment_port: port,
+        };
+        let code = format!("00ff.{}", "a".repeat(64));
+
+        let token = super::token_from_mint("https://horde.example:7777", &response(&code, 7778))
+            .expect("a full answer composes");
+        assert_eq!(
+            token.to_string(),
+            format!("horde://join/horde.example:7778/{code}")
+        );
+
+        assert_eq!(
+            super::token_from_mint("https://horde.example:7777", &response(&code, 0)),
+            None,
+            "no port means no listener to name"
+        );
+        assert_eq!(
+            super::token_from_mint("https://horde.example:7777", &response("garbled", 7778)),
+            None,
+            "a code that does not parse must not ride a token"
+        );
+        assert_eq!(
+            super::token_from_mint("https://", &response(&code, 7778)),
+            None,
+            "no host means no token"
+        );
+    }
+
     /// The identity read back for telemetry is the one enrollment wrote: a
     /// directory holding a CA-signed certificate yields its common name, and
     /// every failure shape yields `None` rather than a refusal.
     #[test]
     fn the_enrolled_principal_is_read_best_effort_from_the_identity_dir() {
-        let ca = horde_identity::CertificateAuthority::generate(1_754_956_800_000)
-            .expect("a CA generates");
-        let (key_pem, csr_pem) = horde_identity::enroll::generate_csr().expect("a CSR generates");
-        let principal =
-            horde_identity::Principal::new(horde_identity::PrincipalRole::Client, "laptop")
-                .expect("a valid name");
-        let issued = ca
-            .sign_join(&csr_pem, &principal, 1_754_956_800_000)
-            .expect("the CA signs");
         let directory = tempfile::tempdir().expect("a temp dir");
-        horde_identity::StoredIdentity {
-            certificate_pem: issued.certificate_pem,
-            key_pem,
-            ca_pem: ca.certificate_pem().to_owned(),
-        }
-        .save(directory.path())
-        .expect("the identity saves");
+        seeded_identity(directory.path());
 
         assert_eq!(
             super::enrolled_principal(Some(directory.path())).as_deref(),

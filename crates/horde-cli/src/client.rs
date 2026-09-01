@@ -78,10 +78,34 @@ pub enum ClientError {
         source: horde_identity::IdentityError,
     },
 
-    /// Enrollment failed: a malformed code, a refused join, or the identity
-    /// failing to persist.
+    /// Enrollment failed: a malformed token, a refused join, or the
+    /// identity failing to persist.
     #[error("enrollment failed: {0}")]
     Enrollment(String),
+
+    /// An enrolled identity with no endpoint from any source (ADR-0007).
+    ///
+    /// A refusal that says where endpoints come from, replacing the old
+    /// always-there plaintext default that could never connect to the
+    /// secured server it implied.
+    #[error(
+        "the identity in {directory} stores no endpoint; pass --endpoint, set HORDE_ENDPOINT, \
+         or re-join (`horde enroll join <token>` stores the server beside the credential)"
+    )]
+    NoEndpoint { directory: std::path::PathBuf },
+
+    /// An `https://` endpoint with no identity anywhere (ADR-0007).
+    ///
+    /// Refused before the dial: attempting it would fail with a TLS error
+    /// naming neither the missing identity nor the fix.
+    #[error(
+        "{endpoint} is an mTLS endpoint but {directory} holds no identity; join first with \
+         `horde enroll join <token>`"
+    )]
+    Unenrolled {
+        endpoint: String,
+        directory: std::path::PathBuf,
+    },
 
     /// A local file the verb needed could not be read or written.
     ///

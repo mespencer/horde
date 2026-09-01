@@ -44,36 +44,34 @@ async fn the_operator_runs(world: &mut HordeWorld, command: String) -> StepResul
     world.run_horde_as(&endpoint, &identity_dir, &args).await
 }
 
-/// "code <secret.fingerprint>" — the artifact a human carries to the new
-/// machine. Noted for the join steps.
-#[then("stdout prints a one-time code")]
-fn stdout_prints_a_code(world: &mut HordeWorld) -> StepResult {
+/// "token horde://join/<host:port>/<secret>.<fingerprint>" — the one
+/// artifact a human carries to the new machine (ADR-0007). Noted for the
+/// join steps.
+#[then("stdout prints a one-time join token")]
+fn stdout_prints_a_token(world: &mut HordeWorld) -> StepResult {
     let stdout = world.last_run()?.stdout.clone();
-    let code = stdout
+    let token = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("code "))
+        .find_map(|line| line.strip_prefix("token "))
         .map(str::trim)
-        .filter(|code| !code.is_empty())
-        .ok_or_else(|| format!("no code line on stdout: {stdout:?}"))?;
-    world.notes.insert("code".to_owned(), code.to_owned());
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| format!("no token line on stdout: {stdout:?}"))?;
+    horde_identity::JoinToken::parse(token)
+        .map_err(|error| format!("the printed token must parse: {error}"))?;
+    world.notes.insert("token".to_owned(), token.to_owned());
     Ok(())
 }
 
 /// The client join, exactly as a new machine does it: the real binary, a
-/// fresh identity directory, the enrollment endpoint, and the pasted code.
-#[when("a new machine joins with the printed code")]
+/// fresh identity directory, and the pasted token — nothing else.
+#[when("a new machine joins with the printed token")]
 async fn a_new_machine_joins(world: &mut HordeWorld) -> StepResult {
-    let code = world.note("code")?.to_owned();
+    let token = world.note("token")?.to_owned();
     let secure = world.secure()?;
-    let enrollment = secure.harness.enrollment_endpoint();
     let dir = secure.base().join("new-machine");
     let dir_flag = dir.display().to_string();
     world
-        .run_horde_as(
-            &enrollment,
-            &dir_flag,
-            &["enroll", "join", &enrollment, &code],
-        )
+        .capture_as(&dir_flag, &["enroll", "join", &token])
         .await?;
     let run = world.last_run()?;
     if !run.success {
@@ -86,8 +84,9 @@ async fn a_new_machine_joins(world: &mut HordeWorld) -> StepResult {
 #[then("the new machine's identity opens the control plane")]
 async fn the_new_identity_opens_the_plane(world: &mut HordeWorld) -> StepResult {
     let dir = world.note("joined-dir")?.to_owned();
-    let endpoint = world.secure()?.harness.main_endpoint();
-    world.run_horde_as(&endpoint, &dir, &["hello"]).await?;
+    // No --endpoint on purpose: the join stored the server beside the
+    // credential, and a bare invocation must find it there (ADR-0007).
+    world.capture_as(&dir, &["hello"]).await?;
     let run = world.last_run()?;
     if !(run.success && run.stdout.contains("horde-server")) {
         return Err(format!(
@@ -101,19 +100,19 @@ async fn the_new_identity_opens_the_plane(world: &mut HordeWorld) -> StepResult 
 
 /// The worker join: the same production `join` the `horde-worker` binary
 /// calls, introducing itself in the Worker role.
-#[when(expr = "a worker machine joins as {string} with the printed code")]
+#[when(expr = "a worker machine joins as {string} with the printed token")]
 async fn a_worker_machine_joins(world: &mut HordeWorld, name: String) -> StepResult {
-    let code_text = world.note("code")?.to_owned();
+    let token_text = world.note("token")?.to_owned();
     let secure = world
         .secure
         .as_mut()
         .ok_or("no secured server is running")?;
-    let code =
-        horde_identity::JoinCode::parse(&code_text).ok_or("the printed code is not a join code")?;
+    let token = horde_identity::JoinToken::parse(&token_text)
+        .map_err(|error| format!("the printed token is not a join token: {error}"))?;
     let enrolled = within("the worker join", async {
         Ok(horde_identity::join(
-            &secure.harness.enrollment_endpoint(),
-            &code,
+            &token.enrollment_endpoint(),
+            &token.code,
             horde_server_testkit::secure::hello(PrincipalRole::Worker, &name),
         )
         .await?)
