@@ -143,13 +143,13 @@ async fn the_daemon_joins_registers_and_a_sigterm_ends_it_cleanly() {
         .expect("the code mints");
 
     let state = tempfile::tempdir().expect("a temp dir");
+    // One token, one flag (ADR-0007): the listener rides inside it.
+    let token = secured.join_token(&minted).to_string();
     let mut daemon = harness::daemon(&[
         "--server",
         &secured.main_endpoint(),
-        "--enrollment",
-        &secured.enrollment_endpoint(),
         "--join",
-        &minted.join_code(),
+        &token,
         "--state-dir",
         &state.path().to_string_lossy(),
         "--adapter",

@@ -91,10 +91,10 @@ pub struct WorkerConfig {
     pub server: String,
     /// Holds `identity/` and the journal. Losing it loses both.
     pub state_dir: PathBuf,
-    /// A one-time enrollment code (`secret.fingerprint`) to redeem first.
+    /// A one-time join token (`horde://join/<host:port>/<secret>.<fingerprint>`,
+    /// ADR-0007) to redeem first: the enrollment listener, the secret, and
+    /// the pinned server fingerprint in one string.
     pub join: Option<String>,
-    /// The TLS-only enrollment listener `--join` redeems against.
-    pub enrollment: Option<String>,
     /// The display name, and the plaintext worker id under `--insecure`.
     /// An enrolled identity's principal always outranks it.
     pub name: Option<String>,
@@ -138,7 +138,6 @@ struct ParsedFlags {
     server: Option<String>,
     state_dir: Option<PathBuf>,
     join: Option<String>,
-    enrollment: Option<String>,
     name: Option<String>,
     adapters: Vec<AdapterChoice>,
     fake_login: Option<PathBuf>,
@@ -164,7 +163,6 @@ fn takes_value(flag: &str) -> bool {
         "--server"
             | "--state-dir"
             | "--join"
-            | "--enrollment"
             | "--name"
             | "--adapter"
             | "--fake-script"
@@ -222,7 +220,6 @@ impl ParsedFlags {
             "--server" => self.server = Some(value),
             "--state-dir" => self.state_dir = Some(PathBuf::from(value)),
             "--join" => self.join = Some(value),
-            "--enrollment" => self.enrollment = Some(value),
             "--name" => self.name = Some(value),
             _ => return self.apply_runtime_value(flag, value),
         }
@@ -286,7 +283,6 @@ impl ParsedFlags {
                 .state_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
             join: self.join,
-            enrollment: self.enrollment,
             name: self.name,
             adapters: self.adapters,
             fake_script: self.fake_script,
@@ -308,16 +304,12 @@ impl ParsedFlags {
 impl WorkerConfig {
     /// The rules that make a parse a usable configuration.
     ///
-    /// Each is a refusal rather than a repair: joining without an enrollment
-    /// listener has nowhere to go, an insecure join is a contradiction (the
-    /// point of joining is the certificate), a fake script without the fake
-    /// adapter configures nothing, and a scheme that disagrees with the
-    /// security mode would otherwise fail later with a TLS error that names
-    /// neither flag.
+    /// Each is a refusal rather than a repair: an insecure join is a
+    /// contradiction (the point of joining is the certificate), a fake
+    /// script without the fake adapter configures nothing, and a scheme that
+    /// disagrees with the security mode would otherwise fail later with a
+    /// TLS error that names neither flag.
     fn check_shape(&self) -> Result<(), String> {
-        if self.join.is_some() != self.enrollment.is_some() {
-            return Err("--join and --enrollment go together".to_owned());
-        }
         if self.join.is_some() && self.insecure {
             return Err("--join enrolls an identity; it cannot combine with --insecure".to_owned());
         }
@@ -526,12 +518,8 @@ pub enum IdentityPlan {
     Insecure,
     /// Load what an earlier join persisted.
     Load(PathBuf),
-    /// Redeem a one-time code and persist the result.
-    Join {
-        enrollment: String,
-        code: String,
-        directory: PathBuf,
-    },
+    /// Redeem a one-time join token and persist the result.
+    Join { token: String, directory: PathBuf },
 }
 
 /// Decides the identity plan from the configuration and one observed fact.
@@ -553,8 +541,8 @@ pub fn identity_plan(
         return Ok(IdentityPlan::Insecure);
     }
     let directory = config.identity_dir();
-    match (&config.join, &config.enrollment) {
-        (Some(code), Some(enrollment)) => {
+    match &config.join {
+        Some(token) => {
             if already_enrolled {
                 return Err(format!(
                     "{} already holds an identity; remove it to re-enroll, \
@@ -563,12 +551,11 @@ pub fn identity_plan(
                 ));
             }
             Ok(IdentityPlan::Join {
-                enrollment: enrollment.clone(),
-                code: code.clone(),
+                token: token.clone(),
                 directory,
             })
         }
-        _ => Ok(IdentityPlan::Load(directory)),
+        None => Ok(IdentityPlan::Load(directory)),
     }
 }
 
@@ -576,7 +563,7 @@ pub fn identity_plan(
 ///
 /// # Errors
 ///
-/// A malformed or refused code, an unreachable enrollment listener, a
+/// A malformed or refused token, an unreachable enrollment listener, a
 /// missing or unreadable identity directory — each named, with the fix.
 pub async fn resolve_identity(
     plan: IdentityPlan,
@@ -589,25 +576,25 @@ pub async fn resolve_identity(
             let identity = StoredIdentity::load(&directory).map_err(|error| {
                 format!(
                     "no usable identity in {} ({error}); enroll with \
-                     --join CODE --enrollment https://…",
+                     --join 'horde://join/<host:port>/<secret>.<fingerprint>' \
+                     (the token a mint prints)",
                     directory.display()
                 )
             })?;
             Ok(Some(identity))
         }
-        IdentityPlan::Join {
-            enrollment,
-            code,
-            directory,
-        } => {
-            let code = horde_identity::JoinCode::parse(&code).ok_or(
-                "the join code is malformed; paste it exactly as the server \
-                 printed it (secret.fingerprint)",
-            )?;
-            let enrolled =
-                horde_identity::join(&enrollment, &code, capabilities::hello(display_name))
-                    .await
-                    .map_err(|error| format!("enrollment failed: {error}"))?;
+        IdentityPlan::Join { token, directory } => {
+            // The parse error itself names the expected horde://join/…
+            // shape — the refusal diagnoses the mistake, not the paste.
+            let token =
+                horde_identity::JoinToken::parse(&token).map_err(|error| error.to_string())?;
+            let enrolled = horde_identity::join(
+                &token.enrollment_endpoint(),
+                &token.code,
+                capabilities::hello(display_name),
+            )
+            .await
+            .map_err(|error| format!("enrollment failed: {error}"))?;
             enrolled
                 .identity
                 .save(&directory)
@@ -1071,7 +1058,7 @@ mod tests {
             "no adapter is honest: nothing is advertised"
         );
         assert!(!config.insecure);
-        assert!(config.join.is_none() && config.enrollment.is_none());
+        assert!(config.join.is_none());
         assert!(config.workspace_root.is_none() && config.relay.is_none());
         assert!(config.tags.is_empty() && config.advertised_remotes.is_empty());
     }
@@ -1184,9 +1171,7 @@ mod tests {
             "--state-dir",
             "/tmp/w",
             "--join",
-            "00ff.abcd",
-            "--enrollment",
-            "https://horde.example:7778",
+            "horde://join/horde.example:7778/00ff.abcd",
             "--name",
             "w-1",
             "--adapter",
@@ -1209,10 +1194,10 @@ mod tests {
         .expect("a full line parses");
         assert_eq!(config.server, "https://horde.example:7777");
         assert_eq!(config.state_dir, std::path::PathBuf::from("/tmp/w"));
-        assert_eq!(config.join.as_deref(), Some("00ff.abcd"));
         assert_eq!(
-            config.enrollment.as_deref(),
-            Some("https://horde.example:7778")
+            config.join.as_deref(),
+            Some("horde://join/horde.example:7778/00ff.abcd"),
+            "the token rides the flag whole; its shape is judged at redeem"
         );
         assert_eq!(config.name.as_deref(), Some("w-1"));
         assert_eq!(
@@ -1257,14 +1242,10 @@ mod tests {
             (&["--server"][..], "--server"),
             (&["--adapter", "gpt"][..], "gpt"),
             (&["--adapter", "fake", "--adapter", "fake"][..], "twice"),
-            (&["--join", "c"][..], "--enrollment"),
-            (&["--enrollment", "https://x:1"][..], "--join"),
             (
                 &[
                     "--join",
-                    "c",
-                    "--enrollment",
-                    "https://x:1",
+                    "horde://join/x:1/c.d",
                     "--insecure",
                     "--server",
                     "http://x:1",
@@ -1321,16 +1302,13 @@ mod tests {
             "--state-dir",
             "/tmp/w",
             "--join",
-            "00ff.abcd",
-            "--enrollment",
-            "https://x:1",
+            "horde://join/x:1/00ff.abcd",
         ])
         .expect("a join shape");
         assert_eq!(
             identity_plan(&join, false).expect("a plan"),
             IdentityPlan::Join {
-                enrollment: "https://x:1".to_owned(),
-                code: "00ff.abcd".to_owned(),
+                token: "horde://join/x:1/00ff.abcd".to_owned(),
                 directory: std::path::PathBuf::from("/tmp/w/identity"),
             }
         );
@@ -1441,6 +1419,49 @@ mod tests {
                 "{json} must be refused naming {needle}: {refused}"
             );
         }
+    }
+
+    /// A garbled token is refused before any network exists, and the
+    /// refusal teaches the expected `horde://join/…` shape — ADR-0007's
+    /// errors-diagnose-the-mistake rule at the worker's redeem surface. The
+    /// old ceremony's inputs (a bare code, a bare listener URL) are exactly
+    /// the pastes that must be diagnosed.
+    #[tokio::test]
+    async fn a_malformed_join_token_refuses_naming_the_expected_shape() {
+        for garbled in ["00ff.abcd", "https://horde.example:7778", "nonsense"] {
+            let refused = super::resolve_identity(
+                IdentityPlan::Join {
+                    token: garbled.to_owned(),
+                    directory: std::path::PathBuf::from("/tmp/never-used"),
+                },
+                "w-1",
+                &mut |_| {},
+            )
+            .await
+            .expect_err("a garbled token must refuse");
+            assert!(
+                refused.contains("horde://join/<host:port>/<secret>.<fingerprint>"),
+                "{garbled:?}: the refusal must teach the form: {refused}"
+            );
+        }
+    }
+
+    /// The missing-identity refusal says how to enroll in token vocabulary:
+    /// the fix it names must be the flag that exists.
+    #[tokio::test]
+    async fn a_missing_identity_refusal_names_the_token_join() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let refused = super::resolve_identity(
+            IdentityPlan::Load(state.path().join("identity")),
+            "w-1",
+            &mut |_| {},
+        )
+        .await
+        .expect_err("an empty directory holds no identity");
+        assert!(
+            refused.contains("--join") && refused.contains("horde://join/"),
+            "the refusal names the one flag and its token: {refused}"
+        );
     }
 
     #[test]
