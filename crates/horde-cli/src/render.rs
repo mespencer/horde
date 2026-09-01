@@ -1912,6 +1912,7 @@ mod enrollment_render_tests {
                 seconds: 1_755,
                 nanos: 500_000_000,
             }),
+            enrollment_port: 7778,
         }
     }
 

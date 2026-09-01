@@ -143,6 +143,56 @@ async fn a_minted_code_joins_and_the_identity_opens_both_spines() -> Setup<()> {
     Ok(())
 }
 
+/// The two ports ADR-0007's token packaging rides, over the wire: the mint
+/// answer names the enrollment listener (so the minting client can print one
+/// self-contained token), the join answer names the control plane (so the
+/// joiner can store its endpoint) — both the real bound ports, not zeros.
+#[tokio::test]
+async fn the_answers_teach_the_listener_ports_the_token_packaging_needs() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let port_of = |endpoint: String| -> Setup<u32> {
+        Ok(endpoint
+            .rsplit(':')
+            .next()
+            .ok_or("an endpoint has a port")?
+            .parse()?)
+    };
+
+    let client_identity = within(
+        "the client join",
+        harness.enroll(PrincipalRole::Client, "laptop"),
+    )
+    .await??;
+    let mut client = harness.client(&client_identity).await?;
+    let minted = within(
+        "the mint",
+        client.mint_enrollment_code(Role::Worker, "gpu-box", None),
+    )
+    .await??;
+    assert_eq!(
+        minted.enrollment_port,
+        port_of(harness.enrollment_endpoint())?,
+        "the mint answer names the enrollment listener"
+    );
+
+    let code = JoinCode::parse(&minted.code).ok_or("the minted code parses")?;
+    let enrolled = within(
+        "the worker join",
+        horde_identity::join(
+            &harness.enrollment_endpoint(),
+            &code,
+            hello(PrincipalRole::Worker, "gpu-box"),
+        ),
+    )
+    .await??;
+    assert_eq!(
+        enrolled.control_plane_port.map(u32::from),
+        Some(port_of(harness.main_endpoint())?),
+        "the join answer names the control plane"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_peer_without_a_certificate_is_refused_by_the_main_listener() -> Setup<()> {
     let harness = serve_secured().await?;

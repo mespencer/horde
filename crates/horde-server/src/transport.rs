@@ -55,13 +55,13 @@ impl Drop for BoundListener {
 ///
 /// The bind failing, or tonic refusing the TLS material.
 pub async fn serve_main(
-    bind: SocketAddr,
+    prebound: Prebound,
     core: ServerCore,
     authority: Arc<EnrollmentAuthority>,
 ) -> Result<BoundListener, ServerError> {
     let deny = authority.deny_list();
     let tls = horde_identity::tls::grpc_server_mtls(authority.credential(), authority.ca_pem());
-    let (listener, addr) = bound(bind).await?;
+    let Prebound { listener, addr } = prebound;
 
     let control_plane = ControlPlaneServiceServer::with_interceptor(
         ControlPlane::with_enrollment(core.clone(), authority),
@@ -107,11 +107,11 @@ pub async fn serve_main(
 ///
 /// The bind failing, or tonic refusing the TLS material.
 pub async fn serve_enrollment(
-    bind: SocketAddr,
+    prebound: Prebound,
     authority: Arc<EnrollmentAuthority>,
 ) -> Result<BoundListener, ServerError> {
     let tls = horde_identity::tls::grpc_server_tls(authority.credential());
-    let (listener, addr) = bound(bind).await?;
+    let Prebound { listener, addr } = prebound;
 
     let router = tonic::transport::Server::builder()
         .tls_config(tls)
@@ -130,15 +130,33 @@ pub async fn serve_enrollment(
     Ok(BoundListener { addr, task })
 }
 
+/// A bound-but-not-yet-serving listener.
+///
+/// Binding is split from serving (ADR-0007) because each listener's service
+/// advertises the *other* listener's port — the mint answer names the
+/// enrollment port, the join answer the control-plane port — so both real
+/// addresses must exist before either service is built. A `:0` bind is only
+/// resolved by the OS at bind time, which is why the split is here and not a
+/// startup-ordering convention.
+#[derive(Debug)]
+pub struct Prebound {
+    listener: tokio::net::TcpListener,
+    pub addr: SocketAddr,
+}
+
 /// Binds and reports the address the OS actually chose.
-async fn bound(bind: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServerError> {
+///
+/// # Errors
+///
+/// The bind failing.
+pub async fn prebind(bind: SocketAddr) -> Result<Prebound, ServerError> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| ServerError::Internal(format!("binding {bind}: {e}")))?;
     let addr = listener
         .local_addr()
         .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok((listener, addr))
+    Ok(Prebound { listener, addr })
 }
 
 #[cfg(test)]

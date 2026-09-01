@@ -63,6 +63,15 @@ pub struct EnrollmentAuthority {
     deny: RevocationList,
     /// Serializes read-fold-decide-append so a code cannot redeem twice.
     gate: tokio::sync::Mutex<()>,
+    /// The main (mTLS) listener's port, taught to joiners in the join answer
+    /// (ADR-0007). Zero when the server has no listener to advertise.
+    control_plane_port: u16,
+    /// The enrollment listener's port, taught to minting clients so they can
+    /// print one self-contained token. Zero when unadvertised.
+    enrollment_port: u16,
+    /// The bootstrap-token file (ADR-0007), removed the moment a client
+    /// enrolls: from then on the filesystem must not hold a mintable path.
+    bootstrap_token_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for EnrollmentAuthority {
@@ -96,7 +105,43 @@ impl EnrollmentAuthority {
             credential,
             deny,
             gate: tokio::sync::Mutex::new(()),
+            control_plane_port: 0,
+            enrollment_port: 0,
+            bootstrap_token_file: None,
         })
+    }
+
+    /// Declares the two listener ports this authority's answers teach
+    /// (ADR-0007): joins learn the control plane, mints learn the enrollment
+    /// listener. Set from real bound addresses, never from configuration —
+    /// a `:0` bind only has a port after the OS chose one.
+    #[must_use]
+    pub fn advertising_ports(mut self, control_plane: u16, enrollment: u16) -> Self {
+        self.control_plane_port = control_plane;
+        self.enrollment_port = enrollment;
+        self
+    }
+
+    /// The bootstrap-token file this authority retires when the first client
+    /// enrolls (ADR-0007). Writing the file is startup's business — it owns
+    /// the minted code; retiring it is this authority's, because only the
+    /// redeem path knows the moment a client exists.
+    #[must_use]
+    pub fn with_bootstrap_token_file(mut self, file: std::path::PathBuf) -> Self {
+        self.bootstrap_token_file = Some(file);
+        self
+    }
+
+    /// The main listener port joins are taught; zero when unadvertised.
+    #[must_use]
+    pub fn control_plane_port(&self) -> u16 {
+        self.control_plane_port
+    }
+
+    /// The enrollment listener port mints are taught; zero when unadvertised.
+    #[must_use]
+    pub fn enrollment_port(&self) -> u16 {
+        self.enrollment_port
     }
 
     async fn roster_of(log: &EventLog) -> Result<EnrollmentRoster, ServerError> {
@@ -224,6 +269,18 @@ impl EnrollmentAuthority {
         )
         .await?;
 
+        // A client now exists, so the same-machine bootstrap door closes:
+        // the file must not outlive the moment it stops being the only way
+        // in (ADR-0007). Only after the enrollment is durably journaled —
+        // removing first and failing the append would close the door on
+        // nobody.
+        if principal.role() == PrincipalRole::Client
+            && let Some(file) = &self.bootstrap_token_file
+            && let Err(error) = retire_bootstrap_token(file)
+        {
+            tracing::warn!(%error, file = %file.display(), "could not retire the bootstrap token");
+        }
+
         Ok((principal, issued))
     }
 
@@ -283,6 +340,21 @@ impl EnrollmentAuthority {
     }
 }
 
+/// Removes the bootstrap token file, treating absence as the goal state it
+/// is: the file being gone is exactly what retirement means, however it got
+/// gone (ADR-0007). Shared by the redeem path here and startup's
+/// stale-file sweep, so "retired" has one meaning.
+///
+/// # Errors
+///
+/// A removal that failed with the file still present.
+pub(crate) fn retire_bootstrap_token(file: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// Identity-crate failures that reach a caller are internal: they mean the
 /// CA or the randomness source is broken, not that the request was wrong.
 fn identity_internal(error: horde_identity::IdentityError) -> ServerError {
@@ -337,6 +409,9 @@ impl EnrollmentService for Enrollment {
             certificate_pem: issued.certificate_pem,
             ca_bundle_pem: self.authority.ca_pem().to_owned(),
             principal: Some(principal_id),
+            // The join teaches the control plane (ADR-0007): the joiner has
+            // the host from the token, this is the port beside it.
+            control_plane_port: u32::from(self.authority.control_plane_port()),
         }))
     }
 }
@@ -380,5 +455,46 @@ mod tests {
             expires_at_unix_ms: 0,
         };
         assert_eq!(minted.join_code(), format!("00ff.{}", "a".repeat(64)));
+    }
+
+    /// Retirement's whole table (ADR-0007): an existing file goes, an absent
+    /// one is already the goal state, and a removal that leaves the path in
+    /// place — a directory stands in for any real filesystem refusal — is an
+    /// error, not a shrug.
+    #[test]
+    fn retirement_removes_treats_absence_as_done_and_surfaces_refusals() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = dir.path().join("bootstrap-token");
+        std::fs::write(&file, "token").expect("the file plants");
+
+        super::retire_bootstrap_token(&file).expect("an existing file retires");
+        assert!(!file.exists(), "retired means gone");
+        super::retire_bootstrap_token(&file).expect("absence is the goal state");
+        assert!(
+            super::retire_bootstrap_token(dir.path()).is_err(),
+            "a path that will not go must be an error"
+        );
+    }
+
+    /// The advertised ports ride the builder to both answers' sources, and
+    /// an unadvertised authority honestly says zero.
+    #[tokio::test]
+    async fn advertised_ports_are_stored_and_default_to_zero() {
+        let now = super::wall_clock_ms();
+        let ca = horde_identity::CertificateAuthority::generate(now).expect("a CA generates");
+        let credential = ca.issue_localhost_server(now).expect("issues");
+        let authority = super::EnrollmentAuthority::new(
+            crate::EventLog::in_memory().expect("a log"),
+            ca,
+            credential,
+        )
+        .await
+        .expect("the authority builds");
+
+        assert_eq!(authority.control_plane_port(), 0);
+        assert_eq!(authority.enrollment_port(), 0);
+        let advertised = authority.advertising_ports(7777, 7778);
+        assert_eq!(advertised.control_plane_port(), 7777);
+        assert_eq!(advertised.enrollment_port(), 7778);
     }
 }

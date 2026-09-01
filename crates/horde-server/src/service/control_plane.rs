@@ -1230,6 +1230,9 @@ impl ControlPlaneService for ControlPlane {
             expires_at: Some(crate::enrollment::ms_to_timestamp(
                 minted.expires_at_unix_ms,
             )),
+            // The minting client prints one self-contained token (ADR-0007);
+            // it owns the host it dialed, this is the listener beside it.
+            enrollment_port: u32::from(authority.enrollment_port()),
         }))
     }
 

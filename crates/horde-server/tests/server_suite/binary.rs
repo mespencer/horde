@@ -182,12 +182,19 @@ async fn serve_prints_the_operator_interface_and_stays_up() -> Setup<()> {
         .strip_prefix("server-fingerprint ")
         .ok_or_else(|| format!("line 3 must be the fingerprint: {seen:?}"))?;
     assert_eq!(fingerprint.len(), 64, "{seen:?}");
-    let code = seen[3]
-        .strip_prefix("bootstrap-client-code ")
-        .ok_or_else(|| format!("line 4 must be the bootstrap code: {seen:?}"))?;
-    assert!(
-        code.ends_with(fingerprint),
-        "the code embeds the fingerprint the joiner pins: {seen:?}"
+    let token = seen[3]
+        .strip_prefix("bootstrap-client-token ")
+        .ok_or_else(|| format!("line 4 must be the bootstrap token: {seen:?}"))?;
+    let token = horde_identity::JoinToken::parse(token)
+        .map_err(|error| format!("the printed token must parse: {error}"))?;
+    assert_eq!(
+        token.code.server_fingerprint, fingerprint,
+        "the token embeds the fingerprint the joiner pins: {seen:?}"
+    );
+    assert_eq!(
+        format!("listening enrollment={}", token.host_port),
+        seen[1],
+        "the token names the enrollment listener that bound: {seen:?}"
     );
 
     // Still serving, not exited: printing the interface must not be the

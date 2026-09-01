@@ -113,11 +113,17 @@ pub fn load_endpoint(directory: &Path) -> Option<String> {
     Some(endpoint.to_owned())
 }
 
-/// Writes key material with owner-only permissions.
+/// Writes secret material with owner-only permissions.
 ///
 /// Written before tightening would leave a world-readable window; instead the
-/// file is created empty with the right mode first, then filled.
-pub(crate) fn write_secret(path: &Path, contents: &str) -> Result<(), IdentityError> {
+/// file is created empty with the right mode first, then filled. Public
+/// because the server's bootstrap-token file (ADR-0007) is the same shape of
+/// secret and must not grow a second permission story.
+///
+/// # Errors
+///
+/// Any filesystem failure, with the path in the message.
+pub fn write_secret(path: &Path, contents: &str) -> Result<(), IdentityError> {
     let context = || path.display().to_string();
 
     #[cfg(unix)]

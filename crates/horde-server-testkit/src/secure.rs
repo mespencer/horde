@@ -95,17 +95,27 @@ async fn serve_secured_with_blobs(
     let now = wall_clock_ms();
     let ca = horde_identity::CertificateAuthority::generate(now)?;
     let credential = ca.issue_localhost_server(now)?;
-    let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
-
     let mut core = ServerCore::new(log.clone());
     if let Some(store) = blobs {
         core = core.with_blob_store(store);
     }
 
+    // Prebound before the authority exists, exactly as `startup::serve`
+    // does it: the authority advertises both real ports (ADR-0007), so its
+    // mints and joins teach the same endpoints the production server's do.
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-    let main = horde_server::transport::serve_main(loopback, core, Arc::clone(&authority)).await?;
+    let main_listener = horde_server::transport::prebind(loopback).await?;
+    let enrollment_listener = horde_server::transport::prebind(loopback).await?;
+    let authority = Arc::new(
+        EnrollmentAuthority::new(log.clone(), ca, credential)
+            .await?
+            .advertising_ports(main_listener.addr.port(), enrollment_listener.addr.port()),
+    );
+    let main =
+        horde_server::transport::serve_main(main_listener, core, Arc::clone(&authority)).await?;
     let enrollment =
-        horde_server::transport::serve_enrollment(loopback, Arc::clone(&authority)).await?;
+        horde_server::transport::serve_enrollment(enrollment_listener, Arc::clone(&authority))
+            .await?;
 
     Ok(SecureHarness {
         authority,
@@ -140,6 +150,22 @@ impl SecureHarness {
     #[must_use]
     pub fn enrollment_endpoint(&self) -> String {
         format!("https://localhost:{}", self.enrollment.addr.port())
+    }
+
+    /// The one-token form (ADR-0007) of a code this harness minted, on the
+    /// `localhost` name its listener credential answers for.
+    #[must_use]
+    pub fn join_token(
+        &self,
+        minted: &horde_server::service::MintedCode,
+    ) -> horde_identity::JoinToken {
+        horde_identity::JoinToken::new(
+            format!("localhost:{}", self.enrollment.addr.port()),
+            horde_identity::JoinCode {
+                secret: minted.secret.clone(),
+                server_fingerprint: minted.server_fingerprint.clone(),
+            },
+        )
     }
 
     /// Mints a code and redeems it over the real enrollment listener —

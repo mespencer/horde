@@ -327,8 +327,24 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let credential = ca.issue_server(now, &dns, &ips).map_err(identity_startup)?;
     let server_fingerprint = credential.fingerprint().map_err(identity_startup)?;
 
-    let authority = Arc::new(EnrollmentAuthority::new(log.clone(), ca, credential).await?);
+    // Both listeners bind before either serves (ADR-0007): each one's
+    // service teaches the other's real port, and `:0` only has one after
+    // the OS chose it.
+    let main_listener = crate::transport::prebind(config.bind).await?;
+    let enrollment_listener = crate::transport::prebind(config.enrollment_bind).await?;
+
+    let authority = Arc::new(
+        EnrollmentAuthority::new(log.clone(), ca, credential)
+            .await?
+            .advertising_ports(main_listener.addr.port(), enrollment_listener.addr.port())
+            .with_bootstrap_token_file(bootstrap_token_path(&config.state_dir)),
+    );
     let bootstrap_code = bootstrap_code_if_unclaimed(&authority, now).await?;
+    sync_bootstrap_token_file(
+        &config.state_dir,
+        bootstrap_code.as_ref(),
+        enrollment_listener.addr,
+    )?;
 
     // The blob store lives beside the CA in the state directory. Failing
     // here rather than on the first upload matches the log's own rule: an
@@ -357,8 +373,8 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let relay = mounted_relay(config, &core).await?;
     let hub_lines = warm_hub(&core).await?;
 
-    let main = crate::transport::serve_main(config.bind, core, Arc::clone(&authority)).await?;
-    let enrollment = crate::transport::serve_enrollment(config.enrollment_bind, authority).await?;
+    let main = crate::transport::serve_main(main_listener, core, Arc::clone(&authority)).await?;
+    let enrollment = crate::transport::serve_enrollment(enrollment_listener, authority).await?;
 
     Ok(RunningServer {
         main,
@@ -436,6 +452,52 @@ async fn bootstrap_code_if_unclaimed(
     Ok(Some(authority.mint(&operator, 0, now).await?))
 }
 
+/// Where the bootstrap token rides the filesystem (ADR-0007): the server's
+/// state dir, which already carries the CA — same trust, same disk.
+#[must_use]
+pub fn bootstrap_token_path(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("bootstrap-token")
+}
+
+/// The one-token form of a minted code (ADR-0007): the enrollment listener
+/// this server actually bound, around the unchanged `secret.fingerprint`.
+#[must_use]
+pub fn join_token_of(code: &MintedCode, enrollment_addr: SocketAddr) -> horde_identity::JoinToken {
+    horde_identity::JoinToken::new(
+        enrollment_addr.to_string(),
+        horde_identity::JoinCode {
+            secret: code.secret.clone(),
+            server_fingerprint: code.server_fingerprint.clone(),
+        },
+    )
+}
+
+/// Keeps the bootstrap-token file truthful at startup (ADR-0007): rewritten
+/// with the fresh token while no client exists, removed when one does — a
+/// stale token on disk after enrollment would be a mintable path the stdout
+/// line no longer shows. User-read-only, through the same secret writer the
+/// identity key uses.
+fn sync_bootstrap_token_file(
+    state_dir: &std::path::Path,
+    code: Option<&MintedCode>,
+    enrollment_addr: SocketAddr,
+) -> Result<(), ServerError> {
+    let path = bootstrap_token_path(state_dir);
+    match code {
+        Some(code) => {
+            let token = join_token_of(code, enrollment_addr);
+            horde_identity::store::write_secret(&path, &format!("{token}\n"))
+                .map_err(identity_startup)
+        }
+        None => crate::service::enrollment::retire_bootstrap_token(&path).map_err(|error| {
+            ServerError::Internal(format!(
+                "could not remove the stale bootstrap token {}: {error}",
+                path.display()
+            ))
+        }),
+    }
+}
+
 /// The stdout lines `--serve` owes the operator: stable, greppable keys —
 /// the addresses, the fingerprint every join pins, and the bootstrap code
 /// when one was minted.
@@ -451,7 +513,13 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
     }
     lines.extend(running.hub_lines.iter().cloned());
     if let Some(code) = &running.bootstrap_code {
-        lines.push(format!("bootstrap-client-code {}", code.join_code()));
+        // The same token the state dir's bootstrap-token file carries: the
+        // stdout line and the file must never disagree about what is
+        // mintable (ADR-0007).
+        lines.push(format!(
+            "bootstrap-client-token {}",
+            join_token_of(code, running.enrollment.addr)
+        ));
     }
     lines
 }
@@ -742,9 +810,15 @@ mod tests {
             .bootstrap_code
             .as_ref()
             .expect("a fresh server has no client, so it must mint the first code");
-        assert!(
-            code.join_code().ends_with(&running.server_fingerprint),
-            "the printed code embeds the fingerprint the joiner pins"
+        let token = super::join_token_of(code, running.enrollment.addr);
+        assert_eq!(
+            token.code.server_fingerprint, running.server_fingerprint,
+            "the printed token embeds the fingerprint the joiner pins"
+        );
+        assert_eq!(
+            token.enrollment_endpoint(),
+            format!("https://{}", running.enrollment.addr),
+            "the token names the listener that actually bound"
         );
         assert!(
             horde_identity::CertificateAuthority::exists(&config.state_dir.join("ca")),
@@ -774,10 +848,27 @@ mod tests {
                 running.relay.as_ref().expect("mounted").server.addr()
             )
         );
+        assert_eq!(lines[4], format!("bootstrap-client-token {token}"));
+
+        // The same token rides the state dir, user-read-only (ADR-0007):
+        // `horde up` reads it where the operator's eyes read stdout.
+        let token_file = super::bootstrap_token_path(&config.state_dir);
         assert_eq!(
-            lines[4],
-            format!("bootstrap-client-code {}", code.join_code())
+            std::fs::read_to_string(&token_file)
+                .expect("the bootstrap token file exists")
+                .trim(),
+            token.to_string(),
+            "the stdout line and the file must carry the same token"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&token_file)
+                .expect("the token file exists")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the token file is user-read-only");
+        }
 
         // Dropping the server takes the chain driver with it: a leaked
         // driver would keep folding the (closed) log forever.
@@ -812,6 +903,67 @@ mod tests {
         assert!(
             again.relay.is_none(),
             "no --relay-bind mounts no relay, quietly"
+        );
+        let rewritten = std::fs::read_to_string(super::bootstrap_token_path(&config.state_dir))
+            .expect("the restart rewrites the bootstrap token file");
+        assert_ne!(
+            rewritten.trim(),
+            token.to_string(),
+            "each unclaimed boot mints (and files) a fresh token"
+        );
+    }
+
+    /// The bootstrap file's other half: a server starting over a state that
+    /// already has an enrolled client removes any stale token file rather
+    /// than leaving a mintable path on disk (ADR-0007).
+    #[tokio::test]
+    async fn a_client_holding_restart_retires_a_stale_bootstrap_token_file() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(&directory, None);
+
+        let running = super::serve(&config).await.expect("the server comes up");
+        let token_file = super::bootstrap_token_path(&config.state_dir);
+        assert!(token_file.is_file(), "a fresh boot files its token");
+
+        // Enroll a client through the real listener, using the filed token —
+        // exactly what `horde up` does — and watch the file retire.
+        let token = std::fs::read_to_string(&token_file).expect("the token reads");
+        let token = horde_identity::JoinToken::parse(token.trim()).expect("the filed token parses");
+        let enrolled = horde_identity::join(
+            &token.enrollment_endpoint(),
+            &token.code,
+            horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                capability_flags: Vec::new(),
+                role: horde_proto::v1::Role::Client as i32,
+                display_name: "up".to_owned(),
+            },
+        )
+        .await
+        .expect("the filed token enrolls");
+        assert_eq!(enrolled.principal.to_string(), "client:operator");
+        assert_eq!(
+            enrolled.control_plane_port,
+            Some(running.main.addr.port()),
+            "the join answer teaches the control plane beside the token's host"
+        );
+        assert!(
+            !token_file.exists(),
+            "the file must retire the moment a client exists"
+        );
+
+        // Plant a stale file and restart: an enrolled client means no
+        // bootstrap line and no file, however the file got there.
+        drop(running);
+        std::fs::write(&token_file, "stale\n").expect("the stale file plants");
+        let again = super::serve(&config).await.expect("a restart comes up");
+        assert!(
+            again.bootstrap_code.is_none(),
+            "an enrolled client closes the bootstrap door"
+        );
+        assert!(
+            !token_file.exists(),
+            "a client-holding restart removes the stale file"
         );
     }
 }
