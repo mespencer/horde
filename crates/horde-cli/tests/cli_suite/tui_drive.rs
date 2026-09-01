@@ -361,3 +361,64 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
     harness.press(KeyCode::Esc).await.expect("detach");
     harness.quit_from_list_screen().await.expect("q exits");
 }
+
+/// The picker's loop through the same seam: a `TestBackend`, scripted keys,
+/// rows listed from a real server. What the screen shows must be exactly the
+/// rows `session list` prints — ADR-0008's "one rendering" is an equality,
+/// not a resemblance — and the scripted walk must land on the session the
+/// cursor pointed at.
+#[tokio::test]
+async fn the_picker_paints_the_shared_rows_and_enter_chooses_the_pointed_session() {
+    use horde_cli::picker::{Choice, Picker};
+
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, first_id, _) = seeded(&endpoint, "pick-one").await.expect("seed");
+    client
+        .create_session("pick-two", "key-2")
+        .await
+        .expect("a second session");
+
+    let mut sessions = client.list_sessions(false).await.expect("the list");
+    horde_cli::front_door::sort_newest_first(&mut sessions);
+    let now = 1_000_000_i64;
+    let rows = horde_cli::render::session_rows(&sessions, now);
+
+    let terminal =
+        Terminal::new(TestBackend::new(80, 24)).expect("a test terminal always constructs");
+    let (keys, mut key_receiver) = mpsc::channel(16);
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
+        keys.send(TermEvent::Key(KeyEvent::from(code)))
+            .await
+            .expect("the loop is listening");
+    }
+
+    let (terminal, choice) = within("the picker loop to finish", async {
+        Ok(horde_cli::picker::drive(
+            terminal,
+            &mut key_receiver,
+            Picker::new(&sessions, now),
+            |_| {},
+        )
+        .await?)
+    })
+    .await
+    .expect("the loop finishes");
+
+    assert_eq!(
+        choice,
+        Choice::Attach(first_id),
+        "two downs from the new-session row is the second (older) session"
+    );
+
+    let screen = terminal.backend().to_string();
+    assert!(
+        screen.contains("new session"),
+        "the top row is the create: {screen}"
+    );
+    for row in &rows {
+        assert!(
+            screen.contains(row.trim_end()),
+            "the picker must paint the same row `session list` prints:\n{row}\n--- screen:\n{screen}"
+        );
+    }
+}

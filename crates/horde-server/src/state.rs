@@ -571,7 +571,10 @@ mod tests {
             event
         };
         let events = vec![
-            at(stored(1, Some("root"), spawned_named(None, &["ci-fix"])), 1_000),
+            at(
+                stored(1, Some("root"), spawned_named(None, &["ci-fix"])),
+                1_000,
+            ),
             at(
                 stored(
                     2,
