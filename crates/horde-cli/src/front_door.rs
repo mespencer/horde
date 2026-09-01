@@ -250,6 +250,16 @@ mod tests {
         );
     }
 
+    /// Sorts and hands back the ids in their new order — both sort tests
+    /// read the same fact, so the extraction lives once.
+    fn sorted_ids(mut sessions: Vec<SessionSummary>) -> Vec<String> {
+        sort_newest_first(&mut sessions);
+        sessions
+            .iter()
+            .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
+            .collect()
+    }
+
     /// Newest first is by creation time, not list order — and a summary
     /// with no stamp sinks to the tail instead of poisoning the sort. The
     /// stamps differ only inside one second, so the nanosecond half must be
@@ -262,20 +272,14 @@ mod tests {
             session_id: Some(SessionId::new("session-unstamped")),
             ..SessionSummary::default()
         };
-        let mut sessions = vec![
-            unstamped,
-            session("session-old", 1_900),
-            session("session-b", 1_998),
-            session("session-a", 1_999),
-            session("session-new", 2_000),
-        ];
-        sort_newest_first(&mut sessions);
-        let ids: Vec<_> = sessions
-            .iter()
-            .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
-            .collect();
         assert_eq!(
-            ids,
+            sorted_ids(vec![
+                unstamped,
+                session("session-old", 1_900),
+                session("session-b", 1_998),
+                session("session-a", 1_999),
+                session("session-new", 2_000),
+            ]),
             vec![
                 "session-new",
                 "session-a",
@@ -321,15 +325,12 @@ mod tests {
     /// paint and the Enter.
     #[test]
     fn a_creation_time_tie_breaks_on_the_id_deterministically() {
-        let mut sessions = vec![
-            session("session-key-1", 5_000),
-            session("session-key-2", 5_000),
-        ];
-        sort_newest_first(&mut sessions);
-        let ids: Vec<_> = sessions
-            .iter()
-            .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
-            .collect();
-        assert_eq!(ids, vec!["session-key-2", "session-key-1"]);
+        assert_eq!(
+            sorted_ids(vec![
+                session("session-key-1", 5_000),
+                session("session-key-2", 5_000),
+            ]),
+            vec!["session-key-2", "session-key-1"]
+        );
     }
 }
