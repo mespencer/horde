@@ -391,6 +391,11 @@ async fn the_picker_paints_the_shared_rows_and_enter_chooses_the_pointed_session
             .await
             .expect("the loop is listening");
     }
+    // Closing the channel bounds the loop by the script's own length: a
+    // picker deaf to its keys drains them, meets the closed channel, and
+    // returns Dismissed — failing the choice assertion at once instead of
+    // spending the wall-clock ceiling.
+    drop(keys);
 
     let (terminal, choice) = within("the picker loop to finish", async {
         Ok(horde_cli::picker::drive(

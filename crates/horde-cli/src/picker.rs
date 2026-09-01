@@ -256,6 +256,11 @@ mod tests {
         keys.send(TermEvent::Key(KeyEvent::from(KeyCode::Enter)))
             .await
             .expect("the loop is about to listen");
+        // The script's own length is the ceiling: with the sender gone, a
+        // picker that ignores its keys drains the queue, meets the closed
+        // channel, and comes back Dismissed — a wrong answer now, never a
+        // hang the harness has to time out.
+        drop(keys);
 
         let (terminal, choice) = super::drive(terminal, &mut receiver, picker(), |_| {})
             .await
