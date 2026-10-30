@@ -322,10 +322,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let log = open_log(&config.database)?;
     let now = wall_clock_ms();
 
-    let ca = ca_for(&config.state_dir.join("ca"), now)?;
-    let (dns, ips) = credential_names(&config.subject_names);
-    let credential = ca.issue_server(now, &dns, &ips).map_err(identity_startup)?;
-    let server_fingerprint = credential.fingerprint().map_err(identity_startup)?;
+    let (ca, credential, server_fingerprint) = listener_identity(config, now)?;
 
     // Both listeners bind before either serves (ADR-0007): each one's
     // service teaches the other's real port, and `:0` only has one after
@@ -380,6 +377,30 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         hub_lines,
         permission_chain,
     })
+}
+
+/// The CA (loaded, or created on first start) and the listener credential
+/// issued fresh from it for this start, with the fingerprint every join pins.
+///
+/// # Errors
+///
+/// The CA failing to load or persist, or the credential failing to issue.
+fn listener_identity(
+    config: &ServeConfig,
+    now: i64,
+) -> Result<
+    (
+        CertificateAuthority,
+        horde_identity::ServerCredential,
+        String,
+    ),
+    ServerError,
+> {
+    let ca = ca_for(&config.state_dir.join("ca"), now)?;
+    let (dns, ips) = credential_names(&config.subject_names);
+    let credential = ca.issue_server(now, &dns, &ips).map_err(identity_startup)?;
+    let fingerprint = credential.fingerprint().map_err(identity_startup)?;
+    Ok((ca, credential, fingerprint))
 }
 
 /// The enrollment authority `serve` stands up (ADR-0007): it advertises the
