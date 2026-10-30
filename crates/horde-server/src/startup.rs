@@ -334,10 +334,14 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let enrollment_listener = crate::transport::prebind(config.enrollment_bind).await?;
 
     let authority = Arc::new(
-        EnrollmentAuthority::new(log.clone(), ca, credential)
-            .await?
-            .advertising_ports(main_listener.addr.port(), enrollment_listener.addr.port())
-            .with_bootstrap_token_file(bootstrap_token_path(&config.state_dir)),
+        advertising_authority(
+            &log,
+            ca,
+            credential,
+            (main_listener.addr.port(), enrollment_listener.addr.port()),
+            &config.state_dir,
+        )
+        .await?,
     );
     let bootstrap_code = bootstrap_code_if_unclaimed(&authority, now).await?;
     sync_bootstrap_token_file(
@@ -346,16 +350,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment_listener.addr,
     )?;
 
-    // The blob store lives beside the CA in the state directory. Failing
-    // here rather than on the first upload matches the log's own rule: an
-    // unusable store must fail at startup, not mid-payload.
-    let mut blobs = crate::blob::BlobStore::open(&config.state_dir.join("blobs"))
-        .map_err(|error| ServerError::Internal(error.to_string()))?;
-    if let Some(max) = config.blob_max_bytes {
-        blobs = blobs.with_max_blob_bytes(max);
-    }
-
-    let core = ServerCore::new(log).with_blob_store(Arc::new(blobs));
+    let core = ServerCore::new(log).with_blob_store(Arc::new(blob_store(config)?));
 
     // The permission chain driver (fix a5): the deterministic layers run in
     // the deployed server, over an escalate-everything default registry —
@@ -384,6 +379,42 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         relay,
         hub_lines,
         permission_chain,
+    })
+}
+
+/// The enrollment authority `serve` stands up (ADR-0007): it advertises the
+/// ports both listeners actually bound, and knows where the bootstrap token
+/// rides the state dir so redeeming it can retire the file.
+///
+/// # Errors
+///
+/// The authority failing to read its state from the log.
+async fn advertising_authority(
+    log: &EventLog,
+    ca: CertificateAuthority,
+    credential: horde_identity::ServerCredential,
+    (main_port, enrollment_port): (u16, u16),
+    state_dir: &std::path::Path,
+) -> Result<EnrollmentAuthority, ServerError> {
+    Ok(EnrollmentAuthority::new(log.clone(), ca, credential)
+        .await?
+        .advertising_ports(main_port, enrollment_port)
+        .with_bootstrap_token_file(bootstrap_token_path(state_dir)))
+}
+
+/// The blob store, beside the CA in the state directory. Failing here rather
+/// than on the first upload matches the log's own rule: an unusable store
+/// must fail at startup, not mid-payload.
+///
+/// # Errors
+///
+/// The store's directory being unusable.
+fn blob_store(config: &ServeConfig) -> Result<crate::blob::BlobStore, ServerError> {
+    let blobs = crate::blob::BlobStore::open(&config.state_dir.join("blobs"))
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    Ok(match config.blob_max_bytes {
+        Some(max) => blobs.with_max_blob_bytes(max),
+        None => blobs,
     })
 }
 
