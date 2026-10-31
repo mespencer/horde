@@ -141,6 +141,11 @@ pub async fn git(dir: &Path, args: &[&str]) -> Setup<String> {
         "user.email=test@horde",
         "user.name=horde-test",
         "init.defaultBranch=main",
+        // A commit otherwise leaves a detached `git maintenance run --auto`
+        // churning `objects/` after it returns, racing the clone a suite
+        // takes next.
+        "maintenance.auto=false",
+        "gc.auto=0",
     ] {
         command.arg("-c").arg(pin);
     }

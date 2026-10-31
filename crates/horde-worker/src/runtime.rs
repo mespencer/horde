@@ -2704,6 +2704,9 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                // No detached auto-maintenance left racing the clone.
+                "-c",
+                "maintenance.auto=false",
                 "commit",
                 "-qm",
                 "seed",

@@ -185,7 +185,15 @@ mod tests {
             assert!(output.status.success(), "git {args:?}: {output:?}");
         };
         git(&["init", "-q", "-b", "main"]);
-        git(&["commit", "-qm", "seed", "--allow-empty"]);
+        // No detached auto-maintenance left churning the origin's objects.
+        git(&[
+            "-c",
+            "maintenance.auto=false",
+            "commit",
+            "-qm",
+            "seed",
+            "--allow-empty",
+        ]);
 
         // Its own names ("maps"/"cartography"), so this fixture cannot twin
         // the worker suites' atlas definitions token for token.

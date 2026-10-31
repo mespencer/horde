@@ -31,6 +31,9 @@ pub(crate) mod harness {
     /// This is the *test's* git — arranging repos to point production code
     /// at — so it asserts rather than returning errors, and it pins the
     /// identity/signing config so a host's global config cannot leak in.
+    /// Auto-maintenance is pinned off too: a commit otherwise leaves a
+    /// detached `git maintenance run --auto` churning `objects/` after it
+    /// returns, which a local-path `clone_to` straight after can trip over.
     pub(crate) async fn git_in(dir: &Path, args: &[&str]) -> String {
         let output = tokio::process::Command::new("git")
             .arg("-C")
@@ -42,6 +45,10 @@ pub(crate) mod harness {
                 "user.name=agent",
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
             ])
             .args(args)
             .output()

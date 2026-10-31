@@ -163,10 +163,25 @@ impl MirrorStore {
 
         // `--` before the URL: an upstream is configuration, not a flag, and
         // the separator keeps a URL starting with `-` from being read as one.
+        //
+        // `--no-local`: an upstream given as a path is somebody's live repo.
+        // A local clone walks its `objects/` copying entry by entry, and the
+        // detached auto-maintenance each commit there spawns creates and
+        // deletes `objects/maintenance.lock` mid-walk ("failed to copy file
+        // … No such file or directory"). Through the transport only the
+        // reachable objects travel, as a pack — at the cost of hardlinks.
+        // For a URL upstream the flag changes nothing.
         let staging_str = staging.display().to_string();
         git(
             &self.root,
-            &["clone", "--mirror", "--", &remote_url, &staging_str],
+            &[
+                "clone",
+                "--mirror",
+                "--no-local",
+                "--",
+                &remote_url,
+                &staging_str,
+            ],
         )
         .await?;
         std::fs::rename(&staging, &path).map_err(|source| self.store_error(source))?;
@@ -265,5 +280,57 @@ mod tests {
             .await
             .expect_err("unknown repos must be refused, not guessed at");
         assert!(matches!(error, MirrorError::UnknownRepo { .. }));
+    }
+
+    /// A path upstream is a live repo whose `objects/` may be mid-maintenance.
+    /// A dangling `maintenance.lock` symlink stands in for the lock that
+    /// vanishes mid-copy, deterministically: a local clone walking `objects/`
+    /// refuses it, a clone through the transport never sees it.
+    #[tokio::test]
+    async fn a_path_upstream_under_maintenance_still_mirrors() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).expect("the upstream dir");
+        for args in [
+            ["init", "-q", "-b", "main", "."].as_slice(),
+            [
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "maintenance.auto=false",
+                "commit",
+                "-qm",
+                "seed",
+                "--allow-empty",
+            ]
+            .as_slice(),
+        ] {
+            crate::git::git(&upstream, args)
+                .await
+                .expect("the upstream arrangement");
+        }
+        let objects = upstream.join(".git").join("objects");
+        std::os::unix::fs::symlink(objects.join("gone"), objects.join("maintenance.lock"))
+            .expect("plants the stray lock");
+        let store = MirrorStore::new(dir.path().join("relay"));
+        store
+            .register("atlas", &upstream.display().to_string())
+            .expect("registers");
+
+        let mirror = store
+            .ensure("atlas")
+            .await
+            .expect("a maintained upstream must still mirror");
+
+        assert_eq!(
+            crate::git::git(&mirror, &["rev-parse", "main"])
+                .await
+                .expect("the mirror holds main"),
+            crate::git::git(&upstream, &["rev-parse", "main"])
+                .await
+                .expect("the upstream holds main"),
+        );
     }
 }

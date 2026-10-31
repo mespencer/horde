@@ -22,8 +22,16 @@ mod harness {
     /// Runs one git command in `cwd`, panicking with git's own words on
     /// failure — a fixture builder, not a reimplementation of the code under
     /// test, which shells out on its own.
+    ///
+    /// Auto-maintenance is pinned off: otherwise every fixture commit leaves
+    /// a detached `git maintenance run --auto` working in that repo's
+    /// `objects/` after `git commit` has returned, racing whatever the test
+    /// does next. Production must survive that race (see
+    /// `a_source_under_maintenance_still_materializes`); the fixture should
+    /// not depend on winning it.
     pub(crate) fn git(cwd: &Path, arguments: &[&str]) -> String {
         let output = std::process::Command::new("git")
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(arguments)
             .current_dir(cwd)
             .output()
@@ -90,6 +98,18 @@ mod harness {
         git(repo, &["add", "."]);
         git(repo, &["commit", "-qm", "the parent's work"]);
         git(repo, &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Leaves `repo`'s object store as a concurrent `git maintenance` run
+    /// can: holding an entry that is not an object. Here it is a dangling
+    /// `maintenance.lock` symlink — the deterministic stand-in for a lock
+    /// file that vanishes mid-copy, since a local-path clone walking
+    /// `objects/` refuses it outright, while a clone through git's
+    /// transport never lists the directory at all.
+    pub(crate) fn plant_stray_lock(repo: &Path) {
+        let objects = repo.join(".git").join("objects");
+        std::os::unix::fs::symlink(objects.join("gone"), objects.join("maintenance.lock"))
+            .expect("plants the stray lock");
     }
 
     /// One already-materialized single-repo instance: the arrangement every
@@ -605,6 +625,64 @@ async fn a_fresh_clone_checkout_is_a_full_clone() {
     assert!(
         checkout.join("atlas").join(".git").is_dir(),
         "a fresh clone owns its whole repository, so .git is a directory"
+    );
+}
+
+/// A remote that is a live local repo — its object store mid-maintenance —
+/// still materializes: the clone goes through git's transport rather than
+/// copying `objects/` entry by entry, so a lock file appearing or vanishing
+/// there is none of its business.
+#[tokio::test]
+async fn a_source_under_maintenance_still_materializes() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let atlas = harness::origin(temp.path(), "atlas");
+    harness::plant_stray_lock(&atlas);
+    let manager = harness::manager_under(temp.path());
+
+    let report = manager
+        .materialize(&harness::definition(
+            "ws-1",
+            vec![harness::repo("atlas", &atlas)],
+        ))
+        .await;
+
+    assert_eq!(
+        report.state,
+        WorkspaceInstanceState::Ready as i32,
+        "a maintained source must not break the clone: {}",
+        report.detail
+    );
+    assert_eq!(
+        report.repos[0].head_commit_sha,
+        harness::git(&atlas, &["rev-parse", "HEAD"]).trim(),
+        "the clone is at the origin's head"
+    );
+}
+
+/// The Instance's object store is the live one: every worktree agent commits
+/// into it, each commit spawning auto-maintenance there. A fresh-clone
+/// checkout taken meanwhile must not trip over it.
+#[tokio::test]
+async fn a_fresh_clone_survives_maintenance_in_the_instance() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
+    let instance_atlas = std::path::PathBuf::from(&instance.repos[0].path);
+    harness::plant_stray_lock(&instance_atlas);
+
+    let checkout = manager
+        .checkout(
+            "ws-1",
+            "agent-1",
+            CheckoutPolicy::FreshClone,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .expect("a fresh clone despite the maintained instance");
+
+    assert_eq!(
+        harness::git(&checkout.join("atlas"), &["rev-parse", "HEAD"]),
+        harness::git(&instance_atlas, &["rev-parse", "HEAD"]),
+        "the fresh clone starts at the instance's HEAD"
     );
 }
 

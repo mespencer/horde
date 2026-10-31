@@ -45,6 +45,25 @@ const AGENTS_DIR: &str = ".horde-agents";
 /// would otherwise stall every later command forever.
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Every clone goes through git's transport, even from a local path.
+///
+/// A local-path clone's default is to walk the source's `objects/` and
+/// hardlink or copy it entry by entry, which is only safe while nothing else
+/// touches that directory. Both our sources are live: a remote URL may be a
+/// user's working repo, and an Instance's object store is shared by every
+/// agent worktree committing into it. Each `git commit` spawns a detached
+/// `git maintenance run --auto`, which creates and deletes
+/// `objects/maintenance.lock` (and may repack) behind the copier's back —
+/// the clone then dies with "failed to copy file … No such file or
+/// directory". Through the transport, `upload-pack` serves the objects
+/// reachable from the source's refs as a pack and never lists the directory.
+///
+/// The price: no hardlinks, so each clone costs the repo's packed size on
+/// disk and a `pack-objects` pass (mostly reusing existing deltas) instead of
+/// near-free links; unreachable objects are not carried. For a URL remote
+/// the flag changes nothing.
+const NO_LOCAL: &str = "--no-local";
+
 /// Materializes Instances and applies Checkout Policies under one root.
 #[derive(Debug, Clone)]
 pub struct WorkspaceManager {
@@ -417,7 +436,7 @@ async fn materialize_repo(
                 repo.remote_url, repo.default_branch
             ));
         }
-        let mut arguments = vec!["clone".to_owned()];
+        let mut arguments = vec!["clone".to_owned(), NO_LOCAL.to_owned()];
         if !repo.default_branch.is_empty() {
             arguments.push("--branch".to_owned());
             arguments.push(repo.default_branch.clone());
@@ -460,8 +479,9 @@ async fn worktree_repo(
         .map_err(WorkerError::Workspace)
 }
 
-/// One agent clone: full isolation, cloned locally from the instance's repo,
-/// switched onto the inherited start point when the spawn carried one.
+/// One agent clone: full isolation, cloned from the instance's repo through
+/// git's transport ([`NO_LOCAL`]), switched onto the inherited start point
+/// when the spawn carried one.
 async fn clone_repo(
     source: PathBuf,
     destination: PathBuf,
@@ -470,7 +490,13 @@ async fn clone_repo(
 ) -> Result<(), WorkerError> {
     git(
         &source,
-        &["clone", &path_str(&source), &path_str(&destination)],
+        &[
+            "clone",
+            NO_LOCAL,
+            "--",
+            &path_str(&source),
+            &path_str(&destination),
+        ],
     )
     .await
     .map(|_| ())
