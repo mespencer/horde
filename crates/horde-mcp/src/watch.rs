@@ -75,10 +75,9 @@ pub struct SessionIndex {
     raised: Vec<Raised>,
     /// Request ids a proxied call has already consumed.
     claimed: HashSet<String>,
-    /// Per agent, the sequence of the latest assignment sent to it.
-    latest_assignment: HashMap<String, u64>,
-    /// Per agent, the latest result it reported and where.
-    latest_result: HashMap<String, (u64, AgentResult)>,
+    /// Per agent, the result answering its latest assignment — present only
+    /// while no assignment has been sent to it since that result.
+    answered: HashMap<String, AgentResult>,
 }
 
 impl SessionIndex {
@@ -127,13 +126,13 @@ impl SessionIndex {
                         .or_insert_with(|| decision.clone());
                 }
             }
+            // A new assignment owes a new result: the old one stops answering.
             Some(EventKind::AssignmentSent(_)) => {
-                self.latest_assignment.insert(agent_id, envelope.sequence);
+                self.answered.remove(&agent_id);
             }
             Some(EventKind::ResultReported(reported)) => {
                 if let Some(result) = reported.result.as_ref() {
-                    self.latest_result
-                        .insert(agent_id, (envelope.sequence, result.clone()));
+                    self.answered.insert(agent_id, result.clone());
                 }
             }
             _ => {}
@@ -154,9 +153,7 @@ impl SessionIndex {
     /// tell the parent its second task finished before it started.
     #[must_use]
     pub fn result_owed(&self, agent_id: &str) -> Option<AgentResult> {
-        let (reported_at, result) = self.latest_result.get(agent_id)?;
-        let assigned_at = self.latest_assignment.get(agent_id).copied().unwrap_or(0);
-        (*reported_at > assigned_at).then(|| result.clone())
+        self.answered.get(agent_id).cloned()
     }
 
     /// Claims the oldest decided, unclaimed request `agent_id` raised for
@@ -591,6 +588,30 @@ mod tests {
         assert!(!redialable(&ClientError::Endpoint {
             endpoint: "nope".to_owned()
         }));
+    }
+
+    /// The cursor every follow starts after is the shared index's, so what one
+    /// wait folded the next does not replay; the debug line names both the
+    /// session and where the watch has read to, and nothing of the transport.
+    #[tokio::test]
+    async fn clones_share_one_cursor_and_the_debug_line_shows_it() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let watch =
+            super::SessionWatch::new(horde_cli::client::Client::with_channel(channel), "s-dbg");
+        assert_eq!(watch.cursor(), 0);
+        let clone = watch.clone();
+        clone.with_index(|index| index.fold(&assigned(7, "child")));
+        assert_eq!(
+            watch.cursor(),
+            7,
+            "a clone's fold advances the shared cursor"
+        );
+
+        let rendered = format!("{watch:?}");
+        assert!(rendered.contains("SessionWatch"), "{rendered}");
+        assert!(rendered.contains("s-dbg"), "{rendered}");
+        assert!(rendered.contains("cursor: 7"), "{rendered}");
+        assert!(!rendered.contains("Channel"), "{rendered}");
     }
 
     /// A server that cannot be reached at all is the network too.

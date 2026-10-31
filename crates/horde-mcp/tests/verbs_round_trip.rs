@@ -163,6 +163,43 @@ async fn a_wait_survives_a_severed_link_and_reads_the_result_after_it_heals() ->
     Ok(())
 }
 
+/// A server's verdict ends the wait; only the network's failures are redialed.
+/// A gRPC server that does not serve the control plane answers the follow
+/// `Unimplemented` — redialing that forever would hang the agent on a
+/// question the server has already said it will never answer.
+#[tokio::test]
+async fn a_server_that_refuses_the_watch_ends_the_wait_with_its_verdict() -> Setup<()> {
+    let harness = harness().await?;
+    let incoming = tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse()?)?;
+    let address = incoming.local_addr()?;
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                horde_proto::v1::blob_service_server::BlobServiceServer::new(
+                    horde_server::service::Blobs::new(None),
+                ),
+            )
+            .serve_with_incoming(incoming),
+    );
+    let waiter = Verbs::new(horde_mcp::context::AgentContext::new(
+        harness.journal(),
+        horde_cli::client::Client::connect(&format!("http://{address}")).await?,
+        harness.session_id.clone(),
+    ));
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        waiter.wait_for_agent(&harness.agent_id),
+    )
+    .await?
+    .expect_err("a server without the control plane cannot answer the wait");
+    assert!(
+        matches!(error, horde_mcp::verbs::VerbError::Unwatchable { .. }),
+        "the verdict surfaces as the watch being refused: {error}"
+    );
+    Ok(())
+}
+
 /// The payload is the Worker's to stamp. An endpoint that let an agent declare
 /// its own commits would be the declaring path DESIGN §5 rules out, so this
 /// asserts the absence deliberately rather than by accident.
