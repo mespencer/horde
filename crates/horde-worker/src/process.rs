@@ -420,13 +420,13 @@ impl Drop for SupervisedHarness {
 
 /// Appends one stderr line to a bounded tail, dropping the oldest.
 fn keep_tail(tail: &mut VecDeque<String>, mut line: String) {
-    if line.len() > STDERR_LINE_BYTES {
-        let mut cut = STDERR_LINE_BYTES;
-        while !line.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        line.truncate(cut);
-    }
+    // The longest char-boundary prefix within the bound (a short line is
+    // its own boundary, so it is kept whole).
+    let cut = (0..=STDERR_LINE_BYTES.min(line.len()))
+        .rev()
+        .find(|&index| line.is_char_boundary(index))
+        .unwrap_or_default();
+    line.truncate(cut);
     if tail.len() == STDERR_LINES {
         tail.pop_front();
     }
@@ -440,7 +440,9 @@ fn group_pid(pgid: u32) -> Option<Pid> {
     (raw > 1).then(|| Pid::from_raw(raw))
 }
 
-/// The leader's start time, as `ps` prints it — empty when `ps` cannot say.
+/// The leader's start time, as `ps` prints it — empty when `ps` cannot say
+/// (an absent pid prints nothing on stdout; with `lstart=` there is no
+/// header either).
 async fn leader_fingerprint(pid: u32) -> String {
     let probe = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
@@ -449,9 +451,7 @@ async fn leader_fingerprint(pid: u32) -> String {
         .kill_on_drop(true)
         .output();
     match tokio::time::timeout(FINGERPRINT_CEILING, probe).await {
-        Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        }
+        Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
         _ => String::new(),
     }
 }
@@ -600,6 +600,23 @@ mod tests {
 
         keep_tail(&mut tail, "short".to_owned());
         assert_eq!(tail.back().map(String::as_str), Some("short"));
+    }
+
+    /// The fingerprint is `ps`'s start-time string for a live process — the
+    /// shape a reboot-reused pid will not match — and empty for a pid that
+    /// does not exist.
+    #[tokio::test]
+    async fn a_fingerprint_is_the_start_time_of_a_live_process_only() {
+        let own = super::leader_fingerprint(std::process::id()).await;
+        assert!(
+            own.contains(':') && own.chars().any(|c| c.is_ascii_digit()),
+            "a start time like `Fri Oct 30 22:13:34 2026`, got {own:?}"
+        );
+        assert_eq!(
+            super::leader_fingerprint(999_999_999).await,
+            "",
+            "no process, no fingerprint"
+        );
     }
 
     /// 0 and 1 would broadcast (the caller's own group, init); neither is a

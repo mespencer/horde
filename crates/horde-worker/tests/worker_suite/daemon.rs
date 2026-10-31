@@ -506,4 +506,51 @@ async fn the_run_loop_redials_dial_failures_until_shutdown() {
         Some("shutdown reaped=0"),
         "the last word is the reap count: {lines:?}"
     );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("swept")),
+        "a clean state dir has nothing to sweep, and says nothing: {lines:?}"
+    );
+}
+
+/// Startup sweeps the harness groups a crashed previous run left in the
+/// journal (ADR-0010), before anything spawns, and says how many.
+#[tokio::test]
+async fn prepare_sweeps_a_crashed_runs_harness_groups() {
+    let state = tempfile::tempdir().expect("a temp dir");
+    let config = harness::insecure_config("http://127.0.0.1:1", "w-crashed", state.path());
+
+    // The previous run: a harness group journaled and never stopped.
+    let journal =
+        horde_worker::Journal::open(&state.path().join(horde_worker::startup::JOURNAL_FILE))
+            .expect("the journal opens");
+    let spec = horde_worker::process::HarnessSpec {
+        args: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
+        ledger: Some(std::sync::Arc::new(journal)),
+        ..horde_worker::process::HarnessSpec::new("/bin/sh")
+    };
+    let crashed = horde_worker::SupervisedHarness::spawn(&spec)
+        .await
+        .expect("spawns");
+    std::mem::forget(crashed);
+
+    let mut lines = Vec::new();
+    let prepared = horde_worker::startup::prepare(&config, &mut |line| lines.push(line))
+        .await
+        .expect("an insecure daemon prepares without a server");
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "swept 1 harness process group(s) a previous run left behind"),
+        "the sweep is announced with its count: {lines:?}"
+    );
+    assert!(
+        prepared
+            .journal
+            .harness_groups()
+            .await
+            .expect("readable")
+            .is_empty(),
+        "and the journal forgets what it swept"
+    );
 }

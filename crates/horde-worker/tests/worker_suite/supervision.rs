@@ -942,6 +942,26 @@ mod process_groups {
         );
     }
 
+    /// A dropped handle forgets its group too, so the next start does not
+    /// go looking for a group this run already took down.
+    #[tokio::test]
+    async fn a_dropped_handle_forgets_its_group() {
+        let journal = Journal::in_memory().expect("journal");
+        let (mut spec, _dir, _pidfile) = spec_with_grandchild();
+        spec.ledger = Some(Arc::new(journal.clone()));
+        let harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        assert_eq!(journal.harness_groups().await.expect("readable").len(), 1);
+
+        drop(harness);
+
+        within("the group is forgotten", async {
+            while !journal.harness_groups().await.expect("readable").is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
     /// The crash path: a group the Worker never stopped (its handle leaked,
     /// as a crashed process leaks everything) is swept by the next start's
     /// reap and forgotten — a second sweep finds nothing.

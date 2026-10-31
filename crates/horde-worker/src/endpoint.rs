@@ -336,14 +336,15 @@ impl EndpointManager {
 /// is no degraded mode — but it is the spawn that fails, loudly, never the
 /// Worker that panics.
 fn mint_token() -> Result<String, WorkerError> {
+    let refused = || {
+        WorkerError::EndpointUnavailable("the OS entropy source yielded no token bytes".to_owned())
+    };
     let mut bytes = [0_u8; 32];
-    let filled = getrandom::fill(&mut bytes).is_ok();
-    if filled && bytes.iter().any(|byte| *byte != 0) {
-        Ok(hex::encode(bytes))
+    getrandom::fill(&mut bytes).map_err(|_| refused())?;
+    if bytes == [0_u8; 32] {
+        Err(refused())
     } else {
-        Err(WorkerError::EndpointUnavailable(
-            "the OS entropy source yielded no token bytes".to_owned(),
-        ))
+        Ok(hex::encode(bytes))
     }
 }
 

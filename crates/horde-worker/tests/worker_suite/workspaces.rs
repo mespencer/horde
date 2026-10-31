@@ -514,6 +514,29 @@ async fn releasing_a_fresh_clone_pins_its_head_and_shared_roots_are_left_alone()
     );
 }
 
+/// A release that cannot remove the checkout says so: only "already gone"
+/// counts as released, and any other failure is reported, not swallowed —
+/// a silently surviving checkout is exactly the leak release exists to end.
+#[tokio::test]
+async fn a_checkout_that_cannot_be_removed_is_reported_not_swallowed() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
+    // A file where the agent's directory should be: removing it as a
+    // directory fails with something other than NotFound.
+    let agents = std::path::Path::new(&instance.root_path).join(".horde-agents");
+    std::fs::create_dir_all(&agents).expect("the agents dir");
+    let not_a_dir = agents.join("agent-1");
+    std::fs::write(&not_a_dir, "not a checkout").expect("writes");
+
+    let refused = manager.release_checkout(&not_a_dir).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("could not remove")),
+        "got {refused:?}"
+    );
+}
+
 /// A remote URL or branch shaped like an option is refused before git ever
 /// sees it — `--upload-pack=` on a clone runs a command — and a layout that
 /// would escape the instance degrades the report instead of cloning there.

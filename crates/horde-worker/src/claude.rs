@@ -662,10 +662,21 @@ mod tests {
         let root = scratch.path().join("claude");
 
         let plain = adapter
-            .harness_spec(&AgentSpec::default(), Vec::new())
+            .harness_spec(
+                &AgentSpec {
+                    cwd: Some(std::path::PathBuf::from("/checkout/agent-1")),
+                    ..AgentSpec::default()
+                },
+                Vec::new(),
+            )
             .expect("a launch");
         assert_eq!(plain.config_env_var, "CLAUDE_CONFIG_DIR");
         assert_eq!(plain.config_dir, Some(root.join("default")));
+        assert_eq!(
+            plain.cwd,
+            Some(std::path::PathBuf::from("/checkout/agent-1")),
+            "the agent runs in its checkout, not wherever the Worker runs"
+        );
 
         let bound = adapter
             .harness_spec(

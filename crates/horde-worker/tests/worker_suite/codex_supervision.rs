@@ -831,6 +831,41 @@ async fn an_interrupt_before_turn_started_is_read_cancels_rather_than_racing() {
     session.shutdown().await.expect("shuts down");
 }
 
+/// The other side of the race: with the last turn closed and its request
+/// answered, nothing is in flight, so an interrupt-delivered message is just
+/// a turn start — there is nothing to cancel, and parking it behind a
+/// `turn/interrupt` would wait forever for a turn that never closes.
+#[tokio::test]
+async fn an_interrupt_delivery_to_an_idle_session_just_starts_a_turn() {
+    let second = [
+        harness::turn_started("turn-2"),
+        harness::final_answer("turn-2", "i2", "SECOND"),
+        harness::turn_completed("turn-2"),
+    ]
+    .join("\n");
+    let script = [harness::basic_turn(), second].join("\n\n");
+    let (mut session, log_path, _dirs) = harness::logged_session(&script, None).await;
+    let (_, first) = events_through_turn_end(&mut session).await;
+    assert!(first.is_some(), "setup: the first turn closes");
+
+    session
+        .send(TurnInput::interrupting("one more thing"))
+        .await
+        .expect("sends");
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    assert_eq!(
+        outcome.and_then(|outcome| outcome.text).as_deref(),
+        Some("SECOND"),
+        "the message ran as its own turn at once"
+    );
+    let recorded = control_log_shows(&log_path, |log| log.contains("one more thing")).await;
+    assert!(
+        !recorded.contains("turn/interrupt"),
+        "nothing was running, so nothing is interrupted: {recorded}"
+    );
+    session.shutdown().await.expect("shuts down");
+}
+
 use interrupt_flow::{cancelled_then_replaced, interrupted_then_replaced_script};
 
 /// The interrupt-then-replace arrangement both interrupt-delivery tests

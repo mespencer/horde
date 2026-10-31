@@ -1313,6 +1313,7 @@ mod tests {
         adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
         let launch = adapter
             .harness_spec(&horde_adapter::AgentSpec {
+                cwd: Some(std::path::PathBuf::from("/checkout/agent-1")),
                 horde_endpoint: Some(McpEndpoint::Http {
                     url: "http://127.0.0.1:1/mcp".to_owned(),
                     headers: vec![("Authorization".to_owned(), "Bearer t".to_owned())],
@@ -1327,6 +1328,11 @@ mod tests {
             Some(scratch.path().join("codex").join("default"))
         );
         assert_eq!(&launch.args[..2], ["app-server", "--stdio"]);
+        assert_eq!(
+            launch.cwd,
+            Some(std::path::PathBuf::from("/checkout/agent-1")),
+            "the harness process runs in the agent's checkout"
+        );
         assert_eq!(
             launch.env,
             vec![
