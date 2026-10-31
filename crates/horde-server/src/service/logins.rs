@@ -254,21 +254,6 @@ where
     )))
 }
 
-/// The worker id a login stream speaks for: the certificate's principal
-/// when there is one, the request's claim on a plaintext channel — the same
-/// trust order as the forward stream's.
-pub(crate) fn login_worker_id(request: &Request<horde_proto::v1::StreamLoginsRequest>) -> String {
-    if let TunnelPrincipal::Worker(name) = super::forwards::tunnel_principal_of(request) {
-        return name;
-    }
-    request
-        .get_ref()
-        .worker_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default()
-}
-
 /// The login-dispatch stream's life: relay login requests as they arrive,
 /// until either side hangs up.
 pub(crate) async fn pump_logins(
@@ -585,22 +570,6 @@ mod tests {
             .expect("the driver ends on the refusal")
             .expect("no panic");
         assert!(login_kinds(&core).await.is_empty(), "no PTY ever lived");
-    }
-
-    /// The worker id a login stream speaks for, both sources: the request's
-    /// claim on a plaintext channel, and nothing when it names nobody — the
-    /// handler refuses an empty answer, so a defaulted or invented id here
-    /// is a stream registered under the wrong key.
-    #[test]
-    fn the_login_streams_worker_id_comes_from_the_request_on_plaintext() {
-        let named = tonic::Request::new(horde_proto::v1::StreamLoginsRequest {
-            worker_id: Some(horde_proto::v1::WorkerId::new("w9")),
-        });
-        assert_eq!(super::login_worker_id(&named), "w9");
-
-        let nameless =
-            tonic::Request::new(horde_proto::v1::StreamLoginsRequest { worker_id: None });
-        assert_eq!(super::login_worker_id(&nameless), "");
     }
 
     /// The dispatch pump, both directions of its life: requests cross into

@@ -559,6 +559,7 @@ fn permission_requested(agent: &str, request_id: &str) -> Event {
 async fn journal_permission_requests(
     harness: &mut Harness,
     session_id: &str,
+    agent_id: &str,
     request_ids: &[&str],
 ) -> Setup<()> {
     let (to_server, mut acks) = open_journal(harness, "worker-a", 0).await?;
@@ -569,7 +570,7 @@ async fn journal_permission_requests(
         events.push(JournaledEvent {
             journal_sequence: u64::try_from(index)? + 1,
             session_id: Some(SessionId::new(session_id)),
-            event: Some(permission_requested("agent-1", request_id)),
+            event: Some(permission_requested(agent_id, request_id)),
         });
     }
     to_server
@@ -588,8 +589,26 @@ async fn journal_permission_requests(
 /// id — the arrangement both answer-side tests start from.
 async fn harness_with_pending_permissions(request_ids: &[&str]) -> Setup<Harness> {
     let mut harness = connect_to(core()?).await?;
-    let (session_id, _) = seed(&mut harness, "perms", "key-1").await?;
-    journal_permission_requests(&mut harness, &session_id, request_ids).await?;
+    // The root lands on a worker whose harness rewrites tool input, so a
+    // narrowing has an adapter that can apply it (ADR-0009).
+    harness
+        .worker
+        .register_worker(RegisterWorkerRequest {
+            hello: crate::common::versioned_hello(),
+            worker_id: Some(WorkerId::new("rewriter")),
+            capabilities: Some(WorkerCapabilities {
+                harnesses: vec![horde_proto::v1::HarnessCapability {
+                    provider: "fake".to_owned(),
+                    installed: true,
+                    capabilities: vec![horde_proto::v1::AdapterCapability::ToolInputRewrite as i32],
+                    ..horde_proto::v1::HarnessCapability::default()
+                }],
+                ..WorkerCapabilities::default()
+            }),
+        })
+        .await?;
+    let (session_id, root) = seed(&mut harness, "perms", "key-1").await?;
+    journal_permission_requests(&mut harness, &session_id, &root, request_ids).await?;
     Ok(harness)
 }
 

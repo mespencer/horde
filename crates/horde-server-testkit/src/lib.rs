@@ -324,6 +324,7 @@ pub async fn seed_agent(
         occurred_at: None,
         idempotency_key: format!("{agent}:placed"),
         kind: Some(Kind::PlacementChanged(PlacementChanged {
+            adapter_capabilities: Vec::new(),
             placement: Some(Placement {
                 agent_id: Some(AgentId::new(agent)),
                 state: state.into(),

@@ -16,7 +16,9 @@ use horde_proto::v1::{
     send_message_request, upload_blob_request,
 };
 use horde_server_testkit::secure::{serve_secured_with_blob_store, within};
-use horde_server_testkit::{Setup, journal_event, seeded, serve, serve_with_blob_store};
+use horde_server_testkit::{
+    Setup, journal_event, journal_event_at, seeded, serve, serve_with_blob_store,
+};
 
 /// A served store and a blob client against it. The tempdir rides back so
 /// the test owns the store's files — and can corrupt them.
@@ -270,7 +272,7 @@ async fn the_control_plane_refuses_bulk_and_carries_the_threshold_exactly() -> S
 #[tokio::test]
 async fn the_worker_journal_refuses_bulk_and_accepts_references() -> Setup<()> {
     let endpoint = serve().await?;
-    let (_client, session_id, _root) = seeded(&endpoint, "journal-gate").await?;
+    let (mut client, session_id, _root) = seeded(&endpoint, "journal-gate").await?;
 
     let result_with = |attachment: Attachment, key: &str| Event {
         agent_id: None,
@@ -289,10 +291,11 @@ async fn the_worker_journal_refuses_bulk_and_accepts_references() -> Setup<()> {
         })),
     };
 
-    // Bulk: the server refuses the batch — the stream closes instead of
-    // acking, which `journal_event` reports as an error.
+    // Bulk: the server refuses the entry — and, since ADR-0009, records the
+    // refusal as a dead letter in its place rather than failing the batch,
+    // so the journal is acked past it instead of wedging on it.
     let over = vec![3u8; usize::try_from(INLINE_THRESHOLD_BYTES)? + 1];
-    let refused = within(
+    within(
         "the refusal",
         journal_event(
             &endpoint,
@@ -300,20 +303,64 @@ async fn the_worker_journal_refuses_bulk_and_accepts_references() -> Setup<()> {
             result_with(inline_attachment("core-dump.bin", &over), "bulk-1"),
         ),
     )
+    .await??;
+    assert!(
+        !kinds_in(&mut client, &session_id)
+            .await?
+            .contains(&"result_reported"),
+        "the bulk result did not land in the session"
+    );
+    let letters = kinds_in(
+        &mut client,
+        horde_server::service::ingest::DEAD_LETTER_STREAM,
+    )
     .await?;
-    assert!(refused.is_err(), "a journaled bulk event must be refused");
+    assert_eq!(
+        letters,
+        vec!["journal_event_refused"],
+        "the refusal is recorded"
+    );
 
-    // A reference to the same content is exactly what the log wants.
+    // A reference to the same content is exactly what the log wants — at the
+    // next journal position, since the refused one is now stored.
     let reference = Attachment {
         inline: Vec::new(),
         ..inline_attachment("core-dump.bin", &over)
     };
     within(
         "the accepted journal",
-        journal_event(&endpoint, &session_id, result_with(reference, "ref-1")),
+        journal_event_at(&endpoint, &session_id, 2, result_with(reference, "ref-1")),
     )
     .await??;
+    assert!(
+        kinds_in(&mut client, &session_id)
+            .await?
+            .contains(&"result_reported"),
+        "the reference landed"
+    );
     Ok(())
+}
+
+/// The kinds in a stream, in order, through the production replay path.
+async fn kinds_in(client: &mut horde_cli::Client, stream: &str) -> Setup<Vec<&'static str>> {
+    let mut kinds = Vec::new();
+    client
+        .sync(
+            &horde_cli::client::SyncOptions::new(stream),
+            |envelope| {
+                kinds.push(
+                    envelope
+                        .event
+                        .as_ref()
+                        .and_then(|event| event.kind.as_ref())
+                        .and_then(horde_proto::kind_field_name)
+                        .unwrap_or("empty"),
+                );
+            },
+            |_| {},
+        )
+        .await?;
+    Ok(kinds)
 }
 
 /// The wave-5 promise applied to blobs: transfer works for an enrolled

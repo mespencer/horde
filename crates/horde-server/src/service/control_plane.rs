@@ -604,6 +604,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<SendMessageRequest>,
     ) -> Result<Response<SendMessageResponse>, Status> {
         let actor = actor_of(&request);
+        let conduit = crate::trust::conduit_worker(&request);
         let request = request.into_inner();
         let agent_id = request
             .to_agent_id
@@ -614,6 +615,12 @@ impl ControlPlaneService for ControlPlane {
             .session_of_agent(&agent_id)
             .await
             .map_err(Status::from)?;
+        // A worker sends on behalf of one of its agents (ADR-0009): it may
+        // only reach sessions it is running an agent in.
+        if let Some(worker_id) = conduit.as_deref() {
+            let state = self.project(&session_id).await.map_err(Status::from)?;
+            conduit_may_message(&state, worker_id)?;
+        }
 
         let (kind, assignment_id) = match request.body {
             Some(send_message_request::Body::Assignment(mut assignment)) => {
@@ -716,11 +723,15 @@ impl ControlPlaneService for ControlPlane {
         for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
             let state = self.project(&session_id).await.map_err(Status::from)?;
             if let Some(pending) = state.pending_permissions.get(&request_id) {
-                found = Some((session_id, pending.agent_id.clone()));
+                let rewrites = state
+                    .agents
+                    .get(&pending.agent_id)
+                    .is_some_and(|agent| agent.rewrites_tool_input);
+                found = Some((session_id, pending.agent_id.clone(), rewrites));
                 break;
             }
         }
-        let (session_id, agent_id) = found.ok_or_else(|| {
+        let (session_id, agent_id, rewrites) = found.ok_or_else(|| {
             Status::from(ServerError::Invalid(format!(
                 "no permission request {request_id} is awaiting a decision"
             )))
@@ -738,6 +749,7 @@ impl ControlPlaneService for ControlPlane {
                 "a permission decision may only carry updated_input with outcome ALLOW".to_owned(),
             )));
         }
+        refuse_unappliable_narrowing(request.updated_input.is_some(), rewrites, &agent_id)?;
 
         let sequence = self
             .append_agent_event(
@@ -773,6 +785,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<SpawnAgentRequest>,
     ) -> Result<Response<SpawnAgentResponse>, Status> {
         let actor = actor_of(&request);
+        let conduit = crate::trust::conduit_worker(&request);
         let request = request.into_inner();
         let session_id = request
             .session_id
@@ -780,6 +793,19 @@ impl ControlPlaneService for ControlPlane {
             .map(ToString::to_string)
             .unwrap_or_default();
         let state = self.project(&session_id).await.map_err(Status::from)?;
+        // A worker spawns on behalf of one of its agents (ADR-0009): the
+        // parent must be named, and placed on the calling worker.
+        if let Some(worker_id) = conduit.as_deref() {
+            conduit_may_spawn(
+                &state,
+                request
+                    .parent_agent_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                worker_id,
+            )?;
+        }
 
         let parent = request
             .parent_agent_id
@@ -862,7 +888,7 @@ impl ControlPlaneService for ControlPlane {
         }
 
         let wire_placement = placement::wire_placement(&agent_id, &placement);
-        placement::append_placement(&self.core, &session_id, wire_placement.clone())
+        placement::append_placement(&self.core, &session_id, wire_placement.clone(), Some(&spec))
             .await
             .map_err(Status::from)?;
 
@@ -1625,6 +1651,80 @@ fn require_client_role<T>(request: &Request<T>, verb: &str) -> Result<(), Status
     Ok(())
 }
 
+/// Refuses a narrowing for an agent whose adapter cannot apply one
+/// (ADR-0009). Delivered anyway, the replacement arguments are either dropped
+/// — the unnarrowed call runs — or refused by the worker mid-turn; on Codex,
+/// which has no `TOOL_INPUT_REWRITE`, the latter took the worker down.
+///
+/// # Errors
+///
+/// `FailedPrecondition` naming the agent and the missing capability.
+fn refuse_unappliable_narrowing(
+    narrowing: bool,
+    rewrites_tool_input: bool,
+    agent_id: &str,
+) -> Result<(), Status> {
+    if narrowing && !rewrites_tool_input {
+        return Err(Status::failed_precondition(format!(
+            "agent {agent_id}'s adapter cannot rewrite tool input \
+             (no TOOL_INPUT_REWRITE), so a narrowed decision cannot be applied; \
+             allow or deny the call as proposed"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a worker may spawn under `parent` in `state`'s session: the
+/// parent must be named — a worker spawning a root-level agent would be
+/// acting for nobody — and placed on the calling worker.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the parent and the worker.
+fn conduit_may_spawn(
+    state: &SessionState,
+    parent: Option<&str>,
+    worker_id: &str,
+) -> Result<(), Status> {
+    let parent = parent.filter(|id| !id.is_empty()).ok_or_else(|| {
+        Status::permission_denied(format!(
+            "worker {worker_id} spawns only on behalf of one of its agents; name the parent"
+        ))
+    })?;
+    let placed_on = state
+        .agents
+        .get(parent)
+        .and_then(|agent| agent.worker_id.as_deref());
+    if crate::trust::holds_agent(placed_on, worker_id) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "agent {parent} is not placed on worker {worker_id}, which may not spawn for it"
+        )))
+    }
+}
+
+/// Whether a worker may message into `state`'s session: only when it is
+/// running one of that session's agents, the sender it speaks for.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the session and the worker.
+fn conduit_may_message(state: &SessionState, worker_id: &str) -> Result<(), Status> {
+    if state
+        .agents
+        .values()
+        .any(|agent| crate::trust::holds_agent(agent.worker_id.as_deref(), worker_id))
+    {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "worker {worker_id} runs no agent in session {} and may not message into it",
+            state.session_id
+        )))
+    }
+}
+
 // `uuid_like` lives in `service::shared` now that the forward verbs mint ids
 // too; re-imported here so every existing call site reads unchanged.
 use super::shared::uuid_like;
@@ -1666,6 +1766,83 @@ mod tests {
              attributing the wrong thing"
         );
         assert_eq!(actor_of(&request_as(None)), None);
+    }
+
+    /// The narrowing gate's table: only a narrowing for an agent that cannot
+    /// rewrite is refused, with a message naming the agent and the fix.
+    #[test]
+    fn a_narrowing_needs_an_agent_that_can_rewrite() {
+        assert!(super::refuse_unappliable_narrowing(false, false, "a").is_ok());
+        assert!(super::refuse_unappliable_narrowing(false, true, "a").is_ok());
+        assert!(super::refuse_unappliable_narrowing(true, true, "a").is_ok());
+        let refused = super::refuse_unappliable_narrowing(true, false, "agent-7")
+            .expect_err("a narrowing nobody can apply is refused");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("agent-7")
+                && refused.message().contains("TOOL_INPUT_REWRITE"),
+            "{}",
+            refused.message()
+        );
+    }
+
+    /// The conduit scopes, over a projected session: a worker spawns only
+    /// for a named parent it holds, and messages only into a session it
+    /// runs an agent in.
+    #[test]
+    fn a_worker_conduit_is_scoped_to_its_own_agents() {
+        use horde_proto::prost::Message;
+        use horde_proto::v1::{AgentId, AgentSpawned, Event, event::Kind};
+
+        let event = |kind: Kind| Event {
+            agent_id: Some(AgentId::new("parent")),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(kind),
+        };
+        let placed = crate::placement::wire_placement(
+            "parent",
+            &crate::scheduler::Placement::Placed {
+                worker_id: "w-1".to_owned(),
+            },
+        );
+        let events: Vec<crate::log::StoredEvent> = [
+            event(Kind::AgentSpawned(AgentSpawned::default())),
+            event(Kind::PlacementChanged(horde_proto::v1::PlacementChanged {
+                placement: Some(placed),
+                adapter_capabilities: Vec::new(),
+            })),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, event)| crate::log::StoredEvent {
+            session_id: "s1".to_owned(),
+            sequence: index as u64 + 1,
+            recorded_at_unix_ms: 0,
+            payload: event.encode_to_vec(),
+        })
+        .collect();
+        let state = crate::state::SessionState::project("s1", &events).expect("projects");
+
+        assert!(super::conduit_may_spawn(&state, Some("parent"), "w-1").is_ok());
+        for (parent, worker) in [
+            (Some("parent"), "w-2"),
+            (None, "w-1"),
+            (Some(""), "w-1"),
+            (Some("ghost"), "w-1"),
+        ] {
+            let refused = super::conduit_may_spawn(&state, parent, worker)
+                .expect_err("only the holding worker spawns for a named parent");
+            assert_eq!(
+                refused.code(),
+                tonic::Code::PermissionDenied,
+                "{parent:?} {worker}"
+            );
+        }
+        assert!(super::conduit_may_message(&state, "w-1").is_ok());
+        let refused = super::conduit_may_message(&state, "w-2")
+            .expect_err("a worker with no agent here cannot message into it");
+        assert!(refused.message().contains("s1"), "{}", refused.message());
     }
 
     /// The backing key follows the same rules as attribution, and it is the

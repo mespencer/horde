@@ -291,7 +291,9 @@ async fn an_interrupt_is_requested_once_and_acknowledged_once() {
         })
         .await;
 
-    system.cli_json(&["send", &root, "after the interrupt"]).await;
+    system
+        .cli_json(&["send", &root, "after the interrupt"])
+        .await;
     let events = system
         .sync_until(&session_id, "the post-interrupt echo", |events| {
             outputs(events)

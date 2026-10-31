@@ -67,6 +67,7 @@ pub(crate) async fn placed_expose(log: &EventLog, session: &str, agent: &str, wo
         &format!("{agent}:place"),
         agent,
         Kind::PlacementChanged(PlacementChanged {
+            adapter_capabilities: Vec::new(),
             placement: Some(Placement {
                 agent_id: Some(AgentId::new(agent)),
                 state: PlacementState::Placed as i32,

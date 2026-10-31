@@ -6,7 +6,7 @@
 //! exist *because* every one of them authenticates. Two listeners:
 //!
 //! * **main** — both gRPC spines (control plane and worker-facing), mTLS
-//!   required, every RPC passing `require_enrolled` so a revoked certificate
+//!   required, every RPC passing the trust door (`crate::trust::door`) so a revoked certificate
 //!   stops working at its next call — and the long-lived streams re-check
 //!   the same deny-list themselves, so revocation severs them too rather
 //!   than waiting for a reconnect;
@@ -63,28 +63,34 @@ pub async fn serve_main(
     let tls = horde_identity::tls::grpc_server_mtls(authority.credential(), authority.ca_pem());
     let Prebound { listener, addr } = prebound;
 
+    // Every guarded service sits behind the trust door (ADR-0009): enrolled
+    // and unrevoked, *and* of a role the called method admits.
     let control_plane = ControlPlaneServiceServer::with_interceptor(
         ControlPlane::with_enrollment(core.clone(), authority),
-        horde_identity::require_enrolled(deny.clone()),
+        crate::trust::door(deny.clone()),
     );
     // Blob transfer rides the same listener and the same enrolled door:
     // workers and clients both move attachments, so the service is
     // principal-agnostic rather than duplicated onto each spine.
     let blobs = BlobServiceServer::with_interceptor(
         crate::service::Blobs::new(core.blobs.clone()),
-        horde_identity::require_enrolled(deny.clone()),
+        crate::trust::door(deny.clone()),
     );
     let worker_facing = WorkerServiceServer::with_interceptor(
         // The deny-list rides into the service too: the per-RPC interceptor
         // cannot reach a stream already in flight, so the streams re-check it
         // themselves and are severed on revocation (fix a4).
         WorkerFacing::new(core).with_deny(deny.clone()),
-        horde_identity::require_enrolled(deny),
+        crate::trust::door(deny),
     );
 
     let router = tonic::transport::Server::builder()
         .tls_config(tls)
         .map_err(|e| ServerError::Internal(format!("mTLS configuration refused: {e}")))?
+        // The door rules by method path, which only this layer can see.
+        .layer(tower::util::MapRequestLayer::new(
+            crate::trust::stamp_rpc_path::<tonic::body::Body>,
+        ))
         .add_service(control_plane)
         .add_service(blobs)
         .add_service(worker_facing);

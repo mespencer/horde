@@ -76,15 +76,29 @@ pub fn require_enrolled(
     deny: RevocationList,
 ) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, Status> + Clone {
     move |mut request: tonic::Request<()>| {
-        let certificates = request.peer_certs();
-        let end_entity = certificates
-            .as_deref()
-            .and_then(|chain| chain.first())
-            .map(AsRef::as_ref);
-        let identity = admit(end_entity, &deny).map_err(Status::from)?;
+        let identity = admit_request(&request, &deny)?;
         request.extensions_mut().insert(identity);
         Ok(request)
     }
+}
+
+/// [`admit`] applied to the end-entity certificate a request's channel
+/// presented — the half of the door every interceptor shares, whatever
+/// policy it layers on top of "enrolled and unrevoked".
+///
+/// # Errors
+///
+/// The [`AdmitRefusal`], as the gRPC status a caller reacts to.
+pub fn admit_request<T>(
+    request: &tonic::Request<T>,
+    deny: &RevocationList,
+) -> Result<PeerIdentity, Status> {
+    let certificates = request.peer_certs();
+    let end_entity = certificates
+        .as_deref()
+        .and_then(|chain| chain.first())
+        .map(AsRef::as_ref);
+    admit(end_entity, deny).map_err(Status::from)
 }
 
 #[cfg(test)]

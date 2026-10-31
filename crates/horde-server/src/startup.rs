@@ -350,14 +350,14 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let core = ServerCore::new(log).with_blob_store(Arc::new(blob_store(config)?));
 
     // The permission chain driver (fix a5): the deterministic layers run in
-    // the deployed server, over an escalate-everything default registry —
-    // exactly what an unconfigured server should do with every request until
-    // §13's authoring layer exists. The judge stays a seam; a missing judge
+    // the deployed server, over the shipped registry (ADR-0009) — an agent's
+    // own orchestrator verbs allowed, everything else escalated — until §13's
+    // authoring layer exists. The judge stays a seam; a missing judge
     // already escalates.
     let permission_chain = ChainTask {
         task: crate::permission::spawn(
             &core.log,
-            Arc::new(crate::permission::PermissionModes::default()),
+            Arc::new(crate::permission::PermissionModes::shipped()),
             None,
         ),
     };

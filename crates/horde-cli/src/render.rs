@@ -2124,6 +2124,7 @@ mod tests {
     #[test]
     fn a_queued_placement_shows_the_reason_the_spawner_needs() {
         let queued = envelope(Some(Kind::PlacementChanged(PlacementChanged {
+            adapter_capabilities: Vec::new(),
             placement: Some(Placement {
                 agent_id: Some(AgentId::new("agent-1")),
                 state: PlacementState::Queued as i32,

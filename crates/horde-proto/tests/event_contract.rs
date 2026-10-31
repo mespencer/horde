@@ -10,12 +10,12 @@ use horde_proto::v1::{
     AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
     AgentResult, AgentSpawned, Assignment, AssignmentId, AssignmentSent, ClientId,
     EnrollmentCodeMinted, EnrollmentRevoked, Event, EventEnvelope, ForwardClosed, ForwardDirection,
-    ForwardId, ForwardOpened, ForwardSpec, IdentityEnrolled, McpHttpTransport, McpServerConfig,
-    McpServerConfigChanged, Note, NoteSent, Payload, PermissionDecided, PermissionDecision,
-    PermissionRequest, PermissionRequested, Placement, PlacementChanged, PlacementState,
-    ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged, SessionLifecycleState,
-    TurnInterrupted, UsageRecord, UsageRecorded, WorkerId, WorkerLoginEnded, WorkerLoginStarted,
-    WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
+    ForwardId, ForwardOpened, ForwardSpec, IdentityEnrolled, JournalEventRefused, McpHttpTransport,
+    McpServerConfig, McpServerConfigChanged, Note, NoteSent, Payload, PermissionDecided,
+    PermissionDecision, PermissionRequest, PermissionRequested, Placement, PlacementChanged,
+    PlacementState, ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged,
+    SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded, WorkerId, WorkerLoginEnded,
+    WorkerLoginStarted, WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
     WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
     mcp_server_config,
 };
@@ -41,6 +41,8 @@ use horde_proto::v1::{
 /// * Interactive logins (DESIGN §4): started and ended, in a reserved stream
 ///   like enrollment's. Audit trail only — a login is EPHEMERAL intent whose
 ///   liveness is the relay's in-memory pairing, never a fold over these.
+/// * Journal refusals (ADR-0009): a worker's journaled event the server
+///   would not append, recorded in its place as a dead letter.
 const EVENT_VOCABULARY: &[&str] = &[
     "agent_output_chunk",
     "agent_spawned",
@@ -65,6 +67,7 @@ const EVENT_VOCABULARY: &[&str] = &[
     "forward_closed",
     "worker_login_started",
     "worker_login_ended",
+    "journal_event_refused",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -96,6 +99,7 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::ForwardClosed(_) => "forward_closed",
         event::Kind::WorkerLoginStarted(_) => "worker_login_started",
         event::Kind::WorkerLoginEnded(_) => "worker_login_ended",
+        event::Kind::JournalEventRefused(_) => "journal_event_refused",
     }
 }
 
@@ -177,6 +181,7 @@ fn every_kind() -> Vec<event::Kind> {
                 worker_id: None,
                 reason: "no online worker with tag `gpu`".to_owned(),
             }),
+            adapter_capabilities: vec![horde_proto::v1::AdapterCapability::ToolInputRewrite.into()],
         }),
         event::Kind::TurnInterrupted(TurnInterrupted {
             requested_by: None,
@@ -252,6 +257,13 @@ fn every_kind() -> Vec<event::Kind> {
             worker_id: Some(WorkerId::new("mac-studio")),
             provider: "claude".to_owned(),
             reason: "the command exited with 0".to_owned(),
+        }),
+        event::Kind::JournalEventRefused(JournalEventRefused {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            journal_sequence: 42,
+            session_id: Some(SessionId::new("horde-mcp-catalog")),
+            kind: "mcp_server_config_changed".to_owned(),
+            reason: "mcp_server_config_changed is written only by the server".to_owned(),
         }),
     ]
 }
@@ -363,7 +375,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 23] = [
+    let expected: [(&str, i32); 24] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -387,6 +399,7 @@ fn event_kind_tags_are_stable() {
         ("forward_closed", 30),
         ("worker_login_started", 31),
         ("worker_login_ended", 32),
+        ("journal_event_refused", 33),
     ];
 
     let expected: Vec<(String, i32)> = expected

@@ -207,9 +207,7 @@ impl CommandProjection {
             // request — that grew the log by thousands of rows a second
             // (ADR-0009). Origin is the discriminator because it is the one
             // fact about the row no journal can forge: the Server stamps it.
-            (Some(Kind::TurnInterrupted(interrupted)), Some(agent_id))
-                if is_request(global) =>
-            {
+            (Some(Kind::TurnInterrupted(interrupted)), Some(agent_id)) if is_request(global) => {
                 let Some(worker_id) = self.placed.get(&agent_id).cloned() else {
                     // An unplaced agent has no turn in flight to abort.
                     return Vec::new();
@@ -481,7 +479,9 @@ impl CommandProjection {
 /// than a panic: the RPC already refused unknown names, so hitting one
 /// means an older log, and the worker's default provider is the honest
 /// fallback.
-fn binding_for(spec: Option<&horde_proto::v1::AgentSpec>) -> Option<horde_proto::v1::ModelBinding> {
+pub(crate) fn binding_for(
+    spec: Option<&horde_proto::v1::AgentSpec>,
+) -> Option<horde_proto::v1::ModelBinding> {
     use horde_proto::v1::model_selection::Selection;
     match spec?.model.as_ref()?.selection.as_ref()? {
         Selection::Concrete(concrete) => Some(horde_proto::v1::ModelBinding {
@@ -798,6 +798,7 @@ mod tests {
             occurred_at: None,
             idempotency_key: String::new(),
             kind: Some(Kind::PlacementChanged(PlacementChanged {
+                adapter_capabilities: Vec::new(),
                 placement: Some(Placement {
                     agent_id: Some(AgentId::new(agent)),
                     state: state as i32,
@@ -1522,10 +1523,9 @@ mod tests {
 
         let issued = fold(&rows);
         assert!(
-            !issued.iter().any(|(_, response)| matches!(
-                response.command,
-                Some(Command::InterruptAgent(_))
-            )),
+            !issued
+                .iter()
+                .any(|(_, response)| matches!(response.command, Some(Command::InterruptAgent(_)))),
             "an acknowledgement is not a request: {issued:?}"
         );
     }

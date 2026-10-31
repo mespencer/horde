@@ -28,6 +28,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time", "process"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["server", "channel", "tls-ring"] }
+# The router layer that stamps each request's gRPC method path where the
+# trust door can read it (ADR-0009) — an interceptor never sees the URI.
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
@@ -42,7 +45,9 @@ horde-cli = { workspace = true }
 tempfile = "3.24.0"
 hyper-util = { version = "0.1", features = ["tokio"] }
 proptest = "1.9.0"
-tower = { version = "0.5", features = ["util"] }
+# The trust suite calls every guarded method by path with an empty body,
+# which needs a codec over `()` rather than a generated client per method.
+tonic-prost = "0.14.6"
 
 [[bin]]
 name = "horde-server"

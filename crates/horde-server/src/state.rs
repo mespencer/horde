@@ -49,6 +49,11 @@ pub struct AgentState {
     /// When the latest `Queued` placement was recorded, for queue-timeout
     /// expiry. Cleared by any other placement outcome.
     pub queued_at_unix_ms: Option<i64>,
+    /// Whether the adapter the agent was placed with can apply a narrowing's
+    /// replacement arguments (`TOOL_INPUT_REWRITE`, stamped on its latest
+    /// placement — ADR-0009). False until placed, and for placements that
+    /// predate the stamp: a narrowing nobody can prove applies is refused.
+    pub rewrites_tool_input: bool,
 }
 
 /// One permission request still awaiting its decision.
@@ -247,6 +252,7 @@ impl SessionState {
                 spec: spawned.spec,
                 placement_state: PlacementState::Unspecified,
                 queued_at_unix_ms: None,
+                rewrites_tool_input: false,
             },
         );
     }
@@ -282,6 +288,10 @@ impl SessionState {
                 PlacementState::try_from(placement.state).unwrap_or(PlacementState::Unspecified);
             agent.queued_at_unix_ms =
                 (agent.placement_state == PlacementState::Queued).then_some(recorded_at_unix_ms);
+            agent.rewrites_tool_input = agent.placement_state == PlacementState::Placed
+                && changed
+                    .adapter_capabilities
+                    .contains(&(horde_proto::v1::AdapterCapability::ToolInputRewrite as i32));
         }
     }
 
@@ -643,6 +653,7 @@ mod tests {
                 2,
                 Some("root"),
                 Kind::PlacementChanged(PlacementChanged {
+                    adapter_capabilities: Vec::new(),
                     placement: Some(Placement {
                         agent_id: Some(AgentId::new("root")),
                         state: PlacementState::Placed as i32,
@@ -672,6 +683,7 @@ mod tests {
                 sequence,
                 Some("root"),
                 Kind::PlacementChanged(PlacementChanged {
+                    adapter_capabilities: Vec::new(),
                     placement: Some(Placement {
                         agent_id: Some(AgentId::new("root")),
                         state: PlacementState::Queued as i32,
@@ -1283,6 +1295,7 @@ mod forward_fold_tests {
                     spec: None,
                     placement_state: horde_proto::v1::PlacementState::Unspecified,
                     queued_at_unix_ms: None,
+                    rewrites_tool_input: false,
                 },
             );
             agents

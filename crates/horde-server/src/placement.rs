@@ -181,12 +181,26 @@ pub fn wire_placement(agent_id: &str, placement: &Placement) -> horde_proto::v1:
 }
 
 /// Appends one placement outcome to its session's log.
+///
+/// A placed outcome is stamped with the adapter capabilities the agent will
+/// run with (ADR-0009), read from the worker's registration *now*, while it
+/// is known: `spec` names the agent's provider, which picks the harness.
+/// Stamping here, at the one append every placement goes through, is what
+/// keeps the capability a log fact the permission chain can fold.
 pub async fn append_placement(
     core: &ServerCore,
     session_id: &str,
     placement: horde_proto::v1::Placement,
+    spec: Option<&AgentSpec>,
 ) -> Result<u64, ServerError> {
     let agent_id = placement.agent_id.clone();
+    let adapter_capabilities = placement
+        .worker_id
+        .as_ref()
+        .filter(|_| placement.state == PlacementState::Placed as i32)
+        .and_then(|worker_id| core.workers.capabilities_of(&worker_id.to_string()))
+        .map(|capabilities| adapter_capabilities(&capabilities, spec))
+        .unwrap_or_default();
     append_server_event(
         &core.log,
         session_id,
@@ -197,10 +211,37 @@ pub async fn append_placement(
             idempotency_key: String::new(),
             kind: Some(Kind::PlacementChanged(horde_proto::v1::PlacementChanged {
                 placement: Some(placement),
+                adapter_capabilities,
             })),
         },
     )
     .await
+}
+
+/// The capabilities of the harness an agent with `spec` runs on, given what
+/// its worker advertises: the spec's provider when it names one (concretely
+/// or through a tier), else the worker's default — its first advertised
+/// harness, the one a spawn naming no provider gets. A provider the worker
+/// does not advertise yields nothing, which every reader treats as "can do
+/// none of it".
+#[must_use]
+pub fn adapter_capabilities(
+    capabilities: &horde_proto::v1::WorkerCapabilities,
+    spec: Option<&AgentSpec>,
+) -> Vec<i32> {
+    let provider = crate::service::commands::binding_for(spec)
+        .map(|binding| binding.provider)
+        .filter(|provider| !provider.is_empty());
+    let harness = match provider {
+        Some(provider) => capabilities
+            .harnesses
+            .iter()
+            .find(|harness| harness.provider == provider),
+        None => capabilities.harnesses.first(),
+    };
+    harness
+        .map(|harness| harness.capabilities.clone())
+        .unwrap_or_default()
 }
 
 /// Records the prewarm the command fold turns into a materialize command,
@@ -321,6 +362,7 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
                                 worker_id: worker_id.clone(),
                             },
                         ),
+                        Some(&spec),
                     )
                     .await?;
                     *load.entry(worker_id).or_insert(0) += 1;
@@ -330,6 +372,7 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
                         core,
                         &state.session_id,
                         wire_placement(&agent.agent_id, &queued),
+                        None,
                     )
                     .await?;
                 }
@@ -345,6 +388,7 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
                                 "queued for longer than the {timeout_ms}ms queue timeout"
                             ),
                         },
+                        None,
                     )
                     .await?;
                 }
@@ -377,6 +421,7 @@ pub async fn queue_lost_worker(core: &ServerCore, worker_id: &str) -> Result<(),
                     worker_id: None,
                     reason: format!("worker `{worker_id}` disconnected before the agent started"),
                 },
+                None,
             )
             .await?;
         }
@@ -534,6 +579,7 @@ mod tests {
             spec: Some(spec_with_timeout(0, 1_000_000)),
             placement_state: state,
             queued_at_unix_ms: queued_at,
+            rewrites_tool_input: false,
         }
     }
 
@@ -626,6 +672,7 @@ mod tests {
                     spec: None,
                     placement_state: PlacementState::Placed,
                     queued_at_unix_ms: None,
+                    rewrites_tool_input: false,
                 },
             );
         };
@@ -764,6 +811,7 @@ mod tests {
                     worker_id: "beta".to_owned(),
                 },
             ),
+            None,
         )
         .await
         .expect("place the parent");
