@@ -39,8 +39,7 @@ impl StoredIdentity {
     ///
     /// Any filesystem failure, with the path in the message.
     pub fn save(&self, directory: &Path) -> Result<(), IdentityError> {
-        std::fs::create_dir_all(directory)
-            .map_err(|e| IdentityError::io(directory.display().to_string(), e))?;
+        create_private_dir(directory)?;
         let write = |file: &str, contents: &str| {
             let path = directory.join(file);
             std::fs::write(&path, contents)
@@ -76,6 +75,187 @@ impl StoredIdentity {
             .iter()
             .all(|file| directory.join(file).is_file())
     }
+
+    /// Moves an existing identity directory aside as
+    /// `<dir>.backup-<unix_secs>` (with `-N` appended when that name is
+    /// taken), so a forced re-join never destroys the credential it
+    /// replaces. Returns where the old directory now lives.
+    ///
+    /// # Errors
+    ///
+    /// The rename failing, or a directory with no usable name.
+    pub fn back_up(directory: &Path, unix_secs: u64) -> Result<std::path::PathBuf, IdentityError> {
+        let name = directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                IdentityError::io(
+                    directory.display().to_string(),
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "no directory name"),
+                )
+            })?;
+        let stem = format!("{name}.backup-{unix_secs}");
+        let target = (0_u32..)
+            .map(|n| match n {
+                0 => directory.with_file_name(&stem),
+                n => directory.with_file_name(format!("{stem}-{n}")),
+            })
+            .find(|candidate| !candidate.exists())
+            .unwrap_or_else(|| directory.with_file_name(&stem));
+        std::fs::rename(directory, &target)
+            .map_err(|e| IdentityError::io(directory.display().to_string(), e))?;
+        Ok(target)
+    }
+}
+
+/// Creates `directory` (and any missing parents) owner-only, and tightens
+/// it to `0700` when it already existed: identity and state directories
+/// hold keys and journals, and a directory listing is itself a disclosure.
+///
+/// # Errors
+///
+/// Any filesystem failure, with the path in the message.
+pub fn create_private_dir(directory: &Path) -> Result<(), IdentityError> {
+    let context = || directory.display().to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .map_err(|e| IdentityError::io(context(), e))?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| IdentityError::io(context(), e))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(directory).map_err(|e| IdentityError::io(context(), e))
+    }
+}
+
+/// Refuses an endpoint that no later invocation could dial (ADR-0007,
+/// 2026-10-31 amendment): it must be `https://host:port`, with a real host
+/// that is not the unspecified address and a non-zero port. Checked before
+/// anything persists it, so a bad endpoint fails at the join that would
+/// have written it rather than at every dial after.
+///
+/// # Errors
+///
+/// [`IdentityError::InvalidEndpoint`], naming what was wrong.
+pub fn validate_endpoint(endpoint: &str) -> Result<(), IdentityError> {
+    let refuse = |reason| {
+        Err(IdentityError::InvalidEndpoint {
+            endpoint: endpoint.to_owned(),
+            reason,
+        })
+    };
+    let Some(authority) = endpoint.strip_prefix("https://") else {
+        return refuse("the control plane is mTLS-only, so it must start with https://");
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return refuse("it names no port");
+    };
+    if host.is_empty() || authority.contains('/') {
+        return refuse("it is not https://host:port");
+    }
+    if !port.parse::<u16>().is_ok_and(|port| port != 0) {
+        return refuse("its port is not a TCP port");
+    }
+    if crate::token::host_scope(host) == crate::token::HostScope::Unspecified {
+        return refuse("it names the unspecified address, which no peer can dial");
+    }
+    Ok(())
+}
+
+/// An exclusive, advisory lock on one state directory, held for as long as
+/// this value lives: how a second server, worker, or `horde up` on the same
+/// state learns that one is already running, from a fact the OS keeps
+/// rather than a port that happens to answer. The holder's pid is written
+/// into the file for the refusal to name. Released on drop — and by the OS
+/// when the holder dies, so a crash never leaves a stale lock.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl StateLock {
+    /// Takes the lock `<directory>/<name>` without waiting, creating the
+    /// directory owner-only if it is missing.
+    ///
+    /// # Errors
+    ///
+    /// [`IdentityError::StateHeld`] when another process holds it, naming
+    /// its pid; any filesystem failure otherwise.
+    pub fn acquire(directory: &Path, name: &str) -> Result<Self, IdentityError> {
+        use std::io::Write;
+
+        create_private_dir(directory)?;
+        let path = directory.join(name);
+        let mut file = open_lock_file(&path)?;
+        if let Err(error) = file.try_lock() {
+            return Err(held_or_io(&path, error));
+        }
+        // Rewritten only once held, so the pid in the file is the holder's.
+        let stamped = file
+            .set_len(0)
+            .and_then(|()| write!(file, "{}", std::process::id()));
+        stamped.map_err(|e| IdentityError::io(path.display().to_string(), e))?;
+        Ok(Self { _file: file, path })
+    }
+
+    /// Whether some live process holds `<directory>/<name>` right now. A
+    /// missing directory or file is "nobody", never an error: probing must
+    /// not create state.
+    #[must_use]
+    pub fn is_held(directory: &Path, name: &str) -> bool {
+        let path = directory.join(name);
+        if !path.is_file() {
+            return false;
+        }
+        match open_lock_file(&path) {
+            Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            Err(_) => false,
+        }
+    }
+
+    /// The lock file this value holds.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn open_lock_file(path: &Path) -> Result<std::fs::File, IdentityError> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| IdentityError::io(path.display().to_string(), e))
+}
+
+/// The refusal for a lock that would not take: held (naming the holder's
+/// pid when the file carries one), or a plain I/O failure.
+fn held_or_io(path: &Path, error: std::fs::TryLockError) -> IdentityError {
+    match error {
+        std::fs::TryLockError::WouldBlock => {
+            let holder = std::fs::read_to_string(path)
+                .ok()
+                .map(|pid| pid.trim().to_owned())
+                .filter(|pid| !pid.is_empty())
+                .map(|pid| format!(" (pid {pid})"))
+                .unwrap_or_default();
+            IdentityError::StateHeld {
+                path: path.display().to_string(),
+                holder,
+            }
+        }
+        std::fs::TryLockError::Error(e) => IdentityError::io(path.display().to_string(), e),
+    }
 }
 
 /// Persists the control-plane endpoint beside the credential (ADR-0007):
@@ -86,12 +266,16 @@ impl StoredIdentity {
 /// credential triple is complete without it — a directory holding only the
 /// three PEMs is still an identity, and must stay one.
 ///
+/// The endpoint is validated first ([`validate_endpoint`]): a stored
+/// endpoint is dialed by every later invocation, so nothing undialable is
+/// ever written.
+///
 /// # Errors
 ///
-/// Any filesystem failure, with the path in the message.
+/// An undialable endpoint, or any filesystem failure with the path.
 pub fn save_endpoint(directory: &Path, endpoint: &str) -> Result<(), IdentityError> {
-    std::fs::create_dir_all(directory)
-        .map_err(|e| IdentityError::io(directory.display().to_string(), e))?;
+    validate_endpoint(endpoint)?;
+    create_private_dir(directory)?;
     let path = directory.join(ENDPOINT_FILE);
     std::fs::write(&path, format!("{endpoint}\n"))
         .map_err(|e| IdentityError::io(path.display().to_string(), e))
@@ -116,7 +300,10 @@ pub fn load_endpoint(directory: &Path) -> Option<String> {
 /// Writes secret material with owner-only permissions.
 ///
 /// Written before tightening would leave a world-readable window; instead the
-/// file is created empty with the right mode first, then filled. Public
+/// file is created empty with the right mode first, then filled. A file that
+/// already existed keeps the mode it was created with, so the mode is set
+/// again on the open handle before any byte lands — a rewrite tightens a
+/// loose file rather than filling it. Public
 /// because the server's bootstrap-token file (ADR-0007) is the same shape of
 /// secret and must not grow a second permission story.
 ///
@@ -129,7 +316,7 @@ pub fn write_secret(path: &Path, contents: &str) -> Result<(), IdentityError> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -137,6 +324,8 @@ pub fn write_secret(path: &Path, contents: &str) -> Result<(), IdentityError> {
             .truncate(true)
             .mode(0o600)
             .open(path)
+            .map_err(|e| IdentityError::io(context(), e))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| IdentityError::io(context(), e))?;
         file.write_all(contents.as_bytes())
             .map_err(|e| IdentityError::io(context(), e))
@@ -242,6 +431,148 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// The rewrite half of the secret writer: a file that already existed
+    /// with a loose mode (a hand-copied key, an older build) is tightened
+    /// by the write, not filled at its old mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_rewrite_tightens_a_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let path = directory.path().join("secret");
+        std::fs::write(&path, "old").expect("writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosens");
+
+        super::write_secret(&path, "new").expect("rewrites");
+        let mode = std::fs::metadata(&path).expect("exists").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the rewrite tightened the file");
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), "new");
+    }
+
+    /// Identity directories are owner-only, created that way and tightened
+    /// when they pre-existed loose — parents included when created here.
+    #[cfg(unix)]
+    #[test]
+    fn identity_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("exists")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        let root = tempfile::tempdir().expect("a temp dir");
+        let nested = root.path().join("home/.horde/id");
+        identity().save(&nested).expect("saves");
+        assert_eq!(mode_of(&nested), 0o700);
+        assert_eq!(mode_of(&root.path().join("home/.horde")), 0o700);
+
+        let loose = root.path().join("loose");
+        std::fs::create_dir(&loose).expect("creates");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("loosens");
+        super::save_endpoint(&loose, "https://h:1").expect("saves");
+        assert_eq!(mode_of(&loose), 0o700, "a loose dir is tightened");
+    }
+
+    /// What may be persisted as an endpoint, as a table: only a dialable
+    /// `https://host:port` survives, and each refusal says why.
+    #[test]
+    fn only_a_dialable_https_endpoint_is_storable() {
+        for good in [
+            "https://horde.example:7777",
+            "https://10.0.0.5:7777/",
+            "https://[::1]:7777",
+            "https://127.0.0.1:1",
+        ] {
+            assert!(super::validate_endpoint(good).is_ok(), "{good}");
+        }
+        for (bad, why) in [
+            ("http://h:7777", "https://"),
+            ("h:7777", "https://"),
+            ("https://h", "no port"),
+            ("https://:7777", "host:port"),
+            ("https://h:7777/path", "host:port"),
+            ("https://h:0", "TCP port"),
+            ("https://h:http", "TCP port"),
+            ("https://0.0.0.0:7777", "unspecified"),
+            ("https://[::]:7777", "unspecified"),
+        ] {
+            let refused = super::validate_endpoint(bad).expect_err(bad);
+            assert!(refused.to_string().contains(why), "{bad}: {refused}");
+        }
+        let directory = tempfile::tempdir().expect("a temp dir");
+        assert!(super::save_endpoint(directory.path(), "https://0.0.0.0:7777").is_err());
+        assert_eq!(
+            super::load_endpoint(directory.path()),
+            None,
+            "a refused endpoint writes nothing"
+        );
+    }
+
+    /// A forced re-join's safety net: the old directory moves aside under a
+    /// timestamped name, a second backup in the same second gets its own
+    /// name, and nothing is lost.
+    #[test]
+    fn a_backup_moves_the_identity_aside_without_clobbering() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("id");
+        identity().save(&dir).expect("saves");
+
+        let first = StoredIdentity::back_up(&dir, 1_700_000_000).expect("backs up");
+        assert_eq!(first, root.path().join("id.backup-1700000000"));
+        assert!(!dir.exists(), "the original is moved, not copied");
+        assert!(StoredIdentity::exists(&first), "the backup is whole");
+
+        identity().save(&dir).expect("saves again");
+        let second = StoredIdentity::back_up(&dir, 1_700_000_000).expect("backs up again");
+        assert_eq!(second, root.path().join("id.backup-1700000000-1"));
+        assert!(StoredIdentity::exists(&first) && StoredIdentity::exists(&second));
+
+        let missing = StoredIdentity::back_up(&dir, 1).expect_err("nothing to move");
+        assert!(missing.to_string().contains("id"), "{missing}");
+        let nameless = StoredIdentity::back_up(std::path::Path::new("/"), 1).expect_err("no name");
+        assert!(nameless.to_string().contains("no directory name"), "{nameless}");
+    }
+
+    /// The state lock: one holder at a time, the refusal names the holder's
+    /// pid, probing never creates state, and dropping releases.
+    #[test]
+    fn a_state_lock_has_one_holder_until_dropped() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("state");
+        assert!(!super::StateLock::is_held(&dir, "server.lock"));
+        assert!(!dir.exists(), "a probe creates nothing");
+
+        let held = super::StateLock::acquire(&dir, "server.lock").expect("takes");
+        assert_eq!(held.path(), dir.join("server.lock"));
+        assert!(super::StateLock::is_held(&dir, "server.lock"));
+        assert!(
+            !super::StateLock::is_held(&dir, "worker.lock"),
+            "locks are per name"
+        );
+        let refused = super::StateLock::acquire(&dir, "server.lock").expect_err("one holder");
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("(pid {})", std::process::id())),
+            "the refusal names the holder: {refused}"
+        );
+
+        drop(held);
+        assert!(!super::StateLock::is_held(&dir, "server.lock"));
+        let _again = super::StateLock::acquire(&dir, "server.lock").expect("free again");
+
+        let blocked = root.path().join("file");
+        std::fs::write(&blocked, "x").expect("writes");
+        assert!(
+            super::StateLock::acquire(&blocked, "server.lock").is_err(),
+            "a file is no state directory"
+        );
     }
 
     #[test]

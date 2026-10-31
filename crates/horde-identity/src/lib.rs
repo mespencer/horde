@@ -28,6 +28,7 @@
 pub mod ca;
 pub mod clock;
 pub mod code;
+pub mod diagnosis;
 pub mod enroll;
 pub mod error;
 pub mod fingerprint;
@@ -45,5 +46,5 @@ pub use fingerprint::{JoinCode, certificate_fingerprint, fingerprint_of_pem};
 pub use interceptor::{admit_request, require_enrolled};
 pub use principal::{PeerIdentity, Principal, PrincipalRole, principal_of_pem};
 pub use revocation::RevocationList;
-pub use store::StoredIdentity;
-pub use token::{JoinToken, TokenError};
+pub use store::{StateLock, StoredIdentity};
+pub use token::{HostScope, JoinToken, TokenError};

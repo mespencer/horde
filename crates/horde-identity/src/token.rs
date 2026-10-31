@@ -104,6 +104,43 @@ impl JoinToken {
     }
 }
 
+/// Who can reach a host a token or endpoint names (ADR-0007, 2026-10-31
+/// amendment) — the fact minting checks before it hands a token to a
+/// machine that may not be this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostScope {
+    /// `0.0.0.0` or `::` — a bind address, never a dial target.
+    Unspecified,
+    /// `localhost` or a loopback address: this machine only.
+    Loopback,
+    /// Anything else: a name or address other machines may dial.
+    Routable,
+}
+
+/// The scope of one host, bracketed IPv6 included.
+#[must_use]
+pub fn host_scope(host: &str) -> HostScope {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => HostScope::Unspecified,
+        Ok(ip) if ip.is_loopback() => HostScope::Loopback,
+        Ok(_) => HostScope::Routable,
+        Err(_) if bare.eq_ignore_ascii_case("localhost") => HostScope::Loopback,
+        Err(_) => HostScope::Routable,
+    }
+}
+
+impl JoinToken {
+    /// Who can redeem this token, judged by the listener host it names.
+    #[must_use]
+    pub fn scope(&self) -> HostScope {
+        host_scope(self.host())
+    }
+}
+
 impl std::fmt::Display for JoinToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{PREFIX}{}/{}", self.host_port, self.code)
@@ -208,6 +245,35 @@ mod tests {
                 "every refusal teaches the form: {refused}"
             );
         }
+    }
+
+    /// Host scope as a table: bind addresses, this machine, everyone else.
+    #[test]
+    fn hosts_are_scoped_unspecified_loopback_or_routable() {
+        use super::{HostScope, host_scope};
+        for (host, scope) in [
+            ("0.0.0.0", HostScope::Unspecified),
+            ("[::]", HostScope::Unspecified),
+            ("::", HostScope::Unspecified),
+            ("127.0.0.1", HostScope::Loopback),
+            ("127.8.0.1", HostScope::Loopback),
+            ("[::1]", HostScope::Loopback),
+            ("localhost", HostScope::Loopback),
+            ("LocalHost", HostScope::Loopback),
+            ("10.0.0.5", HostScope::Routable),
+            ("[fe80::1]", HostScope::Routable),
+            ("horde.example", HostScope::Routable),
+        ] {
+            assert_eq!(host_scope(host), scope, "{host}");
+        }
+        assert_eq!(
+            JoinToken::new("0.0.0.0:7778", code()).scope(),
+            HostScope::Unspecified
+        );
+        assert_eq!(
+            JoinToken::new("box.lan:7778", code()).scope(),
+            HostScope::Routable
+        );
     }
 
     /// Surrounding whitespace is a paste artifact, not a different token.

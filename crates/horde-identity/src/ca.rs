@@ -141,8 +141,7 @@ impl CertificateAuthority {
     ///
     /// Any filesystem failure, with the path in the message.
     pub fn persist(&self, directory: &Path) -> Result<(), IdentityError> {
-        std::fs::create_dir_all(directory)
-            .map_err(|e| IdentityError::io(directory.display().to_string(), e))?;
+        crate::store::create_private_dir(directory)?;
         let cert_path = directory.join(CA_CERT_FILE);
         std::fs::write(&cert_path, &self.certificate_pem)
             .map_err(|e| IdentityError::io(cert_path.display().to_string(), e))?;
@@ -173,6 +172,19 @@ impl CertificateAuthority {
             issuer,
             certificate_pem,
         })
+    }
+
+    /// The root certificate a persisted CA in `directory` publishes, without
+    /// touching its key — what `horde up` compares an identity's `ca.pem`
+    /// against before trusting that the two belong together.
+    ///
+    /// # Errors
+    ///
+    /// The certificate file missing or unreadable.
+    pub fn persisted_certificate_pem(directory: &Path) -> Result<String, IdentityError> {
+        let cert_path = directory.join(CA_CERT_FILE);
+        std::fs::read_to_string(&cert_path)
+            .map_err(|e| IdentityError::io(cert_path.display().to_string(), e))
     }
 
     /// Whether a persisted CA exists in `directory`.
@@ -474,6 +486,12 @@ mod tests {
         ca.persist(directory.path()).expect("the CA persists");
 
         assert!(CertificateAuthority::exists(directory.path()));
+        assert_eq!(
+            CertificateAuthority::persisted_certificate_pem(directory.path())
+                .expect("the published root reads"),
+            ca.certificate_pem(),
+            "the root is readable without its key"
+        );
         let reloaded = CertificateAuthority::load(directory.path()).expect("the CA loads");
         assert_eq!(
             reloaded.certificate_pem(),
@@ -495,6 +513,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temp dir");
         assert!(!CertificateAuthority::exists(directory.path()));
         assert!(CertificateAuthority::load(directory.path()).is_err());
+        let missing = CertificateAuthority::persisted_certificate_pem(directory.path())
+            .expect_err("no root is published here");
+        assert!(missing.to_string().contains("ca.pem"), "{missing}");
     }
 
     /// A half-persisted CA — the state a crashed first start leaves — is no
@@ -562,5 +583,10 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "a CA key is not group/world readable");
+        let dir_mode = std::fs::metadata(directory.path())
+            .expect("the dir exists")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "the CA directory is owner-only");
     }
 }

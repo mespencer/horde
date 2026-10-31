@@ -47,6 +47,24 @@ pub enum IdentityError {
     #[error("a validity time is out of range")]
     TimeOutOfRange,
 
+    /// An endpoint refused before it is persisted (ADR-0007, 2026-10-31
+    /// amendment): a stored endpoint is dialed by every later invocation,
+    /// so a garbled one would fail far from the join that wrote it.
+    #[error("{endpoint:?} is not a storable endpoint: {reason}")]
+    InvalidEndpoint {
+        endpoint: String,
+        reason: &'static str,
+    },
+
+    /// A state directory another live process already holds.
+    #[error("{path} is held by another running process{holder}")]
+    StateHeld {
+        /// The lock file.
+        path: String,
+        /// `" (pid N)"` when the holder wrote its pid, else empty.
+        holder: String,
+    },
+
     /// Reading or writing identity material on disk.
     #[error("{context}: {source}")]
     Io {
