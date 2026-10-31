@@ -1217,6 +1217,46 @@ mod tests {
         );
     }
 
+    /// A storage failure — here a real one: another connection holds the
+    /// write lock past the busy timeout — fails the pass and leaves the
+    /// cursor on the row it could not settle, so the next pass settles it
+    /// instead of skipping it (ADR-0011).
+    #[tokio::test]
+    async fn a_storage_failure_is_retried_from_the_row_that_failed() {
+        let directory = tempfile::tempdir().expect("a dir");
+        let path = directory.path().join("horde.db");
+        let path_text = path.to_string_lossy().into_owned();
+        let log = EventLog::open(&path_text).expect("a file-backed log");
+        one_request(&log, Some(call("Read", "/workspace/a"))).await;
+
+        let blocker = rusqlite::Connection::open(&path).expect("a second connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the write lock is taken");
+
+        let mut driver = driver_over(&log, cautious(), None);
+        let failed = driver.catch_up().await;
+        assert!(
+            matches!(failed, Err(ServerError::Storage { .. })),
+            "a locked log fails the pass: {failed:?}"
+        );
+        let read = format!("{driver:?}");
+        assert!(
+            read.contains("row: 1"),
+            "the cursor stops before the request it could not settle: {read}"
+        );
+
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("the lock is released");
+        assert_eq!(
+            driver.catch_up().await.expect("the log is writable again"),
+            1,
+            "the retried row is settled now"
+        );
+        assert_eq!(decisions_in(&log, "s1").await.len(), 1);
+    }
+
     #[test]
     fn only_storage_failures_are_retried_from_the_same_row() {
         assert!(super::is_transient(&ServerError::Storage {

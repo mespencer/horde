@@ -245,6 +245,30 @@ impl MirrorStore {
 mod tests {
     use super::{MirrorError, MirrorStore, is_valid_repo_name};
 
+    /// Deletion: `retain_only` unregisters exactly the names outside `keep`,
+    /// reports exactly those, and leaves the kept ones served.
+    #[test]
+    fn retain_only_unregisters_and_reports_exactly_what_left() {
+        let store = MirrorStore::new(std::path::PathBuf::from("/nonexistent/relay"));
+        for name in ["kept", "gone-a", "gone-b"] {
+            store
+                .register(name, &format!("https://git.example/{name}.git"))
+                .expect("a valid name registers");
+        }
+        let keep: std::collections::BTreeSet<String> = ["kept".to_owned()].into();
+        assert_eq!(
+            store.retain_only(&keep),
+            vec!["gone-a".to_owned(), "gone-b".to_owned()]
+        );
+        assert!(store.registered("kept").is_some());
+        assert!(store.registered("gone-a").is_none());
+        assert!(store.registered("gone-b").is_none());
+        assert!(
+            store.retain_only(&keep).is_empty(),
+            "nothing left to remove the second time"
+        );
+    }
+
     /// The names that may become path segments, and the shapes of hostile or
     /// broken ones that must not.
     #[test]

@@ -23,9 +23,10 @@ a late journal from an agent's former placement dead-lettered. This ADR
 closes all of them in seven decisions.
 
 **A worker is alive on a lease.** Liveness has three layers. HTTP/2
-keepalive runs on both ends (`horde_server::transport::keepalive`,
-`horde_worker::client::keepalive`: ping every 20 s, dead after 10 s
-unanswered, the worker pinging even while idle), so a half-open connection
+keepalive runs on both ends (the main listener in
+`horde_server::transport::serve_main` and the worker's channel in
+`horde_worker::client`: ping every 20 s, dead after 10 s unanswered, the
+worker pinging even while idle), so a half-open connection
 becomes a transport error instead of an eternal wait. The server's command
 stream pump selects on `sender.closed()` beside the next batch, so the moment
 the transport drops a response stream the worker leaves the registry —

@@ -290,6 +290,27 @@ async fn the_workspace_verbs_round_trip_through_the_dispatch() {
         "the listing is the registry's truth, not a fabrication"
     );
 
+    // The reset verb (ADR-0011) crosses the wire and answers with what the
+    // server journaled: the first event of the reserved reset stream, at the
+    // floor of a worker that never journaled anything.
+    let reset = client
+        .reset_worker_journal("w-9", "disk replaced")
+        .await
+        .expect("the reset answers");
+    assert_eq!((reset.sequence, reset.journal_floor), (1, 0));
+    invoke(&endpoint, &["worker", "reset", "w-9", "--reason", "again"])
+        .await
+        .expect("the CLI verb runs");
+    assert_eq!(
+        client
+            .reset_worker_journal("w-9", "")
+            .await
+            .expect("a third reset answers")
+            .sequence,
+        3,
+        "the CLI verb journaled the second reset"
+    );
+
     let refreshed = client
         .get_workspace_definition(&id)
         .await

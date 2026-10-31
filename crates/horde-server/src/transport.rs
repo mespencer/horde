@@ -54,22 +54,6 @@ pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// How long a ping may go unanswered before the connection is declared dead.
 pub const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// HTTP/2 keepalive on a server builder (ADR-0011).
-///
-/// Without it a peer that vanished without a FIN — a laptop lid, a pulled
-/// cable, a NAT that forgot the mapping — leaves a half-open connection the
-/// server never notices: its streams' senders never close, the worker stays
-/// registered, and its agents stay placed on a machine nobody can reach.
-/// A ping that goes unanswered tears the connection down, which closes every
-/// stream on it and lets `sender.closed()` (and so the worker-lost lease)
-/// see the death within `KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT`.
-#[must_use]
-pub fn keepalive(builder: tonic::transport::Server) -> tonic::transport::Server {
-    builder
-        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
-        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
-}
-
 /// Binds the main mTLS listener: both spines, every RPC behind the enrolled
 /// door.
 ///
@@ -106,7 +90,17 @@ pub async fn serve_main(
         crate::trust::door(deny),
     );
 
-    let router = keepalive(tonic::transport::Server::builder())
+    // HTTP/2 keepalive (ADR-0011). Without it a peer that vanished without a
+    // FIN — a laptop lid, a pulled cable, a NAT that forgot the mapping —
+    // leaves a half-open connection the server never notices: its streams'
+    // senders never close, the worker stays registered, and its agents stay
+    // placed on a machine nobody can reach. An unanswered ping tears the
+    // connection down, which closes every stream on it and lets
+    // `sender.closed()` (and so the worker-lost lease) see the death within
+    // `KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT`.
+    let router = tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .tls_config(tls)
         .map_err(|e| ServerError::Internal(format!("mTLS configuration refused: {e}")))?
         // The door rules by method path, which only this layer can see.

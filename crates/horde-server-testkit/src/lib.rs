@@ -129,7 +129,9 @@ pub async fn serve_core(core: ServerCore) -> Setup<String> {
     tokio::spawn(async move {
         // The production keepalive, so a dead peer is noticed here the way
         // it is behind the mTLS door (ADR-0011).
-        let _ = horde_server::transport::keepalive(tonic::transport::Server::builder())
+        let _ = tonic::transport::Server::builder()
+            .http2_keepalive_interval(Some(horde_server::transport::KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(horde_server::transport::KEEPALIVE_TIMEOUT))
             .add_service(ControlPlaneServiceServer::new(ControlPlane::new(
                 core.clone(),
             )))

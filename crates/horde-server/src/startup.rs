@@ -412,10 +412,7 @@ async fn reconciled_core(config: &ServeConfig, log: EventLog) -> Result<ServerCo
                 .worker_lease
                 .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
         );
-    let away = crate::liveness::reconcile_at_boot(&core).await?;
-    if !away.is_empty() {
-        tracing::info!(?away, "awaiting workers the log places agents on");
-    }
+    crate::liveness::reconcile_at_boot(&core).await?;
     Ok(core)
 }
 

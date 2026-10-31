@@ -289,16 +289,13 @@ pub async fn reconcile_at_boot(core: &ServerCore) -> Result<Vec<String>, ServerE
         }
     }
     for worker_id in &away {
+        tracing::info!(worker_id, "boot found agents on a worker not connected");
         placement::queue_lost_worker(core, worker_id).await?;
         start_lease(core, worker_id, core.workers.epoch_of(worker_id));
     }
-    if !away.is_empty() {
-        tracing::info!(
-            workers = away.len(),
-            "boot found agents on workers not connected"
-        );
-        placement::place_queued(core).await?;
-    }
+    // A pass at boot, whatever was found: what the re-queue freed lands on
+    // whichever worker is already here, and overdue queued spawns expire.
+    placement::place_queued(core).await?;
     Ok(away.into_iter().collect())
 }
 
@@ -410,6 +407,19 @@ mod tests {
             loss_of(&agent(PlacementState::Placed, None, L::Running), "w1"),
             Loss::Untouched
         );
+    }
+
+    /// The reset stream is reserved: no session listing, no placement pass,
+    /// and no all-sessions net ever treats it as a session.
+    #[test]
+    fn the_worker_journal_stream_is_reserved() {
+        assert!(super::is_worker_journal_stream(
+            super::WORKER_JOURNAL_STREAM
+        ));
+        assert!(!super::is_worker_journal_stream("session-1"));
+        assert!(crate::enrollment::is_reserved_stream(
+            super::WORKER_JOURNAL_STREAM
+        ));
     }
 
     #[test]
@@ -598,6 +608,25 @@ mod log_tests {
             "re-queued at once, as any disconnect does"
         );
         placement_becomes(&core, "running", PlacementState::Lost).await;
+    }
+
+    /// The boot pass re-places what the reconcile freed onto a worker that
+    /// is already here.
+    #[tokio::test]
+    async fn boot_re_places_freed_agents_on_a_worker_already_here() {
+        let core = core();
+        core.workers
+            .register("here", horde_proto::v1::WorkerCapabilities::default());
+        placed_for_test(&core, "s1", "starting", "gone").await;
+        lifecycle(&core, "starting", AgentLifecycleState::Starting).await;
+
+        super::reconcile_at_boot(&core).await.expect("reconcile");
+        let state = session(&core).await;
+        assert_eq!(
+            state.agents["starting"].placement_state,
+            PlacementState::Placed
+        );
+        assert_eq!(state.agents["starting"].worker_id.as_deref(), Some("here"));
     }
 
     /// Nothing to reconcile when every placed agent's worker is connected.

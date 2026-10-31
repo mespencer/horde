@@ -102,9 +102,17 @@ impl DialConfig {
     /// The TLS domain is the endpoint's own host: the name the operator
     /// dialed is the name the Server's credential must answer for.
     async fn channel(&self) -> Result<Channel, WorkerError> {
-        let endpoint = keepalive(tonic::transport::Endpoint::from_shared(
-            self.endpoint.clone(),
-        )?);
+        // HTTP/2 keepalive (ADR-0011). The command stream is a long read with
+        // nothing to send: across a half-open connection (a NAT that forgot
+        // the mapping, a server host that died without a FIN) it would wait
+        // forever for a command that cannot arrive, never redialing. Pinging
+        // while idle turns that silence into a transport error inside
+        // `KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT`, which the daemon's fate
+        // table already treats as "redial".
+        let endpoint = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true);
         let endpoint = match &self.identity {
             Some(identity) => {
                 let domain = endpoint.uri().host().unwrap_or("localhost").to_owned();
@@ -121,22 +129,6 @@ pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 
 /// How long a ping may go unanswered before the channel is declared dead.
 pub const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// HTTP/2 keepalive on the Worker's channel (ADR-0011).
-///
-/// The Worker's command stream is a long read with nothing to send: across a
-/// half-open connection (a NAT that forgot the mapping, a server host that
-/// died without a FIN) it would wait forever for a command that cannot
-/// arrive, never redialing. Pinging while idle turns that silence into a
-/// transport error inside `KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT`, which the
-/// daemon's fate table already treats as "redial".
-#[must_use]
-pub fn keepalive(endpoint: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
-    endpoint
-        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-        .keep_alive_while_idle(true)
-}
 
 /// One registered connection to the Server.
 #[derive(Debug, Clone)]
