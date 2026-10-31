@@ -324,6 +324,298 @@ async fn a_local_servers_tool_rides_the_same_endpoint_and_the_same_chain() {
     );
 }
 
+// -- One tool call, one gate -------------------------------------------------
+//
+// Each harness gates an MCP tool call on its own side before the `tools/call`
+// reaches this endpoint, and the endpoint gates proxied calls too. These pin
+// that the two gates are one permission event: one request in the log, one
+// answer from a human, one tool name a rule has to match.
+
+/// Every distinct permission request in the log, as `(request_id, tool_name)`.
+/// Distinct, because the chain's enriched re-raise repeats an escalated
+/// request under its own id — that is the same question, not a second one.
+async fn requests(stack: &Stack) -> Setup<Vec<(String, String)>> {
+    let mut client = stack.horde.client().await?;
+    let mut seen: Vec<(String, String)> = Vec::new();
+    client
+        .sync(
+            &horde_cli::client::SyncOptions::new(stack.horde.session_id.clone()),
+            |envelope| {
+                let Some(horde_proto::v1::event::Kind::PermissionRequested(requested)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                else {
+                    return;
+                };
+                let Some(request) = requested.request.as_ref() else {
+                    return;
+                };
+                let id = request
+                    .request_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let tool = request
+                    .tool_call
+                    .as_ref()
+                    .map(|call| call.tool_name.clone())
+                    .unwrap_or_default();
+                if !seen.iter().any(|(known, _)| *known == id) {
+                    seen.push((id, tool));
+                }
+            },
+            |_| {},
+        )
+        .await?;
+    Ok(seen)
+}
+
+/// A `tools/call` carrying `meta`, the way a harness sends one.
+async fn call_with_meta(
+    stack: &Stack,
+    name: &str,
+    arguments: serde_json::Value,
+    meta: serde_json::Value,
+) -> Setup<serde_json::Value> {
+    stack
+        .client
+        .rpc(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments, "_meta": meta },
+        }))
+        .await
+}
+
+/// The `_meta` codex stamps on every `tools/call` (transcript 17's stub log).
+fn codex_meta() -> serde_json::Value {
+    serde_json::json!({
+        "x-codex-turn-metadata": {"thread_id": "th-1", "turn_id": "tu-1"},
+        "progressToken": 1,
+    })
+}
+
+/// Journals a codex elicitation the way the Worker does — under the item id
+/// and `horde/{tool}` — and answers it as a human would.
+async fn elicited_and_answered(
+    stack: &Stack,
+    item_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    outcome: horde_proto::v1::PermissionOutcome,
+) -> Setup<()> {
+    let call = horde_adapter::permission::ProposedToolCall {
+        tool_call_id: horde_adapter::ToolCallId::new(item_id),
+        tool_name: tool_name.to_owned(),
+        input: arguments,
+    };
+    let agent_id = stack.horde.agent_id.clone();
+    stack
+        .horde
+        .journal()
+        .record(horde_mcp::journal::JournalEntry {
+            session_id: stack.horde.session_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            idempotency_key: format!("{agent_id}:{item_id}:requested"),
+            kind: horde_proto::v1::event::Kind::PermissionRequested(
+                horde_proto::v1::PermissionRequested {
+                    request: Some(horde_proto::v1::PermissionRequest {
+                        request_id: Some(horde_proto::v1::PermissionRequestId::new(item_id)),
+                        agent_id: Some(horde_proto::v1::AgentId::new(agent_id)),
+                        tool_call: Some(horde_wire::permission::proposed_tool_call_to_wire(&call)?),
+                        ..horde_proto::v1::PermissionRequest::default()
+                    }),
+                },
+            ),
+        })
+        .await?;
+    let mut answering = stack.horde.client().await?;
+    answering
+        .answer_permission(horde_cli::client::PermissionAnswer {
+            request_id: item_id,
+            outcome,
+            reason: "answered at the elicitation",
+            remember_for_session: false,
+            updated_input: None,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Answers the first request raised under `tool_name`, found by watching the
+/// log the way an approver's client does.
+async fn answer_when_raised(stack: &Stack, tool_name: &str) -> Setup<String> {
+    let mut client = stack.horde.client().await?;
+    let mut stream = client
+        .follow(&horde_cli::client::SyncOptions::new(
+            stack.horde.session_id.clone(),
+        ))
+        .await?;
+    let wanted = tool_name.to_owned();
+    let request_id = within(
+        "the endpoint's raise appears in the log",
+        stream.next_matching(move |envelope| {
+            let Some(horde_proto::v1::event::Kind::PermissionRequested(requested)) =
+                envelope.event.as_ref()?.kind.as_ref()
+            else {
+                return None;
+            };
+            let request = requested.request.as_ref()?;
+            (request.tool_call.as_ref()?.tool_name == wanted)
+                .then(|| request.request_id.as_ref().map(ToString::to_string))?
+        }),
+    )
+    .await?
+    .ok_or("the raise never appeared")?;
+    client
+        .answer_permission(horde_cli::client::PermissionAnswer::allow(&request_id))
+        .await?;
+    Ok(request_id)
+}
+
+/// Codex asked first: the elicitation's decision covers the call, so the
+/// endpoint forwards it without a second request — the human answered once.
+#[tokio::test]
+async fn a_codex_call_its_elicitation_already_decided_is_not_gated_again() {
+    let stack = stack().await.expect("every hop must come up");
+    let arguments = serde_json::json!({"message": "asked once"});
+    elicited_and_answered(
+        &stack,
+        "item-codex-1",
+        "horde/linear__echo",
+        arguments.clone(),
+        horde_proto::v1::PermissionOutcome::Allow,
+    )
+    .await
+    .expect("the elicitation is raised and answered");
+
+    let rpc = within(
+        "the elicited call is forwarded",
+        call_with_meta(&stack, "linear__echo", arguments, codex_meta()),
+    )
+    .await
+    .expect("the call answers");
+    assert_eq!(
+        rpc["result"]["content"][0]["text"], "echo:asked once",
+        "the elicitation's allow lets the call through: {rpc}"
+    );
+    assert_eq!(
+        requests(&stack).await.expect("the log is readable"),
+        vec![("item-codex-1".to_owned(), "horde/linear__echo".to_owned())],
+        "one call, one request: the endpoint must not ask again"
+    );
+}
+
+/// A refusal at the elicitation is the call's refusal too, even if a
+/// `tools/call` arrives anyway.
+#[tokio::test]
+async fn a_codex_call_its_elicitation_denied_stays_denied() {
+    let stack = stack().await.expect("every hop must come up");
+    let arguments = serde_json::json!({"message": "refused"});
+    elicited_and_answered(
+        &stack,
+        "item-codex-2",
+        "horde/linear__echo",
+        arguments.clone(),
+        horde_proto::v1::PermissionOutcome::Deny,
+    )
+    .await
+    .expect("the elicitation is raised and answered");
+
+    let rpc = within(
+        "the refused call answers",
+        call_with_meta(&stack, "linear__echo", arguments, codex_meta()),
+    )
+    .await
+    .expect("a denial is an answer");
+    assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+    assert_eq!(
+        requests(&stack).await.expect("the log is readable").len(),
+        1,
+        "the denial is not re-asked"
+    );
+}
+
+/// A codex call nobody asked about is gated here — and under the name its
+/// elicitation would have carried, so one rule covers the tool either way.
+#[tokio::test]
+async fn an_unasked_codex_call_is_gated_once_under_the_elicitation_name() {
+    let stack = stack().await.expect("every hop must come up");
+    let (rpc, answered) = tokio::join!(
+        within(
+            "the gated call answers once allowed",
+            call_with_meta(
+                &stack,
+                "linear__echo",
+                serde_json::json!({"message": "unasked"}),
+                codex_meta(),
+            ),
+        ),
+        answer_when_raised(&stack, "horde/linear__echo"),
+    );
+    let rpc = rpc.expect("the call answers");
+    let answered = answered.expect("the raise is answered");
+    assert_eq!(rpc["result"]["content"][0]["text"], "echo:unasked", "{rpc}");
+    assert_eq!(
+        requests(&stack).await.expect("the log is readable"),
+        vec![(answered, "horde/linear__echo".to_owned())],
+        "gated exactly once, under the canonical codex name"
+    );
+}
+
+/// Claude's half of the same rule: `approve` decides under the tool-use id,
+/// and the `tools/call` stamped with that id is a keyed replay, not a second
+/// question.
+#[tokio::test]
+async fn a_claude_call_its_approve_already_decided_is_not_gated_again() {
+    let stack = stack().await.expect("every hop must come up");
+    let arguments = serde_json::json!({"message": "approved once"});
+    let (approved, answered) = tokio::join!(
+        within(
+            "approve is decided",
+            stack.client.call_tool(
+                "approve",
+                serde_json::json!({
+                    "tool_name": "mcp__horde__linear__echo",
+                    "input": arguments.clone(),
+                    "tool_use_id": "toolu_once",
+                }),
+            ),
+        ),
+        answer_when_raised(&stack, "mcp__horde__linear__echo"),
+    );
+    answered.expect("the approve-stage raise is answered");
+    let approved: serde_json::Value =
+        serde_json::from_str(&approved.expect("approve decides")).expect("a JSON decision");
+    assert_eq!(approved["behavior"], "allow");
+
+    let rpc = within(
+        "the approved call is forwarded",
+        call_with_meta(
+            &stack,
+            "linear__echo",
+            arguments,
+            serde_json::json!({"claudecode/toolUseId": "toolu_once"}),
+        ),
+    )
+    .await
+    .expect("the call answers");
+    assert_eq!(
+        rpc["result"]["content"][0]["text"], "echo:approved once",
+        "{rpc}"
+    );
+    assert_eq!(
+        requests(&stack).await.expect("the log is readable"),
+        vec![(
+            "toolu_once".to_owned(),
+            "mcp__horde__linear__echo".to_owned()
+        )],
+        "one call, one request"
+    );
+}
+
 /// `get_tool` is rmcp's own validation hook, and it must agree with the
 /// listing: a verb by name, a visible proxied tool by its namespaced name,
 /// and nothing for a name outside this agent's surface.

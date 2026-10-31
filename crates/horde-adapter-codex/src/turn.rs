@@ -4,11 +4,13 @@
 //! traps spike W2c measured live here, because each is a place where following
 //! the protocol's apparent shape produces a bug that only shows under load.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use horde_adapter::permission::{PermissionDenial, ProposedToolCall};
-use horde_adapter::usage::{HeadroomSource, RateWindow, TokenUsage, UsageDelta, Utilization};
+use horde_adapter::usage::{
+    HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
+};
 use horde_adapter::{
     AgentEvent, OutputChannel, ProviderSessionId, ToolCallId, TurnId, TurnOutcome, TurnStatus,
 };
@@ -31,13 +33,17 @@ pub struct TurnAssembler {
     thread_id: Option<String>,
     model: Option<String>,
     turn: Option<OpenTurn>,
-    /// `(turnId, itemId)` pairs whose usage has already been counted.
+    /// The thread's running `total`, differenced into per-reading deltas.
     ///
-    /// The resume trap: `thread/resume` replays the previous turn's
-    /// `thread/tokenUsage/updated` before the new turn's (transcript 16), so an
-    /// assembler that simply added what it saw would bill the prior turn again
-    /// on every revival.
-    counted_usage: HashSet<(String, String)>,
+    /// Codex sends one `thread/tokenUsage/updated` per *model call*, not per
+    /// turn: `last` is that one call and `total` is the thread's running sum
+    /// (transcript 33 — six readings in one turn, `last` summing exactly to
+    /// `total`). Differencing `total` counts every call once with no identity
+    /// to dedupe on, and it is what makes the resume trap harmless:
+    /// `thread/resume` replays the previous turn's reading (transcript 16),
+    /// which seeds the baseline here and bills nothing, so the new turn's first
+    /// reading counts only its own tokens.
+    usage: UsageAccumulator,
     /// An interrupt asked for while no turn was open yet.
     ///
     /// A Worker calls `interrupt()` on wall-clock time, not on frame arrival,
@@ -459,7 +465,7 @@ impl TurnAssembler {
             Notification::ItemCompleted(completed) => self.item_completed(&completed.item),
             Notification::Error(error) => self.error_notified(error),
             Notification::TokenUsageUpdated(update) => {
-                self.record_usage(update.turn_id.as_deref(), update.token_usage.last.as_ref());
+                self.record_usage(update);
                 Vec::new()
             }
             Notification::RateLimitsUpdated(limits) => headroom_reported(limits),
@@ -644,38 +650,26 @@ impl TurnAssembler {
         )
     }
 
-    /// Adds a per-turn usage reading, once.
+    /// Folds one usage reading into the open turn.
     ///
-    /// Idempotent per `(turnId, itemId)` — here the reading itself is the item,
-    /// so a replayed reading for a turn already counted is dropped.
-    fn record_usage(&mut self, turn_id: Option<&str>, counts: Option<&TokenCounts>) {
-        let (Some(turn_id), Some(counts)) = (turn_id, counts) else {
-            return;
+    /// The delta is the thread `total`'s movement since the previous reading,
+    /// so a reading replayed by resume (or repeated verbatim) moves nothing.
+    /// Every reading advances the baseline — including one for a turn that is
+    /// not the open one, which is exactly what resume replays — so a later
+    /// reading never re-bills tokens a skipped one already accounted for.
+    /// A reading without `total` (shape drift) falls back to its own `last`,
+    /// which is that one call by definition.
+    fn record_usage(&mut self, update: &crate::wire::TokenUsageUpdated) {
+        let delta = match (&update.token_usage.total, &update.token_usage.last) {
+            (Some(total), _) => self.usage.observe(token_usage(total), 0.0).tokens,
+            (None, Some(last)) => token_usage(last),
+            (None, None) => return,
         };
-
-        // One usage reading per turn is what Codex sends; the key still carries
-        // both halves so a future per-item breakdown does not silently merge.
-        let key = (turn_id.to_owned(), "tokenUsage".to_owned());
-        if !self.counted_usage.insert(key) {
-            return;
+        if let Some(turn) = self.turn.as_mut()
+            && update.turn_id.as_deref() == Some(turn.id.as_str())
+        {
+            turn.usage += delta;
         }
-
-        let Some(turn) = self.turn.as_mut() else {
-            return;
-        };
-        if turn.id.as_str() != turn_id {
-            // A reading for a turn that is not the open one — exactly what
-            // resume replays. Recorded as counted above, applied to nothing.
-            return;
-        }
-
-        turn.usage = TokenUsage {
-            input_tokens: counts.input_tokens,
-            output_tokens: counts.output_tokens,
-            cache_read_input_tokens: counts.cached_input_tokens,
-            cache_write_input_tokens: counts.cache_write_input_tokens,
-            reasoning_output_tokens: counts.reasoning_output_tokens,
-        };
     }
 
     fn close_turn(&mut self, status: TurnStatus, duration: Option<Duration>) -> Vec<AgentEvent> {
@@ -708,6 +702,17 @@ impl TurnAssembler {
             denials: std::mem::take(&mut turn.denials),
             duration: duration.unwrap_or(turn.duration),
         })]
+    }
+}
+
+/// The wire's counters in the seam's vocabulary.
+fn token_usage(counts: &TokenCounts) -> TokenUsage {
+    TokenUsage {
+        input_tokens: counts.input_tokens,
+        output_tokens: counts.output_tokens,
+        cache_read_input_tokens: counts.cached_input_tokens,
+        cache_write_input_tokens: counts.cache_write_input_tokens,
+        reasoning_output_tokens: counts.reasoning_output_tokens,
     }
 }
 
@@ -1543,5 +1548,70 @@ mod tests {
             )),
             "the delayed note rides the next turn: {next_turn:?}"
         );
+    }
+
+    fn reading(turn: &str, total: Option<u64>, last: Option<u64>) -> serde_json::Value {
+        let counts = |n: u64| json!({"inputTokens": n, "outputTokens": 1});
+        let mut usage = serde_json::Map::new();
+        if let Some(total) = total {
+            usage.insert("total".to_owned(), counts(total));
+        }
+        if let Some(last) = last {
+            usage.insert("last".to_owned(), counts(last));
+        }
+        json!({"method":"thread/tokenUsage/updated",
+               "params":{"turnId":turn,"tokenUsage":usage}})
+    }
+
+    fn completed() -> serde_json::Value {
+        json!({"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}})
+    }
+
+    /// Every reading moves the baseline, billed or not: a reading for another
+    /// turn (what resume replays) and one landing after the turn closed are
+    /// both accounted for once, so the open turn bills only its own movement.
+    #[test]
+    fn readings_outside_the_open_turn_advance_the_baseline_without_billing() {
+        let mut assembler = TurnAssembler::new();
+        feed(&mut assembler, reading("turn-0", Some(100), Some(100)));
+        open_turn(&mut assembler);
+        feed(&mut assembler, reading("turn-1", Some(130), Some(30)));
+        feed(&mut assembler, reading("turn-1", Some(130), Some(30)));
+        feed(&mut assembler, reading("turn-1", Some(150), Some(20)));
+        let outcome = closed(feed(&mut assembler, completed()), "first turn");
+        assert_eq!(
+            outcome.usage.tokens.input_tokens, 50,
+            "two calls, one repeat"
+        );
+        assert_eq!(
+            outcome.usage.tokens.output_tokens, 0,
+            "the totals' own field moved by 0"
+        );
+
+        // A straggler after the close, then a fresh turn.
+        feed(&mut assembler, reading("turn-1", Some(170), Some(20)));
+        feed(
+            &mut assembler,
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-1"}}}),
+        );
+        feed(&mut assembler, reading("turn-1", Some(175), Some(5)));
+        let outcome = closed(feed(&mut assembler, completed()), "second turn");
+        assert_eq!(
+            outcome.usage.tokens.input_tokens, 5,
+            "the straggler was accounted for when it arrived, not re-billed here"
+        );
+    }
+
+    /// Shape drift: a reading without `total` still bills its own `last` — one
+    /// call by definition — and one with neither bills nothing.
+    #[test]
+    fn a_reading_without_a_total_bills_its_last() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        feed(&mut assembler, reading("turn-1", None, Some(40)));
+        feed(&mut assembler, reading("turn-1", None, None));
+        let outcome = closed(feed(&mut assembler, completed()), "drifted turn");
+        assert_eq!(outcome.usage.tokens.input_tokens, 40);
+        assert_eq!(outcome.usage.tokens.output_tokens, 1);
     }
 }

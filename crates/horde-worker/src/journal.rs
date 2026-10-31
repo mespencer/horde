@@ -234,6 +234,10 @@ impl Journal {
                      provider_session_id TEXT,
                      turns_taken         INTEGER NOT NULL DEFAULT 0
                  ) STRICT;
+                 CREATE TABLE IF NOT EXISTS harness_group (
+                     pgid        INTEGER PRIMARY KEY,
+                     fingerprint TEXT NOT NULL
+                 ) STRICT;
                  CREATE TABLE IF NOT EXISTS meta (
                      key   TEXT PRIMARY KEY,
                      value INTEGER NOT NULL
@@ -546,6 +550,65 @@ impl Journal {
     pub async fn applied_command_sequence(&self) -> Result<u64, WorkerError> {
         self.with_connection("reading the applied-command watermark", |connection| {
             meta(connection, APPLIED_COMMAND).map_err(read_error)
+        })
+        .await
+    }
+
+    /// Remembers a running harness process group (ADR-0010), so the next
+    /// start can sweep it if this Worker dies without stopping it. Additive
+    /// to the schema: a journal written before the table existed simply has
+    /// no groups to sweep.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the row cannot be written.
+    pub async fn remember_harness_group(
+        &self,
+        pgid: u32,
+        fingerprint: &str,
+    ) -> Result<(), WorkerError> {
+        let fingerprint = fingerprint.to_owned();
+        self.with_connection("remembering a harness group", move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO harness_group (pgid, fingerprint) VALUES (?1, ?2)",
+                    params![pgid, fingerprint],
+                )
+                .map(|_| ())
+                .map_err(read_error)
+        })
+        .await
+    }
+
+    /// Forgets a reaped harness process group.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the row cannot be deleted.
+    pub async fn forget_harness_group(&self, pgid: u32) -> Result<(), WorkerError> {
+        self.with_connection("forgetting a harness group", move |connection| {
+            connection
+                .execute("DELETE FROM harness_group WHERE pgid = ?1", params![pgid])
+                .map(|_| ())
+                .map_err(read_error)
+        })
+        .await
+    }
+
+    /// Every remembered harness process group, as `(pgid, fingerprint)`.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the rows cannot be read.
+    pub async fn harness_groups(&self) -> Result<Vec<(u32, String)>, WorkerError> {
+        self.with_connection("reading the harness groups", |connection| {
+            let mut statement = connection
+                .prepare("SELECT pgid, fingerprint FROM harness_group")
+                .map_err(read_error)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(read_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(read_error)
         })
         .await
     }

@@ -21,6 +21,9 @@
 //!   the codec, so a test watching only the event stream cannot tell an
 //!   interrupt that was sent from one that was never written. This file is the
 //!   observation point that closes that gap.
+//! * `HORDE_STUB_GRANDCHILD` — start a long-lived child that ignores SIGTERM
+//!   (a tool command, a dev server) and write its pid to this file, so the
+//!   process-group tests can watch whether stopping the harness reaches it.
 
 use std::io::{BufRead, Write};
 
@@ -28,7 +31,24 @@ fn main() -> std::process::ExitCode {
     let Some(contents) = transcript() else {
         return std::process::ExitCode::FAILURE;
     };
+    if let Ok(pidfile) = std::env::var("HORDE_STUB_GRANDCHILD") {
+        start_grandchild(&pidfile);
+    }
     replay(&turns(&contents), &Behaviour::from_env())
+}
+
+/// Starts a SIGTERM-ignoring sleeper in this harness's process group and
+/// records its pid — written after the spawn, so a test that reads the file
+/// knows the child exists.
+fn start_grandchild(pidfile: &str) {
+    let spawned = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap '' TERM; exec sleep 600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn();
+    if let Ok(child) = spawned {
+        let _ = std::fs::write(pidfile, child.id().to_string());
+    }
 }
 
 /// The transcript this run replays, or `None` having said why on stderr.

@@ -165,6 +165,46 @@ async fn a_denial_reaches_the_blocked_agent_with_its_reason() {
     );
 }
 
+/// A pending approval survives the link to the server being cut: the human
+/// answers during the partition, and the blocked agent hears it once the link
+/// heals — the wait redials from its cursor rather than failing the prompt.
+#[tokio::test]
+async fn a_pending_approval_survives_a_severed_link() -> Setup<()> {
+    let harness = harness().await?;
+    let identity = identity_for(&harness.agent_id)?;
+    let proxy = horde_testkit::fault::FaultProxy::front(&harness.endpoint).await?;
+    let broker = PermissionBroker::new(horde_mcp::context::AgentContext::new(
+        harness.journal(),
+        Client::connect(&proxy.endpoint()).await?,
+        harness.session_id.clone(),
+    ));
+    let prompt = prompt(
+        "Write",
+        serde_json::json!({"file_path": "/tmp/x"}),
+        "toolu_cut",
+    )?;
+    let mut blocked = tokio::spawn(async move { broker.respond(&identity, &prompt).await });
+
+    await_escalation(&harness.endpoint, &harness.session_id, "toolu_cut").await?;
+    proxy.cut();
+
+    let mut answering = Client::connect(&harness.endpoint).await?;
+    answering
+        .answer_permission(PermissionAnswer::allow("toolu_cut"))
+        .await?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut blocked)
+            .await
+            .is_err(),
+        "the answer cannot cross a cut link, and the wait must not fail meanwhile"
+    );
+
+    proxy.heal();
+    let response = within("the decision crosses the healed link", blocked).await??;
+    assert_eq!(decode(&response)?["behavior"], "allow");
+    Ok(())
+}
+
 /// A sanity check that the fake and the real sink agree about the shape of a
 /// failure: an unwritable journal is an error to the agent, never a wait.
 #[tokio::test]

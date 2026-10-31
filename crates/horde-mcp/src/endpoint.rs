@@ -421,7 +421,7 @@ impl HordeEndpoint {
         // for the same task text are two children, and a key built from the
         // text would silently collapse them into one (the audit's collision
         // #1). The task itself rides the spec as the initial assignment.
-        let key = self.request_id_for(&identity, None);
+        let key = self.minted_request_id(&identity);
         let outcome = self
             .verbs()
             .spawn_agent(&identity, &params.task, &key)
@@ -562,7 +562,7 @@ impl HordeEndpoint {
         // through the tool router cannot see `_meta`, so a retried declare
         // re-raises rather than deduping — a safe failure (the chain
         // re-asks), not a silent one.
-        let prompt = forward_prompt(&spec, self.request_id_for(identity, None));
+        let prompt = forward_prompt(&spec, self.minted_request_id(identity));
         let name = spec.name.clone();
         let worker_port = spec.worker_port;
         let decision = self
@@ -601,42 +601,71 @@ impl HordeEndpoint {
         }))
     }
 
-    /// One proxied tool call, with the permission chain in its path.
+    /// The chain's decision on one proxied call — reached exactly once.
     ///
     /// This is where DESIGN §10 puts the chain for hub and `local` tools:
     /// every proxied call is raised as an ordinary `PermissionRequested` and
     /// blocks until the chain answers — deterministically in microseconds
-    /// when a rule covers it, or from a human's phone when nothing does. The
-    /// forwarded call is the *decided* one: a narrowing that arrives with the
-    /// allow replaces the arguments, and a narrowing that cannot be applied
-    /// refuses rather than running the original, wider call.
+    /// when a rule covers it, or from a human's phone when nothing does.
     ///
-    /// When a harness pre-authorizes through `approve` (Claude's
-    /// `--permission-prompt-tool`), its `_meta.claudecode/toolUseId` rides
-    /// the `tools/call` too — and using it as the request id here makes the
-    /// second raise a keyed replay of the first: the journal deduplicates it
-    /// and the wait finds the decision already written, so one human answer
-    /// covers both gates.
-    async fn call_proxied(
+    /// Each harness also gates the call on its own side first, so the work
+    /// here is making the two gates one permission event under one name:
+    ///
+    /// * **Claude** pre-authorizes through `approve` (`--permission-prompt-tool`)
+    ///   and stamps the same `_meta.claudecode/toolUseId` on the `tools/call`.
+    ///   Raising under that id makes this raise a keyed replay of the first:
+    ///   the journal deduplicates it and the wait finds the decision already
+    ///   written, so one answer covers both gates.
+    /// * **Codex** asks through an elicitation the Worker raises under the item
+    ///   id and `horde/{tool}`, and its `tools/call` carries no id to correlate
+    ///   by. The call is matched to that decision instead — same agent, same
+    ///   name, same arguments, consumed once ([`PermissionBroker::decided_earlier`]).
+    ///   A call codex did not ask about is gated here, under the same
+    ///   `horde/{tool}` name the elicitation would have used, so one rule
+    ///   covers the tool whichever gate runs and the chain stays the authority
+    ///   over every call that reaches the tool.
+    async fn decide_proxied(
         &self,
-        proxy: &ToolProxy,
         identity: &AgentIdentity,
         name: &str,
-        arguments: Option<JsonObject>,
-        tool_use_id: String,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: serde_json::Value,
+        meta: &RequestMetaObject,
+    ) -> Result<horde_adapter::PermissionDecision, ErrorData> {
+        let broker = self.broker();
+        let (tool_name, tool_use_id) = match harness_tool_use_id(Some(meta)) {
+            Some(carried) => (name.to_owned(), carried),
+            None if is_codex_call(meta) => {
+                let tool_name = codex_tool_name(name);
+                let earlier = broker
+                    .decided_earlier(identity, &tool_name, &input)
+                    .await
+                    .map_err(internal)?;
+                if let Some(decision) = earlier {
+                    return Ok(decision);
+                }
+                (tool_name, self.minted_request_id(identity))
+            }
+            None => (name.to_owned(), self.minted_request_id(identity)),
+        };
         let prompt = horde_adapter_claude::permission::PromptRequest {
-            tool_name: name.to_owned(),
-            input: arguments_as_input(arguments.as_ref()),
+            tool_name,
+            input,
             tool_use_id,
         };
+        broker.adjudicate(identity, &prompt).await.map_err(internal)
+    }
 
-        let decision = self
-            .broker()
-            .adjudicate(identity, &prompt)
-            .await
-            .map_err(internal)?;
-
+    /// One proxied tool call, run as the chain decided it.
+    ///
+    /// The forwarded call is the *decided* one: a narrowing that arrives with
+    /// the allow replaces the arguments, and a narrowing that cannot be
+    /// applied refuses rather than running the original, wider call.
+    async fn call_proxied(
+        proxy: &ToolProxy,
+        name: &str,
+        arguments: Option<JsonObject>,
+        decision: horde_adapter::PermissionDecision,
+    ) -> Result<CallToolResult, ErrorData> {
         match decision {
             horde_adapter::PermissionDecision::Deny { message } => {
                 // A denial the model reads, not a protocol error it cannot:
@@ -666,19 +695,15 @@ impl HordeEndpoint {
         }
     }
 
-    /// The permission-request id for one proxied call.
+    /// A session-unique permission-request id, for a call whose harness sent
+    /// no correlation id of its own.
     ///
-    /// The harness's own correlation id when it sent one — that is what lets
-    /// an `approve`-stage decision cover the call stage too — and a minted,
-    /// session-unique id otherwise. Minted from wall-clock nanos plus a
-    /// process-local ordinal: the ordinal separates calls within this
-    /// process, the nanos separate this process's ids from a predecessor's
-    /// (a restarted endpoint must not re-mint a key the journal already
-    /// holds, because the dedupe would silently swallow the new request).
-    fn request_id_for(&self, identity: &AgentIdentity, meta: Option<&RequestMetaObject>) -> String {
-        if let Some(carried) = harness_tool_use_id(meta) {
-            return carried;
-        }
+    /// Minted from wall-clock nanos plus a process-local ordinal: the ordinal
+    /// separates calls within this process, the nanos separate this process's
+    /// ids from a predecessor's (a restarted endpoint must not re-mint a key
+    /// the journal already holds, because the dedupe would silently swallow
+    /// the new request).
+    fn minted_request_id(&self, identity: &AgentIdentity) -> String {
         let ordinal = self.minted.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -701,6 +726,35 @@ pub fn harness_tool_use_id(meta: Option<&RequestMetaObject>) -> Option<String> {
         .get("claudecode/toolUseId")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+/// The server name every harness is configured to reach this endpoint under:
+/// Claude sees its tools as `mcp__horde__…`, and codex is launched with
+/// `mcp_servers.horde` (the Worker's codex launch). It is the `{server}` in
+/// the `{server}/{tool}` name a codex elicitation is raised under.
+pub const SERVER_NAME: &str = "horde";
+
+/// The `_meta` key codex stamps on every `tools/call` it sends (transcript
+/// 17's MCP-stub log: thread, turn, sandbox, model — never the item id).
+pub const CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
+
+/// Whether a `tools/call` came from codex.
+///
+/// Used to pick the gate's vocabulary and to look for the elicitation that
+/// already gated the call — never to skip the gate: a caller that forges the
+/// key gains nothing but a name, because a call is only covered by a decision
+/// the chain gave this agent for exactly this call.
+#[must_use]
+pub fn is_codex_call(meta: &RequestMetaObject) -> bool {
+    meta.0.0.contains_key(CODEX_TURN_METADATA)
+}
+
+/// The canonical name a codex agent's proxied call is gated under — the
+/// `{server}/{tool}` its elicitation names (ADR-0005), so a rule written for
+/// the tool matches whichever gate runs.
+#[must_use]
+pub fn codex_tool_name(name: &str) -> String {
+    format!("{SERVER_NAME}/{name}")
 }
 
 /// The proposal the chain adjudicates, from the call's arguments.
@@ -784,16 +838,16 @@ impl ServerHandler for HordeEndpoint {
             // empty. Measured the hard way: the deployed-stack e2e's approve
             // targets the script's tool-use id, and reading `request.meta`
             // here left every proxied call under a minted id instead.
-            let request_id = self.request_id_for(&identity, Some(&context.meta));
-            let result = self
-                .call_proxied(
-                    &proxy,
+            let decision = self
+                .decide_proxied(
                     &identity,
                     &request.name,
-                    request.arguments,
-                    request_id,
+                    arguments_as_input(request.arguments.as_ref()),
+                    &context.meta,
                 )
                 .await?;
+            let result =
+                Self::call_proxied(&proxy, &request.name, request.arguments, decision).await?;
             return Ok(CallToolResponse::Complete(result));
         }
 
@@ -1246,17 +1300,35 @@ mod tests {
     async fn minted_request_ids_never_repeat() {
         let endpoint = endpoint();
         let identity = identity();
-        let first = endpoint.request_id_for(&identity, None);
-        let second = endpoint.request_id_for(&identity, None);
+        let first = endpoint.minted_request_id(&identity);
+        let second = endpoint.minted_request_id(&identity);
         assert_ne!(first, second);
         assert!(first.contains("agent-42"), "{first}");
+    }
 
-        // And a carried harness id wins over minting.
+    /// Codex is recognized by the turn metadata it stamps on every call, and
+    /// its gate speaks the `{server}/{tool}` vocabulary its elicitation does.
+    #[test]
+    fn a_codex_call_is_named_the_way_its_elicitation_names_it() {
         let mut meta = rmcp::model::RequestMetaObject::new();
+        assert!(!super::is_codex_call(&meta), "no metadata, not codex");
         meta.0.0.insert(
             "claudecode/toolUseId".to_owned(),
-            serde_json::Value::String("toolu_02".to_owned()),
+            serde_json::Value::String("toolu_01".to_owned()),
         );
-        assert_eq!(endpoint.request_id_for(&identity, Some(&meta)), "toolu_02");
+        assert!(
+            !super::is_codex_call(&meta),
+            "claude's stamp is not codex's"
+        );
+        meta.0.0.insert(
+            super::CODEX_TURN_METADATA.to_owned(),
+            serde_json::json!({"turn_id": "t1"}),
+        );
+        assert!(super::is_codex_call(&meta));
+
+        assert_eq!(
+            super::codex_tool_name("github__create_issue"),
+            "horde/github__create_issue"
+        );
     }
 }

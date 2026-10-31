@@ -30,6 +30,7 @@ pub mod codex;
 pub mod endpoint;
 pub mod error;
 pub mod forward;
+pub mod harness;
 pub mod hub;
 pub mod journal;
 pub mod login;
@@ -45,6 +46,7 @@ pub use claude::{ClaudeAdapter, LiveClaudeSession};
 pub use client::{ApplyCommand, Connection, DialConfig};
 pub use codex::{CodexAdapter, ExecInterception, LiveCodexSession};
 pub use error::WorkerError;
+pub use harness::HarnessProfile;
 pub use journal::{
     AgentBookkeeping, AgentProgress, CommandApplication, Journal, JournalEntry, JournalSink,
     RevivableAgent,

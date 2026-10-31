@@ -36,6 +36,12 @@ pub struct LoginRecipe {
     /// on one machine, one port cannot be both the client's listener and
     /// the worker's.
     pub listen_port: Option<u16>,
+
+    /// Environment the command runs with — the config directory a login
+    /// must sign in (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). Without it the
+    /// command signs in the operator's own directory, and the Worker-owned
+    /// one its agents run under stays logged out (ADR-0010).
+    pub env: Vec<(String, String)>,
 }
 
 impl LoginRecipe {
@@ -47,6 +53,7 @@ impl LoginRecipe {
             args,
             callback_port: None,
             listen_port: None,
+            env: Vec::new(),
         }
     }
 
@@ -59,6 +66,7 @@ impl LoginRecipe {
             args,
             callback_port: Some(port),
             listen_port: None,
+            env: Vec::new(),
         }
     }
 
@@ -68,6 +76,13 @@ impl LoginRecipe {
     #[must_use]
     pub fn listening_on(mut self, port: u16) -> Self {
         self.listen_port = Some(port);
+        self
+    }
+
+    /// Runs the command with `env` — the directory the login signs in.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
         self
     }
 
@@ -117,5 +132,21 @@ mod tests {
 
         let terminal = LoginRecipe::terminal_only("claude", vec![]);
         assert_eq!(terminal.effective_listen_port(), None);
+    }
+
+    /// The env rides the recipe unchanged; the constructors start with none.
+    #[test]
+    fn the_env_is_empty_until_given_and_kept_as_given() {
+        let bare = LoginRecipe::terminal_only("claude", vec![]);
+        assert!(bare.env.is_empty());
+        let targeted = bare.with_env(vec![(
+            "CLAUDE_CONFIG_DIR".to_owned(),
+            "/state/c".to_owned(),
+        )]);
+        assert_eq!(
+            targeted.env,
+            vec![("CLAUDE_CONFIG_DIR".to_owned(), "/state/c".to_owned())]
+        );
+        assert_eq!(targeted.program, "claude", "nothing else moves");
     }
 }

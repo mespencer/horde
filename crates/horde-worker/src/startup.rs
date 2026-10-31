@@ -687,6 +687,14 @@ pub async fn prepare(
     })?;
     let journal = Journal::open(&config.journal_path())
         .map_err(|error| format!("could not open the journal: {error}"))?;
+    // Before any agent starts: whatever a crashed previous run left running
+    // in its harness process groups is swept now (ADR-0010).
+    let swept = crate::process::reap_leftover_groups(&journal).await;
+    if swept > 0 {
+        announce(format!(
+            "swept {swept} harness process group(s) a previous run left behind"
+        ));
+    }
 
     let runtime = build_runtime(config, identity.as_ref(), &name, journal.clone()).await?;
     Ok(PreparedWorker {
@@ -719,7 +727,7 @@ async fn build_runtime(
     // control-plane verbs. Lazy: a Server that is down at startup is the
     // reconnect loop's business, not a reason to refuse to start.
     let channel = server_channel(&config.server, identity)?;
-    let mut runtime = Runtime::new(journal)
+    let mut runtime = Runtime::new(journal.clone())
         .with_blob_service(channel.clone())
         // The wire ADR-0004 left to the Worker: every spawned agent gets its
         // Session's MCP endpoint and a minted identity pair — and its hub
@@ -736,7 +744,9 @@ async fn build_runtime(
                 }
                 runtime.with_adapter(Arc::new(fake))
             }
-            AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new())),
+            AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new(
+                harness_profile(config, "claude", &journal),
+            ))),
             AdapterChoice::Codex => {
                 // Belt and braces on the transcript-23 hazard: the flag was
                 // validated at parse, and the value is re-validated here so a
@@ -747,7 +757,9 @@ async fn build_runtime(
                 )?;
                 // Probed, not assumed: the exec-gating capability claim is
                 // version-gated (ADR-0005, 2026-08-19 amendment).
-                let adapter = crate::CodexAdapter::new().probe_exec_interception().await;
+                let adapter = crate::CodexAdapter::new(harness_profile(config, "codex", &journal))
+                    .probe_exec_interception()
+                    .await;
                 runtime.with_adapter(Arc::new(adapter))
             }
         };
@@ -760,6 +772,18 @@ async fn build_runtime(
         runtime = runtime.with_relay(horde_relay::RelayLocation::new(relay));
     }
     Ok(runtime)
+}
+
+/// The Worker-owned harness profile one provider's adapter launches under
+/// (ADR-0010): config directories under the state directory, and every
+/// harness process group remembered in the journal so a crash can be swept.
+fn harness_profile(
+    config: &WorkerConfig,
+    provider: &str,
+    journal: &Journal,
+) -> crate::harness::HarnessProfile {
+    crate::harness::HarnessProfile::in_state_dir(&config.state_dir, provider)
+        .with_ledger(Arc::new(journal.clone()))
 }
 
 /// The fake adapter's login recipe, when `--fake-login` gave it one. The

@@ -420,6 +420,173 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
     assert_eq!(redelivered, checkout);
 }
 
+/// Archive gives the checkout back: the worktree is unregistered, the
+/// `horde/<agent>` branch deleted, the directory gone — and the agent's last
+/// commit stays reachable under `refs/horde/archived/<agent>`, because a
+/// result may still name it. A sibling's checkout is untouched.
+#[tokio::test]
+async fn releasing_a_worktree_checkout_removes_it_and_pins_its_head() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
+    let none = std::collections::BTreeMap::new();
+    let checkout = manager
+        .checkout("ws-1", "agent-1", CheckoutPolicy::Worktree, &none)
+        .await
+        .expect("a worktree checkout");
+    let sibling = manager
+        .checkout("ws-1", "agent-2", CheckoutPolicy::Worktree, &none)
+        .await
+        .expect("a sibling checkout");
+    let work = harness::parents_commit(&checkout.join("atlas"));
+    let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
+
+    manager
+        .release_checkout(&checkout)
+        .await
+        .expect("the checkout is released");
+
+    assert!(!checkout.exists(), "the agent's directory is gone");
+    let worktrees = harness::git(&instance_repo, &["worktree", "list"]);
+    assert!(
+        !worktrees.contains("agent-1") && worktrees.contains("agent-2"),
+        "only the archived agent's worktree is unregistered: {worktrees}"
+    );
+    let branches = harness::git(&instance_repo, &["branch", "--list", "horde/*"]);
+    assert!(
+        !branches.contains("horde/agent-1") && branches.contains("horde/agent-2"),
+        "only the archived agent's branch is deleted: {branches}"
+    );
+    assert_eq!(
+        harness::git(
+            &instance_repo,
+            &["rev-parse", "refs/horde/archived/agent-1"]
+        )
+        .trim(),
+        work,
+        "the agent's last commit stays reachable"
+    );
+    assert!(
+        sibling.join("atlas").join(".git").is_file(),
+        "the sibling is untouched"
+    );
+
+    // Idempotent: a second release finds nothing and is not an error.
+    manager
+        .release_checkout(&checkout)
+        .await
+        .expect("releasing twice is fine");
+}
+
+/// A fresh clone is released the same way — its HEAD pinned in the
+/// instance's repo (the clone was the only place it lived) — and the shared
+/// policy's root, the instance itself, is never the agent's to remove.
+#[tokio::test]
+async fn releasing_a_fresh_clone_pins_its_head_and_shared_roots_are_left_alone() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
+    let none = std::collections::BTreeMap::new();
+    let clone = manager
+        .checkout("ws-1", "agent-1", CheckoutPolicy::FreshClone, &none)
+        .await
+        .expect("a fresh clone");
+    let work = harness::parents_commit(&clone.join("atlas"));
+
+    manager.release_checkout(&clone).await.expect("released");
+    assert!(!clone.exists());
+    let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
+    assert_eq!(
+        harness::git(
+            &instance_repo,
+            &["rev-parse", "refs/horde/archived/agent-1"]
+        )
+        .trim(),
+        work
+    );
+
+    let shared = manager
+        .checkout("ws-1", "agent-2", CheckoutPolicy::Shared, &none)
+        .await
+        .expect("the shared checkout");
+    manager.release_checkout(&shared).await.expect("a no-op");
+    assert!(
+        shared.join("atlas").join(".git").is_dir(),
+        "the instance survives an agent that worked in it"
+    );
+}
+
+/// A release that cannot remove the checkout says so: only "already gone"
+/// counts as released, and any other failure is reported, not swallowed —
+/// a silently surviving checkout is exactly the leak release exists to end.
+#[tokio::test]
+async fn a_checkout_that_cannot_be_removed_is_reported_not_swallowed() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
+    // A file where the agent's directory should be: removing it as a
+    // directory fails with something other than NotFound.
+    let agents = std::path::Path::new(&instance.root_path).join(".horde-agents");
+    std::fs::create_dir_all(&agents).expect("the agents dir");
+    let not_a_dir = agents.join("agent-1");
+    std::fs::write(&not_a_dir, "not a checkout").expect("writes");
+
+    let refused = manager.release_checkout(&not_a_dir).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("could not remove")),
+        "got {refused:?}"
+    );
+}
+
+/// A remote URL or branch shaped like an option is refused before git ever
+/// sees it — `--upload-pack=` on a clone runs a command — and a layout that
+/// would escape the instance degrades the report instead of cloning there.
+#[tokio::test]
+async fn option_shaped_clone_inputs_and_escaping_layouts_are_refused() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let atlas = harness::origin(temp.path(), "atlas");
+    let manager = harness::manager_under(temp.path());
+    let marker = temp.path().join("pwned");
+
+    let hostile_url = WorkspaceRepo {
+        remote_url: format!("--upload-pack=touch {}", marker.display()),
+        ..harness::repo("url", &atlas)
+    };
+    let hostile_branch = WorkspaceRepo {
+        default_branch: "--upload-pack=true".to_owned(),
+        ..harness::repo("branch", &atlas)
+    };
+    let escaping = WorkspaceRepo {
+        layout_path: "../../escaped".to_owned(),
+        ..harness::repo("escape", &atlas)
+    };
+    let report = manager
+        .materialize(&harness::definition(
+            "ws-1",
+            vec![
+                hostile_url,
+                hostile_branch,
+                escaping,
+                harness::repo("atlas", &atlas),
+            ],
+        ))
+        .await;
+
+    assert_eq!(report.state, WorkspaceInstanceState::Degraded as i32);
+    assert!(
+        report.detail.contains("repo url") && report.detail.contains("git option"),
+        "{}",
+        report.detail
+    );
+    assert!(report.detail.contains("repo branch"), "{}", report.detail);
+    assert!(report.detail.contains("repo escape"), "{}", report.detail);
+    assert!(!marker.exists(), "no injected command ran");
+    assert!(
+        !temp.path().join("escaped").exists(),
+        "nothing landed outside"
+    );
+    assert_eq!(report.repos.len(), 1, "the honest repo still materialized");
+}
+
 #[tokio::test]
 async fn a_fresh_clone_checkout_is_a_full_clone() {
     let temp = tempfile::tempdir().expect("a tempdir");

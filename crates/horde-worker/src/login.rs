@@ -303,6 +303,11 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     // A daemon has no terminal of its own to inherit TERM from, and a login
     // flow that paints prompts needs one.
     command.env("TERM", "xterm-256color");
+    // The directory the login signs in: the Worker-owned one its agents run
+    // under, never the operator's own (ADR-0010).
+    for (key, value) in &recipe.env {
+        command.env(key, value);
+    }
 
     let mut child = pair
         .slave
@@ -553,10 +558,17 @@ mod tests {
             "/bin/sh",
             vec![
                 "-c".to_owned(),
-                "printf 'account? '; read account; printf 'hello %s\\n' \"$account\"; exit 7"
+                "printf 'account? '; read account; \
+                 printf 'hello %s in %s\\n' \"$account\" \"$HORDE_LOGIN_TARGET\"; exit 7"
                     .to_owned(),
             ],
-        );
+        )
+        // The recipe's env reaches the command: it is how a login signs in
+        // the Worker-owned config directory rather than the operator's.
+        .with_env(vec![(
+            "HORDE_LOGIN_TARGET".to_owned(),
+            "/state/harness/claude/default".to_owned(),
+        )]);
         let mut session = spawn_login_pty(
             &recipe,
             PtySize {
@@ -582,7 +594,7 @@ mod tests {
             .send(b"tester\r".to_vec())
             .expect("the writer thread is alive");
         within("the answer echoes through", async {
-            while !seen.contains("hello tester") {
+            while !seen.contains("hello tester in /state/harness/claude/default") {
                 let chunk = session.output.recv().await.expect("output before EOF");
                 seen.push_str(&String::from_utf8_lossy(&chunk));
             }
@@ -781,6 +793,7 @@ mod tests {
             ],
             callback_port: Some(14555),
             listen_port: None,
+            env: Vec::new(),
         };
         let (feed, mut sent, answering, lines, attach) = dispatched(recipe).await;
         assert!(

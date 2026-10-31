@@ -111,14 +111,6 @@ async fn a_real_claude_routes_its_permission_prompt_through_this_endpoint() -> S
     let mcp_path = scratch.path().join("mcp.json");
     std::fs::write(&mcp_path, serde_json::to_string(&mcp_config)?)?;
 
-    // The ADR-0003 conditional. Empty lists and manual mode mean nothing is
-    // pre-decided, so the prompt tool is genuinely consulted.
-    let settings = serde_json::json!({
-        "permissions": { "allow": [], "deny": [], "defaultMode": "manual" }
-    });
-    let settings_path = scratch.path().join("settings.json");
-    std::fs::write(&settings_path, serde_json::to_string(&settings)?)?;
-
     let answering = tokio::spawn({
         let endpoint = horde.endpoint.clone();
         let session_id = horde.session_id.clone();
@@ -127,17 +119,20 @@ async fn a_real_claude_routes_its_permission_prompt_through_this_endpoint() -> S
 
     // A prompt that cannot be satisfied without a tool call, so "no escalation"
     // is a real failure rather than the model deciding it did not need one.
+    //
+    // The isolation and permission flags come from the builder the Worker's
+    // production launch uses (ADR-0010): no settings file but its own, no MCP
+    // server but this one, and the ADR-0003 conditional — empty allow/deny
+    // lists and manual mode, so nothing is pre-decided and the prompt tool is
+    // genuinely consulted.
+    let isolation = horde_adapter_claude::launch::IsolationFlags {
+        mcp_config: Some(&mcp_path),
+        permission_prompt_tool: Some("mcp__horde__approve"),
+    }
+    .argv();
     let harness_run = tokio::process::Command::new("claude")
         .arg("--print")
-        .arg("--strict-mcp-config")
-        .arg("--mcp-config")
-        .arg(&mcp_path)
-        .arg("--settings")
-        .arg(&settings_path)
-        .arg("--permission-prompt-tool")
-        .arg("mcp__horde__approve")
-        .arg("--permission-mode")
-        .arg("manual")
+        .args(&isolation)
         .arg("Create a file called smoke.txt containing the word HORDE. Use the Write tool.")
         .current_dir(scratch.path())
         .output()

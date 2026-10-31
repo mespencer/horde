@@ -99,7 +99,10 @@ mod harness {
         let file = dir.path().join("script.jsonl");
         std::fs::write(&file, script).expect("writes");
 
-        let mut adapter = CodexAdapter::new().with_program(stub_binary().to_string_lossy());
+        let mut adapter = CodexAdapter::new(horde_worker::HarnessProfile::new(
+            dir.path().join("harness"),
+        ))
+        .with_program(stub_binary().to_string_lossy());
         // A stub that answers nothing must fail the test in seconds, not
         // stall the suite until a mutants timeout nobody evaluates.
         adapter.response_ceiling = std::time::Duration::from_secs(2);
@@ -182,7 +185,7 @@ mod harness {
     /// approval-shaped tests both build on. Returns the control-log path the
     /// stub records to; the tempdirs ride along because dropping them deletes
     /// the files under the child.
-    async fn logged_session(
+    pub(crate) async fn logged_session(
         script: &str,
         steer_mode: Option<&str>,
     ) -> (
@@ -641,41 +644,52 @@ async fn an_interrupt_cancels_a_parked_exec_approval_before_the_turn_dies() {
     session.shutdown().await.expect("shuts down");
 }
 
-/// A narrowing decision must be refused loudly — neither reply vocabulary can
-/// carry replacement arguments, and a narrowing that silently widened into a
-/// plain allow is the failure the capability advertisement exists to prevent.
-/// The refusal must also leave the request outstanding: a consumed-but-
-/// unanswered approval would park the harness forever.
+/// A narrowing neither reply vocabulary can carry degrades to a journaled
+/// decline: never widened into a plain allow (the failure the capability
+/// advertisement exists to prevent), and never an error that leaves the
+/// request unanswered — nobody re-answers in production, and an unanswered
+/// approval parks the harness forever. A production Server can deliver one
+/// (nothing upstream is guaranteed to gate it), so this is a real path.
 #[tokio::test]
-async fn a_narrowing_decision_is_refused_not_widened_and_stays_answerable() {
-    let (mut session, _log_path, _dirs) =
+async fn a_narrowing_decision_degrades_to_a_journaled_decline() {
+    let (mut session, log_path, _dirs) =
         harness::approval_session(&exec_approval_script("declined", None)).await;
     let request = surfaced_request(&mut session).await;
 
     // A real rewrite: the chain narrowed to a different command, which the
     // decision vocabulary cannot express.
-    let refused = session
+    session
         .answer_permission(
             &request.tool_call_id,
             PermissionDecision::allow_with(json!({"command": "true", "cwd": "/work"})),
         )
-        .await;
+        .await
+        .expect("an inexpressible narrowing is answered, not refused");
+
+    let recorded = control_log_shows(&log_path, |log| log.contains("\"decision\"")).await;
     assert!(
-        matches!(refused, Err(AdapterError::Unsupported { .. })),
-        "got {refused:?}"
+        recorded.contains("\"decision\":\"decline\""),
+        "the harness is told decline — never accept: {recorded}"
+    );
+    let (events, outcome) = events_through_turn_end(&mut session).await;
+    assert!(outcome.is_some(), "the turn ends once the decline landed");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Output { text, .. }
+                if text.contains("cannot express") && text.contains("decline")
+        )),
+        "the journal says why the allow became a decline: {events:?}"
     );
 
-    // The refusal consumed nothing: the same request still takes an
-    // expressible answer, and the turn completes on it.
-    session
-        .answer_permission(
-            &request.tool_call_id,
-            PermissionDecision::deny("narrowing could not apply"),
-        )
-        .await
-        .expect("the request must still be answerable after the refusal");
-    let (_, outcome) = events_through_turn_end(&mut session).await;
-    assert!(outcome.is_some(), "the turn ends once a real answer landed");
+    // The request is consumed: answering it again is an error, not a no-op.
+    let again = session
+        .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+        .await;
+    assert!(
+        matches!(again, Err(AdapterError::UnknownPermissionRequest { .. })),
+        "got {again:?}"
+    );
 
     // And an answer for a call nobody proposed is an error, never a no-op.
     let stray = session
@@ -780,22 +794,7 @@ async fn a_steer_that_lost_its_race_falls_back_to_a_fresh_turn() {
 /// idle that ends the old turn.
 #[tokio::test]
 async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
-    // Block 1: a turn that opens and stalls. Block 2 — played on the
-    // interrupt — the delta tail and the idle that closes the turn
-    // (transcript 11's shape). Block 3 — played on the deferred turn/start —
-    // the replacement turn.
-    let script = [
-        harness::opening_block(),
-        [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
-        [
-            harness::turn_started("turn-2"),
-            harness::final_answer("turn-2", "i2", "REPLACEMENT"),
-            harness::turn_completed("turn-2"),
-        ]
-        .join("\n"),
-    ]
-    .join("\n\n");
-
+    let script = interrupted_then_replaced_script();
     let (mut session, log_path, _dirs) = mid_turn(&script, None).await;
 
     session
@@ -803,29 +802,128 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
         .await
         .expect("the interrupt goes out");
 
-    // First ending: the cancelled turn, closed by idle, with no answer.
-    let (_, first) = events_through_turn_end(&mut session).await;
-    let first = first.expect("the interrupted turn closes on idle");
-    assert_eq!(first.status, TurnStatus::Interrupted);
-    assert_eq!(first.text, None, "a cancelled turn has no answer");
-
-    // Second ending: the deferred message's own turn.
-    let (_, second) = events_through_turn_end(&mut session).await;
-    let second = second.expect("the deferred message runs as its own turn");
-    assert_eq!(second.status, TurnStatus::Completed);
-    assert_eq!(second.text.as_deref(), Some("REPLACEMENT"));
-
-    let recorded = control_log_shows(&log_path, |log| log.contains("do this instead")).await;
-    let interrupt_at = recorded.find("turn/interrupt");
-    let deferred_at = recorded.find("do this instead");
-    match (interrupt_at, deferred_at) {
-        (Some(interrupt), Some(deferred)) => assert!(
-            interrupt < deferred,
-            "the cancel precedes the delivery: {recorded}"
-        ),
-        other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
-    }
+    cancelled_then_replaced(&mut session, &log_path).await;
     session.shutdown().await.expect("shuts down");
+}
+
+/// The race: an interrupt that arrives after `turn/start` went out but
+/// before `turn/started` was read. The turn exists — its request is in
+/// flight — so the interrupt must cancel it and defer the message, not send
+/// a second `turn/start` that races the first.
+#[tokio::test]
+async fn an_interrupt_before_turn_started_is_read_cancels_rather_than_racing() {
+    // The same three blocks as above; only the moment of the interrupt
+    // differs. Sent, but nothing read: the turn/start reply and
+    // turn/started are both still in the pipe.
+    let script = interrupted_then_replaced_script();
+    let (mut session, log_path, _dirs) = harness::logged_session(&script, None).await;
+    session
+        .send(TurnInput::interrupting("do this instead"))
+        .await
+        .expect("the interrupt goes out");
+
+    let recorded = cancelled_then_replaced(&mut session, &log_path).await;
+    assert_eq!(
+        recorded.matches("turn/start").count(),
+        2,
+        "the opening turn and the deferred one — never a racing third: {recorded}"
+    );
+    session.shutdown().await.expect("shuts down");
+}
+
+/// The other side of the race: with the last turn closed and its request
+/// answered, nothing is in flight, so an interrupt-delivered message is just
+/// a turn start — there is nothing to cancel, and parking it behind a
+/// `turn/interrupt` would wait forever for a turn that never closes.
+#[tokio::test]
+async fn an_interrupt_delivery_to_an_idle_session_just_starts_a_turn() {
+    let second = [
+        harness::turn_started("turn-2"),
+        harness::final_answer("turn-2", "i2", "SECOND"),
+        harness::turn_completed("turn-2"),
+    ]
+    .join("\n");
+    let script = [harness::basic_turn(), second].join("\n\n");
+    let (mut session, log_path, _dirs) = harness::logged_session(&script, None).await;
+    let (_, first) = events_through_turn_end(&mut session).await;
+    assert!(first.is_some(), "setup: the first turn closes");
+
+    session
+        .send(TurnInput::interrupting("one more thing"))
+        .await
+        .expect("sends");
+    let (_, outcome) = events_through_turn_end(&mut session).await;
+    assert_eq!(
+        outcome.and_then(|outcome| outcome.text).as_deref(),
+        Some("SECOND"),
+        "the message ran as its own turn at once"
+    );
+    let recorded = control_log_shows(&log_path, |log| log.contains("one more thing")).await;
+    assert!(
+        !recorded.contains("turn/interrupt"),
+        "nothing was running, so nothing is interrupted: {recorded}"
+    );
+    session.shutdown().await.expect("shuts down");
+}
+
+use interrupt_flow::{cancelled_then_replaced, interrupted_then_replaced_script};
+
+/// The interrupt-then-replace arrangement both interrupt-delivery tests
+/// share. A `cfg(test)` module so the workspace's test exemption for
+/// `expect`/`panic` applies.
+#[cfg(test)]
+mod interrupt_flow {
+    use super::*;
+
+    /// Block 1: a turn that opens and stalls. Block 2 — played on the interrupt
+    /// — the delta tail and the idle that closes the turn (transcript 11's
+    /// shape). Block 3 — played on the deferred turn/start — the replacement.
+    pub(crate) fn interrupted_then_replaced_script() -> String {
+        [
+            harness::opening_block(),
+            [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
+            [
+                harness::turn_started("turn-2"),
+                harness::final_answer("turn-2", "i2", "REPLACEMENT"),
+                harness::turn_completed("turn-2"),
+            ]
+            .join("\n"),
+        ]
+        .join("\n\n")
+    }
+
+    /// Drives both endings of an interrupt-delivered "do this instead" — the
+    /// cancelled turn, then the deferred message's own — and pins that the cancel
+    /// reached the wire before the delivery. Returns the control log.
+    pub(crate) async fn cancelled_then_replaced(
+        session: &mut Box<dyn horde_adapter::AgentSession>,
+        log_path: &std::path::Path,
+    ) -> String {
+        // First ending: the cancelled turn, closed by idle, with no answer.
+        let (_, first) = events_through_turn_end(session).await;
+        let first = first.expect("the interrupted turn closes on idle");
+        assert_eq!(first.status, TurnStatus::Interrupted);
+        assert_eq!(first.text, None, "a cancelled turn has no answer");
+
+        // Second ending: the deferred message's own turn.
+        let (_, second) = events_through_turn_end(session).await;
+        let second = second.expect("the deferred message runs as its own turn");
+        assert_eq!(second.status, TurnStatus::Completed);
+        assert_eq!(second.text.as_deref(), Some("REPLACEMENT"));
+
+        let recorded = control_log_shows(log_path, |log| log.contains("do this instead")).await;
+        match (
+            recorded.find("turn/interrupt"),
+            recorded.find("do this instead"),
+        ) {
+            (Some(interrupt), Some(deferred)) => assert!(
+                interrupt < deferred,
+                "the cancel precedes the delivery: {recorded}"
+            ),
+            other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
+        }
+        recorded
+    }
 }
 
 /// `interrupt()` itself — not just interrupt-delivery — must put
@@ -1108,8 +1206,11 @@ async fn a_mute_harness_fails_the_spawn_on_the_response_ceiling() {
 async fn a_harness_that_dies_mid_handshake_reads_as_its_death() {
     // No script in the environment: the stub prints why to stderr and exits
     // nonzero, which is exactly a binary that starts and immediately dies.
-    let adapter =
-        horde_worker::CodexAdapter::new().with_program(harness::stub_binary().to_string_lossy());
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+    let adapter = horde_worker::CodexAdapter::new(horde_worker::HarnessProfile::new(
+        scratch.path().join("harness"),
+    ))
+    .with_program(harness::stub_binary().to_string_lossy());
 
     let error = adapter
         .spawn(&AgentSpec::default())

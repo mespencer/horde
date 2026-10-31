@@ -30,7 +30,17 @@ child process beside the agent.
   `PermissionRequested`; a deny returns the rule's reason as a readable tool
   error; an allow forwards the decided call, narrowing included. A harness
   that pre-authorizes through `approve` collapses both gates into one
-  permission event via its `claudecode/toolUseId`.
+  permission event via its `claudecode/toolUseId`. Codex gates every MCP
+  call through an elicitation the Worker raises under the item id and
+  `horde/{tool}`, and its `tools/call` carries no correlation id (transcript
+  17's stub log), so the endpoint matches the call to that decision instead —
+  same agent, same `horde/{tool}`, same arguments, decided, consumed once —
+  and forwards it without a second request. A codex call with no such
+  decision is gated at the endpoint under `horde/{tool}`, the name the
+  elicitation would have used, so the chain stays authoritative over every
+  proxied call and one rule covers a codex tool whichever gate runs
+  (2026-10-30; previously every codex hub call needed two approvals under two
+  names).
 - **Per-agent-type allowlists are resolved server-side** at command-fold
   time: `SpawnAgentCommand` carries the agent's `local` configs in full (the
   MaterializeWorkspace rule — no round trip) and its visible hub servers by

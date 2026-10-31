@@ -380,8 +380,10 @@ async fn the_real_claude_path_streams_a_turn_into_the_server_log() {
     .await;
 
     let journal = Journal::in_memory().expect("an in-memory journal");
-    let runtime =
-        Runtime::new(journal.clone()).with_adapter(Arc::new(horde_worker::ClaudeAdapter::new()));
+    let profile = tempfile::tempdir().expect("a scratch dir");
+    let runtime = Runtime::new(journal.clone()).with_adapter(Arc::new(
+        horde_worker::ClaudeAdapter::new(horde_worker::HarnessProfile::new(profile.path())),
+    ));
     let config = harness::config_for(&endpoint, "worker-a", &runtime);
     let (run, _) = harness::dial_and_run(&config, &journal, runtime).await;
 

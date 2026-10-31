@@ -22,32 +22,28 @@
 //! A clock-based timeout here would convert "the human is thinking" into "the
 //! agent was denied", silently, which is the one answer nobody chose.
 //!
-//! # Subscribe before you write
+//! # Matched by identity, read from a cursor
 //!
 //! The decision is matched by **identity** — a `PermissionDecided` carrying the
-//! `request_id` that was raised — and never by log position. Two reasons, and
-//! the second is the one that bites:
+//! `request_id` that was raised — and never by log position. The journal
+//! answers with a per-Worker `journal_sequence`, while the log's cursors are
+//! per-Session `EventEnvelope.sequence`; the two diverge the moment a Worker
+//! serves two Sessions, so there is no position to match on even if one wanted
+//! to.
 //!
-//! 1. The stream is opened *before* the request is journaled, so an answer that
-//!    lands between the write and the listen cannot be missed. Opening it after
-//!    would leave exactly that window.
-//! 2. There is no offset to use even if we wanted one. The journal answers with
-//!    a per-Worker `journal_sequence`; `SyncEvents` cursors are per-Session
-//!    `EventEnvelope.sequence`. They are different number spaces that diverge
-//!    the moment a Worker serves two Sessions, and the session sequence does
-//!    not exist yet when the append returns — the Server assigns it later, in
-//!    `ingest_batch`. Feeding one to the other yields a plausible offset
-//!    pointing somewhere arbitrary, with nothing to notice.
-//!
-//! Because the match is by identity, replaying from the start of the session is
-//! harmless and useful: a freshly minted `request_id` cannot collide with
-//! history, and a *retried* raise — deduped server-side on the idempotency key
-//! — finds the decision that was already answered rather than waiting forever
-//! for a second one. That is what makes this wait resumable across a reconnect.
+//! The wait reads the endpoint's shared [`SessionWatch`](crate::watch::SessionWatch):
+//! it follows from the cursor the endpoint has already folded to — never from
+//! zero — so a prompt costs only what is new in the log. Because the watch
+//! starts *behind* the write rather than at the live head, an answer that lands
+//! between the write and the listen cannot be missed. Because every decision
+//! the watch has ever folded stays indexed, a *retried* raise — deduped
+//! server-side on the idempotency key — finds the decision already answered
+//! rather than waiting forever for a second one. And because the watch redials
+//! from its cursor on a transport failure, the wait survives a reconnect: a
+//! human who answers during a partition is heard once it heals.
 
 use horde_adapter::permission::PermissionDecision;
 use horde_adapter_claude::permission::{PromptRequest, encode_tool_response};
-use horde_cli::client::SyncOptions;
 use horde_proto::v1::event::Kind as EventKind;
 
 use crate::context::AgentContext;
@@ -67,20 +63,15 @@ pub enum PermissionError {
         source: JournalError,
     },
 
-    /// The control plane could not be reached or refused the subscription.
+    /// The control plane refused to let the decision be watched.
+    ///
+    /// Only a refusal the server meant ends the wait this way; a transport
+    /// failure is redialed from the cursor instead (see the module docs).
     #[error("could not watch for the decision: {source}")]
     Unwatchable {
         #[source]
-        source: horde_cli::client::ClientError,
+        source: crate::watch::WatchError,
     },
-
-    /// The event stream ended before any decision arrived.
-    ///
-    /// Distinct from a denial. The agent is not permitted, but it was not
-    /// refused either, and reporting a shutdown as a denial would teach an
-    /// operator that the chain said no when it said nothing.
-    #[error("the event stream ended before {request_id} was decided")]
-    Abandoned { request_id: String },
 
     /// A decision arrived that cannot be applied as written.
     ///
@@ -156,20 +147,11 @@ impl PermissionBroker {
         forward: Option<horde_proto::v1::ForwardSpec>,
     ) -> Result<PermissionDecision, PermissionError> {
         let session_id = self.context.session_id().to_owned();
-        let mut client = self.context.client();
         // The harness's own id for this tool call: unique per call, and stable
         // across a replay of the same call, which is exactly what both the
         // request id and the dedupe key need to be. Minting a fresh random one
         // here would dedupe nothing.
         let request_id = prompt.tool_use_id.clone();
-
-        // Subscribed FIRST. See the module docs — the answer can land between
-        // the write and the listen, and from-zero is safe because the match is
-        // by identity rather than position.
-        let mut stream = client
-            .follow(&SyncOptions::new(session_id.clone()))
-            .await
-            .map_err(|source| PermissionError::Unwatchable { source })?;
 
         self.context
             .journal()
@@ -187,21 +169,47 @@ impl PermissionBroker {
             .await
             .map_err(|source| PermissionError::NotRaised { source })?;
 
-        let wanted = request_id.clone();
-        let decided = stream
-            .next_matching(move |envelope| decision_for(envelope, &wanted))
+        let decided = self
+            .context
+            .watch()
+            .until(|index| index.decision(&request_id))
             .await
-            .map_err(|source| PermissionError::Unwatchable { source })?
-            .ok_or_else(|| PermissionError::Abandoned {
-                request_id: request_id.clone(),
-            })?;
+            .map_err(|source| PermissionError::Unwatchable { source })?;
+        domain_decision(&decided, request_id)
+    }
 
-        // Claude executes whatever `updatedInput` says, so this adapter *can*
-        // rewrite — which is what makes a narrowing meaningful here rather than
-        // an error. A provider that could not would get `RewriteUnsupported`
-        // out of this call rather than a silently widened permission.
-        horde_wire::permission::permission_decision_from_wire(&decided, true)
-            .map_err(|source| PermissionError::Unusable { request_id, source })
+    /// The decision the chain already gave this exact call at an earlier
+    /// gate, consumed so it covers this call and no other.
+    ///
+    /// The codex half of "one tool call, one gate": codex asks before every
+    /// MCP tool call through an elicitation the Worker raises under the item
+    /// id and `{server}/{tool}` (ADR-0005), and its `tools/call` that follows
+    /// carries no id the endpoint could correlate by. What it can match is the
+    /// call itself — the same agent, the same canonical tool name, the same
+    /// arguments, already decided — and a match means the chain has spoken on
+    /// this call. `None` means it has not, and the caller gates the call
+    /// itself, so the chain stays the authority over every call that reaches
+    /// a proxied tool, whether or not codex asked first.
+    ///
+    /// # Errors
+    ///
+    /// [`PermissionError`], as for [`Self::adjudicate`].
+    pub async fn decided_earlier(
+        &self,
+        identity: &AgentIdentity,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<Option<PermissionDecision>, PermissionError> {
+        let watch = self.context.watch();
+        watch
+            .catch_up()
+            .await
+            .map_err(|source| PermissionError::Unwatchable { source })?;
+        let input = as_struct(input);
+        watch
+            .with_index(|index| index.claim_decided(identity.agent_id(), tool_name, input.as_ref()))
+            .map(|(request_id, decided)| domain_decision(&decided, request_id))
+            .transpose()
     }
 
     /// The complete `tools/call` result for the harness.
@@ -281,26 +289,23 @@ fn as_struct(input: &serde_json::Value) -> Option<horde_proto::prost_types::Stru
         .and_then(|wire| wire.updated_input)
 }
 
-/// The decision in this envelope, if it answers `request_id`.
-fn decision_for(
-    envelope: &horde_proto::v1::EventEnvelope,
-    request_id: &str,
-) -> Option<horde_proto::v1::PermissionDecision> {
-    let EventKind::PermissionDecided(decided) = envelope
-        .event
-        .as_ref()
-        .and_then(|event| event.kind.as_ref())?
-    else {
-        return None;
-    };
-    let decision = decided.decision.as_ref()?;
-    let answered = decision.request_id.as_ref().map(ToString::to_string)?;
-    (answered == request_id).then(|| decision.clone())
+/// A decision off the log, in the domain's terms.
+///
+/// Claude executes whatever `updatedInput` says, so this adapter *can* rewrite
+/// — which is what makes a narrowing meaningful here rather than an error. A
+/// provider that could not would get `RewriteUnsupported` out of this call
+/// rather than a silently widened permission.
+fn domain_decision(
+    decided: &horde_proto::v1::PermissionDecision,
+    request_id: String,
+) -> Result<PermissionDecision, PermissionError> {
+    horde_wire::permission::permission_decision_from_wire(decided, true)
+        .map_err(|source| PermissionError::Unusable { request_id, source })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{as_struct, decision_for, rendered, requested};
+    use super::{as_struct, rendered, requested};
     use serde_json::json;
 
     fn prompt(
@@ -399,50 +404,6 @@ mod tests {
     #[test]
     fn a_non_object_proposal_is_not_smuggled_in_as_fields() {
         assert_eq!(as_struct(&json!("rm -rf /")), None);
-    }
-
-    fn decided(request_id: &str) -> horde_proto::v1::EventEnvelope {
-        crate::testing::envelope(
-            "agent-42",
-            horde_proto::v1::event::Kind::PermissionDecided(horde_proto::v1::PermissionDecided {
-                decision: Some(horde_proto::v1::PermissionDecision {
-                    request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
-                    outcome: horde_proto::v1::PermissionOutcome::Allow as i32,
-                    ..horde_proto::v1::PermissionDecision::default()
-                }),
-            }),
-        )
-    }
-
-    /// The whole wait turns on this: a decision for somebody else's request
-    /// must not end this agent's block. Two agents escalating at once is the
-    /// ordinary case, not the exotic one.
-    #[test]
-    fn only_the_matching_request_id_answers_the_wait() {
-        assert!(decision_for(&decided("toolu_01"), "toolu_01").is_some());
-        assert!(
-            decision_for(&decided("toolu_02"), "toolu_01").is_none(),
-            "another agent's decision must not unblock this one"
-        );
-    }
-
-    #[test]
-    fn events_that_are_not_decisions_are_ignored() {
-        let requested = crate::testing::envelope(
-            "agent-42",
-            horde_proto::v1::event::Kind::PermissionRequested(
-                horde_proto::v1::PermissionRequested::default(),
-            ),
-        );
-        assert!(decision_for(&requested, "toolu_01").is_none());
-        assert!(
-            decision_for(
-                &crate::testing::envelope_without_event("agent-42"),
-                "toolu_01"
-            )
-            .is_none(),
-            "an envelope with no event must not panic or match"
-        );
     }
 
     /// The approver is answering on a phone. The rendering is what they read.

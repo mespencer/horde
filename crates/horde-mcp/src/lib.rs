@@ -49,6 +49,7 @@ pub mod server;
 #[cfg(test)]
 mod testing;
 pub mod verbs;
+pub mod watch;
 
 // Re-exported because the pinned rmcp version is this crate's contract:
 // hosts implementing hub seams (the Worker's forwarded link, the Server's
