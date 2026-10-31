@@ -1073,9 +1073,10 @@ impl ApplyCommand for Runtime {
         let applied = self.execute(kind).await?;
 
         self.journal
-            .apply_command(
+            .apply_command_at(
                 &command.command_id,
                 command.command_sequence,
+                command.log_position,
                 applied.effects,
                 applied.bookkeeping,
             )
@@ -1571,6 +1572,7 @@ mod tests {
         StreamCommandsResponse {
             command_sequence: sequence,
             command_id: format!("s1:{sequence}"),
+            log_position: sequence,
             command: Some(Command::SpawnAgent(SpawnAgentCommand {
                 session_id: Some(SessionId::new("s1")),
                 agent_id: Some(AgentId::new(agent)),
@@ -1596,6 +1598,7 @@ mod tests {
         StreamCommandsResponse {
             command_sequence: sequence,
             command_id: format!("s1:{}", sequence + 100),
+            log_position: 0,
             command: Some(Command::DeliverPermissionDecision(
                 DeliverPermissionDecisionCommand {
                     agent_id: Some(AgentId::new(agent)),
@@ -1880,6 +1883,7 @@ mod tests {
             .apply(StreamCommandsResponse {
                 command_sequence: 1,
                 command_id: "s1:9".to_owned(),
+                log_position: 0,
                 command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
                     agent_id: Some(AgentId::new("nobody")),
                     reason: "cleanup".to_owned(),
@@ -1913,6 +1917,7 @@ mod tests {
             .apply(StreamCommandsResponse {
                 command_sequence: 2,
                 command_id: "s1:8".to_owned(),
+                log_position: 0,
                 command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
                     agent_id: Some(AgentId::new("agent-1")),
                     reason: "done with it".to_owned(),
@@ -1949,6 +1954,7 @@ mod tests {
         StreamCommandsResponse {
             command_sequence: sequence,
             command_id: format!("s1:{}", sequence + 200),
+            log_position: 0,
             command: Some(Command::DeliverMessage(DeliverMessageCommand {
                 agent_id: Some(AgentId::new(agent)),
                 body: Some(body),
@@ -2065,6 +2071,7 @@ mod tests {
             .apply(StreamCommandsResponse {
                 command_sequence: 2,
                 command_id: "s1:300".to_owned(),
+                log_position: 0,
                 command: Some(Command::InterruptAgent(
                     horde_proto::v1::InterruptAgentCommand {
                         agent_id: Some(AgentId::new("agent-1")),
@@ -2457,6 +2464,7 @@ mod tests {
             .apply(StreamCommandsResponse {
                 command_sequence: 2,
                 command_id: "s1:301".to_owned(),
+                log_position: 0,
                 command: Some(Command::InterruptAgent(
                     horde_proto::v1::InterruptAgentCommand {
                         agent_id: Some(AgentId::new("agent-1")),
@@ -2675,6 +2683,7 @@ mod tests {
             .apply(StreamCommandsResponse {
                 command_sequence: 1,
                 command_id: "s1:7".to_owned(),
+                log_position: 0,
                 command: Some(Command::MaterializeWorkspace(
                     MaterializeWorkspaceCommand::default(),
                 )),
@@ -2729,6 +2738,7 @@ mod tests {
         StreamCommandsResponse {
             command_sequence: sequence,
             command_id: format!("s1:{sequence}"),
+            log_position: 0,
             command: Some(Command::MaterializeWorkspace(MaterializeWorkspaceCommand {
                 definition: Some(horde_proto::v1::WorkspaceDefinition {
                     workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
@@ -3033,6 +3043,7 @@ mod tests {
         StreamCommandsResponse {
             command_sequence: sequence,
             command_id: command_id.to_owned(),
+            log_position: 0,
             command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
                 agent_id: Some(AgentId::new(agent)),
                 reason: "done".to_owned(),

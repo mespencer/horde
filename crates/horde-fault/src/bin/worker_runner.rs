@@ -186,6 +186,7 @@ async fn attempt(
         hello: capabilities::hello(&invocation.worker_id),
         capabilities: advertised,
         identity: identity.clone(),
+        last_local_journal_sequence: journal.last_local_sequence().await.ok(),
     };
     if let Ok((mut connection, registration)) = Connection::dial(&config).await {
         println!(

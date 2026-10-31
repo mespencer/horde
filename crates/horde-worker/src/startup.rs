@@ -859,6 +859,9 @@ async fn fresh_dial_config(prepared: &PreparedWorker) -> DialConfig {
             &prepared.declared,
         ),
         identity: prepared.identity.clone(),
+        // An unreadable head reports nothing rather than zero: zero would
+        // read as a lost journal and refuse a healthy Worker.
+        last_local_journal_sequence: prepared.journal.last_local_sequence().await.ok(),
     }
 }
 

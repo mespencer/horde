@@ -105,6 +105,26 @@ impl MirrorStore {
         Ok(())
     }
 
+    /// Unregisters every name not in `keep`, returning the names removed.
+    ///
+    /// The registry's deletion path: a repo whose workspace definition was
+    /// deleted must stop being served, or the Relay keeps cloning and serving
+    /// a remote nobody declared any more. The mirror on disk is left alone —
+    /// a result already in the log may name a commit only that mirror holds,
+    /// and re-registering the name serves it again without a clone.
+    pub fn retain_only(&self, keep: &std::collections::BTreeSet<String>) -> Vec<String> {
+        let mut registry = self.lock_registry();
+        let removed: Vec<String> = registry
+            .keys()
+            .filter(|name| !keep.contains(*name))
+            .cloned()
+            .collect();
+        for name in &removed {
+            registry.remove(name);
+        }
+        removed
+    }
+
     /// The registered upstream for `name`, if any.
     #[must_use]
     pub fn registered(&self, name: &str) -> Option<String> {

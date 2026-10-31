@@ -88,6 +88,15 @@ impl WorkerService for WorkerFacing {
                 "a worker must supply its id when no certificate carries it".to_owned(),
             )));
         }
+        // A regressed journal is refused here, before any stream opens: its
+        // command stream would otherwise replay a history its fresh state
+        // never applied (ADR-0011). Unset from older workers, which are
+        // still judged at PushEventsStart.
+        if let Some(reported) = request.last_local_journal_sequence {
+            refuse_regressed(&self.core, &worker_id, reported)
+                .await
+                .map_err(Status::from)?;
+        }
         let capabilities = request.capabilities.unwrap_or_default();
         refuse_foreign_reports(&worker_id, &capabilities.warm_instances)?;
 
@@ -129,10 +138,13 @@ impl WorkerService for WorkerFacing {
         // they are folded from the log, because the fold can rebuild every
         // command a worker was ever issued and only the worker knows which of
         // them it finished.
-        let mut stream = CommandStream::open(
+        let mut stream = CommandStream::resuming(
             &self.core.log,
             &worker_id,
-            request.resume_from_command_sequence,
+            commands::Resume {
+                sequence: request.resume_from_command_sequence,
+                log_position: request.resume_after_log_position,
+            },
         );
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
@@ -143,41 +155,28 @@ impl WorkerService for WorkerFacing {
         // stale stream must not knock the fresh registration out of placement.
         let epoch = core.workers.epoch_of(&worker_id);
         tokio::spawn(async move {
-            let pump = async {
-                'stream: while let Some(batch) = stream.next_batch().await {
-                    let batch = match batch {
-                        Ok(batch) => batch,
-                        Err(error) => {
-                            let _ = sender.send(Err(Status::from(error))).await;
-                            break 'stream;
-                        }
-                    };
-                    for command in batch {
-                        if sender.send(Ok(command)).await.is_err() {
-                            break 'stream; // The worker hung up.
-                        }
-                    }
-                }
-            };
-            // Revocation severs the stream (fix a4).
+            // Revocation severs the stream (fix a4); a dead peer ends it as
+            // soon as the transport says so, not at the next command.
+            let pump = pump_commands(&mut stream, &sender);
             super::shared::run_severable(pump, deny, serial, &sender).await;
 
             // The command stream is the worker's lifeline: once it is gone the
-            // server cannot command this worker, so it leaves placement and
-            // the agents it never started are re-queued — unless the worker
-            // has re-registered since, in which case this stream is stale and
-            // the disconnect is not its to declare. This is a background
-            // task, so a failed re-queue can only be logged — the next
-            // placement pass will see the same queued agents anyway.
-            if !worker_id.is_empty()
-                && core.workers.deregister_if_current(&worker_id, epoch)
-                && let Err(error) = worker_lost(&core, &worker_id).await
-            {
-                tracing::warn!(
-                    %error,
-                    worker_id,
-                    "re-queueing a disconnected worker's agents failed"
-                );
+            // server cannot command this worker, so it leaves placement, the
+            // agents it never started are re-queued, and its lease starts
+            // (ADR-0011) — unless the worker has re-registered since, in
+            // which case this stream is stale and the disconnect is not its
+            // to declare. This is a background task, so a failed re-queue can
+            // only be logged — the next placement pass will see the same
+            // queued agents anyway.
+            if !worker_id.is_empty() && core.workers.deregister_if_current(&worker_id, epoch) {
+                crate::liveness::start_lease(&core, &worker_id, epoch);
+                if let Err(error) = worker_lost(&core, &worker_id).await {
+                    tracing::warn!(
+                        %error,
+                        worker_id,
+                        "re-queueing a disconnected worker's agents failed"
+                    );
+                }
             }
         });
 
@@ -489,13 +488,64 @@ impl WorkerService for WorkerFacing {
 /// ceiling the worker corrects downwards on `StreamCommands` if it applied
 /// fewer, because saying "everything" would replay the world.
 async fn resume_positions(core: &ServerCore, worker_id: &str) -> Result<(u64, u64), ServerError> {
-    let journal = core
-        .log
-        .worker_journal_watermark(worker_id)
+    let journal = crate::liveness::own_watermark(&core.log, worker_id)
         .await?
         .saturating_add(1);
     let issued = commands::issued_to(&core.log, worker_id).await?;
     Ok((journal, issued.saturating_add(1)))
+}
+
+/// Delivers a command stream until the log closes, the fold fails, or the
+/// worker is gone.
+///
+/// The worker going away is noticed through `sender.closed()` — the moment
+/// the transport drops the response stream — rather than at the next failed
+/// send, which for a quiet worker might be hours away and would hold its
+/// registration (and so its agents' placement) hostage to the next command
+/// anyone happened to send it (ADR-0011). Cancelling a pending fold read on
+/// that branch loses nothing: the stream is ending, and the next one
+/// re-folds from the log.
+async fn pump_commands(
+    stream: &mut CommandStream,
+    sender: &tokio::sync::mpsc::Sender<Result<StreamCommandsResponse, Status>>,
+) {
+    loop {
+        let batch = tokio::select! {
+            () = sender.closed() => return,
+            batch = stream.next_batch() => batch,
+        };
+        let batch = match batch {
+            None => return,
+            Some(Ok(batch)) => batch,
+            Some(Err(error)) => {
+                let _ = sender.send(Err(Status::from(error))).await;
+                return;
+            }
+        };
+        for command in batch {
+            if sender.send(Ok(command)).await.is_err() {
+                return; // The worker hung up.
+            }
+        }
+    }
+}
+
+/// Refuses a worker whose reported journal head is below what the log holds
+/// for its current journal — it lost its journal (see [`handle_start`]).
+async fn refuse_regressed(
+    core: &ServerCore,
+    worker_id: &str,
+    reported: u64,
+) -> Result<u64, ServerError> {
+    let stored = crate::liveness::own_watermark(&core.log, worker_id).await?;
+    if reported < stored {
+        return Err(ServerError::JournalRegressed {
+            worker_id: worker_id.to_owned(),
+            reported,
+            stored,
+        });
+    }
+    Ok(stored)
 }
 
 /// Registers a worker's capabilities, refreshes the instance cache from its
@@ -541,18 +591,12 @@ async fn handle_start(
     worker_id: &str,
     last_local_journal_sequence: u64,
 ) -> Result<PushEventsResponse, ServerError> {
-    let stored = core.log.worker_journal_watermark(worker_id).await?;
-
     // A worker reporting a head below what we already stored has lost its
     // journal. Renumbering its events under fresh journal positions would
-    // forge history and silently defeat the dedupe index, so this is refused.
-    if last_local_journal_sequence < stored {
-        return Err(ServerError::JournalRegressed {
-            worker_id: worker_id.to_owned(),
-            reported: last_local_journal_sequence,
-            stored,
-        });
-    }
+    // forge history and silently defeat the dedupe index, so this is refused
+    // — until an operator resets it (ADR-0011), after which "stored" counts
+    // only what its current journal sent.
+    let stored = refuse_regressed(core, worker_id, last_local_journal_sequence).await?;
 
     Ok(PushEventsResponse {
         body: Some(push_events_response::Body::Accepted(PushEventsAccepted {
@@ -862,6 +906,7 @@ mod tests {
                 }),
                 worker_id: worker_id.map(horde_proto::v1::WorkerId::new),
                 capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+                last_local_journal_sequence: None,
             })
         };
 

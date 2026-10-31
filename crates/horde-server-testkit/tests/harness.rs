@@ -228,6 +228,7 @@ async fn a_placed_seed_folds_into_that_workers_spawn_command() {
         .stream_commands(horde_proto::v1::StreamCommandsRequest {
             worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
             resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
         })
         .await
         .expect("the stream must open")

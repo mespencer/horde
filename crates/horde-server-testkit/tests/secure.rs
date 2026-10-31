@@ -90,6 +90,7 @@ async fn the_harness_issues_identities_that_open_the_spines_they_are_for() -> Se
             hello: Some(hello(PrincipalRole::Worker, "mac-studio")),
             worker_id: Some(horde_proto::v1::WorkerId::new("mac-studio")),
             capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+            last_local_journal_sequence: None,
         }),
     )
     .await??

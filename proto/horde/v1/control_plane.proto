@@ -90,6 +90,11 @@ service ControlPlaneService {
   // Deny-list an issued certificate by principal.
   rpc RevokeEnrollment(RevokeEnrollmentRequest) returns (RevokeEnrollmentResponse);
 
+  // Reset a Worker whose journal regressed (ADR-0011): its fresh journal is
+  // accepted from here on, its command stream starts over, and the Agents it
+  // held are declared lost.
+  rpc ResetWorkerJournal(ResetWorkerJournalRequest) returns (ResetWorkerJournalResponse);
+
   // -- Usage ----------------------------------------------------------------
 
   rpc QueryUsage(QueryUsageRequest) returns (QueryUsageResponse);
@@ -526,6 +531,24 @@ message RevokeEnrollmentRequest {
 message RevokeEnrollmentResponse {
   // Certificate serial added to the deny-list.
   string revoked_serial = 1;
+}
+
+message ResetWorkerJournalRequest {
+  WorkerId worker_id = 1;
+
+  string reason = 2;
+}
+
+message ResetWorkerJournalResponse {
+  // The highest journal position the log held for the Worker; its fresh
+  // journal is numbered above it.
+  uint64 journal_floor = 1;
+
+  // The Agents the reset declared lost.
+  repeated AgentId lost_agents = 2;
+
+  // Log position of the WorkerJournalReset event.
+  uint64 sequence = 3;
 }
 
 // ---------------------------------------------------------------------------

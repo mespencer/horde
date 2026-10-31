@@ -294,6 +294,22 @@ impl Client {
             .revoked_serial)
     }
 
+    /// Resets a worker whose journal regressed (ADR-0011).
+    pub async fn reset_worker_journal(
+        &mut self,
+        worker_id: &str,
+        reason: &str,
+    ) -> Result<horde_proto::v1::ResetWorkerJournalResponse, ClientError> {
+        Ok(self
+            .inner
+            .reset_worker_journal(horde_proto::v1::ResetWorkerJournalRequest {
+                worker_id: Some(horde_proto::v1::WorkerId::new(worker_id)),
+                reason: reason.to_owned(),
+            })
+            .await?
+            .into_inner())
+    }
+
     /// Builds a client over a channel the caller already has.
     ///
     /// The seam for anything that owns its transport rather than wanting one

@@ -82,6 +82,7 @@ mod harness {
                 &capabilities::DeclaredFacts::default(),
             ),
             identity: None,
+            last_local_journal_sequence: None,
         }
     }
 
@@ -97,6 +98,7 @@ mod harness {
                 &capabilities::DeclaredFacts::default(),
             ),
             identity: None,
+            last_local_journal_sequence: None,
         }
     }
 
@@ -476,6 +478,7 @@ async fn an_enrolled_worker_dials_mtls_and_the_unenrolled_or_revoked_are_refused
             &horde_worker::capabilities::DeclaredFacts::default(),
         ),
         identity: Some(identity.clone()),
+        last_local_journal_sequence: None,
     };
 
     let (connection, _) = tokio::time::timeout(

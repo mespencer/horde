@@ -64,6 +64,10 @@ pub struct ServerCore {
     /// worker. Honestly a cache of connections — which servers *exist* is the
     /// journaled catalog's to say, re-read per call.
     pub hub: Arc<crate::hub::HubUpstreams>,
+    /// How long a worker may stay away before the agents it was running are
+    /// declared lost (ADR-0011). A partition shorter than this is ridden
+    /// out; one longer is treated as the worker's death.
+    pub worker_lease: std::time::Duration,
 }
 
 impl ServerCore {
@@ -83,7 +87,16 @@ impl ServerCore {
             forwards: ForwardRegistry::new(),
             logins: crate::login::registry::LoginRegistry::new(),
             hub: Arc::new(crate::hub::HubUpstreams::new()),
+            worker_lease: crate::liveness::DEFAULT_WORKER_LEASE,
         }
+    }
+
+    /// Overrides the worker-lost lease (ADR-0011) — the serving path from
+    /// `--worker-lease`, tests to watch a lease lapse without waiting minutes.
+    #[must_use]
+    pub fn with_worker_lease(mut self, lease: std::time::Duration) -> Self {
+        self.worker_lease = lease;
+        self
     }
 
     /// Replaces the scheduler. Wave 4 swaps in the real one here.

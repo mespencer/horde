@@ -108,6 +108,13 @@ message RegisterWorkerRequest {
   WorkerId worker_id = 2;
 
   WorkerCapabilities capabilities = 3;
+
+  // Highest sequence in the Worker's local journal, as PushEventsStart
+  // reports it. Lets the Server refuse a regressed Worker at registration —
+  // before its command stream could replay a history its fresh state never
+  // saw — and name the recovery (ADR-0011). Unset from Workers that predate
+  // the field, which are judged at PushEventsStart as before.
+  optional uint64 last_local_journal_sequence = 4;
 }
 
 message RegisterWorkerResponse {
@@ -134,6 +141,14 @@ message StreamCommandsRequest {
   // Last command the Worker durably applied, plus one. Authoritative: the
   // Worker's local state, not the Server's guess, decides what is replayed.
   uint64 resume_from_command_sequence = 2;
+
+  // The highest StreamCommandsResponse.log_position the Worker durably
+  // applied (ADR-0011). When set, it outranks resume_from_command_sequence:
+  // the Server redelivers every command caused at or after this position and
+  // the Worker dedupes on command_id. Sequences are a fold's numbering and a
+  // newer fold may number the same history differently; a position names the
+  // causing event itself, which no fold can renumber. Zero means unknown.
+  uint64 resume_after_log_position = 3;
 }
 
 message SpawnAgentCommand {
@@ -223,6 +238,12 @@ message StreamCommandsResponse {
   // Stable across redelivery. Commands are at-least-once; the Worker dedupes
   // on this.
   string command_id = 2;
+
+  // The log position of the event that caused this command — opaque to the
+  // Worker, which records the highest it applied and resumes from it
+  // (StreamCommandsRequest.resume_after_log_position). Non-decreasing along
+  // the stream.
+  uint64 log_position = 3;
 
   oneof command {
     SpawnAgentCommand spawn_agent = 10;

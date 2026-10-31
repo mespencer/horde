@@ -38,6 +38,7 @@ fn register_request(name: &str) -> RegisterWorkerRequest {
         hello: Some(hello(PrincipalRole::Worker, name)),
         worker_id: Some(WorkerId::new(name)),
         capabilities: Some(WorkerCapabilities::default()),
+        last_local_journal_sequence: None,
     }
 }
 
@@ -464,6 +465,7 @@ async fn revocation_severs_a_live_command_stream() -> Setup<()> {
         worker.stream_commands(horde_proto::v1::StreamCommandsRequest {
             worker_id: Some(WorkerId::new("mac-studio")),
             resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
         }),
     )
     .await??

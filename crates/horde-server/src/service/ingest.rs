@@ -26,12 +26,21 @@
 //! dedupe index turns a replay of the same poison event into a no-op; and the
 //! refusal is an auditable event like everything else. Only a storage fault —
 //! the server failing, not the worker — still fails the batch.
+//!
+//! # Late journals from a former placement (ADR-0011)
+//!
+//! A worker partitioned away keeps journaling, and by the time it returns
+//! its agent may have been re-placed or declared lost. Such an entry is not
+//! a stranger's and is not dead-lettered: output and usage are history and
+//! land as themselves; anything that would speak for the agent *now* is
+//! recorded whole as a `StaleJournalEvent` in the agent's own session —
+//! deliberate, visible to every attached client, never silent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use horde_proto::v1::{
-    Event, JournalEventRefused, JournaledEvent, PlacementState, SessionId, WorkerId,
-    WorkspaceInstanceChanged, event::Kind,
+    Event, JournalEventRefused, JournaledEvent, PlacementState, SessionId, StaleJournalEvent,
+    WorkerId, WorkspaceInstanceChanged, event::Kind,
 };
 use prost::Message;
 
@@ -69,6 +78,11 @@ struct Residence {
 #[derive(Debug, Default)]
 pub struct OriginView {
     agents: BTreeMap<String, Residence>,
+    /// `(agent, worker)` pairs where the worker once held the agent and no
+    /// longer does — the placements a late journal can come from (ADR-0011).
+    former: BTreeSet<(String, String)>,
+    /// Each worker's journal floor, from its latest reset (ADR-0011).
+    floors: BTreeMap<String, u64>,
     /// `(stream, worker)` pairs a prewarm named: the only way a worker's
     /// agent-less instance change has a reason to exist.
     prewarmed: BTreeSet<(String, String)>,
@@ -107,9 +121,8 @@ impl OriginView {
     ///
     /// The log failing to read.
     pub async fn catch_up(&mut self, log: &EventLog) -> Result<(), ServerError> {
-        if self.ambient {
-            return Ok(());
-        }
+        // Even an ambient view folds: it judges nothing, but a journal floor
+        // is a fact about storage, not about trust.
         loop {
             let page = log.read_global_from(self.cursor, PAGE).await?;
             let Some(last) = page.last() else {
@@ -141,7 +154,23 @@ impl OriginView {
             }
             (Some(Kind::PlacementChanged(changed)), Some(agent_id)) => {
                 if let Some(residence) = self.agents.get_mut(&agent_id) {
-                    residence.worker_id = changed.placement.as_ref().and_then(placed_worker);
+                    let next = changed.placement.as_ref().and_then(placed_worker);
+                    if let Some(previous) = residence.worker_id.take()
+                        && next.as_deref() != Some(previous.as_str())
+                    {
+                        self.former.insert((agent_id.clone(), previous));
+                    }
+                    if let Some(worker_id) = next.as_ref() {
+                        // Held again: whatever it journals now is current.
+                        self.former.remove(&(agent_id, worker_id.clone()));
+                    }
+                    residence.worker_id = next;
+                }
+            }
+            (Some(Kind::WorkerJournalReset(reset)), _) => {
+                if let Some(worker_id) = reset.worker_id.as_ref() {
+                    self.floors
+                        .insert(worker_id.to_string(), reset.journal_floor);
                 }
             }
             (Some(Kind::WorkspacePrewarmRequested(prewarm)), _) => {
@@ -204,6 +233,32 @@ impl OriginView {
         }
     }
 
+    /// The worker's journal floor (ADR-0011): its journal positions are
+    /// stored this far above what it numbers them.
+    #[must_use]
+    pub fn floor(&self, worker_id: &str) -> u64 {
+        self.floors.get(worker_id).copied().unwrap_or(0)
+    }
+
+    /// Whether `event` is a late journal from a placement `worker_id` used to
+    /// hold for this session's agent (ADR-0011), and if so how it is handled.
+    /// `None` for anything else — current placements and strangers alike are
+    /// [`Self::judge`]'s.
+    #[must_use]
+    pub fn lateness(&self, worker_id: &str, session_id: &str, event: &Event) -> Option<Late> {
+        if self.ambient {
+            return None;
+        }
+        let agent_id = event.agent_id.as_ref().map(ToString::to_string)?;
+        let residence = self.agents.get(&agent_id)?;
+        let formerly = residence.session_id == session_id
+            && self.former.contains(&(agent_id, worker_id.to_owned()));
+        if !formerly {
+            return None;
+        }
+        late_handling(event.kind.as_ref()?, residence.worker_id.clone())
+    }
+
     /// An agent event: the agent must belong to the session it targets and
     /// be placed on the journaling worker.
     fn judge_agent(
@@ -263,6 +318,33 @@ impl OriginView {
     }
 }
 
+/// What a late journal entry from a former placement becomes (ADR-0011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Late {
+    /// Pure history — output, usage — lands as itself: it happened, it is
+    /// attributable, and it overwrites nothing the current placement says.
+    Land,
+    /// Anything that would speak *for* the agent now — a lifecycle, a
+    /// permission request, a result, an interrupt ack, an instance change —
+    /// is recorded whole as a `StaleJournalEvent` in the agent's session.
+    /// Carries where the agent is placed now, if anywhere.
+    Record { current_worker_id: Option<String> },
+}
+
+/// The late-handling table by kind. Kinds a worker may never journal are
+/// not late, they are refused, so they answer `None` and fall to the judge.
+fn late_handling(kind: &Kind, current_worker_id: Option<String>) -> Option<Late> {
+    match kind {
+        Kind::AgentOutputChunk(_) | Kind::UsageRecorded(_) => Some(Late::Land),
+        Kind::AgentLifecycleChanged(_)
+        | Kind::PermissionRequested(_)
+        | Kind::ResultReported(_)
+        | Kind::TurnInterrupted(_)
+        | Kind::WorkspaceInstanceChanged(_) => Some(Late::Record { current_worker_id }),
+        _ => None,
+    }
+}
+
 /// The worker a placement names, when it is actually placed on one.
 fn placed_worker(placement: &horde_proto::v1::Placement) -> Option<String> {
     (placement.state == PlacementState::Placed as i32)
@@ -308,7 +390,12 @@ async fn ingest_one(
     worker_id: &str,
     journaled: JournaledEvent,
 ) -> Result<(), ServerError> {
-    let journal_sequence = journaled.journal_sequence;
+    // Stored above the worker's journal floor (ADR-0011): after a reset its
+    // fresh journal restarts at one, and the log must neither dedupe those
+    // entries onto the lost journal's rows nor take them for a regression.
+    let journal_sequence = origins
+        .floor(worker_id)
+        .saturating_add(journaled.journal_sequence);
     let session_id = journaled
         .session_id
         .as_ref()
@@ -326,17 +413,28 @@ async fn ingest_one(
             .unwrap_or_default(),
     };
 
-    let (session_id, event) = match admit(origins, worker_id, session_id, journaled.event) {
-        Ok(admitted) => admitted,
+    let (session_id, event) = match shaped(session_id, journaled.event) {
+        Ok(shaped) => shaped,
         Err(reason) => return dead_letter(core, refusal, reason).await,
     };
+    match origins.lateness(worker_id, &session_id, &event) {
+        Some(Late::Land) => {}
+        Some(Late::Record { current_worker_id }) => {
+            return record_stale(core, &refusal, &session_id, event, current_worker_id).await;
+        }
+        None => {
+            if let Err(reason) = origins.judge(worker_id, &session_id, &event) {
+                return dead_letter(core, refusal, reason).await;
+            }
+        }
+    }
 
     let appended = core
         .log
         .append(PendingEvent {
             session_id: session_id.clone(),
             origin_worker_id: worker_id.to_owned(),
-            journal_sequence: Some(journal_sequence),
+            journal_sequence: Some(refusal.journal_sequence),
             idempotency_key: event.idempotency_key.clone(),
             payload: event.encode_to_vec(),
         })
@@ -365,22 +463,70 @@ async fn ingest_one(
     Ok(())
 }
 
-/// The shape and origin checks, in one place: a session, an event, no
-/// inline bulk, and a kind this worker may say about that agent.
-fn admit(
-    origins: &OriginView,
-    worker_id: &str,
-    session_id: Option<String>,
-    event: Option<Event>,
-) -> Result<(String, Event), String> {
+/// The shape checks, in one place: a session, an event, no inline bulk.
+/// What the worker may say about whom is the origin view's question, asked
+/// after this.
+fn shaped(session_id: Option<String>, event: Option<Event>) -> Result<(String, Event), String> {
     let session_id =
         session_id.ok_or_else(|| "a journaled event must name its session".to_owned())?;
     let event = event.ok_or_else(|| "a journaled event must carry an event".to_owned())?;
     // The other append chokepoint: the worker journal must not carry bulk
     // into the log any more than a client verb may.
     crate::service::shared::refuse_inline_bulk(&event).map_err(|error| error.to_string())?;
-    origins.judge(worker_id, &session_id, &event)?;
     Ok((session_id, event))
+}
+
+/// Records a late journal entry from a former placement in the agent's own
+/// session (ADR-0011), whole, under the worker's origin and the entry's
+/// journal position — visible where the agent is, and still advancing the
+/// worker's watermark like any other stored row.
+async fn record_stale(
+    core: &ServerCore,
+    refusal: &Refusal<'_>,
+    session_id: &str,
+    event: Event,
+    current_worker_id: Option<String>,
+) -> Result<(), ServerError> {
+    let reason = match current_worker_id.as_deref() {
+        Some(current) => format!(
+            "journaled by worker {} after the agent was placed on worker {current}",
+            refusal.worker_id
+        ),
+        None => format!(
+            "journaled by worker {} after the agent left it, and it is placed nowhere now",
+            refusal.worker_id
+        ),
+    };
+    tracing::info!(
+        worker_id = refusal.worker_id,
+        journal_sequence = refusal.journal_sequence,
+        kind = refusal.kind,
+        %reason,
+        "a late journal entry was recorded as stale"
+    );
+    let stale = Event {
+        agent_id: event.agent_id.clone(),
+        occurred_at: None,
+        idempotency_key: String::new(),
+        kind: Some(Kind::StaleJournalEvent(Box::new(StaleJournalEvent {
+            worker_id: Some(WorkerId::new(refusal.worker_id)),
+            journal_sequence: refusal.journal_sequence,
+            current_worker_id: current_worker_id.map(WorkerId::new),
+            kind: refusal.kind.to_owned(),
+            reason,
+            event: Some(Box::new(event)),
+        }))),
+    };
+    core.log
+        .append(PendingEvent {
+            session_id: session_id.to_owned(),
+            origin_worker_id: refusal.worker_id.to_owned(),
+            journal_sequence: Some(refusal.journal_sequence),
+            idempotency_key: String::new(),
+            payload: stale.encode_to_vec(),
+        })
+        .await?;
+    Ok(())
 }
 
 /// Everything a dead letter records except its reason.

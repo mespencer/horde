@@ -14,8 +14,8 @@ use horde_proto::v1::{
     McpServerConfig, McpServerConfigChanged, Note, NoteSent, Payload, PermissionDecided,
     PermissionDecision, PermissionRequest, PermissionRequested, Placement, PlacementChanged,
     PlacementState, ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged,
-    SessionLifecycleState, TurnInterrupted, UsageRecord, UsageRecorded, WorkerId, WorkerLoginEnded,
-    WorkerLoginStarted, WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
+    SessionLifecycleState, StaleJournalEvent, TurnInterrupted, UsageRecord, UsageRecorded,
+    WorkerId, WorkerJournalReset, WorkerLoginEnded, WorkerLoginStarted, WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
     WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
     mcp_server_config,
 };
@@ -68,6 +68,8 @@ const EVENT_VOCABULARY: &[&str] = &[
     "worker_login_started",
     "worker_login_ended",
     "journal_event_refused",
+    "stale_journal_event",
+    "worker_journal_reset",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -100,6 +102,8 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::WorkerLoginStarted(_) => "worker_login_started",
         event::Kind::WorkerLoginEnded(_) => "worker_login_ended",
         event::Kind::JournalEventRefused(_) => "journal_event_refused",
+        event::Kind::StaleJournalEvent(_) => "stale_journal_event",
+        event::Kind::WorkerJournalReset(_) => "worker_journal_reset",
     }
 }
 
@@ -265,6 +269,29 @@ fn every_kind() -> Vec<event::Kind> {
             kind: "mcp_server_config_changed".to_owned(),
             reason: "mcp_server_config_changed is written only by the server".to_owned(),
         }),
+        event::Kind::StaleJournalEvent(Box::new(StaleJournalEvent {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            journal_sequence: 43,
+            current_worker_id: Some(WorkerId::new("linux-box")),
+            kind: "agent_lifecycle_changed".to_owned(),
+            reason: "journaled after the agent was placed elsewhere".to_owned(),
+            event: Some(Box::new(Event {
+                agent_id: Some(AgentId::new("agent-1")),
+                occurred_at: None,
+                idempotency_key: "agent-1:done".to_owned(),
+                kind: Some(event::Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                    previous_state: AgentLifecycleState::Running as i32,
+                    state: AgentLifecycleState::Idle as i32,
+                    reason: "turn ended".to_owned(),
+                })),
+            })),
+        })),
+        event::Kind::WorkerJournalReset(WorkerJournalReset {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            journal_floor: 1_024,
+            reset_by: None,
+            reason: "disk replaced".to_owned(),
+        }),
     ]
 }
 
@@ -375,7 +402,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 24] = [
+    let expected: [(&str, i32); 26] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -400,6 +427,8 @@ fn event_kind_tags_are_stable() {
         ("worker_login_started", 31),
         ("worker_login_ended", 32),
         ("journal_event_refused", 33),
+        ("stale_journal_event", 34),
+        ("worker_journal_reset", 35),
     ];
 
     let expected: Vec<(String, i32)> = expected

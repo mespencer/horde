@@ -276,6 +276,7 @@ async fn the_workspace_verbs_round_trip_through_the_dispatch() {
             }),
             worker_id: Some(horde_proto::v1::WorkerId::new("w-9")),
             capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+            last_local_journal_sequence: None,
         })
         .await
         .expect("the worker registers");

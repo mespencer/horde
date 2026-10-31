@@ -132,6 +132,7 @@ fn worker_command_stream_carries_sequence_and_idempotency_key() {
     round_trip(&StreamCommandsResponse {
         command_sequence: 88,
         command_id: "cmd-01JABCD".to_owned(),
+        log_position: 4_096,
         command: Some(stream_commands_response::Command::InterruptAgent(
             horde_proto::v1::InterruptAgentCommand {
                 agent_id: Some(AgentId::new("agent-9")),

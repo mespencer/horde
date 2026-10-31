@@ -48,6 +48,7 @@ async fn register_worker(harness: &mut Harness, worker_id: &str) -> Setup<u64> {
             hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker_id)),
             capabilities: Some(WorkerCapabilities::default()),
+            last_local_journal_sequence: None,
         })
         .await?
         .into_inner()
@@ -68,6 +69,7 @@ async fn the_handshakes_refuse_peers_below_the_minimum_version() -> Setup<()> {
         }),
         worker_id: Some(WorkerId::new("old-worker")),
         capabilities: Some(WorkerCapabilities::default()),
+        last_local_journal_sequence: None,
     };
 
     for peer in [None, Some("0.0.1"), Some("not-a-version")] {
@@ -210,6 +212,7 @@ async fn a_worker_and_a_client_meet_through_the_log() {
         .stream_commands(StreamCommandsRequest {
             worker_id: Some(WorkerId::new("worker-a")),
             resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
         })
         .await
         .expect("the command stream must open")
@@ -605,6 +608,7 @@ async fn harness_with_pending_permissions(request_ids: &[&str]) -> Setup<Harness
                 }],
                 ..WorkerCapabilities::default()
             }),
+            last_local_journal_sequence: None,
         })
         .await?;
     let (session_id, root) = seed(&mut harness, "perms", "key-1").await?;
@@ -918,6 +922,7 @@ async fn first_command(
         .stream_commands(StreamCommandsRequest {
             worker_id: Some(WorkerId::new(worker_id)),
             resume_from_command_sequence: resume_from,
+            resume_after_log_position: 0,
         })
         .await?
         .into_inner();

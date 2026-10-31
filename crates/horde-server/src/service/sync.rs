@@ -14,7 +14,8 @@
 //! drops the tail. A quiet connection becomes distinguishable from a dead one
 //! on both ends: the client sees heartbeats stop, the server sees the send
 //! fail. This is the clock-as-ceiling shape QUALITY_GATES permits, not the
-//! clock-as-progress-bound shape it forbids.
+//! clock-as-progress-bound shape it forbids. The ceiling races the batch it
+//! waits on and never cancels it ([`next_or_heartbeat`], ADR-0011).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -226,23 +227,53 @@ pub(crate) async fn stream_merged(
     }
 
     loop {
-        match tokio::time::timeout(heartbeat_period, tail.next_batch()).await {
-            // Quiet past the ceiling: the heartbeat is both the client's
-            // staleness signal and the server's dead-client probe — a failed
-            // send is how this task learns nobody is listening.
-            Err(_elapsed) => {
-                if sender.send(Ok(heartbeat())).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => return,
-            Ok(Some(Err(error))) => {
+        let Some(next) = next_or_heartbeat(tail.next_batch(), heartbeat_period, &sender).await
+        else {
+            return; // The client is gone.
+        };
+        match next {
+            None => return,
+            Some(Err(error)) => {
                 let _ = sender.send(Err(Status::from(error))).await;
                 return;
             }
-            Ok(Some(Ok(events))) => {
+            Some(Ok(events)) => {
                 if !send_stored(&sender, &events, &mut filter).await {
                     return;
+                }
+            }
+        }
+    }
+}
+
+/// Drives `next` to completion, sending a heartbeat each time it has been
+/// quiet for `period`. `None` means the client is gone — a heartbeat failed
+/// to send, or the receiving half closed.
+///
+/// The heartbeat races `next`; it never cancels it. The batch future is
+/// pinned once and polled across every heartbeat, because cancelling it is
+/// not safe: a tail that has consumed its wake-up notification but not yet
+/// returned the batch it read would lose the wake-up (the event waits for
+/// the next append, which may never come), and a lag recovery cancelled
+/// between two sessions' reads would advance one session's watermark past
+/// events nobody was handed. The old `timeout(period, next_batch())` did
+/// exactly that cancellation whenever the ceiling fired mid-read (ADR-0011).
+/// The heartbeat is still both the client's staleness signal and the
+/// server's dead-client probe; `sender.closed()` makes the probe immediate.
+pub(crate) async fn next_or_heartbeat<T>(
+    next: impl std::future::Future<Output = T>,
+    period: Duration,
+    sender: &Sender<Result<SyncEventsResponse, Status>>,
+) -> Option<T> {
+    tokio::pin!(next);
+    loop {
+        tokio::select! {
+            biased;
+            outcome = &mut next => return Some(outcome),
+            () = sender.closed() => return None,
+            () = tokio::time::sleep(period) => {
+                if sender.send(Ok(heartbeat())).await.is_err() {
+                    return None;
                 }
             }
         }
@@ -537,5 +568,64 @@ mod tests {
             vec![10],
             "the seed also proves the session holds the root"
         );
+    }
+
+    /// Counts drops of the batch future the heartbeat races.
+    struct DropCounter(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The cancel-safety pin (ADR-0011): heartbeats fire while the batch is
+    /// still in flight, and the batch future survives every one of them —
+    /// dropped exactly once, after it delivered — so whatever it had already
+    /// consumed reaches the client. The old `timeout(period, next_batch())`
+    /// dropped it at the first ceiling.
+    #[tokio::test]
+    async fn heartbeats_race_the_pending_batch_without_cancelling_it() {
+        use horde_proto::v1::sync_events_response::Update;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let drops = std::sync::Arc::new(AtomicU64::new(0));
+        let (release, released) = tokio::sync::oneshot::channel::<u64>();
+        let guard = DropCounter(std::sync::Arc::clone(&drops));
+        let batch = async move {
+            let _guard = guard;
+            released.await.unwrap_or(0)
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let racing = tokio::spawn(async move {
+            super::next_or_heartbeat(batch, std::time::Duration::from_millis(1), &sender).await
+        });
+
+        for _ in 0..3 {
+            let frame = receiver.recv().await.expect("a heartbeat").expect("not an error");
+            assert!(matches!(frame.update, Some(Update::Heartbeat(_))));
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "three heartbeats in, the batch is still being polled"
+        );
+        release.send(42).expect("the batch is still listening");
+        assert_eq!(racing.await.expect("the race ends"), Some(42));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// A client that hangs up ends the wait at once, batch or no batch.
+    #[tokio::test]
+    async fn a_closed_client_ends_the_wait() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let outcome = super::next_or_heartbeat(
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(3_600),
+            &sender,
+        )
+        .await;
+        assert_eq!(outcome, None);
     }
 }

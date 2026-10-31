@@ -159,6 +159,7 @@ async fn a_spawned_child_starts_at_its_parents_committed_head() {
     let command = |sequence: u64, kind| horde_proto::v1::StreamCommandsResponse {
         command_sequence: sequence,
         command_id: format!("a8:{sequence}"),
+        log_position: 0,
         command: Some(kind),
     };
     let spawn = |agent: &str, parent: Option<&str>| {

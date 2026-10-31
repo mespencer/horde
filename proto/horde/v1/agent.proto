@@ -198,6 +198,13 @@ enum PlacementState {
   PLACEMENT_STATE_EXPIRED = 3;
 
   PLACEMENT_STATE_CANCELLED = 4;
+
+  // The Agent had started on a Worker that then stayed silent beyond the
+  // worker-lost lease (ADR-0011), or whose journal an operator reset. Its
+  // context lived on that Worker and is presumed gone, so it is not re-placed
+  // automatically: a fresh spawn elsewhere would silently re-run half-finished
+  // work. Settled, like EXPIRED; the reason names the Worker.
+  PLACEMENT_STATE_LOST = 5;
 }
 
 // The scheduler assigning one Agent to one Worker. Sessions span Workers; the

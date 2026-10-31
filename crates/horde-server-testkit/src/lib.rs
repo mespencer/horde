@@ -127,7 +127,9 @@ pub async fn serve_core(core: ServerCore) -> Setup<String> {
     let address = listener.local_addr()?;
 
     tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
+        // The production keepalive, so a dead peer is noticed here the way
+        // it is behind the mTLS door (ADR-0011).
+        let _ = horde_server::transport::keepalive(tonic::transport::Server::builder())
             .add_service(ControlPlaneServiceServer::new(ControlPlane::new(
                 core.clone(),
             )))
@@ -300,6 +302,7 @@ pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup
                 }],
                 ..WorkerCapabilities::default()
             }),
+            last_local_journal_sequence: None,
         })
         .await?;
     Ok(())

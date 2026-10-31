@@ -78,6 +78,9 @@ pub struct ServeConfig {
     /// Serve the git Relay here (DESIGN §8, fix a10). `None` serves no
     /// relay; loopback only — see [`crate::relay::mount`].
     pub relay_bind: Option<SocketAddr>,
+    /// The worker-lost lease (ADR-0011); `None` takes
+    /// [`crate::liveness::DEFAULT_WORKER_LEASE`].
+    pub worker_lease: Option<std::time::Duration>,
 }
 
 /// What one command line asks for.
@@ -100,6 +103,7 @@ struct ParsedFlags {
     subject_names: Vec<String>,
     blob_max_bytes: Option<u64>,
     relay_bind: Option<SocketAddr>,
+    worker_lease_secs: Option<u64>,
 }
 
 impl ParsedFlags {
@@ -148,6 +152,18 @@ impl ParsedFlags {
                     value
                         .parse()
                         .map_err(|_| format!("--blob-max-bytes {value} is not a byte count"))?,
+                );
+            }
+            "--worker-lease" => {
+                let value = value_of("--worker-lease")?;
+                self.worker_lease_secs = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|secs: &u64| *secs > 0)
+                        .ok_or_else(|| {
+                            format!("--worker-lease {value} is not a positive number of seconds")
+                        })?,
                 );
             }
             _ => return Ok(false),
@@ -199,10 +215,11 @@ impl ParsedFlags {
                 || self.state_dir.is_some()
                 || self.blob_max_bytes.is_some()
                 || self.relay_bind.is_some()
+                || self.worker_lease_secs.is_some()
             {
                 return Err(
-                    "--bind, --enrollment-bind, --state-dir, --blob-max-bytes and \
-                     --relay-bind need --serve"
+                    "--bind, --enrollment-bind, --state-dir, --blob-max-bytes, \
+                     --relay-bind and --worker-lease need --serve"
                         .to_owned(),
                 );
             }
@@ -224,6 +241,7 @@ impl ParsedFlags {
             subject_names: self.subject_names,
             blob_max_bytes: self.blob_max_bytes,
             relay_bind: self.relay_bind,
+            worker_lease: self.worker_lease_secs.map(std::time::Duration::from_secs),
         })))
     }
 }
@@ -347,7 +365,21 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment_listener.addr,
     )?;
 
-    let core = ServerCore::new(log).with_blob_store(Arc::new(blob_store(config)?));
+    let core = ServerCore::new(log)
+        .with_blob_store(Arc::new(blob_store(config)?))
+        .with_worker_lease(
+            config
+                .worker_lease
+                .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
+        );
+    // Boot reconciliation (ADR-0011): this process holds no registrations,
+    // so every agent the log places on a worker is on a worker that is away
+    // until it dials in — treated exactly as a disconnect, lease and all,
+    // rather than left placed forever on a machine nobody may ever see again.
+    let away = crate::liveness::reconcile_at_boot(&core).await?;
+    if !away.is_empty() {
+        tracing::info!(?away, "awaiting workers the log places agents on");
+    }
 
     // The permission chain driver (fix a5): the deterministic layers run in
     // the deployed server, over the shipped registry (ADR-0009) — an agent's
@@ -672,9 +704,15 @@ mod tests {
             "1048576",
             "--relay-bind",
             "127.0.0.1:7420",
+            "--worker-lease",
+            "45",
         ]) else {
             panic!("a full serve line must parse");
         };
+        assert_eq!(
+            config.worker_lease,
+            Some(std::time::Duration::from_secs(45))
+        );
         assert_eq!(
             config.relay_bind.map(|addr| addr.to_string()),
             Some("127.0.0.1:7420".to_owned())
@@ -704,6 +742,7 @@ mod tests {
             defaulted.blob_max_bytes, None,
             "unset lets the store keep its documented default"
         );
+        assert_eq!(defaulted.worker_lease, None);
     }
 
     /// A mistyped flag silently falling back to a default would serve on the
@@ -737,6 +776,12 @@ mod tests {
                 "--blob-max-bytes lots",
             ),
             (&["--serve", "--blob-max-bytes"][..], "--blob-max-bytes"),
+            (&["--worker-lease", "30"][..], "--serve"),
+            (
+                &["--serve", "--worker-lease", "soon"][..],
+                "--worker-lease soon",
+            ),
+            (&["--serve", "--worker-lease", "0"][..], "--worker-lease 0"),
             (&["a.db", "b.db"][..], "b.db"),
         ] {
             let refused = parsed(arguments).expect_err("must refuse");
@@ -782,6 +827,7 @@ mod tests {
             subject_names: Vec::new(),
             blob_max_bytes: None,
             relay_bind,
+            worker_lease: None,
         }
     }
 

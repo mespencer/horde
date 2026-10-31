@@ -166,6 +166,7 @@ fn control_plane(method: &str) -> Option<Admits> {
         | "ListWorkers"
         | "MintEnrollmentCode"
         | "RevokeEnrollment"
+        | "ResetWorkerJournal"
         | "QueryUsage"
         | "OpenForward"
         | "CloseForward"
@@ -382,6 +383,7 @@ mod tests {
             "PrewarmWorkspace",
             "MintEnrollmentCode",
             "RevokeEnrollment",
+            "ResetWorkerJournal",
             "CreateSession",
             "WorkerLogin",
         ] {

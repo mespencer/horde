@@ -283,7 +283,60 @@ message Event {
     // A Worker journaled an event the Server refused to append (ADR-0009).
     // Lives in the reserved dead-letter stream.
     JournalEventRefused journal_event_refused = 33;
+
+    // A Worker journaled an event about an Agent it used to hold, after the
+    // Agent was placed elsewhere or declared lost (ADR-0011). Lives in the
+    // Agent's own Session, so it is visible where the Agent is.
+    StaleJournalEvent stale_journal_event = 34;
+
+    // An operator reset a Worker's journal (ADR-0011). Lives in the reserved
+    // worker-journal stream.
+    WorkerJournalReset worker_journal_reset = 35;
   }
+}
+
+// A late journal entry from an Agent's former placement (ADR-0011): the
+// Worker that journaled it no longer holds the Agent, because the Agent was
+// re-placed or declared lost while the Worker was partitioned away. Kinds that
+// are pure history (output, usage) land as themselves; everything else would
+// overwrite what the current placement says — a lifecycle, a permission
+// request the current Worker cannot answer, a result from a superseded
+// incarnation — so it is recorded here instead, whole, in the Agent's Session,
+// under the Worker's origin and the entry's journal_sequence: visible to every
+// attached Client, never silently dropped, and still advancing the Worker's
+// journal watermark.
+message StaleJournalEvent {
+  WorkerId worker_id = 1;
+
+  uint64 journal_sequence = 2;
+
+  // Where the Agent is placed now; unset when it is queued or lost.
+  WorkerId current_worker_id = 3;
+
+  // The original event's kind, as its Event.kind field name.
+  string kind = 4;
+
+  string reason = 5;
+
+  // The entry as the Worker journaled it.
+  Event event = 6;
+}
+
+// An operator reset a Worker's journal (ADR-0011) — the recovery for a Worker
+// whose journal regressed, such as a fresh state directory after a disk loss.
+// From this event on, the Worker's journal positions are numbered above
+// journal_floor in the log (so its fresh journal neither collides with nor is
+// mistaken for the lost one), its command stream starts over at sequence 1,
+// and the Agents it held are declared lost.
+message WorkerJournalReset {
+  WorkerId worker_id = 1;
+
+  // The highest journal position the log held for this Worker at the reset.
+  uint64 journal_floor = 2;
+
+  Actor reset_by = 3;
+
+  string reason = 4;
 }
 
 // A journaled event the Server refused: a kind only the Server writes, a

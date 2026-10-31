@@ -82,6 +82,7 @@ async fn register(
             hello: crate::common::versioned_hello(),
             worker_id: Some(WorkerId::new(worker)),
             capabilities: Some(capabilities),
+            last_local_journal_sequence: None,
         })
         .await?;
     Ok(())
@@ -351,6 +352,7 @@ async fn a_lost_workers_unstarted_agents_are_requeued_and_replaced() {
         .stream_commands(StreamCommandsRequest {
             worker_id: Some(WorkerId::new("worker-a")),
             resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
         })
         .await
         .expect("the command stream opens")
@@ -415,6 +417,7 @@ async fn a_lost_workers_unstarted_agents_are_requeued_and_replaced() {
         .stream_commands(StreamCommandsRequest {
             worker_id: Some(WorkerId::new("worker-a")),
             resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
         })
         .await
         .expect("the replay stream opens")
@@ -545,6 +548,7 @@ async fn a_workspace_spawn_is_materialize_then_spawn_and_warmth_is_reused() {
         .stream_commands(StreamCommandsRequest {
             worker_id: Some(WorkerId::new("ws-worker")),
             resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
         })
         .await
         .expect("the command stream opens")

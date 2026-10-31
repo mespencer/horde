@@ -64,6 +64,7 @@ async fn register(h: &mut Harness, worker: &str, tags: &[&str]) -> Setup<()> {
                 tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
                 ..WorkerCapabilities::default()
             }),
+            last_local_journal_sequence: None,
         })
         .await?;
     Ok(())

@@ -25,7 +25,9 @@
 //!
 //! # What no pass does
 //!
-//! Nothing here runs on a timer. Queue-timeout expiry is evaluated whenever a
+//! Nothing here runs on a timer — the one clock in placement is the
+//! worker-lost lease, which lives in `crate::liveness` and ends in an
+//! ordinary pass (ADR-0011). Queue-timeout expiry is evaluated whenever a
 //! pass runs, which means an expiry is heard when the worker pool next
 //! changes rather than at the exact deadline. A clock-driven sweeper would
 //! tighten that latency and is deliberately not built yet: a loop bounded
@@ -35,8 +37,8 @@
 use std::collections::BTreeMap;
 
 use horde_proto::v1::{
-    AgentId, AgentLifecycleState, AgentSpec, Event, PlacementState, WorkerId,
-    WorkspaceDefinitionId, WorkspaceInstanceReport, WorkspaceInstanceState, event::Kind,
+    AgentId, AgentLifecycleState, AgentSpec, Event, PlacementState, SessionLifecycleState,
+    WorkerId, WorkspaceDefinitionId, WorkspaceInstanceReport, WorkspaceInstanceState, event::Kind,
 };
 
 use crate::error::ServerError;
@@ -129,9 +131,21 @@ pub(crate) fn now_unix_ms() -> i64 {
         .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0))
 }
 
+/// Whether an agent awaiting placement may still be placed: not archived,
+/// and not in an archived session (ADR-0011 — archive is terminal).
+///
+/// Two independent reasons, separately reachable only as a predicate: a
+/// session archive now archives its agents too, so in a fresh log the halves
+/// always agree, while an older log holds archived sessions whose queued
+/// agents were never archived themselves.
+#[must_use]
+pub fn placeable(session: SessionLifecycleState, agent: AgentLifecycleState) -> bool {
+    session != SessionLifecycleState::Archived && agent != AgentLifecycleState::Archived
+}
+
 /// Projects every session — the reserved streams (catalog, enrollment) are
 /// not sessions.
-async fn session_states(core: &ServerCore) -> Result<Vec<SessionState>, ServerError> {
+pub(crate) async fn session_states(core: &ServerCore) -> Result<Vec<SessionState>, ServerError> {
     let mut states = Vec::new();
     for session_id in core.log.session_ids().await? {
         if crate::enrollment::is_reserved_stream(&session_id) {
@@ -333,7 +347,9 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
 
     for state in &states {
         for agent in state.agents.values() {
-            if !awaits_placement(agent.placement_state) {
+            if !awaits_placement(agent.placement_state)
+                || !placeable(state.lifecycle, agent.lifecycle)
+            {
                 continue;
             }
 
@@ -463,6 +479,16 @@ mod tests {
     use horde_proto::v1::PlacementConstraints;
 
     #[test]
+    fn archived_agents_and_archived_sessions_are_never_placed() {
+        use AgentLifecycleState as A;
+        use SessionLifecycleState as S;
+        assert!(placeable(S::Active, A::Queued));
+        assert!(!placeable(S::Active, A::Archived));
+        assert!(!placeable(S::Archived, A::Queued));
+        assert!(!placeable(S::Archived, A::Archived));
+    }
+
+    #[test]
     fn only_unspecified_and_queued_await_placement() {
         assert!(awaits_placement(PlacementState::Unspecified));
         assert!(awaits_placement(PlacementState::Queued));
@@ -473,6 +499,10 @@ mod tests {
              outcome the spawner already heard"
         );
         assert!(!awaits_placement(PlacementState::Cancelled));
+        assert!(
+            !awaits_placement(PlacementState::Lost),
+            "a lost agent's context is gone; re-placing it would re-run its work"
+        );
     }
 
     #[test]

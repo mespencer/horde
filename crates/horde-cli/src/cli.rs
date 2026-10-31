@@ -299,6 +299,14 @@ pub enum WorkerCommand {
         #[arg(long, default_value = "")]
         reason: String,
     },
+    /// Accept a fresh journal from a worker whose journal regressed — a new
+    /// state directory after a disk loss — and declare the agents it held
+    /// lost (ADR-0011). Only for a worker whose old state is gone for good.
+    Reset {
+        name: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
     /// Sign a provider's CLI into an account on a worker: the provider's
     /// login command runs in a PTY there with this terminal attached, and
     /// any OAuth-callback port the provider needs is relayed from this
@@ -1334,6 +1342,10 @@ async fn run_worker(
                 )
                 .await?;
             println!("{}", render::revoked(name, &serials, format));
+        }
+        WorkerCommand::Reset { name, reason } => {
+            let reset = client.reset_worker_journal(name, reason).await?;
+            println!("{}", render::journal_reset(name, &reset, format));
         }
         WorkerCommand::Login { worker, provider } => {
             crate::login::run_interactive(client, worker, provider, format).await?;
@@ -2525,6 +2537,23 @@ mod enrollment_tests {
                 assert_eq!(reason, "stolen");
             }
             other => panic!("expected worker revoke, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "horde",
+            "worker",
+            "reset",
+            "gpu-box",
+            "--reason",
+            "disk replaced",
+        ])
+        .expect("ADR-0011 names this verb");
+        match cli.command {
+            Some(Command::Worker(WorkerCommand::Reset { name, reason })) => {
+                assert_eq!(name, "gpu-box");
+                assert_eq!(reason, "disk replaced");
+            }
+            other => panic!("expected worker reset, got {other:?}"),
         }
     }
 

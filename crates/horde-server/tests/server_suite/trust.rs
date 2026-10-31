@@ -156,6 +156,7 @@ fn registration(name: &str, capabilities: WorkerCapabilities) -> RegisterWorkerR
         hello: Some(hello(PrincipalRole::Worker, name)),
         worker_id: Some(WorkerId::new(name)),
         capabilities: Some(capabilities),
+        last_local_journal_sequence: None,
     }
 }
 

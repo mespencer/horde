@@ -76,7 +76,10 @@ pub async fn mount(
     Ok(MountedRelay { server, follower })
 }
 
-/// Registers every live definition's repos, answering how many.
+/// Makes the registry exactly the live catalog's repos: registers every live
+/// definition's repos and unregisters every name no live definition holds —
+/// a deleted definition's repos stop being served (ADR-0011). Answers how
+/// many it registered.
 async fn register_catalog(
     store: &horde_relay::MirrorStore,
     log: &EventLog,
@@ -84,10 +87,14 @@ async fn register_catalog(
     let events = log.read_all(CATALOG_STREAM).await?;
     let catalog = WorkspaceCatalog::project(&events)?;
     let mut registered = 0_usize;
+    let mut live = std::collections::BTreeSet::new();
     for definition in catalog.live() {
         for repo in &definition.repos {
             match store.register(&repo.name, &repo.remote_url) {
-                Ok(()) => registered += 1,
+                Ok(()) => {
+                    registered += 1;
+                    live.insert(repo.name.clone());
+                }
                 // A name that cannot be a path segment was already refused at
                 // definition time; hitting one here means an older log — skip
                 // it loudly rather than refusing to serve every other repo.
@@ -96,6 +103,9 @@ async fn register_catalog(
                 }
             }
         }
+    }
+    for removed in store.retain_only(&live) {
+        tracing::info!(repo = %removed, "the relay stopped serving a repo no live definition holds");
     }
     Ok(registered)
 }
@@ -130,6 +140,16 @@ mod tests {
         key: &str,
         definition: horde_proto::v1::WorkspaceDefinition,
     ) {
+        journal_change(log, key, definition, false).await;
+    }
+
+    /// One catalog change, a deletion when `deleted`.
+    async fn journal_change(
+        log: &EventLog,
+        key: &str,
+        definition: horde_proto::v1::WorkspaceDefinition,
+        deleted: bool,
+    ) {
         crate::service::shared::append_server_event(
             log,
             crate::workspace::CATALOG_STREAM,
@@ -141,7 +161,7 @@ mod tests {
                 kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
                     horde_proto::v1::WorkspaceDefinitionChanged {
                         definition: Some(definition),
-                        deleted: false,
+                        deleted,
                     },
                 )),
             },
@@ -328,6 +348,49 @@ mod tests {
         assert!(
             store.registered("-hostile").is_none(),
             "a name that cannot be a path segment is skipped, loudly"
+        );
+    }
+
+    /// Deletion propagates (ADR-0011): once the definition holding a repo
+    /// is deleted, the registry stops serving it, while a repo another live
+    /// definition still holds stays.
+    #[tokio::test]
+    async fn a_deleted_definitions_repos_leave_the_registry() {
+        let log = EventLog::in_memory().expect("an in-memory log");
+        let definition = |id: &str, repos: &[&str]| horde_proto::v1::WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(id)),
+            name: id.to_owned(),
+            repos: repos
+                .iter()
+                .map(|name| horde_proto::v1::WorkspaceRepo {
+                    name: (*name).to_owned(),
+                    remote_url: format!("https://git.example/{name}.git"),
+                    default_branch: "main".to_owned(),
+                    layout_path: String::new(),
+                })
+                .collect(),
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        };
+        journal_definition(&log, "ws-1:1", definition("ws-1", &["maps", "shared"])).await;
+        journal_definition(&log, "ws-2:1", definition("ws-2", &["shared"])).await;
+        let store =
+            horde_relay::MirrorStore::new(tempfile::tempdir().expect("a dir").path().join("relay"));
+        super::register_catalog(&store, &log)
+            .await
+            .expect("the catalog reads");
+        assert!(store.registered("maps").is_some());
+
+        journal_change(&log, "ws-1:2", definition("ws-1", &["maps", "shared"]), true).await;
+        super::register_catalog(&store, &log)
+            .await
+            .expect("the catalog reads");
+        assert!(
+            store.registered("maps").is_none(),
+            "a repo no live definition holds is no longer served"
+        );
+        assert!(
+            store.registered("shared").is_some(),
+            "a repo another live definition still holds stays"
         );
     }
 }

@@ -74,6 +74,7 @@ async fn join_with(world: &mut HordeWorld, script: Script) -> StepResult {
             &horde_worker::capabilities::DeclaredFacts::default(),
         ),
         identity: None,
+        last_local_journal_sequence: None,
     };
     let (mut connection, _registration) = horde_worker::Connection::dial(&config).await?;
     // Built before the spawn: the scripted worker's login plane is static

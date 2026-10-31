@@ -25,8 +25,8 @@ use horde_proto::v1::{
     ListSessionsResponse, ListWorkersRequest, ListWorkersResponse, ListWorkspaceDefinitionsRequest,
     ListWorkspaceDefinitionsResponse, McpServerConfig, MintEnrollmentCodeRequest,
     MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest, PrewarmWorkspaceResponse,
-    QueryUsageRequest, QueryUsageResponse, RevokeEnrollmentRequest, RevokeEnrollmentResponse,
-    SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
+    QueryUsageRequest, QueryUsageResponse, ResetWorkerJournalRequest, ResetWorkerJournalResponse,
+    RevokeEnrollmentRequest, RevokeEnrollmentResponse, SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
     SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
     UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
@@ -474,7 +474,30 @@ impl ControlPlaneService for ControlPlane {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        self.project(&session_id).await.map_err(Status::from)?;
+        let state = self.project(&session_id).await.map_err(Status::from)?;
+
+        // Each agent's archive is a fact of its own, written here with the
+        // state it was archived *from* (ADR-0011): the worker that carries
+        // the archive out cannot say — it does not track idle-versus-running
+        // — and an agent no worker holds (queued, lost) has nobody else to
+        // record its end at all. The fold, placement and the verbs all read
+        // the agent's own lifecycle, so archive is terminal for each of them.
+        for agent in state.agents.values() {
+            if agent.lifecycle == horde_proto::v1::AgentLifecycleState::Archived {
+                continue;
+            }
+            self.append_agent_event(
+                &session_id,
+                agent.agent_id.clone(),
+                Kind::AgentLifecycleChanged(horde_proto::v1::AgentLifecycleChanged {
+                    previous_state: agent.lifecycle as i32,
+                    state: horde_proto::v1::AgentLifecycleState::Archived as i32,
+                    reason: archive_reason(&request.reason),
+                }),
+            )
+            .await
+            .map_err(Status::from)?;
+        }
 
         let event = Event {
             agent_id: None,
@@ -509,6 +532,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<SyncEventsRequest>,
     ) -> Result<Response<Self::SyncEventsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
+        let conduit = crate::trust::conduit_worker(&request);
         let request = request.into_inner();
 
         let cursors: Vec<(String, u64)> = request
@@ -529,6 +553,22 @@ impl ControlPlaneService for ControlPlane {
             return Err(Status::from(ServerError::Invalid(
                 "sync requires a cursor to replay, or all_sessions".to_owned(),
             )));
+        }
+        // A worker reads on behalf of its agents (ADR-0009's gap, closed in
+        // ADR-0011): only sessions it holds an agent in, named one by one —
+        // never the all-sessions net, which would hand it every session's
+        // traffic, including ones it has no agent in.
+        if let Some(worker_id) = conduit.as_deref() {
+            if request.all_sessions {
+                return Err(Status::permission_denied(format!(
+                    "worker {worker_id} reads only sessions it runs agents in; all_sessions is \
+                     a client's view"
+                )));
+            }
+            for (session_id, _) in &cursors {
+                let state = self.project(session_id).await.map_err(Status::from)?;
+                conduit_holds_session(&state, worker_id, "read")?;
+            }
         }
 
         let subtree_root = request
@@ -615,12 +655,13 @@ impl ControlPlaneService for ControlPlane {
             .session_of_agent(&agent_id)
             .await
             .map_err(Status::from)?;
+        let state = self.project(&session_id).await.map_err(Status::from)?;
         // A worker sends on behalf of one of its agents (ADR-0009): it may
         // only reach sessions it is running an agent in.
         if let Some(worker_id) = conduit.as_deref() {
-            let state = self.project(&session_id).await.map_err(Status::from)?;
-            conduit_may_message(&state, worker_id)?;
+            conduit_holds_session(&state, worker_id, "message into")?;
         }
+        refuse_ended(&state, &agent_id)?;
 
         let (kind, assignment_id) = match request.body {
             Some(send_message_request::Body::Assignment(mut assignment)) => {
@@ -650,19 +691,26 @@ impl ControlPlaneService for ControlPlane {
             }
         };
 
-        let sequence = self
-            .append(
-                &session_id,
-                &request.idempotency_key,
-                Event {
-                    agent_id: Some(AgentId::new(agent_id)),
-                    occurred_at: None,
-                    idempotency_key: request.idempotency_key.clone(),
-                    kind: Some(kind),
-                },
-            )
-            .await
-            .map_err(Status::from)?;
+        let appended = crate::service::shared::append_server_event_returning(
+            &self.core.log,
+            &session_id,
+            &request.idempotency_key,
+            Event {
+                agent_id: Some(AgentId::new(agent_id)),
+                occurred_at: None,
+                idempotency_key: request.idempotency_key.clone(),
+                kind: Some(kind),
+            },
+        )
+        .await
+        .map_err(Status::from)?;
+        let sequence = appended.sequence;
+        // A retry of a send that already landed answers with what the first
+        // one minted (ADR-0011), not with the assignment id this attempt
+        // made up and the log never stored.
+        if let Some(stored) = appended.existing_payload.as_deref() {
+            return Ok(Response::new(send_retry(&session_id, sequence, stored)?));
+        }
 
         Ok(Response::new(SendMessageResponse {
             assignment_id,
@@ -834,6 +882,29 @@ impl ControlPlaneService for ControlPlane {
         // place this agent between our appends.
         let serialized = self.core.placement_lock.clone();
         let _serialized = serialized.lock().await;
+
+        // A retried spawn answers with the agent the first attempt created,
+        // placed wherever it is now, instead of minting a phantom id whose
+        // placement names an agent the log never spawned (ADR-0011). Under
+        // the lock, so two racing twins cannot both miss the stored one.
+        if let Some((_, payload)) = self
+            .core
+            .log
+            .stored_under_key(&session_id, &request.idempotency_key)
+            .await
+            .map_err(Status::from)?
+        {
+            let current = self.project(&session_id).await.map_err(Status::from)?;
+            if let Some(response) = spawn_retry(&current, &payload) {
+                return Ok(Response::new(response));
+            }
+        }
+        // Archive (and loss) is terminal: an ended agent has no children,
+        // and an archived session takes none at all.
+        match parent.as_deref() {
+            Some(parent) => refuse_ended(&state, parent)?,
+            None => refuse_archived_session(&state)?,
+        }
 
         // The agent exists whether or not it is placed: spawn never blocks, and
         // an unmatched spawn comes back queued with a reason (DESIGN.md §6).
@@ -1314,6 +1385,37 @@ impl ControlPlaneService for ControlPlane {
         }))
     }
 
+    /// The operator's recovery for a worker whose journal regressed
+    /// (ADR-0011): accepts its fresh journal and declares its agents lost.
+    #[instrument(skip_all)]
+    async fn reset_worker_journal(
+        &self,
+        request: Request<ResetWorkerJournalRequest>,
+    ) -> Result<Response<ResetWorkerJournalResponse>, Status> {
+        let actor = actor_of(&request);
+        let request = request.into_inner();
+        let worker_id = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let reset =
+            crate::liveness::reset_worker_journal(&self.core, &worker_id, &request.reason, actor)
+                .await
+                .map_err(Status::from)?;
+        tracing::warn!(
+            worker_id,
+            journal_floor = reset.journal_floor,
+            lost = reset.lost_agents.len(),
+            "worker journal reset"
+        );
+        Ok(Response::new(ResetWorkerJournalResponse {
+            journal_floor: reset.journal_floor,
+            lost_agents: reset.lost_agents.into_iter().map(AgentId::new).collect(),
+            sequence: reset.sequence,
+        }))
+    }
+
     /// Usage reporting (DESIGN §12): a pure fold over the named sessions'
     /// logs — no usage table exists to disagree with the events.
     #[instrument(skip_all)]
@@ -1710,7 +1812,7 @@ fn conduit_may_spawn(
 /// # Errors
 ///
 /// `PermissionDenied` naming the session and the worker.
-fn conduit_may_message(state: &SessionState, worker_id: &str) -> Result<(), Status> {
+fn conduit_holds_session(state: &SessionState, worker_id: &str, verb: &str) -> Result<(), Status> {
     if state
         .agents
         .values()
@@ -1719,10 +1821,107 @@ fn conduit_may_message(state: &SessionState, worker_id: &str) -> Result<(), Stat
         Ok(())
     } else {
         Err(Status::permission_denied(format!(
-            "worker {worker_id} runs no agent in session {} and may not message into it",
+            "worker {worker_id} runs no agent in session {} and may not {verb} it",
             state.session_id
         )))
     }
+}
+
+/// Why an agent takes no more messages or children, when it takes none
+/// (ADR-0011): its session or the agent itself is archived, or it was lost
+/// with its worker. Archive is terminal; so is loss, because the context a
+/// message would continue died with the worker.
+fn ended(state: &SessionState, agent_id: &str) -> Option<String> {
+    if state.lifecycle == horde_proto::v1::SessionLifecycleState::Archived {
+        return Some(format!(
+            "is in archived session {}; archive is terminal",
+            state.session_id
+        ));
+    }
+    let agent = state.agents.get(agent_id)?;
+    if agent.lifecycle == horde_proto::v1::AgentLifecycleState::Archived {
+        return Some("is archived; archive is terminal".to_owned());
+    }
+    (agent.placement_state == horde_proto::v1::PlacementState::Lost).then(|| {
+        "was lost with its worker and its context with it; spawn a replacement".to_owned()
+    })
+}
+
+/// [`ended`] as a refusal: `FailedPrecondition`, naming the agent and why.
+fn refuse_ended(state: &SessionState, agent_id: &str) -> Result<(), Status> {
+    match ended(state, agent_id) {
+        Some(why) => Err(Status::from(ServerError::AgentEnded {
+            agent_id: agent_id.to_owned(),
+            why,
+        })),
+        None => Ok(()),
+    }
+}
+
+/// Refuses work in an archived session that names no agent to blame.
+fn refuse_archived_session(state: &SessionState) -> Result<(), Status> {
+    if state.lifecycle == horde_proto::v1::SessionLifecycleState::Archived {
+        return Err(Status::failed_precondition(format!(
+            "session {} is archived; archive is terminal",
+            state.session_id
+        )));
+    }
+    Ok(())
+}
+
+/// The reason each agent's archive records.
+fn archive_reason(reason: &str) -> String {
+    if reason.is_empty() {
+        "the session was archived".to_owned()
+    } else {
+        reason.to_owned()
+    }
+}
+
+/// The answer a retried spawn gets: the agent its stored `AgentSpawned`
+/// created, with the placement it has now. `None` when the stored event is
+/// not a spawn — the append that follows refuses that collision by name.
+fn spawn_retry(state: &SessionState, stored: &[u8]) -> Option<SpawnAgentResponse> {
+    use prost::Message;
+    let event = Event::decode(stored).ok()?;
+    let Some(Kind::AgentSpawned(_)) = event.kind else {
+        return None;
+    };
+    let agent_id = event.agent_id?.to_string();
+    let agent = state.agents.get(&agent_id)?;
+    Some(SpawnAgentResponse {
+        agent_id: Some(AgentId::new(agent_id.clone())),
+        placement: Some(horde_proto::v1::Placement {
+            agent_id: Some(AgentId::new(agent_id)),
+            state: agent.placement_state as i32,
+            worker_id: agent.worker_id.clone().map(horde_proto::v1::WorkerId::new),
+            reason: String::new(),
+        }),
+    })
+}
+
+/// The answer a retried send gets: the stored message's own assignment id
+/// and position.
+///
+/// # Errors
+///
+/// `Internal` when the stored payload does not decode.
+fn send_retry(
+    session_id: &str,
+    sequence: u64,
+    stored: &[u8],
+) -> Result<SendMessageResponse, Status> {
+    use prost::Message;
+    let event = Event::decode(stored).map_err(|error| Status::from(ServerError::from(error)))?;
+    let assignment_id = match event.kind {
+        Some(Kind::AssignmentSent(sent)) => sent.assignment.and_then(|a| a.assignment_id),
+        _ => None,
+    };
+    Ok(SendMessageResponse {
+        assignment_id,
+        session_id: Some(SessionId::new(session_id)),
+        sequence,
+    })
 }
 
 // `uuid_like` lives in `service::shared` now that the forward verbs mint ids
@@ -1827,10 +2026,96 @@ mod tests {
                 "{parent:?} {worker}"
             );
         }
-        assert!(super::conduit_may_message(&state, "w-1").is_ok());
-        let refused = super::conduit_may_message(&state, "w-2")
+        assert!(super::conduit_holds_session(&state, "w-1", "read").is_ok());
+        let refused = super::conduit_holds_session(&state, "w-2", "message into")
             .expect_err("a worker with no agent here cannot message into it");
         assert!(refused.message().contains("s1"), "{}", refused.message());
+        assert!(
+            refused.message().contains("message into"),
+            "{}",
+            refused.message()
+        );
+    }
+
+    /// Why an agent takes nothing more (ADR-0011): an archived session, an
+    /// archived agent, or a lost one — and a live agent, or one the session
+    /// never spawned, is not ended.
+    #[test]
+    fn archived_and_lost_agents_are_ended_and_live_ones_are_not() {
+        use crate::state::fixture::{projected, spawned};
+        use horde_proto::v1::{
+            AgentId, AgentLifecycleChanged, AgentLifecycleState, Event, Placement,
+            PlacementChanged, PlacementState, SessionLifecycleChanged, SessionLifecycleState,
+            event::Kind,
+        };
+        let on = |agent: &str, kind: Kind| Event {
+            agent_id: Some(AgentId::new(agent)),
+            kind: Some(kind),
+            ..Event::default()
+        };
+        let events = vec![
+            spawned("live", None),
+            spawned("archived", Some("live")),
+            spawned("lost", Some("live")),
+            on(
+                "archived",
+                Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                    state: AgentLifecycleState::Archived as i32,
+                    ..AgentLifecycleChanged::default()
+                }),
+            ),
+            on(
+                "lost",
+                Kind::PlacementChanged(PlacementChanged {
+                    placement: Some(Placement {
+                        agent_id: Some(AgentId::new("lost")),
+                        state: PlacementState::Lost as i32,
+                        ..Placement::default()
+                    }),
+                    adapter_capabilities: Vec::new(),
+                }),
+            ),
+        ];
+        let state = projected(&events);
+        assert_eq!(super::ended(&state, "live"), None);
+        assert_eq!(super::ended(&state, "never-spawned"), None);
+        assert!(
+            super::ended(&state, "archived").is_some_and(|why| why.contains("archived")),
+            "an archived agent is ended"
+        );
+        assert!(
+            super::ended(&state, "lost").is_some_and(|why| why.contains("lost")),
+            "a lost agent is ended"
+        );
+        let refused = super::refuse_ended(&state, "archived").expect_err("refused");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(super::refuse_archived_session(&state).is_ok());
+
+        let mut with_archive = events;
+        with_archive.push(Event {
+            kind: Some(Kind::SessionLifecycleChanged(SessionLifecycleChanged {
+                state: SessionLifecycleState::Archived as i32,
+                ..SessionLifecycleChanged::default()
+            })),
+            ..Event::default()
+        });
+        let archived_session = projected(&with_archive);
+        assert!(
+            super::ended(&archived_session, "live").is_some_and(|why| why.contains("session")),
+            "everything in an archived session is ended"
+        );
+        assert_eq!(
+            super::refuse_archived_session(&archived_session)
+                .expect_err("refused")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn a_session_archive_names_its_reason_or_says_so() {
+        assert_eq!(super::archive_reason(""), "the session was archived");
+        assert_eq!(super::archive_reason("done"), "done");
     }
 
     /// The backing key follows the same rules as attribution, and it is the

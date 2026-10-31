@@ -191,6 +191,7 @@ impl std::fmt::Debug for Journal {
 const NEXT_SEQUENCE: &str = "next_journal_sequence";
 const FLOOR: &str = "floor";
 const APPLIED_COMMAND: &str = "applied_command_sequence";
+const APPLIED_POSITION: &str = "applied_command_position";
 const IDENTITY: &str = "journal_identity";
 
 impl Journal {
@@ -244,7 +245,8 @@ impl Journal {
                  ) STRICT;
                  INSERT OR IGNORE INTO meta (key, value)
                      VALUES ('next_journal_sequence', 1), ('floor', 1),
-                            ('applied_command_sequence', 0);",
+                            ('applied_command_sequence', 0),
+                            ('applied_command_position', 0);",
             )
             .map_err(|source| WorkerError::Journal {
                 context: "creating the journal schema",
@@ -398,6 +400,25 @@ impl Journal {
         effects: Vec<JournalEntry>,
         bookkeeping: AgentBookkeeping,
     ) -> Result<CommandApplication, WorkerError> {
+        self.apply_command_at(command_id, command_sequence, 0, effects, bookkeeping)
+            .await
+    }
+
+    /// [`Self::apply_command`], also ratcheting the applied log-position
+    /// watermark the Worker resumes from (ADR-0011): the causing event's
+    /// position, which — unlike the sequence — no newer fold can renumber.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the transaction cannot commit.
+    pub async fn apply_command_at(
+        &self,
+        command_id: &str,
+        command_sequence: u64,
+        log_position: u64,
+        effects: Vec<JournalEntry>,
+        bookkeeping: AgentBookkeeping,
+    ) -> Result<CommandApplication, WorkerError> {
         const CONTEXT: &str = "recording an applied command";
         let command_id = command_id.to_owned();
         let (application, head) = self
@@ -425,6 +446,8 @@ impl Journal {
                     )?;
                     let acked = meta(transaction, APPLIED_COMMAND)?;
                     set_meta(transaction, APPLIED_COMMAND, acked.max(command_sequence))?;
+                    let reached = meta(transaction, APPLIED_POSITION)?;
+                    set_meta(transaction, APPLIED_POSITION, reached.max(log_position))?;
 
                     let last = append_all(transaction, &effects)?;
                     apply_bookkeeping(transaction, &bookkeeping)?;
@@ -550,6 +573,20 @@ impl Journal {
     pub async fn applied_command_sequence(&self) -> Result<u64, WorkerError> {
         self.with_connection("reading the applied-command watermark", |connection| {
             meta(connection, APPLIED_COMMAND).map_err(read_error)
+        })
+        .await
+    }
+
+    /// The highest causing-event log position ever applied — what the Worker
+    /// resumes `StreamCommands` from when it knows one (ADR-0011). Zero for a
+    /// journal that never applied a positioned command.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the watermark cannot be read.
+    pub async fn applied_command_position(&self) -> Result<u64, WorkerError> {
+        self.with_connection("reading the applied-position watermark", |connection| {
+            meta(connection, APPLIED_POSITION).map_err(read_error)
         })
         .await
     }

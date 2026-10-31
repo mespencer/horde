@@ -169,8 +169,9 @@ impl ChainDriver {
     /// chain can answer. Returns how many events it appended.
     async fn catch_up(&mut self) -> Result<u64, ServerError> {
         let mut appended = 0;
+        let mut read_to = self.cursor;
         loop {
-            let page = self.log.read_global_from(self.cursor, PAGE).await?;
+            let page = self.log.read_global_from(read_to, PAGE).await?;
             // Terminates on the page it read: the rows this loop itself
             // appends are decisions, enriched re-raises, and the forward
             // opens a settling decision produces — and `consider` appends
@@ -179,10 +180,25 @@ impl ChainDriver {
             let Some(last) = page.last() else {
                 return Ok(appended);
             };
-            self.cursor = last.row;
+            read_to = last.row;
 
+            // The cursor advances per row *processed*, never per row read
+            // (ADR-0011): a pass that fails mid-page resumes at the row that
+            // failed rather than skipping the rest of the page — and rows
+            // already settled are not re-considered.
             for global in &page {
-                appended += self.consider(global).await?;
+                match self.consider(global).await {
+                    Ok(count) => appended += count,
+                    Err(error) if is_transient(&error) => return Err(error),
+                    // A row that can never settle — it does not decode, or
+                    // its decision collides with what the log already holds
+                    // — must not wedge every request behind it: it is logged
+                    // and passed, as a dead letter is.
+                    Err(error) => {
+                        tracing::error!(%error, row = global.row, "the chain passed a row it cannot settle");
+                    }
+                }
+                self.cursor = global.row;
             }
         }
     }
@@ -379,6 +395,16 @@ impl ChainDriver {
 /// Whether a park's wake-up means there is more log to read (`true`), or the
 /// log is gone (`false`).
 ///
+/// Whether a failure to settle a row is the server's own weather — storage —
+/// and worth retrying from the same row on the next wake, as opposed to a
+/// property of the row that no retry can change.
+fn is_transient(error: &ServerError) -> bool {
+    matches!(
+        error,
+        ServerError::Storage { .. } | ServerError::StorageTask(_)
+    )
+}
+
 /// Lagging is survivable for the same reason it is everywhere else: the
 /// channel is a hint and the log is the truth, so a driver that fell behind
 /// simply re-reads from its cursor.
@@ -1133,6 +1159,64 @@ mod tests {
     /// `Debug` on a driver is what an operator reads when the chain looks
     /// stuck, and the two facts that diagnose it are how far it has folded and
     /// whether it is parking.
+    #[tokio::test]
+    async fn a_row_that_cannot_settle_is_passed_and_the_rest_of_its_page_still_settles() {
+        let log = EventLog::in_memory().expect("log");
+        append(
+            &log,
+            "s1",
+            "spawn-root",
+            spawned("root", None, "cautious", &["ci-fix"]),
+        )
+        .await;
+        // Poison: the key the chain decides `req-bad` under already holds
+        // another kind, so that decision can never append.
+        append(
+            &log,
+            "s1",
+            "chain:req-bad",
+            agent_event(
+                "root",
+                Kind::NoteSent(horde_proto::v1::NoteSent::default()),
+            ),
+        )
+        .await;
+        append(&log, "s1", "req-bad", requested("root", "req-bad", Some(call("Read", "/a")))).await;
+        append(&log, "s1", "req-good", requested("root", "req-good", Some(call("Read", "/b")))).await;
+
+        let mut driver = driver_over(&log, cautious(), None);
+        driver
+            .catch_up()
+            .await
+            .expect("a row no retry can settle does not fail the pass");
+
+        let decided: Vec<String> = decisions_in(&log, "s1")
+            .await
+            .iter()
+            .filter_map(|decision| decision.request_id.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            decided,
+            vec!["req-good".to_owned()],
+            "the request behind the poison is settled in the same pass, not skipped"
+        );
+        let read = format!("{driver:?}");
+        assert!(
+            read.contains("row: 5"),
+            "the cursor stands on the last row processed — the chain's own \
+             decision included — so nothing is considered twice: {read}"
+        );
+    }
+
+    #[test]
+    fn only_storage_failures_are_retried_from_the_same_row() {
+        assert!(super::is_transient(&ServerError::Storage {
+            context: "test",
+            source: rusqlite::Error::InvalidQuery,
+        }));
+        assert!(!super::is_transient(&ServerError::Invalid("x".to_owned())));
+    }
+
     #[tokio::test]
     async fn the_debug_view_shows_how_far_the_chain_has_read() {
         let log = EventLog::in_memory().expect("log");

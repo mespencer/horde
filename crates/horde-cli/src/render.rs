@@ -525,6 +525,34 @@ pub fn revoked(name: &str, serials: &str, format: Format) -> String {
     }
 }
 
+/// Renders a journal reset: the floor the fresh journal is numbered above,
+/// and the agents the reset declared lost.
+#[must_use]
+pub fn journal_reset(
+    name: &str,
+    reset: &horde_proto::v1::ResetWorkerJournalResponse,
+    format: Format,
+) -> String {
+    let lost: Vec<String> = reset.lost_agents.iter().map(ToString::to_string).collect();
+    match format {
+        Format::Json => json!({
+            "reset": name,
+            "journal_floor": reset.journal_floor,
+            "lost_agents": lost,
+        })
+        .to_string(),
+        Format::Human if lost.is_empty() => format!(
+            "reset {name}'s journal above {}; it held no running agents",
+            reset.journal_floor
+        ),
+        Format::Human => format!(
+            "reset {name}'s journal above {}; declared lost: {}",
+            reset.journal_floor,
+            lost.join(", ")
+        ),
+    }
+}
+
 /// One MCP server config as JSON — the same fields both `mcp` renders show,
 /// so the human and JSON forms cannot disagree about what a server is.
 fn mcp_server_json(config: &horde_proto::v1::McpServerConfig) -> serde_json::Value {
@@ -2186,6 +2214,35 @@ mod enrollment_render_tests {
             serde_json::from_str(&minted(&response("s.fp"), None, Format::Json))
                 .expect("json mode emits json");
         assert!(bare["token"].is_null());
+    }
+
+    #[test]
+    fn a_journal_reset_names_its_floor_and_the_agents_it_lost() {
+        let reset = |lost: &[&str]| horde_proto::v1::ResetWorkerJournalResponse {
+            journal_floor: 812,
+            lost_agents: lost
+                .iter()
+                .map(|agent| horde_proto::v1::AgentId::new(*agent))
+                .collect(),
+            sequence: 3,
+        };
+        assert_eq!(
+            super::journal_reset("gpu-box", &reset(&["a1", "a2"]), Format::Human),
+            "reset gpu-box's journal above 812; declared lost: a1, a2"
+        );
+        assert_eq!(
+            super::journal_reset("gpu-box", &reset(&[]), Format::Human),
+            "reset gpu-box's journal above 812; it held no running agents"
+        );
+        let json: serde_json::Value = serde_json::from_str(&super::journal_reset(
+            "gpu-box",
+            &reset(&["a1"]),
+            Format::Json,
+        ))
+        .expect("json mode emits json");
+        assert_eq!(json["reset"], "gpu-box");
+        assert_eq!(json["journal_floor"], 812);
+        assert_eq!(json["lost_agents"], serde_json::json!(["a1"]));
     }
 
     #[test]

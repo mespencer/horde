@@ -81,6 +81,11 @@ pub enum ServerError {
     #[error("no worker is registered, so {what} cannot be placed")]
     NoWorkerAvailable { what: String },
 
+    /// The agent a verb addresses has ended — archived, or lost with its
+    /// worker — and takes no messages or children (ADR-0011).
+    #[error("agent {agent_id} {why}")]
+    AgentEnded { agent_id: String, why: String },
+
     /// The request was understood but is not valid.
     #[error("invalid request: {0}")]
     Invalid(String),
@@ -90,7 +95,8 @@ pub enum ServerError {
     /// silently renumbering would forge history.
     #[error(
         "worker {worker_id} reports journal head {reported} but the server has already stored \
-         {stored}; refusing to renumber"
+         {stored}; refusing to renumber — if its state is gone for good, `horde worker reset \
+         {worker_id}` accepts its fresh journal and declares its agents lost"
     )]
     JournalRegressed {
         worker_id: String,
@@ -185,7 +191,9 @@ impl From<ServerError> for Status {
             }
             ServerError::StaleEtag { .. } | ServerError::StaleMcpServerEtag { .. } => Code::Aborted,
             ServerError::Invalid(_) => Code::InvalidArgument,
-            ServerError::NoWorkerAvailable { .. } => Code::FailedPrecondition,
+            ServerError::NoWorkerAvailable { .. } | ServerError::AgentEnded { .. } => {
+                Code::FailedPrecondition
+            }
             ServerError::JournalRegressed { .. } => Code::FailedPrecondition,
             // The caller must change the key, not retry: sending the same
             // bytes again produces the same collision.

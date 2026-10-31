@@ -61,6 +61,7 @@ pub fn plain_registration(worker: &str) -> horde_proto::v1::RegisterWorkerReques
         hello: versioned_hello(),
         worker_id: Some(horde_proto::v1::WorkerId::new(worker)),
         capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+        last_local_journal_sequence: None,
     }
 }
 

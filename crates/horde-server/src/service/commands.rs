@@ -39,17 +39,30 @@
 //! is why the worker's ack — not the server's memory — decides where a stream
 //! resumes.
 //!
-//! # What is not here yet
+//! # ...unless the fold itself changes (ADR-0011)
 //!
-//! Spawn, permission-decision, delivery and interrupt commands are derived.
-//! Delivery to an agent that is not yet *placed* issues nothing — the event
-//! stays in the log, and deliverability-before-placement is the scheduler's
-//! queue problem (DESIGN.md §6), not the stream's. Reconciling against
-//! what a *real* worker actually applied — as opposed to what it says it
-//! acked — needs the worker crate, which is not on `main` yet; see
-//! `tests/services.rs` for the marked seam.
+//! "The same log yields the same sequences" holds for one build of this fold.
+//! A build that folds the same history into more or fewer commands — the
+//! interrupt-storm fix dropped commands, buffered delivery adds them —
+//! renumbers every later command, and a worker resuming by sequence then
+//! skips or repeats work. So every command also carries its causing event's
+//! log position, which no fold can renumber; a worker that reports the
+//! highest position it applied resumes from that position, inclusive, and
+//! dedupes the overlap on `command_id`. The sequence remains the resume key
+//! only for a worker that has never seen a position.
+//!
+//! # Messages to agents that are not placed
+//!
+//! A message sent before its agent is placed — or while a not-yet-started
+//! agent waits to be re-placed — is buffered here, durably in the only sense
+//! that matters: it is a fold over the log, so it survives every restart. The
+//! placement that finally spawns the agent delivers the buffer right behind
+//! the spawn, and a re-placement delivers it again to the new worker, because
+//! the new incarnation never saw any of it. The buffer is let go once the
+//! agent is seen running: from then on it is never re-placed (a lost worker
+//! declares it lost instead, ADR-0011), so nobody would ever replay it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -63,7 +76,7 @@ use prost::Message;
 use tokio::sync::broadcast;
 
 use crate::error::ServerError;
-use crate::log::{EventLog, GlobalEvent, Notification, StoredEvent};
+use crate::log::{EventLog, GlobalEvent, Notification};
 
 /// How many log rows one fold step reads.
 const PAGE: u32 = 512;
@@ -79,6 +92,16 @@ struct SpawnDetails {
     parent_agent_id: Option<String>,
     spec: Option<horde_proto::v1::AgentSpec>,
     tree_path: Vec<String>,
+}
+
+/// One message held for an agent that may still be (re-)placed.
+#[derive(Debug, Clone, PartialEq)]
+struct Buffered {
+    /// The message event's own position — its delivery's identity.
+    session_id: String,
+    sequence: u64,
+    body: deliver_message_command::Body,
+    delivery: i32,
 }
 
 /// The fold state: everything needed to turn the next log row into commands.
@@ -115,6 +138,15 @@ pub struct CommandProjection {
     /// How many commands each worker has been issued. This *is* the per-worker
     /// command sequence.
     issued: BTreeMap<String, u64>,
+    /// Every message sent to an agent that has not been seen running, in
+    /// send order — what a (re-)placement delivers behind its spawn.
+    inbox: BTreeMap<String, Vec<Buffered>>,
+    /// Agents seen running (or ended): never re-placed, so never buffered.
+    started: BTreeSet<String>,
+    /// How many journal resets each worker has had (ADR-0011). A stream
+    /// watches its own worker's count: commands folded before a reset were
+    /// issued to a journal that no longer exists.
+    resets: BTreeMap<String, u64>,
 }
 
 impl CommandProjection {
@@ -127,6 +159,12 @@ impl CommandProjection {
     #[must_use]
     pub fn issued(&self, worker_id: &str) -> u64 {
         self.issued.get(worker_id).copied().unwrap_or(0)
+    }
+
+    /// How many journal resets this worker has had so far in the fold.
+    #[must_use]
+    pub fn resets(&self, worker_id: &str) -> u64 {
+        self.resets.get(worker_id).copied().unwrap_or(0)
     }
 
     /// Folds one log row, returning the commands it causes and whose they are.
@@ -216,8 +254,28 @@ impl CommandProjection {
                     agent_id: Some(AgentId::new(agent_id)),
                     reason: interrupted.reason,
                 });
-                let issued = self.issue(&worker_id, &global.event, command, MAIN);
+                let issued = self.issue(&worker_id, global, command, MAIN);
                 vec![(worker_id, issued)]
+            }
+            // An agent seen running is never re-placed again (a lost worker
+            // declares it lost instead), so its buffer has no future reader.
+            (Some(Kind::AgentLifecycleChanged(changed)), Some(agent_id)) => {
+                if let Ok(state) = horde_proto::v1::AgentLifecycleState::try_from(changed.state)
+                    && crate::placement::survives_only_as_placed(state)
+                {
+                    self.inbox.remove(&agent_id);
+                    self.started.insert(agent_id);
+                }
+                Vec::new()
+            }
+            // An operator reset this worker's journal (ADR-0011): its fresh
+            // state applied nothing, so its numbering starts over.
+            (Some(Kind::WorkerJournalReset(reset)), _) => {
+                if let Some(worker_id) = reset.worker_id.as_ref().map(ToString::to_string) {
+                    self.issued.insert(worker_id.clone(), 0);
+                    *self.resets.entry(worker_id).or_insert(0) += 1;
+                }
+                Vec::new()
             }
             // Archive finally has a producer (fix a7): archiving the session
             // folds into an ArchiveAgentCommand for each of its placed
@@ -242,7 +300,7 @@ impl CommandProjection {
                         // worker if the narrowing is left behind here.
                         decision: Some(decision),
                     });
-                let issued = self.issue(&worker_id, &global.event, command, MAIN);
+                let issued = self.issue(&worker_id, global, command, MAIN);
                 vec![(worker_id, issued)]
             }
             _ => Vec::new(),
@@ -294,7 +352,7 @@ impl CommandProjection {
             definition: Some(definition),
             session_id: Some(SessionId::new(global.event.session_id.clone())),
         });
-        let issued = self.issue(&worker_id, &global.event, command, MAIN);
+        let issued = self.issue(&worker_id, global, command, MAIN);
         vec![(worker_id, issued)]
     }
 
@@ -325,6 +383,9 @@ impl CommandProjection {
         let mut commands = Vec::new();
         for agent_id in archived {
             self.spawned.remove(&agent_id);
+            // Archive is terminal: nothing buffered for it is owed anyone.
+            self.inbox.remove(&agent_id);
+            self.started.insert(agent_id.clone());
             let Some(worker_id) = self.placed.remove(&agent_id) else {
                 continue; // Queued or never placed: nobody is running it.
             };
@@ -337,7 +398,7 @@ impl CommandProjection {
                 },
             });
             let suffix = format!(":archive:{agent_id}");
-            let issued = self.issue(&worker_id, &global.event, command, &suffix);
+            let issued = self.issue(&worker_id, global, command, &suffix);
             commands.push((worker_id, issued));
         }
         commands
@@ -366,7 +427,7 @@ impl CommandProjection {
                 agent_id: Some(AgentId::new(agent_id)),
                 reason: "the agent is no longer placed on this worker".to_owned(),
             });
-            let issued = self.issue(previous, &global.event, cancel, CANCEL);
+            let issued = self.issue(previous, global, cancel, CANCEL);
             commands.push((previous.clone(), issued));
         }
 
@@ -406,8 +467,11 @@ impl CommandProjection {
                             .mcp_servers
                             .visible_hub_servers_for(agent_type),
                     });
-                    let issued = self.issue(&worker_id, &global.event, spawn, MAIN);
-                    commands.push((worker_id, issued));
+                    let issued = self.issue(&worker_id, global, spawn, MAIN);
+                    commands.push((worker_id.clone(), issued));
+                    // Right behind the spawn: everything sent while the agent
+                    // had no worker, or before this incarnation existed.
+                    commands.extend(self.flush_inbox(global, agent_id, &worker_id));
                 }
             }
             None => {
@@ -418,12 +482,13 @@ impl CommandProjection {
     }
 
     /// The command one sent message causes: deliver it to the worker holding
-    /// the agent, mode intact.
+    /// the agent, mode intact — and, while the agent may still be
+    /// (re-)placed, keep it for the placement that spawns the next
+    /// incarnation (see the module docs).
     ///
-    /// A message to an *unplaced* agent has nobody to deliver to and issues
-    /// nothing — the event stays in the log, but this fold does not buffer it
-    /// for a later placement. Deliverability before placement is the
-    /// scheduler's queue problem, not the stream's; see DESIGN.md §6.
+    /// A message to an agent this fold never saw spawned, or one already
+    /// archived or seen running and now unplaced, has nobody it could ever
+    /// reach and issues nothing; the control plane refuses those sends.
     fn deliver_commands(
         &mut self,
         global: &GlobalEvent,
@@ -431,41 +496,114 @@ impl CommandProjection {
         body: Option<deliver_message_command::Body>,
         delivery: i32,
     ) -> Vec<(String, StreamCommandsResponse)> {
-        let (Some(body), Some(worker_id)) = (body, self.placed.get(agent_id).cloned()) else {
+        let Some(body) = body else {
+            return Vec::new();
+        };
+        if buffers_for(
+            self.spawned.contains_key(agent_id),
+            self.started.contains(agent_id),
+        ) {
+            self.inbox
+                .entry(agent_id.to_owned())
+                .or_default()
+                .push(Buffered {
+                    session_id: global.event.session_id.clone(),
+                    sequence: global.event.sequence,
+                    body: body.clone(),
+                    delivery,
+                });
+        }
+        let Some(worker_id) = self.placed.get(agent_id).cloned() else {
             return Vec::new();
         };
 
-        let command = Command::DeliverMessage(DeliverMessageCommand {
-            agent_id: Some(AgentId::new(agent_id)),
-            body: Some(body),
-            delivery,
-        });
-        let issued = self.issue(&worker_id, &global.event, command, MAIN);
+        let command = deliver(agent_id, body, delivery);
+        let issued = self.issue(&worker_id, global, command, MAIN);
         vec![(worker_id, issued)]
+    }
+
+    /// The buffered messages a placement owes its new worker, behind the
+    /// spawn it just issued.
+    ///
+    /// Each delivery's id is the message's own position suffixed with the
+    /// placement's, so a re-placement back onto a worker that applied an
+    /// earlier incarnation's copy is not deduplicated away; its log position
+    /// is the placement's, which is where the fold issued it.
+    fn flush_inbox(
+        &mut self,
+        placement: &GlobalEvent,
+        agent_id: &str,
+        worker_id: &str,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        let buffered = self.inbox.get(agent_id).cloned().unwrap_or_default();
+        let role = format!(":placed:{}", placement.event.sequence);
+        buffered
+            .into_iter()
+            .map(|message| {
+                let id = command_id(&message.session_id, message.sequence, &role);
+                let command = deliver(agent_id, message.body, message.delivery);
+                let issued = self.issue_with_id(worker_id, placement.row, id, command);
+                (worker_id.to_owned(), issued)
+            })
+            .collect()
     }
 
     /// Assigns the next per-worker sequence, and the command's stable id.
     fn issue(
         &mut self,
         worker_id: &str,
-        cause: &StoredEvent,
+        cause: &GlobalEvent,
         command: Command,
         role: &str,
+    ) -> StreamCommandsResponse {
+        // Derived from the event that caused it rather than from the
+        // command's own sequence. `(session_id, sequence)` is the log's
+        // primary key, so this is unique by construction and identical every
+        // time the fold is recomputed — which is what "stable across
+        // redelivery" has to mean once a redelivery can follow a restart.
+        let id = command_id(&cause.event.session_id, cause.event.sequence, role);
+        self.issue_with_id(worker_id, cause.row, id, command)
+    }
+
+    /// [`Self::issue`] with the id already chosen.
+    fn issue_with_id(
+        &mut self,
+        worker_id: &str,
+        log_position: u64,
+        command_id: String,
+        command: Command,
     ) -> StreamCommandsResponse {
         let next = self.issued.entry(worker_id.to_owned()).or_insert(0);
         *next = next.saturating_add(1);
 
         StreamCommandsResponse {
             command_sequence: *next,
-            // Derived from the event that caused it rather than from the
-            // command's own sequence. `(session_id, sequence)` is the log's
-            // primary key, so this is unique by construction and identical
-            // every time the fold is recomputed — which is what "stable across
-            // redelivery" has to mean once a redelivery can follow a restart.
-            command_id: command_id(&cause.session_id, cause.sequence, role),
+            command_id,
+            log_position,
             command: Some(command),
         }
     }
+}
+
+/// A delivery command for one agent.
+fn deliver(agent_id: &str, body: deliver_message_command::Body, delivery: i32) -> Command {
+    Command::DeliverMessage(DeliverMessageCommand {
+        agent_id: Some(AgentId::new(agent_id)),
+        body: Some(body),
+        delivery,
+    })
+}
+
+/// Whether a message is kept for a later (re-)placement: only for an agent
+/// this fold saw spawned and has not yet seen running or ended.
+///
+/// Both halves disqualify alone, and inline they are not separately
+/// reachable: a live log never messages an agent it has not spawned, and
+/// a started agent is usually still placed, so either operator flipped keeps
+/// passing end-to-end while buffering for nobody or re-delivering to a
+/// running agent on its next re-placement.
+fn buffers_for(spawned: bool, started: bool) -> bool {
+    spawned && !started
 }
 
 /// The binding a spawn's model selection resolves to (W7b finding 5).
@@ -540,6 +678,40 @@ fn command_id(session_id: &str, sequence: u64, role: &str) -> String {
     format!("{session_id}:{sequence}{role}")
 }
 
+/// Where a worker said its command stream resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resume {
+    /// The first command sequence not applied — the fallback key.
+    pub sequence: u64,
+    /// The highest causing-event position applied; zero when unknown. When
+    /// known it outranks the sequence (see the module docs).
+    pub log_position: u64,
+}
+
+impl Resume {
+    /// A resume by sequence alone, as every worker before ADR-0011 asks.
+    #[must_use]
+    pub fn from_sequence(sequence: u64) -> Self {
+        Self {
+            sequence,
+            log_position: 0,
+        }
+    }
+
+    /// Whether a command at this sequence and position is at or past the
+    /// resume point. Inclusive both ways: the position a worker applied may
+    /// have caused further commands it never saw, and it dedupes the ones it
+    /// did on `command_id`.
+    #[must_use]
+    pub fn reaches(&self, command: &StreamCommandsResponse) -> bool {
+        if self.log_position > 0 {
+            command.log_position >= self.log_position
+        } else {
+            command.command_sequence >= self.sequence
+        }
+    }
+}
+
 /// Whether a folded command is one this stream still owes its worker.
 ///
 /// Two independent reasons to drop one, and inline they are not separately
@@ -547,8 +719,13 @@ fn command_id(session_id: &str, sequence: u64, role: &str) -> String {
 /// ascending order from its resume point, so `&&` keeps behaving correctly
 /// while silently delivering another worker's commands the moment two workers
 /// share a server. Four cases, all assertable.
-fn is_owed(worker_id: &str, command_worker: &str, sequence: u64, resume_from: u64) -> bool {
-    worker_id == command_worker && sequence >= resume_from
+fn is_owed(
+    worker_id: &str,
+    command_worker: &str,
+    command: &StreamCommandsResponse,
+    resume: Resume,
+) -> bool {
+    worker_id == command_worker && resume.reaches(command)
 }
 
 /// One worker's live command stream.
@@ -559,7 +736,7 @@ fn is_owed(worker_id: &str, command_worker: &str, sequence: u64, resume_from: u6
 pub struct CommandStream {
     log: EventLog,
     worker_id: String,
-    resume_from: u64,
+    resume: Resume,
     projection: CommandProjection,
     /// Append position read up to. Owned here rather than by the fold, because
     /// this is what [`Self::catch_up`]'s loop terminates on and a loop whose
@@ -580,11 +757,21 @@ impl CommandStream {
     /// during the catch-up read is either in the read or in the channel.
     #[must_use]
     pub fn open(log: &EventLog, worker_id: &str, resume_from: u64) -> Self {
+        Self::resuming(log, worker_id, Resume::from_sequence(resume_from))
+    }
+
+    /// [`Self::open`], resuming wherever the worker said — by position when
+    /// it knows one (ADR-0011).
+    #[must_use]
+    pub fn resuming(log: &EventLog, worker_id: &str, resume: Resume) -> Self {
         Self {
             notifications: log.subscribe(),
             log: log.clone(),
             worker_id: worker_id.to_owned(),
-            resume_from: resume_from.max(1),
+            resume: Resume {
+                sequence: resume.sequence.max(1),
+                log_position: resume.log_position,
+            },
             projection: CommandProjection::new(),
             cursor: 0,
             parks: Arc::new(AtomicU64::new(0)),
@@ -657,13 +844,17 @@ impl CommandStream {
             self.cursor = last.row;
 
             for global in &page {
-                for (worker_id, command) in self.projection.advance(global) {
-                    if is_owed(
-                        &self.worker_id,
-                        &worker_id,
-                        command.command_sequence,
-                        self.resume_from,
-                    ) {
+                let resets_before = self.projection.resets(&self.worker_id);
+                let commands = self.projection.advance(global);
+                if self.projection.resets(&self.worker_id) != resets_before {
+                    // A journal reset (ADR-0011): everything folded so far was
+                    // issued to a journal that no longer exists, and the
+                    // fresh one resumes by the restarted numbering.
+                    owed.clear();
+                    self.resume = Resume::from_sequence(self.resume.sequence.max(1));
+                }
+                for (worker_id, command) in commands {
+                    if is_owed(&self.worker_id, &worker_id, &command, self.resume) {
                         owed.push(command);
                     }
                 }
@@ -677,7 +868,7 @@ impl std::fmt::Debug for CommandStream {
         formatter
             .debug_struct("CommandStream")
             .field("worker_id", &self.worker_id)
-            .field("resume_from", &self.resume_from)
+            .field("resume", &self.resume)
             .field("row", &self.cursor)
             .finish_non_exhaustive()
     }
@@ -716,7 +907,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::log::PendingEvent;
+    use crate::log::{PendingEvent, StoredEvent};
 
     /// A log row carrying `event`, at `row` in append order.
     fn row(row: u64, session: &str, sequence: u64, event: Event) -> GlobalEvent {
@@ -937,17 +1128,57 @@ mod tests {
     /// redeliver what was acked or skip the first command owed.
     #[test]
     fn a_command_is_owed_only_to_its_own_worker_and_only_from_the_resume_point() {
-        assert!(is_owed("w1", "w1", 5, 5), "the resume point is inclusive");
-        assert!(is_owed("w1", "w1", 6, 5));
+        let at = |sequence: u64| StreamCommandsResponse {
+            command_sequence: sequence,
+            ..StreamCommandsResponse::default()
+        };
+        let from = Resume::from_sequence;
         assert!(
-            !is_owed("w1", "w1", 4, 5),
+            is_owed("w1", "w1", &at(5), from(5)),
+            "the resume point is inclusive"
+        );
+        assert!(is_owed("w1", "w1", &at(6), from(5)));
+        assert!(
+            !is_owed("w1", "w1", &at(4), from(5)),
             "already applied, so not owed again"
         );
         assert!(
-            !is_owed("w1", "w2", 5, 5),
+            !is_owed("w1", "w2", &at(5), from(5)),
             "another worker's command must never be delivered here"
         );
-        assert!(!is_owed("w1", "w2", 4, 5));
+        assert!(!is_owed("w1", "w2", &at(4), from(5)));
+    }
+
+    /// A known position outranks the sequence, inclusively (ADR-0011): a
+    /// renumbering fold may hand an applied command a *higher* sequence than
+    /// the worker's watermark, or an unapplied one a lower — the position of
+    /// the causing event is the only key no fold can move.
+    #[test]
+    fn a_known_position_outranks_the_sequence_and_includes_its_own_row() {
+        let command = |sequence: u64, log_position: u64| StreamCommandsResponse {
+            command_sequence: sequence,
+            log_position,
+            ..StreamCommandsResponse::default()
+        };
+        let resume = Resume {
+            sequence: 10,
+            log_position: 40,
+        };
+        assert!(
+            resume.reaches(&command(3, 41)),
+            "an unapplied command the new fold numbered low is still owed"
+        );
+        assert!(
+            resume.reaches(&command(3, 40)),
+            "the applied row may have caused further commands; dedupe covers the rest"
+        );
+        assert!(
+            !resume.reaches(&command(99, 39)),
+            "an applied command the new fold numbered high is not owed again"
+        );
+        let by_sequence = Resume::from_sequence(10);
+        assert!(by_sequence.reaches(&command(10, 1)));
+        assert!(!by_sequence.reaches(&command(9, 1_000)));
     }
 
     #[test]
@@ -1456,11 +1687,10 @@ mod tests {
         }
     }
 
-    /// A message to an agent nobody placed issues nothing: there is no worker
-    /// to address, and buffering for a later placement is the scheduler's
-    /// problem, not the stream's.
+    /// A message to an agent nobody ever spawned issues nothing: there is no
+    /// worker to address and no placement that could ever owe it.
     #[test]
-    fn a_message_to_an_unplaced_agent_issues_no_command() {
+    fn a_message_to_an_unknown_agent_issues_no_command() {
         let rows = vec![row(
             1,
             "s1",
@@ -1468,6 +1698,224 @@ mod tests {
             assignment_event("agent-1", "hello", DeliveryMode::TurnBoundary),
         )];
         assert!(fold(&rows).is_empty());
+    }
+
+    /// The deliveries in `issued` for `worker`: (id, text, log position).
+    fn deliveries_to(
+        issued: &[(String, StreamCommandsResponse)],
+        worker: &str,
+    ) -> Vec<(String, String, u64)> {
+        issued
+            .iter()
+            .filter(|(to, _)| to == worker)
+            .filter_map(|(_, response)| match &response.command {
+                Some(Command::DeliverMessage(DeliverMessageCommand {
+                    body: Some(deliver_message_command::Body::Assignment(assignment)),
+                    ..
+                })) => Some((
+                    response.command_id.clone(),
+                    assignment.text.clone(),
+                    response.log_position,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Messages to a spawned-but-unplaced agent wait in the fold and ride
+    /// right behind the spawn its placement issues (ADR-0011), in send order,
+    /// positioned at the placement that issued them.
+    #[test]
+    fn messages_before_placement_are_delivered_behind_the_spawn() {
+        let rows = vec![
+            row(1, "s1", 1, spawn_event("agent-1", None)),
+            row(
+                2,
+                "s1",
+                2,
+                assignment_event("agent-1", "first", DeliveryMode::TurnBoundary),
+            ),
+            row(
+                3,
+                "s1",
+                3,
+                assignment_event("agent-1", "second", DeliveryMode::TurnBoundary),
+            ),
+            row(
+                4,
+                "s1",
+                4,
+                placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
+            ),
+        ];
+        let issued = fold(&rows);
+        assert!(
+            matches!(
+                issued.first().map(|(_, r)| &r.command),
+                Some(Some(Command::SpawnAgent(_)))
+            ),
+            "the spawn comes first: {issued:?}"
+        );
+        assert_eq!(
+            deliveries_to(&issued, "worker-a"),
+            vec![
+                ("s1:2:placed:4".to_owned(), "first".to_owned(), 4),
+                ("s1:3:placed:4".to_owned(), "second".to_owned(), 4),
+            ]
+        );
+    }
+
+    /// A not-yet-started agent re-placed elsewhere takes its messages along —
+    /// the new incarnation never saw them — including back onto a worker
+    /// that applied an earlier copy, which a distinct id keeps from
+    /// deduplicating away. Once seen running, nothing is replayed again.
+    #[test]
+    fn buffered_messages_follow_every_re_placement_until_the_agent_runs() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        rows.push(row(
+            3,
+            "s1",
+            3,
+            assignment_event("agent-1", "hello", DeliveryMode::TurnBoundary),
+        ));
+        rows.push(row(
+            4,
+            "s1",
+            4,
+            placement_event("agent-1", None, PlacementState::Queued),
+        ));
+        rows.push(row(
+            5,
+            "s1",
+            5,
+            placement_event("agent-1", Some("worker-b"), PlacementState::Placed),
+        ));
+        rows.push(row(
+            6,
+            "s1",
+            6,
+            placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
+        ));
+        let issued = fold(&rows);
+        assert_eq!(
+            deliveries_to(&issued, "worker-a"),
+            vec![
+                ("s1:3".to_owned(), "hello".to_owned(), 3),
+                ("s1:3:placed:6".to_owned(), "hello".to_owned(), 6),
+            ],
+            "delivered live, then again to the incarnation the return spawned"
+        );
+        assert_eq!(
+            deliveries_to(&issued, "worker-b"),
+            vec![("s1:3:placed:5".to_owned(), "hello".to_owned(), 5)]
+        );
+
+        // Seen running: a later re-placement replays nothing.
+        let mut running = placed_agent(1, "s1", "agent-1", "worker-a");
+        running.push(row(
+            3,
+            "s1",
+            3,
+            assignment_event("agent-1", "hello", DeliveryMode::TurnBoundary),
+        ));
+        running.push(row(
+            4,
+            "s1",
+            4,
+            Event {
+                agent_id: Some(AgentId::new("agent-1")),
+                kind: Some(Kind::AgentLifecycleChanged(
+                    horde_proto::v1::AgentLifecycleChanged {
+                        state: horde_proto::v1::AgentLifecycleState::Running as i32,
+                        ..Default::default()
+                    },
+                )),
+                ..Event::default()
+            },
+        ));
+        running.push(row(
+            5,
+            "s1",
+            5,
+            placement_event("agent-1", Some("worker-b"), PlacementState::Placed),
+        ));
+        assert!(deliveries_to(&fold(&running), "worker-b").is_empty());
+    }
+
+    #[test]
+    fn only_a_spawned_agent_not_yet_started_buffers() {
+        assert!(buffers_for(true, false));
+        assert!(!buffers_for(true, true));
+        assert!(!buffers_for(false, false));
+        assert!(!buffers_for(false, true));
+    }
+
+    /// A journal reset restarts the worker's numbering (ADR-0011), and a
+    /// stream opened for the fresh journal is owed nothing from before it.
+    #[tokio::test]
+    async fn a_journal_reset_restarts_the_numbering_and_forgets_what_came_before() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        let append = |session: &str, event: Event| {
+            let log = log.clone();
+            let session = session.to_owned();
+            async move {
+                log.append(PendingEvent {
+                    session_id: session,
+                    payload: event.encode_to_vec(),
+                    ..PendingEvent::default()
+                })
+                .await
+                .expect("append");
+            }
+        };
+        append("s1", spawn_event("old", None)).await;
+        append(
+            "s1",
+            placement_event("old", Some("worker-a"), PlacementState::Placed),
+        )
+        .await;
+        append(
+            "horde-worker-journal",
+            Event {
+                kind: Some(Kind::WorkerJournalReset(
+                    horde_proto::v1::WorkerJournalReset {
+                        worker_id: Some(WorkerId::new("worker-a")),
+                        ..Default::default()
+                    },
+                )),
+                ..Event::default()
+            },
+        )
+        .await;
+        append("s1", spawn_event("new", None)).await;
+        append(
+            "s1",
+            placement_event("new", Some("worker-a"), PlacementState::Placed),
+        )
+        .await;
+
+        let mut stream = CommandStream::open(&log, "worker-a", 1);
+        let batch = stream
+            .next_batch()
+            .await
+            .expect("the log is open")
+            .expect("the fold reads");
+        let spawned: Vec<(u64, String)> = batch
+            .iter()
+            .filter_map(|response| match &response.command {
+                Some(Command::SpawnAgent(spawn)) => Some((
+                    response.command_sequence,
+                    spawn.agent_id.as_ref().map(ToString::to_string)?,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawned, vec![(1, "new".to_owned())]);
+        assert_eq!(
+            super::issued_to(&log, "worker-a").await.expect("fold"),
+            1,
+            "registration answers the restarted count"
+        );
     }
 
     /// The interrupt verb's missing leg: the journaled request becomes a

@@ -133,6 +133,7 @@ mod suite {
         StreamCommandsResponse {
             command_sequence: sequence,
             command_id: format!("share:{sequence}"),
+            log_position: 0,
             command: Some(command),
         }
     }
