@@ -97,6 +97,9 @@ tokio-rustls = { workspace = true }
 # `horde-server`'s own suites. The dependency points one way only —
 # horde-server knows nothing about this crate — so there is no cycle.
 horde-server-testkit = { workspace = true }
+# The fault proxy: the waits are tested across a severed link to the server,
+# because "resumable across a reconnect" is a claim only a cut can check.
+horde-testkit = { workspace = true }
 # The chain e2e configures the server's permission modes and scripts its
 # Policy Judge, which are `horde-server::permission` types.
 horde-server = { workspace = true }

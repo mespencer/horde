@@ -90,7 +90,7 @@ Two message kinds, sender declares intent (one bit, no taxonomy):
 - **`assign`** — expects exactly one **result**: `status (success | partial | blocked) + summary + payload`. Spawning carries an implicit first assignment. A follow-up assignment ("you missed X") yields a new result.
 - **`note`** — chat/context/status. No result owed. Ongoing agents (monitors) live on notes.
 
-`wait_for_agent` waits on an assignment's result. As built, correlation is by **agent**, not assignment id: the wait wakes on that agent's next result, whichever assignment it answers. (CC precedent: Task subagents are strict result-per-call; teammates are freeform + shared task list. This is the synthesis.)
+`wait_for_agent` waits on an assignment's result. As built, correlation is by **agent**, not assignment id (results carry no assignment id yet): the wait answers with the agent's result reported *after the latest assignment sent to it* — a result already in history answers at once unless a newer assignment has superseded it, in which case the wait holds for the new one. The wait reads the log from the endpoint's shared cursor and redials it from that cursor on a transport failure, so a wait (or a pending approval) survives a worker↔server partition. (CC precedent: Task subagents are strict result-per-call; teammates are freeform + shared task list. This is the synthesis.)
 
 ### Sharing is implicit in the verbs (payloads)
 

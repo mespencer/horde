@@ -69,6 +69,100 @@ async fn a_result_reported_before_the_wait_still_answers_it() -> Setup<()> {
     Ok(())
 }
 
+/// A second assignment owes a second result. The wait used to replay the log
+/// from zero and hand back the *first* result it met, so a parent that
+/// re-assigned a child was told its new task was done before it started.
+/// Both waits share one context — the second reads from the cursor the first
+/// left, which is the path production takes.
+#[tokio::test]
+async fn a_wait_after_a_second_assignment_is_not_answered_by_the_first_result() -> Setup<()> {
+    let (harness, identity, reporter) = verbs_for_one_agent().await?;
+    let parent = std::sync::Arc::new(Verbs::new(harness.context().await?));
+
+    reporter
+        .report_result(&identity, ResultStatus::Success, "first", "result-first")
+        .await?;
+    assert_eq!(
+        parent.wait_for_agent(&harness.agent_id).await?.summary,
+        "first"
+    );
+
+    parent
+        .send_message(
+            &harness.agent_id,
+            MessageKind::Assign,
+            "now the second thing",
+            None,
+            false,
+            "assign-second",
+        )
+        .await?;
+
+    let waiter = std::sync::Arc::clone(&parent);
+    let agent_id = harness.agent_id.clone();
+    let mut waiting = tokio::spawn(async move { waiter.wait_for_agent(&agent_id).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+            .await
+            .is_err(),
+        "the first result is stale once a second assignment was sent"
+    );
+
+    reporter
+        .report_result(&identity, ResultStatus::Success, "second", "result-second")
+        .await?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), waiting).await???;
+    assert_eq!(result.summary, "second");
+    Ok(())
+}
+
+/// A wait survives the link to the server being cut: the result lands during
+/// the partition, and the wait reads it once the link heals — by redialing
+/// from its cursor, not by failing the verb as an internal error.
+#[tokio::test]
+async fn a_wait_survives_a_severed_link_and_reads_the_result_after_it_heals() -> Setup<()> {
+    let (harness, identity, reporter) = verbs_for_one_agent().await?;
+    let proxy = horde_testkit::fault::FaultProxy::front(&harness.endpoint).await?;
+    let through_proxy = horde_mcp::context::AgentContext::new(
+        harness.journal(),
+        horde_cli::client::Client::connect(&proxy.endpoint()).await?,
+        harness.session_id.clone(),
+    );
+    let waiter = Verbs::new(through_proxy);
+    let agent_id = harness.agent_id.clone();
+    let mut waiting = tokio::spawn(async move { waiter.wait_for_agent(&agent_id).await });
+
+    // Let the follow open, then cut it mid-wait.
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while proxy.connections_carried() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(opened.is_ok(), "the wait must dial the server");
+    proxy.cut();
+
+    reporter
+        .report_result(
+            &identity,
+            ResultStatus::Success,
+            "landed in the partition",
+            "r-cut",
+        )
+        .await?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+            .await
+            .is_err(),
+        "nothing can arrive while the link is cut, and the wait must not fail"
+    );
+
+    proxy.heal();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), waiting).await???;
+    assert_eq!(result.summary, "landed in the partition");
+    Ok(())
+}
+
 /// The payload is the Worker's to stamp. An endpoint that let an agent declare
 /// its own commits would be the declaring path DESIGN §5 rules out, so this
 /// asserts the absence deliberately rather than by accident.

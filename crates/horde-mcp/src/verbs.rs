@@ -18,7 +18,8 @@
 //!   Worker's journal, because DESIGN §5 prefers the orchestrator observing
 //!   what happened over Agents declaring it.
 //! * **`wait_for_agent` is a read.** It watches the log for the result it is
-//!   waiting on, matched by the agent that owes it.
+//!   waiting on: the one the agent reported after the latest assignment it was
+//!   sent, so a second assignment is never answered with the first's result.
 //!
 //! # What `report_result` can and cannot say
 //!
@@ -30,7 +31,6 @@
 //! be exactly the declaring path that principle rules out. So the payload is
 //! left unset here, for the Worker to fill. That is a seam, not an omission.
 
-use horde_cli::client::SyncOptions;
 use horde_proto::v1::event::Kind as EventKind;
 use horde_proto::v1::{DeliveryMode, ResultStatus};
 
@@ -55,13 +55,17 @@ pub enum VerbError {
         source: JournalError,
     },
 
-    /// The stream ended before the awaited agent reported.
+    /// The control plane refused to let the result be watched.
     ///
-    /// Distinct from "it reported failure": the agent may still be working, and
-    /// telling a parent its child failed when the connection dropped would
-    /// invent a result nobody produced.
-    #[error("the event stream ended before {agent_id} reported a result")]
-    Abandoned { agent_id: String },
+    /// Distinct from "it reported failure": the agent may still be working,
+    /// and telling a parent its child failed because the watch was refused
+    /// would invent a result nobody produced. A transport failure never lands
+    /// here — the watch redials from its cursor instead.
+    #[error("could not watch for the result: {source}")]
+    Unwatchable {
+        #[source]
+        source: crate::watch::WatchError,
+    },
 
     /// The verb is understood but its backend is not built.
     ///
@@ -263,123 +267,35 @@ impl Verbs {
             .map_err(|source| VerbError::NotRecorded { source })
     }
 
-    /// Blocks until `agent_id` reports a result.
+    /// Blocks until `agent_id` reports the result its latest assignment owes.
     ///
-    /// Same discipline as the permission wait: subscribe first, match by
-    /// identity, and impose no clock on progress. A child may legitimately take
-    /// hours, and a timeout here would report "no result" for an agent that is
-    /// still working — which a parent would act on.
+    /// Same discipline as the permission wait: read from the endpoint's
+    /// shared cursor, match by identity, and impose no clock on progress. A
+    /// child may legitimately take hours, and a timeout here would report "no
+    /// result" for an agent that is still working — which a parent would act
+    /// on. A result already in history answers at once, *unless* an assignment
+    /// was sent to the agent after it: then that assignment's result is the
+    /// one owed, and the old one is stale.
     ///
     /// # Errors
     ///
-    /// [`VerbError::Abandoned`] if the stream ended first, which is explicitly
-    /// not the same as a failed result.
+    /// [`VerbError::Unwatchable`] if the server refused the watch, which is
+    /// explicitly not the same as a failed result.
     pub async fn wait_for_agent(
         &self,
         agent_id: &str,
     ) -> Result<horde_proto::v1::AgentResult, VerbError> {
-        // Subscribed before anything is read, so a result that lands while this
-        // is being set up is still seen. Replaying from the start is safe
-        // because the match is on which agent reported, and a result already in
-        // history is the answer rather than a stale one.
-        let mut stream = self
-            .context
-            .client()
-            .follow(&SyncOptions::new(self.context.session_id().to_owned()))
-            .await?;
-
-        let wanted = agent_id.to_owned();
-        stream
-            .next_matching(move |envelope| result_from(envelope, &wanted))
-            .await?
-            .ok_or_else(|| VerbError::Abandoned {
-                agent_id: agent_id.to_owned(),
-            })
+        self.context
+            .watch()
+            .until(|index| index.result_owed(agent_id))
+            .await
+            .map_err(|source| VerbError::Unwatchable { source })
     }
-}
-
-/// The result in this envelope, if `agent_id` is the one that reported it.
-fn result_from(
-    envelope: &horde_proto::v1::EventEnvelope,
-    agent_id: &str,
-) -> Option<horde_proto::v1::AgentResult> {
-    let event = envelope.event.as_ref()?;
-    let EventKind::ResultReported(reported) = event.kind.as_ref()? else {
-        return None;
-    };
-    // `Event.agent_id` is the *reporting* agent, which is what makes this a
-    // safe match: a result reported by somebody else's child must not end this
-    // wait.
-    let reporter = event.agent_id.as_ref().map(ToString::to_string)?;
-    (reporter == agent_id).then(|| reported.result.clone())?
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageKind, VerbError, result_from};
-    use horde_proto::v1::ResultStatus;
-
-    fn reported(agent: &str, summary: &str) -> horde_proto::v1::EventEnvelope {
-        crate::testing::envelope(
-            agent,
-            horde_proto::v1::event::Kind::ResultReported(horde_proto::v1::ResultReported {
-                result: Some(horde_proto::v1::AgentResult {
-                    assignment_id: None,
-                    status: ResultStatus::Success as i32,
-                    summary: summary.to_owned(),
-                    payload: None,
-                }),
-            }),
-        )
-    }
-
-    /// The property the whole wait turns on. A tree has many children reporting
-    /// concurrently, and a parent waiting on one of them must not be woken by
-    /// another.
-    #[test]
-    fn only_the_awaited_agents_result_ends_the_wait() {
-        assert_eq!(
-            result_from(&reported("child-1", "done"), "child-1").map(|r| r.summary),
-            Some("done".to_owned())
-        );
-        assert!(
-            result_from(&reported("child-2", "done"), "child-1").is_none(),
-            "a sibling's result must not end this wait"
-        );
-    }
-
-    #[test]
-    fn a_result_reported_with_no_result_body_does_not_end_the_wait() {
-        // An empty ResultReported is a malformed event, not an answer. Treating
-        // it as one would hand the parent a default-everything result.
-        let mut envelope = reported("child-1", "done");
-        if let Some(event) = envelope.event.as_mut()
-            && let Some(horde_proto::v1::event::Kind::ResultReported(reported)) =
-                event.kind.as_mut()
-        {
-            reported.result = None;
-        }
-        assert!(result_from(&envelope, "child-1").is_none());
-    }
-
-    #[test]
-    fn events_that_are_not_results_are_ignored() {
-        let requested = crate::testing::envelope(
-            "child-1",
-            horde_proto::v1::event::Kind::PermissionRequested(
-                horde_proto::v1::PermissionRequested::default(),
-            ),
-        );
-        assert!(result_from(&requested, "child-1").is_none());
-        assert!(
-            result_from(
-                &crate::testing::envelope_without_event("child-1"),
-                "child-1"
-            )
-            .is_none(),
-            "an envelope with no event must not panic or match"
-        );
-    }
+    use super::{MessageKind, VerbError};
 
     /// One bit, declared by the sender — the distinction the whole messaging
     /// model rests on.

@@ -13,6 +13,7 @@
 //! serve a single verb correctly.
 
 use crate::journal::JournalSink;
+use crate::watch::SessionWatch;
 
 /// The context one Agent's endpoint operates in.
 ///
@@ -27,6 +28,9 @@ pub struct AgentContext {
     journal: std::sync::Arc<dyn JournalSink>,
     client: horde_cli::client::Client,
     session_id: String,
+    /// The Session's log as the blocking verbs read it — shared by every clone,
+    /// so each wait starts where the last one's fold left off.
+    watch: SessionWatch,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -44,10 +48,12 @@ impl AgentContext {
         client: horde_cli::client::Client,
         session_id: impl Into<String>,
     ) -> Self {
+        let session_id = session_id.into();
         Self {
             journal,
+            watch: SessionWatch::new(client.clone(), session_id.clone()),
             client,
-            session_id: session_id.into(),
+            session_id,
         }
     }
 
@@ -70,6 +76,12 @@ impl AgentContext {
     #[must_use]
     pub fn client(&self) -> horde_cli::client::Client {
         self.client.clone()
+    }
+
+    /// The shared, redialing view of the Session's log.
+    #[must_use]
+    pub fn watch(&self) -> &SessionWatch {
+        &self.watch
     }
 }
 
