@@ -371,11 +371,12 @@ pub struct TokenUsageUpdated {
     pub token_usage: TokenUsageBody,
 }
 
-/// Codex reports both a per-thread running `total` and a per-turn `last`.
+/// Codex reports both a per-thread running `total` and a per-call `last`.
 ///
-/// `last` is the turn, which is why this codec needs no accumulator the way the
-/// Claude one does — but resume replays a prior `last`, so idempotence is still
-/// required (see [`crate::turn`]).
+/// One reading arrives per *model call*, so a turn that calls the model six
+/// times sends six (transcript 33): `last` is one call, never the turn. The
+/// assembler differences `total` instead, which also makes the reading resume
+/// replays (transcript 16) a no-op (see [`crate::turn`]).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TokenUsageBody {
     #[serde(default)]

@@ -15,6 +15,7 @@ use horde_adapter::{AgentEvent, TurnStatus};
 use horde_adapter_codex::TurnAssembler;
 use horde_adapter_codex::codec::decode_line;
 use horde_adapter_codex::replay::replay as replay_session;
+use horde_adapter_codex::wire::{Frame, Notification};
 use horde_testkit::{HarnessOutputKey, Transcript};
 
 /// The W2c recordings, loaded through the shared testkit.
@@ -217,6 +218,94 @@ fn resume_does_not_bill_the_previous_turn_again() {
         billed, 19_522,
         "only the new turn's usage may be billed; the replayed reading is a duplicate"
     );
+}
+
+/// Codex sends one usage reading per *model call*, not per turn: `last` is
+/// one call and `total` is the thread's running sum. Every recording whose
+/// turn called a tool has two or more readings in that turn — transcript 33
+/// has six, whose `last` figures (18 411 … 19 395) sum to its final `total`
+/// of 113 895 — and the turn must bill all of them, not the first.
+///
+/// Each figure is the recording's final `total.totalTokens` (codex's own
+/// `inputTokens + outputTokens`); every one of these is a single-turn thread,
+/// so that total is the turn.
+#[test]
+fn a_multi_reading_turn_bills_every_model_call_it_made() {
+    for (name, readings, recorded_total) in [
+        ("04-approval-echo-untrusted.jsonl", 2, 34_525),
+        (
+            "08-approval-write-onrequest-workspacewrite.jsonl",
+            2,
+            39_610,
+        ),
+        ("09-approval-outside-workspace.jsonl", 2, 39_554),
+        ("15-steer.jsonl", 2, 34_733),
+        ("17-mcp-elicitation-accept.jsonl", 3, 56_986),
+        ("18-mcp-elicitation-decline.jsonl", 3, 57_055),
+        ("20-exec-user-onrequest-ro-vscode-write.jsonl", 2, 37_863),
+        ("21-exec-user-onrequest-ro-horde-write.jsonl", 2, 38_036),
+        ("22-exec-unset-onrequest-ro-horde-write.jsonl", 2, 38_048),
+        (
+            "23-exec-autoreview-onrequest-ro-horde-write.jsonl",
+            3,
+            57_456,
+        ),
+        ("24-exec-user-untrusted-ro-horde-echo.jsonl", 2, 36_542),
+        ("25-exec-user-granular-ro-horde-write.jsonl", 4, 86_982),
+        ("26-exec-user-onrequest-ww-horde-escape.jsonl", 3, 58_023),
+        ("27-exec-user-onrequest-ww-horde-net.jsonl", 3, 58_152),
+        (
+            "29-exec-user-onrequest-ro-horde-write-accept.jsonl",
+            2,
+            38_002,
+        ),
+        (
+            "30-exec-user-onrequest-ro-horde-write-amend.jsonl",
+            3,
+            57_352,
+        ),
+        (
+            "33-0147-exec-user-granular-ro-horde-write.jsonl",
+            6,
+            113_895,
+        ),
+    ] {
+        let recorded_readings = transcript(name)
+            .iter()
+            .filter(|line| {
+                matches!(
+                    decode_line(line),
+                    Ok(Frame::Notification(Notification::TokenUsageUpdated(_)))
+                )
+            })
+            .count();
+        assert_eq!(
+            recorded_readings, readings,
+            "{name}: the recording's reading count is the premise"
+        );
+
+        let (mut events, mut assembler) = replay(name);
+        // The approval probe stopped reading at `idle` in most of these, one
+        // frame short of the `turn/completed` codex writes next (20, 22 and 26
+        // kept it). Appending that frame closes the turn the way the live
+        // stream would; it carries no usage of its own.
+        if let Some(turn_id) = assembler.active_turn_id().map(ToString::to_string) {
+            let completed = serde_json::json!({
+                "method": "turn/completed",
+                "params": {"turn": {"id": turn_id, "status": "completed"}}
+            });
+            let frame = decode_line(&completed.to_string()).expect("a well-formed terminal frame");
+            events.extend(assembler.feed(&frame));
+        }
+        let billed: u64 = turn_endings(&events)
+            .iter()
+            .map(|outcome| outcome.usage.tokens.input_tokens + outcome.usage.tokens.output_tokens)
+            .sum();
+        assert_eq!(
+            billed, recorded_total,
+            "{name}: every one of the {readings} model calls must be billed"
+        );
+    }
 }
 
 /// Every recording must survive the codec without a protocol error.

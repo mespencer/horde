@@ -13,8 +13,9 @@ and ACP is not native and would add a bridge plus a second skew surface.
 **Status: verified 2026-08-09** against codex-cli 0.145.0 under a ChatGPT Pro
 subscription (see `docs/spikes/codex-app-server.md` and its transcripts).
 Streaming, per-turn token usage, and provider-reported rate-limit headroom all
-work and need no reconstruction — `thread/tokenUsage/updated` reports `last`
-per turn, so unlike Claude there is nothing to diff.
+work and need no reconstruction. *(The usage half of that sentence — "`last`
+per turn, nothing to diff" — was wrong; see the 2026-10-30 amendment at the
+end of this ADR.)*
 
 **The exception, and it is load-bearing:** Horde cannot intercept Codex tool
 calls before they run. The protocol declares five approval requests, but
@@ -215,3 +216,28 @@ The consequences above are re-scoped accordingly: "Codex agents get a coarser
 permission story" is now true only of **file changes** on 0.147+, and of
 everything on older CLIs. The sandbox tier and `cwd` remain the enforcement
 floor beneath the chain either way, and the tier-choice journaling stands.
+
+## Amendment, 2026-10-30: usage readings are per model call, not per turn
+
+The status paragraph's claim that `thread/tokenUsage/updated` "reports `last`
+per turn, so … there is nothing to diff" was an artefact of the first
+recordings: transcripts 03 and 14 are one-call turns, so their single reading
+looked like the turn. Codex sends **one reading per model call**. `last` is
+that call; `total` is the thread's running sum. Transcript 33 (0.147.0) has six
+readings in one turn — `last.totalTokens` 18 411, 18 683, 18 942, 19 153,
+19 311, 19 395, summing exactly to the final `total` of 113 895 — and every
+recording with a tool call has two or more (04, 08, 09, 15, 17, 18, 20–27, 29,
+30). The adapter as built kept the first reading of each turn and so billed
+18 411 for transcript 33's turn: an undercount of 2–6× on exactly the turns
+that do work.
+
+What the codec does now: it differences the monotonic thread `total` through
+the same `UsageAccumulator` the Claude adapter uses, adding each reading's
+delta to the open turn. The resume trap needs no separate dedupe under this
+shape: the reading `thread/resume` replays (transcript 16, the previous turn's
+id and `total`) seeds the baseline and bills nothing, so the new turn's first
+reading counts only its own tokens. A reading for any turn other than the open
+one still advances the baseline, so it is never billed later either. A reading
+missing `total` (shape drift) falls back to its own `last`, which is one call by
+definition. Conformance tests pin the recorded totals of the multi-reading
+transcripts.
