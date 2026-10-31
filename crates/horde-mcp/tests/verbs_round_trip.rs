@@ -324,19 +324,43 @@ async fn assignments_and_notes_both_land_and_report_where() -> Setup<()> {
 /// `agent_spawned` — acked, returned `Ok`, and silently absent from the log, so
 /// the wait in the tests above hung with no error anywhere to explain it.
 ///
-/// It is now refused at the write, which is the whole point: the complaint
-/// arrives at the caller that caused it rather than as a hang in a reader
-/// nobody has connected to it yet.
+/// It is now refused at the write and recorded — since ADR-0009, as a
+/// dead letter in the refused entry's place rather than as an error that
+/// failed the whole journal batch. A failed batch wedged a real worker: it
+/// re-offered the same entry on every reconnect, forever. The complaint is
+/// still never silent — it is an event of record, naming the collision.
 #[tokio::test]
 async fn reusing_another_events_idempotency_key_is_refused_rather_than_swallowed() -> Setup<()> {
-    let (_harness, identity, verbs) = verbs_for_one_agent().await?;
+    let (harness, identity, verbs) = verbs_for_one_agent().await?;
 
-    let error = verbs
+    verbs
         .report_result(&identity, ResultStatus::Success, "done", "key-1")
-        .await
-        .expect_err("key-1 already belongs to this session's agent_spawned");
+        .await?;
 
-    let rendered = error.to_string();
+    let mut reasons = Vec::new();
+    harness
+        .client()
+        .await?
+        .sync(
+            &horde_cli::client::SyncOptions::new(horde_server::service::ingest::DEAD_LETTER_STREAM),
+            |envelope| {
+                if let Some(horde_proto::v1::event::Kind::JournalEventRefused(refused)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                {
+                    reasons.push(refused.reason.clone());
+                }
+            },
+            |_| {},
+        )
+        .await?;
+    let rendered = reasons.join("\n");
+    assert_eq!(
+        reasons.len(),
+        1,
+        "the collision is recorded once: {rendered}"
+    );
     assert!(
         rendered.contains("agent_spawned") && rendered.contains("result_reported"),
         "the message must name both kinds so the collision is obvious: {rendered}"

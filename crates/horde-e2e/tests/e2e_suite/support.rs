@@ -287,6 +287,13 @@ impl System {
         .await
     }
 
+    /// Starts a worker named `name` on the fake adapter's default echo
+    /// script, its state beside the system's.
+    pub(crate) async fn spawn_echo_worker(&self, name: &str) -> SpawnedProcess {
+        self.spawn_worker(name, &self.state.path().join(name), &[])
+            .await
+    }
+
     /// A fresh session whose root agent has been placed — the point from
     /// which a scenario can start sending.
     pub(crate) async fn placed_session(&self, title: &str) -> (String, String) {

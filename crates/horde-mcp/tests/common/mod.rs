@@ -120,6 +120,15 @@ pub async fn harness() -> Setup<Harness> {
     seeded_on(horde_server_testkit::serve().await?).await
 }
 
+/// [`harness`], with the root placed on a worker whose adapter rewrites tool
+/// input — the arrangement a narrowing needs, since the server refuses one
+/// an adapter cannot apply (ADR-0009).
+pub async fn rewriting_harness() -> Setup<Harness> {
+    let endpoint = horde_server_testkit::serve().await?;
+    horde_server_testkit::register_rewriting_worker(&endpoint, "rewriter").await?;
+    seeded_on(endpoint).await
+}
+
 /// [`harness`], with the server's permission chain live under `modes` and an
 /// optional Policy Judge — the arrangement the chain e2e opts into.
 pub async fn harness_with_permissions(

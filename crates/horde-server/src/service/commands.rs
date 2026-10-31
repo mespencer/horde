@@ -199,7 +199,15 @@ impl CommandProjection {
             ),
             // The interrupt verb. The RPC journals the request; the worker
             // holding the agent is the only place it can be carried out.
-            (Some(Kind::TurnInterrupted(interrupted)), Some(agent_id)) => {
+            //
+            // Only a *Server-written* interrupt is a request. The worker
+            // acknowledges carrying one out by journaling a `TurnInterrupted`
+            // of its own, and folding that acknowledgement into another
+            // command made each interrupt an unbounded loop — request, ack,
+            // request — that grew the log by thousands of rows a second
+            // (ADR-0009). Origin is the discriminator because it is the one
+            // fact about the row no journal can forge: the Server stamps it.
+            (Some(Kind::TurnInterrupted(interrupted)), Some(agent_id)) if is_request(global) => {
                 let Some(worker_id) = self.placed.get(&agent_id).cloned() else {
                     // An unplaced agent has no turn in flight to abort.
                     return Vec::new();
@@ -471,7 +479,9 @@ impl CommandProjection {
 /// than a panic: the RPC already refused unknown names, so hitting one
 /// means an older log, and the worker's default provider is the honest
 /// fallback.
-fn binding_for(spec: Option<&horde_proto::v1::AgentSpec>) -> Option<horde_proto::v1::ModelBinding> {
+pub(crate) fn binding_for(
+    spec: Option<&horde_proto::v1::AgentSpec>,
+) -> Option<horde_proto::v1::ModelBinding> {
     use horde_proto::v1::model_selection::Selection;
     match spec?.model.as_ref()?.selection.as_ref()? {
         Selection::Concrete(concrete) => Some(horde_proto::v1::ModelBinding {
@@ -491,6 +501,13 @@ fn binding_for(spec: Option<&horde_proto::v1::AgentSpec>) -> Option<horde_proto:
             })
         }
     }
+}
+
+/// Whether a row is a request the Server made, as opposed to a fact a Worker
+/// reported. Events the Server appends carry no origin worker; everything a
+/// journal delivered carries the journal's worker.
+fn is_request(global: &GlobalEvent) -> bool {
+    global.origin_worker_id.is_empty()
 }
 
 /// The main command an event causes. Its id is the bare log position.
@@ -694,7 +711,7 @@ pub async fn issued_to(log: &EventLog, worker_id: &str) -> Result<u64, ServerErr
 #[cfg(test)]
 mod tests {
     use horde_proto::v1::{
-        AgentSpawned, AgentSpec, DeliveryMode, PlacementChanged, TurnInterrupted, WorkerId,
+        AgentSpec, DeliveryMode, PlacementChanged, TurnInterrupted, WorkerId,
         stream_commands_response::Command,
     };
 
@@ -711,22 +728,11 @@ mod tests {
                 recorded_at_unix_ms: 0,
                 payload: event.encode_to_vec(),
             },
+            origin_worker_id: String::new(),
         }
     }
 
-    fn spawn_event(agent: &str, parent: Option<&str>) -> Event {
-        Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: String::new(),
-            kind: Some(Kind::AgentSpawned(AgentSpawned {
-                parent_agent_id: parent.map(AgentId::new),
-                spawned_by: None,
-                spec: Some(AgentSpec::default()),
-                tree_path: Vec::new(),
-            })),
-        }
-    }
+    use crate::state::fixture::spawned as spawn_event;
 
     /// The binding truth table (W7b finding 5): a concrete request binds as
     /// itself, a tier binds its catalog's first candidate deterministically,
@@ -780,6 +786,7 @@ mod tests {
             occurred_at: None,
             idempotency_key: String::new(),
             kind: Some(Kind::PlacementChanged(PlacementChanged {
+                adapter_capabilities: Vec::new(),
                 placement: Some(Placement {
                     agent_id: Some(AgentId::new(agent)),
                     state: state as i32,
@@ -1490,6 +1497,27 @@ mod tests {
         }
     }
 
+    /// The storm's regression pin (ADR-0009): the worker acknowledges an
+    /// interrupt by journaling a `TurnInterrupted` of its own, and that row
+    /// must command nothing. Before the origin check, the ack folded into
+    /// another `InterruptAgentCommand`, whose ack folded into another, and
+    /// one `horde interrupt` grew the log by thousands of rows a second.
+    #[test]
+    fn a_worker_acknowledged_interrupt_commands_nothing() {
+        let mut rows = placed_agent(1, "s1", "agent-1", "worker-a");
+        let mut ack = row(3, "s1", 3, interrupt_event("agent-1", "escape"));
+        ack.origin_worker_id = "worker-a".to_owned();
+        rows.push(ack);
+
+        let issued = fold(&rows);
+        assert!(
+            !issued
+                .iter()
+                .any(|(_, response)| matches!(response.command, Some(Command::InterruptAgent(_)))),
+            "an acknowledgement is not a request: {issued:?}"
+        );
+    }
+
     /// An unplaced agent has no turn in flight to abort.
     #[test]
     fn an_interrupt_for_an_unplaced_agent_issues_no_command() {
@@ -1553,6 +1581,7 @@ mod tests {
                 recorded_at_unix_ms: 0,
                 payload: vec![0xff, 0xff, 0xff],
             },
+            origin_worker_id: String::new(),
         };
 
         assert!(projection.advance(&garbage).is_empty());

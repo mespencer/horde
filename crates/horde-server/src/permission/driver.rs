@@ -44,7 +44,7 @@ use horde_proto::v1::{
 use prost::Message;
 use tokio::sync::broadcast;
 
-use super::chain::{ChainRuling, Consultation, JudgeRuling, PolicyJudge, evaluate};
+use super::chain::{ChainRuling, Consultation, JudgeRuling, PolicyJudge, Requester, evaluate};
 use super::modes::PermissionModes;
 use crate::error::ServerError;
 use crate::log::{EventLog, GlobalEvent, Notification};
@@ -251,7 +251,14 @@ impl ChainDriver {
                 from: PermissionLayer::DeterministicAllow,
             }
         } else {
-            self.ruling_for(mode_name, pending.tool_call.as_ref(), &ancestry, state)
+            let requester = Requester {
+                ancestry: &ancestry,
+                rewrites_tool_input: agent.is_some_and(|agent| agent.rewrites_tool_input),
+                own_orchestrator_verb: pending.tool_call.as_ref().is_some_and(|call| {
+                    super::orchestrator::own_orchestrator_verb(call, &pending.agent_id, state)
+                }),
+            };
+            self.ruling_for(mode_name, pending.tool_call.as_ref(), &requester, state)
                 .await
         };
 
@@ -286,7 +293,7 @@ impl ChainDriver {
         &self,
         mode_name: &str,
         call: Option<&ProposedToolCall>,
-        ancestry: &[String],
+        requester: &Requester<'_>,
         state: &SessionState,
     ) -> Settled {
         let Some(mode) = self.modes.resolve(mode_name) else {
@@ -305,7 +312,7 @@ impl ChainDriver {
             };
         };
 
-        match evaluate(mode, call, ancestry, &state.remembered_allows) {
+        match evaluate(mode, call, requester, &state.remembered_allows) {
             ChainRuling::Deny { reason } => Settled::Decided {
                 outcome: PermissionOutcome::Deny,
                 decided_by: PermissionLayer::DeterministicDeny,
@@ -319,7 +326,7 @@ impl ChainDriver {
                 updated_input,
             },
             ChainRuling::Consult { instructions } => {
-                self.consult(&instructions, call, ancestry).await
+                self.consult(&instructions, call, requester.ancestry).await
             }
             ChainRuling::Escalate { from } => Settled::Escalate { from },
         }
@@ -1258,19 +1265,7 @@ mod tests {
         assert!(already_escalated(&enriched));
     }
 
-    fn projected(events: &[Event]) -> SessionState {
-        let stored: Vec<crate::log::StoredEvent> = events
-            .iter()
-            .enumerate()
-            .map(|(index, event)| crate::log::StoredEvent {
-                session_id: "s1".to_owned(),
-                sequence: index as u64 + 1,
-                recorded_at_unix_ms: 0,
-                payload: event.encode_to_vec(),
-            })
-            .collect();
-        SessionState::project("s1", &stored).expect("project")
-    }
+    use crate::state::fixture::projected;
 
     #[test]
     fn ancestry_prefers_the_recorded_tree_path() {
@@ -1633,6 +1628,7 @@ mod tests {
             spec: None,
             placement_state: horde_proto::v1::PlacementState::Unspecified,
             queued_at_unix_ms: None,
+            rewrites_tool_input: false,
         };
         assert_eq!(display_name(&typed), "reviewer");
 

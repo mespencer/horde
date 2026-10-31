@@ -33,6 +33,16 @@ pub struct GlobalEvent {
     /// Append order. See [`read_global_from`] for why this is `rowid`.
     pub row: u64,
     pub event: StoredEvent,
+    /// The worker whose journal this row came from; empty for an event the
+    /// Server appended itself.
+    ///
+    /// Folds over the whole log need it because one event kind can mean two
+    /// different things depending on who wrote it: a `TurnInterrupted` the
+    /// Server journaled is a *request* to interrupt, and one a Worker
+    /// journaled is that Worker *acknowledging* it carried one out. A fold
+    /// that cannot tell them apart answers every acknowledgement with another
+    /// request (ADR-0009).
+    pub origin_worker_id: String,
 }
 
 /// What to append, before the server has assigned it a position.
@@ -305,7 +315,7 @@ pub fn read_global_from(
 ) -> Result<Vec<GlobalEvent>, ServerError> {
     let mut statement = connection
         .prepare_cached(
-            "SELECT rowid, session_id, sequence, recorded_at_unix_ms, payload
+            "SELECT rowid, session_id, sequence, recorded_at_unix_ms, payload, origin_worker_id
              FROM events
              WHERE rowid > ?1
              ORDER BY rowid ASC
@@ -323,6 +333,7 @@ pub fn read_global_from(
                     recorded_at_unix_ms: row.get(3)?,
                     payload: row.get(4)?,
                 },
+                origin_worker_id: row.get(5)?,
             })
         })
         .map_err(ServerError::storage("replaying the log"))?;

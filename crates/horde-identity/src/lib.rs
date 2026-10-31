@@ -42,7 +42,7 @@ pub use ca::{CertificateAuthority, IssuedCertificate, ServerCredential};
 pub use enroll::{EnrolledIdentity, JoinError, join};
 pub use error::IdentityError;
 pub use fingerprint::{JoinCode, certificate_fingerprint, fingerprint_of_pem};
-pub use interceptor::require_enrolled;
+pub use interceptor::{admit_request, require_enrolled};
 pub use principal::{PeerIdentity, Principal, PrincipalRole, principal_of_pem};
 pub use revocation::RevocationList;
 pub use store::StoredIdentity;

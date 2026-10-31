@@ -270,6 +270,41 @@ pub async fn journal_event(endpoint: &str, session_id: &str, event: Event) -> Se
     journal_event_at(endpoint, session_id, 1, event).await
 }
 
+/// Registers a worker whose one harness rewrites tool input, so an agent the
+/// scheduler places after it can take a human's narrowing — the server
+/// refuses a narrowing for an adapter that cannot apply one (ADR-0009).
+///
+/// # Errors
+///
+/// The dial or the registration failing.
+pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup<()> {
+    use horde_proto::v1::{
+        AdapterCapability, HarnessCapability, Hello, RegisterWorkerRequest, WorkerCapabilities,
+    };
+    let mut worker =
+        WorkerServiceClient::connect(tonic::transport::Endpoint::try_from(endpoint.to_owned())?)
+            .await?;
+    worker
+        .register_worker(RegisterWorkerRequest {
+            hello: Some(Hello {
+                semver: horde_server::service::SERVER_SEMVER.to_owned(),
+                ..Hello::default()
+            }),
+            worker_id: Some(WorkerId::new(worker_id)),
+            capabilities: Some(WorkerCapabilities {
+                // The worker's only harness is its default, so a spawn
+                // naming no provider runs on it.
+                harnesses: vec![HarnessCapability {
+                    capabilities: vec![AdapterCapability::ToolInputRewrite as i32],
+                    ..HarnessCapability::default()
+                }],
+                ..WorkerCapabilities::default()
+            }),
+        })
+        .await?;
+    Ok(())
+}
+
 /// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane
 /// writes when the scheduler answers a spawn: placed on `worker` when one is
 /// given, queued when `None`. The placed pair is what the server's command
@@ -324,6 +359,7 @@ pub async fn seed_agent(
         occurred_at: None,
         idempotency_key: format!("{agent}:placed"),
         kind: Some(Kind::PlacementChanged(PlacementChanged {
+            adapter_capabilities: Vec::new(),
             placement: Some(Placement {
                 agent_id: Some(AgentId::new(agent)),
                 state: state.into(),

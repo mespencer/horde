@@ -243,7 +243,7 @@ async fn admitted_caller(
         .ok_or_else(|| ServerError::NoSuchAgent {
             agent_id: agent_id.to_owned(),
         })?;
-    if !holds_agent(agent.worker_id.as_deref(), worker_id) {
+    if !crate::trust::holds_agent(agent.worker_id.as_deref(), worker_id) {
         return Err(ServerError::AgentNotOnWorker {
             agent_id: agent_id.to_owned(),
             worker_id: worker_id.to_owned(),
@@ -252,15 +252,6 @@ async fn admitted_caller(
     Ok(ForwardedCaller {
         agent_type: agent.agent_type.clone(),
     })
-}
-
-/// Whether the worker forwarding a call is the one the log placed the agent
-/// on. A named predicate because it is the whole attribution check: an
-/// unplaced agent (`None`) matches no worker — fail closed — and an empty
-/// worker id (a plaintext caller that named nobody) matches nothing either,
-/// because placement never records an empty worker.
-fn holds_agent(placed_on: Option<&str>, worker_id: &str) -> bool {
-    !worker_id.is_empty() && placed_on == Some(worker_id)
 }
 
 /// The catalog config a namespaced tool routes to for this agent type.
@@ -369,26 +360,9 @@ mod tests {
 
     use horde_mcp::hub::link;
 
-    use super::{holds_agent, routed_config};
+    use super::routed_config;
     use crate::error::ServerError;
     use crate::mcp::McpServerCatalog;
-
-    /// The attribution predicate's whole truth table: only the placed worker
-    /// passes, and the two empty-ish shapes fail closed.
-    #[test]
-    fn only_the_worker_holding_the_agent_passes_the_gate() {
-        assert!(holds_agent(Some("w1"), "w1"));
-        assert!(!holds_agent(Some("w1"), "w2"));
-        assert!(!holds_agent(None, "w1"), "an unplaced agent has no worker");
-        assert!(
-            !holds_agent(None, ""),
-            "an anonymous caller must not match an unplaced agent"
-        );
-        assert!(
-            !holds_agent(Some(""), ""),
-            "empty never matches empty; placement never records an empty worker"
-        );
-    }
 
     fn catalog_with(configs: Vec<McpServerConfig>) -> McpServerCatalog {
         let mut catalog = McpServerCatalog::default();

@@ -183,6 +183,17 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// What a connected worker last advertised; `None` once it is gone.
+    #[must_use]
+    pub fn capabilities_of(&self, worker_id: &str) -> Option<WorkerCapabilities> {
+        self.workers.lock().ok().and_then(|registrations| {
+            registrations
+                .connected
+                .get(worker_id)
+                .map(|worker| worker.capabilities.clone())
+        })
+    }
+
     #[must_use]
     pub fn contains(&self, worker_id: &str) -> bool {
         self.workers

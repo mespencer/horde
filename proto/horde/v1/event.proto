@@ -25,6 +25,7 @@ import "horde/v1/login.proto";
 import "horde/v1/mcp.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/usage.proto";
+import "horde/v1/worker.proto";
 import "horde/v1/workspace.proto";
 
 // ---------------------------------------------------------------------------
@@ -136,6 +137,15 @@ message SessionLifecycleChanged {
 // outcome: spawn never blocks the caller.
 message PlacementChanged {
   Placement placement = 1;
+
+  // What the placed Agent's adapter can do on the Worker it was placed on, as
+  // that Worker advertised it at placement time (ADR-0009). Set only for a
+  // PLACED outcome. Stamped here so a capability the permission chain must
+  // honor — TOOL_INPUT_REWRITE, without which a narrowing decision cannot be
+  // applied — is a fact of the log rather than a lookup in a live registry
+  // that a disconnect or restart forgets. Absent reads as "none": an Agent
+  // placed before this field existed is treated as unable to rewrite.
+  repeated AdapterCapability adapter_capabilities = 2;
 }
 
 // The catalog of Workspace Definitions changed: one was created, updated,
@@ -269,7 +279,35 @@ message Event {
     // never a fold over these.
     WorkerLoginStarted worker_login_started = 31;
     WorkerLoginEnded worker_login_ended = 32;
+
+    // A Worker journaled an event the Server refused to append (ADR-0009).
+    // Lives in the reserved dead-letter stream.
+    JournalEventRefused journal_event_refused = 33;
   }
+}
+
+// A journaled event the Server refused: a kind only the Server writes, a
+// reserved stream, an Agent not placed on the journaling Worker, or a
+// malformed entry. Appended in the refused event's place — under the Worker's
+// origin and the refused event's journal_sequence — so the refusal is
+// auditable, the Worker's journal watermark advances past it, and a replay of
+// the same event deduplicates onto this record. Without it, a refused event
+// stopped the journal and the Worker re-offered it on every reconnect,
+// forever.
+message JournalEventRefused {
+  WorkerId worker_id = 1;
+
+  uint64 journal_sequence = 2;
+
+  // The stream the refused event targeted; unset when it named none.
+  SessionId session_id = 3;
+
+  // The refused event's kind, as its Event.kind field name; empty when the
+  // entry carried no event.
+  string kind = 4;
+
+  // Why, in words an operator can act on.
+  string reason = 5;
 }
 
 // An Event as it sits in a Session's log.

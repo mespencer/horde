@@ -32,6 +32,10 @@ pub struct PermissionMode {
     /// never anything that talks to the network". `None` skips the judge
     /// stage entirely and unsettled calls go straight to a human.
     pub judge_instructions: Option<String>,
+    /// Whether an agent's own orchestrator verbs — its spawns, its result,
+    /// its messages and waits within its own subtree — are allowed without a
+    /// human (ADR-0009). Evaluated after deny, before the allow rules.
+    pub own_orchestrator_verbs: bool,
 }
 
 impl PermissionMode {
@@ -42,7 +46,16 @@ impl PermissionMode {
             deny: Vec::new(),
             allow: Vec::new(),
             judge_instructions: None,
+            own_orchestrator_verbs: false,
         }
+    }
+
+    /// Lets an agent drive its own subtree through the orchestrator verbs
+    /// without a human in the loop.
+    #[must_use]
+    pub fn allowing_own_orchestrator_verbs(mut self) -> Self {
+        self.own_orchestrator_verbs = true;
+        self
     }
 
     /// Adds a deny rule with the reason the refused agent will read.
@@ -87,6 +100,16 @@ impl Default for PermissionModes {
 }
 
 impl PermissionModes {
+    /// What a production server starts with (ADR-0009): an agent's own
+    /// orchestrator verbs are allowed, and everything else escalates to a
+    /// human. [`Default`] stays escalate-everything — the do-no-harm
+    /// configuration the chain's own tests start from.
+    #[must_use]
+    pub fn shipped() -> Self {
+        Self::default()
+            .with_default(PermissionMode::escalate_everything().allowing_own_orchestrator_verbs())
+    }
+
     /// Registers a mode under its name.
     #[must_use]
     pub fn with_mode(mut self, name: impl Into<String>, mode: PermissionMode) -> Self {
@@ -146,6 +169,22 @@ mod tests {
     fn an_unknown_name_is_not_guessed_at() {
         let modes = PermissionModes::default();
         assert_eq!(modes.resolve("typo-mode"), None);
+    }
+
+    #[test]
+    fn the_shipped_default_allows_own_orchestrator_verbs_and_nothing_else() {
+        let shipped = PermissionModes::shipped();
+        let unnamed = shipped.resolve("").expect("the unnamed mode resolves");
+        assert!(unnamed.own_orchestrator_verbs);
+        assert!(unnamed.allow.is_empty() && unnamed.deny.is_empty());
+        assert_eq!(unnamed.judge_instructions, None);
+        assert!(
+            !PermissionModes::default()
+                .resolve("")
+                .expect("resolves")
+                .own_orchestrator_verbs,
+            "Default stays escalate-everything"
+        );
     }
 
     #[test]

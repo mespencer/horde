@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{Setup, harness, identity_for, within};
+use common::{Setup, harness, identity_for, rewriting_harness, within};
 use common::{decode_tool_response as decode, prompt_request as prompt};
 use horde_adapter::permission::PermissionDecision;
 use horde_cli::client::{Client, PermissionAnswer, SyncOptions};
@@ -66,7 +66,7 @@ async fn round_trip(
     reason: &'static str,
     narrowing: Option<serde_json::Value>,
 ) -> Setup<serde_json::Value> {
-    let harness = harness().await?;
+    let harness = rewriting_harness().await?;
     let identity = identity_for(&harness.agent_id)?;
     let broker = PermissionBroker::new(harness.context().await?);
     let prompt = prompt("Write", input, tool_use_id)?;

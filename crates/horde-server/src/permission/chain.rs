@@ -37,6 +37,22 @@ pub enum ChainRuling {
     Escalate { from: PermissionLayer },
 }
 
+/// The facts about the requesting agent the deterministic layers consult,
+/// gathered by the caller from the session projection so [`evaluate`] stays
+/// a pure function of its arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requester<'a> {
+    /// Ancestry display names, root first — what rules scope by.
+    pub ancestry: &'a [String],
+    /// Whether the agent's adapter can apply a narrowing's replacement
+    /// arguments (ADR-0009). A remembered narrowing replayed to an agent that
+    /// cannot apply it escalates instead.
+    pub rewrites_tool_input: bool,
+    /// Whether the call is one of the agent's own orchestrator verbs, scoped
+    /// to its own subtree ([`super::orchestrator::own_orchestrator_verb`]).
+    pub own_orchestrator_verb: bool,
+}
+
 /// Runs the deterministic layers of the chain over one call.
 ///
 /// The judge is not called here — a pure function cannot ask a model
@@ -46,9 +62,10 @@ pub enum ChainRuling {
 pub fn evaluate(
     mode: &PermissionMode,
     call: &ProposedToolCall,
-    ancestry: &[String],
+    requester: &Requester<'_>,
     remembered: &BTreeMap<RememberedCall, Option<Struct>>,
 ) -> ChainRuling {
+    let ancestry = requester.ancestry;
     if let Some(denied) = mode
         .deny
         .iter()
@@ -60,8 +77,21 @@ pub fn evaluate(
     }
 
     if let Some(narrowing) = remembered.get(&RememberedCall::of(call)) {
+        // A clamp the agent's adapter cannot apply would be either dropped —
+        // the unclamped call runs — or refused by the worker mid-turn. A human
+        // decides instead (ADR-0009).
+        if narrowing.is_some() && !requester.rewrites_tool_input {
+            return ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicAllow,
+            };
+        }
         return ChainRuling::Allow {
             updated_input: narrowing.clone(),
+        };
+    }
+    if mode.own_orchestrator_verbs && requester.own_orchestrator_verb {
+        return ChainRuling::Allow {
+            updated_input: None,
         };
     }
     if mode.allow.iter().any(|rule| rule.matches(call, ancestry)) {
@@ -129,7 +159,7 @@ mod tests {
     use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
     use horde_proto::v1::{PermissionLayer, ProposedToolCall};
 
-    use super::{ChainRuling, evaluate};
+    use super::{ChainRuling, Requester, evaluate};
     use crate::permission::modes::PermissionMode;
     use crate::permission::rules::Rule;
     use crate::state::RememberedCall;
@@ -149,6 +179,16 @@ mod tests {
         }
     }
 
+    /// A requester at `ancestry` whose adapter rewrites and whose call is no
+    /// orchestrator verb — the shape every rule-order test wants.
+    fn at(ancestry: &[String]) -> Requester<'_> {
+        Requester {
+            ancestry,
+            rewrites_tool_input: true,
+            own_orchestrator_verb: false,
+        }
+    }
+
     fn remembered(
         entries: &[(&ProposedToolCall, Option<Struct>)],
     ) -> BTreeMap<RememberedCall, Option<Struct>> {
@@ -163,7 +203,7 @@ mod tests {
         let ruling = evaluate(
             &PermissionMode::escalate_everything(),
             &call("Bash", "/x"),
-            &[],
+            &at(&[]),
             &BTreeMap::new(),
         );
         assert_eq!(
@@ -185,7 +225,7 @@ mod tests {
             .judged_by("anything goes");
 
         assert_eq!(
-            evaluate(&mode, &call("Bash", "/x"), &[], &BTreeMap::new()),
+            evaluate(&mode, &call("Bash", "/x"), &at(&[]), &BTreeMap::new()),
             ChainRuling::Deny {
                 reason: "no shell here".to_owned()
             }
@@ -198,7 +238,7 @@ mod tests {
         let mode = PermissionMode::escalate_everything().deny(Rule::tool("Bash"), "never Y");
 
         assert_eq!(
-            evaluate(&mode, &bash, &[], &remembered(&[(&bash, None)])),
+            evaluate(&mode, &bash, &at(&[]), &remembered(&[(&bash, None)])),
             ChainRuling::Deny {
                 reason: "never Y".to_owned()
             },
@@ -213,7 +253,7 @@ mod tests {
             .judged_by("would have been asked");
 
         assert_eq!(
-            evaluate(&mode, &call("Read", "/x"), &[], &BTreeMap::new()),
+            evaluate(&mode, &call("Read", "/x"), &at(&[]), &BTreeMap::new()),
             ChainRuling::Allow {
                 updated_input: None
             }
@@ -229,7 +269,7 @@ mod tests {
             evaluate(
                 &PermissionMode::escalate_everything(),
                 &proposal,
-                &[],
+                &at(&[]),
                 &remembered(&[(&proposal, clamp.clone())]),
             ),
             ChainRuling::Allow {
@@ -244,7 +284,7 @@ mod tests {
         let mode = PermissionMode::escalate_everything().judged_by("allow read-only git");
 
         assert_eq!(
-            evaluate(&mode, &call("Bash", "/x"), &[], &BTreeMap::new()),
+            evaluate(&mode, &call("Bash", "/x"), &at(&[]), &BTreeMap::new()),
             ChainRuling::Consult {
                 instructions: "allow read-only git".to_owned()
             }
@@ -267,7 +307,7 @@ mod tests {
             evaluate(
                 &mode,
                 &bash,
-                &["ci-fix".to_owned(), "test-runner".to_owned()],
+                &at(&["ci-fix".to_owned(), "test-runner".to_owned()]),
                 &BTreeMap::new()
             ),
             ChainRuling::Deny {
@@ -278,7 +318,7 @@ mod tests {
             evaluate(
                 &mode,
                 &bash,
-                &["ci-fix".to_owned(), "reviewer".to_owned()],
+                &at(&["ci-fix".to_owned(), "reviewer".to_owned()]),
                 &BTreeMap::new()
             ),
             ChainRuling::Allow {
@@ -289,13 +329,101 @@ mod tests {
             evaluate(
                 &mode,
                 &bash,
-                &["ci-fix".to_owned(), "doc-writer".to_owned()],
+                &at(&["ci-fix".to_owned(), "doc-writer".to_owned()]),
                 &BTreeMap::new()
             ),
             ChainRuling::Escalate {
                 from: PermissionLayer::DeterministicAllow
             },
             "an agent neither scope covers falls through to a human"
+        );
+    }
+
+    /// A remembered clamp replays only to an agent that can apply it; for one
+    /// that cannot, the chain escalates rather than allowing the unclamped
+    /// call or shipping a clamp the worker must refuse (ADR-0009). A plain
+    /// remembered allow carries no clamp and replays to anyone.
+    #[test]
+    fn a_remembered_clamp_escalates_for_an_agent_that_cannot_rewrite() {
+        let proposal = call("Write", "/etc/hosts");
+        let clamp = call("Write", "/tmp/safe").input;
+        let cannot = Requester {
+            rewrites_tool_input: false,
+            ..at(&[])
+        };
+
+        assert_eq!(
+            evaluate(
+                &PermissionMode::escalate_everything(),
+                &proposal,
+                &cannot,
+                &remembered(&[(&proposal, clamp)]),
+            ),
+            ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicAllow
+            }
+        );
+        assert_eq!(
+            evaluate(
+                &PermissionMode::escalate_everything(),
+                &proposal,
+                &cannot,
+                &remembered(&[(&proposal, None)]),
+            ),
+            ChainRuling::Allow {
+                updated_input: None
+            },
+            "an unclamped remembered allow needs no rewriting"
+        );
+    }
+
+    /// The orchestrator-verb allowance: only a mode that grants it, only for
+    /// a call the requester owns, and never past a deny.
+    #[test]
+    fn own_orchestrator_verbs_are_allowed_only_where_the_mode_grants_them() {
+        let verb = call("horde/report_result", "/x");
+        let own = Requester {
+            own_orchestrator_verb: true,
+            ..at(&[])
+        };
+        let granting = PermissionMode::escalate_everything().allowing_own_orchestrator_verbs();
+
+        assert_eq!(
+            evaluate(&granting, &verb, &own, &BTreeMap::new()),
+            ChainRuling::Allow {
+                updated_input: None
+            }
+        );
+        assert_eq!(
+            evaluate(&granting, &verb, &at(&[]), &BTreeMap::new()),
+            ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicAllow
+            },
+            "a verb the requester does not own is not covered"
+        );
+        assert_eq!(
+            evaluate(
+                &PermissionMode::escalate_everything(),
+                &verb,
+                &own,
+                &BTreeMap::new()
+            ),
+            ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicAllow
+            },
+            "a mode that does not grant it escalates"
+        );
+        assert_eq!(
+            evaluate(
+                &granting.deny(Rule::tool("horde/report_result"), "not here"),
+                &verb,
+                &own,
+                &BTreeMap::new()
+            ),
+            ChainRuling::Deny {
+                reason: "not here".to_owned()
+            },
+            "deny still runs first"
         );
     }
 
@@ -306,7 +434,7 @@ mod tests {
             .deny(Rule::any_tool(), "general");
 
         assert_eq!(
-            evaluate(&mode, &call("Bash", "/x"), &[], &BTreeMap::new()),
+            evaluate(&mode, &call("Bash", "/x"), &at(&[]), &BTreeMap::new()),
             ChainRuling::Deny {
                 reason: "specific".to_owned()
             },

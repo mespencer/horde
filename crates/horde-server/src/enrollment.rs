@@ -43,6 +43,7 @@ pub fn is_reserved_stream(session_id: &str) -> bool {
         || is_enrollment_stream(session_id)
         || crate::mcp::is_mcp_catalog_stream(session_id)
         || crate::login::is_login_stream(session_id)
+        || crate::service::ingest::is_dead_letter_stream(session_id)
 }
 
 /// The wire form of a principal role.

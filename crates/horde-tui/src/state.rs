@@ -664,6 +664,7 @@ mod tests {
             ),
             (
                 Kind::PlacementChanged(PlacementChanged {
+                    adapter_capabilities: Vec::new(),
                     placement: Some(Placement {
                         agent_id: None,
                         state: PlacementState::Queued as i32,

@@ -23,3 +23,4 @@ mod mcp_catalog;
 mod placement;
 mod services;
 mod sync_equivalence;
+mod trust;

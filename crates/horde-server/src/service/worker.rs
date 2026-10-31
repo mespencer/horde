@@ -5,9 +5,9 @@
 //! purpose: a burst of agent output must not head-of-line block a placement
 //! command, and each direction reconnects independently.
 //!
-//! The only interesting logic here is journal ingestion, which is where the two
-//! sequence spaces meet — per-worker journal positions coming in, per-session
-//! log positions going out.
+//! The interesting logic — journal ingestion, where the two sequence spaces
+//! meet and where a worker's events are judged before they land — lives in
+//! [`super::ingest`]. Who a request speaks for is `crate::trust`'s answer.
 
 use std::pin::Pin;
 
@@ -19,7 +19,6 @@ use horde_proto::v1::{
     StreamCommandsRequest, StreamCommandsResponse, WorkerId, push_events_request,
     push_events_response, worker_service_server::WorkerService,
 };
-use prost::Message;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::instrument;
@@ -27,7 +26,6 @@ use tracing::instrument;
 use super::commands::{self, CommandStream};
 use super::shared::{MIN_SUPPORTED_SEMVER, SERVER_SEMVER, ServerCore};
 use crate::error::ServerError;
-use crate::log::PendingEvent;
 use crate::placement;
 
 /// Implements `horde.v1.WorkerService`.
@@ -69,72 +67,6 @@ impl WorkerFacing {
     }
 }
 
-/// Ingests one journaled batch, translating journal positions into session
-/// positions.
-///
-/// Returns the highest journal sequence durably stored, which is what the
-/// worker needs in order to truncate.
-///
-/// Factored out of the stream handler because it is the part worth testing: a
-/// pure-ish function over a batch, rather than something reachable only by
-/// standing up a gRPC connection.
-async fn ingest_batch(
-    core: &ServerCore,
-    worker_id: &str,
-    events: Vec<horde_proto::v1::JournaledEvent>,
-) -> Result<u64, ServerError> {
-    let mut highest = 0_u64;
-
-    for journaled in events {
-        let session_id = journaled
-            .session_id
-            .as_ref()
-            .map(ToString::to_string)
-            .ok_or_else(|| {
-                ServerError::Invalid("a journaled event must name its session".to_owned())
-            })?;
-        let event = journaled.event.ok_or_else(|| {
-            ServerError::Invalid("a journaled event must carry an event".to_owned())
-        })?;
-        // The other append chokepoint: the worker journal must not carry
-        // bulk into the log any more than a client verb may.
-        crate::service::shared::refuse_inline_bulk(&event)?;
-
-        let appended = core
-            .log
-            .append(PendingEvent {
-                session_id: session_id.clone(),
-                origin_worker_id: worker_id.to_owned(),
-                journal_sequence: Some(journaled.journal_sequence),
-                idempotency_key: event.idempotency_key.clone(),
-                payload: event.encode_to_vec(),
-            })
-            .await?;
-
-        // A journal replay is at-least-once and deduplicates silently, as it
-        // should. Two *different* events under one key is a different thing
-        // entirely, and would otherwise vanish here.
-        crate::service::shared::refuse_kind_collision(
-            &appended,
-            &session_id,
-            &event.idempotency_key,
-            &event,
-        )?;
-
-        // A journaled instance report is also the freshest fact about that
-        // worker's disk, so the cache placement reads hears it too.
-        if let Some(horde_proto::v1::event::Kind::WorkspaceInstanceChanged(changed)) = &event.kind
-            && let Some(report) = &changed.report
-        {
-            core.instances.record(report);
-        }
-
-        highest = highest.max(journaled.journal_sequence);
-    }
-
-    Ok(highest)
-}
-
 #[tonic::async_trait]
 impl WorkerService for WorkerFacing {
     #[instrument(skip_all)]
@@ -142,29 +74,26 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
+        // The certificate names the worker (ADR-0009); the body's claim
+        // stands only where no certificate exists — the plaintext test shape.
+        let worker_id =
+            crate::trust::caller_worker_id(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
         // The version gate (DESIGN §2, fix a6): a worker below the minimum —
         // or one saying nothing — is refused at registration, with the code
         // the daemon's fate table treats as fatal.
         super::shared::version_gate(request.hello.as_ref())?;
-        let worker_id = request
-            .worker_id
-            .as_ref()
-            .map(ToString::to_string)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                Status::from(ServerError::Invalid(
-                    "a worker must supply its id until certificates carry it".to_owned(),
-                ))
-            })?;
+        if worker_id.is_empty() {
+            return Err(Status::from(ServerError::Invalid(
+                "a worker must supply its id when no certificate carries it".to_owned(),
+            )));
+        }
+        let capabilities = request.capabilities.unwrap_or_default();
+        refuse_foreign_reports(&worker_id, &capabilities.warm_instances)?;
 
-        register_and_replace(
-            &self.core,
-            &worker_id,
-            request.capabilities.unwrap_or_default(),
-        )
-        .await
-        .map_err(Status::from)?;
+        register_and_replace(&self.core, &worker_id, capabilities)
+            .await
+            .map_err(Status::from)?;
 
         let (resume_from_journal_sequence, resume_from_command_sequence) =
             resume_positions(&self.core, &worker_id)
@@ -190,12 +119,9 @@ impl WorkerService for WorkerFacing {
         request: Request<StreamCommandsRequest>,
     ) -> Result<Response<Self::StreamCommandsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
+        let worker_id =
+            crate::trust::caller_worker_id(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let worker_id = request
-            .worker_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
 
         // The worker's own state decides what is replayed, not the server's
         // guess: it is the only side that knows what it durably applied. That
@@ -266,6 +192,12 @@ impl WorkerService for WorkerFacing {
         request: Request<Streaming<PushEventsRequest>>,
     ) -> Result<Response<Self::PushEventsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
+        // Read before the body is consumed: the certificate, not the Start
+        // message, says whose journal this stream carries (ADR-0009).
+        let identity = request
+            .extensions()
+            .get::<horde_identity::PeerIdentity>()
+            .cloned();
         let mut inbound = request.into_inner();
         let core = self.core.clone();
         let deny = self.deny.clone();
@@ -274,7 +206,17 @@ impl WorkerService for WorkerFacing {
 
         tokio::spawn(async move {
             let pump = async {
-                let mut worker_id = String::new();
+                // A certificate names the worker from the first message; the
+                // plaintext shape learns it from Start.
+                let mut worker_id = identity
+                    .as_ref()
+                    .map(|identity| identity.principal.name().to_owned())
+                    .unwrap_or_default();
+                let mut origins = if identity.is_some() {
+                    super::ingest::OriginView::new()
+                } else {
+                    super::ingest::OriginView::ambient()
+                };
 
                 while let Some(message) = inbound.next().await {
                     let message = match message {
@@ -285,34 +227,56 @@ impl WorkerService for WorkerFacing {
                         }
                     };
 
-                    let outcome = match message.body {
-                        Some(push_events_request::Body::Start(start)) => {
-                            worker_id = start
-                                .worker_id
-                                .as_ref()
-                                .map(ToString::to_string)
-                                .unwrap_or_default();
-                            handle_start(&core, &worker_id, start.last_local_journal_sequence).await
-                        }
-                        Some(push_events_request::Body::Batch(batch)) => {
-                            // `acked_command_sequence` is deliberately not
-                            // recorded server-side. The worker replays from
-                            // its own ack on the next StreamCommands, so a
-                            // server-held copy would be a second answer to a
-                            // question the worker already answers — and the
-                            // copy is the one a restart loses.
-                            ingest_batch(&core, &worker_id, batch.events).await.map(
-                                |acked_journal_sequence| PushEventsResponse {
+                    let outcome =
+                        match message.body {
+                            Some(push_events_request::Body::Start(start)) => {
+                                match crate::trust::worker_identity(
+                                    identity.as_ref(),
+                                    start
+                                        .worker_id
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_default(),
+                                ) {
+                                    Ok(claimed) => {
+                                        worker_id = claimed;
+                                        handle_start(
+                                            &core,
+                                            &worker_id,
+                                            start.last_local_journal_sequence,
+                                        )
+                                        .await
+                                    }
+                                    Err(status) => {
+                                        let _ = sender.send(Err(status)).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            Some(push_events_request::Body::Batch(batch)) => {
+                                // `acked_command_sequence` is deliberately not
+                                // recorded server-side. The worker replays from
+                                // its own ack on the next StreamCommands, so a
+                                // server-held copy would be a second answer to a
+                                // question the worker already answers — and the
+                                // copy is the one a restart loses.
+                                super::ingest::ingest_batch(
+                                    &core,
+                                    &mut origins,
+                                    &worker_id,
+                                    batch.events,
+                                )
+                                .await
+                                .map(|acked_journal_sequence| PushEventsResponse {
                                     body: Some(push_events_response::Body::Ack(JournalAck {
                                         acked_journal_sequence,
                                     })),
-                                },
-                            )
-                        }
-                        None => Err(ServerError::Invalid(
-                            "a PushEvents message must carry a body".to_owned(),
-                        )),
-                    };
+                                })
+                            }
+                            None => Err(ServerError::Invalid(
+                                "a PushEvents message must carry a body".to_owned(),
+                            )),
+                        };
 
                     let reply = match outcome {
                         Ok(reply) => Ok(reply),
@@ -346,12 +310,7 @@ impl WorkerService for WorkerFacing {
         request: Request<horde_proto::v1::StreamForwardsRequest>,
     ) -> Result<Response<Self::StreamForwardsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
-        let worker_id = forward_worker_id(&request);
-        if worker_id.is_empty() {
-            return Err(Status::from(ServerError::Invalid(
-                "a forward stream must name its worker".to_owned(),
-            )));
-        }
+        let worker_id = named_worker(&request, request.get_ref().worker_id.as_ref(), "forward")?;
 
         let (epoch, lane) = self.core.forwards.register_worker(&worker_id);
         // Subscribe before the first computation, so an intent appended
@@ -399,12 +358,7 @@ impl WorkerService for WorkerFacing {
         request: Request<horde_proto::v1::StreamLoginsRequest>,
     ) -> Result<Response<Self::StreamLoginsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
-        let worker_id = super::logins::login_worker_id(&request);
-        if worker_id.is_empty() {
-            return Err(Status::from(ServerError::Invalid(
-                "a login stream must name its worker".to_owned(),
-            )));
-        }
+        let worker_id = named_worker(&request, request.get_ref().worker_id.as_ref(), "login")?;
 
         let (epoch, lane) = self.core.logins.register_worker(&worker_id);
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
@@ -487,22 +441,16 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<ReportCapabilitiesRequest>,
     ) -> Result<Response<ReportCapabilitiesResponse>, Status> {
-        let request = request.into_inner();
-        let worker_id = request
-            .worker_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let worker_id =
+            crate::trust::caller_worker_id(&request, request.get_ref().worker_id.as_ref())?;
+        let capabilities = request.into_inner().capabilities.unwrap_or_default();
+        refuse_foreign_reports(&worker_id, &capabilities.warm_instances)?;
 
         // Wholesale replacement, per the proto: a partial update is how a
         // scheduler ends up matching on facts that stopped being true.
-        register_and_replace(
-            &self.core,
-            &worker_id,
-            request.capabilities.unwrap_or_default(),
-        )
-        .await
-        .map_err(Status::from)?;
+        register_and_replace(&self.core, &worker_id, capabilities)
+            .await
+            .map_err(Status::from)?;
         Ok(Response::new(ReportCapabilitiesResponse {}))
     }
 
@@ -511,12 +459,10 @@ impl WorkerService for WorkerFacing {
         &self,
         request: Request<ReportWorkspaceInstancesRequest>,
     ) -> Result<Response<ReportWorkspaceInstancesResponse>, Status> {
+        let worker_id =
+            crate::trust::caller_worker_id(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let worker_id = request
-            .worker_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        refuse_foreign_reports(&worker_id, &request.reports)?;
 
         // The worker-local state file is the truth; this call corrects the
         // server's cache. An authoritative report is the worker's complete
@@ -653,19 +599,16 @@ macro_rules! hub_forward_request {
 hub_forward_request!(ListHubToolsRequest, CallHubToolRequest);
 
 /// The attribution triple every hub-forwarding RPC opens with: the worker
-/// from the channel (the mTLS principal outranks the request's claim, the
-/// same rule as [`forward_worker_id`]), the session and agent from the
-/// request — refused when either is unnamed. An empty worker fails the
-/// placement gate downstream rather than being refused here, so the refusal
-/// names the agent it was about.
+/// from the certificate (`crate::trust::caller_worker_id` — a contradicting
+/// claim is refused), the session and agent from the request — refused when
+/// either is unnamed. An empty worker fails the placement gate downstream
+/// rather than being refused here, so the refusal names the agent it was
+/// about.
 fn hub_caller<T: HubForwardRequest>(
     request: &Request<T>,
 ) -> Result<(String, String, String), Status> {
     let (claimed, session_id, agent_id) = request.get_ref().ids();
-    let worker_id = match super::forwards::tunnel_principal_of(request) {
-        crate::forward::registry::TunnelPrincipal::Worker(name) => name,
-        _ => claimed.map(ToString::to_string).unwrap_or_default(),
-    };
+    let worker_id = crate::trust::caller_worker_id(request, claimed)?;
     let session_id = session_id
         .map(ToString::to_string)
         .filter(|id| !id.is_empty())
@@ -685,21 +628,52 @@ fn hub_caller<T: HubForwardRequest>(
     Ok((worker_id, session_id, agent_id))
 }
 
-/// The worker a forward stream serves: the mTLS principal when the channel
-/// names a worker (certificates are authoritative), else the id the request
-/// claims — the same plaintext-bootstrap trust `RegisterWorker` extends.
-fn forward_worker_id(request: &Request<horde_proto::v1::StreamForwardsRequest>) -> String {
-    if let crate::forward::registry::TunnelPrincipal::Worker(name) =
-        super::forwards::tunnel_principal_of(request)
-    {
-        return name;
+/// The worker a per-worker stream serves: the certificate's, or on a
+/// plaintext channel the claim — which must then name someone, because a
+/// stream registered under the empty id serves nobody.
+///
+/// # Errors
+///
+/// `PermissionDenied` from the identity rule; `InvalidArgument` for a
+/// nameless plaintext stream.
+fn named_worker<T>(
+    request: &Request<T>,
+    claimed: Option<&WorkerId>,
+    stream: &str,
+) -> Result<String, Status> {
+    let worker_id = crate::trust::caller_worker_id(request, claimed)?;
+    if worker_id.is_empty() {
+        return Err(Status::from(ServerError::Invalid(format!(
+            "a {stream} stream must name its worker"
+        ))));
     }
-    request
-        .get_ref()
-        .worker_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default()
+    Ok(worker_id)
+}
+
+/// Refuses instance reports that name a worker other than the caller.
+///
+/// The instance cache is keyed by the worker a report *names*, so a report
+/// the caller could address to another worker would rewrite that worker's
+/// warmth — and placement prefers warm workers. An unnamed report keys
+/// nothing and is let through.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming both workers.
+fn refuse_foreign_reports(
+    worker_id: &str,
+    reports: &[horde_proto::v1::WorkspaceInstanceReport],
+) -> Result<(), Status> {
+    match reports
+        .iter()
+        .filter_map(|report| report.worker_id.as_ref().map(ToString::to_string))
+        .find(|named| !named.is_empty() && named != worker_id)
+    {
+        Some(named) => Err(Status::permission_denied(format!(
+            "worker {worker_id:?} may not report instances for worker {named:?}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// How many queued notifications one recompute may absorb. A bound, not a
@@ -837,9 +811,23 @@ mod tests {
     };
 
     use super::super::shared::ServerCore;
-    use super::{handle_start, ingest_batch};
+    use super::handle_start;
     use crate::EventLog;
     use crate::error::ServerError;
+
+    /// Ingests through the production path as `worker-a`, with `agent-1`
+    /// placed on it in `s1` first so the entries are admissible.
+    async fn ingest(core: &ServerCore, events: Vec<JournaledEvent>) {
+        super::super::ingest::placed_for_test(core, "s1", "agent-1", "worker-a").await;
+        super::super::ingest::ingest_batch(
+            core,
+            &mut super::super::ingest::OriginView::new(),
+            "worker-a",
+            events,
+        )
+        .await
+        .expect("ingest");
+    }
 
     fn core() -> ServerCore {
         ServerCore::new(EventLog::in_memory().expect("in-memory log"))
@@ -919,64 +907,6 @@ mod tests {
         assert!(super::should_stop(true, true));
     }
 
-    #[tokio::test]
-    async fn ingestion_translates_journal_positions_into_session_positions() {
-        let core = core();
-        let acked = ingest_batch(
-            &core,
-            "worker-a",
-            vec![
-                journaled("s1", 1, "k1"),
-                journaled("s1", 2, "k2"),
-                journaled("s2", 3, "k3"),
-            ],
-        )
-        .await
-        .expect("ingest");
-
-        assert_eq!(acked, 3, "the ack is in the worker's sequence space");
-        assert_eq!(core.log.head("s1").await.expect("head"), 2);
-        assert_eq!(
-            core.log.head("s2").await.expect("head"),
-            1,
-            "each session numbers independently of the worker's journal"
-        );
-    }
-
-    #[tokio::test]
-    async fn re_ingesting_a_batch_after_a_reconnect_appends_nothing_new() {
-        let core = core();
-        let batch = vec![journaled("s1", 1, "k1"), journaled("s1", 2, "k2")];
-
-        ingest_batch(&core, "worker-a", batch.clone())
-            .await
-            .expect("ingest");
-        let acked = ingest_batch(&core, "worker-a", batch)
-            .await
-            .expect("re-ingest");
-
-        assert_eq!(acked, 2, "the ack still reflects what is durably stored");
-        assert_eq!(
-            core.log.head("s1").await.expect("head"),
-            2,
-            "a replayed journal must not grow the session log"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_journaled_event_without_a_session_is_rejected() {
-        let core = core();
-        let orphan = JournaledEvent {
-            journal_sequence: 1,
-            session_id: None,
-            event: Some(Event::default()),
-        };
-        let error = ingest_batch(&core, "worker-a", vec![orphan])
-            .await
-            .expect_err("must reject");
-        assert!(matches!(error, ServerError::Invalid(_)));
-    }
-
     /// Both resume positions come from the log, so a fresh worker starts both
     /// streams at one, and a worker with stored history resumes after it.
     #[tokio::test]
@@ -987,9 +917,7 @@ mod tests {
             .expect("positions");
         assert_eq!((journal, command), (1, 1), "a fresh worker starts at one");
 
-        ingest_batch(&core, "worker-a", vec![journaled("s1", 1, "k1")])
-            .await
-            .expect("ingest");
+        ingest(&core, vec![journaled("s1", 1, "k1")]).await;
         let (journal, _) = super::resume_positions(&core, "worker-a")
             .await
             .expect("positions");
@@ -1012,9 +940,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_resumes_after_what_the_server_already_stored() {
         let core = core();
-        ingest_batch(&core, "worker-a", vec![journaled("s1", 1, "k1")])
-            .await
-            .expect("ingest");
+        ingest(&core, vec![journaled("s1", 1, "k1")]).await;
 
         let response = handle_start(&core, "worker-a", 1).await.expect("start");
         match response.body.expect("a body") {
@@ -1025,38 +951,49 @@ mod tests {
         }
     }
 
-    /// The certificate outranks the request, and the request fills in for
-    /// plaintext bootstrap — with a client cert naming nothing, because a
-    /// client is not a worker.
+    /// A per-worker stream must end up naming someone: the certificate's
+    /// worker, or the plaintext claim — and a nameless plaintext stream is
+    /// refused rather than registered under the empty id.
     #[test]
-    fn the_forward_stream_takes_its_worker_from_cert_then_request() {
+    fn a_per_worker_stream_must_name_its_worker() {
         use horde_identity::PrincipalRole;
+        use horde_proto::v1::WorkerId;
 
-        let request = |identity: Option<PrincipalRole>, claimed: Option<&str>| {
-            as_peer(
-                horde_proto::v1::StreamForwardsRequest {
-                    worker_id: claimed.map(horde_proto::v1::WorkerId::new),
-                },
-                identity,
-            )
+        let claimed = WorkerId::new("w9");
+        let plain = tonic::Request::new(());
+        assert_eq!(
+            super::named_worker(&plain, Some(&claimed), "login").ok(),
+            Some("w9".to_owned())
+        );
+        let nameless = super::named_worker(&plain, None, "login")
+            .expect_err("a nameless plaintext stream serves nobody");
+        assert_eq!(nameless.code(), tonic::Code::InvalidArgument);
+        assert!(nameless.message().contains("login"), "{nameless}");
+
+        let certified = as_peer((), Some(PrincipalRole::Worker));
+        assert_eq!(
+            super::named_worker(&certified, None, "forward").ok(),
+            Some("gpu-box".to_owned())
+        );
+    }
+
+    /// Instance reports may name the caller or nobody; naming another
+    /// worker is refused, since the cache keys by the named worker.
+    #[test]
+    fn instance_reports_naming_another_worker_are_refused() {
+        use horde_proto::v1::{WorkerId, WorkspaceInstanceReport};
+
+        let report = |worker: Option<&str>| WorkspaceInstanceReport {
+            worker_id: worker.map(WorkerId::new),
+            ..WorkspaceInstanceReport::default()
         };
-
-        assert_eq!(
-            super::forward_worker_id(&request(Some(PrincipalRole::Worker), Some("claimed"))),
-            "gpu-box",
-            "the certificate is authoritative over the claim"
-        );
-        assert_eq!(
-            super::forward_worker_id(&request(None, Some("claimed"))),
-            "claimed",
-            "plaintext bootstrap trusts the request, as RegisterWorker does"
-        );
-        assert_eq!(
-            super::forward_worker_id(&request(Some(PrincipalRole::Client), Some("claimed"))),
-            "claimed",
-            "a client certificate names no worker; the claim fills in"
-        );
-        assert_eq!(super::forward_worker_id(&request(None, None)), "");
+        assert!(super::refuse_foreign_reports("w1", &[report(Some("w1")), report(None)]).is_ok());
+        assert!(super::refuse_foreign_reports("w1", &[report(Some(""))]).is_ok());
+        let refused =
+            super::refuse_foreign_reports("w1", &[report(Some("w1")), report(Some("w2"))])
+                .expect_err("a report for another worker is refused");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+        assert!(refused.message().contains("w2"), "{refused}");
     }
 
     /// A request with an optional peer identity stamped, the way the mTLS
@@ -1092,19 +1029,25 @@ mod tests {
             };
         let complete = || body(Some("claimed"), Some("s1"), Some("agent-1"));
 
-        let from_cert = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Worker)))
-            .expect("a complete call passes");
+        let from_cert = super::hub_caller(&as_peer(
+            body(None, Some("s1"), Some("agent-1")),
+            Some(PrincipalRole::Worker),
+        ))
+        .expect("a complete call passes");
         assert_eq!(
             from_cert,
             ("gpu-box".to_owned(), "s1".to_owned(), "agent-1".to_owned()),
-            "the certificate is authoritative over the claim"
+            "the certificate names the worker"
         );
+        let forged = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Worker)))
+            .expect_err("a claim contradicting the certificate is refused");
+        assert_eq!(forged.code(), tonic::Code::PermissionDenied);
         let from_claim =
             super::hub_caller(&as_peer(complete(), None)).expect("plaintext bootstrap");
         assert_eq!(from_claim.0, "claimed");
         let client_cert = super::hub_caller(&as_peer(complete(), Some(PrincipalRole::Client)))
-            .expect("a client cert names no worker; the claim fills in");
-        assert_eq!(client_cert.0, "claimed");
+            .expect_err("a client cannot speak for a worker");
+        assert_eq!(client_cert.code(), tonic::Code::PermissionDenied);
 
         let no_session =
             super::hub_caller(&as_peer(body(Some("claimed"), None, Some("agent-1")), None))
@@ -1337,19 +1280,15 @@ mod tests {
     #[tokio::test]
     async fn a_worker_that_lost_its_journal_is_refused() {
         let core = core();
-        for journal_sequence in 1..=5 {
-            ingest_batch(
-                &core,
-                "worker-a",
-                vec![journaled(
-                    "s1",
-                    journal_sequence,
-                    &format!("k{journal_sequence}"),
-                )],
-            )
-            .await
-            .expect("ingest");
-        }
+        ingest(
+            &core,
+            (1..=5)
+                .map(|journal_sequence| {
+                    journaled("s1", journal_sequence, &format!("k{journal_sequence}"))
+                })
+                .collect(),
+        )
+        .await;
 
         let error = handle_start(&core, "worker-a", 2)
             .await

@@ -27,6 +27,7 @@ pub mod startup;
 pub mod state;
 pub mod tiers;
 pub mod transport;
+pub mod trust;
 pub mod usage;
 pub mod workspace;
 

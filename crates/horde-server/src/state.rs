@@ -49,6 +49,11 @@ pub struct AgentState {
     /// When the latest `Queued` placement was recorded, for queue-timeout
     /// expiry. Cleared by any other placement outcome.
     pub queued_at_unix_ms: Option<i64>,
+    /// Whether the adapter the agent was placed with can apply a narrowing's
+    /// replacement arguments (`TOOL_INPUT_REWRITE`, stamped on its latest
+    /// placement — ADR-0009). False until placed, and for placements that
+    /// predate the stamp: a narrowing nobody can prove applies is refused.
+    pub rewrites_tool_input: bool,
 }
 
 /// One permission request still awaiting its decision.
@@ -247,6 +252,7 @@ impl SessionState {
                 spec: spawned.spec,
                 placement_state: PlacementState::Unspecified,
                 queued_at_unix_ms: None,
+                rewrites_tool_input: false,
             },
         );
     }
@@ -282,6 +288,10 @@ impl SessionState {
                 PlacementState::try_from(placement.state).unwrap_or(PlacementState::Unspecified);
             agent.queued_at_unix_ms =
                 (agent.placement_state == PlacementState::Queued).then_some(recorded_at_unix_ms);
+            agent.rewrites_tool_input = agent.placement_state == PlacementState::Placed
+                && changed
+                    .adapter_capabilities
+                    .contains(&(horde_proto::v1::AdapterCapability::ToolInputRewrite as i32));
         }
     }
 
@@ -643,6 +653,7 @@ mod tests {
                 2,
                 Some("root"),
                 Kind::PlacementChanged(PlacementChanged {
+                    adapter_capabilities: Vec::new(),
                     placement: Some(Placement {
                         agent_id: Some(AgentId::new("root")),
                         state: PlacementState::Placed as i32,
@@ -672,6 +683,7 @@ mod tests {
                 sequence,
                 Some("root"),
                 Kind::PlacementChanged(PlacementChanged {
+                    adapter_capabilities: Vec::new(),
                     placement: Some(Placement {
                         agent_id: Some(AgentId::new("root")),
                         state: PlacementState::Queued as i32,
@@ -1283,6 +1295,7 @@ mod forward_fold_tests {
                     spec: None,
                     placement_state: horde_proto::v1::PlacementState::Unspecified,
                     queued_at_unix_ms: None,
+                    rewrites_tool_input: false,
                 },
             );
             agents
@@ -1302,5 +1315,46 @@ mod forward_fold_tests {
         assert!(!forward_is_live(&forward(true), &running));
         assert!(!forward_is_live(&forward(false), &failed));
         assert!(!forward_is_live(&forward(true), &failed));
+    }
+}
+
+/// Session fixtures the server's unit suites share: hand-built events,
+/// projected through the production fold.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use horde_proto::v1::{AgentId, AgentSpawned, AgentSpec, Event, event::Kind};
+    use prost::Message;
+
+    use super::SessionState;
+    use crate::log::StoredEvent;
+
+    /// `events`, in order, as session `s1`'s log, projected.
+    pub(crate) fn projected(events: &[Event]) -> SessionState {
+        let stored: Vec<StoredEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| StoredEvent {
+                session_id: "s1".to_owned(),
+                sequence: index as u64 + 1,
+                recorded_at_unix_ms: 0,
+                payload: event.encode_to_vec(),
+            })
+            .collect();
+        SessionState::project("s1", &stored).expect("project")
+    }
+
+    /// An `AgentSpawned` for `agent` under `parent`, with a default spec.
+    pub(crate) fn spawned(agent: &str, parent: Option<&str>) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::AgentSpawned(AgentSpawned {
+                parent_agent_id: parent.map(AgentId::new),
+                spawned_by: None,
+                spec: Some(AgentSpec::default()),
+                tree_path: Vec::new(),
+            })),
+        }
     }
 }

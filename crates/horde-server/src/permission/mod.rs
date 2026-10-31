@@ -14,9 +14,10 @@
 pub mod chain;
 pub mod driver;
 pub mod modes;
+pub mod orchestrator;
 pub mod rules;
 
-pub use chain::{ChainRuling, Consultation, JudgeRuling, PolicyJudge, evaluate};
+pub use chain::{ChainRuling, Consultation, JudgeRuling, PolicyJudge, Requester, evaluate};
 pub use driver::{ChainDriver, spawn};
 pub use modes::{PermissionMode, PermissionModes};
 pub use rules::{DenyRule, FieldPrefix, Rule};
