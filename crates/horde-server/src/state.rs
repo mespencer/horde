@@ -1343,6 +1343,43 @@ pub(crate) mod fixture {
         SessionState::project("s1", &stored).expect("project")
     }
 
+    /// An `AgentLifecycleChanged` moving `agent` to `state`, from nowhere in
+    /// particular — what a worker journals as the agent moves.
+    pub(crate) fn lifecycle(agent: &str, state: horde_proto::v1::AgentLifecycleState) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            kind: Some(Kind::AgentLifecycleChanged(
+                horde_proto::v1::AgentLifecycleChanged {
+                    state: state as i32,
+                    ..horde_proto::v1::AgentLifecycleChanged::default()
+                },
+            )),
+            ..Event::default()
+        }
+    }
+
+    /// One agent as the fold would hold it: no parent, type, mode or spec.
+    pub(crate) fn agent(
+        id: &str,
+        placement: horde_proto::v1::PlacementState,
+        worker: Option<&str>,
+        lifecycle: horde_proto::v1::AgentLifecycleState,
+    ) -> super::AgentState {
+        super::AgentState {
+            agent_id: id.to_owned(),
+            parent_agent_id: None,
+            lifecycle,
+            tree_path: Vec::new(),
+            agent_type: String::new(),
+            permission_mode: String::new(),
+            worker_id: worker.map(ToString::to_string),
+            spec: None,
+            placement_state: placement,
+            queued_at_unix_ms: None,
+            rewrites_tool_input: false,
+        }
+    }
+
     /// An `AgentSpawned` for `agent` under `parent`, with a default spec.
     pub(crate) fn spawned(agent: &str, parent: Option<&str>) -> Event {
         Event {

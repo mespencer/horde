@@ -2028,6 +2028,7 @@ mod tests {
             (PlacementState::Queued, "queued"),
             (PlacementState::Expired, "expired"),
             (PlacementState::Cancelled, "cancelled"),
+            (PlacementState::Lost, "lost"),
             (PlacementState::Unspecified, "unspecified"),
         ] {
             assert_eq!(super::placement_state(state as i32), expected);

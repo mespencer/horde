@@ -691,19 +691,7 @@ mod tests {
         let mut with = |id: &str, worker: Option<&str>, lifecycle| {
             state.agents.insert(
                 id.to_owned(),
-                AgentState {
-                    agent_id: id.to_owned(),
-                    parent_agent_id: None,
-                    lifecycle,
-                    tree_path: Vec::new(),
-                    agent_type: String::new(),
-                    permission_mode: String::new(),
-                    worker_id: worker.map(ToString::to_string),
-                    spec: None,
-                    placement_state: PlacementState::Placed,
-                    queued_at_unix_ms: None,
-                    rewrites_tool_input: false,
-                },
+                crate::state::fixture::agent(id, PlacementState::Placed, worker, lifecycle),
             );
         };
         with("a", Some("w1"), AgentLifecycleState::Running);

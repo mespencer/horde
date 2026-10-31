@@ -602,7 +602,11 @@ mod tests {
         });
 
         for _ in 0..3 {
-            let frame = receiver.recv().await.expect("a heartbeat").expect("not an error");
+            let frame = receiver
+                .recv()
+                .await
+                .expect("a heartbeat")
+                .expect("not an error");
             assert!(matches!(frame.update, Some(Update::Heartbeat(_))));
         }
         assert_eq!(

@@ -1822,16 +1822,10 @@ mod tests {
             4,
             "s1",
             4,
-            Event {
-                agent_id: Some(AgentId::new("agent-1")),
-                kind: Some(Kind::AgentLifecycleChanged(
-                    horde_proto::v1::AgentLifecycleChanged {
-                        state: horde_proto::v1::AgentLifecycleState::Running as i32,
-                        ..Default::default()
-                    },
-                )),
-                ..Event::default()
-            },
+            crate::state::fixture::lifecycle(
+                "agent-1",
+                horde_proto::v1::AgentLifecycleState::Running,
+            ),
         ));
         running.push(row(
             5,

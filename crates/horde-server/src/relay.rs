@@ -143,6 +143,19 @@ mod tests {
         journal_change(log, key, definition, false).await;
     }
 
+    /// Repos by name, each with a `git.example` remote.
+    fn example_repos(names: &[&str]) -> Vec<horde_proto::v1::WorkspaceRepo> {
+        names
+            .iter()
+            .map(|name| horde_proto::v1::WorkspaceRepo {
+                name: (*name).to_owned(),
+                remote_url: format!("https://git.example/{name}.git"),
+                default_branch: "main".to_owned(),
+                layout_path: String::new(),
+            })
+            .collect()
+    }
+
     /// One catalog change, a deletion when `deleted`.
     async fn journal_change(
         log: &EventLog,
@@ -324,15 +337,7 @@ mod tests {
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
             name: "mixed".to_owned(),
             etag: "1".to_owned(),
-            repos: ["maps", "charts", "-hostile"]
-                .into_iter()
-                .map(|name| horde_proto::v1::WorkspaceRepo {
-                    name: name.to_owned(),
-                    remote_url: format!("https://git.example/{name}.git"),
-                    default_branch: "main".to_owned(),
-                    layout_path: String::new(),
-                })
-                .collect(),
+            repos: example_repos(&["maps", "charts", "-hostile"]),
             ..horde_proto::v1::WorkspaceDefinition::default()
         };
         journal_definition(&log, "ws-1:1", definition).await;
@@ -360,15 +365,7 @@ mod tests {
         let definition = |id: &str, repos: &[&str]| horde_proto::v1::WorkspaceDefinition {
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(id)),
             name: id.to_owned(),
-            repos: repos
-                .iter()
-                .map(|name| horde_proto::v1::WorkspaceRepo {
-                    name: (*name).to_owned(),
-                    remote_url: format!("https://git.example/{name}.git"),
-                    default_branch: "main".to_owned(),
-                    layout_path: String::new(),
-                })
-                .collect(),
+            repos: example_repos(repos),
             ..horde_proto::v1::WorkspaceDefinition::default()
         };
         journal_definition(&log, "ws-1:1", definition("ws-1", &["maps", "shared"])).await;
@@ -380,7 +377,13 @@ mod tests {
             .expect("the catalog reads");
         assert!(store.registered("maps").is_some());
 
-        journal_change(&log, "ws-1:2", definition("ws-1", &["maps", "shared"]), true).await;
+        journal_change(
+            &log,
+            "ws-1:2",
+            definition("ws-1", &["maps", "shared"]),
+            true,
+        )
+        .await;
         super::register_catalog(&store, &log)
             .await
             .expect("the catalog reads");

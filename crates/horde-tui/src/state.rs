@@ -499,6 +499,7 @@ pub fn placement_state_name(state: i32) -> &'static str {
         Ok(PlacementState::Queued) => "queued",
         Ok(PlacementState::Expired) => "expired",
         Ok(PlacementState::Cancelled) => "cancelled",
+        Ok(PlacementState::Lost) => "lost",
         _ => "unspecified",
     }
 }
@@ -1079,6 +1080,7 @@ mod tests {
                 (PlacementState::Queued as i32, "queued"),
                 (PlacementState::Expired as i32, "expired"),
                 (PlacementState::Cancelled as i32, "cancelled"),
+                (PlacementState::Lost as i32, "lost"),
                 (887, "unspecified"),
             ],
         );

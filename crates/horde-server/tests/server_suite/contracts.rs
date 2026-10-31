@@ -863,8 +863,9 @@ async fn archiving_appends_an_event_and_reports_the_archived_session() {
     );
     assert_eq!(
         sequences(&mut h, &session_id).await.expect("replay").len(),
-        before + 1,
-        "archiving is an event like everything else"
+        before + 2,
+        "archiving is an event like everything else: the session's, and its root \
+         agent's own ARCHIVED (ADR-0011)"
     );
 }
 

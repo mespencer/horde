@@ -15,9 +15,9 @@ use horde_proto::v1::{
     PermissionDecision, PermissionRequest, PermissionRequested, Placement, PlacementChanged,
     PlacementState, ResultReported, ResultStatus, Role, SessionId, SessionLifecycleChanged,
     SessionLifecycleState, StaleJournalEvent, TurnInterrupted, UsageRecord, UsageRecorded,
-    WorkerId, WorkerJournalReset, WorkerLoginEnded, WorkerLoginStarted, WorkspaceDefinition, WorkspaceDefinitionChanged, WorkspaceDefinitionId,
-    WorkspaceInstanceChanged, WorkspaceInstanceReport, WorkspacePrewarmRequested, event,
-    mcp_server_config,
+    WorkerId, WorkerJournalReset, WorkerLoginEnded, WorkerLoginStarted, WorkspaceDefinition,
+    WorkspaceDefinitionChanged, WorkspaceDefinitionId, WorkspaceInstanceChanged,
+    WorkspaceInstanceReport, WorkspacePrewarmRequested, event, mcp_server_config,
 };
 
 /// The event vocabulary, as named in CONTEXT.md and DESIGN.md:

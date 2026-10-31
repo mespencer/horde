@@ -26,9 +26,10 @@ use horde_proto::v1::{
     ListWorkspaceDefinitionsResponse, McpServerConfig, MintEnrollmentCodeRequest,
     MintEnrollmentCodeResponse, NoteSent, PrewarmWorkspaceRequest, PrewarmWorkspaceResponse,
     QueryUsageRequest, QueryUsageResponse, ResetWorkerJournalRequest, ResetWorkerJournalResponse,
-    RevokeEnrollmentRequest, RevokeEnrollmentResponse, SendMessageRequest, SendMessageResponse, ServerHello, SessionId, SessionSummary,
-    SpawnAgentRequest, SpawnAgentResponse, SyncEventsRequest, SyncEventsResponse,
-    UpdateWorkspaceDefinitionRequest, UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
+    RevokeEnrollmentRequest, RevokeEnrollmentResponse, SendMessageRequest, SendMessageResponse,
+    ServerHello, SessionId, SessionSummary, SpawnAgentRequest, SpawnAgentResponse,
+    SyncEventsRequest, SyncEventsResponse, UpdateWorkspaceDefinitionRequest,
+    UpdateWorkspaceDefinitionResponse, WorkspaceDefinitionId,
     control_plane_service_server::ControlPlaneService, event::Kind, send_message_request,
 };
 use tokio_stream::{Stream, wrappers::ReceiverStream};
@@ -261,6 +262,17 @@ impl ControlPlane {
         SessionState::project(session_id, &events)
     }
 
+    /// The session a request names, and its projection — refused, as a
+    /// status, when it has no events.
+    async fn project_named(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<(String, SessionState), Status> {
+        let session_id = session_id.map(ToString::to_string).unwrap_or_default();
+        let state = self.project(&session_id).await.map_err(Status::from)?;
+        Ok((session_id, state))
+    }
+
     /// Finds which session an agent belongs to.
     ///
     /// A scan across sessions today. It is correct and it is honest about being
@@ -469,12 +481,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<ArchiveSessionRequest>,
     ) -> Result<Response<ArchiveSessionResponse>, Status> {
         let request = request.into_inner();
-        let session_id = request
-            .session_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let state = self.project(&session_id).await.map_err(Status::from)?;
+        let (session_id, state) = self.project_named(request.session_id.as_ref()).await?;
 
         // Each agent's archive is a fact of its own, written here with the
         // state it was archived *from* (ADR-0011): the worker that carries
@@ -835,12 +842,7 @@ impl ControlPlaneService for ControlPlane {
         let actor = actor_of(&request);
         let conduit = crate::trust::conduit_worker(&request);
         let request = request.into_inner();
-        let session_id = request
-            .session_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let state = self.project(&session_id).await.map_err(Status::from)?;
+        let (session_id, state) = self.project_named(request.session_id.as_ref()).await?;
         // A worker spawns on behalf of one of its agents (ADR-0009): the
         // parent must be named, and placed on the calling worker.
         if let Some(worker_id) = conduit.as_deref() {
@@ -1842,9 +1844,8 @@ fn ended(state: &SessionState, agent_id: &str) -> Option<String> {
     if agent.lifecycle == horde_proto::v1::AgentLifecycleState::Archived {
         return Some("is archived; archive is terminal".to_owned());
     }
-    (agent.placement_state == horde_proto::v1::PlacementState::Lost).then(|| {
-        "was lost with its worker and its context with it; spawn a replacement".to_owned()
-    })
+    (agent.placement_state == horde_proto::v1::PlacementState::Lost)
+        .then(|| "was lost with its worker and its context with it; spawn a replacement".to_owned())
 }
 
 /// [`ended`] as a refusal: `FailedPrecondition`, naming the agent and why.
@@ -2324,10 +2325,7 @@ mod delivery_tests {
         );
         crate::placement::place_queued(&core).await.expect("a pass");
         let after = state(&core, &session_id).await;
-        assert_ne!(
-            after.agents[&child].placement_state,
-            PlacementState::Placed
-        );
+        assert_ne!(after.agents[&child].placement_state, PlacementState::Placed);
 
         let refused = plane
             .send_message(send(&root, assignment("too late"), ""))

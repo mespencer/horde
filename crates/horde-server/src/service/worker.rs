@@ -898,17 +898,8 @@ mod tests {
         use horde_proto::v1::worker_service_server::WorkerService as _;
 
         let facing = super::WorkerFacing::new(core());
-        let request = |hello: Option<&str>, worker_id: Option<&str>| {
-            tonic::Request::new(horde_proto::v1::RegisterWorkerRequest {
-                hello: hello.map(|semver| horde_proto::v1::Hello {
-                    semver: semver.to_owned(),
-                    ..horde_proto::v1::Hello::default()
-                }),
-                worker_id: worker_id.map(horde_proto::v1::WorkerId::new),
-                capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
-                last_local_journal_sequence: None,
-            })
-        };
+        let request =
+            |hello: Option<&str>, worker_id: Option<&str>| register_request(hello, worker_id, None);
 
         let registered = facing
             .register_worker(request(Some("0.1.0"), Some("worker-a")))
@@ -937,16 +928,28 @@ mod tests {
         assert_eq!(unversioned.code(), tonic::Code::FailedPrecondition);
     }
 
-    fn registration(reported: Option<u64>) -> tonic::Request<horde_proto::v1::RegisterWorkerRequest> {
+    /// A registration as a worker sends it: its hello's semver, its claimed
+    /// name, and the journal head it reports, each optional.
+    fn register_request(
+        hello: Option<&str>,
+        worker_id: Option<&str>,
+        reported: Option<u64>,
+    ) -> tonic::Request<horde_proto::v1::RegisterWorkerRequest> {
         tonic::Request::new(horde_proto::v1::RegisterWorkerRequest {
-            hello: Some(horde_proto::v1::Hello {
-                semver: "0.1.0".to_owned(),
+            hello: hello.map(|semver| horde_proto::v1::Hello {
+                semver: semver.to_owned(),
                 ..horde_proto::v1::Hello::default()
             }),
-            worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
+            worker_id: worker_id.map(horde_proto::v1::WorkerId::new),
             capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
             last_local_journal_sequence: reported,
         })
+    }
+
+    fn registration(
+        reported: Option<u64>,
+    ) -> tonic::Request<horde_proto::v1::RegisterWorkerRequest> {
+        register_request(Some("0.1.0"), Some("worker-a"), reported)
     }
 
     /// A worker reporting a journal head below what the log stored is
@@ -1013,16 +1016,10 @@ mod tests {
             &core.log,
             "s1",
             "",
-            Event {
-                agent_id: Some(AgentId::new("agent-1")),
-                kind: Some(Kind::AgentLifecycleChanged(
-                    horde_proto::v1::AgentLifecycleChanged {
-                        state: horde_proto::v1::AgentLifecycleState::Running as i32,
-                        ..Default::default()
-                    },
-                )),
-                ..Event::default()
-            },
+            crate::state::fixture::lifecycle(
+                "agent-1",
+                horde_proto::v1::AgentLifecycleState::Running,
+            ),
         )
         .await
         .expect("the lifecycle appends");
@@ -1043,8 +1040,7 @@ mod tests {
             loop {
                 let events = core.log.read_all("s1").await.expect("read");
                 let state = crate::state::SessionState::project("s1", &events).expect("project");
-                if state.agents["agent-1"].placement_state
-                    == horde_proto::v1::PlacementState::Lost
+                if state.agents["agent-1"].placement_state == horde_proto::v1::PlacementState::Lost
                 {
                     return;
                 }
@@ -1053,7 +1049,10 @@ mod tests {
         })
         .await;
         assert!(lost.is_ok(), "the lapsed lease must declare the agent lost");
-        assert!(!core.workers.contains("worker-a"), "and the worker left placement");
+        assert!(
+            !core.workers.contains("worker-a"),
+            "and the worker left placement"
+        );
     }
 
     #[test]

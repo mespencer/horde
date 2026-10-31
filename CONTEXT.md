@@ -73,6 +73,16 @@ _Avoid_: scheduling a session
 A fact a worker advertises that placement can match on: tags, provider accounts, reachable remotes, warm instances.
 _Avoid_: feature, label (alone)
 
+**Worker Lease**:
+How long a worker may stay away before it is declared lost (ADR-0011): its never-started agents are re-placed, its started agents are marked lost — their context lived on that worker.
+_Avoid_: timeout (alone), heartbeat
+
+**Lost**:
+The settled placement of an agent whose worker outlived its lease, or whose journal was reset. Never re-placed automatically; it takes no messages or children.
+
+**Journal Reset**:
+The operator's recovery for a worker whose journal regressed (`horde worker reset`): its fresh journal is numbered above the old one's floor and its agents are declared lost.
+
 **Workspace**:
 A named set of 1..N repos an agent tree works in. Exists as a portable Definition and per-worker Instances.
 

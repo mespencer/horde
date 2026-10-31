@@ -1175,14 +1175,23 @@ mod tests {
             &log,
             "s1",
             "chain:req-bad",
-            agent_event(
-                "root",
-                Kind::NoteSent(horde_proto::v1::NoteSent::default()),
-            ),
+            agent_event("root", Kind::NoteSent(horde_proto::v1::NoteSent::default())),
         )
         .await;
-        append(&log, "s1", "req-bad", requested("root", "req-bad", Some(call("Read", "/a")))).await;
-        append(&log, "s1", "req-good", requested("root", "req-good", Some(call("Read", "/b")))).await;
+        append(
+            &log,
+            "s1",
+            "req-bad",
+            requested("root", "req-bad", Some(call("Read", "/a"))),
+        )
+        .await;
+        append(
+            &log,
+            "s1",
+            "req-good",
+            requested("root", "req-good", Some(call("Read", "/b"))),
+        )
+        .await;
 
         let mut driver = driver_over(&log, cautious(), None);
         driver

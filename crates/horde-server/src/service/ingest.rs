@@ -1308,7 +1308,10 @@ mod tests {
             Kind::AgentOutputChunk(AgentOutputChunk::default()),
             Kind::UsageRecorded(UsageRecorded::default()),
         ] {
-            assert_eq!(super::late_handling(&kind, current()), Some(super::Late::Land));
+            assert_eq!(
+                super::late_handling(&kind, current()),
+                Some(super::Late::Land)
+            );
         }
         for kind in [
             Kind::AgentLifecycleChanged(AgentLifecycleChanged::default()),
@@ -1320,7 +1323,10 @@ mod tests {
             assert_eq!(super::late_handling(&kind, current()), record);
         }
         assert_eq!(
-            super::late_handling(&Kind::PermissionDecided(PermissionDecided::default()), current()),
+            super::late_handling(
+                &Kind::PermissionDecided(PermissionDecided::default()),
+                current()
+            ),
             None,
             "a server-only kind is not late, it is refused"
         );

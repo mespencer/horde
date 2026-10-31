@@ -217,11 +217,9 @@ impl ParsedFlags {
                 || self.relay_bind.is_some()
                 || self.worker_lease_secs.is_some()
             {
-                return Err(
-                    "--bind, --enrollment-bind, --state-dir, --blob-max-bytes, \
+                return Err("--bind, --enrollment-bind, --state-dir, --blob-max-bytes, \
                      --relay-bind and --worker-lease need --serve"
-                        .to_owned(),
-                );
+                    .to_owned());
             }
             return Ok(Invocation::CheckOnly { database });
         }
