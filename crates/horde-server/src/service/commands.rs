@@ -182,16 +182,17 @@ impl CommandProjection {
         let agent_id = event.agent_id.as_ref().map(ToString::to_string);
 
         match (event.kind, agent_id) {
-            // The catalog half of materialization: a prewarm request can only
-            // become a command if the definition it names has been folded.
-            (Some(Kind::WorkspaceDefinitionChanged(changed)), _) => {
-                self.fold_definition(changed);
-                Vec::new()
-            }
-            // The catalog half of the MCP Hub: a spawn can only carry a
-            // server's config if the change that created it has been folded.
-            (Some(Kind::McpServerConfigChanged(changed)), _) => {
-                self.mcp_servers.fold_change(global.event.sequence, changed);
+            // Facts the fold remembers but that command nobody by themselves.
+            (
+                Some(
+                    kind @ (Kind::WorkspaceDefinitionChanged(_)
+                    | Kind::McpServerConfigChanged(_)
+                    | Kind::AgentLifecycleChanged(_)
+                    | Kind::WorkerJournalReset(_)),
+                ),
+                agent_id,
+            ) => {
+                self.remember(global, kind, agent_id);
                 Vec::new()
             }
             (Some(Kind::WorkspacePrewarmRequested(prewarm)), _) => {
@@ -257,26 +258,6 @@ impl CommandProjection {
                 let issued = self.issue(&worker_id, global, command, MAIN);
                 vec![(worker_id, issued)]
             }
-            // An agent seen running is never re-placed again (a lost worker
-            // declares it lost instead), so its buffer has no future reader.
-            (Some(Kind::AgentLifecycleChanged(changed)), Some(agent_id)) => {
-                if let Ok(state) = horde_proto::v1::AgentLifecycleState::try_from(changed.state)
-                    && crate::placement::survives_only_as_placed(state)
-                {
-                    self.inbox.remove(&agent_id);
-                    self.started.insert(agent_id);
-                }
-                Vec::new()
-            }
-            // An operator reset this worker's journal (ADR-0011): its fresh
-            // state applied nothing, so its numbering starts over.
-            (Some(Kind::WorkerJournalReset(reset)), _) => {
-                if let Some(worker_id) = reset.worker_id.as_ref().map(ToString::to_string) {
-                    self.issued.insert(worker_id.clone(), 0);
-                    *self.resets.entry(worker_id).or_insert(0) += 1;
-                }
-                Vec::new()
-            }
             // Archive finally has a producer (fix a7): archiving the session
             // folds into an ArchiveAgentCommand for each of its placed
             // agents. Context dies at archive, not at result (DESIGN §5),
@@ -304,6 +285,39 @@ impl CommandProjection {
                 vec![(worker_id, issued)]
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Folds a fact that issues no command by itself but shapes later ones.
+    fn remember(&mut self, global: &GlobalEvent, kind: Kind, agent_id: Option<String>) {
+        match (kind, agent_id) {
+            // The catalog half of materialization: a prewarm request can only
+            // become a command if the definition it names has been folded.
+            (Kind::WorkspaceDefinitionChanged(changed), _) => self.fold_definition(changed),
+            // The catalog half of the MCP Hub: a spawn can only carry a
+            // server's config if the change that created it has been folded.
+            (Kind::McpServerConfigChanged(changed), _) => {
+                self.mcp_servers.fold_change(global.event.sequence, changed);
+            }
+            // An agent seen running is never re-placed again (a lost worker
+            // declares it lost instead), so its buffer has no future reader.
+            (Kind::AgentLifecycleChanged(changed), Some(agent_id)) => {
+                if let Ok(state) = horde_proto::v1::AgentLifecycleState::try_from(changed.state)
+                    && crate::placement::survives_only_as_placed(state)
+                {
+                    self.inbox.remove(&agent_id);
+                    self.started.insert(agent_id);
+                }
+            }
+            // An operator reset this worker's journal (ADR-0011): its fresh
+            // state applied nothing, so its numbering starts over.
+            (Kind::WorkerJournalReset(reset), _) => {
+                if let Some(worker_id) = reset.worker_id.as_ref().map(ToString::to_string) {
+                    self.issued.insert(worker_id.clone(), 0);
+                    *self.resets.entry(worker_id).or_insert(0) += 1;
+                }
+            }
+            _ => {}
         }
     }
 

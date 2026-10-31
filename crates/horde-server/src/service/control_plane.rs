@@ -273,6 +273,61 @@ impl ControlPlane {
         Ok((session_id, state))
     }
 
+    /// The workspace a spawn names, once it is known to exist.
+    ///
+    /// A spawn naming a workspace the catalog does not hold — or a tier it
+    /// cannot resolve — is refused before anything is written: placing it
+    /// would eventually command a materialization of nothing, or bind a
+    /// model of nothing.
+    async fn validated_workspace(
+        &self,
+        spec: &horde_proto::v1::AgentSpec,
+    ) -> Result<Option<String>, Status> {
+        let workspace = spec
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        if let Some(id) = workspace.as_deref() {
+            self.required_definition(id).await.map_err(Status::from)?;
+        }
+        validate_model_selection(Some(spec))?;
+        Ok(workspace)
+    }
+
+    /// The two answers a spawn owes before it creates anything (ADR-0011),
+    /// asked under the placement lock: a retry answers with the agent the
+    /// first attempt created, placed wherever it is now — instead of a
+    /// phantom id whose placement names an agent the log never spawned, and
+    /// with no racing twin able to miss the stored one — and a spawn under an
+    /// ended parent, or into an archived session, is refused by name.
+    /// `Ok(None)` means: go ahead and spawn.
+    async fn spawn_retried_or_refused(
+        &self,
+        session_id: &str,
+        idempotency_key: &str,
+        state: &SessionState,
+        parent: Option<&str>,
+    ) -> Result<Option<SpawnAgentResponse>, Status> {
+        if let Some((_, payload)) = self
+            .core
+            .log
+            .stored_under_key(session_id, idempotency_key)
+            .await
+            .map_err(Status::from)?
+        {
+            let current = self.project(session_id).await.map_err(Status::from)?;
+            if let Some(response) = spawn_retry(&current, &payload) {
+                return Ok(Some(response));
+            }
+        }
+        match parent {
+            Some(parent) => refuse_ended(state, parent)?,
+            None => refuse_archived_session(state)?,
+        }
+        Ok(None)
+    }
+
     /// Finds which session an agent belongs to.
     ///
     /// A scan across sessions today. It is correct and it is honest about being
@@ -865,19 +920,7 @@ impl ControlPlaneService for ControlPlane {
         let agent_id = format!("agent-{}", uuid_like());
         let spec = request.spec.unwrap_or_default();
 
-        // A spawn naming a workspace the catalog does not hold — or a tier
-        // it cannot resolve — is refused before anything is written: placing
-        // it would eventually command a materialization of nothing, or bind
-        // a model of nothing.
-        let workspace = spec
-            .workspace_definition_id
-            .as_ref()
-            .map(ToString::to_string)
-            .filter(|id| !id.is_empty());
-        if let Some(id) = workspace.as_deref() {
-            self.required_definition(id).await.map_err(Status::from)?;
-        }
-        validate_model_selection(Some(&spec))?;
+        let workspace = self.validated_workspace(&spec).await?;
 
         // The whole decision — project, place, append — runs under the
         // placement lock so a drain pass woken by a worker registering cannot
@@ -885,27 +928,16 @@ impl ControlPlaneService for ControlPlane {
         let serialized = self.core.placement_lock.clone();
         let _serialized = serialized.lock().await;
 
-        // A retried spawn answers with the agent the first attempt created,
-        // placed wherever it is now, instead of minting a phantom id whose
-        // placement names an agent the log never spawned (ADR-0011). Under
-        // the lock, so two racing twins cannot both miss the stored one.
-        if let Some((_, payload)) = self
-            .core
-            .log
-            .stored_under_key(&session_id, &request.idempotency_key)
-            .await
-            .map_err(Status::from)?
+        if let Some(response) = self
+            .spawn_retried_or_refused(
+                &session_id,
+                &request.idempotency_key,
+                &state,
+                parent.as_deref(),
+            )
+            .await?
         {
-            let current = self.project(&session_id).await.map_err(Status::from)?;
-            if let Some(response) = spawn_retry(&current, &payload) {
-                return Ok(Response::new(response));
-            }
-        }
-        // Archive (and loss) is terminal: an ended agent has no children,
-        // and an archived session takes none at all.
-        match parent.as_deref() {
-            Some(parent) => refuse_ended(&state, parent)?,
-            None => refuse_archived_session(&state)?,
+            return Ok(Response::new(response));
         }
 
         // The agent exists whether or not it is placed: spawn never blocks, and

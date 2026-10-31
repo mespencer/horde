@@ -363,21 +363,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment_listener.addr,
     )?;
 
-    let core = ServerCore::new(log)
-        .with_blob_store(Arc::new(blob_store(config)?))
-        .with_worker_lease(
-            config
-                .worker_lease
-                .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
-        );
-    // Boot reconciliation (ADR-0011): this process holds no registrations,
-    // so every agent the log places on a worker is on a worker that is away
-    // until it dials in — treated exactly as a disconnect, lease and all,
-    // rather than left placed forever on a machine nobody may ever see again.
-    let away = crate::liveness::reconcile_at_boot(&core).await?;
-    if !away.is_empty() {
-        tracing::info!(?away, "awaiting workers the log places agents on");
-    }
+    let core = reconciled_core(config, log).await?;
 
     // The permission chain driver (fix a5): the deterministic layers run in
     // the deployed server, over the shipped registry (ADR-0009) — an agent's
@@ -407,6 +393,30 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         hub_lines,
         permission_chain,
     })
+}
+
+/// The serving core: blob store and worker lease from `config`, and the log
+/// reconciled at boot (ADR-0011) — this process holds no registrations, so
+/// every agent the log places on a worker is on a worker that is away until
+/// it dials in, treated exactly as a disconnect, lease and all, rather than
+/// left placed forever on a machine nobody may ever see again.
+///
+/// # Errors
+///
+/// The blob store being unusable, or the reconcile failing to read or append.
+async fn reconciled_core(config: &ServeConfig, log: EventLog) -> Result<ServerCore, ServerError> {
+    let core = ServerCore::new(log)
+        .with_blob_store(Arc::new(blob_store(config)?))
+        .with_worker_lease(
+            config
+                .worker_lease
+                .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
+        );
+    let away = crate::liveness::reconcile_at_boot(&core).await?;
+    if !away.is_empty() {
+        tracing::info!(?away, "awaiting workers the log places agents on");
+    }
+    Ok(core)
 }
 
 /// The CA (loaded, or created on first start) and the listener credential
