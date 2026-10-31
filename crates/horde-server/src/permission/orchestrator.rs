@@ -92,42 +92,34 @@ fn is_parent(state: &SessionState, caller: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use horde_proto::prost::Message;
     use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
-    use horde_proto::v1::{AgentId, AgentSpawned, Event, ProposedToolCall, event::Kind};
+    use horde_proto::v1::ProposedToolCall;
 
     use super::{orchestrator_verb, own_orchestrator_verb};
-    use crate::log::StoredEvent;
     use crate::state::SessionState;
+    use crate::state::fixture::{projected, spawned};
 
     /// root → child → grandchild, plus a sibling under root, projected
     /// through the production fold.
     fn tree() -> SessionState {
-        let spawned = |agent: &str, parent: Option<&str>| Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: String::new(),
-            kind: Some(Kind::AgentSpawned(AgentSpawned {
-                parent_agent_id: parent.map(AgentId::new),
-                ..AgentSpawned::default()
-            })),
-        };
-        let events: Vec<StoredEvent> = [
+        projected(&[
             spawned("root", None),
             spawned("child", Some("root")),
             spawned("grandchild", Some("child")),
             spawned("sibling", Some("root")),
-        ]
-        .iter()
-        .enumerate()
-        .map(|(index, event)| StoredEvent {
-            session_id: "s1".to_owned(),
-            sequence: index as u64 + 1,
-            recorded_at_unix_ms: 0,
-            payload: event.encode_to_vec(),
-        })
-        .collect();
-        SessionState::project("s1", &events).expect("the tree projects")
+        ])
+    }
+
+    /// A malformed history whose parents loop must answer, not spin: the
+    /// walk is bounded by the number of agents.
+    #[test]
+    fn a_parent_cycle_is_walked_to_a_bounded_no() {
+        let state = projected(&[spawned("a", Some("b")), spawned("b", Some("a"))]);
+        assert!(!own_orchestrator_verb(
+            &naming("horde/wait_for_agent", "agent_id", "a"),
+            "c",
+            &state
+        ));
     }
 
     fn call(tool: &str, field: &str, value: Option<ValueKind>) -> ProposedToolCall {

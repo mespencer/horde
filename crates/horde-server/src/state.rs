@@ -1317,3 +1317,44 @@ mod forward_fold_tests {
         assert!(!forward_is_live(&forward(true), &failed));
     }
 }
+
+/// Session fixtures the server's unit suites share: hand-built events,
+/// projected through the production fold.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use horde_proto::v1::{AgentId, AgentSpawned, AgentSpec, Event, event::Kind};
+    use prost::Message;
+
+    use super::SessionState;
+    use crate::log::StoredEvent;
+
+    /// `events`, in order, as session `s1`'s log, projected.
+    pub(crate) fn projected(events: &[Event]) -> SessionState {
+        let stored: Vec<StoredEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| StoredEvent {
+                session_id: "s1".to_owned(),
+                sequence: index as u64 + 1,
+                recorded_at_unix_ms: 0,
+                payload: event.encode_to_vec(),
+            })
+            .collect();
+        SessionState::project("s1", &stored).expect("project")
+    }
+
+    /// An `AgentSpawned` for `agent` under `parent`, with a default spec.
+    pub(crate) fn spawned(agent: &str, parent: Option<&str>) -> Event {
+        Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::AgentSpawned(AgentSpawned {
+                parent_agent_id: parent.map(AgentId::new),
+                spawned_by: None,
+                spec: Some(AgentSpec::default()),
+                tree_path: Vec::new(),
+            })),
+        }
+    }
+}

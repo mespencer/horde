@@ -15,9 +15,7 @@ use crate::support::{System, has_kind, outputs};
 #[tokio::test]
 async fn the_full_lifecycle_runs_over_real_processes() {
     let system = System::launch().await;
-    let mut worker = system
-        .spawn_worker("w-1", &system.state.path().join("w-1"), &[])
-        .await;
+    let mut worker = system.spawn_echo_worker("w-1").await;
 
     let (session_id, root) = system.new_session("e2e lifecycle").await;
 
@@ -270,9 +268,7 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
 #[tokio::test]
 async fn an_interrupt_is_requested_once_and_acknowledged_once() {
     let system = System::launch().await;
-    let mut worker = system
-        .spawn_worker("w-1", &system.state.path().join("w-1"), &[])
-        .await;
+    let mut worker = system.spawn_echo_worker("w-1").await;
     let (session_id, root) = system.placed_session("e2e interrupt").await;
 
     let interrupted = |events: &[serde_json::Value]| {

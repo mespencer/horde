@@ -1265,19 +1265,7 @@ mod tests {
         assert!(already_escalated(&enriched));
     }
 
-    fn projected(events: &[Event]) -> SessionState {
-        let stored: Vec<crate::log::StoredEvent> = events
-            .iter()
-            .enumerate()
-            .map(|(index, event)| crate::log::StoredEvent {
-                session_id: "s1".to_owned(),
-                sequence: index as u64 + 1,
-                recorded_at_unix_ms: 0,
-                payload: event.encode_to_vec(),
-            })
-            .collect();
-        SessionState::project("s1", &stored).expect("project")
-    }
+    use crate::state::fixture::projected;
 
     #[test]
     fn ancestry_prefers_the_recorded_tree_path() {

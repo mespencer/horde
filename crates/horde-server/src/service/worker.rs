@@ -310,13 +310,7 @@ impl WorkerService for WorkerFacing {
         request: Request<horde_proto::v1::StreamForwardsRequest>,
     ) -> Result<Response<Self::StreamForwardsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
-        let worker_id =
-            crate::trust::caller_worker_id(&request, request.get_ref().worker_id.as_ref())?;
-        if worker_id.is_empty() {
-            return Err(Status::from(ServerError::Invalid(
-                "a forward stream must name its worker".to_owned(),
-            )));
-        }
+        let worker_id = named_worker(&request, request.get_ref().worker_id.as_ref(), "forward")?;
 
         let (epoch, lane) = self.core.forwards.register_worker(&worker_id);
         // Subscribe before the first computation, so an intent appended
@@ -364,13 +358,7 @@ impl WorkerService for WorkerFacing {
         request: Request<horde_proto::v1::StreamLoginsRequest>,
     ) -> Result<Response<Self::StreamLoginsStream>, Status> {
         let serial = super::shared::peer_serial(&request);
-        let worker_id =
-            crate::trust::caller_worker_id(&request, request.get_ref().worker_id.as_ref())?;
-        if worker_id.is_empty() {
-            return Err(Status::from(ServerError::Invalid(
-                "a login stream must name its worker".to_owned(),
-            )));
-        }
+        let worker_id = named_worker(&request, request.get_ref().worker_id.as_ref(), "login")?;
 
         let (epoch, lane) = self.core.logins.register_worker(&worker_id);
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
@@ -638,6 +626,28 @@ fn hub_caller<T: HubForwardRequest>(
             ))
         })?;
     Ok((worker_id, session_id, agent_id))
+}
+
+/// The worker a per-worker stream serves: the certificate's, or on a
+/// plaintext channel the claim — which must then name someone, because a
+/// stream registered under the empty id serves nobody.
+///
+/// # Errors
+///
+/// `PermissionDenied` from the identity rule; `InvalidArgument` for a
+/// nameless plaintext stream.
+fn named_worker<T>(
+    request: &Request<T>,
+    claimed: Option<&WorkerId>,
+    stream: &str,
+) -> Result<String, Status> {
+    let worker_id = crate::trust::caller_worker_id(request, claimed)?;
+    if worker_id.is_empty() {
+        return Err(Status::from(ServerError::Invalid(format!(
+            "a {stream} stream must name its worker"
+        ))));
+    }
+    Ok(worker_id)
 }
 
 /// Refuses instance reports that name a worker other than the caller.
@@ -939,6 +949,32 @@ mod tests {
             }
             other => panic!("expected Accepted, got {other:?}"),
         }
+    }
+
+    /// A per-worker stream must end up naming someone: the certificate's
+    /// worker, or the plaintext claim — and a nameless plaintext stream is
+    /// refused rather than registered under the empty id.
+    #[test]
+    fn a_per_worker_stream_must_name_its_worker() {
+        use horde_identity::PrincipalRole;
+        use horde_proto::v1::WorkerId;
+
+        let claimed = WorkerId::new("w9");
+        let plain = tonic::Request::new(());
+        assert_eq!(
+            super::named_worker(&plain, Some(&claimed), "login").ok(),
+            Some("w9".to_owned())
+        );
+        let nameless = super::named_worker(&plain, None, "login")
+            .expect_err("a nameless plaintext stream serves nobody");
+        assert_eq!(nameless.code(), tonic::Code::InvalidArgument);
+        assert!(nameless.message().contains("login"), "{nameless}");
+
+        let certified = as_peer((), Some(PrincipalRole::Worker));
+        assert_eq!(
+            super::named_worker(&certified, None, "forward").ok(),
+            Some("gpu-box".to_owned())
+        );
     }
 
     /// Instance reports may name the caller or nobody; naming another

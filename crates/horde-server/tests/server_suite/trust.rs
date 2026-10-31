@@ -9,7 +9,6 @@
 use crate::common::Setup;
 use horde_identity::{PrincipalRole, StoredIdentity};
 use horde_proto::prost::Message;
-use horde_proto::prost_types::FileDescriptorSet;
 use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
 use horde_proto::v1::{
     AdapterCapability, AgentId, AnswerPermissionRequest, Event, HarnessCapability, JournaledEvent,
@@ -19,25 +18,8 @@ use horde_proto::v1::{
     event::Kind, push_events_request, push_events_response,
     worker_service_client::WorkerServiceClient,
 };
-use horde_server::trust::{Admits, GUARDED_SERVICES, admits};
+use horde_server::trust::{Admits, admits, guarded_method_paths};
 use horde_server_testkit::secure::{SecureHarness, hello, serve_secured, within};
-
-/// Every guarded method path the compiled proto declares.
-fn guarded_methods() -> Setup<Vec<String>> {
-    let set = FileDescriptorSet::decode(horde_proto::FILE_DESCRIPTOR_SET)?;
-    let mut paths = Vec::new();
-    for file in &set.file {
-        for service in &file.service {
-            let full = format!("{}.{}", file.package(), service.name());
-            if GUARDED_SERVICES.contains(&full.as_str()) {
-                for method in &service.method {
-                    paths.push(format!("/{full}/{}", method.name()));
-                }
-            }
-        }
-    }
-    Ok(paths)
-}
 
 /// Calls `path` with an empty body as `identity`, returning the status. The
 /// door rules before any body is decoded, so an empty unary message reaches
@@ -75,7 +57,7 @@ async fn every_guarded_method_refuses_the_role_its_policy_excludes() -> Setup<()
     let client = harness.enroll(PrincipalRole::Client, "laptop").await?;
 
     let mut refused = 0_u32;
-    for path in guarded_methods()? {
+    for path in guarded_method_paths() {
         let (wrong, who) = match admits(&path) {
             Some(Admits::Clients) => (&worker, "worker:mac-studio"),
             Some(Admits::Workers) => (&client, "client:laptop"),
@@ -107,8 +89,7 @@ async fn every_guarded_method_refuses_the_role_its_policy_excludes() -> Setup<()
 #[tokio::test]
 async fn a_worker_cannot_register_as_another_worker() -> Setup<()> {
     let harness = serve_secured().await?;
-    let identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
-    let mut worker = harness.worker_client(&identity).await?;
+    let mut worker = certified_worker(&harness).await?;
 
     let forged = within(
         "the forged registration",
@@ -130,6 +111,44 @@ async fn a_worker_cannot_register_as_another_worker() -> Setup<()> {
         Some("mac-studio".to_owned())
     );
     Ok(())
+}
+
+/// The worker spine as the enrolled worker `mac-studio`.
+async fn certified_worker(
+    harness: &SecureHarness,
+) -> Setup<WorkerServiceClient<tonic::transport::Channel>> {
+    let identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    harness.worker_client(&identity).await
+}
+
+/// A registered `mac-studio` advertising `rewrites`, an enrolled operator,
+/// and a session the operator created — whose root the scheduler placed on
+/// `mac-studio`. Returns the worker spine, the operator's identity, the
+/// session id, and the root agent id.
+async fn placed_root(
+    harness: &SecureHarness,
+    rewrites: bool,
+) -> Setup<(
+    WorkerServiceClient<tonic::transport::Channel>,
+    StoredIdentity,
+    String,
+    String,
+)> {
+    let mut worker = certified_worker(harness).await?;
+    within(
+        "the registration",
+        worker.register_worker(registration("mac-studio", capabilities(rewrites))),
+    )
+    .await??;
+    let operator = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let mut client = harness.client(&operator).await?;
+    let (summary, root) = within("the session", client.create_session("trust", "")).await??;
+    let session = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or("a session id")?;
+    Ok((worker, operator, session, root.to_string()))
 }
 
 fn registration(name: &str, capabilities: WorkerCapabilities) -> RegisterWorkerRequest {
@@ -196,21 +215,7 @@ async fn journal(
 #[tokio::test]
 async fn a_certified_workers_server_only_event_is_dead_lettered() -> Setup<()> {
     let harness = serve_secured().await?;
-    let identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
-    let mut worker = harness.worker_client(&identity).await?;
-    within(
-        "the registration",
-        worker.register_worker(registration("mac-studio", capabilities(true))),
-    )
-    .await??;
-    let operator = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let mut client = harness.client(&operator).await?;
-    let (summary, root) = within("the session", client.create_session("origin", "")).await??;
-    let session = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .ok_or("a session id")?;
+    let (mut worker, _operator, session, root) = placed_root(&harness, true).await?;
 
     let catalog_change = Event {
         kind: Some(Kind::McpServerConfigChanged(
@@ -219,7 +224,7 @@ async fn a_certified_workers_server_only_event_is_dead_lettered() -> Setup<()> {
         ..Event::default()
     };
     let observed = Event {
-        agent_id: Some(AgentId::new(root.to_string())),
+        agent_id: Some(AgentId::new(root)),
         kind: Some(Kind::TurnInterrupted(
             horde_proto::v1::TurnInterrupted::default(),
         )),
@@ -323,22 +328,8 @@ async fn pending_permission(
     harness: &SecureHarness,
     rewrites: bool,
 ) -> Setup<ControlPlaneServiceClient<tonic::transport::Channel>> {
-    let identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
-    let mut worker = harness.worker_client(&identity).await?;
-    within(
-        "the registration",
-        worker.register_worker(registration("mac-studio", capabilities(rewrites))),
-    )
-    .await??;
-    let operator = harness.enroll(PrincipalRole::Client, "laptop").await?;
-    let mut client = harness.client(&operator).await?;
-    let (summary, root) = within("the session", client.create_session("asks", "")).await??;
-    let session = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .ok_or("a session id")?;
-    raise(&mut worker, &session, &root.to_string(), "call-1").await?;
+    let (mut worker, operator, session, root) = placed_root(harness, rewrites).await?;
+    raise(&mut worker, &session, &root, "call-1").await?;
     let channel = harness.main_endpoint_as(&operator)?.connect().await?;
     Ok(ControlPlaneServiceClient::new(channel))
 }

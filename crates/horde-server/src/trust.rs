@@ -88,6 +88,36 @@ pub const GUARDED_SERVICES: [&str; 3] = [
     "horde.v1.BlobService",
 ];
 
+/// Every `/package.Service/Method` path the compiled proto declares on the
+/// [`GUARDED_SERVICES`] — the list a completeness check walks, read from the
+/// schema itself so a new RPC appears in it without anyone adding it.
+/// Empty only if the compiled descriptor cannot be read, which every check
+/// over it then fails on.
+#[must_use]
+pub fn guarded_method_paths() -> Vec<String> {
+    use prost::Message;
+    let Ok(set) =
+        horde_proto::prost_types::FileDescriptorSet::decode(horde_proto::FILE_DESCRIPTOR_SET)
+    else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for file in &set.file {
+        for service in &file.service {
+            let full = format!("{}.{}", file.package(), service.name());
+            if GUARDED_SERVICES.contains(&full.as_str()) {
+                paths.extend(
+                    service
+                        .method
+                        .iter()
+                        .map(|method| format!("/{full}/{}", method.name())),
+                );
+            }
+        }
+    }
+    paths
+}
+
 /// The policy for one gRPC method path; `None` for a path this build does
 /// not know, which the door refuses.
 ///
@@ -277,12 +307,10 @@ pub fn holds_agent(placed_on: Option<&str>, worker_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admits, GUARDED_SERVICES, RpcPath, admits, holds_agent, rule, stamp_rpc_path,
-        worker_identity,
+        Admits, RpcPath, admits, guarded_method_paths as declared_methods, holds_agent, rule,
+        stamp_rpc_path, worker_identity,
     };
     use horde_identity::{PeerIdentity, Principal, PrincipalRole};
-    use horde_proto::prost_types::FileDescriptorSet;
-    use prost::Message;
 
     fn identity(role: PrincipalRole, name: &str) -> PeerIdentity {
         PeerIdentity {
@@ -291,23 +319,20 @@ mod tests {
         }
     }
 
-    /// Every `/package.Service/Method` the compiled proto declares on the
-    /// guarded services.
-    fn declared_methods() -> Vec<String> {
-        let set = FileDescriptorSet::decode(horde_proto::FILE_DESCRIPTOR_SET)
-            .expect("the compiled descriptor decodes");
-        let mut paths = Vec::new();
-        for file in &set.file {
-            for service in &file.service {
-                let full = format!("{}.{}", file.package(), service.name());
-                if GUARDED_SERVICES.contains(&full.as_str()) {
-                    for method in &service.method {
-                        paths.push(format!("/{full}/{}", method.name()));
-                    }
-                }
-            }
+    /// The walk reads every guarded service and nothing else: the enrollment
+    /// service is served to certificate-less peers and has no row.
+    #[test]
+    fn the_method_walk_covers_the_guarded_services_only() {
+        let paths = declared_methods();
+        for service in super::GUARDED_SERVICES {
+            assert!(
+                paths
+                    .iter()
+                    .any(|path| path.starts_with(&format!("/{service}/"))),
+                "{service} must be walked"
+            );
         }
-        paths
+        assert!(!paths.iter().any(|path| path.contains("EnrollmentService")));
     }
 
     /// The structural half of ADR-0009: an RPC added to a guarded service

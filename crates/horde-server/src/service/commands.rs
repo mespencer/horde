@@ -711,7 +711,7 @@ pub async fn issued_to(log: &EventLog, worker_id: &str) -> Result<u64, ServerErr
 #[cfg(test)]
 mod tests {
     use horde_proto::v1::{
-        AgentSpawned, AgentSpec, DeliveryMode, PlacementChanged, TurnInterrupted, WorkerId,
+        AgentSpec, DeliveryMode, PlacementChanged, TurnInterrupted, WorkerId,
         stream_commands_response::Command,
     };
 
@@ -732,19 +732,7 @@ mod tests {
         }
     }
 
-    fn spawn_event(agent: &str, parent: Option<&str>) -> Event {
-        Event {
-            agent_id: Some(AgentId::new(agent)),
-            occurred_at: None,
-            idempotency_key: String::new(),
-            kind: Some(Kind::AgentSpawned(AgentSpawned {
-                parent_agent_id: parent.map(AgentId::new),
-                spawned_by: None,
-                spec: Some(AgentSpec::default()),
-                tree_path: Vec::new(),
-            })),
-        }
-    }
+    use crate::state::fixture::spawned as spawn_event;
 
     /// The binding truth table (W7b finding 5): a concrete request binds as
     /// itself, a tier binds its catalog's first candidate deterministically,

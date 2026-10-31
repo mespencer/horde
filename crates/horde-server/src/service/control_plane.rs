@@ -1791,38 +1791,26 @@ mod tests {
     /// runs an agent in.
     #[test]
     fn a_worker_conduit_is_scoped_to_its_own_agents() {
-        use horde_proto::prost::Message;
-        use horde_proto::v1::{AgentId, AgentSpawned, Event, event::Kind};
+        use horde_proto::v1::{AgentId, Event, event::Kind};
 
-        let event = |kind: Kind| Event {
-            agent_id: Some(AgentId::new("parent")),
-            occurred_at: None,
-            idempotency_key: String::new(),
-            kind: Some(kind),
-        };
         let placed = crate::placement::wire_placement(
             "parent",
             &crate::scheduler::Placement::Placed {
                 worker_id: "w-1".to_owned(),
             },
         );
-        let events: Vec<crate::log::StoredEvent> = [
-            event(Kind::AgentSpawned(AgentSpawned::default())),
-            event(Kind::PlacementChanged(horde_proto::v1::PlacementChanged {
-                placement: Some(placed),
-                adapter_capabilities: Vec::new(),
-            })),
-        ]
-        .iter()
-        .enumerate()
-        .map(|(index, event)| crate::log::StoredEvent {
-            session_id: "s1".to_owned(),
-            sequence: index as u64 + 1,
-            recorded_at_unix_ms: 0,
-            payload: event.encode_to_vec(),
-        })
-        .collect();
-        let state = crate::state::SessionState::project("s1", &events).expect("projects");
+        let state = crate::state::fixture::projected(&[
+            crate::state::fixture::spawned("parent", None),
+            Event {
+                agent_id: Some(AgentId::new("parent")),
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(Kind::PlacementChanged(horde_proto::v1::PlacementChanged {
+                    placement: Some(placed),
+                    adapter_capabilities: Vec::new(),
+                })),
+            },
+        ]);
 
         assert!(super::conduit_may_spawn(&state, Some("parent"), "w-1").is_ok());
         for (parent, worker) in [
