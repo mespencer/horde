@@ -7,13 +7,14 @@
 //!   for the lifetime of one child process, so a Worker that summed the numbers
 //!   it was handed would over-bill quadratically (spike W1c measured 0.0037 →
 //!   0.0063 → 0.0078 across three turns of one process).
-//! * Codex reports `thread/tokenUsage/updated` with a `last` field that is
-//!   already the turn (spike W2c), so there is nothing to difference.
+//! * Codex reports `thread/tokenUsage/updated` once per *model call*, with
+//!   `last` covering that call alone and `total` running for the thread
+//!   (transcript 33: six readings in one turn). Taking the first `last` as the
+//!   turn undercounts; the thread `total` is the figure to difference.
 //!
 //! Normalizing *inside* each adapter means the Worker never has to know which
-//! harness accumulates. [`UsageAccumulator`] exists for the first kind, so that
-//! subtraction happens in one audited place; the second kind simply does not
-//! use it.
+//! harness accumulates. Both adapters feed their running totals to
+//! [`UsageAccumulator`], so that subtraction happens in one audited place.
 
 use core::ops::{Add, AddAssign, Sub};
 use core::time::Duration;
