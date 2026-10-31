@@ -255,3 +255,58 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     let (status, _, _) = worker.wait().await.expect("the worker exits");
     assert!(status.success());
 }
+
+/// One `horde interrupt` is one request and one acknowledgement, and then
+/// the log is quiet (ADR-0009).
+///
+/// The storm this pins: the server folded *every* `TurnInterrupted` into an
+/// interrupt command, including the one the worker journals to say it
+/// carried the interrupt out — so each ack commanded another interrupt,
+/// whose ack commanded another, and the head ran from 20 to 2662 in three
+/// seconds. "Settled" is asserted by a fact rather than a sleep: a steering
+/// message sent after the ack is delivered on the same ordered command
+/// stream, so by the time its echo is in the log, any interrupt the ack had
+/// caused would have been applied and acknowledged ahead of it.
+#[tokio::test]
+async fn an_interrupt_is_requested_once_and_acknowledged_once() {
+    let system = System::launch().await;
+    let mut worker = system
+        .spawn_worker("w-1", &system.state.path().join("w-1"), &[])
+        .await;
+    let (session_id, root) = system.placed_session("e2e interrupt").await;
+
+    let interrupted = |events: &[serde_json::Value]| {
+        events
+            .iter()
+            .filter(|event| event["kind"] == "turn_interrupted")
+            .count()
+    };
+
+    system
+        .cli_json(&["interrupt", &root, "--reason", "stop"])
+        .await;
+    system
+        .sync_until(&session_id, "the worker's acknowledgement", |events| {
+            interrupted(events) >= 2
+        })
+        .await;
+
+    system.cli_json(&["send", &root, "after the interrupt"]).await;
+    let events = system
+        .sync_until(&session_id, "the post-interrupt echo", |events| {
+            outputs(events)
+                .iter()
+                .any(|text| text == "after the interrupt")
+        })
+        .await;
+    assert_eq!(
+        interrupted(&events),
+        2,
+        "one request and its one acknowledgement — anything more is the \
+         acknowledgement being folded into another request: {events:?}"
+    );
+
+    worker.terminate().await.expect("SIGTERM sends");
+    let (status, _, _) = worker.wait().await.expect("the worker exits");
+    assert!(status.success());
+}
