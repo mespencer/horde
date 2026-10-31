@@ -308,6 +308,45 @@ async fn a_worker_less_seed_queues_rather_than_placing() {
     );
 }
 
+/// A rewriting worker registers, and a session seeded after it places its
+/// root there with input rewriting stamped on the placement — the fact a
+/// narrowing needs (ADR-0009).
+#[tokio::test]
+async fn a_rewriting_worker_takes_the_next_root_with_rewriting_stamped() {
+    let endpoint = serve().await.expect("a listening server");
+    horde_server_testkit::register_rewriting_worker(&endpoint, "rewriter")
+        .await
+        .expect("a versioned worker registers");
+    let (mut client, session_id, _root) = seeded(&endpoint, "rewriting")
+        .await
+        .expect("a seeded session");
+
+    let mut stamped = Vec::new();
+    client
+        .sync(
+            &SyncOptions::new(session_id),
+            |envelope| {
+                if let Some(Kind::PlacementChanged(changed)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                {
+                    stamped.push(changed.adapter_capabilities.clone());
+                }
+            },
+            |_| {},
+        )
+        .await
+        .expect("replay");
+    assert_eq!(
+        stamped,
+        vec![vec![
+            horde_proto::v1::AdapterCapability::ToolInputRewrite as i32
+        ]],
+        "the root lands on the rewriter, and the placement says it can rewrite"
+    );
+}
+
 /// `serve_with_blob_store` really wires the store, rooted where the caller
 /// said: bytes uploaded through the endpoint land as a file under the
 /// caller's directory, and download hands them back. The on-disk effect is

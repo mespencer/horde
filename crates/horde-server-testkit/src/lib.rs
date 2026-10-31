@@ -292,9 +292,9 @@ pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup
             }),
             worker_id: Some(WorkerId::new(worker_id)),
             capabilities: Some(WorkerCapabilities {
+                // The worker's only harness is its default, so a spawn
+                // naming no provider runs on it.
                 harnesses: vec![HarnessCapability {
-                    provider: "fake".to_owned(),
-                    installed: true,
                     capabilities: vec![AdapterCapability::ToolInputRewrite as i32],
                     ..HarnessCapability::default()
                 }],

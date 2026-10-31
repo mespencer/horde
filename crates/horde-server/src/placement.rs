@@ -831,6 +831,62 @@ mod tests {
         );
     }
 
+    /// Which harness's capabilities a placement stamps (ADR-0009): the
+    /// spec's provider when it names one, the worker's first harness when it
+    /// names none — or names the empty provider — and nothing for a provider
+    /// the worker does not run.
+    #[test]
+    fn the_stamped_capabilities_are_the_specs_providers_harness() {
+        use horde_proto::v1::{
+            AdapterCapability, ConcreteModel, HarnessCapability, ModelSelection,
+            WorkerCapabilities, model_selection::Selection,
+        };
+        let harness = |provider: &str, capability: AdapterCapability| HarnessCapability {
+            provider: provider.to_owned(),
+            installed: true,
+            capabilities: vec![capability as i32],
+            ..HarnessCapability::default()
+        };
+        let worker = WorkerCapabilities {
+            harnesses: vec![
+                harness("fake", AdapterCapability::Resumable),
+                harness("codex", AdapterCapability::ToolInputRewrite),
+            ],
+            ..WorkerCapabilities::default()
+        };
+        let naming = |provider: &str| AgentSpec {
+            model: Some(ModelSelection {
+                selection: Some(Selection::Concrete(ConcreteModel {
+                    provider: provider.to_owned(),
+                    model: "m".to_owned(),
+                    provider_account: String::new(),
+                })),
+            }),
+            ..AgentSpec::default()
+        };
+
+        assert_eq!(
+            adapter_capabilities(&worker, Some(&naming("codex"))),
+            vec![AdapterCapability::ToolInputRewrite as i32],
+            "a named provider picks its own harness, not the first"
+        );
+        assert_eq!(
+            adapter_capabilities(&worker, None),
+            vec![AdapterCapability::Resumable as i32],
+            "no spec runs on the worker's default harness"
+        );
+        assert_eq!(
+            adapter_capabilities(&worker, Some(&naming(""))),
+            vec![AdapterCapability::Resumable as i32],
+            "an empty provider is no provider"
+        );
+        assert!(
+            adapter_capabilities(&worker, Some(&naming("ollama"))).is_empty(),
+            "a provider the worker does not run can do nothing"
+        );
+        assert!(adapter_capabilities(&WorkerCapabilities::default(), None).is_empty());
+    }
+
     #[test]
     fn a_spec_names_a_workspace_only_when_the_id_is_non_empty() {
         assert_eq!(workspace_of(&AgentSpec::default()), None);
