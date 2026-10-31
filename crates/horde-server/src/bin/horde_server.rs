@@ -25,6 +25,10 @@ fn main() -> ExitCode {
 /// startup refusal, printed before any subscriber exists to log it.
 fn run() -> Result<ExitCode, String> {
     let parsed = invocation(std::env::args().skip(1))?;
+    if let Invocation::Print(text) = &parsed {
+        print!("{text}");
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // The runtime exists before telemetry because the OTLP exporter's gRPC
     // channel lives on it; `CheckOnly` pays for an idle runtime, which is
@@ -56,6 +60,7 @@ fn run() -> Result<ExitCode, String> {
     let code = match parsed {
         Invocation::CheckOnly { database } => check_only(&database),
         Invocation::Serve(config) => runtime.block_on(serve_until_interrupted(&config)),
+        Invocation::Print(_) => ExitCode::SUCCESS,
     };
 
     if let Some(telemetry) = telemetry {

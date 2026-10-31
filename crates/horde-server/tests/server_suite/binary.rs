@@ -14,23 +14,56 @@ type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 ///
 /// Async because a blocking `std::process::Command::output` would stall the
 /// runtime this test is running on.
-async fn horde_server(argument: Option<&str>) -> Setup<std::process::ExitStatus> {
-    Ok(horde_server_with_env(argument, &[]).await?.status)
+async fn horde_server(arguments: &[&str]) -> Setup<std::process::ExitStatus> {
+    Ok(horde_server_with_env(arguments, &[]).await?.status)
 }
 
 /// Same, through the testkit's scrubbed runner, with the whole output kept:
 /// the telemetry tests read the refusal off stderr, not just the exit code.
 async fn horde_server_with_env(
-    argument: Option<&str>,
+    arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Setup<std::process::Output> {
-    let arguments: Vec<&str> = argument.into_iter().collect();
     horde_server_testkit::otlp_scrubbed_run(
         env!("CARGO_BIN_EXE_horde-server"),
-        &arguments,
+        arguments,
         environment,
     )
     .await
+}
+
+/// `--help` is output and a success, through the binary's own `main`; a
+/// bare invocation is a refusal that names both modes — and creates no
+/// database anywhere, the stray-`horde.db` trap closed.
+#[tokio::test]
+async fn help_prints_and_a_bare_invocation_refuses_without_a_database() {
+    let help = horde_server_with_env(&["--help"], &[])
+        .await
+        .expect("the binary must run");
+    assert!(help.status.success(), "help is not a failure");
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        text.contains("--serve") && text.contains("--check"),
+        "help names the modes: {text}"
+    );
+
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_horde-server"));
+    command.current_dir(directory.path());
+    let bare = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .expect("a refusal is immediate")
+        .expect("the binary must run");
+    assert!(!bare.status.success(), "no mode is a refusal");
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(stderr.contains("--serve"), "{stderr}");
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("the dir reads")
+            .count(),
+        0,
+        "nothing lands in the working directory"
+    );
 }
 
 #[tokio::test]
@@ -38,7 +71,7 @@ async fn opening_a_usable_database_exits_successfully() {
     let directory = tempfile::tempdir().expect("a temp dir");
     let path = directory.path().join("horde.db");
 
-    let status = horde_server(Some(&path.to_string_lossy()))
+    let status = horde_server(&["--check", &path.to_string_lossy()])
         .await
         .expect("the binary must run");
 
@@ -59,7 +92,7 @@ async fn a_database_that_cannot_be_opened_exits_nonzero() {
     let directory = tempfile::tempdir().expect("a temp dir");
 
     // A directory is not a database file.
-    let status = horde_server(Some(&directory.path().to_string_lossy()))
+    let status = horde_server(&["--check", &directory.path().to_string_lossy()])
         .await
         .expect("the binary must run");
 
@@ -74,7 +107,7 @@ async fn a_database_that_cannot_be_opened_exits_nonzero() {
 async fn check_only_with_otlp(environment: &[(&str, &str)]) -> Setup<std::process::Output> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("horde.db");
-    horde_server_with_env(Some(&path.to_string_lossy()), environment).await
+    horde_server_with_env(&["--check", &path.to_string_lossy()], environment).await
 }
 
 /// OTLP misconfiguration is a startup refusal (DESIGN §12 wiring): a sample
@@ -130,7 +163,7 @@ async fn a_dead_collector_does_not_change_the_exit_code() {
 /// A mistyped flag must refuse loudly, not silently serve with defaults.
 #[tokio::test]
 async fn an_unknown_flag_exits_nonzero() {
-    let status = horde_server(Some("--bnid"))
+    let status = horde_server(&["--serve", "--bnid"])
         .await
         .expect("the binary must run");
     assert!(!status.success(), "an unknown flag must be a refusal");

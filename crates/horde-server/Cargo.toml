@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+# The binary's command line (`--help`, and refusals that name the flag),
+# the same parser the `horde` CLI uses.
+clap = { version = "4.5", features = ["derive"] }
 horde-identity = { workspace = true }
 # The hub core (ADR-0004): upstream connections and the namespaced routing
 # the worker-forwarded hub calls are answered from.

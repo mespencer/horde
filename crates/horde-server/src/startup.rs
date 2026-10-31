@@ -5,8 +5,9 @@
 //! only by running the binary — which coverage cannot see and mutation testing
 //! therefore reports as untested however carefully it was written.
 //!
-//! Two invocations exist. Bare `horde-server [db]` opens the log and exits —
-//! the pre-wave-5 behavior, kept as the health check it always was. With
+//! Two invocations exist, and one of them must be asked for by name (a bare
+//! `horde-server` is a refusal, ADR-0007's 2026-10-31 amendment).
+//! `--check [db]` opens the log and exits — the health check. With
 //! `--serve`, the networked entrypoint DESIGN §3 sequenced into wave 5 comes
 //! up: the CA is loaded or created, both TLS listeners bind, and — the
 //! bootstrap answer to "who mints the first code with no client enrolled to
@@ -26,27 +27,21 @@ use crate::service::enrollment::{EnrollmentAuthority, MintedCode, wall_clock_ms}
 use crate::transport::BoundListener;
 use horde_identity::{CertificateAuthority, Principal, PrincipalRole};
 
-/// Where the log lives when the operator does not say.
-pub const DEFAULT_DATABASE: &str = "horde.db";
+/// The log's file name inside the default state directory.
+pub const DATABASE_FILE: &str = "horde.db";
 
-/// Where identity material lives when the operator does not say.
-pub const DEFAULT_STATE_DIR: &str = "horde-state";
+/// The server's state directory under `$HOME` when the operator does not
+/// say — the same `server/` that `horde up` lays out under `~/.horde`, and
+/// never the working directory, where a stray `horde.db` would land in
+/// whatever checkout the server happened to start from.
+pub const DEFAULT_STATE_SUBDIR: &str = ".horde/server";
+
+/// The lock a serving server holds on its state directory, so a second
+/// server on the same state refuses instead of sharing a CA and a log.
+pub const STATE_LOCK_FILE: &str = "server.lock";
 
 /// The principal name of the bootstrap client code.
 pub const BOOTSTRAP_CLIENT_NAME: &str = "operator";
-
-/// Chooses the database path from the command line.
-///
-/// Separated from opening it so the choice is testable without touching a
-/// filesystem: an empty argument is not a path, and treating it as one would
-/// create a file named after nothing.
-#[must_use]
-pub fn database_path(arguments: impl IntoIterator<Item = String>) -> String {
-    arguments
-        .into_iter()
-        .find(|argument| !argument.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_DATABASE.to_owned())
-}
 
 /// Opens the log the server will serve from.
 ///
@@ -86,172 +81,83 @@ pub struct ServeConfig {
 /// What one command line asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    /// Open the log, report, exit — the health check.
+    /// `--check`: open the log, report, exit — the health check.
     CheckOnly { database: String },
-    /// The networked server.
+    /// `--serve`: the networked server.
     Serve(Box<ServeConfig>),
+    /// `--help` or `--version`: text for stdout, then a successful exit.
+    Print(String),
 }
 
-/// What the flags said, before the shape rules are applied.
-#[derive(Debug, Default)]
-struct ParsedFlags {
-    database: Option<String>,
+/// The command line, as clap reads it. Every serve-time flag requires
+/// `--serve`, and one of `--serve` or `--check` is required: a bare
+/// `horde-server` used to open (and create) `horde.db` in whatever
+/// directory it ran from, which is how stray databases landed in
+/// checkouts. Values may not start with `-`, so a forgotten value never
+/// swallows the next flag as a path.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "horde-server",
+    version,
+    about = "The Horde control plane: the event log, the mTLS listeners, and the enrollment CA.",
+    group = clap::ArgGroup::new("mode").required(true).args(["serve", "check"])
+)]
+struct ServerArgs {
+    /// The event log's SQLite file. Defaults to `~/.horde/server/horde.db`
+    /// (inside the default state directory).
+    database: Option<PathBuf>,
+
+    /// Run the networked server.
+    #[arg(long)]
     serve: bool,
+
+    /// Open the log and exit: the health check.
+    #[arg(long)]
+    check: bool,
+
+    /// Where the CA, blobs, and bootstrap token live. Defaults to
+    /// `~/.horde/server`, created owner-only.
+    #[arg(long, requires = "serve")]
     state_dir: Option<PathBuf>,
-    bind: Option<SocketAddr>,
-    enrollment_bind: Option<SocketAddr>,
-    subject_names: Vec<String>,
-    blob_max_bytes: Option<u64>,
+
+    /// The mTLS listener both spines share.
+    #[arg(long, requires = "serve", default_value = "127.0.0.1:7777")]
+    bind: SocketAddr,
+
+    /// The TLS-only enrollment listener.
+    #[arg(long, requires = "serve", default_value = "127.0.0.1:7778")]
+    enrollment_bind: SocketAddr,
+
+    /// Serve the git Relay here (loopback only).
+    #[arg(long, requires = "serve")]
     relay_bind: Option<SocketAddr>,
-    worker_lease_secs: Option<u64>,
+
+    /// An extra name the listener certificate answers to — the host other
+    /// machines dial. Repeatable. Join tokens name the first one when the
+    /// listener binds the unspecified address.
+    #[arg(long = "san", requires = "serve")]
+    subject_names: Vec<String>,
+
+    /// The blob store's per-blob cap in bytes.
+    #[arg(long, requires = "serve")]
+    blob_max_bytes: Option<u64>,
+
+    /// Seconds a disconnected worker may stay away before its agents are
+    /// declared lost.
+    #[arg(long, requires = "serve", value_parser = clap::value_parser!(u64).range(1..))]
+    worker_lease: Option<u64>,
 }
 
-impl ParsedFlags {
-    /// Folds one argument (consuming its value from `arguments` if it takes
-    /// one) into the parse: the mode flag, then the serve-time flags, then
-    /// whatever is left.
-    fn apply(
-        &mut self,
-        argument: &str,
-        arguments: &mut impl Iterator<Item = String>,
-    ) -> Result<(), String> {
-        let mut value_of = |flag: &str| {
-            arguments
-                .next()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| format!("{flag} needs a value"))
-        };
-        if argument == "--serve" {
-            self.serve = true;
-            return Ok(());
-        }
-        if self.apply_serve_flag(argument, &mut value_of)? {
-            return Ok(());
-        }
-        self.apply_bare(argument)
-    }
-
-    /// Applies one of the flags that configure how `--serve` serves.
-    /// `Ok(false)` means the argument is not one of them. Split from the
-    /// bind-address flags by subject so neither half outgrows the
-    /// complexity bar as listeners accumulate.
-    fn apply_serve_flag(
-        &mut self,
-        argument: &str,
-        value_of: &mut impl FnMut(&str) -> Result<String, String>,
-    ) -> Result<bool, String> {
-        if self.apply_bind_flag(argument, value_of)? {
-            return Ok(true);
-        }
-        match argument {
-            "--state-dir" => self.state_dir = Some(PathBuf::from(value_of("--state-dir")?)),
-            "--san" => self.subject_names.push(value_of("--san")?),
-            "--blob-max-bytes" => {
-                let value = value_of("--blob-max-bytes")?;
-                self.blob_max_bytes = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("--blob-max-bytes {value} is not a byte count"))?,
-                );
-            }
-            "--worker-lease" => {
-                let value = value_of("--worker-lease")?;
-                self.worker_lease_secs = Some(
-                    value
-                        .parse()
-                        .ok()
-                        .filter(|secs: &u64| *secs > 0)
-                        .ok_or_else(|| {
-                            format!("--worker-lease {value} is not a positive number of seconds")
-                        })?,
-                );
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    /// Applies one of the three listener-address flags.
-    fn apply_bind_flag(
-        &mut self,
-        argument: &str,
-        value_of: &mut impl FnMut(&str) -> Result<String, String>,
-    ) -> Result<bool, String> {
-        match argument {
-            "--bind" => self.bind = Some(parse_bind("--bind", &value_of("--bind")?)?),
-            "--enrollment-bind" => {
-                self.enrollment_bind = Some(parse_bind(
-                    "--enrollment-bind",
-                    &value_of("--enrollment-bind")?,
-                )?);
-            }
-            "--relay-bind" => {
-                self.relay_bind = Some(parse_bind("--relay-bind", &value_of("--relay-bind")?)?);
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    /// An argument that is not a known flag: the one positional (the
-    /// database path), or a refusal naming what it was.
-    fn apply_bare(&mut self, argument: &str) -> Result<(), String> {
-        if argument.starts_with("--") {
-            return Err(format!("unknown flag {argument}"));
-        }
-        if self.database.is_none() && !argument.trim().is_empty() {
-            self.database = Some(argument.to_owned());
-            return Ok(());
-        }
-        Err(format!("unexpected argument {argument}"))
-    }
-
-    /// Applies the shape rules and defaults, yielding the invocation.
-    fn conclude(self) -> Result<Invocation, String> {
-        let database = self.database.unwrap_or_else(|| DEFAULT_DATABASE.to_owned());
-        if !self.serve {
-            if self.bind.is_some()
-                || self.enrollment_bind.is_some()
-                || self.state_dir.is_some()
-                || self.blob_max_bytes.is_some()
-                || self.relay_bind.is_some()
-                || self.worker_lease_secs.is_some()
-            {
-                return Err("--bind, --enrollment-bind, --state-dir, --blob-max-bytes, \
-                     --relay-bind and --worker-lease need --serve"
-                    .to_owned());
-            }
-            return Ok(Invocation::CheckOnly { database });
-        }
-        Ok(Invocation::Serve(Box::new(ServeConfig {
-            database,
-            state_dir: self
-                .state_dir
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
-            // Loopback defaults: binding wider is a deliberate act, exactly
-            // as before mTLS existed — the difference is that now it works.
-            bind: self
-                .bind
-                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7777))),
-            enrollment_bind: self
-                .enrollment_bind
-                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7778))),
-            subject_names: self.subject_names,
-            blob_max_bytes: self.blob_max_bytes,
-            relay_bind: self.relay_bind,
-            worker_lease: self.worker_lease_secs.map(std::time::Duration::from_secs),
-        })))
-    }
+/// Parses the command line, defaulting under `$HOME`.
+///
+/// # Errors
+///
+/// A human-readable refusal naming the flag that was wrong.
+pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
+    invocation_in(arguments, std::env::var_os("HOME").map(PathBuf::from))
 }
 
-/// A bind flag's value as an address, refused with the flag's own name.
-fn parse_bind(flag: &str, value: &str) -> Result<SocketAddr, String> {
-    value
-        .parse()
-        .map_err(|_| format!("{flag} {value} is not an address:port"))
-}
-
-/// Parses the command line.
+/// [`invocation`] with `$HOME` passed in, so the defaults are testable.
 ///
 /// Pure so every flag combination is testable without a process. Unknown
 /// flags are errors rather than ignored: a mistyped `--bnid` silently
@@ -259,14 +165,47 @@ fn parse_bind(flag: &str, value: &str) -> Result<SocketAddr, String> {
 ///
 /// # Errors
 ///
-/// A human-readable refusal naming the flag that was wrong.
-pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
-    let mut flags = ParsedFlags::default();
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        flags.apply(&argument, &mut arguments)?;
+/// A human-readable refusal naming the flag that was wrong, or no `$HOME`
+/// to default under when nothing named the state.
+pub fn invocation_in(
+    arguments: impl IntoIterator<Item = String>,
+    home: Option<PathBuf>,
+) -> Result<Invocation, String> {
+    use clap::Parser;
+    let program = std::iter::once("horde-server".to_owned());
+    let args = match ServerArgs::try_parse_from(program.chain(arguments)) {
+        Ok(args) => args,
+        Err(error) if !error.use_stderr() => return Ok(Invocation::Print(error.to_string())),
+        Err(error) => return Err(error.to_string()),
+    };
+    let state_dir = match (args.state_dir, home) {
+        (Some(dir), _) => dir,
+        (None, Some(home)) => home.join(DEFAULT_STATE_SUBDIR),
+        (None, None) if args.database.is_some() && args.check => PathBuf::new(),
+        (None, None) => {
+            return Err("HOME is unset, so pass --state-dir (and a database path)".to_owned());
+        }
+    };
+    let database = args
+        .database
+        .unwrap_or_else(|| state_dir.join(DATABASE_FILE))
+        .to_string_lossy()
+        .into_owned();
+    if args.check {
+        return Ok(Invocation::CheckOnly { database });
     }
-    flags.conclude()
+    Ok(Invocation::Serve(Box::new(ServeConfig {
+        database,
+        state_dir,
+        // Loopback defaults: binding wider is a deliberate act, exactly as
+        // before mTLS existed — the difference is that now it works.
+        bind: args.bind,
+        enrollment_bind: args.enrollment_bind,
+        subject_names: args.subject_names,
+        blob_max_bytes: args.blob_max_bytes,
+        relay_bind: args.relay_bind,
+        worker_lease: args.worker_lease.map(std::time::Duration::from_secs),
+    })))
 }
 
 /// The listener credential's names: the defaults plus whatever the operator
@@ -298,6 +237,12 @@ pub struct RunningServer {
     pub server_fingerprint: String,
     /// Present exactly when no client held an active certificate at startup.
     pub bootstrap_code: Option<MintedCode>,
+    /// The enrollment listener as join tokens name it: `host:port` on a
+    /// host the listener certificate answers to ([`advertised_host`]).
+    pub advertised_enrollment: String,
+    /// This server's hold on its state directory: a second server on the
+    /// same state refuses while this lives.
+    pub state_lock: horde_identity::StateLock,
     /// The mounted git Relay, when `--relay-bind` asked for one.
     pub relay: Option<crate::relay::MountedRelay>,
     /// One line per hub-placed MCP server the startup warm-up touched
@@ -335,6 +280,10 @@ impl Drop for ChainTask {
 ///
 /// The log, the CA, the credential, or either bind failing.
 pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
+    // Held before anything opens: a second server on this state would share
+    // a CA, a log, and a bootstrap file with this one.
+    let state_lock = horde_identity::StateLock::acquire(&config.state_dir, STATE_LOCK_FILE)
+        .map_err(identity_startup)?;
     let log = open_log(&config.database)?;
     let now = wall_clock_ms();
 
@@ -357,10 +306,15 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         .await?,
     );
     let bootstrap_code = bootstrap_code_if_unclaimed(&authority, now).await?;
+    let advertised_enrollment = format!(
+        "{}:{}",
+        advertised_host(enrollment_listener.addr.ip(), &config.subject_names),
+        enrollment_listener.addr.port()
+    );
     sync_bootstrap_token_file(
         &config.state_dir,
         bootstrap_code.as_ref(),
-        enrollment_listener.addr,
+        &advertised_enrollment,
     )?;
 
     let core = reconciled_core(config, log).await?;
@@ -389,10 +343,42 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         enrollment,
         server_fingerprint,
         bootstrap_code,
+        advertised_enrollment,
+        state_lock,
         relay,
         hub_lines,
         permission_chain,
     })
+}
+
+/// The host a join token names for a listener bound at `bound`
+/// (ADR-0007, 2026-10-31 amendment). A token must name a host the
+/// listener certificate answers to, because the joiner stores
+/// `https://<host>:<port>` and dials it over mTLS forever after — and
+/// `0.0.0.0` is a bind address no peer can dial. So: a loopback bind or a
+/// bound address that is itself a `--san` names itself; otherwise the
+/// first `--san` (the name other machines were told to dial); with no
+/// `--san`, a specific address names itself and the unspecified address
+/// falls back to loopback — this machine only, which is honest.
+#[must_use]
+pub fn advertised_host(bound: IpAddr, subject_names: &[String]) -> String {
+    let own = || match bound {
+        IpAddr::V6(v6) => format!("[{v6}]"),
+        IpAddr::V4(v4) => v4.to_string(),
+    };
+    if bound.is_loopback() || subject_names.contains(&bound.to_string()) {
+        return own();
+    }
+    if let Some(first) = subject_names.first() {
+        return match first.parse::<std::net::Ipv6Addr>() {
+            Ok(v6) => format!("[{v6}]"),
+            Err(_) => first.clone(),
+        };
+    }
+    if bound.is_unspecified() {
+        return "127.0.0.1".to_owned();
+    }
+    own()
 }
 
 /// The serving core: blob store and worker lease from `config`, and the log
@@ -549,11 +535,12 @@ pub fn bootstrap_token_path(state_dir: &std::path::Path) -> PathBuf {
 }
 
 /// The one-token form of a minted code (ADR-0007): the enrollment listener
-/// this server actually bound, around the unchanged `secret.fingerprint`.
+/// this server actually bound, as [`advertised_host`] names it, around the
+/// unchanged `secret.fingerprint`.
 #[must_use]
-pub fn join_token_of(code: &MintedCode, enrollment_addr: SocketAddr) -> horde_identity::JoinToken {
+pub fn join_token_of(code: &MintedCode, advertised_enrollment: &str) -> horde_identity::JoinToken {
     horde_identity::JoinToken::new(
-        enrollment_addr.to_string(),
+        advertised_enrollment,
         horde_identity::JoinCode {
             secret: code.secret.clone(),
             server_fingerprint: code.server_fingerprint.clone(),
@@ -569,12 +556,12 @@ pub fn join_token_of(code: &MintedCode, enrollment_addr: SocketAddr) -> horde_id
 fn sync_bootstrap_token_file(
     state_dir: &std::path::Path,
     code: Option<&MintedCode>,
-    enrollment_addr: SocketAddr,
+    advertised_enrollment: &str,
 ) -> Result<(), ServerError> {
     let path = bootstrap_token_path(state_dir);
     match code {
         Some(code) => {
-            let token = join_token_of(code, enrollment_addr);
+            let token = join_token_of(code, advertised_enrollment);
             horde_identity::store::write_secret(&path, &format!("{token}\n"))
                 .map_err(identity_startup)
         }
@@ -607,7 +594,7 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
         // mintable (ADR-0007).
         lines.push(format!(
             "bootstrap-client-token {}",
-            join_token_of(code, running.enrollment.addr)
+            join_token_of(code, &running.advertised_enrollment)
         ));
     }
     lines
@@ -619,28 +606,7 @@ fn identity_startup(error: horde_identity::IdentityError) -> ServerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_DATABASE, database_path, open_log};
-
-    #[test]
-    fn the_first_argument_names_the_database() {
-        assert_eq!(
-            database_path(vec!["/tmp/horde-test.db".to_owned()]),
-            "/tmp/horde-test.db"
-        );
-    }
-
-    #[test]
-    fn no_argument_falls_back_to_the_default() {
-        assert_eq!(database_path(Vec::new()), DEFAULT_DATABASE);
-    }
-
-    /// An empty argument is not a path. Taking it literally would create a file
-    /// named after nothing, which is worse than falling back.
-    #[test]
-    fn a_blank_argument_falls_back_rather_than_naming_a_file_after_nothing() {
-        assert_eq!(database_path(vec![String::new()]), DEFAULT_DATABASE);
-        assert_eq!(database_path(vec!["   ".to_owned()]), DEFAULT_DATABASE);
-    }
+    use super::open_log;
 
     #[test]
     fn opening_creates_a_usable_log() {
@@ -671,23 +637,72 @@ mod tests {
     }
 
     fn parsed(arguments: &[&str]) -> Result<super::Invocation, String> {
-        super::invocation(arguments.iter().map(|s| (*s).to_owned()))
+        super::invocation_in(
+            arguments.iter().map(|s| (*s).to_owned()),
+            Some("/home/me".into()),
+        )
     }
 
+    /// A mode is asked for by name: a bare invocation (or a bare database
+    /// path, the old health check) is a refusal naming both modes, and
+    /// `--check` is the health check — defaulting under `$HOME`, never the
+    /// working directory.
     #[test]
-    fn a_bare_invocation_is_the_health_check_it_always_was() {
+    fn a_mode_must_be_named_and_check_is_the_health_check() {
+        for bare in [&[][..], &["/tmp/x.db"][..]] {
+            let refused = parsed(bare).expect_err("no mode named");
+            assert!(
+                refused.contains("--serve") && refused.contains("--check"),
+                "{bare:?}: {refused}"
+            );
+        }
         assert_eq!(
-            parsed(&["/tmp/x.db"]),
+            parsed(&["--check", "/tmp/x.db"]),
             Ok(super::Invocation::CheckOnly {
                 database: "/tmp/x.db".to_owned()
             })
         );
         assert_eq!(
-            parsed(&[]),
+            parsed(&["--check"]),
             Ok(super::Invocation::CheckOnly {
-                database: DEFAULT_DATABASE.to_owned()
+                database: "/home/me/.horde/server/horde.db".to_owned()
             })
         );
+        assert!(
+            parsed(&["--check", "--serve"]).is_err(),
+            "one mode at a time"
+        );
+    }
+
+    /// Help and version are output, not refusals; with no `$HOME` and no
+    /// named state there is nowhere honest to default to, unless the check
+    /// names its own database.
+    #[test]
+    fn help_prints_and_a_homeless_default_refuses() {
+        for flag in ["--help", "-h", "--version"] {
+            let Ok(super::Invocation::Print(text)) = parsed(&[flag]) else {
+                panic!("{flag} must print");
+            };
+            assert!(text.contains("horde-server"), "{flag}: {text}");
+        }
+        let homeless = |arguments: &[&str]| {
+            super::invocation_in(arguments.iter().map(|s| (*s).to_owned()), None)
+        };
+        let refused = homeless(&["--serve"]).expect_err("nowhere to default to");
+        assert!(refused.contains("--state-dir"), "{refused}");
+        assert!(homeless(&["--check"]).is_err());
+        assert_eq!(
+            homeless(&["--check", "/tmp/x.db"]),
+            Ok(super::Invocation::CheckOnly {
+                database: "/tmp/x.db".to_owned()
+            })
+        );
+        let Ok(super::Invocation::Serve(named)) =
+            homeless(&["--serve", "--state-dir", "/srv/horde"])
+        else {
+            panic!("a named state dir needs no HOME");
+        };
+        assert_eq!(named.database, "/srv/horde/horde.db");
     }
 
     #[test]
@@ -732,7 +747,7 @@ mod tests {
         let Ok(super::Invocation::Serve(defaulted)) = parsed(&["--serve"]) else {
             panic!("--serve alone must parse");
         };
-        assert_eq!(defaulted.database, DEFAULT_DATABASE);
+        assert_eq!(defaulted.database, "/home/me/.horde/server/horde.db");
         assert_eq!(
             defaulted.bind.to_string(),
             "127.0.0.1:7777",
@@ -741,7 +756,8 @@ mod tests {
         assert_eq!(defaulted.enrollment_bind.to_string(), "127.0.0.1:7778");
         assert_eq!(
             defaulted.state_dir,
-            std::path::PathBuf::from(super::DEFAULT_STATE_DIR)
+            std::path::PathBuf::from("/home/me/.horde/server"),
+            "state defaults under HOME, never the working directory"
         );
         assert_eq!(
             defaulted.blob_max_bytes, None,
@@ -755,16 +771,17 @@ mod tests {
     #[test]
     fn wrong_flags_are_refused_by_name() {
         for (arguments, needle) in [
-            (&["--bnid", "1.2.3.4:1"][..], "--bnid"),
+            (&["--serve", "--bnid", "1.2.3.4:1"][..], "--bnid"),
             (&["--serve", "--bind"][..], "--bind"),
             (
                 &["--serve", "--bind", "not-an-address"][..],
                 "not-an-address",
             ),
-            (
-                &["--serve", "--enrollment-bind", "7777"][..],
-                "--enrollment-bind 7777",
-            ),
+            (&["--serve", "--enrollment-bind", "7777"][..], "7777"),
+            // A forgotten value never swallows the next flag as a path, and
+            // a dash-prefixed word is never the database.
+            (&["--serve", "--state-dir", "--san", "x"][..], "--state-dir"),
+            (&["--serve", "-rf"][..], "-r"),
             (&["--bind", "127.0.0.1:1"][..], "--serve"),
             // Each serve-only flag alone must trip the rule by itself: the
             // refusal is an OR over them, not a conjunction.
@@ -776,18 +793,12 @@ mod tests {
                 &["--serve", "--relay-bind", "not-an-address"][..],
                 "not-an-address",
             ),
-            (
-                &["--serve", "--blob-max-bytes", "lots"][..],
-                "--blob-max-bytes lots",
-            ),
+            (&["--serve", "--blob-max-bytes", "lots"][..], "lots"),
             (&["--serve", "--blob-max-bytes"][..], "--blob-max-bytes"),
             (&["--worker-lease", "30"][..], "--serve"),
-            (
-                &["--serve", "--worker-lease", "soon"][..],
-                "--worker-lease soon",
-            ),
-            (&["--serve", "--worker-lease", "0"][..], "--worker-lease 0"),
-            (&["a.db", "b.db"][..], "b.db"),
+            (&["--serve", "--worker-lease", "soon"][..], "soon"),
+            (&["--serve", "--worker-lease", "0"][..], "--worker-lease"),
+            (&["--serve", "a.db", "b.db"][..], "b.db"),
         ] {
             let refused = parsed(arguments).expect_err("must refuse");
             assert!(
@@ -811,6 +822,34 @@ mod tests {
             vec!["127.0.0.1", "::1", "10.0.0.7"],
             "IP literals must become IP SANs — a DNS SAN of `10.0.0.7` never matches"
         );
+    }
+
+    /// What a join token names, as a table (ADR-0007, 2026-10-31
+    /// amendment): never the unspecified address, always a host the
+    /// listener certificate answers to when one exists.
+    #[test]
+    fn tokens_name_a_host_the_certificate_answers_to() {
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("an ip");
+        let sans = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        for (bound, names, expected) in [
+            ("127.0.0.1", &[][..], "127.0.0.1"),
+            ("127.0.0.1", &["box.lan"][..], "127.0.0.1"),
+            ("::1", &[][..], "[::1]"),
+            ("0.0.0.0", &["box.lan", "10.0.0.7"][..], "box.lan"),
+            ("0.0.0.0", &["fe80::1"][..], "[fe80::1]"),
+            ("0.0.0.0", &[][..], "127.0.0.1"),
+            ("::", &[][..], "127.0.0.1"),
+            ("10.0.0.7", &["box.lan", "10.0.0.7"][..], "10.0.0.7"),
+            ("10.0.0.7", &["box.lan"][..], "box.lan"),
+            ("10.0.0.7", &[][..], "10.0.0.7"),
+            ("fe80::2", &[][..], "[fe80::2]"),
+        ] {
+            assert_eq!(
+                super::advertised_host(ip(bound), &sans(names)),
+                expected,
+                "{bound} with {names:?}"
+            );
+        }
     }
 
     /// A serve config rooted in `directory`: OS-chosen loopback ports, the
@@ -913,7 +952,12 @@ mod tests {
             .bootstrap_code
             .as_ref()
             .expect("a fresh server has no client, so it must mint the first code");
-        let token = super::join_token_of(code, running.enrollment.addr);
+        assert_eq!(
+            running.advertised_enrollment,
+            running.enrollment.addr.to_string(),
+            "a loopback listener advertises itself"
+        );
+        let token = super::join_token_of(code, &running.advertised_enrollment);
         assert_eq!(
             token.code.server_fingerprint, running.server_fingerprint,
             "the printed token embeds the fingerprint the joiner pins"
@@ -971,6 +1015,25 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "the token file is user-read-only");
+        }
+
+        // A second server on the same state refuses while this one lives,
+        // naming the lock; the state dir itself is owner-only.
+        let refused = super::serve(&config)
+            .await
+            .expect_err("one server per state dir");
+        assert!(
+            refused.to_string().contains("server.lock"),
+            "the refusal names the held lock: {refused}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&config.state_dir)
+                .expect("the state dir exists")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "the state dir is owner-only");
         }
 
         // Dropping the server takes the chain driver with it: a leaked

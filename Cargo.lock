@@ -1362,6 +1362,7 @@ name = "horde-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "horde-cli",
  "horde-identity",
  "horde-mcp",
