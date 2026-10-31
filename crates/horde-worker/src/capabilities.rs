@@ -137,7 +137,9 @@ mod tests {
     /// it is what lets the scheduler place gated, high-trust work here.
     #[test]
     fn a_registered_claude_adapter_is_advertised_with_its_gating() {
-        let claude = ClaudeAdapter::new();
+        let claude = ClaudeAdapter::new(crate::harness::HarnessProfile::new(
+            "/nonexistent/horde-test-profile",
+        ));
         let capabilities = advertise([&claude as &dyn Adapter], None, &DeclaredFacts::default());
 
         let harnesses = &capabilities.harnesses;
@@ -164,7 +166,9 @@ mod tests {
     /// gating stay off the wire until placement can match per call kind.
     #[test]
     fn a_registered_codex_adapter_advertises_without_blanket_gating() {
-        let mut codex = crate::codex::CodexAdapter::new();
+        let mut codex = crate::codex::CodexAdapter::new(crate::harness::HarnessProfile::new(
+            "/nonexistent/horde-test-profile",
+        ));
         for interception in [
             crate::codex::ExecInterception::SandboxOnly {
                 reason: "unprobed".to_owned(),
@@ -183,7 +187,9 @@ mod tests {
             );
         }
 
-        let codex = crate::codex::CodexAdapter::new();
+        let codex = crate::codex::CodexAdapter::new(crate::harness::HarnessProfile::new(
+            "/nonexistent/horde-test-profile",
+        ));
         let capabilities = advertise([&codex as &dyn Adapter], None, &DeclaredFacts::default());
 
         let harnesses = &capabilities.harnesses;

@@ -440,7 +440,7 @@ fn layout_of(repo: &WorkspaceRepo) -> &str {
 /// guard against a compromised or confused server, not a validation layer —
 /// which is why it refuses rather than sanitizes: a cleaned-up id would
 /// silently point two different ids at one directory.
-fn is_path_safe(id: &str) -> bool {
+pub(crate) fn is_path_safe(id: &str) -> bool {
     !id.is_empty()
         && id
             .chars()

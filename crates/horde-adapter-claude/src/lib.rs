@@ -15,6 +15,8 @@
 //!   [`horde_adapter::AgentEvent`]s, including usage normalization.
 //! * [`permission`] — the `--permission-prompt-tool` payloads, which arrive on
 //!   the MCP endpoint rather than on stdout.
+//! * [`launch`] — the isolation flags every supervised launch carries, shared
+//!   by the Worker's spawn and the live smokes so the two cannot drift.
 //! * [`identity`] — what it takes to find a conversation again. A session id
 //!   alone is not enough: sessions live inside `CLAUDE_CONFIG_DIR`, so the
 //!   account directory is part of an agent's revival identity.
@@ -38,6 +40,7 @@
 
 pub mod codec;
 pub mod identity;
+pub mod launch;
 pub mod permission;
 pub mod replay;
 pub mod turn;

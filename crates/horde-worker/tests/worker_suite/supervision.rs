@@ -18,7 +18,7 @@ use horde_worker::{SupervisedHarness, SupervisorError};
 mod harness {
     use super::{HarnessSpec, PathBuf};
     use horde_adapter::{Adapter, AgentEvent, AgentSession, AgentSpec, TurnOutcome};
-    use horde_worker::ClaudeAdapter;
+    use horde_worker::{ClaudeAdapter, HarnessProfile};
 
     /// The stub binary cargo built alongside this test, its first-exec
     /// admission paid (`support::admitted_binary`) so the suite's bounded
@@ -40,23 +40,27 @@ mod harness {
         (spec, dir)
     }
 
+    /// A claude adapter on the stub, its Worker-owned profile inside `dir` —
+    /// the production launch shape (ADR-0010), so the tests run the same argv
+    /// and the same config-dir rules production does.
+    pub(crate) fn stub_claude(dir: &tempfile::TempDir) -> ClaudeAdapter {
+        ClaudeAdapter::new(HarnessProfile::new(dir.path().join("harness")))
+            .with_program(stub_binary().to_string_lossy())
+    }
+
     pub(crate) fn spec_for(transcript: &str) -> (HarnessSpec, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("a scratch dir");
         let file = dir.path().join("transcript.jsonl");
         std::fs::write(&file, transcript).expect("writes");
 
         let spec = HarnessSpec {
-            program: stub_binary().to_string_lossy().into_owned(),
-            args: Vec::new(),
             // The script travels in the child's environment, so each test's child
             // gets its own without touching this process's env.
             env: vec![(
                 "HORDE_STUB_TRANSCRIPT".to_owned(),
                 file.to_string_lossy().into_owned(),
             )],
-            config_dir: None,
-            config_env_var: "CLAUDE_CONFIG_DIR",
-            cwd: None,
+            ..HarnessSpec::new(stub_binary().to_string_lossy())
         };
         (spec, dir)
     }
@@ -72,7 +76,7 @@ mod harness {
         extra: &[(&str, &str)],
     ) -> (Box<dyn AgentSession>, tempfile::TempDir) {
         let (spec, dir) = spec_with(script, extra);
-        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        let mut adapter = stub_claude(&dir);
         adapter.extra_env = spec.env.clone();
         let session = adapter
             .spawn(&AgentSpec::default())
@@ -128,7 +132,9 @@ async fn a_turn_round_trips_through_a_real_child_process() {
          {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":5,\"result\":\"hi\"}",
     );
 
-    let mut harness = SupervisedHarness::spawn(&spec).expect("the stub must spawn");
+    let mut harness = SupervisedHarness::spawn(&spec)
+        .await
+        .expect("the stub must spawn");
     assert!(harness.id().is_some(), "a live child has a pid");
 
     harness
@@ -153,7 +159,7 @@ async fn a_dead_harness_reads_as_eof_rather_than_hanging() {
         "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"done\"}",
     );
 
-    let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+    let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
     harness
         .write_line("{\"type\":\"user\"}")
         .await
@@ -182,18 +188,11 @@ async fn a_dead_harness_reads_as_eof_rather_than_hanging() {
 #[tokio::test]
 async fn a_missing_binary_is_an_error_not_a_panic() {
     // Ordinary on a Worker that has not installed the harness yet.
-    let spec = HarnessSpec {
-        program: "horde-no-such-harness".to_owned(),
-        args: Vec::new(),
-        env: Vec::new(),
-        config_dir: None,
-        config_env_var: "CLAUDE_CONFIG_DIR",
-        cwd: None,
-    };
+    let spec = HarnessSpec::new("horde-no-such-harness");
 
     assert!(
         matches!(
-            SupervisedHarness::spawn(&spec).err(),
+            SupervisedHarness::spawn(&spec).await.err(),
             Some(SupervisorError::Spawn { .. })
         ),
         "a missing harness is a reportable condition, not a crash"
@@ -210,7 +209,7 @@ async fn the_account_directory_reaches_the_child() {
     let account = PathBuf::from("/var/horde/accounts/work");
     spec.config_dir = Some(account.clone());
 
-    let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+    let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
     // The stub echoes nothing about its env, so this asserts the spec carries
     // the binding rather than the child's view of it; the child-side read is
     // covered by the live smoke.
@@ -224,9 +223,8 @@ async fn the_account_directory_reaches_the_child() {
 
 #[cfg(test)]
 mod live_session {
-    use super::harness::{spec_for, stub_binary, turn_end};
+    use super::harness::{spec_for, turn_end};
     use horde_adapter::{Adapter, AgentSpec, TurnInput, TurnStatus};
-    use horde_worker::ClaudeAdapter;
 
     /// A whole turn, from spawn to `TurnEnded`, against a real child.
     #[tokio::test]
@@ -237,8 +235,7 @@ mod live_session {
         );
 
         // Point the adapter at the stub: the tests must never touch the real CLI.
-        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
-        adapter.accounts_root = None;
+        let mut adapter = super::harness::stub_claude(&_dir);
 
         // Per-child, never process-wide: setting it on this process would race
         // every other test's spawn.
@@ -289,7 +286,7 @@ mod failure_modes {
             &[("HORDE_STUB_IGNORE_INTERRUPT", "1")],
         );
 
-        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
         let control =
             r#"{"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}"#;
 
@@ -318,7 +315,7 @@ mod failure_modes {
             ],
         );
 
-        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
         harness
             .write_line("{\"type\":\"user\"}")
             .await
@@ -357,7 +354,7 @@ mod failure_modes {
         let (mut spec, _dir) = spec_with("{}", &[]);
         spec.env.retain(|(k, _)| k != "HORDE_STUB_TRANSCRIPT");
 
-        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
         let _ = within("a line arrives", harness.read_line()).await;
         let _ = within("the child is reaped", harness.wait()).await;
 
@@ -380,7 +377,7 @@ mod failure_modes {
 
 #[cfg(test)]
 mod revival {
-    use super::harness::{drain, spec_with, stub_binary, turn_end};
+    use super::harness::{drain, spec_with, turn_end};
     use horde_adapter::{Adapter, AgentEvent, AgentSpec, ProviderSessionId, TurnInput};
     use horde_worker::ClaudeAdapter;
 
@@ -389,7 +386,7 @@ mod revival {
     /// child, so it travels with the adapter.
     fn stub_adapter(script: &str) -> (ClaudeAdapter, tempfile::TempDir) {
         let (harness_spec, dir) = spec_with(script, &[]);
-        let mut adapter = ClaudeAdapter::with_program(stub_binary().to_string_lossy());
+        let mut adapter = super::harness::stub_claude(&dir);
         adapter.extra_env = harness_spec.env.clone();
         (adapter, dir)
     }
@@ -685,7 +682,7 @@ mod process_identity {
     #[tokio::test]
     async fn kill_actually_ends_the_child() {
         let (spec, _dir) = spec_with(SCRIPT, &[]);
-        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
         assert!(harness.id().is_some(), "the child is running");
 
         harness.kill().await.expect("kill by handle");
@@ -713,8 +710,10 @@ mod process_identity {
         let (first_spec, _a) = spec_with(SCRIPT, &[]);
         let (second_spec, _b) = spec_with(SCRIPT, &[]);
 
-        let mut first = SupervisedHarness::spawn(&first_spec).expect("spawns");
-        let mut second = SupervisedHarness::spawn(&second_spec).expect("spawns");
+        let mut first = SupervisedHarness::spawn(&first_spec).await.expect("spawns");
+        let mut second = SupervisedHarness::spawn(&second_spec)
+            .await
+            .expect("spawns");
 
         let first_id = first.id().expect("a running child has a pid");
         let second_id = second.id().expect("a running child has a pid");
@@ -740,7 +739,7 @@ mod process_identity {
     #[tokio::test]
     async fn a_reaped_child_reports_no_pid() {
         let (spec, _dir) = spec_with(SCRIPT, &[]);
-        let mut harness = SupervisedHarness::spawn(&spec).expect("spawns");
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
         assert!(harness.id().is_some());
 
         harness.kill().await.expect("kill by handle");

@@ -99,7 +99,10 @@ mod harness {
         let file = dir.path().join("script.jsonl");
         std::fs::write(&file, script).expect("writes");
 
-        let mut adapter = CodexAdapter::new().with_program(stub_binary().to_string_lossy());
+        let mut adapter = CodexAdapter::new(horde_worker::HarnessProfile::new(
+            dir.path().join("harness"),
+        ))
+        .with_program(stub_binary().to_string_lossy());
         // A stub that answers nothing must fail the test in seconds, not
         // stall the suite until a mutants timeout nobody evaluates.
         adapter.response_ceiling = std::time::Duration::from_secs(2);
@@ -1108,8 +1111,11 @@ async fn a_mute_harness_fails_the_spawn_on_the_response_ceiling() {
 async fn a_harness_that_dies_mid_handshake_reads_as_its_death() {
     // No script in the environment: the stub prints why to stderr and exits
     // nonzero, which is exactly a binary that starts and immediately dies.
-    let adapter =
-        horde_worker::CodexAdapter::new().with_program(harness::stub_binary().to_string_lossy());
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+    let adapter = horde_worker::CodexAdapter::new(horde_worker::HarnessProfile::new(
+        scratch.path().join("harness"),
+    ))
+    .with_program(harness::stub_binary().to_string_lossy());
 
     let error = adapter
         .spawn(&AgentSpec::default())

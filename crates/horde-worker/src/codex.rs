@@ -22,7 +22,6 @@
 //!   auditable.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 
 use async_trait::async_trait;
 use horde_adapter::{
@@ -39,7 +38,11 @@ use horde_adapter_codex::sandbox::SandboxPolicy;
 use horde_adapter_codex::turn::{ApprovalKind, TurnAssembler};
 use horde_adapter_codex::wire::{EXEC_APPROVAL_METHOD, Frame, MCP_ELICITATION_METHOD, RpcError};
 
+use crate::harness::HarnessProfile;
 use crate::process::{HarnessSpec, SupervisedHarness};
+
+/// The variable `codex` reads its home (config, credentials, rollouts) from.
+const CONFIG_ENV_VAR: &str = "CODEX_HOME";
 
 /// How many frames a handshake response may be preceded by before the adapter
 /// concludes the harness is not going to answer. Bounds the wait by count, not
@@ -53,8 +56,10 @@ pub struct CodexAdapter {
     /// Binary to run. A path, so tests can point at a stub and never touch the
     /// operator's real CLI.
     pub program: String,
-    /// Root under which each account's `CODEX_HOME` lives.
-    pub accounts_root: Option<PathBuf>,
+    /// The Worker-owned `CODEX_HOME`s and process-group ledger every launch
+    /// runs under (ADR-0010) — never the operator's `~/.codex`, whose
+    /// `config.toml`, MCP servers, and trusted projects would all apply.
+    pub profile: HarnessProfile,
     /// Permission-mode name → sandbox tier. Everything unmapped runs
     /// read-only; see `horde_adapter_codex::sandbox`.
     pub sandbox_policy: SandboxPolicy,
@@ -106,12 +111,12 @@ impl ExecInterception {
 }
 
 impl CodexAdapter {
-    /// An adapter that runs the real `codex` on `PATH`.
+    /// An adapter that runs the real `codex` on `PATH` under `profile`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(profile: HarnessProfile) -> Self {
         Self {
             program: "codex".to_owned(),
-            accounts_root: None,
+            profile,
             sandbox_policy: SandboxPolicy::default(),
             extra_env: Vec::new(),
             response_ceiling: std::time::Duration::from_secs(30),
@@ -143,23 +148,24 @@ impl CodexAdapter {
         self
     }
 
-    fn harness_spec(&self, spec: &AgentSpec) -> HarnessSpec {
+    /// The full launch: the account's Worker-owned `CODEX_HOME`, and the
+    /// endpoint as `-c` overrides whose header values ride the child's
+    /// environment rather than its argv.
+    fn harness_spec(&self, spec: &AgentSpec) -> core::result::Result<HarnessSpec, String> {
+        let overrides = mcp_server_overrides(spec.horde_endpoint.as_ref());
         let mut args = vec!["app-server".to_owned(), "--stdio".to_owned()];
-        args.extend(mcp_server_overrides(spec.horde_endpoint.as_ref()));
+        args.extend(overrides.args);
+        let mut env = self.extra_env.clone();
+        env.extend(overrides.env);
 
-        HarnessSpec {
-            program: self.program.clone(),
+        Ok(HarnessSpec {
             args,
-            env: self.extra_env.clone(),
-            config_dir: horde_adapter_codex::identity::codex_home_for(
-                spec.account.as_ref(),
-                self.accounts_root
-                    .as_deref()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            ),
-            config_env_var: "CODEX_HOME",
+            env,
             cwd: spec.cwd.clone(),
-        }
+            ..self
+                .profile
+                .spec(&self.program, CONFIG_ENV_VAR, spec.account.as_ref())?
+        })
     }
 
     /// Starts a supervised `codex app-server` and drives the handshake.
@@ -171,12 +177,10 @@ impl CodexAdapter {
         spec: &AgentSpec,
         resume_thread: Option<&ProviderSessionId>,
     ) -> Result<Box<dyn AgentSession>> {
-        let harness = SupervisedHarness::spawn(&self.harness_spec(spec)).map_err(|error| {
-            AdapterError::Spawn {
-                provider: horde_adapter_codex::PROVIDER.to_owned(),
-                message: error.to_string(),
-            }
-        })?;
+        let launch = self.harness_spec(spec).map_err(launch_failure)?;
+        let harness = SupervisedHarness::spawn(&launch)
+            .await
+            .map_err(|error| launch_failure(error.to_string()))?;
 
         // The tier decision, made before the harness hears anything: this is
         // the enforcement for every exec call the agent will ever make.
@@ -256,12 +260,6 @@ impl CodexAdapter {
     }
 }
 
-impl Default for CodexAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl Adapter for CodexAdapter {
     fn provider(&self) -> &str {
@@ -284,11 +282,16 @@ impl Adapter for CodexAdapter {
         // `codex login` runs a local OAuth-callback server on loopback port
         // 1455, fixed by the CLI. PROVISIONAL until verified against the
         // live CLI (see the W9a handoff flags).
-        Some(horde_adapter::LoginRecipe::with_callback(
-            self.program.clone(),
-            vec!["login".to_owned()],
-            1455,
-        ))
+        // It signs in the Worker-owned CODEX_HOME the agents run under
+        // (ADR-0010), not the operator's own.
+        Some(
+            horde_adapter::LoginRecipe::with_callback(
+                self.program.clone(),
+                vec!["login".to_owned()],
+                1455,
+            )
+            .with_env(self.profile.login_env(CONFIG_ENV_VAR)),
+        )
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {
@@ -308,35 +311,68 @@ impl Adapter for CodexAdapter {
     }
 }
 
-/// The `-c mcp_servers.…` overrides that give one agent its Horde endpoint.
+/// The `-c mcp_servers.…` overrides that give one agent its Horde endpoint,
+/// and the environment their header values ride.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct McpOverrides {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// The variable one header value travels in. `TOKEN` in the name is
+/// deliberate: codex's default shell-environment policy strips variables
+/// whose names match `*TOKEN*` from the commands it runs, so the agent's own
+/// shell does not inherit the credential.
+fn header_env_var(index: usize) -> String {
+    format!("HORDE_MCP_HEADER_TOKEN_{index}")
+}
+
+/// Builds the overrides for one endpoint.
 ///
 /// Per-process flags rather than `config.toml` writes, because `CODEX_HOME` is
 /// shared by every agent on the same Provider Account and a config write from
 /// one spawn would race every concurrent one. Measured working in the
 /// transcript 17–19 captures.
-fn mcp_server_overrides(endpoint: Option<&McpEndpoint>) -> Vec<String> {
-    let mut overrides = Vec::new();
+///
+/// Header *values* never touch argv (ADR-0010): `env_http_headers` maps each
+/// header name to a variable the child's environment carries, so `ps` shows
+/// the variable's name, never the bearer token. Verified against codex-cli
+/// 0.165.0 (`codex mcp list --json` reports the mapping as
+/// `env_http_headers`).
+fn mcp_server_overrides(endpoint: Option<&McpEndpoint>) -> McpOverrides {
+    let mut overrides = McpOverrides::default();
     let mut push = |assignment: String| {
-        overrides.push("-c".to_owned());
-        overrides.push(assignment);
+        overrides.args.push("-c".to_owned());
+        overrides.args.push(assignment);
     };
     match endpoint {
         None => {}
         Some(McpEndpoint::Http { url, headers }) => {
             push(format!("mcp_servers.horde.url={}", toml_string(url)));
             if !headers.is_empty() {
-                // An inline TOML table: the identity pair must ride *every*
-                // request (the endpoint's gate refuses unidentified ones), and
-                // `http_headers` is the config.toml mechanism the spike
-                // confirmed Codex sends on all of them.
+                // The identity pair must ride *every* request (the
+                // endpoint's gate refuses unidentified ones), which is what
+                // the http-headers mechanisms do.
                 let rendered: Vec<String> = headers
                     .iter()
-                    .map(|(name, value)| format!("{}={}", toml_string(name), toml_string(value)))
+                    .enumerate()
+                    .map(|(index, (name, _))| {
+                        format!(
+                            "{}={}",
+                            toml_string(name),
+                            toml_string(&header_env_var(index))
+                        )
+                    })
                     .collect();
                 push(format!(
-                    "mcp_servers.horde.http_headers={{{}}}",
+                    "mcp_servers.horde.env_http_headers={{{}}}",
                     rendered.join(",")
                 ));
+                overrides.env = headers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, value))| (header_env_var(index), value.clone()))
+                    .collect();
             }
         }
         Some(McpEndpoint::Stdio { command, args }) => {
@@ -404,6 +440,14 @@ fn is_auth_failure(message: &str) -> bool {
         || lowered.contains("401")
         || lowered.contains("not logged in")
         || lowered.contains("login")
+}
+
+/// A launch that never got as far as a running harness.
+fn launch_failure(message: String) -> AdapterError {
+    AdapterError::Spawn {
+        provider: horde_adapter_codex::PROVIDER.to_owned(),
+        message,
+    }
 }
 
 fn spawn_failure(error: RpcError) -> AdapterError {
@@ -973,8 +1017,9 @@ impl AgentSession for LiveCodexSession {
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        // Kill by handle. Never by name or pattern.
-        let _ = self.harness.kill().await;
+        // Stop by handle — the harness and everything it started, SIGTERM
+        // then SIGKILL. Never by name or pattern.
+        let _ = self.harness.stop().await;
         self.ended = true;
         self.pending.clear();
         self.in_flight.clear();
@@ -988,8 +1033,16 @@ mod tests {
     use horde_adapter::{Adapter, Capability, McpEndpoint};
 
     use super::{
-        CodexAdapter, is_approval_method, is_auth_failure, mcp_server_overrides, toml_string,
+        CodexAdapter, McpOverrides, is_approval_method, is_auth_failure, mcp_server_overrides,
+        toml_string,
     };
+    use crate::harness::HarnessProfile;
+
+    /// An adapter for the tests that never launch: its profile is a path
+    /// nothing is created under.
+    fn unspawned() -> CodexAdapter {
+        CodexAdapter::new(HarnessProfile::new("/nonexistent/horde-test-profile"))
+    }
 
     /// The login recipe rides the adapter's own binary with codex's
     /// documented 1455 callback — the port the relay's ephemeral expose
@@ -997,7 +1050,7 @@ mod tests {
     /// `horde worker login <w> codex`.
     #[test]
     fn the_login_recipe_runs_this_adapters_own_binary_with_its_callback() {
-        let recipe = CodexAdapter::new()
+        let recipe = unspawned()
             .with_program("/stub/codex")
             .login_recipe()
             .expect("codex is loginable");
@@ -1012,7 +1065,7 @@ mod tests {
 
     #[test]
     fn the_adapter_reports_the_provider_key_the_wire_contract_uses() {
-        assert_eq!(CodexAdapter::new().provider(), "codex");
+        assert_eq!(unspawned().provider(), "codex");
     }
 
     /// The adapter must pass the codec's measured capabilities through
@@ -1020,7 +1073,7 @@ mod tests {
     /// rely on something no spike ever demonstrated.
     #[test]
     fn capabilities_come_from_the_codec_not_from_the_supervisor() {
-        let claimed = CodexAdapter::new().capabilities();
+        let claimed = unspawned().capabilities();
 
         assert_eq!(claimed, horde_adapter_codex::capabilities());
         assert!(claimed.supports(Capability::Resumable));
@@ -1034,7 +1087,7 @@ mod tests {
     /// transcripts 28/31).
     #[test]
     fn the_exec_gating_claim_follows_the_probe_verdict() {
-        let unprobed = CodexAdapter::new();
+        let unprobed = unspawned();
         assert!(
             !unprobed
                 .capabilities()
@@ -1042,7 +1095,7 @@ mod tests {
             "no probe, no claim"
         );
 
-        let mut routed = CodexAdapter::new();
+        let mut routed = unspawned();
         routed.exec_interception = super::ExecInterception::Routed {
             version: "codex-cli 0.148.0".to_owned(),
         };
@@ -1059,7 +1112,7 @@ mod tests {
             "and never the blanket claim — file changes stay ungated"
         );
 
-        let mut refused = CodexAdapter::new();
+        let mut refused = unspawned();
         refused.exec_interception = super::ExecInterception::SandboxOnly {
             reason: "codex-cli 0.145.0".to_owned(),
         };
@@ -1091,7 +1144,7 @@ mod tests {
     /// the policy, and every other field the caller configured.
     #[tokio::test]
     async fn the_probe_builder_keeps_the_adapter_it_probed() {
-        let mut adapter = CodexAdapter::new().with_program("/nonexistent/horde-test-codex");
+        let mut adapter = unspawned().with_program("/nonexistent/horde-test-codex");
         adapter.response_ceiling = std::time::Duration::from_secs(2);
         adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
 
@@ -1174,39 +1227,121 @@ mod tests {
         }));
         assert_eq!(
             http,
-            vec![
-                "-c".to_owned(),
-                "mcp_servers.horde.url=\"http://127.0.0.1:8931/mcp\"".to_owned(),
-            ]
-        );
-
-        // The per-agent identity pair rides as an inline `http_headers`
-        // table — on every request, which is what the endpoint's gate
-        // demands; a headerless entry would be refused 401 on each call.
-        let with_identity = mcp_server_overrides(Some(&McpEndpoint::Http {
-            url: "http://127.0.0.1:8931/mcp".to_owned(),
-            headers: vec![
-                ("Authorization".to_owned(), "Bearer tok-1".to_owned()),
-                ("X-Horde-Agent".to_owned(), "agent-1".to_owned()),
-            ],
-        }));
-        let expected_headers = "mcp_servers.horde.http_headers=\
-                                {\"Authorization\"=\"Bearer tok-1\",\"X-Horde-Agent\"=\"agent-1\"}";
-        assert!(
-            with_identity.contains(&expected_headers.to_owned()),
-            "the identity pair must ride the config override: {with_identity:?}"
+            McpOverrides {
+                args: vec![
+                    "-c".to_owned(),
+                    "mcp_servers.horde.url=\"http://127.0.0.1:8931/mcp\"".to_owned(),
+                ],
+                env: Vec::new(),
+            }
         );
 
         let stdio = mcp_server_overrides(Some(&McpEndpoint::Stdio {
             command: "horde-mcp".to_owned(),
             args: vec!["--agent".to_owned(), "a1".to_owned()],
         }));
-        assert!(stdio.contains(&"mcp_servers.horde.command=\"horde-mcp\"".to_owned()));
-        assert!(stdio.contains(&"mcp_servers.horde.args=[\"--agent\",\"a1\"]".to_owned()));
-
         assert!(
-            mcp_server_overrides(None).is_empty(),
+            stdio
+                .args
+                .contains(&"mcp_servers.horde.command=\"horde-mcp\"".to_owned())
+        );
+        assert!(
+            stdio
+                .args
+                .contains(&"mcp_servers.horde.args=[\"--agent\",\"a1\"]".to_owned())
+        );
+        assert!(stdio.env.is_empty());
+
+        assert_eq!(
+            mcp_server_overrides(None),
+            McpOverrides::default(),
             "no endpoint is no override, not an empty one"
+        );
+    }
+
+    /// ADR-0010: the per-agent identity pair rides every request, but its
+    /// values never touch argv — `env_http_headers` names a variable per
+    /// header, and the values travel in the child's environment, where `ps`
+    /// cannot show them.
+    #[test]
+    fn the_bearer_token_rides_the_environment_never_argv() {
+        let overrides = mcp_server_overrides(Some(&McpEndpoint::Http {
+            url: "http://127.0.0.1:8931/mcp".to_owned(),
+            headers: vec![
+                ("Authorization".to_owned(), "Bearer tok-1".to_owned()),
+                ("X-Horde-Agent".to_owned(), "agent-1".to_owned()),
+            ],
+        }));
+        let joined = overrides.args.join(" ");
+        assert!(
+            !joined.contains("tok-1") && !joined.contains("agent-1"),
+            "no header value on the command line: {joined}"
+        );
+        assert!(
+            overrides.args.contains(
+                &"mcp_servers.horde.env_http_headers=\
+                  {\"Authorization\"=\"HORDE_MCP_HEADER_TOKEN_0\",\
+                  \"X-Horde-Agent\"=\"HORDE_MCP_HEADER_TOKEN_1\"}"
+                    .to_owned()
+            ),
+            "each header is mapped to the variable that carries it: {joined}"
+        );
+        assert_eq!(
+            overrides.env,
+            vec![
+                (
+                    "HORDE_MCP_HEADER_TOKEN_0".to_owned(),
+                    "Bearer tok-1".to_owned()
+                ),
+                ("HORDE_MCP_HEADER_TOKEN_1".to_owned(), "agent-1".to_owned()),
+            ]
+        );
+    }
+
+    /// The launch puts the overrides' environment on the child beside the
+    /// configured extras, and always exports a Worker-owned `CODEX_HOME`.
+    #[test]
+    fn a_launch_runs_under_a_worker_owned_codex_home() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let mut adapter = CodexAdapter::new(HarnessProfile::new(scratch.path().join("codex")));
+        adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
+        let launch = adapter
+            .harness_spec(&horde_adapter::AgentSpec {
+                horde_endpoint: Some(McpEndpoint::Http {
+                    url: "http://127.0.0.1:1/mcp".to_owned(),
+                    headers: vec![("Authorization".to_owned(), "Bearer t".to_owned())],
+                }),
+                ..horde_adapter::AgentSpec::default()
+            })
+            .expect("a launch");
+
+        assert_eq!(launch.config_env_var, "CODEX_HOME");
+        assert_eq!(
+            launch.config_dir,
+            Some(scratch.path().join("codex").join("default"))
+        );
+        assert_eq!(&launch.args[..2], ["app-server", "--stdio"]);
+        assert_eq!(
+            launch.env,
+            vec![
+                ("MARKER".to_owned(), "kept".to_owned()),
+                ("HORDE_MCP_HEADER_TOKEN_0".to_owned(), "Bearer t".to_owned()),
+            ]
+        );
+
+        let recipe = adapter.login_recipe().expect("codex is loginable");
+        assert_eq!(
+            recipe.env,
+            vec![(
+                "CODEX_HOME".to_owned(),
+                scratch
+                    .path()
+                    .join("codex")
+                    .join("default")
+                    .display()
+                    .to_string()
+            )],
+            "the login signs in the home the agents run under"
         );
     }
 

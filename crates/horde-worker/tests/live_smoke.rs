@@ -12,11 +12,30 @@
 //!
 //! It costs a few hundred tokens per provider. Run it when bumping a supported
 //! CLI version, or when a stub-backed test starts disagreeing with reality.
+//!
+//! The adapters run under a Worker-owned [`HarnessProfile`] exactly as in
+//! production (ADR-0010), so the profile's config directories must be signed
+//! in first — the operator's own login is deliberately not inherited:
+//!
+//! ```sh
+//! export HORDE_LIVE_HARNESS_ROOT=$HOME/.horde-live-harness
+//! CLAUDE_CONFIG_DIR=$HORDE_LIVE_HARNESS_ROOT/claude/default claude login
+//! CODEX_HOME=$HORDE_LIVE_HARNESS_ROOT/codex/default codex login
+//! ```
 
 use horde_adapter::{
     Adapter, AgentEvent, AgentSession, AgentSpec, PermissionDecision, TurnInput, TurnStatus,
 };
-use horde_worker::{ClaudeAdapter, CodexAdapter, ExecInterception};
+use horde_worker::{ClaudeAdapter, CodexAdapter, ExecInterception, HarnessProfile};
+
+/// The Worker-owned profile one provider's live smoke runs under: the
+/// production launch shape, rooted where the operator signed it in.
+fn live_profile(provider: &str) -> HarnessProfile {
+    let root = std::env::var_os("HORDE_LIVE_HARNESS_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("horde-live-harness"));
+    HarnessProfile::new(root.join(provider))
+}
 
 /// A codex session rooted in its own scratch cwd — the shape every codex
 /// live test shares, so the sandbox tier judges a throwaway directory.
@@ -60,7 +79,7 @@ async fn stream_turn(
 #[tokio::test]
 #[ignore = "spends real tokens and needs a claude login"]
 async fn the_real_binary_still_streams_a_turn_through_the_supervisor() {
-    let adapter = ClaudeAdapter::new();
+    let adapter = ClaudeAdapter::new(live_profile("claude"));
     let spec = AgentSpec {
         model: Some("haiku".to_owned()),
         append_system_prompt: Some("Answer with exactly the token asked for.".to_owned()),
@@ -99,7 +118,7 @@ async fn the_real_binary_still_streams_a_turn_through_the_supervisor() {
 #[tokio::test]
 #[ignore = "spends real subscription quota and needs a ChatGPT login"]
 async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
-    let adapter = CodexAdapter::new();
+    let adapter = CodexAdapter::new(live_profile("codex"));
     let (_scratch, mut session) = codex_session_in_scratch(&adapter)
         .await
         .expect("a codex session in a scratch cwd");
@@ -146,7 +165,9 @@ async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
 #[tokio::test]
 #[ignore = "spends real subscription quota and needs a ChatGPT login"]
 async fn the_real_codex_routes_an_exec_approval_and_honors_both_verdicts() {
-    let adapter = CodexAdapter::new().probe_exec_interception().await;
+    let adapter = CodexAdapter::new(live_profile("codex"))
+        .probe_exec_interception()
+        .await;
     let ExecInterception::Routed { version } = adapter.exec_interception.clone() else {
         eprintln!("SKIP: this codex does not route exec approvals; nothing to smoke");
         return;

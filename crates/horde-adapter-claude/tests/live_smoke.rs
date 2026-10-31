@@ -20,13 +20,15 @@ use std::process::Stdio;
 
 use horde_adapter::{AgentEvent, TurnStatus};
 use horde_adapter_claude::codec::{decode_line, encode_user_message};
+use horde_adapter_claude::launch::IsolationFlags;
 use horde_adapter_claude::turn::TurnAssembler;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 /// The flags spike W1c established as the minimum for a usable stream:
-/// `--verbose` is mandatory alongside `-p`, and the setting/MCP suppression
-/// keeps an operator's hooks and servers out of the protocol.
+/// `--verbose` is mandatory alongside `-p`, and the isolation flags — from
+/// the same builder the Worker's production launch uses (ADR-0010) — keep an
+/// operator's settings, hooks, and servers out of the protocol.
 fn claude_command() -> Command {
     let mut command = Command::new("claude");
     command
@@ -39,12 +41,10 @@ fn claude_command() -> Command {
             "--verbose",
             "--model",
             "haiku",
-            "--setting-sources",
-            "",
-            "--strict-mcp-config",
             "--tools",
             "",
         ])
+        .args(IsolationFlags::default().argv())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

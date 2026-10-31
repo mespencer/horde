@@ -1450,6 +1450,7 @@ dependencies = [
  "horde-server-testkit",
  "horde-testkit",
  "horde-wire",
+ "nix 0.31.3",
  "portable-pty",
  "rusqlite",
  "serde_json",

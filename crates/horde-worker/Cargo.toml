@@ -39,8 +39,14 @@ horde-wire = { workspace = true }
 # The interactive-auth relay's PTY (DESIGN §4): provider login commands run
 # in a real terminal the client's keystrokes are relayed into.
 portable-pty = "0.9.0"
+# Signalling harness process groups (ADR-0010): killpg through a safe API,
+# because the workspace forbids `unsafe`.
+nix = { version = "0.31.3", features = ["process", "signal"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde_json = { workspace = true }
+# Owner-only secret files (ADR-0010): an MCP config carrying a bearer token
+# lives exactly as long as the harness that reads it.
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.19"
@@ -62,7 +68,6 @@ horde-server-testkit = { workspace = true }
 # cycle, and it is the shape horde-cli already uses to test its client against a
 # server it stands up itself.
 horde-server = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "test-util"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
