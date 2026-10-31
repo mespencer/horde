@@ -449,3 +449,202 @@ mod tests {
         assert_eq!(super::floor_in(&events, "w3"), 0, "never reset");
     }
 }
+
+/// The lease, boot reconcile and reset, against a real in-memory log through
+/// the production appends.
+#[cfg(test)]
+mod log_tests {
+    use std::time::Duration;
+
+    use horde_proto::v1::{
+        AgentId, AgentLifecycleChanged, AgentLifecycleState, Event, PlacementState, event::Kind,
+    };
+    use prost::Message;
+
+    use crate::EventLog;
+    use crate::log::PendingEvent;
+    use crate::service::ingest::placed_for_test;
+    use crate::service::shared::{ServerCore, append_server_event};
+    use crate::state::SessionState;
+
+    fn core() -> ServerCore {
+        ServerCore::new(EventLog::in_memory().expect("in-memory log"))
+    }
+
+    /// Moves `agent` to `state`, as its worker would journal it.
+    async fn lifecycle(core: &ServerCore, agent: &str, state: AgentLifecycleState) {
+        append_server_event(
+            &core.log,
+            "s1",
+            "",
+            Event {
+                agent_id: Some(AgentId::new(agent)),
+                kind: Some(Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+                    state: state as i32,
+                    ..AgentLifecycleChanged::default()
+                })),
+                ..Event::default()
+            },
+        )
+        .await
+        .expect("the lifecycle appends");
+    }
+
+    async fn session(core: &ServerCore) -> SessionState {
+        let events = core.log.read_all("s1").await.expect("the log reads");
+        SessionState::project("s1", &events).expect("project")
+    }
+
+    /// Every lifecycle change for `agent`: (previous, state).
+    async fn transitions(core: &ServerCore, agent: &str) -> Vec<(i32, i32)> {
+        core.log
+            .read_all("s1")
+            .await
+            .expect("the log reads")
+            .iter()
+            .filter_map(|stored| Event::decode(stored.payload.as_slice()).ok())
+            .filter(|event| event.agent_id.as_ref().map(ToString::to_string).as_deref() == Some(agent))
+            .filter_map(|event| match event.kind {
+                Some(Kind::AgentLifecycleChanged(changed)) => {
+                    Some((changed.previous_state, changed.state))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits — on the log, bounded — until `agent`'s placement is `state`.
+    async fn placement_becomes(core: &ServerCore, agent: &str, state: PlacementState) {
+        let waited = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if session(core).await.agents[agent].placement_state == state {
+                    return;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "{agent} never became {state:?}");
+    }
+
+    /// The loss, end to end through the appends: the started agent is lost
+    /// and failed from the state it was in, the never-started one goes back
+    /// to the queue, the archived one and a neighbour's are untouched.
+    #[tokio::test]
+    async fn a_declared_loss_loses_the_started_and_requeues_the_rest() {
+        let core = core();
+        for agent in ["running", "starting", "archived"] {
+            placed_for_test(&core, "s1", agent, "w1").await;
+        }
+        placed_for_test(&core, "s1", "neighbour", "w2").await;
+        lifecycle(&core, "running", AgentLifecycleState::Running).await;
+        lifecycle(&core, "starting", AgentLifecycleState::Starting).await;
+        lifecycle(&core, "archived", AgentLifecycleState::Archived).await;
+        lifecycle(&core, "neighbour", AgentLifecycleState::Running).await;
+
+        let lost = super::declare_worker_lost(&core, "w1", "gone")
+            .await
+            .expect("the loss appends");
+        assert_eq!(lost, vec!["running".to_owned()]);
+
+        let state = session(&core).await;
+        assert_eq!(state.agents["running"].placement_state, PlacementState::Lost);
+        assert_eq!(state.agents["running"].lifecycle, AgentLifecycleState::Failed);
+        assert_eq!(
+            transitions(&core, "running").await.last(),
+            Some(&(
+                AgentLifecycleState::Running as i32,
+                AgentLifecycleState::Failed as i32
+            )),
+            "the failure records the state the agent was lost from"
+        );
+        assert_eq!(
+            state.agents["starting"].placement_state,
+            PlacementState::Queued,
+            "no worker is connected, so the re-queued agent waits"
+        );
+        assert_eq!(state.agents["archived"].placement_state, PlacementState::Placed);
+        assert_eq!(state.agents["neighbour"].placement_state, PlacementState::Placed);
+    }
+
+    /// A lease nobody answers ends in the loss, journaled.
+    #[tokio::test]
+    async fn a_lapsed_lease_declares_the_worker_lost() {
+        let core = core().with_worker_lease(Duration::from_millis(1));
+        placed_for_test(&core, "s1", "agent-1", "w1").await;
+        lifecycle(&core, "agent-1", AgentLifecycleState::Idle).await;
+
+        super::start_lease(&core, "w1", core.workers.epoch_of("w1"));
+        placement_becomes(&core, "agent-1", PlacementState::Lost).await;
+    }
+
+    /// Boot: a worker the log places agents on and nobody has registered is
+    /// away — its never-started agent re-queued at once, its started agent
+    /// lost when the lease runs out.
+    #[tokio::test]
+    async fn boot_reconciles_agents_on_workers_nobody_registered() {
+        let core = core().with_worker_lease(Duration::from_millis(1));
+        placed_for_test(&core, "s1", "starting", "gone").await;
+        placed_for_test(&core, "s1", "running", "gone").await;
+        lifecycle(&core, "starting", AgentLifecycleState::Starting).await;
+        lifecycle(&core, "running", AgentLifecycleState::Running).await;
+
+        let away = super::reconcile_at_boot(&core).await.expect("reconcile");
+        assert_eq!(away, vec!["gone".to_owned()]);
+        assert_eq!(
+            session(&core).await.agents["starting"].placement_state,
+            PlacementState::Queued,
+            "re-queued at once, as any disconnect does"
+        );
+        placement_becomes(&core, "running", PlacementState::Lost).await;
+    }
+
+    /// Nothing to reconcile when every placed agent's worker is connected.
+    #[tokio::test]
+    async fn boot_leaves_connected_workers_alone() {
+        let core = core();
+        core.workers
+            .register("here", horde_proto::v1::WorkerCapabilities::default());
+        placed_for_test(&core, "s1", "agent-1", "here").await;
+        assert!(super::reconcile_at_boot(&core).await.expect("reconcile").is_empty());
+    }
+
+    /// A reset records the floor, loses the worker's agents, and from then
+    /// on the worker's own journal is numbered from one above that floor.
+    #[tokio::test]
+    async fn a_reset_sets_the_floor_and_loses_the_workers_agents() {
+        let core = core();
+        placed_for_test(&core, "s1", "agent-1", "w1").await;
+        lifecycle(&core, "agent-1", AgentLifecycleState::Running).await;
+        for journal_sequence in 1..=3 {
+            core.log
+                .append(PendingEvent {
+                    session_id: "s1".to_owned(),
+                    origin_worker_id: "w1".to_owned(),
+                    journal_sequence: Some(journal_sequence),
+                    payload: Event::default().encode_to_vec(),
+                    ..PendingEvent::default()
+                })
+                .await
+                .expect("the journal row appends");
+        }
+        assert_eq!(super::own_watermark(&core.log, "w1").await.expect("read"), 3);
+
+        let reset = super::reset_worker_journal(&core, "w1", "disk replaced", None)
+            .await
+            .expect("the reset appends");
+        assert_eq!(reset.journal_floor, 3);
+        assert_eq!(reset.lost_agents, vec!["agent-1".to_owned()]);
+        assert_eq!(super::journal_floor(&core.log, "w1").await.expect("read"), 3);
+        assert_eq!(
+            super::own_watermark(&core.log, "w1").await.expect("read"),
+            0,
+            "the fresh journal has sent nothing yet"
+        );
+        assert!(
+            super::reset_worker_journal(&core, "", "", None).await.is_err(),
+            "a reset must name its worker"
+        );
+    }
+}

@@ -1918,6 +1918,51 @@ mod tests {
         );
     }
 
+    /// A stream resumed by position delivers what was caused at or after it,
+    /// whatever sequence the worker claims — the claim a renumbering fold
+    /// would have made a lie (ADR-0011).
+    #[tokio::test]
+    async fn a_stream_resumed_by_position_ignores_the_sequence() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for event in [
+            spawn_event("first", None),
+            placement_event("first", Some("worker-a"), PlacementState::Placed),
+            spawn_event("second", None),
+            placement_event("second", Some("worker-a"), PlacementState::Placed),
+        ] {
+            log.append(PendingEvent {
+                session_id: "s1".to_owned(),
+                payload: event.encode_to_vec(),
+                ..PendingEvent::default()
+            })
+            .await
+            .expect("append");
+        }
+
+        let mut stream = CommandStream::resuming(
+            &log,
+            "worker-a",
+            Resume {
+                sequence: 99,
+                log_position: 4,
+            },
+        );
+        let batch = stream
+            .next_batch()
+            .await
+            .expect("the log is open")
+            .expect("the fold reads");
+        let positions: Vec<(u64, u64)> = batch
+            .iter()
+            .map(|response| (response.command_sequence, response.log_position))
+            .collect();
+        assert_eq!(
+            positions,
+            vec![(2, 4)],
+            "only the second spawn, caused at row 4, though its sequence is below 99"
+        );
+    }
+
     /// The interrupt verb's missing leg: the journaled request becomes a
     /// command to the worker holding the agent, reason intact.
     #[test]

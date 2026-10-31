@@ -1136,4 +1136,234 @@ mod tests {
         assert!(!super::is_dead_letter_stream("session-1"));
         assert!(crate::enrollment::is_reserved_stream(DEAD_LETTER_STREAM));
     }
+
+    /// Re-places `agent-1` from `worker-a` onto `worker-b`.
+    async fn re_placed_onto_b(core: &ServerCore) {
+        placed_for_test(core, "s1", "agent-1", "worker-a").await;
+        crate::placement::append_placement(
+            core,
+            "s1",
+            crate::placement::wire_placement(
+                "agent-1",
+                &crate::scheduler::Placement::Placed {
+                    worker_id: "worker-b".to_owned(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("the re-placement appends");
+    }
+
+    /// The `StaleJournalEvent`s in `s1`: (journaling worker, kind, current
+    /// worker, whether the original rode along).
+    async fn stale_in_s1(core: &ServerCore) -> Vec<(String, String, String, bool)> {
+        core.log
+            .read_all("s1")
+            .await
+            .expect("the session reads")
+            .iter()
+            .filter_map(|stored| Event::decode(stored.payload.as_slice()).ok())
+            .filter_map(|event| match event.kind {
+                Some(Kind::StaleJournalEvent(stale)) => Some((
+                    stale.worker_id.map(|id| id.to_string()).unwrap_or_default(),
+                    stale.kind,
+                    stale
+                        .current_worker_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    stale.event.is_some(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A late journal from the agent's former placement (ADR-0011): history
+    /// lands as itself, anything that would speak for the agent now is
+    /// recorded whole and visibly in the agent's session, and a worker that
+    /// never held the agent is still a stranger whose entry dead-letters.
+    #[tokio::test]
+    async fn a_former_placements_late_journal_lands_as_history_or_is_recorded_stale() {
+        use horde_proto::v1::{AgentLifecycleChanged, AgentOutputChunk};
+        let core = core();
+        re_placed_onto_b(&core).await;
+        let before = core.log.read_all("s1").await.expect("read").len();
+
+        let mut view = OriginView::new();
+        ingest_batch(
+            &core,
+            &mut view,
+            "worker-a",
+            vec![
+                journaled(
+                    "s1",
+                    1,
+                    event(
+                        Some("agent-1"),
+                        Kind::AgentOutputChunk(AgentOutputChunk::default()),
+                    ),
+                ),
+                journaled(
+                    "s1",
+                    2,
+                    event(
+                        Some("agent-1"),
+                        Kind::AgentLifecycleChanged(AgentLifecycleChanged::default()),
+                    ),
+                ),
+            ],
+        )
+        .await
+        .expect("late entries are not a batch failure");
+        ingest_batch(
+            &core,
+            &mut OriginView::new(),
+            "worker-c",
+            vec![journaled("s1", 1, interrupted("agent-1"))],
+        )
+        .await
+        .expect("a stranger's refusal is not a batch failure");
+
+        assert_eq!(
+            core.log.read_all("s1").await.expect("read").len(),
+            before + 2,
+            "the output landed and the lifecycle was recorded; the stranger added nothing here"
+        );
+        assert_eq!(
+            stale_in_s1(&core).await,
+            vec![(
+                "worker-a".to_owned(),
+                "agent_lifecycle_changed".to_owned(),
+                "worker-b".to_owned(),
+                true
+            )]
+        );
+        assert_eq!(
+            dead_letters(&core).await.len(),
+            1,
+            "only the stranger dead-letters"
+        );
+        assert_eq!(
+            core.log
+                .worker_journal_watermark("worker-a")
+                .await
+                .expect("read"),
+            2,
+            "the stale record still advances the worker's watermark"
+        );
+    }
+
+    /// A worker the agent comes back to is current again, not late.
+    #[tokio::test]
+    async fn returning_to_a_former_worker_makes_it_current_again() {
+        let core = core();
+        re_placed_onto_b(&core).await;
+        crate::placement::append_placement(
+            &core,
+            "s1",
+            crate::placement::wire_placement(
+                "agent-1",
+                &crate::scheduler::Placement::Placed {
+                    worker_id: "worker-a".to_owned(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("the return appends");
+        let view = view_of(&core).await;
+        assert_eq!(
+            view.lateness("worker-a", "s1", &interrupted("agent-1")),
+            None
+        );
+        assert_eq!(
+            view.lateness("worker-b", "s1", &interrupted("agent-1")),
+            Some(super::Late::Record {
+                current_worker_id: Some("worker-a".to_owned())
+            }),
+            "and the worker it left is now the former one"
+        );
+        assert_eq!(
+            view.lateness("worker-b", "other-session", &interrupted("agent-1")),
+            None,
+            "a late entry must name the agent's own session"
+        );
+        assert_eq!(
+            OriginView::ambient().lateness("worker-b", "s1", &interrupted("agent-1")),
+            None
+        );
+    }
+
+    #[test]
+    fn history_lands_and_what_speaks_for_the_agent_is_recorded() {
+        use horde_proto::v1::{
+            AgentLifecycleChanged, AgentOutputChunk, ResultReported, UsageRecorded,
+        };
+        let current = || Some("w2".to_owned());
+        let record = Some(super::Late::Record {
+            current_worker_id: current(),
+        });
+        for kind in [
+            Kind::AgentOutputChunk(AgentOutputChunk::default()),
+            Kind::UsageRecorded(UsageRecorded::default()),
+        ] {
+            assert_eq!(super::late_handling(&kind, current()), Some(super::Late::Land));
+        }
+        for kind in [
+            Kind::AgentLifecycleChanged(AgentLifecycleChanged::default()),
+            Kind::PermissionRequested(PermissionRequested::default()),
+            Kind::ResultReported(ResultReported::default()),
+            Kind::TurnInterrupted(TurnInterrupted::default()),
+            Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged::default()),
+        ] {
+            assert_eq!(super::late_handling(&kind, current()), record);
+        }
+        assert_eq!(
+            super::late_handling(&Kind::PermissionDecided(PermissionDecided::default()), current()),
+            None,
+            "a server-only kind is not late, it is refused"
+        );
+    }
+
+    /// After a reset (ADR-0011) the worker's fresh journal is stored above
+    /// the floor: journal position 1 is a new row, not a duplicate of the
+    /// lost journal's first.
+    #[tokio::test]
+    async fn after_a_reset_the_fresh_journal_lands_above_the_floor() {
+        let core = core();
+        placed_for_test(&core, "s1", "agent-1", "worker-a").await;
+        let mut view = OriginView::new();
+        ingest_batch(
+            &core,
+            &mut view,
+            "worker-a",
+            vec![journaled("s1", 1, interrupted("agent-1"))],
+        )
+        .await
+        .expect("ingest");
+        crate::liveness::reset_worker_journal(&core, "worker-a", "disk", None)
+            .await
+            .expect("reset");
+        placed_for_test(&core, "s1", "agent-2", "worker-a").await;
+
+        let acked = ingest_batch(
+            &core,
+            &mut view,
+            "worker-a",
+            vec![journaled("s1", 1, interrupted("agent-2"))],
+        )
+        .await
+        .expect("ingest");
+        assert_eq!(acked, 1, "acks speak the worker's own numbering");
+        assert_eq!(view.floor("worker-a"), 1);
+        assert_eq!(
+            core.log
+                .worker_journal_watermark("worker-a")
+                .await
+                .expect("read"),
+            2,
+            "stored above the floor, not deduplicated onto the lost row"
+        );
+    }
 }

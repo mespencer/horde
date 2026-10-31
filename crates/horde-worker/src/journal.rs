@@ -1096,6 +1096,22 @@ mod tests {
         );
     }
 
+    /// The applied position ratchets like the sequence (ADR-0011): a
+    /// redelivered or renumbered older command cannot move it backwards, and
+    /// a command carrying no position leaves it where it was.
+    #[tokio::test]
+    async fn the_applied_position_ratchets_and_never_regresses() {
+        let journal = journal();
+        assert_eq!(journal.applied_command_position().await.expect("read"), 0);
+        for (id, position) in [("s1:9", 40), ("s1:3", 12), ("s1:10", 0)] {
+            journal
+                .apply_command_at(id, 1, position, Vec::new(), AgentBookkeeping::None)
+                .await
+                .expect("applies");
+        }
+        assert_eq!(journal.applied_command_position().await.expect("read"), 40);
+    }
+
     #[tokio::test]
     async fn the_ack_watermark_ratchets_and_never_regresses() {
         let journal = journal();

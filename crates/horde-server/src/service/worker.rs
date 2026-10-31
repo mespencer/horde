@@ -937,6 +937,125 @@ mod tests {
         assert_eq!(unversioned.code(), tonic::Code::FailedPrecondition);
     }
 
+    fn registration(reported: Option<u64>) -> tonic::Request<horde_proto::v1::RegisterWorkerRequest> {
+        tonic::Request::new(horde_proto::v1::RegisterWorkerRequest {
+            hello: Some(horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                ..horde_proto::v1::Hello::default()
+            }),
+            worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
+            capabilities: Some(horde_proto::v1::WorkerCapabilities::default()),
+            last_local_journal_sequence: reported,
+        })
+    }
+
+    /// A worker reporting a journal head below what the log stored is
+    /// refused at registration, naming the reset (ADR-0011); after the
+    /// reset, its fresh journal registers and resumes from one.
+    #[tokio::test]
+    async fn a_regressed_journal_is_refused_at_registration_until_reset() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+        let core = core();
+        ingest(
+            &core,
+            vec![journaled("s1", 1, "k1"), journaled("s1", 2, "k2")],
+        )
+        .await;
+        let facing = super::WorkerFacing::new(core.clone());
+
+        let refused = facing
+            .register_worker(registration(Some(0)))
+            .await
+            .expect_err("a lost journal is refused before any stream opens");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("horde worker reset"),
+            "the refusal names the recovery: {}",
+            refused.message()
+        );
+        assert!(
+            facing.register_worker(registration(Some(2))).await.is_ok(),
+            "a worker at the stored head registers"
+        );
+        assert!(
+            facing.register_worker(registration(None)).await.is_ok(),
+            "an older worker reporting nothing is judged at PushEventsStart"
+        );
+
+        crate::liveness::reset_worker_journal(&core, "worker-a", "disk", None)
+            .await
+            .expect("reset");
+        let registered = facing
+            .register_worker(registration(Some(0)))
+            .await
+            .expect("the fresh journal registers after the reset")
+            .into_inner();
+        assert_eq!(
+            registered.resume_from_journal_sequence, 1,
+            "the fresh journal resumes from its own first position"
+        );
+    }
+
+    /// The command stream's end is noticed the moment the transport drops
+    /// it — no command needs to fail — and the lease that starts then ends,
+    /// unanswered, in the worker's started agent declared lost (ADR-0011).
+    #[tokio::test]
+    async fn a_dropped_command_stream_starts_the_lease_that_loses_the_worker() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+        let core = core().with_worker_lease(std::time::Duration::from_millis(1));
+        let facing = super::WorkerFacing::new(core.clone());
+        facing
+            .register_worker(registration(None))
+            .await
+            .expect("registered");
+        super::super::ingest::placed_for_test(&core, "s1", "agent-1", "worker-a").await;
+        crate::service::shared::append_server_event(
+            &core.log,
+            "s1",
+            "",
+            Event {
+                agent_id: Some(AgentId::new("agent-1")),
+                kind: Some(Kind::AgentLifecycleChanged(
+                    horde_proto::v1::AgentLifecycleChanged {
+                        state: horde_proto::v1::AgentLifecycleState::Running as i32,
+                        ..Default::default()
+                    },
+                )),
+                ..Event::default()
+            },
+        )
+        .await
+        .expect("the lifecycle appends");
+
+        let stream = facing
+            .stream_commands(tonic::Request::new(
+                horde_proto::v1::StreamCommandsRequest {
+                    worker_id: Some(horde_proto::v1::WorkerId::new("worker-a")),
+                    resume_from_command_sequence: 1,
+                    resume_after_log_position: 0,
+                },
+            ))
+            .await
+            .expect("the stream opens");
+        drop(stream);
+
+        let lost = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = core.log.read_all("s1").await.expect("read");
+                let state = crate::state::SessionState::project("s1", &events).expect("project");
+                if state.agents["agent-1"].placement_state
+                    == horde_proto::v1::PlacementState::Lost
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(lost.is_ok(), "the lapsed lease must declare the agent lost");
+        assert!(!core.workers.contains("worker-a"), "and the worker left placement");
+    }
+
     #[test]
     fn the_ingest_loop_stops_when_either_the_reply_or_the_send_failed() {
         // Neither: the only case that keeps the stream open.

@@ -2136,3 +2136,299 @@ mod tests {
         assert_eq!(super::client_principal_of(&request_as(None)), None);
     }
 }
+
+/// The ADR-0011 verbs and refusals, through the production handlers.
+#[cfg(test)]
+mod delivery_tests {
+    use horde_identity::{PeerIdentity, Principal, PrincipalRole};
+    use horde_proto::v1::control_plane_service_server::ControlPlaneService;
+    use horde_proto::v1::{
+        AgentId, AgentLifecycleState, ArchiveSessionRequest, Assignment, CreateSessionRequest,
+        Note, PlacementState, ResetWorkerJournalRequest, SendMessageRequest, SessionCursor,
+        SessionId, SpawnAgentRequest, SyncEventsRequest, WorkerId, send_message_request::Body,
+    };
+    use tonic::{Code, Request};
+
+    use super::ControlPlane;
+    use crate::EventLog;
+    use crate::service::shared::ServerCore;
+    use crate::state::SessionState;
+
+    fn plane() -> (ControlPlane, ServerCore) {
+        let core = ServerCore::new(EventLog::in_memory().expect("in-memory log"));
+        (ControlPlane::new(core.clone()), core)
+    }
+
+    /// A fresh session: its id and its root agent.
+    async fn session(plane: &ControlPlane) -> (String, String) {
+        let created = plane
+            .create_session(Request::new(CreateSessionRequest {
+                title: "delivery".to_owned(),
+                ..CreateSessionRequest::default()
+            }))
+            .await
+            .expect("the session is created")
+            .into_inner();
+        let session_id = created
+            .session
+            .and_then(|summary| summary.session_id)
+            .map(|id| id.to_string())
+            .expect("a session id");
+        let root = created
+            .root_agent_id
+            .map(|id| id.to_string())
+            .expect("a root agent");
+        (session_id, root)
+    }
+
+    async fn state(core: &ServerCore, session_id: &str) -> SessionState {
+        let events = core.log.read_all(session_id).await.expect("read");
+        SessionState::project(session_id, &events).expect("project")
+    }
+
+    fn spawn(session_id: &str, key: &str) -> Request<SpawnAgentRequest> {
+        Request::new(SpawnAgentRequest {
+            session_id: Some(SessionId::new(session_id)),
+            idempotency_key: key.to_owned(),
+            ..SpawnAgentRequest::default()
+        })
+    }
+
+    fn send(agent: &str, body: Body, key: &str) -> Request<SendMessageRequest> {
+        Request::new(SendMessageRequest {
+            to_agent_id: Some(AgentId::new(agent)),
+            body: Some(body),
+            idempotency_key: key.to_owned(),
+            ..SendMessageRequest::default()
+        })
+    }
+
+    fn assignment(text: &str) -> Body {
+        Body::Assignment(Assignment {
+            text: text.to_owned(),
+            ..Assignment::default()
+        })
+    }
+
+    /// A retried spawn answers with the first attempt's agent and creates
+    /// nothing — not a second agent, not a placement for a phantom.
+    #[tokio::test]
+    async fn a_retried_spawn_returns_the_agent_the_first_one_made() {
+        let (plane, core) = plane();
+        let (session_id, _) = session(&plane).await;
+        let first = plane
+            .spawn_agent(spawn(&session_id, "spawn-1"))
+            .await
+            .expect("spawned")
+            .into_inner();
+        let head = core.log.head(&session_id).await.expect("head");
+        let again = plane
+            .spawn_agent(spawn(&session_id, "spawn-1"))
+            .await
+            .expect("the retry answers")
+            .into_inner();
+        assert_eq!(again.agent_id, first.agent_id);
+        assert_eq!(
+            again.placement.map(|placement| placement.state),
+            Some(PlacementState::Queued as i32)
+        );
+        assert_eq!(
+            core.log.head(&session_id).await.expect("head"),
+            head,
+            "the retry appended nothing"
+        );
+        assert_eq!(state(&core, &session_id).await.agents.len(), 2);
+    }
+
+    /// A retried send answers with the stored assignment id, not a fresh one
+    /// the log never held; a note has none either way.
+    #[tokio::test]
+    async fn a_retried_send_returns_the_stored_ids() {
+        let (plane, _) = plane();
+        let (_, root) = session(&plane).await;
+        let first = plane
+            .send_message(send(&root, assignment("do it"), "send-1"))
+            .await
+            .expect("sent")
+            .into_inner();
+        let again = plane
+            .send_message(send(&root, assignment("do it"), "send-1"))
+            .await
+            .expect("the retry answers")
+            .into_inner();
+        assert!(first.assignment_id.is_some());
+        assert_eq!(again.assignment_id, first.assignment_id);
+        assert_eq!(again.sequence, first.sequence);
+
+        let note = |key: &str| {
+            send(
+                &root,
+                Body::Note(Note {
+                    text: "fyi".to_owned(),
+                    ..Note::default()
+                }),
+                key,
+            )
+        };
+        let first = plane
+            .send_message(note("note-1"))
+            .await
+            .expect("sent")
+            .into_inner();
+        let again = plane
+            .send_message(note("note-1"))
+            .await
+            .expect("again")
+            .into_inner();
+        assert_eq!(
+            (again.assignment_id, again.sequence),
+            (None, first.sequence)
+        );
+    }
+
+    /// Archive is terminal (ADR-0011): every agent records its own archive
+    /// with the state it left, placement never places them, and both verbs
+    /// refuse by name.
+    #[tokio::test]
+    async fn archive_is_terminal_for_every_agent_and_every_verb() {
+        let (plane, core) = plane();
+        let (session_id, root) = session(&plane).await;
+        let child = plane
+            .spawn_agent(spawn(&session_id, ""))
+            .await
+            .expect("spawned")
+            .into_inner()
+            .agent_id
+            .map(|id| id.to_string())
+            .expect("a child");
+        plane
+            .archive_session(Request::new(ArchiveSessionRequest {
+                session_id: Some(SessionId::new(session_id.clone())),
+                reason: String::new(),
+            }))
+            .await
+            .expect("archived");
+
+        let archived = state(&core, &session_id).await;
+        for agent in [&root, &child] {
+            assert_eq!(
+                archived.agents[agent].lifecycle,
+                AgentLifecycleState::Archived
+            );
+        }
+
+        // A worker appearing must not place an archived agent.
+        core.workers.register(
+            "late-worker",
+            horde_proto::v1::WorkerCapabilities::default(),
+        );
+        crate::placement::place_queued(&core).await.expect("a pass");
+        let after = state(&core, &session_id).await;
+        assert_ne!(
+            after.agents[&child].placement_state,
+            PlacementState::Placed
+        );
+
+        let refused = plane
+            .send_message(send(&root, assignment("too late"), ""))
+            .await
+            .expect_err("an archived agent takes no messages");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("archive"),
+            "{}",
+            refused.message()
+        );
+        let refused = plane
+            .spawn_agent(spawn(&session_id, ""))
+            .await
+            .expect_err("an archived session takes no children");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+    }
+
+    fn as_worker<T>(name: &str, mut request: Request<T>) -> Request<T> {
+        request.extensions_mut().insert(PeerIdentity {
+            principal: Principal::new(PrincipalRole::Worker, name).expect("a valid name"),
+            serial_hex: "aa".to_owned(),
+        });
+        request
+    }
+
+    fn sync(cursors: &[&str], all_sessions: bool) -> Request<SyncEventsRequest> {
+        Request::new(SyncEventsRequest {
+            cursors: cursors
+                .iter()
+                .map(|session| SessionCursor {
+                    session_id: Some(SessionId::new(*session)),
+                    from_sequence: 1,
+                })
+                .collect(),
+            all_sessions,
+            ..SyncEventsRequest::default()
+        })
+    }
+
+    /// A worker reads only sessions it holds agents in, and never the
+    /// all-sessions net (ADR-0011, closing ADR-0009's gap).
+    #[tokio::test]
+    async fn a_worker_reads_only_sessions_it_holds_agents_in() {
+        let (plane, core) = plane();
+        let (held, _) = session(&plane).await;
+        let (foreign, _) = session(&plane).await;
+        crate::service::ingest::placed_for_test(&core, &held, "agent-w", "w1").await;
+
+        assert!(
+            plane
+                .sync_events(as_worker("w1", sync(&[&held], false)))
+                .await
+                .is_ok()
+        );
+        let refused = plane
+            .sync_events(as_worker("w1", sync(&[&held, &foreign], false)))
+            .await
+            .err()
+            .expect("a session it holds no agent in is refused");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        let refused = plane
+            .sync_events(as_worker("w1", sync(&[], true)))
+            .await
+            .err()
+            .expect("the all-sessions net is a client's view");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(
+            plane.sync_events(sync(&[&foreign], false)).await.is_ok(),
+            "a client reads any session"
+        );
+    }
+
+    /// The reset verb answers its floor and the agents it lost.
+    #[tokio::test]
+    async fn the_reset_verb_reports_its_floor_and_losses() {
+        let (plane, core) = plane();
+        let (session_id, _) = session(&plane).await;
+        crate::service::ingest::placed_for_test(&core, &session_id, "agent-w", "w1").await;
+        let reset = plane
+            .reset_worker_journal(Request::new(ResetWorkerJournalRequest {
+                worker_id: Some(WorkerId::new("w1")),
+                reason: "disk replaced".to_owned(),
+            }))
+            .await
+            .expect("reset")
+            .into_inner();
+        assert_eq!(reset.journal_floor, 0);
+        assert_eq!(
+            reset
+                .lost_agents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+            "an agent never seen running is re-queued, not lost"
+        );
+        let refused = plane
+            .reset_worker_journal(Request::new(ResetWorkerJournalRequest::default()))
+            .await
+            .expect_err("a reset must name its worker");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+}
