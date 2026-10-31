@@ -368,42 +368,40 @@ async fn a_lost_workers_unstarted_agents_are_requeued_and_replaced() {
     ));
     drop(commands);
 
-    // The server only notices a lazy disconnect when it next tries to send —
-    // which this spawn provides: it is placed on worker-a (still registered),
-    // the dead stream fails to deliver it, and the loss machinery runs.
+    // The server notices the stream is gone the moment the transport drops
+    // it (ADR-0011) — no command has to fail first — so the never-started
+    // root falls back to the queue on its own.
+    let requeued = placements_until(&mut harness, &session_id, 2)
+        .await
+        .expect("the re-queue");
+    assert_eq!(
+        requeued[1],
+        Observed {
+            agent_id: root.clone(),
+            state: PlacementState::Queued,
+            worker_id: None,
+        },
+        "the never-started root falls back to the queue: {requeued:?}"
+    );
+
+    // With worker-a gone from placement, a new spawn has nowhere to go.
     let orphan = spawn(&mut harness, &session_id, AgentSpec::default())
         .await
         .expect("a spawn");
-
-    // Events 1..=4: root queued? no — root placed at creation, orphan placed.
-    // After the loss: both are re-queued (neither ever started), and once
-    // worker-b registers, both land there.
-    let requeued = placements_until(&mut harness, &session_id, 4)
+    let queued = placements_until(&mut harness, &session_id, 3)
         .await
-        .expect("the re-queues");
-    let requeued_agents: Vec<&str> = requeued[2..]
-        .iter()
-        .map(|observed| observed.agent_id.as_str())
-        .collect();
-    assert!(
-        requeued[2..]
-            .iter()
-            .all(|observed| observed.state == PlacementState::Queued),
-        "both never-started agents fall back to the queue: {requeued:?}"
-    );
-    assert!(
-        requeued_agents.contains(&root.as_str()) && requeued_agents.contains(&orphan.as_str()),
-        "the lost worker held exactly these two: {requeued_agents:?}"
-    );
+        .expect("the orphan's answer");
+    assert_eq!(queued[2].agent_id, orphan);
+    assert_eq!(queued[2].state, PlacementState::Queued);
 
     register(&mut harness, "worker-b", WorkerCapabilities::default())
         .await
         .expect("register the replacement");
-    let replaced = placements_until(&mut harness, &session_id, 6)
+    let replaced = placements_until(&mut harness, &session_id, 5)
         .await
         .expect("the re-placements");
     assert!(
-        replaced[4..]
+        replaced[3..]
             .iter()
             .all(|observed| observed.state == PlacementState::Placed
                 && observed.worker_id.as_deref() == Some("worker-b")),
@@ -438,13 +436,14 @@ async fn a_lost_workers_unstarted_agents_are_requeued_and_replaced() {
                     .unwrap_or_default(),
             );
         }
-        if cancelled.len() == 2 {
+        if !cancelled.is_empty() {
             break;
         }
     }
-    assert!(
-        cancelled.contains(&root) && cancelled.contains(&orphan),
-        "each moved agent is cancelled on the worker that lost it: {cancelled:?}"
+    assert_eq!(
+        cancelled,
+        vec![root],
+        "the moved agent is cancelled on the worker that lost it"
     );
 }
 
