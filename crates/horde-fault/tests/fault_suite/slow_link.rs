@@ -153,12 +153,32 @@ async fn heartbeats_mark_a_stale_link_and_the_healed_stream_catches_up() {
     // heartbeat IS the staleness verdict — this wait is the client-side
     // staleness detector running for real, and its positive control is the
     // heal below, which proves the same stream was alive the whole time.
+    //
+    // `blackhole` resolves once the hole is airtight, so the forwarded count
+    // is frozen from here: any frame still readable crossed *before* the
+    // hole (under load the reader can trail the wire by several heartbeats)
+    // and is drained as such. The staleness verdict is the quiet that
+    // follows, and the frozen count is its proof — not "the first read came
+    // back empty", which raced every frame already past the proxy.
     proxy.heal();
-    proxy.blackhole();
-    let while_dark = frame_within(&mut stream, Duration::from_millis(700)).await;
-    assert!(
-        while_dark.is_none(),
-        "a blackholed link must deliver nothing — got {while_dark:?}"
+    support::within("the blackhole to close", proxy.blackhole()).await;
+    let dark_at = proxy.bytes_forwarded();
+    let mut quiet = false;
+    for _ in 0_u32..256 {
+        if frame_within(&mut stream, Duration::from_millis(700))
+            .await
+            .is_none()
+        {
+            quiet = true;
+            break;
+        }
+    }
+    assert!(quiet, "a blackholed link must fall quiet");
+    assert_eq!(
+        proxy.bytes_forwarded(),
+        dark_at,
+        "a blackholed link must carry nothing: every frame read in the dark \
+         crossed before the hole"
     );
 
     // Something real happens while the link is dark.

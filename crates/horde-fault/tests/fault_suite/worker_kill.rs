@@ -71,7 +71,7 @@ async fn a_worker_killed_mid_turn_requeues_the_unstarted_and_revives_the_running
 
     // Blackhole first: whatever is seeded from here can reach the log but
     // never the worker, so agent-2's spawn is guaranteed never-started.
-    proxy.blackhole();
+    support::within("the blackhole to close", proxy.blackhole()).await;
     horde_server_testkit::place_agent(&core.log, "s2", "agent-2", "worker-a", "queued work")
         .await
         .expect("the seed appends");

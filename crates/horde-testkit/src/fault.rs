@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 
 /// How much one relay read moves at a time. Small enough that throttling and
 /// byte-budget cuts land with sub-chunk precision on real traffic.
@@ -80,6 +80,11 @@ struct Shared {
     /// `false` while blackholed. A watch channel so a held relay parks on a
     /// wakeup instead of polling a clock.
     forward: watch::Sender<bool>,
+    /// Held shared by every delivery from its gate check through its count,
+    /// and exclusively by [`FaultProxy::held`]: once that exclusive claim is
+    /// granted after a blackhole, no delivery is between "the gate was open"
+    /// and "the bytes were written".
+    gate: RwLock<()>,
     live: Mutex<Vec<tokio::task::AbortHandle>>,
     connections_carried: AtomicU64,
     bytes_forwarded: AtomicU64,
@@ -112,6 +117,7 @@ impl FaultProxy {
             throttle: AtomicU64::new(0),
             budget: Mutex::new(BUDGET_DISARMED),
             forward,
+            gate: RwLock::new(()),
             live: Mutex::new(Vec::new()),
             connections_carried: AtomicU64::new(0),
             bytes_forwarded: AtomicU64::new(0),
@@ -162,12 +168,21 @@ impl FaultProxy {
     /// writes appear to succeed, nothing arrives — until [`heal`] releases
     /// the held bytes on the same connections.
     ///
+    /// Resolves once the hole is airtight: every delivery that found the
+    /// gate open before it closed has finished writing and counting, so from
+    /// the moment this returns until [`heal`], [`bytes_forwarded`] cannot
+    /// move. A staleness test can then treat whatever its peer still reads
+    /// as bytes that crossed *before* the hole — a fact, not a hope that no
+    /// frame was mid-flight when the fault landed.
+    ///
     /// [`heal`]: FaultProxy::heal
-    pub fn blackhole(&self) {
+    /// [`bytes_forwarded`]: FaultProxy::bytes_forwarded
+    pub async fn blackhole(&self) {
         // `send_replace`, not `send`: relays subscribe per chunk, so there may
         // be no receiver alive at this instant — and `send` on a receiverless
         // watch drops the value on the floor.
         self.shared.forward.send_replace(false);
+        drop(self.shared.gate.write().await);
     }
 
     /// Adds `extra` latency to every delivered chunk.
@@ -305,12 +320,21 @@ impl Shared {
             tokio::time::sleep(pace).await;
         }
 
-        // The blackhole gate. Parked on a wakeup, never a poll: the wait ends
-        // when `heal` flips the watch or the proxy is dropped.
+        // The blackhole gate, checked *under* the shared passage so `held`
+        // can wait out every delivery that saw it open. Parked on a wakeup,
+        // never a poll: the wait ends when `heal` flips the watch or the
+        // proxy is dropped.
         let mut forward = self.forward.subscribe();
-        if forward.wait_for(|open| *open).await.is_err() {
-            return Err(Undeliverable);
-        }
+        let passage = loop {
+            let passage = self.gate.read().await;
+            if *forward.borrow_and_update() {
+                break passage;
+            }
+            drop(passage);
+            if forward.changed().await.is_err() {
+                return Err(Undeliverable);
+            }
+        };
 
         // No zero-length guard, deliberately: `write_all` of an empty slice
         // and `fetch_add(0)` are both no-ops, and a branch that cannot
@@ -321,6 +345,7 @@ impl Shared {
         }
         self.bytes_forwarded
             .fetch_add(allowed as u64, Ordering::SeqCst);
+        drop(passage);
         if sever {
             self.cut();
             return Err(Undeliverable);
@@ -563,7 +588,7 @@ mod tests {
         let mut stream = dial(&proxy).await;
         within("the pre-blackhole echo", round_trip(&mut stream, b"ok")).await;
 
-        proxy.blackhole();
+        within("the blackhole to close", proxy.blackhole()).await;
         stream
             .write_all(b"held")
             .await
