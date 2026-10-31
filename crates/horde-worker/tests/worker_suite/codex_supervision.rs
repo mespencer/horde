@@ -185,7 +185,7 @@ mod harness {
     /// approval-shaped tests both build on. Returns the control-log path the
     /// stub records to; the tempdirs ride along because dropping them deletes
     /// the files under the child.
-    async fn logged_session(
+    pub(crate) async fn logged_session(
         script: &str,
         steer_mode: Option<&str>,
     ) -> (
@@ -644,41 +644,52 @@ async fn an_interrupt_cancels_a_parked_exec_approval_before_the_turn_dies() {
     session.shutdown().await.expect("shuts down");
 }
 
-/// A narrowing decision must be refused loudly — neither reply vocabulary can
-/// carry replacement arguments, and a narrowing that silently widened into a
-/// plain allow is the failure the capability advertisement exists to prevent.
-/// The refusal must also leave the request outstanding: a consumed-but-
-/// unanswered approval would park the harness forever.
+/// A narrowing neither reply vocabulary can carry degrades to a journaled
+/// decline: never widened into a plain allow (the failure the capability
+/// advertisement exists to prevent), and never an error that leaves the
+/// request unanswered — nobody re-answers in production, and an unanswered
+/// approval parks the harness forever. A production Server can deliver one
+/// (nothing upstream is guaranteed to gate it), so this is a real path.
 #[tokio::test]
-async fn a_narrowing_decision_is_refused_not_widened_and_stays_answerable() {
-    let (mut session, _log_path, _dirs) =
+async fn a_narrowing_decision_degrades_to_a_journaled_decline() {
+    let (mut session, log_path, _dirs) =
         harness::approval_session(&exec_approval_script("declined", None)).await;
     let request = surfaced_request(&mut session).await;
 
     // A real rewrite: the chain narrowed to a different command, which the
     // decision vocabulary cannot express.
-    let refused = session
+    session
         .answer_permission(
             &request.tool_call_id,
             PermissionDecision::allow_with(json!({"command": "true", "cwd": "/work"})),
         )
-        .await;
+        .await
+        .expect("an inexpressible narrowing is answered, not refused");
+
+    let recorded = control_log_shows(&log_path, |log| log.contains("\"decision\"")).await;
     assert!(
-        matches!(refused, Err(AdapterError::Unsupported { .. })),
-        "got {refused:?}"
+        recorded.contains("\"decision\":\"decline\""),
+        "the harness is told decline — never accept: {recorded}"
+    );
+    let (events, outcome) = events_through_turn_end(&mut session).await;
+    assert!(outcome.is_some(), "the turn ends once the decline landed");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Output { text, .. }
+                if text.contains("cannot express") && text.contains("decline")
+        )),
+        "the journal says why the allow became a decline: {events:?}"
     );
 
-    // The refusal consumed nothing: the same request still takes an
-    // expressible answer, and the turn completes on it.
-    session
-        .answer_permission(
-            &request.tool_call_id,
-            PermissionDecision::deny("narrowing could not apply"),
-        )
-        .await
-        .expect("the request must still be answerable after the refusal");
-    let (_, outcome) = events_through_turn_end(&mut session).await;
-    assert!(outcome.is_some(), "the turn ends once a real answer landed");
+    // The request is consumed: answering it again is an error, not a no-op.
+    let again = session
+        .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+        .await;
+    assert!(
+        matches!(again, Err(AdapterError::UnknownPermissionRequest { .. })),
+        "got {again:?}"
+    );
 
     // And an answer for a call nobody proposed is an error, never a no-op.
     let stray = session
@@ -825,6 +836,62 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
         (Some(interrupt), Some(deferred)) => assert!(
             interrupt < deferred,
             "the cancel precedes the delivery: {recorded}"
+        ),
+        other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
+    }
+    session.shutdown().await.expect("shuts down");
+}
+
+/// The race: an interrupt that arrives after `turn/start` went out but
+/// before `turn/started` was read. The turn exists — its request is in
+/// flight — so the interrupt must cancel it and defer the message, not send
+/// a second `turn/start` that races the first.
+#[tokio::test]
+async fn an_interrupt_before_turn_started_is_read_cancels_rather_than_racing() {
+    let script = [
+        harness::opening_block(),
+        [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
+        [
+            harness::turn_started("turn-2"),
+            harness::final_answer("turn-2", "i2", "REPLACEMENT"),
+            harness::turn_completed("turn-2"),
+        ]
+        .join("\n"),
+    ]
+    .join("\n\n");
+
+    // Sent, but nothing read: the turn/start reply and turn/started are
+    // both still in the pipe.
+    let (mut session, log_path, _dirs) = harness::logged_session(&script, None).await;
+    session
+        .send(TurnInput::interrupting("do this instead"))
+        .await
+        .expect("the interrupt goes out");
+
+    let (_, first) = events_through_turn_end(&mut session).await;
+    assert_eq!(
+        first.expect("the first turn closes").status,
+        TurnStatus::Interrupted
+    );
+    let (_, second) = events_through_turn_end(&mut session).await;
+    assert_eq!(
+        second.expect("the deferred turn runs").text.as_deref(),
+        Some("REPLACEMENT")
+    );
+
+    let recorded = control_log_shows(&log_path, |log| log.contains("do this instead")).await;
+    assert_eq!(
+        recorded.matches("turn/start").count(),
+        2,
+        "the opening turn and the deferred one — never a racing third: {recorded}"
+    );
+    match (
+        recorded.find("turn/interrupt"),
+        recorded.find("do this instead"),
+    ) {
+        (Some(interrupt), Some(deferred)) => assert!(
+            interrupt < deferred,
+            "the in-flight turn is cancelled before the message is delivered: {recorded}"
         ),
         other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
     }

@@ -197,8 +197,9 @@ impl WorkspaceManager {
     {
         let agent_root = instance_root.join(AGENTS_DIR).join(agent_id);
         for repo in &definition.repos {
-            let source = instance_root.join(layout_of(repo));
-            let destination = agent_root.join(layout_of(repo));
+            let layout = layout_of(repo).map_err(WorkerError::Workspace)?;
+            let source = instance_root.join(layout);
+            let destination = agent_root.join(layout);
             if destination.exists() {
                 // A redelivered spawn reuses its checkout; at-least-once
                 // delivery must not stack a second worktree beside the first.
@@ -231,11 +232,85 @@ impl WorkspaceManager {
     ) -> Result<Vec<(String, PathBuf)>, WorkerError> {
         let instance_root = self.instance_root(definition_id);
         let definition = required_state(&instance_root, definition_id).await?;
-        Ok(definition
+        definition
             .repos
             .iter()
-            .map(|repo| (repo.name.clone(), PathBuf::from(layout_of(repo))))
-            .collect())
+            .map(|repo| {
+                layout_of(repo)
+                    .map(|layout| (repo.name.clone(), PathBuf::from(layout)))
+                    .map_err(WorkerError::Workspace)
+            })
+            .collect()
+    }
+
+    /// Gives back an archived agent's private checkout: each repo's HEAD is
+    /// pinned in the Instance's repo under `refs/horde/archived/<agent>` (so
+    /// a commit a result named stays reachable — a branch deleted with
+    /// nothing else pointing at it is garbage-collection fodder), then the
+    /// worktree is removed, its `horde/<agent>` branch deleted, and the
+    /// agent's directory under `.horde-agents/` removed.
+    ///
+    /// A root that is not an agent-private checkout of this manager — the
+    /// `shared` policy's Instance root, or anywhere else — is left alone:
+    /// only what [`Self::checkout`] composed for the agent is the agent's to
+    /// give back. Uncommitted work in the checkout is discarded; archive is
+    /// where an agent's context ends.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Workspace`] when pinning or removal fails. Nothing is
+    /// deleted for a repo whose HEAD could not be pinned.
+    pub async fn release_checkout(&self, root: &Path) -> Result<(), WorkerError> {
+        let Some((instance_root, agent_id)) = self.agent_private(root) else {
+            return Ok(());
+        };
+        let repos = read_state_file(&instance_root)
+            .await
+            .map(|definition| definition.repos)
+            .unwrap_or_default();
+        for repo in &repos {
+            let layout = layout_of(repo).map_err(WorkerError::Workspace)?;
+            let source = instance_root.join(layout);
+            let destination = root.join(layout);
+            if !destination.exists() {
+                continue;
+            }
+            let destination = path_str(&destination);
+            let pin = format!("+HEAD:refs/horde/archived/{agent_id}");
+            git(&source, &["fetch", "--no-tags", "--", &destination, &pin])
+                .await
+                .map_err(WorkerError::Workspace)?;
+            if Path::new(&destination).join(".git").is_file() {
+                git(&source, &["worktree", "remove", "--force", &destination])
+                    .await
+                    .map_err(WorkerError::Workspace)?;
+            }
+            // Absent for a fresh clone (its branch lives in the clone), and
+            // for a checkout that never left the instance's HEAD's branch.
+            let _ = git(&source, &["branch", "-D", &format!("horde/{agent_id}")]).await;
+        }
+        match tokio::fs::remove_dir_all(root).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Workspace(format!(
+                "could not remove {}: {error}",
+                root.display()
+            ))),
+        }
+    }
+
+    /// `(instance root, agent id)` when `root` is exactly an agent-private
+    /// checkout under this manager: `<root>/<definition>/.horde-agents/<agent>`.
+    fn agent_private(&self, root: &Path) -> Option<(PathBuf, String)> {
+        let agent_id = root.file_name()?.to_str()?;
+        let agents_dir = root.parent()?;
+        let instance_root = agents_dir.parent()?;
+        let definition_id = instance_root.file_name()?.to_str()?;
+        let shaped = is_path_safe(agent_id)
+            && is_path_safe(definition_id)
+            && agents_dir.file_name()?.to_str()? == AGENTS_DIR
+            && instance_root.parent()? == self.root;
+        shaped.then(|| (instance_root.to_path_buf(), agent_id.to_owned()))
     }
 
     /// The Instances already on this Worker's disk, for the capability
@@ -264,7 +339,13 @@ impl WorkspaceManager {
             let mut repos = Vec::new();
             let mut failures = Vec::new();
             for repo in &definition.repos {
-                let path = instance_root.join(layout_of(repo));
+                let path = match layout_of(repo) {
+                    Ok(layout) => instance_root.join(layout),
+                    Err(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                };
                 if path.join(".git").exists() {
                     repos.push(RepoInstanceReport {
                         repo_name: repo.name.clone(),
@@ -317,7 +398,7 @@ async fn materialize_repo(
     instance_root: &Path,
     repo: &WorkspaceRepo,
 ) -> Result<RepoInstanceReport, String> {
-    let destination = instance_root.join(layout_of(repo));
+    let destination = instance_root.join(layout_of(repo)?);
 
     if destination.join(".git").exists() {
         // Repair path: the checkout exists; refresh its view of the remote.
@@ -327,11 +408,21 @@ async fn materialize_repo(
         )
         .await?;
     } else {
+        // Both values arrive over the wire. A leading `-` would be parsed
+        // as an option (`--upload-pack=…` runs a command), so the branch is
+        // refused outright and the positionals sit behind `--`.
+        if is_option_shaped(&repo.default_branch) || is_option_shaped(&repo.remote_url) {
+            return Err(format!(
+                "refusing to clone {:?} at branch {:?}: a leading '-' would be read as a git option",
+                repo.remote_url, repo.default_branch
+            ));
+        }
         let mut arguments = vec!["clone".to_owned()];
         if !repo.default_branch.is_empty() {
             arguments.push("--branch".to_owned());
             arguments.push(repo.default_branch.clone());
         }
+        arguments.push("--".to_owned());
         arguments.push(repo.remote_url.clone());
         arguments.push(path_str(&destination));
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
@@ -426,12 +517,36 @@ async fn git(cwd: &Path, arguments: &[&str]) -> Result<String, String> {
 }
 
 /// The path a repo occupies inside its Instance, defaulted to its name.
-fn layout_of(repo: &WorkspaceRepo) -> &str {
-    if repo.layout_path.is_empty() {
+///
+/// # Errors
+///
+/// A layout that would land outside the Instance root — absolute, empty, or
+/// climbing with `..` — is refused, not joined: `Path::join` with an
+/// absolute path *replaces* the root, so an unchecked layout from a confused
+/// or compromised Server would clone (and later delete) wherever it pointed.
+fn layout_of(repo: &WorkspaceRepo) -> Result<&str, String> {
+    let layout = if repo.layout_path.is_empty() {
         &repo.name
     } else {
         &repo.layout_path
+    };
+    let mut components = Path::new(layout).components().peekable();
+    let contained = components.peek().is_some()
+        && components.all(|component| matches!(component, std::path::Component::Normal(_)));
+    if contained {
+        Ok(layout)
+    } else {
+        Err(format!(
+            "repo {:?} lays out at {layout:?}, which is not a path inside the instance",
+            repo.name
+        ))
     }
+}
+
+/// A clone source or branch git would read as an option. `--` protects the
+/// positional URL; a branch rides `--branch` and so must be refused here.
+fn is_option_shaped(value: &str) -> bool {
+    value.starts_with('-')
 }
 
 /// Whether an id may be used as a single directory component.
@@ -495,8 +610,70 @@ mod tests {
             name: "atlas".to_owned(),
             ..WorkspaceRepo::default()
         };
-        assert_eq!(layout_of(&repo), "atlas");
+        assert_eq!(layout_of(&repo), Ok("atlas"));
         repo.layout_path = "code/atlas".to_owned();
-        assert_eq!(layout_of(&repo), "code/atlas");
+        assert_eq!(layout_of(&repo), Ok("code/atlas"));
+    }
+
+    /// A layout that would land outside the Instance is refused: `join` with
+    /// an absolute path replaces the root, and `..` climbs out of it.
+    #[test]
+    fn a_layout_that_escapes_the_instance_is_refused() {
+        for hostile in ["../escape", "/etc", "code/../../x", "./atlas", "."] {
+            let repo = WorkspaceRepo {
+                name: "atlas".to_owned(),
+                layout_path: hostile.to_owned(),
+                ..WorkspaceRepo::default()
+            };
+            assert!(
+                layout_of(&repo).is_err_and(|e| e.contains("not a path inside")),
+                "{hostile:?} must be refused"
+            );
+        }
+        let nameless = WorkspaceRepo::default();
+        assert!(layout_of(&nameless).is_err(), "an empty layout is no path");
+        let escaping_name = WorkspaceRepo {
+            name: "../atlas".to_owned(),
+            ..WorkspaceRepo::default()
+        };
+        assert!(
+            layout_of(&escaping_name).is_err(),
+            "the name is the layout's default, so it is checked too"
+        );
+    }
+
+    #[test]
+    fn only_a_leading_dash_is_option_shaped() {
+        assert!(is_option_shaped("--upload-pack=touch /tmp/x"));
+        assert!(is_option_shaped("-b"));
+        assert!(!is_option_shaped("https://example.com/a-b.git"));
+        assert!(!is_option_shaped(""));
+    }
+
+    /// Only an exact agent-private checkout of this manager is releasable:
+    /// the shared policy's Instance root, a foreign path, and a hostile
+    /// shape are all left alone.
+    #[test]
+    fn only_an_agent_private_checkout_is_releasable() {
+        let manager = WorkspaceManager::new("w", "/ws");
+        assert_eq!(
+            manager.agent_private(Path::new("/ws/def-1/.horde-agents/agent-1")),
+            Some((PathBuf::from("/ws/def-1"), "agent-1".to_owned()))
+        );
+        for left_alone in [
+            "/ws/def-1",
+            "/ws/def-1/other/agent-1",
+            "/elsewhere/def-1/.horde-agents/agent-1",
+            "/ws/nested/def-1/.horde-agents/agent-1",
+            "/ws/def-1/.horde-agents/.hidden",
+            "/ws/.def/.horde-agents/agent-1",
+            "/",
+        ] {
+            assert_eq!(
+                manager.agent_private(Path::new(left_alone)),
+                None,
+                "{left_alone} is not the agent's to give back"
+            );
+        }
     }
 }

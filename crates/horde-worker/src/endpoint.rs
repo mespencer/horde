@@ -91,6 +91,10 @@ struct Served {
 
 struct ServedEndpoint {
     url: String,
+    /// The agents this endpoint was minted for and not yet forgotten. The
+    /// last one forgotten takes the endpoint down with it — a Session whose
+    /// agents are all archived has nobody left to serve.
+    agents: std::collections::BTreeSet<String>,
     /// The serving handle; shut down (listener and admitted connections
     /// both reaped) at shutdown, kept alive by being held here.
     serving: horde_mcp::server::ServingEndpoint,
@@ -145,9 +149,9 @@ impl EndpointManager {
         sink: StampingSink,
         surface: &AgentMcpSurface,
     ) -> Result<McpEndpoint, WorkerError> {
-        let url = self.session_endpoint(session_id, sink).await?;
+        let url = self.session_endpoint(session_id, agent_id, sink).await?;
         self.register_surface(session_id, agent_id, surface).await?;
-        let token = mint_token();
+        let token = mint_token()?;
         self.registry.insert(agent_id, token.clone());
         Ok(McpEndpoint::Http {
             url,
@@ -200,12 +204,34 @@ impl EndpointManager {
         Ok(())
     }
 
-    /// Revokes an archived Agent's token (effective on its next request) and
-    /// drops its proxied toolset — the `local` children die by handle with
-    /// the last clone of their upstreams.
-    pub fn forget_agent(&self, agent_id: &str) {
+    /// Revokes an Agent's token (effective on its next request) and drops its
+    /// proxied toolset — the `local` children die by handle with the last
+    /// clone of their upstreams. Called at archive, and for a spawn or
+    /// revival that minted an endpoint but never got a running harness: a
+    /// credential nobody holds must not stay valid.
+    ///
+    /// When this was the last agent of its Session's endpoint, the endpoint
+    /// is shut down too (listener and connections reaped) rather than left
+    /// serving nobody until the Worker exits. Returns whether that happened.
+    pub async fn forget_agent(&self, agent_id: &str) -> bool {
         self.registry.remove(agent_id);
         self.proxies.remove(agent_id);
+
+        let mut served = self.served.lock().await;
+        let emptied = served.endpoints.iter_mut().find_map(|(session, endpoint)| {
+            (endpoint.agents.remove(agent_id) && endpoint.agents.is_empty())
+                .then(|| session.clone())
+        });
+        let released = emptied.and_then(|session| served.endpoints.remove(&session));
+        drop(served);
+
+        match released {
+            Some(endpoint) => {
+                endpoint.serving.shutdown().await;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Stops every serving loop, and does not return until each has actually
@@ -248,10 +274,14 @@ impl EndpointManager {
         reaped
     }
 
-    /// The served URL for one Session's endpoint, binding it on first use.
+    /// The served URL for one Session's endpoint, binding it on first use,
+    /// with `agent_id` recorded as one of the agents it serves — before the
+    /// rest of the mint can fail, so a failed spawn's `forget_agent` still
+    /// finds it and releases an endpoint nobody else uses.
     async fn session_endpoint(
         &self,
         session_id: &str,
+        agent_id: &str,
         sink: StampingSink,
     ) -> Result<String, WorkerError> {
         let mut served = self.served.lock().await;
@@ -260,7 +290,8 @@ impl EndpointManager {
                 "the endpoint manager has shut down".to_owned(),
             ));
         }
-        if let Some(endpoint) = served.endpoints.get(session_id) {
+        if let Some(endpoint) = served.endpoints.get_mut(session_id) {
+            endpoint.agents.insert(agent_id.to_owned());
             return Ok(endpoint.url.clone());
         }
 
@@ -284,6 +315,7 @@ impl EndpointManager {
             session_id.to_owned(),
             ServedEndpoint {
                 url: url.clone(),
+                agents: std::collections::BTreeSet::from([agent_id.to_owned()]),
                 serving,
             },
         );
@@ -296,17 +328,23 @@ impl EndpointManager {
 /// From the OS entropy source, not a counter or a clock: the token is the
 /// only thing separating one agent's verbs from another's on a shared
 /// loopback port.
-fn mint_token() -> String {
+///
+/// # Errors
+///
+/// [`WorkerError::EndpointUnavailable`] when the entropy source fails or
+/// yields all zeroes. A machine in that state cannot do TLS either, so there
+/// is no degraded mode — but it is the spawn that fails, loudly, never the
+/// Worker that panics.
+fn mint_token() -> Result<String, WorkerError> {
     let mut bytes = [0_u8; 32];
-    // The OS entropy source failing is a machine that cannot do TLS either;
-    // there is no meaningful degraded mode. Fall back to a panic-free but
-    // loud refusal via the zeroed check below rather than unwrapping.
     let filled = getrandom::fill(&mut bytes).is_ok();
-    assert!(
-        filled && bytes.iter().any(|byte| *byte != 0),
-        "the OS entropy source must yield token bytes"
-    );
-    hex::encode(bytes)
+    if filled && bytes.iter().any(|byte| *byte != 0) {
+        Ok(hex::encode(bytes))
+    } else {
+        Err(WorkerError::EndpointUnavailable(
+            "the OS entropy source yielded no token bytes".to_owned(),
+        ))
+    }
 }
 
 /// The Worker's journal, as the endpoint's seam sees it.
@@ -351,8 +389,8 @@ mod tests {
     /// entropy — a predictable token is another agent's verbs.
     #[test]
     fn minted_tokens_are_long_and_never_repeat() {
-        let first = mint_token();
-        let second = mint_token();
+        let first = mint_token().expect("entropy");
+        let second = mint_token().expect("entropy");
         assert_ne!(first, second);
         assert_eq!(first.len(), 64);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
@@ -436,7 +474,48 @@ mod tests {
             "got {refused:?}"
         );
 
-        assert_eq!(manager.shutdown().await, 1, "the session endpoint reaps");
+        // The failed spawn's cleanup: forgetting the agent that never got a
+        // harness releases the endpoint bound for it, rather than leaving it
+        // serving nobody until shutdown.
+        assert!(
+            manager.forget_agent("agent-1").await,
+            "the endpoint bound for the failed spawn is released"
+        );
+        assert_eq!(manager.shutdown().await, 0, "nothing was left to reap");
+    }
+
+    /// Forgetting one sibling keeps the Session's endpoint for the other;
+    /// forgetting the last takes it down. An agent the manager never minted
+    /// for releases nothing.
+    #[tokio::test]
+    async fn a_sessions_endpoint_lives_exactly_as_long_as_its_agents() {
+        let manager = manager();
+        for agent in ["agent-1", "agent-2"] {
+            manager
+                .endpoint_for("s1", agent, sink(), &bare())
+                .await
+                .expect("serves");
+        }
+        assert!(!manager.forget_agent("agent-nobody").await);
+        assert!(
+            !manager.forget_agent("agent-1").await,
+            "a sibling still needs the endpoint"
+        );
+        assert!(
+            manager.forget_agent("agent-2").await,
+            "the last agent takes the endpoint down"
+        );
+        assert!(
+            !manager.forget_agent("agent-2").await,
+            "forgetting twice releases nothing twice"
+        );
+
+        // A new agent of the same Session binds afresh.
+        manager
+            .endpoint_for("s1", "agent-3", sink(), &bare())
+            .await
+            .expect("a fresh endpoint");
+        assert_eq!(manager.shutdown().await, 1);
     }
 
     /// The Session mapping: two agents of one Session share its endpoint
@@ -528,7 +607,13 @@ mod tests {
             .await
             .expect("the minted pair authenticates against the served endpoint");
 
-        manager.forget_agent("agent-1");
+        // A sibling keeps the endpoint up, so what is observed below is the
+        // token's revocation, not the socket's death.
+        manager
+            .endpoint_for("s1", "agent-sibling", sink(), &bare())
+            .await
+            .expect("the sibling shares it");
+        assert!(!manager.forget_agent("agent-1").await);
         assert!(
             dial(token.clone(), url.clone()).await.is_err(),
             "a forgotten agent's token must stop authenticating immediately"

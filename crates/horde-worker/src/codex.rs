@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 
 use async_trait::async_trait;
 use horde_adapter::{
-    Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, Capabilities, Capability, Delivery,
+    Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, Capabilities, Delivery,
     McpEndpoint, PermissionDecision, ProviderSessionId, Result, ToolCallId, TurnInput,
 };
 use horde_adapter_codex::codec::{
@@ -664,6 +664,14 @@ impl LiveCodexSession {
         self.write(&encode_interrupt(id, &thread)).await
     }
 
+    /// Whether a `turn/start` is still awaiting its reply — a turn the
+    /// harness has been asked for but has not announced yet.
+    fn turn_start_outstanding(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|(_, request)| *request == OutstandingRequest::TurnStart)
+    }
+
     /// Starts a fresh turn with `text`.
     async fn start_turn(&mut self, text: &str) -> Result<()> {
         let thread = self.thread_id.clone().unwrap_or_default();
@@ -792,9 +800,9 @@ fn unadjudicable_refusal(id: u64, method: &str) -> String {
     }
 }
 
-/// A narrowing the exec vocabulary cannot express — the caller refuses the
-/// decision (`Capability::RewritesToolInput` unsupported) and the request
-/// stays outstanding, still answerable with a decision that fits.
+/// A narrowing the exec vocabulary cannot express — the caller declines the
+/// request and journals why, rather than run the un-narrowed original or
+/// leave the harness parked on an unanswered request.
 #[derive(Debug, PartialEq, Eq)]
 struct InexpressibleNarrowing;
 
@@ -809,7 +817,7 @@ struct InexpressibleNarrowing;
 /// | allow + remember for session              | `acceptForSession`              |
 /// | allow + narrowing == the proposal, and codex proposed an amendment | `acceptWithExecpolicyAmendment` (codex's own argv) |
 /// | allow + narrowing == the proposal, no amendment proposed | `accept` (`acceptForSession` with remember) |
-/// | allow + narrowing ≠ the proposal          | refused (`InexpressibleNarrowing`) |
+/// | allow + narrowing ≠ the proposal          | `InexpressibleNarrowing` → the caller declines |
 ///
 /// The reply cannot change what runs — codex executes the command it proposed
 /// or nothing — so the only "narrowing" this vocabulary can express is one
@@ -818,8 +826,10 @@ struct InexpressibleNarrowing;
 /// is that statement made persistent (transcript 30). A narrowing that
 /// actually rewrites arguments is refused, never downgraded to running the
 /// un-narrowed original — the same reject-don't-drop rule the wire layer
-/// enforces (and does enforce first: this session never advertises
-/// `RewritesToolInput`, so a production Server cannot deliver one here).
+/// enforces. This session never advertises `RewritesToolInput`, but a
+/// production Server *can* still deliver a narrowing here (nothing upstream
+/// is guaranteed to gate it), so the refusal must degrade to a journaled
+/// decline, not an error.
 fn exec_decision_for(
     decision: &PermissionDecision,
     proposal_input: &serde_json::Value,
@@ -884,8 +894,13 @@ impl AgentSession for LiveCodexSession {
     async fn send(&mut self, input: TurnInput) -> Result<()> {
         self.refuse_if_ended()?;
 
-        match (input.delivery, self.assembler.active_turn_id().cloned()) {
-            (Delivery::Interrupt, Some(_)) => {
+        let active = self.assembler.active_turn_id().cloned();
+        // A turn/start still awaiting its reply is a turn: `turn/started`
+        // just has not been read yet. Starting a second one would race it, so
+        // an interrupt treats it as the active turn.
+        let starting = self.turn_start_outstanding();
+        match (input.delivery, active) {
+            (Delivery::Interrupt, active) if active.is_some() || starting => {
                 // Cancel first, deliver after the turn actually closes: the
                 // interrupted turn ends on idle while deltas keep arriving
                 // (transcript 11), and a turn/start racing that idle would
@@ -910,9 +925,7 @@ impl AgentSession for LiveCodexSession {
                     .await
             }
             // No turn in flight: both deliveries are an ordinary turn start.
-            (Delivery::Interrupt | Delivery::TurnBoundary, None) => {
-                self.start_turn(&input.text).await
-            }
+            (Delivery::Interrupt | Delivery::TurnBoundary, _) => self.start_turn(&input.text).await,
         }
     }
 
@@ -944,19 +957,17 @@ impl AgentSession for LiveCodexSession {
             });
         };
 
-        let (reply, encoding) = match &kind {
+        // A narrowing neither reply vocabulary can carry is declined — never
+        // downgraded to running the un-narrowed original, and never left
+        // unanswered either: an error here reaches nobody who would re-answer,
+        // and an unanswered request parks the harness forever (transcript 19).
+        // The decline is journaled with why, below.
+        let (reply, encoding, inexpressible) = match &kind {
             ApprovalKind::McpElicitation => {
-                if decision.updated_input().is_some() {
-                    // The elicitation reply is accept-or-decline; there is
-                    // nowhere to carry replacement arguments. Refused so a
-                    // narrowing that could not apply is never mistaken for one
-                    // that did.
-                    return Err(AdapterError::Unsupported {
-                        provider: horde_adapter_codex::PROVIDER.to_owned(),
-                        capability: Capability::RewritesToolInput,
-                    });
-                }
-                let allowed = decision.is_allow();
+                // Accept-or-decline: there is nowhere to carry replacement
+                // arguments, so any narrowing is inexpressible.
+                let inexpressible = decision.updated_input().is_some();
+                let allowed = decision.is_allow() && !inexpressible;
                 let Some(resolved) = self.assembler.resolve_approval(tool_call_id, allowed) else {
                     return Err(AdapterError::UnknownPermissionRequest {
                         tool_call_id: tool_call_id.clone(),
@@ -965,6 +976,7 @@ impl AgentSession for LiveCodexSession {
                 (
                     encode_elicitation_response(resolved.rpc_id, allowed),
                     if allowed { "accept" } else { "decline" }.to_owned(),
+                    inexpressible,
                 )
             }
             ApprovalKind::ExecCommand { proposed_amendment } => {
@@ -973,16 +985,13 @@ impl AgentSession for LiveCodexSession {
                     .approval_input(tool_call_id)
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let exec_decision =
-                    exec_decision_for(&decision, &proposal, proposed_amendment.as_deref())
-                        .map_err(|_rewrite| AdapterError::Unsupported {
-                            provider: horde_adapter_codex::PROVIDER.to_owned(),
-                            capability: Capability::RewritesToolInput,
-                        })?;
-                let Some(resolved) = self
-                    .assembler
-                    .resolve_approval(tool_call_id, decision.is_allow())
-                else {
+                let (exec_decision, inexpressible) =
+                    match exec_decision_for(&decision, &proposal, proposed_amendment.as_deref()) {
+                        Ok(exec_decision) => (exec_decision, false),
+                        Err(InexpressibleNarrowing) => (ExecDecision::Decline, true),
+                    };
+                let allowed = decision.is_allow() && !inexpressible;
+                let Some(resolved) = self.assembler.resolve_approval(tool_call_id, allowed) else {
                     return Err(AdapterError::UnknownPermissionRequest {
                         tool_call_id: tool_call_id.clone(),
                     });
@@ -990,6 +999,7 @@ impl AgentSession for LiveCodexSession {
                 (
                     encode_exec_approval_response(resolved.rpc_id, &exec_decision),
                     exec_decision.wire_name().to_owned(),
+                    inexpressible,
                 )
             }
         };
@@ -1003,8 +1013,13 @@ impl AgentSession for LiveCodexSession {
         } else {
             ""
         };
+        let narrowing = if inexpressible {
+            " with a narrowing codex cannot express, so declined rather than run un-narrowed"
+        } else {
+            ""
+        };
         if let Some(event) = self.assembler.note_decision(format!(
-            "codex approval {tool_call_id}: chain {chain_said}{remembering} → {encoding}"
+            "codex approval {tool_call_id}: chain {chain_said}{remembering}{narrowing} → {encoding}"
         )) {
             self.pending.push_back(event);
         }

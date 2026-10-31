@@ -752,3 +752,212 @@ mod process_identity {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process groups (ADR-0010): stopping a harness reaches everything it started.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod process_groups {
+    use std::sync::Arc;
+
+    use nix::sys::signal::kill;
+    use nix::unistd::{Pid, getpgid};
+
+    use super::harness::{spec_with, within};
+    use horde_worker::process::{HarnessSpec, reap_leftover_groups};
+    use horde_worker::{Journal, SupervisedHarness};
+
+    const SCRIPT: &str = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\",\"duration_ms\":1,\"result\":\"x\"}";
+
+    /// A stub that starts a SIGTERM-ignoring grandchild, with a short grace.
+    /// The pid file lives in the spec's own scratch dir, which travels back.
+    fn spec_with_grandchild() -> (HarnessSpec, tempfile::TempDir, std::path::PathBuf) {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let pidfile = scratch.path().join("grandchild.pid");
+        let (mut spec, _transcript_dir) = spec_with(
+            SCRIPT,
+            &[("HORDE_STUB_GRANDCHILD", &pidfile.to_string_lossy())],
+        );
+        // The transcript must outlive the child: copy it beside the pid file.
+        let transcript = scratch.path().join("transcript.jsonl");
+        std::fs::write(&transcript, SCRIPT).expect("writes");
+        for (key, value) in &mut spec.env {
+            if key == "HORDE_STUB_TRANSCRIPT" {
+                *value = transcript.to_string_lossy().into_owned();
+            }
+        }
+        spec.stop_grace = std::time::Duration::from_millis(300);
+        (spec, scratch, pidfile)
+    }
+
+    fn pid_of(raw: u32) -> Pid {
+        Pid::from_raw(i32::try_from(raw).expect("a pid fits pid_t"))
+    }
+
+    /// The grandchild's pid, once the stub has written it.
+    async fn grandchild(pidfile: &std::path::Path) -> Pid {
+        within("the grandchild starts", async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(pidfile)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return Pid::from_raw(pid);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+
+    /// Whether `pid` is gone, polled under a ceiling: an orphan is reaped by
+    /// init a moment after it dies, and until then it still answers.
+    async fn is_gone(pid: Pid) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while kill(pid, None).is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Each harness leads its own group, so a group signal reaches its
+    /// children and never the Worker's own group.
+    #[tokio::test]
+    async fn a_harness_leads_its_own_process_group() {
+        let (spec, _dir, _pidfile) = spec_with_grandchild();
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let pid = harness.id().expect("running");
+
+        assert_eq!(harness.process_group(), Some(pid));
+        assert_eq!(
+            getpgid(Some(pid_of(pid))).ok(),
+            Some(pid_of(pid)),
+            "the harness is its own group's leader"
+        );
+        assert_ne!(
+            getpgid(None).ok(),
+            Some(pid_of(pid)),
+            "and that group is not the Worker's"
+        );
+        harness.stop().await.expect("stops");
+        assert_eq!(
+            harness.process_group(),
+            None,
+            "a reaped group is not ours to name"
+        );
+    }
+
+    /// The archive path: stop reaches a child that ignores SIGTERM — a tool
+    /// command or dev server must not outlive the agent that started it.
+    #[tokio::test]
+    async fn stopping_a_harness_reaches_everything_it_started() {
+        let (spec, _dir, pidfile) = spec_with_grandchild();
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let orphan = grandchild(&pidfile).await;
+
+        within("stop", harness.stop()).await.expect("stops");
+
+        assert!(
+            is_gone(orphan).await,
+            "the grandchild must die with its harness"
+        );
+    }
+
+    /// A leader that ignores SIGTERM is SIGKILLed once the grace runs out —
+    /// the stop is bounded, never a wait on a process that chose not to exit.
+    #[tokio::test]
+    async fn a_leader_that_ignores_sigterm_is_killed_after_the_grace() {
+        let spec = HarnessSpec {
+            args: vec!["-c".to_owned(), "trap '' TERM; exec sleep 600".to_owned()],
+            stop_grace: std::time::Duration::from_millis(200),
+            ..HarnessSpec::new("/bin/sh")
+        };
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let pid = pid_of(harness.id().expect("running"));
+        // Let the shell install its trap before the signal lands.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        within("a bounded stop", harness.stop())
+            .await
+            .expect("stops");
+        assert_eq!(harness.id(), None, "the leader is reaped");
+        assert!(kill(pid, None).is_err(), "and gone");
+    }
+
+    /// A handle dropped without a stop still takes its group down.
+    #[tokio::test]
+    async fn a_dropped_handle_takes_its_group_down() {
+        let (spec, _dir, pidfile) = spec_with_grandchild();
+        let harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let orphan = grandchild(&pidfile).await;
+
+        drop(harness);
+
+        assert!(
+            is_gone(orphan).await,
+            "dropping the handle must not orphan children"
+        );
+    }
+
+    /// A harness that dies on its own leaves its children with no supervisor;
+    /// reaping it sweeps them.
+    #[tokio::test]
+    async fn a_harness_that_dies_on_its_own_leaves_no_children_behind() {
+        let (mut spec, _dir, pidfile) = spec_with_grandchild();
+        spec.env
+            .push(("HORDE_STUB_EXIT_AFTER".to_owned(), "1".to_owned()));
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let orphan = grandchild(&pidfile).await;
+
+        harness.write_line("{}").await.expect("one turn");
+        let _ = within("the harness exits", harness.wait()).await;
+
+        assert!(is_gone(orphan).await, "the dead harness's child is swept");
+    }
+
+    /// The ledger remembers a group from spawn to reap, fingerprinted.
+    #[tokio::test]
+    async fn the_ledger_remembers_a_group_until_it_is_reaped() {
+        let journal = Journal::in_memory().expect("journal");
+        let (mut spec, _dir, _pidfile) = spec_with_grandchild();
+        spec.ledger = Some(Arc::new(journal.clone()));
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let pid = harness.id().expect("running");
+
+        let groups = journal.harness_groups().await.expect("readable");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, pid);
+        assert!(
+            !groups[0].1.is_empty(),
+            "the leader is fingerprinted: {groups:?}"
+        );
+
+        harness.stop().await.expect("stops");
+        assert!(
+            journal.harness_groups().await.expect("readable").is_empty(),
+            "a reaped group is forgotten"
+        );
+    }
+
+    /// The crash path: a group the Worker never stopped (its handle leaked,
+    /// as a crashed process leaks everything) is swept by the next start's
+    /// reap and forgotten — a second sweep finds nothing.
+    #[tokio::test]
+    async fn a_crashed_runs_leftover_group_is_swept_at_startup() {
+        let journal = Journal::in_memory().expect("journal");
+        let (mut spec, _dir, pidfile) = spec_with_grandchild();
+        spec.ledger = Some(Arc::new(journal.clone()));
+        let harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        let orphan = grandchild(&pidfile).await;
+        // The crash: no stop, no drop — nothing of this run gets to clean up.
+        std::mem::forget(harness);
+
+        assert_eq!(reap_leftover_groups(&journal).await, 1, "one group swept");
+        assert!(is_gone(orphan).await, "the leftover child is dead");
+        assert!(journal.harness_groups().await.expect("readable").is_empty());
+        assert_eq!(reap_leftover_groups(&journal).await, 0, "nothing left");
+    }
+}

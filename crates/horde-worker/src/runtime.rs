@@ -359,11 +359,17 @@ impl Runtime {
         // rather than launching an agent missing a promised toolset.
         let endpoint = match self.agent_endpoint(&session_id, &agent_id, &spawn).await {
             Ok(endpoint) => endpoint,
-            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
+            Err(error) => {
+                self.abandon_spawn(&agent_id, checkout.as_ref()).await;
+                return Ok(spawn_failed(&context, &agent_id, &error));
+            }
         };
         let (session, can_rewrite) = match self.start_session(&spawn, cwd, endpoint).await {
             Ok(started) => started,
-            Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
+            Err(error) => {
+                self.abandon_spawn(&agent_id, checkout.as_ref()).await;
+                return Ok(spawn_failed(&context, &agent_id, &error));
+            }
         };
         // Registered only once the harness actually started: a checkout with
         // no agent behind it must not become a peer-fetch source or a
@@ -404,6 +410,35 @@ impl Runtime {
                 first_input,
             },
         })
+    }
+
+    /// Gives back what a spawn minted for an agent whose harness never
+    /// started: the endpoint token (a credential nobody holds must not stay
+    /// valid), its `local` MCP children, and the checkout — the agent is not
+    /// remembered, so nothing would ever reuse or release it.
+    async fn abandon_spawn(&self, agent_id: &str, checkout: Option<&AgentCheckout>) {
+        self.forget_endpoint(agent_id).await;
+        if let (Some(workspaces), Some(checkout)) = (&self.workspaces, checkout)
+            && let Err(error) = workspaces.release_checkout(&checkout.root).await
+        {
+            tracing::warn!(agent_id, %error, "could not release a failed spawn's checkout");
+        }
+    }
+
+    /// Revokes an agent's endpoint identity and drops its MCP surface (and
+    /// its Session's endpoint, when it was the last agent there).
+    async fn forget_endpoint(&self, agent_id: &str) {
+        if let Some(endpoints) = &self.endpoints {
+            endpoints.forget_agent(agent_id).await;
+        }
+    }
+
+    /// Keeps a finished-or-finishing task for shutdown to join, dropping the
+    /// ones that already finished — the list would otherwise grow by one per
+    /// archive for the Worker's whole life.
+    fn keep_retired(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.retired.retain(|retired| !retired.is_finished());
+        self.retired.push(task);
     }
 
     /// Resolves the adapter and starts the harness session in `cwd`, with
@@ -652,8 +687,10 @@ impl Runtime {
                     && let Err(error) = self.obtain_payload(&agent_id, payload).await
                 {
                     // The revived checkout must not linger as a stamping
-                    // target for an agent whose pump never started.
+                    // target for an agent whose pump never started, nor its
+                    // fresh endpoint token stay valid with no harness behind it.
                     self.broker.forget(&agent_id);
+                    self.forget_endpoint(&agent_id).await;
                     return Ok(self.payload_failed(&agent_id, &error));
                 }
                 Ok(Applied {
@@ -677,20 +714,25 @@ impl Runtime {
                     },
                 })
             }
-            Err(error) => Ok(Applied {
+            Err(error) => {
+                // Whatever the failed revival minted — a token, `local`
+                // children — must not outlive it.
+                self.forget_endpoint(&agent_id).await;
                 // The revival failing is the *agent's* failure, journaled so
                 // the sender learns the message has no one to reach — silence
                 // here would read as an agent that is merely slow.
-                effects: vec![lifecycle_entry(
-                    &context,
-                    String::new(),
-                    AgentLifecycleState::Unspecified,
-                    AgentLifecycleState::Failed,
-                    error.to_string(),
-                )],
-                bookkeeping: AgentBookkeeping::None,
-                then: AfterCommit::Nothing,
-            }),
+                Ok(Applied {
+                    effects: vec![lifecycle_entry(
+                        &context,
+                        String::new(),
+                        AgentLifecycleState::Unspecified,
+                        AgentLifecycleState::Failed,
+                        error.to_string(),
+                    )],
+                    bookkeeping: AgentBookkeeping::None,
+                    then: AfterCommit::Nothing,
+                })
+            }
         }
     }
 
@@ -974,7 +1016,7 @@ impl Runtime {
                 if let Some(previous) = previous {
                     // A revival replacing a dead pump: the old task is done or
                     // about to be, but shutdown still owes it a join.
-                    self.retired.push(previous.task);
+                    self.keep_retired(previous.task);
                 }
             }
             AfterCommit::Control { agent_id, control } => {
@@ -990,13 +1032,24 @@ impl Runtime {
                 // checkout as a peer-fetch source, forever. Same for the
                 // endpoint token — an archived agent's credential must stop
                 // authenticating on its next request.
-                if let Some(endpoints) = &self.endpoints {
-                    endpoints.forget_agent(&agent_id);
-                }
+                self.forget_endpoint(&agent_id).await;
+                let checkout = self.broker.checkout_of(&agent_id);
                 self.broker.forget(&agent_id);
                 if let Some(handle) = self.agents.remove(&agent_id) {
                     let _ = handle.control.send(AgentControl::Archive).await;
-                    self.retired.push(handle.task);
+                    // The checkout goes back only once the pump — and so the
+                    // harness group — has stopped: removing a worktree under
+                    // a running agent would pull its cwd out from under it.
+                    let workspaces = self.workspaces.clone();
+                    let pump = handle.task;
+                    self.keep_retired(tokio::spawn(async move {
+                        let _ = pump.await;
+                        if let (Some(workspaces), Some(checkout)) = (workspaces, checkout)
+                            && let Err(error) = workspaces.release_checkout(&checkout.root).await
+                        {
+                            tracing::warn!(%error, "could not release an archived agent's checkout");
+                        }
+                    }));
                 }
             }
         }
@@ -2986,6 +3039,115 @@ mod tests {
             reason.contains("codex"),
             "the reason names the missing adapter: {reason}"
         );
+    }
+
+    /// A spawn that minted an endpoint and composed a checkout but never got
+    /// a harness gives both back: the Session's endpoint (bound for nobody
+    /// else) is released, and the checkout is gone from disk — the agent is
+    /// not remembered, so nothing would ever reuse or release either.
+    #[tokio::test]
+    async fn a_spawn_that_cannot_start_releases_what_it_minted() {
+        let (_temp, workspaces_root, runtime) = materialized_runtime(Script::echoing()).await;
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut runtime = runtime.with_agent_endpoints(channel, "w-test");
+        let mut command = workspace_spawn(2, "agent-1", "ws-1");
+        if let Some(Command::SpawnAgent(spawn)) = &mut command.command {
+            spawn.binding = Some(horde_proto::v1::ModelBinding {
+                provider: "codex".to_owned(),
+                ..horde_proto::v1::ModelBinding::default()
+            });
+        }
+
+        runtime
+            .apply(command)
+            .await
+            .expect("the command applies; the agent is what failed");
+        assert_eq!(runtime.running_agents(), 0);
+        // events[0] is the materialize report; the spawn's failure follows.
+        let events = journal_at_least(&runtime, 2).await;
+        assert!(
+            matches!(
+                events[1].event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+                        && changed.reason.contains("codex")
+            ),
+            "the spawn failed the agent: {:?}",
+            events[1]
+        );
+
+        assert!(
+            !workspaces_root
+                .join("ws-1")
+                .join(".horde-agents")
+                .join("agent-1")
+                .exists(),
+            "the failed spawn's checkout is released"
+        );
+        let endpoints = runtime.endpoints.clone().expect("endpoints are wired");
+        assert_eq!(
+            endpoints.shutdown().await,
+            0,
+            "the endpoint bound for the failed spawn was already released"
+        );
+    }
+
+    /// Archive gives a running agent's checkout back once its pump (and so
+    /// its harness group) has stopped — and shutdown joins that release.
+    #[tokio::test]
+    async fn archiving_a_workspace_agent_gives_its_checkout_back() {
+        let (_temp, workspaces_root, mut runtime) =
+            materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+        runtime
+            .apply(workspace_spawn(2, "agent-1", "ws-1"))
+            .await
+            .expect("the spawn applies");
+        let checkout = workspaces_root
+            .join("ws-1")
+            .join(".horde-agents")
+            .join("agent-1");
+        assert!(checkout.exists(), "setup: the checkout was composed");
+
+        runtime
+            .apply(StreamCommandsResponse {
+                command_sequence: 3,
+                command_id: "s1:3".to_owned(),
+                command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
+                    agent_id: Some(AgentId::new("agent-1")),
+                    reason: "done".to_owned(),
+                })),
+            })
+            .await
+            .expect("the archive applies");
+        runtime.shutdown().await;
+
+        assert!(
+            !checkout.exists(),
+            "the archived agent's checkout is released"
+        );
+    }
+
+    /// Finished retired tasks are dropped as new ones arrive, so the list
+    /// does not grow by one per archive for the Worker's whole life.
+    #[tokio::test]
+    async fn finished_retired_tasks_do_not_accumulate() {
+        let mut runtime = runtime_with(Script::echoing());
+        for _ in 0..3 {
+            runtime.keep_retired(tokio::spawn(async {}));
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runtime.retired.len(),
+            1,
+            "only the newest (maybe unfinished) task is kept"
+        );
+        runtime.keep_retired(tokio::spawn(std::future::pending::<()>()));
+        runtime.keep_retired(tokio::spawn(std::future::pending::<()>()));
+        assert_eq!(runtime.retired.len(), 2, "unfinished tasks are always kept");
+        for task in &runtime.retired {
+            task.abort();
+        }
     }
 
     /// A pump around `journal`, for driving [`super::Pump::journal_event`]
