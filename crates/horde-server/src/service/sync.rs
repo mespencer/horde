@@ -602,9 +602,9 @@ mod tests {
         });
 
         for _ in 0..3 {
-            let frame = receiver
-                .recv()
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
                 .await
+                .expect("a heartbeat within the ceiling, rather than a hang")
                 .expect("a heartbeat")
                 .expect("not an error");
             assert!(matches!(frame.update, Some(Update::Heartbeat(_))));
@@ -615,7 +615,11 @@ mod tests {
             "three heartbeats in, the batch is still being polled"
         );
         release.send(42).expect("the batch is still listening");
-        assert_eq!(racing.await.expect("the race ends"), Some(42));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), racing)
+            .await
+            .expect("the released batch ends the race")
+            .expect("the race ends");
+        assert_eq!(outcome, Some(42));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
@@ -624,12 +628,16 @@ mod tests {
     async fn a_closed_client_ends_the_wait() {
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         drop(receiver);
-        let outcome = super::next_or_heartbeat(
-            std::future::pending::<()>(),
-            std::time::Duration::from_secs(3_600),
-            &sender,
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::next_or_heartbeat(
+                std::future::pending::<()>(),
+                std::time::Duration::from_secs(3_600),
+                &sender,
+            ),
         )
-        .await;
+        .await
+        .expect("the closed client ends the wait at once, not at the next heartbeat");
         assert_eq!(outcome, None);
     }
 }

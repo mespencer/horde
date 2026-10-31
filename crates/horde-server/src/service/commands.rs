@@ -1903,11 +1903,7 @@ mod tests {
         .await;
 
         let mut stream = CommandStream::open(&log, "worker-a", 1);
-        let batch = stream
-            .next_batch()
-            .await
-            .expect("the log is open")
-            .expect("the fold reads");
+        let batch = next_within(&mut stream).await;
         let spawned: Vec<(u64, String)> = batch
             .iter()
             .filter_map(|response| match &response.command {
@@ -1955,11 +1951,7 @@ mod tests {
                 log_position: 4,
             },
         );
-        let batch = stream
-            .next_batch()
-            .await
-            .expect("the log is open")
-            .expect("the fold reads");
+        let batch = next_within(&mut stream).await;
         let positions: Vec<(u64, u64)> = batch
             .iter()
             .map(|response| (response.command_sequence, response.log_position))
