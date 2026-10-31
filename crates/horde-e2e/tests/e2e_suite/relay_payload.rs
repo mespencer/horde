@@ -166,6 +166,18 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     let receiver_checkout = checkout_path(&root_b, &definition_id, &receiver);
     path_appears("the sender's checkout", &sender_checkout).await;
     path_appears("the receiver's checkout", &receiver_checkout).await;
+    // A directory existing is not a checkout finished: `git worktree add`
+    // creates it first and only then checks out and writes the index, so a
+    // commit made in between is silently reset away. The worker journals the
+    // sender's Starting transition only once its whole checkout is composed.
+    system
+        .sync_until(&session_id, "the sender's checkout is composed", |events| {
+            events.iter().any(|event| {
+                event["kind"] == "agent_lifecycle_changed"
+                    && event["agent_id"].as_str() == Some(sender.as_str())
+            })
+        })
+        .await;
 
     // The sender's work: a commit that exists only on worker A. Then the
     // real report: a message wakes the sender, whose scripted turn calls
