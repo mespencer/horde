@@ -962,46 +962,37 @@ impl AgentSession for LiveCodexSession {
         // unanswered either: an error here reaches nobody who would re-answer,
         // and an unanswered request parks the harness forever (transcript 19).
         // The decline is journaled with why, below.
-        let (reply, encoding, inexpressible) = match &kind {
-            ApprovalKind::McpElicitation => {
-                // Accept-or-decline: there is nowhere to carry replacement
-                // arguments, so any narrowing is inexpressible.
-                let inexpressible = decision.updated_input().is_some();
-                let allowed = decision.is_allow() && !inexpressible;
-                let Some(resolved) = self.assembler.resolve_approval(tool_call_id, allowed) else {
-                    return Err(AdapterError::UnknownPermissionRequest {
-                        tool_call_id: tool_call_id.clone(),
-                    });
-                };
-                (
-                    encode_elicitation_response(resolved.rpc_id, allowed),
-                    if allowed { "accept" } else { "decline" }.to_owned(),
-                    inexpressible,
-                )
-            }
+        let (exec_decision, inexpressible) = match &kind {
+            // Accept-or-decline: there is nowhere to carry replacement
+            // arguments, so any narrowing is inexpressible.
+            ApprovalKind::McpElicitation => (None, decision.updated_input().is_some()),
             ApprovalKind::ExecCommand { proposed_amendment } => {
                 let proposal = self
                     .assembler
                     .approval_input(tool_call_id)
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (exec_decision, inexpressible) =
-                    match exec_decision_for(&decision, &proposal, proposed_amendment.as_deref()) {
-                        Ok(exec_decision) => (exec_decision, false),
-                        Err(InexpressibleNarrowing) => (ExecDecision::Decline, true),
-                    };
-                let allowed = decision.is_allow() && !inexpressible;
-                let Some(resolved) = self.assembler.resolve_approval(tool_call_id, allowed) else {
-                    return Err(AdapterError::UnknownPermissionRequest {
-                        tool_call_id: tool_call_id.clone(),
-                    });
-                };
-                (
-                    encode_exec_approval_response(resolved.rpc_id, &exec_decision),
-                    exec_decision.wire_name().to_owned(),
-                    inexpressible,
-                )
+                match exec_decision_for(&decision, &proposal, proposed_amendment.as_deref()) {
+                    Ok(exec_decision) => (Some(exec_decision), false),
+                    Err(InexpressibleNarrowing) => (Some(ExecDecision::Decline), true),
+                }
             }
+        };
+        let allowed = decision.is_allow() && !inexpressible;
+        let Some(resolved) = self.assembler.resolve_approval(tool_call_id, allowed) else {
+            return Err(AdapterError::UnknownPermissionRequest {
+                tool_call_id: tool_call_id.clone(),
+            });
+        };
+        let (reply, encoding) = match exec_decision {
+            None => (
+                encode_elicitation_response(resolved.rpc_id, allowed),
+                if allowed { "accept" } else { "decline" }.to_owned(),
+            ),
+            Some(exec_decision) => (
+                encode_exec_approval_response(resolved.rpc_id, &exec_decision),
+                exec_decision.wire_name().to_owned(),
+            ),
         };
 
         // Every decision is journaled with the codex encoding it became, so

@@ -794,22 +794,7 @@ async fn a_steer_that_lost_its_race_falls_back_to_a_fresh_turn() {
 /// idle that ends the old turn.
 #[tokio::test]
 async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
-    // Block 1: a turn that opens and stalls. Block 2 — played on the
-    // interrupt — the delta tail and the idle that closes the turn
-    // (transcript 11's shape). Block 3 — played on the deferred turn/start —
-    // the replacement turn.
-    let script = [
-        harness::opening_block(),
-        [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
-        [
-            harness::turn_started("turn-2"),
-            harness::final_answer("turn-2", "i2", "REPLACEMENT"),
-            harness::turn_completed("turn-2"),
-        ]
-        .join("\n"),
-    ]
-    .join("\n\n");
-
+    let script = interrupted_then_replaced_script();
     let (mut session, log_path, _dirs) = mid_turn(&script, None).await;
 
     session
@@ -817,28 +802,7 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
         .await
         .expect("the interrupt goes out");
 
-    // First ending: the cancelled turn, closed by idle, with no answer.
-    let (_, first) = events_through_turn_end(&mut session).await;
-    let first = first.expect("the interrupted turn closes on idle");
-    assert_eq!(first.status, TurnStatus::Interrupted);
-    assert_eq!(first.text, None, "a cancelled turn has no answer");
-
-    // Second ending: the deferred message's own turn.
-    let (_, second) = events_through_turn_end(&mut session).await;
-    let second = second.expect("the deferred message runs as its own turn");
-    assert_eq!(second.status, TurnStatus::Completed);
-    assert_eq!(second.text.as_deref(), Some("REPLACEMENT"));
-
-    let recorded = control_log_shows(&log_path, |log| log.contains("do this instead")).await;
-    let interrupt_at = recorded.find("turn/interrupt");
-    let deferred_at = recorded.find("do this instead");
-    match (interrupt_at, deferred_at) {
-        (Some(interrupt), Some(deferred)) => assert!(
-            interrupt < deferred,
-            "the cancel precedes the delivery: {recorded}"
-        ),
-        other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
-    }
+    cancelled_then_replaced(&mut session, &log_path).await;
     session.shutdown().await.expect("shuts down");
 }
 
@@ -848,54 +812,83 @@ async fn an_interrupt_delivery_cancels_then_delivers_after_the_turn_closes() {
 /// a second `turn/start` that races the first.
 #[tokio::test]
 async fn an_interrupt_before_turn_started_is_read_cancels_rather_than_racing() {
-    let script = [
-        harness::opening_block(),
-        [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
-        [
-            harness::turn_started("turn-2"),
-            harness::final_answer("turn-2", "i2", "REPLACEMENT"),
-            harness::turn_completed("turn-2"),
-        ]
-        .join("\n"),
-    ]
-    .join("\n\n");
-
-    // Sent, but nothing read: the turn/start reply and turn/started are
-    // both still in the pipe.
+    // The same three blocks as above; only the moment of the interrupt
+    // differs. Sent, but nothing read: the turn/start reply and
+    // turn/started are both still in the pipe.
+    let script = interrupted_then_replaced_script();
     let (mut session, log_path, _dirs) = harness::logged_session(&script, None).await;
     session
         .send(TurnInput::interrupting("do this instead"))
         .await
         .expect("the interrupt goes out");
 
-    let (_, first) = events_through_turn_end(&mut session).await;
-    assert_eq!(
-        first.expect("the first turn closes").status,
-        TurnStatus::Interrupted
-    );
-    let (_, second) = events_through_turn_end(&mut session).await;
-    assert_eq!(
-        second.expect("the deferred turn runs").text.as_deref(),
-        Some("REPLACEMENT")
-    );
-
-    let recorded = control_log_shows(&log_path, |log| log.contains("do this instead")).await;
+    let recorded = cancelled_then_replaced(&mut session, &log_path).await;
     assert_eq!(
         recorded.matches("turn/start").count(),
         2,
         "the opening turn and the deferred one — never a racing third: {recorded}"
     );
-    match (
-        recorded.find("turn/interrupt"),
-        recorded.find("do this instead"),
-    ) {
-        (Some(interrupt), Some(deferred)) => assert!(
-            interrupt < deferred,
-            "the in-flight turn is cancelled before the message is delivered: {recorded}"
-        ),
-        other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
-    }
     session.shutdown().await.expect("shuts down");
+}
+
+use interrupt_flow::{cancelled_then_replaced, interrupted_then_replaced_script};
+
+/// The interrupt-then-replace arrangement both interrupt-delivery tests
+/// share. A `cfg(test)` module so the workspace's test exemption for
+/// `expect`/`panic` applies.
+#[cfg(test)]
+mod interrupt_flow {
+    use super::*;
+
+    /// Block 1: a turn that opens and stalls. Block 2 — played on the interrupt
+    /// — the delta tail and the idle that closes the turn (transcript 11's
+    /// shape). Block 3 — played on the deferred turn/start — the replacement.
+    pub(crate) fn interrupted_then_replaced_script() -> String {
+        [
+            harness::opening_block(),
+            [harness::delta("turn-1", "tail"), harness::idle()].join("\n"),
+            [
+                harness::turn_started("turn-2"),
+                harness::final_answer("turn-2", "i2", "REPLACEMENT"),
+                harness::turn_completed("turn-2"),
+            ]
+            .join("\n"),
+        ]
+        .join("\n\n")
+    }
+
+    /// Drives both endings of an interrupt-delivered "do this instead" — the
+    /// cancelled turn, then the deferred message's own — and pins that the cancel
+    /// reached the wire before the delivery. Returns the control log.
+    pub(crate) async fn cancelled_then_replaced(
+        session: &mut Box<dyn horde_adapter::AgentSession>,
+        log_path: &std::path::Path,
+    ) -> String {
+        // First ending: the cancelled turn, closed by idle, with no answer.
+        let (_, first) = events_through_turn_end(session).await;
+        let first = first.expect("the interrupted turn closes on idle");
+        assert_eq!(first.status, TurnStatus::Interrupted);
+        assert_eq!(first.text, None, "a cancelled turn has no answer");
+
+        // Second ending: the deferred message's own turn.
+        let (_, second) = events_through_turn_end(session).await;
+        let second = second.expect("the deferred message runs as its own turn");
+        assert_eq!(second.status, TurnStatus::Completed);
+        assert_eq!(second.text.as_deref(), Some("REPLACEMENT"));
+
+        let recorded = control_log_shows(log_path, |log| log.contains("do this instead")).await;
+        match (
+            recorded.find("turn/interrupt"),
+            recorded.find("do this instead"),
+        ) {
+            (Some(interrupt), Some(deferred)) => assert!(
+                interrupt < deferred,
+                "the cancel precedes the delivery: {recorded}"
+            ),
+            other => panic!("both requests must reach the wire, got {other:?}: {recorded}"),
+        }
+        recorded
+    }
 }
 
 /// `interrupt()` itself — not just interrupt-delivery — must put

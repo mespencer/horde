@@ -2610,14 +2610,7 @@ mod tests {
             .expect("the spawn applies");
         journal_at_least(&first, 4).await;
         first
-            .apply(StreamCommandsResponse {
-                command_sequence: 2,
-                command_id: "s1:8".to_owned(),
-                command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
-                    agent_id: Some(AgentId::new("agent-1")),
-                    reason: "done".to_owned(),
-                })),
-            })
+            .apply(archive_command(2, "s1:8", "agent-1"))
             .await
             .expect("the archive applies");
         let settled = journal_at_least(&first, 5).await.len();
@@ -3021,18 +3014,35 @@ mod tests {
         );
     }
 
-    /// A spawn that cannot start fails the *agent*, not the command loop: the
-    /// command applies with the failure as its journaled effect.
-    #[tokio::test]
-    async fn a_spawn_naming_an_unknown_provider_fails_the_agent_not_the_loop() {
-        let mut runtime = runtime_with(Script::echoing());
-        let mut command = spawn_command(1, "agent-1", "hello");
+    /// `command`, bound to a provider this test Runtime has no adapter for.
+    fn bound_to_codex(mut command: StreamCommandsResponse) -> StreamCommandsResponse {
         if let Some(Command::SpawnAgent(spawn)) = &mut command.command {
             spawn.binding = Some(horde_proto::v1::ModelBinding {
                 provider: "codex".to_owned(),
                 ..horde_proto::v1::ModelBinding::default()
             });
         }
+        command
+    }
+
+    /// An archive of `agent`.
+    fn archive_command(sequence: u64, command_id: &str, agent: &str) -> StreamCommandsResponse {
+        StreamCommandsResponse {
+            command_sequence: sequence,
+            command_id: command_id.to_owned(),
+            command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
+                agent_id: Some(AgentId::new(agent)),
+                reason: "done".to_owned(),
+            })),
+        }
+    }
+
+    /// A spawn that cannot start fails the *agent*, not the command loop: the
+    /// command applies with the failure as its journaled effect.
+    #[tokio::test]
+    async fn a_spawn_naming_an_unknown_provider_fails_the_agent_not_the_loop() {
+        let mut runtime = runtime_with(Script::echoing());
+        let command = bound_to_codex(spawn_command(1, "agent-1", "hello"));
 
         let reason = failed_spawn_reason(&mut runtime, command).await;
         assert!(
@@ -3050,13 +3060,7 @@ mod tests {
         let (_temp, workspaces_root, runtime) = materialized_runtime(Script::echoing()).await;
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let mut runtime = runtime.with_agent_endpoints(channel, "w-test");
-        let mut command = workspace_spawn(2, "agent-1", "ws-1");
-        if let Some(Command::SpawnAgent(spawn)) = &mut command.command {
-            spawn.binding = Some(horde_proto::v1::ModelBinding {
-                provider: "codex".to_owned(),
-                ..horde_proto::v1::ModelBinding::default()
-            });
-        }
+        let command = bound_to_codex(workspace_spawn(2, "agent-1", "ws-1"));
 
         runtime
             .apply(command)
@@ -3109,14 +3113,7 @@ mod tests {
         assert!(checkout.exists(), "setup: the checkout was composed");
 
         runtime
-            .apply(StreamCommandsResponse {
-                command_sequence: 3,
-                command_id: "s1:3".to_owned(),
-                command: Some(Command::ArchiveAgent(ArchiveAgentCommand {
-                    agent_id: Some(AgentId::new("agent-1")),
-                    reason: "done".to_owned(),
-                })),
-            })
+            .apply(archive_command(3, "s1:3", "agent-1"))
             .await
             .expect("the archive applies");
         runtime.shutdown().await;

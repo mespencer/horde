@@ -589,7 +589,14 @@ mod tests {
         let mut tail = VecDeque::new();
         keep_tail(&mut tail, "é".repeat(STDERR_LINE_BYTES));
         let kept = tail.front().map(String::len).unwrap_or_default();
-        assert!(kept <= STDERR_LINE_BYTES && kept >= STDERR_LINE_BYTES - 1);
+        // "é" is two bytes and the bound is even, so the cut lands exactly.
+        assert_eq!(kept, STDERR_LINE_BYTES);
+        keep_tail(&mut tail, format!("a{}", "é".repeat(STDERR_LINE_BYTES)));
+        assert_eq!(
+            tail.back().map(String::len),
+            Some(STDERR_LINE_BYTES - 1),
+            "a cut mid-character backs off to the boundary"
+        );
 
         keep_tail(&mut tail, "short".to_owned());
         assert_eq!(tail.back().map(String::as_str), Some("short"));
