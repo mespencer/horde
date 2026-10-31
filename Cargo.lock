@@ -1437,6 +1437,7 @@ name = "horde-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "getrandom 0.3.4",
  "hex",
  "horde-adapter",

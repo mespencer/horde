@@ -36,17 +36,14 @@ use crate::error::WorkerError;
 use crate::journal::Journal;
 use crate::runtime::Runtime;
 
-/// Where a Server is expected when the operator does not say.
-pub const DEFAULT_SERVER: &str = "https://127.0.0.1:7777";
+// The command line and the configuration it yields live in `flags`; these
+// re-exports keep `startup` the one place a caller reaches for both.
+pub use crate::flags::{AdapterChoice, IDENTITY_DIR, JOURNAL_FILE, JoinRequest, WorkerConfig};
 
-/// Where identity and journal live when the operator does not say.
-pub const DEFAULT_STATE_DIR: &str = "horde-worker-state";
-
-/// The journal's file name inside the state directory.
-pub const JOURNAL_FILE: &str = "journal.sqlite3";
-
-/// The identity directory inside the state directory.
-pub const IDENTITY_DIR: &str = "identity";
+/// The lock a running daemon holds on its state directory: a second worker
+/// on the same state (a second `horde up`, a supervisor double-start)
+/// refuses instead of sharing a journal.
+pub const STATE_LOCK_FILE: &str = "worker.lock";
 
 /// The display name used before any identity names this Worker.
 pub const DEFAULT_NAME: &str = "horde-worker";
@@ -59,329 +56,23 @@ pub const DEFAULT_NAME: &str = "horde-worker";
 /// and a schedule would be tuning nobody has measured a need for.
 pub const RETRY_DELAY: core::time::Duration = core::time::Duration::from_millis(500);
 
-/// A provider harness the daemon can register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdapterChoice {
-    /// The scripted hermetic provider (TESTING.md §3).
-    Fake,
-    /// The Claude Code harness.
-    Claude,
-    /// The Codex app-server harness.
-    Codex,
-}
-
-impl AdapterChoice {
-    /// Parses one `--adapter` value, refusing anything unknown by name.
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "fake" => Ok(Self::Fake),
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            other => Err(format!(
-                "--adapter {other} is not one of fake, claude, codex"
-            )),
-        }
-    }
-}
-
-/// Everything one command line asks the daemon to be.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerConfig {
-    /// The Server's main (mTLS) endpoint.
-    pub server: String,
-    /// Holds `identity/` and the journal. Losing it loses both.
-    pub state_dir: PathBuf,
-    /// A one-time join token (`horde://join/<host:port>/<secret>.<fingerprint>`,
-    /// ADR-0007) to redeem first: the enrollment listener, the secret, and
-    /// the pinned server fingerprint in one string.
-    pub join: Option<String>,
-    /// The display name, and the plaintext worker id under `--insecure`.
-    /// An enrolled identity's principal always outranks it.
-    pub name: Option<String>,
-    /// Which harnesses to register, in order; the first is the default
-    /// provider for spawns that name none.
-    pub adapters: Vec<AdapterChoice>,
-    /// A JSON script for the fake adapter; absent means the echo script.
-    pub fake_script: Option<PathBuf>,
-    /// The fake adapter's login command (DESIGN §4's relay, hermetically):
-    /// a program the login PTY spawns instead of a real provider CLI.
-    pub fake_login: Option<PathBuf>,
-    /// The browser-facing callback port the fake login recipe declares —
-    /// what the client binds exactly and the URL the command prints names.
-    pub fake_login_callback_port: Option<u16>,
-    /// Where the fake login command actually listens on this machine, when
-    /// it differs from the callback port. The hermetic e2e needs the split:
-    /// on one machine, one port cannot be both the client's listener and
-    /// the worker's.
-    pub fake_login_listen_port: Option<u16>,
-    /// Enables workspace support rooted here.
-    pub workspace_root: Option<PathBuf>,
-    /// The git Relay payload shares stage to and fetch through.
-    pub relay: Option<String>,
-    /// Placement tags this Worker advertises (`--tag`, repeatable).
-    pub tags: Vec<String>,
-    /// Remote URLs this machine's credentials can reach
-    /// (`--advertise-remote`, repeatable).
-    pub advertised_remotes: Vec<String>,
-    /// Dial plaintext with no identity — the in-process-test-server shape.
-    pub insecure: bool,
-    /// The codex `approvalsReviewer`, already validated at parse: only
-    /// `"user"` survives [`horde_adapter_codex::approvals_reviewer_from_config`].
-    /// `auto_review` is the transcript-23 self-approval hazard and is refused
-    /// before any process starts.
-    pub codex_approvals_reviewer: Option<String>,
-}
-
-/// What the flags said, before the shape rules are applied.
-#[derive(Debug, Default)]
-struct ParsedFlags {
-    server: Option<String>,
-    state_dir: Option<PathBuf>,
-    join: Option<String>,
-    name: Option<String>,
-    adapters: Vec<AdapterChoice>,
-    fake_login: Option<PathBuf>,
-    fake_login_callback_port: Option<u16>,
-    fake_login_listen_port: Option<u16>,
-    fake_script: Option<PathBuf>,
-    workspace_root: Option<PathBuf>,
-    relay: Option<String>,
-    tags: Vec<String>,
-    advertised_remotes: Vec<String>,
-    insecure: bool,
-    codex_approvals_reviewer: Option<String>,
-}
-
-/// Whether `flag` is one of the daemon's value-carrying flags.
-///
-/// Decided *before* the value is consumed: an unknown flag must be refused
-/// as unknown, not have the next argument eaten and then complain about a
-/// missing value for a flag that never existed.
-fn takes_value(flag: &str) -> bool {
-    matches!(
-        flag,
-        "--server"
-            | "--state-dir"
-            | "--join"
-            | "--name"
-            | "--adapter"
-            | "--fake-script"
-            | "--fake-login"
-            | "--fake-login-callback-port"
-            | "--fake-login-listen-port"
-            | "--workspace-root"
-            | "--relay"
-            | "--tag"
-            | "--advertise-remote"
-            | "--codex-approvals-reviewer"
-    )
-}
-
-/// A flag's value as a TCP port, refused with the flag's own name.
-fn parsed_port(flag: &str, value: &str) -> Result<u16, String> {
-    value
-        .parse::<u16>()
-        .map_err(|_| format!("{flag} is not a port: {value}"))
-}
-
-/// Consumes the next argument as `flag`'s value, refusing blanks.
-fn take_value(flag: &str, arguments: &mut impl Iterator<Item = String>) -> Result<String, String> {
-    arguments
-        .next()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("{flag} needs a value"))
-}
-
-impl ParsedFlags {
-    /// Folds one argument into the parse. Every flag except `--insecure`
-    /// carries a value; a mistyped flag silently ignored would dial the
-    /// wrong server, so unknown ones are refusals by name.
-    fn apply(
-        &mut self,
-        argument: &str,
-        arguments: &mut impl Iterator<Item = String>,
-    ) -> Result<(), String> {
-        if argument == "--insecure" {
-            self.insecure = true;
-            return Ok(());
-        }
-        if !takes_value(argument) {
-            return Err(format!("unknown argument {argument}"));
-        }
-        let value = take_value(argument, arguments)?;
-        self.apply_identity_value(argument, value)
-    }
-
-    /// Applies the flags that decide who and where this Worker is; the rest
-    /// fall through to [`Self::apply_runtime_value`]. Split by subject so
-    /// neither half outgrows the complexity bar as the surface grows.
-    fn apply_identity_value(&mut self, flag: &str, value: String) -> Result<(), String> {
-        match flag {
-            "--server" => self.server = Some(value),
-            "--state-dir" => self.state_dir = Some(PathBuf::from(value)),
-            "--join" => self.join = Some(value),
-            "--name" => self.name = Some(value),
-            _ => return self.apply_runtime_value(flag, value),
-        }
-        Ok(())
-    }
-
-    /// Applies the flags that decide what this Worker runs; the fake login
-    /// recipe's fall through to [`Self::apply_login_value`]. Split by
-    /// subject so neither half outgrows the complexity bar.
-    fn apply_runtime_value(&mut self, flag: &str, value: String) -> Result<(), String> {
-        match flag {
-            "--adapter" => {
-                let choice = AdapterChoice::parse(&value)?;
-                if self.adapters.contains(&choice) {
-                    return Err(format!("--adapter {choice:?} was given twice").to_lowercase());
-                }
-                self.adapters.push(choice);
-            }
-            "--fake-script" => self.fake_script = Some(PathBuf::from(value)),
-            "--workspace-root" => self.workspace_root = Some(PathBuf::from(value)),
-            "--relay" => self.relay = Some(value),
-            "--tag" => self.tags.push(value),
-            "--advertise-remote" => self.advertised_remotes.push(value),
-            "--codex-approvals-reviewer" => {
-                // Rejected at parse, not at spawn: `auto_review` had codex's
-                // own subagent approve a sandbox escalation and run the write
-                // under a read-only sandbox (transcript 23). The validator
-                // admits only "user", which the codec pins anyway.
-                horde_adapter_codex::approvals_reviewer_from_config(Some(&value))?;
-                self.codex_approvals_reviewer = Some(value);
-            }
-            _ => return self.apply_login_value(flag, value),
-        }
-        Ok(())
-    }
-
-    /// Applies the flags that shape the fake adapter's login recipe
-    /// (DESIGN §4's relay, hermetically).
-    fn apply_login_value(&mut self, flag: &str, value: String) -> Result<(), String> {
-        match flag {
-            "--fake-login" => self.fake_login = Some(PathBuf::from(value)),
-            "--fake-login-callback-port" => {
-                self.fake_login_callback_port = Some(parsed_port(flag, &value)?);
-            }
-            "--fake-login-listen-port" => {
-                self.fake_login_listen_port = Some(parsed_port(flag, &value)?);
-            }
-            // Unreachable while `takes_value` and these matches agree;
-            // refusing (rather than ignoring) is what keeps a future drift
-            // between them loud.
-            other => return Err(format!("unknown argument {other}")),
-        }
-        Ok(())
-    }
-
-    /// Applies the shape rules and defaults, yielding the configuration.
-    fn conclude(self) -> Result<WorkerConfig, String> {
-        let config = WorkerConfig {
-            server: self.server.unwrap_or_else(|| DEFAULT_SERVER.to_owned()),
-            state_dir: self
-                .state_dir
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
-            join: self.join,
-            name: self.name,
-            adapters: self.adapters,
-            fake_script: self.fake_script,
-            fake_login: self.fake_login,
-            fake_login_callback_port: self.fake_login_callback_port,
-            fake_login_listen_port: self.fake_login_listen_port,
-            workspace_root: self.workspace_root,
-            relay: self.relay,
-            tags: self.tags,
-            advertised_remotes: self.advertised_remotes,
-            insecure: self.insecure,
-            codex_approvals_reviewer: self.codex_approvals_reviewer,
-        };
-        config.check_shape()?;
-        Ok(config)
-    }
-}
-
-impl WorkerConfig {
-    /// The rules that make a parse a usable configuration.
-    ///
-    /// Each is a refusal rather than a repair: an insecure join is a
-    /// contradiction (the point of joining is the certificate), a fake
-    /// script without the fake adapter configures nothing, and a scheme that
-    /// disagrees with the security mode would otherwise fail later with a
-    /// TLS error that names neither flag.
-    fn check_shape(&self) -> Result<(), String> {
-        if self.join.is_some() && self.insecure {
-            return Err("--join enrolls an identity; it cannot combine with --insecure".to_owned());
-        }
-        self.check_fake_shape()?;
-        if self.codex_approvals_reviewer.is_some() && !self.adapters.contains(&AdapterChoice::Codex)
-        {
-            return Err("--codex-approvals-reviewer needs --adapter codex".to_owned());
-        }
-        if self.insecure && !self.server.starts_with("http://") {
-            return Err(format!(
-                "--insecure dials plaintext, so --server must be http://…, not {}",
-                self.server
-            ));
-        }
-        if !self.insecure && !self.server.starts_with("https://") {
-            return Err(format!(
-                "an enrolled dial is mTLS, so --server must be https://…, not {} \
-                 (or pass --insecure for a plaintext test server)",
-                self.server
-            ));
-        }
-        Ok(())
-    }
-
-    /// The fake adapter's own shape rules: scripts and login recipes
-    /// configure nothing without the adapter they belong to, and the login
-    /// ports form a dependency chain (listen needs callback needs command).
-    fn check_fake_shape(&self) -> Result<(), String> {
-        if self.fake_script.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
-            return Err("--fake-script needs --adapter fake".to_owned());
-        }
-        if self.fake_login.is_some() && !self.adapters.contains(&AdapterChoice::Fake) {
-            return Err("--fake-login needs --adapter fake".to_owned());
-        }
-        if self.fake_login_callback_port.is_some() && self.fake_login.is_none() {
-            return Err("--fake-login-callback-port needs --fake-login".to_owned());
-        }
-        if self.fake_login_listen_port.is_some() && self.fake_login_callback_port.is_none() {
-            return Err("--fake-login-listen-port needs --fake-login-callback-port".to_owned());
-        }
-        Ok(())
-    }
-
-    /// Where this configuration keeps its identity.
-    #[must_use]
-    pub fn identity_dir(&self) -> PathBuf {
-        self.state_dir.join(IDENTITY_DIR)
-    }
-
-    /// Where this configuration keeps its journal.
-    #[must_use]
-    pub fn journal_path(&self) -> PathBuf {
-        self.state_dir.join(JOURNAL_FILE)
-    }
-}
-
-/// Parses the command line.
-///
-/// Pure so every flag combination is testable without a process. Unknown
-/// flags are errors rather than ignored, exactly as in `horde-server`.
+/// Parses the command line against the process environment and `$HOME`
+/// (see [`crate::flags`] for the precedence rules), running or refusing:
+/// `--help` and `--version` come back as the refusal text here, because
+/// this is the run-or-refuse path — the binary asks [`crate::flags::parse`]
+/// directly so it can print them and exit zero.
 ///
 /// # Errors
 ///
 /// A human-readable refusal naming the flag that was wrong.
 pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<WorkerConfig, String> {
-    let mut stream = arguments.into_iter();
-    let mut flags = ParsedFlags::default();
-    loop {
-        let Some(argument) = stream.next() else {
-            return flags.conclude();
-        };
-        flags.apply(&argument, &mut stream)?;
+    match crate::flags::parse(
+        arguments,
+        |name| std::env::var(name).ok(),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )? {
+        crate::flags::Parsed::Run(config) => Ok(*config),
+        crate::flags::Parsed::Print(text) => Err(text),
     }
 }
 
@@ -528,7 +219,9 @@ pub enum IdentityPlan {
 /// table is testable without a filesystem. A join over an existing identity
 /// is refused rather than resolved either way: silently loading would ignore
 /// the operator's code, silently re-joining would discard a working identity
-/// — both are the wrong thing done quietly.
+/// — both are the wrong thing done quietly. The one exception is an ambient
+/// token (`HORDE_JOIN_TOKEN`): nobody asked for it on this command line, so
+/// over an existing identity it is ignored and the identity loads.
 ///
 /// # Errors
 ///
@@ -542,21 +235,42 @@ pub fn identity_plan(
     }
     let directory = config.identity_dir();
     match &config.join {
-        Some(token) => {
-            if already_enrolled {
-                return Err(format!(
-                    "{} already holds an identity; remove it to re-enroll, \
-                     or drop --join to use it",
-                    directory.display()
-                ));
-            }
-            Ok(IdentityPlan::Join {
-                token: token.clone(),
-                directory,
-            })
-        }
+        Some(join) if already_enrolled && join.ambient => Ok(IdentityPlan::Load(directory)),
+        Some(_) if already_enrolled => Err(format!(
+            "{} already holds an identity; remove it to re-enroll, \
+             or drop --join to use it",
+            directory.display()
+        )),
+        Some(join) => Ok(IdentityPlan::Join {
+            token: join.token.clone(),
+            directory,
+        }),
         None => Ok(IdentityPlan::Load(directory)),
     }
+}
+
+/// Where this run dials (ADR-0007, 2026-10-31 amendment): `--server`, then
+/// `HORDE_SERVER` (both already folded into [`WorkerConfig::server`]), then
+/// the endpoint the identity dir stored at join. Nothing from any source is
+/// a refusal that says where endpoints come from — there is no default
+/// server to guess at.
+///
+/// # Errors
+///
+/// No endpoint from any source.
+pub fn resolve_server(config: &WorkerConfig) -> Result<String, String> {
+    config
+        .server
+        .clone()
+        .or_else(|| horde_identity::store::load_endpoint(&config.identity_dir()))
+        .ok_or_else(|| {
+            format!(
+                "no server to dial: pass --server https://host:port, set {}, or join with \
+                 --join <token> (a join stores the server in {})",
+                crate::flags::SERVER_VAR,
+                config.identity_dir().display()
+            )
+        })
 }
 
 /// Carries out an identity plan.
@@ -604,8 +318,31 @@ pub async fn resolve_identity(
                 enrolled.principal.common_name(),
                 directory.display()
             ));
+            remember_server(&directory, &token, enrolled.control_plane_port, announce);
             Ok(Some(enrolled.identity))
         }
+    }
+}
+
+/// Stores the control-plane endpoint a join taught (ADR-0007): the token's
+/// host and the answer's control-plane port, beside the credential, so a
+/// restart needs no `--server`. An answer without the port (an older
+/// server), or an endpoint the store refuses, stores nothing — announced,
+/// not fatal, because the identity itself is already safe and a `--server`
+/// still works.
+fn remember_server(
+    directory: &Path,
+    token: &horde_identity::JoinToken,
+    control_plane_port: Option<u16>,
+    announce: &mut dyn FnMut(String),
+) {
+    let Some(port) = control_plane_port else {
+        return;
+    };
+    let endpoint = format!("https://{}:{port}", token.host());
+    match horde_identity::store::save_endpoint(directory, &endpoint) {
+        Ok(()) => announce(format!("stored server={endpoint}")),
+        Err(error) => announce(format!("server not stored: {error}")),
     }
 }
 
@@ -649,6 +386,8 @@ pub struct PreparedWorker {
     /// `login reaped …`). Stdout by default — the operator interface — and
     /// injectable so in-process suites can read the reap witness.
     pub login_announce: crate::login::Announce,
+    /// This daemon's hold on its state directory, for as long as it runs.
+    pub state_lock: horde_identity::StateLock,
 }
 
 impl std::fmt::Debug for PreparedWorker {
@@ -674,17 +413,25 @@ pub async fn prepare(
     config: &WorkerConfig,
     announce: &mut dyn FnMut(String),
 ) -> Result<PreparedWorker, String> {
-    let plan = identity_plan(config, StoredIdentity::exists(&config.identity_dir()))?;
+    // First, before an enrollment spends a one-time code: a second daemon
+    // on this state would share its journal. Taking the lock also creates
+    // the state directory, owner-only.
+    let state_lock = horde_identity::StateLock::acquire(&config.state_dir, STATE_LOCK_FILE)
+        .map_err(|error| format!("could not hold the state directory: {error}"))?;
+    let enrolled = StoredIdentity::exists(&config.identity_dir());
+    if enrolled && config.join.as_ref().is_some_and(|join| join.ambient) {
+        announce(format!(
+            "ignoring {}: {} already holds an identity",
+            crate::flags::JOIN_TOKEN_VAR,
+            config.identity_dir().display()
+        ));
+    }
+    let plan = identity_plan(config, enrolled)?;
     let provisional_name = config.name.as_deref().unwrap_or(DEFAULT_NAME);
     let identity = resolve_identity(plan, provisional_name, announce).await?;
     let name = worker_name(identity.as_ref(), config.name.as_deref());
+    let server = resolve_server(config)?;
 
-    std::fs::create_dir_all(&config.state_dir).map_err(|error| {
-        format!(
-            "could not create the state directory {}: {error}",
-            config.state_dir.display()
-        )
-    })?;
     let journal = Journal::open(&config.journal_path())
         .map_err(|error| format!("could not open the journal: {error}"))?;
     // Before any agent starts: whatever a crashed previous run left running
@@ -696,7 +443,7 @@ pub async fn prepare(
         ));
     }
 
-    let runtime = build_runtime(config, identity.as_ref(), &name, journal.clone()).await?;
+    let runtime = build_runtime(config, &server, identity.as_ref(), &name, journal.clone()).await?;
     Ok(PreparedWorker {
         runtime,
         journal,
@@ -704,10 +451,11 @@ pub async fn prepare(
             tags: config.tags.clone(),
             reachable_remotes: config.advertised_remotes.clone(),
         },
-        server: config.server.clone(),
+        server,
         identity,
         name,
         login_announce: Arc::new(|line| println!("{line}")),
+        state_lock,
     })
 }
 
@@ -718,6 +466,7 @@ pub async fn prepare(
 /// guess.
 async fn build_runtime(
     config: &WorkerConfig,
+    server: &str,
     identity: Option<&StoredIdentity>,
     name: &str,
     journal: Journal,
@@ -726,7 +475,7 @@ async fn build_runtime(
     // to the Server: attachment transfer, and the per-agent MCP endpoints'
     // control-plane verbs. Lazy: a Server that is down at startup is the
     // reconnect loop's business, not a reason to refuse to start.
-    let channel = server_channel(&config.server, identity)?;
+    let channel = server_channel(server, identity)?;
     let mut runtime = Runtime::new(journal.clone())
         .with_blob_service(channel.clone())
         // The wire ADR-0004 left to the Worker: every spawned agent gets its
@@ -1063,8 +812,8 @@ async fn pause_before_redial(shutdown: core::pin::Pin<&mut impl Future<Output = 
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterChoice, DEFAULT_NAME, DEFAULT_SERVER, DEFAULT_STATE_DIR, Fate, IdentityPlan,
-        WorkerConfig, fake_script, fate_of, identity_plan, invocation, worker_name,
+        AdapterChoice, DEFAULT_NAME, Fate, IdentityPlan, JoinRequest, WorkerConfig, fake_script,
+        fate_of, identity_plan, invocation, worker_name,
     };
     use crate::error::WorkerError;
 
@@ -1075,10 +824,14 @@ mod tests {
     #[test]
     fn a_bare_invocation_takes_every_default() {
         let config = parsed(&[]).expect("no flags is a valid daemon");
-        assert_eq!(config.server, DEFAULT_SERVER);
         assert_eq!(
-            config.state_dir,
-            std::path::PathBuf::from(DEFAULT_STATE_DIR)
+            config.server, None,
+            "no default server: the stored endpoint or a refusal decides"
+        );
+        assert!(
+            config.state_dir.ends_with(".horde/worker"),
+            "state defaults under HOME, never the working directory: {}",
+            config.state_dir.display()
         );
         assert!(
             config.adapters.is_empty(),
@@ -1157,13 +910,19 @@ mod tests {
         ])
         .expect_err("a port typo is the typist's, by name");
         assert!(
-            refused.contains("--fake-login-callback-port is not a port"),
+            refused.contains("--fake-login-callback-port") && refused.contains("not-a-port"),
             "{refused}"
         );
-        let refused = super::parsed_port("--fake-login-listen-port", "70000")
-            .expect_err("no TCP port is that big");
-        assert!(refused.contains("not a port"), "{refused}");
-        assert_eq!(super::parsed_port("--x", "8080"), Ok(8080));
+        let refused = parsed(&[
+            "--adapter",
+            "fake",
+            "--fake-login",
+            "/tmp/fake-login",
+            "--fake-login-callback-port",
+            "70000",
+        ])
+        .expect_err("no TCP port is that big");
+        assert!(refused.contains("70000"), "{refused}");
     }
 
     /// The transcript-23 pin at the config seam: `user` (with the codex
@@ -1219,11 +978,13 @@ mod tests {
             "https://git.example/atlas.git",
         ])
         .expect("a full line parses");
-        assert_eq!(config.server, "https://horde.example:7777");
+        assert_eq!(config.server.as_deref(), Some("https://horde.example:7777"));
         assert_eq!(config.state_dir, std::path::PathBuf::from("/tmp/w"));
         assert_eq!(
-            config.join.as_deref(),
-            Some("horde://join/horde.example:7778/00ff.abcd"),
+            config.join,
+            Some(JoinRequest::explicit(
+                "horde://join/horde.example:7778/00ff.abcd".to_owned()
+            )),
             "the token rides the flag whole; its shape is judged at redeem"
         );
         assert_eq!(config.name.as_deref(), Some("w-1"));
@@ -1261,11 +1022,11 @@ mod tests {
     #[test]
     fn wrong_shapes_are_refused_by_name() {
         for (arguments, needle) in [
-            // "unknown argument", precisely: a parser that instead treated
+            // Named as unexpected, precisely: a parser that instead treated
             // the stray as a valued flag would eat the next argument and
             // complain about a missing value for a flag that never existed.
-            (&["--bogus"][..], "unknown argument --bogus"),
-            (&["positional"][..], "unknown argument positional"),
+            (&["--bogus", "x"][..], "unexpected argument '--bogus'"),
+            (&["positional"][..], "unexpected argument 'positional'"),
             (&["--server"][..], "--server"),
             (&["--adapter", "gpt"][..], "gpt"),
             (&["--adapter", "fake", "--adapter", "fake"][..], "twice"),
@@ -1343,6 +1104,56 @@ mod tests {
         assert!(
             refused.contains("/tmp/w/identity"),
             "the refusal names the directory to clear: {refused}"
+        );
+
+        // An ambient token joins a fresh state and is ignored over an
+        // existing identity — a variable left set must not fail restarts.
+        let ambient = WorkerConfig {
+            join: Some(JoinRequest::ambient(
+                "horde://join/x:1/00ff.abcd".to_owned(),
+            )),
+            ..load
+        };
+        assert_eq!(
+            identity_plan(&ambient, true).expect("a plan"),
+            IdentityPlan::Load(std::path::PathBuf::from("/tmp/w/identity"))
+        );
+        assert!(matches!(
+            identity_plan(&ambient, false),
+            Ok(IdentityPlan::Join { .. })
+        ));
+    }
+
+    /// Where to dial, by precedence: the configured server, then the
+    /// endpoint a join stored, else a refusal naming every source.
+    #[test]
+    fn the_server_is_configured_then_stored_then_refused() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let bare = WorkerConfig {
+            server: None,
+            ..parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses")
+        };
+        let refused = super::resolve_server(&bare).expect_err("nothing to dial");
+        assert!(
+            refused.contains("--server")
+                && refused.contains("HORDE_SERVER")
+                && refused.contains("--join"),
+            "{refused}"
+        );
+        horde_identity::store::save_endpoint(&bare.identity_dir(), "https://stored:7777")
+            .expect("stores");
+        assert_eq!(
+            super::resolve_server(&bare).as_deref(),
+            Ok("https://stored:7777")
+        );
+        let flagged = WorkerConfig {
+            server: Some("https://flag:7777".to_owned()),
+            ..bare
+        };
+        assert_eq!(
+            super::resolve_server(&flagged).as_deref(),
+            Ok("https://flag:7777"),
+            "the flag outranks the stored endpoint"
         );
     }
 

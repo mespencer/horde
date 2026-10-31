@@ -447,7 +447,10 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosens");
 
         super::write_secret(&path, "new").expect("rewrites");
-        let mode = std::fs::metadata(&path).expect("exists").permissions().mode();
+        let mode = std::fs::metadata(&path)
+            .expect("exists")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "the rewrite tightened the file");
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "new");
     }
@@ -536,7 +539,10 @@ mod tests {
         let missing = StoredIdentity::back_up(&dir, 1).expect_err("nothing to move");
         assert!(missing.to_string().contains("id"), "{missing}");
         let nameless = StoredIdentity::back_up(std::path::Path::new("/"), 1).expect_err("no name");
-        assert!(nameless.to_string().contains("no directory name"), "{nameless}");
+        assert!(
+            nameless.to_string().contains("no directory name"),
+            "{nameless}"
+        );
     }
 
     /// The state lock: one holder at a time, the refusal names the holder's

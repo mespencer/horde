@@ -29,6 +29,7 @@ pub mod client;
 pub mod codex;
 pub mod endpoint;
 pub mod error;
+pub mod flags;
 pub mod forward;
 pub mod harness;
 pub mod hub;
