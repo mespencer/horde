@@ -128,4 +128,4 @@ deny rules still run first.
   a general reset verb for a worker whose journal regressed is a separate
   item; and a worker-journaled event for an agent re-placed elsewhere after
   a partition dead-letters rather than landing — the log records it, but no
-  reconciliation acts on it yet.
+  reconciliation acts on it yet. (All three are closed by ADR-0011.)
