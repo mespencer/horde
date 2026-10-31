@@ -229,6 +229,10 @@ fn permission_requested(agent: &str, request_id: &str) -> horde_proto::v1::Event
 #[tokio::test]
 async fn a_human_can_narrow_a_call_and_the_narrowing_reaches_the_log() {
     let endpoint = common::serve().await.expect("a server");
+    // The root lands on a worker whose adapter can apply a narrowing.
+    horde_server_testkit::register_rewriting_worker(&endpoint, "rewriter")
+        .await
+        .expect("the worker registers");
     let (mut client, session_id, agent_id) = common::seeded(&endpoint, "narrowing")
         .await
         .expect("a seeded session");
