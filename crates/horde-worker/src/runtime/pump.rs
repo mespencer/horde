@@ -235,7 +235,10 @@ impl Pump {
                 self.state = PumpState::Streaming;
                 Flow::Continue
             }
-            Err(error) if revivable => {
+            // Only the harness's *death* is revivable: a write that hung up
+            // (`SupervisorError::HungUp`, which the adapters report as
+            // `HarnessExited`). Any other refusal is the agent's failure.
+            Err(error @ horde_adapter::AdapterError::HarnessExited { .. }) if revivable => {
                 tracing::info!(agent_id = %self.context.agent_id, %error, "the harness died between turns; reviving it");
                 let _ = self.session.shutdown().await;
                 Flow::Gone
