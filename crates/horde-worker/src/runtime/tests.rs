@@ -378,11 +378,20 @@ fn any_chunk(
     events: &[horde_proto::v1::JournaledEvent],
     accept: impl Fn(&horde_proto::v1::AgentOutputChunk) -> bool,
 ) -> bool {
+    any_kind(
+        events,
+        |kind| matches!(kind, Kind::AgentOutputChunk(chunk) if accept(chunk)),
+    )
+}
+
+/// Whether any journaled event's kind satisfies `accept`.
+fn any_kind(events: &[horde_proto::v1::JournaledEvent], accept: impl Fn(&Kind) -> bool) -> bool {
     events.iter().any(|journaled| {
-        matches!(
-            journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-            Some(Kind::AgentOutputChunk(chunk)) if accept(chunk)
-        )
+        journaled
+            .event
+            .as_ref()
+            .and_then(|event| event.kind.as_ref())
+            .is_some_and(&accept)
     })
 }
 
@@ -591,10 +600,10 @@ fn failed_with_reason(
     events: &[horde_proto::v1::JournaledEvent],
     reason: impl Fn(&str) -> bool,
 ) -> bool {
-    events.iter().any(|journaled| {
+    any_kind(events, |kind| {
         matches!(
-            journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-            Some(Kind::AgentLifecycleChanged(changed))
+            kind,
+            Kind::AgentLifecycleChanged(changed)
                 if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
                     && reason(&changed.reason)
         )
