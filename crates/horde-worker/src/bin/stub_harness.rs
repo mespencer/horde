@@ -24,6 +24,10 @@
 //! * `HORDE_STUB_GRANDCHILD` — start a long-lived child that ignores SIGTERM
 //!   (a tool command, a dev server) and write its pid to this file, so the
 //!   process-group tests can watch whether stopping the harness reaches it.
+//! * `HORDE_STUB_HANG_UP` — close stdin on the first turn, before serving it,
+//!   then exit. A supervisor that has read that turn is guaranteed its next
+//!   write meets EPIPE: the write-side face of a death, forced rather than
+//!   left to the scheduler.
 
 use std::io::{BufRead, Write};
 
@@ -91,6 +95,7 @@ struct Behaviour {
     exit_code: u8,
     ignore_interrupt: bool,
     control_log: Option<String>,
+    hang_up: bool,
 }
 
 impl Behaviour {
@@ -100,6 +105,7 @@ impl Behaviour {
             exit_code: numeric("HORDE_STUB_EXIT_CODE").unwrap_or(0),
             ignore_interrupt: std::env::var("HORDE_STUB_IGNORE_INTERRUPT").is_ok(),
             control_log: std::env::var("HORDE_STUB_CONTROL_LOG").ok(),
+            hang_up: std::env::var("HORDE_STUB_HANG_UP").is_ok(),
         }
     }
 
@@ -163,6 +169,13 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
         // Out of script: behave like a harness that has nothing left.
         let Some(turn) = turns.get(served) else { break };
         served += 1;
+
+        // Closed before the turn is served, so a supervisor that has read
+        // the turn knows its next write meets EPIPE. The next read here
+        // fails on the closed descriptor, which ends the loop.
+        if behaviour.hang_up {
+            let _ = nix::unistd::close(0);
+        }
 
         if !serve(&mut stdout, turn) || behaviour.done_after(served) {
             break;

@@ -39,7 +39,7 @@ use horde_adapter_codex::turn::{ApprovalKind, TurnAssembler};
 use horde_adapter_codex::wire::{EXEC_APPROVAL_METHOD, Frame, MCP_ELICITATION_METHOD, RpcError};
 
 use crate::harness::HarnessProfile;
-use crate::process::{HarnessSpec, SupervisedHarness};
+use crate::process::{HarnessSpec, SupervisedHarness, SupervisorError};
 
 /// The variable `codex` reads its home (config, credentials, rollouts) from.
 const CONFIG_ENV_VAR: &str = "CODEX_HOME";
@@ -537,14 +537,24 @@ impl LiveCodexSession {
         }
     }
 
+    /// Writes one line, or reports the harness gone.
+    ///
+    /// A hang-up is the same death EOF announces on the read side — which of
+    /// the two the session notices first is the scheduler's race — so it is
+    /// reported the same way: the session ends and the error is the exit,
+    /// never a protocol accident.
     async fn write(&mut self, line: &str) -> Result<()> {
-        self.harness
-            .write_line(line)
-            .await
-            .map_err(|error| AdapterError::Protocol {
+        match self.harness.write_line(line).await {
+            Ok(()) => Ok(()),
+            Err(SupervisorError::HungUp) => {
+                self.ended = true;
+                Err(AdapterError::HarnessExited { exit_code: None })
+            }
+            Err(error) => Err(AdapterError::Protocol {
                 message: error.to_string(),
                 raw: String::new(),
-            })
+            }),
+        }
     }
 
     /// Reads one line, or reports the harness gone.

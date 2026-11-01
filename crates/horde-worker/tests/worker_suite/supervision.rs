@@ -369,6 +369,64 @@ mod failure_modes {
             "a harness that refused to start must leave its reason behind, got {diagnostics:?}"
         );
     }
+
+    /// A write to a child that has let go of its stdin is a hang-up — the
+    /// death seen from the write side — never a bare I/O failure. The stub
+    /// closes stdin before serving the turn, so having read the turn the
+    /// next write is certain to meet EPIPE: no race, no sleep.
+    #[tokio::test]
+    async fn a_write_after_the_child_hangs_up_is_a_hang_up() {
+        let (spec, _dir) = spec_with(super::harness::RESULT_ONLY, &[("HORDE_STUB_HANG_UP", "1")]);
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        harness
+            .write_line("{\"type\":\"user\"}")
+            .await
+            .expect("writes");
+        let served = within("the turn arrives", harness.read_line()).await;
+        assert!(
+            matches!(served, Ok(Some(_))),
+            "the turn proves stdin is closed: {served:?}"
+        );
+
+        let refused = harness.write_line("{\"type\":\"user\"}").await;
+        assert!(
+            matches!(refused, Err(super::SupervisorError::HungUp)),
+            "EPIPE is the child hanging up: {refused:?}"
+        );
+        harness.kill().await.expect("kill by handle");
+    }
+
+    /// The same hang-up through the claude session is the harness's death,
+    /// with the exit status attached exactly as the EOF path attaches it.
+    #[tokio::test]
+    async fn a_claude_harness_that_hangs_up_reads_as_its_death() {
+        let (mut session, _dir) = super::harness::session_on(
+            super::harness::RESULT_ONLY,
+            &[("HORDE_STUB_HANG_UP", "1"), ("HORDE_STUB_EXIT_CODE", "3")],
+        )
+        .await;
+        session
+            .send(horde_adapter::TurnInput::queued("hello"))
+            .await
+            .expect("the first turn is written before the stub lets go");
+        assert!(
+            super::harness::turn_end(&mut session).await.is_some(),
+            "the served turn proves stdin is closed"
+        );
+
+        let refused = within(
+            "the death is reported",
+            session.send(horde_adapter::TurnInput::queued("again")),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(horde_adapter::AdapterError::HarnessExited { exit_code: Some(3) })
+            ),
+            "EPIPE on a claude harness is its death, with its status: {refused:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
