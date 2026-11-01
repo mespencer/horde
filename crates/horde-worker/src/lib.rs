@@ -33,7 +33,7 @@ pub mod flags;
 pub mod forward;
 pub mod harness;
 pub mod hub;
-pub mod inbox;
+mod inbox;
 pub mod journal;
 pub mod login;
 pub mod process;

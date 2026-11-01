@@ -37,7 +37,9 @@ use std::sync::{Arc, Mutex};
 use horde_proto::prost::Message;
 use horde_proto::prost_types::Timestamp;
 use horde_proto::v1::event::Kind;
-use horde_proto::v1::{AgentId, Event, JournaledEvent, SessionId, SpawnAgentCommand};
+use horde_proto::v1::{
+    AgentId, Event, JournaledEvent, SessionId, SpawnAgentCommand, StreamCommandsResponse,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::watch;
 
@@ -969,6 +971,220 @@ pub(crate) fn read_error(source: rusqlite::Error) -> WorkerError {
         context: "reading the journal",
         source,
     }
+}
+
+// --- The journaled inbox (ADR-0012) -----------------------------------------
+//
+// Applying a command is two transactions. *Accepting* it marks it applied,
+// ratchets both ack watermarks, and holds the command in `inbox`; after that
+// it is this Worker's to finish. *Completing* it journals its effects,
+// applies its bookkeeping, and disposes of its row. A crash in between loses
+// nothing: the next start replays the inbox. A delivered message's row is
+// only *handed* at completion and settled by the pump once the harness took
+// the text, so whatever is still handed when a harness dies is what a
+// revival replays, oldest first. Lives here, beside the transactions it
+// extends, so the journal module owns every table it creates.
+
+/// What completing a command does with its inbox row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxDisposition {
+    /// The command is done: its row goes.
+    Settle,
+    /// A message handed to a live pump: the row stays, marked handed, until
+    /// the pump settles it after the harness took the text.
+    Hand,
+    /// The command is done, and so is every message the agent was handed
+    /// and never sent — a revival that failed, whose journaled failure is
+    /// the answer to all of them.
+    SettleAgent(String),
+}
+
+/// One accepted command, as the inbox holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboxEntry {
+    /// The lane that runs it: an agent id, or a workspace's lane key.
+    pub lane: String,
+    pub command: StreamCommandsResponse,
+}
+
+impl Journal {
+    /// Accepts a command: marks it applied, ratchets the ack watermarks, and
+    /// holds it in the inbox under `lane`, in one transaction.
+    ///
+    /// A redelivery appends nothing and reports
+    /// [`CommandApplication::AlreadyApplied`] — the caller must not run it.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the transaction cannot commit.
+    pub async fn accept_command(
+        &self,
+        command: &StreamCommandsResponse,
+        lane: &str,
+    ) -> Result<CommandApplication, WorkerError> {
+        const CONTEXT: &str = "accepting a command into the inbox";
+        let command_id = command.command_id.clone();
+        let sequence = command.command_sequence;
+        let position = command.log_position;
+        let encoded = command.encode_to_vec();
+        let lane = lane.to_owned();
+        self.with_connection(CONTEXT, move |connection| {
+            in_transaction(connection, CONTEXT, |transaction| {
+                let application = mark_applied(transaction, &command_id, sequence, position)?;
+                if application == CommandApplication::Applied {
+                    transaction.execute(
+                        "INSERT INTO inbox (command_id, lane, command) VALUES (?1, ?2, ?3)",
+                        params![command_id, lane, encoded],
+                    )?;
+                }
+                Ok(application)
+            })
+        })
+        .await
+    }
+
+    /// Completes a command: journals its effects, applies its bookkeeping,
+    /// and disposes of its inbox row, in one transaction. `command_id` is
+    /// `None` for work no command caused (a revival after a harness died
+    /// idle), whose disposition then touches only what it names.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the transaction cannot commit.
+    pub async fn complete_command(
+        &self,
+        command_id: Option<String>,
+        effects: Vec<JournalEntry>,
+        bookkeeping: AgentBookkeeping,
+        disposition: InboxDisposition,
+    ) -> Result<(), WorkerError> {
+        const CONTEXT: &str = "completing an accepted command";
+        let appended = !effects.is_empty();
+        let head = self
+            .with_connection(CONTEXT, move |connection| {
+                in_transaction(connection, CONTEXT, |transaction| {
+                    let head = append_all(transaction, &effects)?;
+                    apply_bookkeeping(transaction, &bookkeeping)?;
+                    let id = command_id.unwrap_or_default();
+                    match &disposition {
+                        InboxDisposition::Settle => {
+                            transaction
+                                .execute("DELETE FROM inbox WHERE command_id = ?1", params![id])?;
+                        }
+                        InboxDisposition::Hand => {
+                            transaction.execute(
+                                "UPDATE inbox SET handed = 1 WHERE command_id = ?1",
+                                params![id],
+                            )?;
+                        }
+                        InboxDisposition::SettleAgent(agent_id) => {
+                            transaction.execute(
+                                "DELETE FROM inbox WHERE command_id = ?1
+                                     OR (lane = ?2 AND handed = 1)",
+                                params![id, agent_id],
+                            )?;
+                        }
+                    }
+                    Ok(head)
+                })
+            })
+            .await?;
+        if appended {
+            self.announce(head);
+        }
+        Ok(())
+    }
+
+    /// Settles one handed message: the harness took its text.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the row cannot be deleted.
+    pub async fn settle_delivery(&self, command_id: &str) -> Result<(), WorkerError> {
+        let command_id = command_id.to_owned();
+        self.with_connection("settling a delivered message", move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM inbox WHERE command_id = ?1",
+                    params![command_id],
+                )
+                .map(|_| ())
+                .map_err(read_error)
+        })
+        .await
+    }
+
+    /// The messages `agent_id` was handed and never sent, oldest first —
+    /// what a revival delivers before anything newer.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the rows cannot be read, and
+    /// [`WorkerError::CorruptInboxEntry`] when one no longer decodes.
+    pub async fn handed_deliveries(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<StreamCommandsResponse>, WorkerError> {
+        let agent_id = agent_id.to_owned();
+        let entries = self
+            .with_connection("reading an agent's handed messages", move |connection| {
+                inbox_rows(connection, Some(&agent_id))
+            })
+            .await?;
+        Ok(entries.into_iter().map(|entry| entry.command).collect())
+    }
+
+    /// Every command the inbox still holds, oldest first, all marked
+    /// unhanded again — what a fresh start replays. Nothing is running yet,
+    /// so nothing is handed: each row runs again as the command it was, and
+    /// a message reaches its agent by the same revival any message would.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Journal`] when the rows cannot be read or reset, and
+    /// [`WorkerError::CorruptInboxEntry`] when one no longer decodes.
+    pub async fn replay_inbox(&self) -> Result<Vec<InboxEntry>, WorkerError> {
+        self.with_connection("replaying the inbox", |connection| {
+            connection
+                .execute("UPDATE inbox SET handed = 0", [])
+                .map_err(read_error)?;
+            inbox_rows(connection, None)
+        })
+        .await
+    }
+}
+
+/// Reads and decodes inbox rows in acceptance order: `agent`'s handed
+/// messages, or with `None` every row.
+fn inbox_rows(
+    connection: &rusqlite::Connection,
+    agent: Option<&str>,
+) -> Result<Vec<InboxEntry>, WorkerError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT command_id, lane, command FROM inbox
+                 WHERE ?1 IS NULL OR (lane = ?1 AND handed = 1)
+                 ORDER BY ordinal",
+        )
+        .map_err(read_error)?;
+    let stored: Vec<(String, String, Vec<u8>)> = statement
+        .query_map(params![agent], |row| {
+            Ok((
+                row.get("command_id")?,
+                row.get("lane")?,
+                row.get("command")?,
+            ))
+        })
+        .and_then(Iterator::collect)
+        .map_err(read_error)?;
+    stored
+        .into_iter()
+        .map(|(command_id, lane, encoded)| {
+            StreamCommandsResponse::decode(encoded.as_slice())
+                .map(|command| InboxEntry { lane, command })
+                .map_err(|source| WorkerError::CorruptInboxEntry { command_id, source })
+        })
+        .collect()
 }
 
 #[cfg(test)]

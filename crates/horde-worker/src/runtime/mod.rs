@@ -8,7 +8,7 @@
 //!
 //! Applying a command is two transactions. [`ApplyCommand::apply`] only
 //! *accepts* it — dedupe on `command_id`, both ack watermarks, and the
-//! command itself into the journaled [inbox](crate::inbox) — and hands it to
+//! command itself into the journaled [inbox](crate::journal::InboxDisposition) — and hands it to
 //! the [lane](lane) its target names: one per agent, one per workspace. The
 //! lane runs it in order behind everything else that agent was sent, and
 //! *completes* it — effects, bookkeeping, and the inbox row — in a second

@@ -42,8 +42,7 @@ use super::shared::{
     required_id,
 };
 use crate::error::WorkerError;
-use crate::inbox::InboxDisposition;
-use crate::journal::{AgentBookkeeping, JournalEntry, RevivableAgent};
+use crate::journal::{AgentBookkeeping, InboxDisposition, JournalEntry, RevivableAgent};
 use crate::translate::AgentContext;
 
 /// How many control messages may queue for one agent's pump.
