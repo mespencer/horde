@@ -757,6 +757,37 @@ pub fn codex_tool_name(name: &str) -> String {
     format!("{SERVER_NAME}/{name}")
 }
 
+/// How Claude Code spells this server's tools: `mcp__{server}__{tool}`.
+pub const CLAUDE_TOOL_PREFIX: &str = "mcp__horde__";
+
+/// The tool a Horde-served name spells, under either harness's spelling —
+/// `horde/{tool}` (codex, and every elicitation) or `mcp__horde__{tool}`
+/// (Claude) — or `None` for a tool this server does not serve (`Bash`,
+/// another MCP server's tool). Hub tools ride the same prefix
+/// (`horde/github__create_issue`), so they are covered too.
+#[must_use]
+pub fn horde_tool(name: &str) -> Option<&str> {
+    name.strip_prefix(CLAUDE_TOOL_PREFIX)
+        .or_else(|| name.strip_prefix("horde/"))
+        .filter(|tool| !tool.is_empty())
+}
+
+/// The one canonical name a permission rule, a remembered decision, and
+/// the chain compare by (ADR-0004, 2026-10-31 amendment): `horde/{tool}`
+/// for anything this server serves, whichever harness spelled it; any
+/// other name unchanged. Harness-visible names never change — each harness
+/// still sees and sends its own spelling — so one rule written as
+/// `horde/report_result` covers a Claude agent and a codex agent alike.
+#[must_use]
+pub fn canonical_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match horde_tool(name) {
+        Some(tool) if name.starts_with(CLAUDE_TOOL_PREFIX) => {
+            std::borrow::Cow::Owned(codex_tool_name(tool))
+        }
+        _ => std::borrow::Cow::Borrowed(name),
+    }
+}
+
 /// The proposal the chain adjudicates, from the call's arguments.
 ///
 /// No arguments is an empty object rather than `null`: the chain's rules and
@@ -1330,5 +1361,29 @@ mod tests {
             super::codex_tool_name("github__create_issue"),
             "horde/github__create_issue"
         );
+    }
+
+    /// One canonical name per Horde tool, whichever harness spelled it;
+    /// everything else passes through untouched.
+    #[test]
+    fn both_harness_spellings_canonicalize_to_one_name() {
+        use super::{canonical_tool_name, horde_tool};
+        for (spelled, canonical) in [
+            ("mcp__horde__report_result", "horde/report_result"),
+            ("horde/report_result", "horde/report_result"),
+            (
+                "mcp__horde__github__create_issue",
+                "horde/github__create_issue",
+            ),
+            ("Bash", "Bash"),
+            ("mcp__other__tool", "mcp__other__tool"),
+            ("mcp__horde__", "mcp__horde__"),
+        ] {
+            assert_eq!(canonical_tool_name(spelled), canonical, "{spelled}");
+        }
+        assert_eq!(horde_tool("mcp__horde__spawn_agent"), Some("spawn_agent"));
+        assert_eq!(horde_tool("horde/spawn_agent"), Some("spawn_agent"));
+        assert_eq!(horde_tool("horde/"), None, "no tool is no tool");
+        assert_eq!(horde_tool("Write"), None);
     }
 }

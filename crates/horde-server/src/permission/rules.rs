@@ -123,8 +123,14 @@ impl DenyRule {
 }
 
 /// Whether a rule's tool selector accepts this tool name.
+///
+/// Both sides are compared in canonical form (ADR-0004, 2026-10-31
+/// amendment): Claude spells a Horde tool `mcp__horde__X` and codex
+/// `horde/X`, and a rule written in either spelling must cover an agent on
+/// either harness. Every other name is compared exactly, as before.
 fn tool_matches(selector: Option<&str>, tool_name: &str) -> bool {
-    selector.is_none_or(|wanted| wanted == tool_name)
+    use horde_mcp::endpoint::canonical_tool_name;
+    selector.is_none_or(|wanted| canonical_tool_name(wanted) == canonical_tool_name(tool_name))
 }
 
 /// Whether every argument constraint holds against the call's input.
@@ -196,6 +202,28 @@ mod tests {
             tool_matches(None, "anything"),
             "no selector means every tool"
         );
+    }
+
+    /// One rule covers both harnesses: a Horde tool matches in either
+    /// spelling, from either side, and the canonicalization never widens a
+    /// rule to a different tool.
+    #[test]
+    fn a_horde_tool_rule_covers_both_harness_spellings() {
+        assert!(tool_matches(
+            Some("horde/report_result"),
+            "mcp__horde__report_result"
+        ));
+        assert!(tool_matches(
+            Some("mcp__horde__report_result"),
+            "horde/report_result"
+        ));
+        assert!(!tool_matches(
+            Some("horde/report_result"),
+            "mcp__horde__spawn_agent"
+        ));
+        assert!(!tool_matches(Some("horde/Bash"), "Bash"));
+        let rule = Rule::tool("horde/github__create_issue");
+        assert!(rule.matches(&call("mcp__horde__github__create_issue", &[]), &[]));
     }
 
     /// The full table for one constraint: present-and-prefixed is the only
