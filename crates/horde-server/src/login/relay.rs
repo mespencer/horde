@@ -144,6 +144,9 @@ pub(crate) async fn arrange(
         provider: open.provider.clone(),
         cols: open.cols,
         rows: open.rows,
+        // The worker resolves (and refuses) the account against its own
+        // profile layout; the relay only carries the name.
+        account: open.account.clone(),
     };
     if lane.try_send(request).is_err() {
         logins.end(&login_id);
@@ -429,6 +432,7 @@ mod tests {
             provider: provider.to_owned(),
             cols: 80,
             rows: 24,
+            account: None,
         };
 
         let refused = super::arrange(&logins, &open("claude"))
@@ -470,6 +474,7 @@ mod tests {
             provider: "fake".to_owned(),
             cols: 80,
             rows: 24,
+            account: Some("work".to_owned()),
         };
         let arranging = {
             let logins = logins.clone();
@@ -482,6 +487,11 @@ mod tests {
             .expect("a login request");
         assert_eq!(dispatched.provider, "fake");
         assert_eq!((dispatched.cols, dispatched.rows), (80, 24));
+        assert_eq!(
+            dispatched.account.as_deref(),
+            Some("work"),
+            "the account rides the dispatch to the worker"
+        );
 
         // The worker answers: a tunnel whose first frame attaches.
         let (worker_feed, mut worker_out, tunnel) =

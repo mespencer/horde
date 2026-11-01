@@ -103,6 +103,46 @@ impl LoginPlane {
     pub fn recipe_for(&self, provider: &str) -> Option<&LoginRecipe> {
         self.recipes.get(provider)
     }
+
+    /// The recipe one dispatched login runs: the provider's, and for an
+    /// `account`, that recipe retargeted at the account's profile directory
+    /// (ADR-0010's `<root>/accounts/<account>`, prepared owner-only) — the
+    /// very directory an agent bound to that account launches under.
+    ///
+    /// # Errors
+    ///
+    /// `(reason, announce tag, detail)`: no recipe for the provider; a
+    /// recipe that cannot sign in per account; or an account name that is
+    /// not one plain directory component, refused rather than joined.
+    pub fn resolve(
+        &self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<LoginRecipe, (LoginRefusalReason, &'static str, String)> {
+        let mut recipe = self.recipe_for(provider).cloned().ok_or_else(|| {
+            (
+                LoginRefusalReason::UnknownProvider,
+                "unknown-provider",
+                format!("this worker has no login recipe for {provider}"),
+            )
+        })?;
+        let Some(account) = account else {
+            return Ok(recipe);
+        };
+        let (variable, root) = recipe.accounts.clone().ok_or_else(|| {
+            (
+                LoginRefusalReason::UnknownProvider,
+                "no-accounts",
+                format!("{provider} on this worker cannot sign in per account"),
+            )
+        })?;
+        let dir = crate::harness::HarnessProfile::new(root)
+            .config_dir(Some(&horde_adapter::ProviderAccount::new(account)))
+            .map_err(|detail| (LoginRefusalReason::SpawnFailed, "bad-account", detail))?;
+        recipe.env.retain(|(name, _)| *name != variable);
+        recipe.env.push((variable, dir.display().to_string()));
+        Ok(recipe)
+    }
 }
 
 /// Runs the login plane over one connection until the Server ends it.
@@ -192,26 +232,26 @@ async fn handle_login(
 async fn answer_dispatch(tunnel: LoginTunnel, request: LoginSessionRequest, plane: &LoginPlane) {
     let login_id = request.login_id.clone();
 
-    let Some(recipe) = plane.recipe_for(&request.provider).cloned() else {
-        // The attach carries the claim; the refusal follows it (the wire's
-        // first tunnel frame is always the attach, because the claim needs
-        // its login id).
-        let _ = tunnel
-            .to_relay
-            .send(login_attach_frame(&login_id, 0, 0))
-            .await;
-        let _ = tunnel
-            .to_relay
-            .send(login_refusal_frame(
-                LoginRefusalReason::UnknownProvider,
-                format!("this worker has no login recipe for {}", request.provider),
-            ))
-            .await;
-        (plane.announce)(format!(
-            "login refused login_id={login_id} provider={} reason=unknown-provider",
-            request.provider
-        ));
-        return tunnel.finish().await;
+    let recipe = match plane.resolve(&request.provider, request.account.as_deref()) {
+        Ok(recipe) => recipe,
+        Err((reason, tag, detail)) => {
+            // The attach carries the claim; the refusal follows it (the
+            // wire's first tunnel frame is always the attach, because the
+            // claim needs its login id).
+            let _ = tunnel
+                .to_relay
+                .send(login_attach_frame(&login_id, 0, 0))
+                .await;
+            let _ = tunnel
+                .to_relay
+                .send(login_refusal_frame(reason, detail))
+                .await;
+            (plane.announce)(format!(
+                "login refused login_id={login_id} provider={} reason={tag}",
+                request.provider
+            ));
+            return tunnel.finish().await;
+        }
     };
 
     let callback = recipe.callback_port.map(u32::from).unwrap_or_default();
@@ -473,7 +513,9 @@ mod tests {
     use std::sync::Arc;
 
     use horde_adapter::LoginRecipe;
-    use horde_proto::v1::{LoginFrame, LoginSessionRequest, login_frame::Frame};
+    use horde_proto::v1::{
+        LoginFrame, LoginRefusalReason, LoginSessionRequest, login_frame::Frame,
+    };
     use portable_pty::PtySize;
 
     use super::{LoginPlane, spawn_login_pty};
@@ -529,6 +571,79 @@ mod tests {
         );
     }
 
+    /// Per-account resolution: no account keeps the recipe as published; an
+    /// account retargets the config variable at `accounts/<account>` under
+    /// the profile, created owner-only; a recipe without account support and
+    /// an account that is not a directory name are each refused by name.
+    #[test]
+    fn an_account_login_targets_that_accounts_profile_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().expect("a tempdir");
+        let profile = scratch.path().join("claude");
+        let per_account = LoginRecipe::terminal_only("claude", vec!["login".to_owned()])
+            .with_env(vec![
+                ("KEEP".to_owned(), "kept".to_owned()),
+                ("CLAUDE_CONFIG_DIR".to_owned(), "/default".to_owned()),
+            ])
+            .with_accounts("CLAUDE_CONFIG_DIR", profile.clone());
+        let plane = LoginPlane::new(
+            [
+                ("claude".to_owned(), per_account.clone()),
+                (
+                    "fake".to_owned(),
+                    LoginRecipe::terminal_only("fake", Vec::new()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            Arc::new(|_line| {}),
+        );
+
+        assert_eq!(
+            plane.resolve("claude", None).expect("the default resolves"),
+            per_account
+        );
+        let resolved = plane
+            .resolve("claude", Some("work"))
+            .expect("an account resolves");
+        let dir = profile.join("accounts").join("work");
+        assert_eq!(
+            resolved.env,
+            vec![
+                ("KEEP".to_owned(), "kept".to_owned()),
+                ("CLAUDE_CONFIG_DIR".to_owned(), dir.display().to_string()),
+            ]
+        );
+        let mode = std::fs::metadata(&dir)
+            .expect("the directory is prepared")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let refused = |provider: &str, account: Option<&str>| {
+            plane
+                .resolve(provider, account)
+                .expect_err("this login must be refused")
+        };
+        let (reason, tag, detail) = refused("codex", None);
+        assert_eq!(
+            (reason, tag),
+            (LoginRefusalReason::UnknownProvider, "unknown-provider")
+        );
+        assert!(detail.contains("codex"));
+        let (reason, tag, _) = refused("fake", Some("work"));
+        assert_eq!(
+            (reason, tag),
+            (LoginRefusalReason::UnknownProvider, "no-accounts")
+        );
+        let (reason, tag, detail) = refused("claude", Some("../escape"));
+        assert_eq!(
+            (reason, tag),
+            (LoginRefusalReason::SpawnFailed, "bad-account")
+        );
+        assert!(detail.contains("escape"), "{detail}");
+    }
+
     /// The size table: zero and overflow fall back, sane values pass.
     #[test]
     fn the_requested_size_is_defaulted_and_clamped() {
@@ -538,6 +653,7 @@ mod tests {
                 provider: "fake".to_owned(),
                 cols,
                 rows,
+                account: None,
             })
         };
         assert_eq!((sized(120, 40).cols, sized(120, 40).rows), (120, 40));
@@ -665,6 +781,7 @@ mod tests {
             provider: provider.to_owned(),
             cols: 80,
             rows: 24,
+            account: None,
         }
     }
 
@@ -794,6 +911,7 @@ mod tests {
             callback_port: Some(14555),
             listen_port: None,
             env: Vec::new(),
+            accounts: None,
         };
         let (feed, mut sent, answering, lines, attach) = dispatched(recipe).await;
         assert!(

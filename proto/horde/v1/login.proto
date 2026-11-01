@@ -55,6 +55,11 @@ message LoginOpen {
 
   uint32 cols = 3;
   uint32 rows = 4;
+
+  // The provider account to sign in (ADR-0010's per-account profile
+  // directory, <state>/harness/<provider>/accounts/<account>). Unset signs
+  // in the directory account-less agents run under, as before.
+  optional string account = 5;
 }
 
 // First frame of a Worker's login tunnel: which dispatched login this stream
@@ -153,6 +158,10 @@ message LoginSessionRequest {
 
   uint32 cols = 3;
   uint32 rows = 4;
+
+  // The account whose profile directory the login signs in, echoed from
+  // LoginOpen.account; unset means the account-less default.
+  optional string account = 5;
 }
 
 // ---------------------------------------------------------------------------

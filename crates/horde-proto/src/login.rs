@@ -14,12 +14,26 @@ use crate::v1::{
 /// the terminal is.
 #[must_use]
 pub fn login_open_frame(worker_id: &str, provider: &str, cols: u32, rows: u32) -> LoginFrame {
+    login_open_frame_for(worker_id, provider, None, cols, rows)
+}
+
+/// [`login_open_frame`] for one provider account: the login signs in that
+/// account's profile directory instead of the account-less default.
+#[must_use]
+pub fn login_open_frame_for(
+    worker_id: &str,
+    provider: &str,
+    account: Option<&str>,
+    cols: u32,
+    rows: u32,
+) -> LoginFrame {
     LoginFrame {
         frame: Some(Frame::Open(LoginOpen {
             worker_id: Some(WorkerId::new(worker_id)),
             provider: provider.to_owned(),
             cols,
             rows,
+            account: account.map(str::to_owned),
         })),
     }
 }
@@ -118,8 +132,12 @@ mod tests {
     fn every_login_frame_carries_its_own_kind() {
         assert!(matches!(
             login_open_frame("w1", "claude", 80, 24).frame,
-            Some(Frame::Open(LoginOpen { provider, cols, rows, .. }))
+            Some(Frame::Open(LoginOpen { provider, cols, rows, account: None, .. }))
                 if provider == "claude" && cols == 80 && rows == 24
+        ));
+        assert!(matches!(
+            login_open_frame_for("w1", "claude", Some("work"), 80, 24).frame,
+            Some(Frame::Open(LoginOpen { account: Some(account), .. })) if account == "work"
         ));
         assert!(matches!(
             login_attach_frame("login-1", 1455, 0).frame,

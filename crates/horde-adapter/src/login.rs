@@ -42,6 +42,13 @@ pub struct LoginRecipe {
     /// command signs in the operator's own directory, and the Worker-owned
     /// one its agents run under stays logged out (ADR-0010).
     pub env: Vec<(String, String)>,
+
+    /// How a login for one provider *account* differs: `(variable, profile
+    /// root)` — the environment variable carrying the config directory, and
+    /// the Worker-owned profile whose `accounts/<account>` directory an
+    /// account's login signs in (ADR-0010). `None` when this recipe can only
+    /// sign in the account-less default.
+    pub accounts: Option<(String, std::path::PathBuf)>,
 }
 
 impl LoginRecipe {
@@ -54,6 +61,7 @@ impl LoginRecipe {
             callback_port: None,
             listen_port: None,
             env: Vec::new(),
+            accounts: None,
         }
     }
 
@@ -67,6 +75,7 @@ impl LoginRecipe {
             callback_port: Some(port),
             listen_port: None,
             env: Vec::new(),
+            accounts: None,
         }
     }
 
@@ -83,6 +92,18 @@ impl LoginRecipe {
     #[must_use]
     pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Lets the recipe sign in per-account profile directories: an account's
+    /// login sets `variable` to `<profile_root>/accounts/<account>`.
+    #[must_use]
+    pub fn with_accounts(
+        mut self,
+        variable: impl Into<String>,
+        profile_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.accounts = Some((variable.into(), profile_root.into()));
         self
     }
 
@@ -148,5 +169,14 @@ mod tests {
             vec![("CLAUDE_CONFIG_DIR".to_owned(), "/state/c".to_owned())]
         );
         assert_eq!(targeted.program, "claude", "nothing else moves");
+        assert_eq!(targeted.accounts, None, "no account support until given");
+        let per_account = targeted.with_accounts("CLAUDE_CONFIG_DIR", "/state/harness/claude");
+        assert_eq!(
+            per_account.accounts,
+            Some((
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                std::path::PathBuf::from("/state/harness/claude")
+            ))
+        );
     }
 }

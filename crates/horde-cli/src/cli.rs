@@ -317,6 +317,11 @@ pub enum WorkerCommand {
         /// The provider whose adapter carries the login recipe, e.g.
         /// `claude`.
         provider: String,
+        /// The provider account to sign in — the profile directory agents
+        /// bound to that account run under (ADR-0010). Omitted signs in the
+        /// directory account-less agents use.
+        #[arg(long)]
+        account: Option<String>,
     },
 }
 
@@ -1347,8 +1352,13 @@ async fn run_worker(
             let reset = client.reset_worker_journal(name, reason).await?;
             println!("{}", render::journal_reset(name, &reset, format));
         }
-        WorkerCommand::Login { worker, provider } => {
-            crate::login::run_interactive(client, worker, provider, format).await?;
+        WorkerCommand::Login {
+            worker,
+            provider,
+            account,
+        } => {
+            crate::login::run_interactive(client, worker, provider, account.as_deref(), format)
+                .await?;
         }
     }
     Ok(())
@@ -2555,6 +2565,38 @@ mod enrollment_tests {
             }
             other => panic!("expected worker reset, got {other:?}"),
         }
+    }
+
+    /// `worker login --account` names the profile to sign in; without it the
+    /// login signs in the account-less default.
+    #[test]
+    fn worker_login_takes_an_optional_account() {
+        let parse =
+            |argv: &[&str]| match Cli::try_parse_from(argv).expect("valid arguments").command {
+                Some(Command::Worker(WorkerCommand::Login {
+                    worker,
+                    provider,
+                    account,
+                })) => (worker, provider, account),
+                other => panic!("expected worker login, got {other:?}"),
+            };
+        assert_eq!(
+            parse(&[
+                "horde",
+                "worker",
+                "login",
+                "w1",
+                "claude",
+                "--account",
+                "work"
+            ]),
+            (
+                "w1".to_owned(),
+                "claude".to_owned(),
+                Some("work".to_owned())
+            )
+        );
+        assert_eq!(parse(&["horde", "worker", "login", "w1", "claude"]).2, None);
     }
 
     /// Join takes exactly the token — one argument, nothing left to swap

@@ -290,7 +290,8 @@ impl Adapter for CodexAdapter {
                 vec!["login".to_owned()],
                 1455,
             )
-            .with_env(self.profile.login_env(CONFIG_ENV_VAR)),
+            .with_env(self.profile.login_env(CONFIG_ENV_VAR))
+            .with_accounts(CONFIG_ENV_VAR, self.profile.root()),
         )
     }
 
@@ -1354,6 +1355,11 @@ mod tests {
                     .to_string()
             )],
             "the login signs in the home the agents run under"
+        );
+        assert_eq!(
+            recipe.accounts,
+            Some(("CODEX_HOME".to_owned(), scratch.path().join("codex"))),
+            "an account's login signs in under the same profile"
         );
     }
 

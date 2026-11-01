@@ -12,7 +12,7 @@
 
 use std::io::Write;
 
-use horde_proto::login::{login_input_frame, login_open_frame, login_resize_frame};
+use horde_proto::login::{login_input_frame, login_open_frame_for, login_resize_frame};
 use horde_proto::v1::{LoginFrame, LoginRefusal, login_frame::Frame};
 use tokio_stream::StreamExt;
 
@@ -52,27 +52,30 @@ pub struct OpenedLogin {
     pub callback: Option<(String, u16)>,
 }
 
-/// Opens a login against `worker`/`provider` and waits (ceilinged) for the
-/// relay's answer.
+/// Opens a login against `worker`/`provider` — for one provider `account`,
+/// when given — and waits (ceilinged) for the relay's answer.
 ///
 /// # Errors
 ///
 /// [`ClientError::Login`] carrying the relay's refusal detail (worker
-/// unreachable, already in progress, not a client, unknown provider), or
-/// the transport failure that ended the stream first.
+/// unreachable, already in progress, not a client, unknown provider, an
+/// account the worker refuses), or the transport failure that ended the
+/// stream first.
 pub async fn open_login(
     client: &mut Client,
     worker: &str,
     provider: &str,
+    account: Option<&str>,
     cols: u16,
     rows: u16,
 ) -> Result<OpenedLogin, ClientError> {
     let mut stream = client.worker_login().await?;
     stream
         .to_relay
-        .send(login_open_frame(
+        .send(login_open_frame_for(
             worker,
             provider,
+            account,
             u32::from(cols),
             u32::from(rows),
         ))
@@ -254,10 +257,11 @@ pub async fn run_interactive(
     client: &mut Client,
     worker: &str,
     provider: &str,
+    account: Option<&str>,
     format: crate::render::Format,
 ) -> Result<(), ClientError> {
     let (cols, rows) = terminal_size();
-    let opened = open_login(client, worker, provider, cols, rows).await?;
+    let opened = open_login(client, worker, provider, account, cols, rows).await?;
     let realized = realize_callback(client, provider, &opened.callback).await?;
     println!(
         "{}",
@@ -695,13 +699,19 @@ mod tests {
         let (core, mut client, endpoint) = crate::forward::testing::served_with_endpoint().await;
         let (_epoch, mut lane) = core.logins.register_worker("w1");
 
-        let opening =
-            tokio::spawn(async move { super::open_login(&mut client, "w1", "fake", 80, 24).await });
+        let opening = tokio::spawn(async move {
+            super::open_login(&mut client, "w1", "fake", Some("work"), 80, 24).await
+        });
         let dispatched = within("the dispatch reaches the lane", lane.recv())
             .await
             .expect("a login request");
         assert_eq!(dispatched.provider, "fake");
         assert_eq!((dispatched.cols, dispatched.rows), (80, 24));
+        assert_eq!(
+            dispatched.account.as_deref(),
+            Some("work"),
+            "the client's account rides through the relay to the worker"
+        );
 
         let (worker_send, _worker_inbound) = worker_tunnel(
             &endpoint,
@@ -753,7 +763,7 @@ mod tests {
     async fn opening_refuses_unreachable_and_busy_workers() {
         let (core, mut client, _endpoint) = crate::forward::testing::served_with_endpoint().await;
 
-        let refused = super::open_login(&mut client, "w-none", "fake", 80, 24)
+        let refused = super::open_login(&mut client, "w-none", "fake", None, 80, 24)
             .await
             .expect_err("no login stream, no login");
         assert!(
@@ -763,7 +773,7 @@ mod tests {
 
         let (_epoch, _lane) = core.logins.register_worker("w1");
         let busy = core.logins.begin("w1", "fake").expect("occupy the slot");
-        let refused = super::open_login(&mut client, "w1", "fake", 80, 24)
+        let refused = super::open_login(&mut client, "w1", "fake", None, 80, 24)
             .await
             .expect_err("the slot is taken");
         assert!(
@@ -793,7 +803,8 @@ mod tests {
         let (_epoch, mut lane) = core.logins.register_worker("w1");
 
         let running = tokio::spawn(async move {
-            super::run_interactive(&mut client, "w1", "fake", crate::render::Format::Json).await
+            super::run_interactive(&mut client, "w1", "fake", None, crate::render::Format::Json)
+                .await
         });
         let dispatched = within("the dispatch reaches the lane", lane.recv())
             .await

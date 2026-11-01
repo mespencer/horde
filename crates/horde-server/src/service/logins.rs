@@ -587,6 +587,7 @@ mod tests {
                 provider: "fake".to_owned(),
                 cols: 80,
                 rows: 24,
+                account: None,
             })
             .await
             .expect("the dispatch queues");

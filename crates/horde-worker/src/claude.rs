@@ -160,7 +160,8 @@ impl Adapter for ClaudeAdapter {
                 self.program.clone(),
                 vec!["login".to_owned()],
             )
-            .with_env(self.profile.login_env(CONFIG_ENV_VAR)),
+            .with_env(self.profile.login_env(CONFIG_ENV_VAR))
+            .with_accounts(CONFIG_ENV_VAR, self.profile.root()),
         )
     }
 
@@ -453,6 +454,20 @@ mod tests {
                 "CLAUDE_CONFIG_DIR".to_owned(),
                 agents_dir.display().to_string()
             )]
+        );
+
+        // An account's login targets exactly the profile an agent bound to
+        // that account launches under.
+        let (variable, profile_root) = recipe.accounts.expect("claude signs in per account");
+        assert_eq!(variable, "CLAUDE_CONFIG_DIR");
+        let bound = AgentSpec {
+            account: Some(horde_adapter::ProviderAccount::new("work")),
+            ..AgentSpec::default()
+        };
+        let launch = adapter.harness_spec(&bound, Vec::new()).expect("a launch");
+        assert_eq!(
+            launch.config_dir,
+            Some(profile_root.join("accounts").join("work"))
         );
     }
 

@@ -105,7 +105,7 @@ async fn a_real_login_dispatch_is_answered_and_a_vanished_client_reaped() {
     let mut client = horde_cli::Client::connect(&endpoint)
         .await
         .expect("the client dials");
-    let opened = horde_cli::login::open_login(&mut client, "w-login", "fake", 80, 24)
+    let opened = horde_cli::login::open_login(&mut client, "w-login", "fake", None, 80, 24)
         .await
         .expect("the worker's plane must attach: an accepted answer is the proof");
     assert!(!opened.login_id.is_empty());

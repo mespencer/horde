@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use horde_adapter::{Capabilities, Capability};
