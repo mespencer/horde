@@ -253,6 +253,107 @@ fn no_forward() -> super::Forward {
     Arc::new(|_| {})
 }
 
+/// The environment most refusal tests share: an idle scripted server and
+/// worker under `root`, dialing `bind`.
+fn idle_rig(root: &std::path::Path, bind: &str) -> UpEnvironment {
+    let server_binary = fake_daemon(root, "server", "", &[], None);
+    let worker_binary = fake_daemon(root, "worker", "", &[], None);
+    environment_under(root, server_binary, worker_binary, bind, Vec::new())
+}
+
+/// A scripted server that announces everything `up` waits on, with the
+/// given fingerprint, then parks.
+fn announcing_server(
+    root: &std::path::Path,
+    main_port: u16,
+    enrollment_port: u16,
+    fingerprint: &str,
+) -> std::path::PathBuf {
+    fake_daemon(
+        root,
+        "server",
+        "",
+        &[
+            format!("listening main=127.0.0.1:{main_port}"),
+            format!("listening enrollment=127.0.0.1:{enrollment_port}"),
+            format!("server-fingerprint {fingerprint}"),
+        ],
+        None,
+    )
+}
+
+/// The "found server" arrangement: its state lock held as a running
+/// server holds it, and a client identity issued by `issuer` in place.
+async fn found_server(
+    paths: &UpPaths,
+    issuer: &horde_server_testkit::secure::SecureHarness,
+) -> horde_identity::StateLock {
+    let held = horde_identity::StateLock::acquire(&paths.server_state, "server.lock")
+        .expect("the stand-in server holds its state");
+    issuer
+        .enroll(horde_identity::PrincipalRole::Client, "operator")
+        .await
+        .expect("a client enrolls")
+        .save(&paths.client_identity)
+        .expect("saves");
+    held
+}
+
+/// A real secured server, a scratch root, and that server "found running"
+/// there (its lock held, a client identity it issued in place).
+struct Found {
+    harness: horde_server_testkit::secure::SecureHarness,
+    root: tempfile::TempDir,
+    paths: UpPaths,
+    _lock: horde_identity::StateLock,
+}
+
+async fn found() -> Found {
+    let harness = horde_server_testkit::secure::serve_secured()
+        .await
+        .expect("a secured server");
+    let root = tempfile::tempdir().expect("a temp dir");
+    let paths = paths_under(root.path(), None);
+    let _lock = found_server(&paths, &harness).await;
+    Found {
+        harness,
+        root,
+        paths,
+        _lock,
+    }
+}
+
+/// The refusal from a started server that announces itself (fingerprint
+/// `a…`) over whatever the test planted in `root`'s server state.
+async fn refusal_after_announcing(root: &std::path::Path) -> String {
+    let mut environment = idle_rig(root, "127.0.0.1:1");
+    environment.server_binary = announcing_server(root, 4242, 4243, &"a".repeat(64));
+    refusal_of(&environment).await
+}
+
+/// A worker state that already holds an identity, so `up` mints nothing.
+fn seed_worker_identity(paths: &UpPaths) {
+    let worker_identity = paths.worker_state.join("identity");
+    std::fs::create_dir_all(&worker_identity).expect("the dir");
+    for file in ["identity.pem", "identity.key", "ca.pem"] {
+        std::fs::write(worker_identity.join(file), "seeded").expect("writes");
+    }
+}
+
+/// The refusal a flow ends in, as text.
+async fn refusal_of(environment: &UpEnvironment) -> String {
+    stood_up(environment)
+        .await
+        .0
+        .expect_err("this arrangement must refuse")
+        .to_string()
+}
+
+/// The `127.0.0.1:<port>` the harness's main listener answers on.
+fn harness_bind(harness: &horde_server_testkit::secure::SecureHarness) -> String {
+    format!("127.0.0.1:{}", port_of(&harness.main_endpoint()))
+}
+
 /// Runs the flow with a shutdown that fires the moment the ready line is
 /// announced — the fact every successful flow test stops on.
 async fn stood_up(environment: &UpEnvironment) -> (Result<(), crate::ClientError>, Vec<String>) {
@@ -313,16 +414,11 @@ async fn stand_up_boots_enrolls_mints_and_tears_down_what_it_started() {
     .expect("the token files");
 
     let token_out = root.path().join("worker-token");
-    let server_binary = fake_daemon(
+    let server_binary = announcing_server(
         root.path(),
-        "server",
-        "",
-        &[
-            format!("listening main=127.0.0.1:{main_port}"),
-            format!("listening enrollment=127.0.0.1:{enrollment_port}"),
-            format!("server-fingerprint {}", minted.server_fingerprint),
-        ],
-        None,
+        main_port,
+        enrollment_port,
+        &minted.server_fingerprint,
     );
     let worker_binary = fake_daemon(
         root.path(),
@@ -397,25 +493,14 @@ async fn stand_up_boots_enrolls_mints_and_tears_down_what_it_started() {
 /// a Hello, and the ready line names whatever name the worker registered.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_found_server_and_existing_identities_are_left_alone() {
-    let harness = horde_server_testkit::secure::serve_secured()
-        .await
-        .expect("a secured server");
-    let bind = format!("127.0.0.1:{}", port_of(&harness.main_endpoint()));
-    let root = tempfile::tempdir().expect("a temp dir");
-    let paths = paths_under(root.path(), None);
-    let _running = horde_identity::StateLock::acquire(&paths.server_state, "server.lock")
-        .expect("the stand-in server holds its state");
-    harness
-        .enroll(horde_identity::PrincipalRole::Client, "operator")
-        .await
-        .expect("a client enrolls")
-        .save(&paths.client_identity)
-        .expect("saves");
-    let worker_identity = paths.worker_state.join("identity");
-    std::fs::create_dir_all(&worker_identity).expect("the dir");
-    for file in ["identity.pem", "identity.key", "ca.pem"] {
-        std::fs::write(worker_identity.join(file), "seeded").expect("writes");
-    }
+    let Found {
+        harness,
+        root,
+        paths,
+        _lock,
+    } = found().await;
+    let bind = harness_bind(&harness);
+    seed_worker_identity(&paths);
 
     let server_binary = fake_daemon(root.path(), "server", "", &[], None);
     let worker_binary = fake_daemon(
@@ -458,17 +543,7 @@ async fn a_found_server_without_an_identity_never_reads_the_token_file() {
     let _running =
         horde_identity::StateLock::acquire(&paths.server_state, "server.lock").expect("holds");
     std::fs::write(paths.server_state.join("bootstrap-token"), "planted\n").expect("plants");
-    let server_binary = fake_daemon(root.path(), "server", "", &[], None);
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
-    );
-    let (outcome, _) = stood_up(&environment).await;
-    let refusal = outcome.expect_err("must refuse").to_string();
+    let refusal = refusal_of(&idle_rig(root.path(), "127.0.0.1:1")).await;
     assert!(
         refusal.contains("started itself") && refusal.contains("enroll join"),
         "{refusal}"
@@ -480,27 +555,7 @@ async fn a_found_server_without_an_identity_never_reads_the_token_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_missing_bootstrap_token_refuses_and_tears_down_the_started_server() {
     let root = tempfile::tempdir().expect("a temp dir");
-    let server_binary = fake_daemon(
-        root.path(),
-        "server",
-        "",
-        &[
-            "listening main=127.0.0.1:4242".to_owned(),
-            "listening enrollment=127.0.0.1:4243".to_owned(),
-            format!("server-fingerprint {}", "a".repeat(64)),
-        ],
-        None,
-    );
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
-    );
-    let (outcome, _lines) = stood_up(&environment).await;
-    let refusal = outcome.expect_err("no token file must refuse").to_string();
+    let refusal = refusal_after_announcing(root.path()).await;
     assert!(
         refusal.contains("bootstrap-token") && refusal.contains("enroll join"),
         "{refusal}"
@@ -524,27 +579,7 @@ async fn a_stale_bootstrap_token_is_refused() {
         format!("horde://join/127.0.0.1:4243/00ff.{}\n", "b".repeat(64)),
     )
     .expect("plants");
-    let server_binary = fake_daemon(
-        root.path(),
-        "server",
-        "",
-        &[
-            "listening main=127.0.0.1:4242".to_owned(),
-            "listening enrollment=127.0.0.1:4243".to_owned(),
-            format!("server-fingerprint {}", "a".repeat(64)),
-        ],
-        None,
-    );
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
-    );
-    let (outcome, _) = stood_up(&environment).await;
-    let refusal = outcome.expect_err("stale").to_string();
+    let refusal = refusal_after_announcing(root.path()).await;
     assert!(refusal.contains("earlier run"), "{refusal}");
 }
 
@@ -553,24 +588,16 @@ async fn a_stale_bootstrap_token_is_refused() {
 #[tokio::test]
 async fn a_daemon_dying_during_bring_up_fails_with_its_output() {
     let root = tempfile::tempdir().expect("a temp dir");
-    let server_binary = fake_daemon(
+    let mut environment = idle_rig(root.path(), "127.0.0.1:1");
+    environment.server_binary = fake_daemon(
         root.path(),
         "server",
         "",
         &["boom: address in use".to_owned()],
         Some("exit 3"),
     );
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
-    );
     let started = std::time::Instant::now();
-    let (outcome, _) = stood_up(&environment).await;
-    let refusal = outcome.expect_err("a dead server").to_string();
+    let refusal = refusal_of(&environment).await;
     assert!(
         refusal.contains("exited") && refusal.contains("boom: address in use"),
         "{refusal}"
@@ -585,28 +612,16 @@ async fn a_daemon_dying_during_bring_up_fails_with_its_output() {
 /// it — the machine is not held up half-alive.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_dying_after_ready_ends_up_naming_it() {
-    let harness = horde_server_testkit::secure::serve_secured()
-        .await
-        .expect("a secured server");
-    let bind = format!("127.0.0.1:{}", port_of(&harness.main_endpoint()));
-    let root = tempfile::tempdir().expect("a temp dir");
-    let paths = paths_under(root.path(), None);
-    let _running =
-        horde_identity::StateLock::acquire(&paths.server_state, "server.lock").expect("holds");
-    harness
-        .enroll(horde_identity::PrincipalRole::Client, "operator")
-        .await
-        .expect("enrolls")
-        .save(&paths.client_identity)
-        .expect("saves");
-    let worker_identity = paths.worker_state.join("identity");
-    std::fs::create_dir_all(&worker_identity).expect("the dir");
-    for file in ["identity.pem", "identity.key", "ca.pem"] {
-        std::fs::write(worker_identity.join(file), "seeded").expect("writes");
-    }
+    let Found {
+        harness,
+        root,
+        paths,
+        _lock,
+    } = found().await;
+    seed_worker_identity(&paths);
     let dies = root.path().join("die-now");
-    let server_binary = fake_daemon(root.path(), "server", "", &[], None);
-    let worker_binary = fake_daemon(
+    let mut environment = idle_rig(root.path(), &harness_bind(&harness));
+    environment.worker_binary = fake_daemon(
         root.path(),
         "worker",
         "",
@@ -616,8 +631,6 @@ async fn a_daemon_dying_after_ready_ends_up_naming_it() {
             dies.display()
         )),
     );
-    let environment =
-        environment_under(root.path(), server_binary, worker_binary, &bind, Vec::new());
     let mut lines = Vec::new();
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -648,17 +661,7 @@ async fn a_daemon_dying_after_ready_ends_up_naming_it() {
 async fn a_second_up_on_the_same_root_refuses() {
     let root = tempfile::tempdir().expect("a temp dir");
     let _first = horde_identity::StateLock::acquire(root.path(), "up.lock").expect("holds");
-    let server_binary = fake_daemon(root.path(), "server", "", &[], None);
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
-    );
-    let (outcome, _) = stood_up(&environment).await;
-    let refusal = outcome.expect_err("held").to_string();
+    let refusal = refusal_of(&idle_rig(root.path(), "127.0.0.1:1")).await;
     assert!(refusal.contains("another `horde up`"), "{refusal}");
     assert!(!stopped(root.path(), "server"));
 }
@@ -668,46 +671,22 @@ async fn a_second_up_on_the_same_root_refuses() {
 #[tokio::test]
 async fn san_advertising_is_refused_when_nobody_else_could_dial_it() {
     let root = tempfile::tempdir().expect("a temp dir");
-    let server_binary = fake_daemon(root.path(), "server", "", &[], None);
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let mut environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:7777",
-        Vec::new(),
-    );
+    let mut environment = idle_rig(root.path(), "127.0.0.1:7777");
     environment.subject_names = vec!["box.lan".to_owned()];
-    let refusal = stood_up(&environment)
-        .await
-        .0
-        .expect_err("loopback bind")
-        .to_string();
+    let refusal = refusal_of(&environment).await;
     assert!(refusal.contains("--bind 127.0.0.1:7777"), "{refusal}");
 
     environment.bind = "0.0.0.0:7777".to_owned();
-    let refusal = stood_up(&environment)
-        .await
-        .0
-        .expect_err("loopback enrollment")
-        .to_string();
+    let refusal = refusal_of(&environment).await;
     assert!(refusal.contains("--enrollment-bind"), "{refusal}");
 
     environment.subject_names = vec!["0.0.0.0".to_owned()];
-    let refusal = stood_up(&environment)
-        .await
-        .0
-        .expect_err("no name")
-        .to_string();
+    let refusal = refusal_of(&environment).await;
     assert!(refusal.contains("--san 0.0.0.0"), "{refusal}");
 
     environment.subject_names = vec!["box.lan".to_owned()];
     environment.bind = "not-an-address".to_owned();
-    let refusal = stood_up(&environment)
-        .await
-        .0
-        .expect_err("garbage")
-        .to_string();
+    let refusal = refusal_of(&environment).await;
     assert!(refusal.contains("not an address"), "{refusal}");
     assert!(!stopped(root.path(), "server"), "nothing was started");
 }
@@ -716,37 +695,19 @@ async fn san_advertising_is_refused_when_nobody_else_could_dial_it() {
 /// refused before any dial, naming both directories.
 #[tokio::test]
 async fn an_identity_from_another_ca_is_refused_against_the_state_ca() {
-    let harness = horde_server_testkit::secure::serve_secured()
-        .await
-        .expect("a secured server");
-    let root = tempfile::tempdir().expect("a temp dir");
-    let paths = paths_under(root.path(), None);
-    let _running =
-        horde_identity::StateLock::acquire(&paths.server_state, "server.lock").expect("holds");
+    // Every field bound: a `..` would drop the harness and the held lock
+    // at the end of this statement, and the server would stop being found.
+    let Found {
+        harness: _harness,
+        root,
+        paths,
+        _lock,
+    } = found().await;
     horde_identity::CertificateAuthority::generate(1_754_956_800_000)
         .expect("a CA")
         .persist(&paths.server_state.join("ca"))
         .expect("persists");
-    harness
-        .enroll(horde_identity::PrincipalRole::Client, "operator")
-        .await
-        .expect("enrolls")
-        .save(&paths.client_identity)
-        .expect("saves");
-    let server_binary = fake_daemon(root.path(), "server", "", &[], None);
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
-    );
-    let refusal = stood_up(&environment)
-        .await
-        .0
-        .expect_err("mismatch")
-        .to_string();
+    let refusal = refusal_of(&idle_rig(root.path(), "127.0.0.1:1")).await;
     assert!(refusal.contains("different CA"), "{refusal}");
 }
 
@@ -761,27 +722,12 @@ async fn the_hello_probe_diagnoses_a_server_from_another_ca() {
     let other = horde_server_testkit::secure::serve_secured()
         .await
         .expect("another secured server");
-    let bind = format!("127.0.0.1:{}", port_of(&serving.main_endpoint()));
     let root = tempfile::tempdir().expect("a temp dir");
     let paths = paths_under(root.path(), None);
-    let _running =
-        horde_identity::StateLock::acquire(&paths.server_state, "server.lock").expect("holds");
-    other
-        .enroll(horde_identity::PrincipalRole::Client, "operator")
-        .await
-        .expect("enrolls elsewhere")
-        .save(&paths.client_identity)
-        .expect("saves");
-    let server_binary = fake_daemon(root.path(), "server", "", &[], None);
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment =
-        environment_under(root.path(), server_binary, worker_binary, &bind, Vec::new());
+    // The identity comes from `other`; the server dialed is `serving`.
+    let _running = found_server(&paths, &other).await;
     let started = std::time::Instant::now();
-    let refusal = stood_up(&environment)
-        .await
-        .0
-        .expect_err("untrusted")
-        .to_string();
+    let refusal = refusal_of(&idle_rig(root.path(), &harness_bind(&serving))).await;
     assert!(
         refusal.contains("did not answer a Hello") && refusal.contains("not issued by the CA"),
         "{refusal}"
@@ -798,20 +744,13 @@ async fn the_hello_probe_diagnoses_a_server_from_another_ca() {
 async fn a_stop_during_bring_up_tears_down_what_was_started() {
     let root = tempfile::tempdir().expect("a temp dir");
     let ran = root.path().join("server-ran");
-    let server_binary = fake_daemon(
+    let mut environment = idle_rig(root.path(), "127.0.0.1:1");
+    environment.server_binary = fake_daemon(
         root.path(),
         "server",
         &format!("touch {}", ran.display()),
         &[],
         None,
-    );
-    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
-    let environment = environment_under(
-        root.path(),
-        server_binary,
-        worker_binary,
-        "127.0.0.1:1",
-        Vec::new(),
     );
     let mut lines = Vec::new();
     let watched = ran.clone();

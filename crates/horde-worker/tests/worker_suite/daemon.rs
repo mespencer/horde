@@ -40,6 +40,26 @@ mod harness {
         .expect("the daemon spawns")
     }
 
+    /// A one-time worker join token for `name`, minted by the harness's
+    /// production authority and in the token form a mint prints.
+    pub(crate) async fn worker_token(
+        secured: &horde_server_testkit::secure::SecureHarness,
+        name: &str,
+    ) -> String {
+        let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, name)
+            .expect("a valid name");
+        let minted = secured
+            .authority
+            .mint(
+                &principal,
+                0,
+                horde_server::service::enrollment::wall_clock_ms(),
+            )
+            .await
+            .expect("the code mints");
+        secured.join_token(&minted).to_string()
+    }
+
     /// The insecure fake-adapter shape both in-process loop tests drive:
     /// plaintext to `server`, named, stateful under `state`.
     pub(crate) fn insecure_config(
@@ -130,21 +150,9 @@ async fn the_daemon_joins_registers_and_a_sigterm_ends_it_cleanly() {
     let secured = horde_server_testkit::secure::serve_secured()
         .await
         .expect("a secured server comes up");
-    let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w-1")
-        .expect("a valid name");
-    let minted = secured
-        .authority
-        .mint(
-            &principal,
-            0,
-            horde_server::service::enrollment::wall_clock_ms(),
-        )
-        .await
-        .expect("the code mints");
-
     let state = tempfile::tempdir().expect("a temp dir");
     // One token, one flag (ADR-0007): the listener rides inside it.
-    let token = secured.join_token(&minted).to_string();
+    let token = harness::worker_token(&secured, "w-1").await;
     let mut daemon = harness::daemon(&[
         "--server",
         &secured.main_endpoint(),
@@ -195,21 +203,13 @@ async fn a_token_joined_daemon_remembers_its_server_and_holds_its_state() {
     let secured = horde_server_testkit::secure::serve_secured()
         .await
         .expect("a secured server comes up");
-    let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w-9")
-        .expect("a valid name");
-    let minted = secured
-        .authority
-        .mint(
-            &principal,
-            0,
-            horde_server::service::enrollment::wall_clock_ms(),
-        )
-        .await
-        .expect("the code mints");
     let state = tempfile::tempdir().expect("a temp dir");
     let token_file = state.path().join("token");
-    std::fs::write(&token_file, format!("{}\n", secured.join_token(&minted)))
-        .expect("the token file writes");
+    std::fs::write(
+        &token_file,
+        format!("{}\n", harness::worker_token(&secured, "w-9").await),
+    )
+    .expect("the token file writes");
     let state_dir = state.path().join("worker");
     let state_arg = state_dir.to_string_lossy().into_owned();
 

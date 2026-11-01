@@ -2,7 +2,9 @@
 name = "horde-identity"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+# 1.89: the state-dir lock (`store::StateLock`) is std's `File::try_lock`.
+# The pinned toolchain (rust-toolchain.toml) is newer still.
+rust-version = "1.89"
 publish = false
 description = "Identity and mTLS: the Server's internal CA, the Enrollment code flow, and the rustls configuration every channel shares."
 
