@@ -175,9 +175,17 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), IdentityError> {
 /// rather than a port that happens to answer. The holder's pid is written
 /// into the file for the refusal to name. Released on drop — and by the OS
 /// when the holder dies, so a crash never leaves a stale lock.
+///
+/// Released *explicitly* (`LOCK_UN`), never by closing the fd alone:
+/// `flock` belongs to the open file description, and a child that any
+/// thread of this process is forking holds a copy of every fd until it
+/// execs (close-on-exec only acts at exec). Closing ours would then leave
+/// the state held by this very process until that copy closed, and the
+/// next holder would be refused naming our own pid. The probe releases the
+/// same way.
 #[derive(Debug)]
 pub struct StateLock {
-    _file: std::fs::File,
+    file: std::fs::File,
     path: std::path::PathBuf,
 }
 
@@ -203,7 +211,7 @@ impl StateLock {
             .set_len(0)
             .and_then(|()| write!(file, "{}", std::process::id()));
         stamped.map_err(|e| IdentityError::io(path.display().to_string(), e))?;
-        Ok(Self { _file: file, path })
+        Ok(Self { file, path })
     }
 
     /// Whether some live process holds `<directory>/<name>` right now. A
@@ -215,9 +223,16 @@ impl StateLock {
         if !path.is_file() {
             return false;
         }
-        match open_lock_file(&path) {
-            Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-            Err(_) => false,
+        let Ok(file) = open_lock_file(&path) else {
+            return false;
+        };
+        match file.try_lock() {
+            // The probe took it: give it back explicitly (see the type docs).
+            Ok(()) => {
+                let _released = file.unlock();
+                false
+            }
+            Err(error) => matches!(error, std::fs::TryLockError::WouldBlock),
         }
     }
 
@@ -225,6 +240,14 @@ impl StateLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // Best effort: a failed unlock still closes the fd, which is the
+        // old behaviour, and the OS releases everything at exit anyway.
+        let _released = self.file.unlock();
     }
 }
 
@@ -579,6 +602,29 @@ mod tests {
             super::StateLock::acquire(&blocked, "server.lock").is_err(),
             "a file is no state directory"
         );
+    }
+
+    /// The fork window, deterministically: a child forked by any thread
+    /// holds a copy of every fd until it execs, and `flock` belongs to the
+    /// open file description those copies share. A `try_clone` is exactly
+    /// such a copy. Dropping the lock (or ending a probe) must release it
+    /// while the copy lives — closing our fd alone would leave the state
+    /// "held by" this very process until the copy closed, which is how a
+    /// sequence of `horde up` calls in one process refused itself under
+    /// plain `cargo test`.
+    #[test]
+    fn a_dropped_lock_is_released_even_while_a_forked_copy_lives() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let held = super::StateLock::acquire(root.path(), "up.lock").expect("takes");
+        let forked_copy = held.file.try_clone().expect("the fd duplicates");
+        drop(held);
+        assert!(
+            !super::StateLock::is_held(root.path(), "up.lock"),
+            "a drop releases the lock, not just our fd"
+        );
+        let _again = super::StateLock::acquire(root.path(), "up.lock")
+            .expect("the next holder takes it at once");
+        drop(forked_copy);
     }
 
     #[test]
