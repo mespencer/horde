@@ -13,69 +13,133 @@
 
 use rustls::{AlertDescription, CertificateError};
 
+/// The actionable cause of a failed dial, as a fact a caller can branch on
+/// (`horde up` retries only the transient ones) and render (its `Display`
+/// is the plain-words diagnosis with the fix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cause {
+    /// The server's certificate was not issued by the CA this side trusts.
+    UnknownIssuer,
+    /// The server's certificate does not cover the dialed host.
+    NameMismatch,
+    /// The server's certificate has expired.
+    Expired,
+    /// Any other refusal of the server's certificate, by name.
+    CertificateRefused(String),
+    /// The server refused this side's certificate (the alert it sent).
+    PeerRefusedCertificate(String),
+    /// The server ended the handshake with another alert.
+    HandshakeEnded(String),
+    /// Any other TLS failure.
+    Tls(String),
+    /// Nothing accepted the connection.
+    NothingListening,
+    /// The address did not answer in time.
+    TimedOut,
+}
+
+impl Cause {
+    /// Whether waiting could cure it: a server still starting refuses or
+    /// stalls; a certificate problem never heals by retrying.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::NothingListening | Self::TimedOut)
+    }
+}
+
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownIssuer => f.write_str(
+                "the server's certificate was not issued by the CA this identity trusts: the \
+                 identity belongs to a different server (or the server's state dir was \
+                 recreated); re-join with a fresh token (`horde enroll join <token>`)",
+            ),
+            Self::NameMismatch => f.write_str(
+                "the server's certificate does not cover the host you dialed: dial a name it \
+                 answers to (localhost, 127.0.0.1, or one of its --san names), or restart the \
+                 server with --san <host>",
+            ),
+            Self::Expired => f.write_str(
+                "the server's certificate has expired; restart the server to issue a fresh one",
+            ),
+            Self::CertificateRefused(what) => {
+                write!(f, "the server's certificate was refused: {what}")
+            }
+            Self::PeerRefusedCertificate(alert) => write!(
+                f,
+                "the server refused this machine's certificate ({alert}): it is revoked, \
+                 expired, or from another server's CA; re-join with a fresh token"
+            ),
+            Self::HandshakeEnded(alert) => {
+                write!(f, "the server ended the TLS handshake ({alert})")
+            }
+            Self::Tls(what) => write!(f, "the TLS handshake failed: {what}"),
+            Self::NothingListening => f.write_str(
+                "nothing is listening at that address: is the server running? (`horde up` \
+                 starts one on this machine)",
+            ),
+            Self::TimedOut => f.write_str(
+                "the address did not answer in time: check the host, the port, and any \
+                 firewall between here and the server",
+            ),
+        }
+    }
+}
+
 /// The actionable cause of a failed dial, if the chain names one.
-///
-/// `None` means nothing in the chain is a cause this module recognizes;
-/// the caller's own message stands alone.
 #[must_use]
-pub fn diagnose(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+pub fn cause(error: &(dyn std::error::Error + 'static)) -> Option<Cause> {
     let mut current = Some(error);
     while let Some(link) = current {
-        if let Some(diagnosis) = diagnose_link(link) {
-            return Some(diagnosis);
+        if let Some(found) = cause_of_link(link) {
+            return Some(found);
         }
         current = link.source();
     }
     None
 }
 
+/// [`cause`], rendered: `None` means nothing in the chain is a cause this
+/// module recognizes, and the caller's own message stands alone.
+#[must_use]
+pub fn diagnose(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    cause(error).map(|found| found.to_string())
+}
+
 /// One link of the chain: a rustls error, or an `io::Error` — whose
 /// wrapped payload `source()` skips, so it is opened here.
-fn diagnose_link(link: &(dyn std::error::Error + 'static)) -> Option<String> {
+fn cause_of_link(link: &(dyn std::error::Error + 'static)) -> Option<Cause> {
     if let Some(tls) = link.downcast_ref::<rustls::Error>() {
         return Some(tls_cause(tls));
     }
     let io = link.downcast_ref::<std::io::Error>()?;
     match io.get_ref() {
-        Some(inner) => diagnose(inner),
+        Some(inner) => cause(inner),
         None => io_cause(io.kind()),
     }
 }
 
-/// A rustls failure in operator words.
-fn tls_cause(error: &rustls::Error) -> String {
+fn tls_cause(error: &rustls::Error) -> Cause {
     match error {
         rustls::Error::InvalidCertificate(certificate) => certificate_cause(certificate),
         rustls::Error::AlertReceived(alert) => alert_cause(*alert),
-        other => format!("the TLS handshake failed: {other}"),
+        other => Cause::Tls(other.to_string()),
     }
 }
 
-/// The server's certificate, judged by this side.
-fn certificate_cause(error: &CertificateError) -> String {
+fn certificate_cause(error: &CertificateError) -> Cause {
     match error {
-        CertificateError::UnknownIssuer | CertificateError::BadSignature => {
-            "the server's certificate was not issued by the CA this identity trusts: the \
-             identity belongs to a different server (or the server's state dir was \
-             recreated); re-join with a fresh token (`horde enroll join <token>`)"
-                .to_owned()
-        }
+        CertificateError::UnknownIssuer | CertificateError::BadSignature => Cause::UnknownIssuer,
         CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
-            "the server's certificate does not cover the host you dialed: dial a name it \
-             answers to (localhost, 127.0.0.1, or one of its --san names), or restart the \
-             server with --san <host>"
-                .to_owned()
+            Cause::NameMismatch
         }
-        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-            "the server's certificate has expired; restart the server to issue a fresh one"
-                .to_owned()
-        }
-        other => format!("the server's certificate was refused: {other:?}"),
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => Cause::Expired,
+        other => Cause::CertificateRefused(format!("{other:?}")),
     }
 }
 
-/// The server refusing this side's certificate, as the alert it sent.
-fn alert_cause(alert: AlertDescription) -> String {
+fn alert_cause(alert: AlertDescription) -> Cause {
     match alert {
         AlertDescription::BadCertificate
         | AlertDescription::UnknownCA
@@ -83,27 +147,15 @@ fn alert_cause(alert: AlertDescription) -> String {
         | AlertDescription::CertificateExpired
         | AlertDescription::CertificateUnknown
         | AlertDescription::CertificateRequired
-        | AlertDescription::AccessDenied => format!(
-            "the server refused this machine's certificate ({alert:?}): it is revoked, expired, \
-             or from another server's CA; re-join with a fresh token"
-        ),
-        other => format!("the server ended the TLS handshake ({other:?})"),
+        | AlertDescription::AccessDenied => Cause::PeerRefusedCertificate(format!("{alert:?}")),
+        other => Cause::HandshakeEnded(format!("{other:?}")),
     }
 }
 
-/// A socket-level failure with a cause worth naming.
-fn io_cause(kind: std::io::ErrorKind) -> Option<String> {
+fn io_cause(kind: std::io::ErrorKind) -> Option<Cause> {
     match kind {
-        std::io::ErrorKind::ConnectionRefused => Some(
-            "nothing is listening at that address: is the server running? (`horde up` starts \
-             one on this machine)"
-                .to_owned(),
-        ),
-        std::io::ErrorKind::TimedOut => Some(
-            "the address did not answer in time: check the host, the port, and any firewall \
-             between here and the server"
-                .to_owned(),
-        ),
+        std::io::ErrorKind::ConnectionRefused => Some(Cause::NothingListening),
+        std::io::ErrorKind::TimedOut => Some(Cause::TimedOut),
         _ => None,
     }
 }
@@ -112,7 +164,7 @@ fn io_cause(kind: std::io::ErrorKind) -> Option<String> {
 mod tests {
     use rustls::{AlertDescription, CertificateError};
 
-    use super::diagnose;
+    use super::{Cause, cause, diagnose};
 
     /// The shape the dial produces: rustls's error boxed in an `io::Error`
     /// (whose `source()` skips it), under an outer error that names it as
@@ -149,10 +201,16 @@ mod tests {
             (CertificateError::Expired, "expired"),
             (CertificateError::NotValidYet, "refused: NotValidYet"),
         ];
-        for (cause, expected) in cases {
-            let text = diagnosed(rustls::Error::InvalidCertificate(cause.clone()));
-            assert!(text.contains(expected), "{cause:?}: {text}");
+        for (certificate, expected) in cases {
+            let text = diagnosed(rustls::Error::InvalidCertificate(certificate.clone()));
+            assert!(text.contains(expected), "{certificate:?}: {text}");
         }
+        assert_eq!(
+            cause(&wrapped(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            ))),
+            Some(Cause::UnknownIssuer)
+        );
     }
 
     #[test]
@@ -178,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_causes_are_named_and_the_rest_are_left_alone() {
+    fn socket_causes_are_named_transient_and_the_rest_are_left_alone() {
         let refused = Outer(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
         assert!(
             diagnose(&refused).is_some_and(|text| text.contains("horde up")),
@@ -186,6 +244,8 @@ mod tests {
         );
         let timed_out = Outer(std::io::Error::from(std::io::ErrorKind::TimedOut));
         assert!(diagnose(&timed_out).is_some_and(|text| text.contains("firewall")));
+        assert!(Cause::NothingListening.is_transient() && Cause::TimedOut.is_transient());
+        assert!(!Cause::UnknownIssuer.is_transient() && !Cause::NameMismatch.is_transient());
         let other = Outer(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         assert_eq!(diagnose(&other), None, "nothing to add");
         let plain = std::fmt::Error;

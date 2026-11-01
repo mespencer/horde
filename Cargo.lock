@@ -1219,6 +1219,7 @@ dependencies = [
 name = "horde-e2e"
 version = "0.1.0"
 dependencies = [
+ "horde-identity",
  "horde-server-testkit",
  "portable-pty",
  "serde_json",

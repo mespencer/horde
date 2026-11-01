@@ -489,15 +489,27 @@ pub fn minted(
     let expires_at_unix_ms = response.expires_at.as_ref().map_or(0, |at| {
         at.seconds.saturating_mul(1_000) + i64::from(at.nanos) / 1_000_000
     });
+    // A token naming loopback redeems only on this machine (ADR-0007,
+    // 2026-10-31 amendment): said, so it is not carried to another one.
+    let local_only =
+        token.is_some_and(|token| token.scope() == horde_identity::HostScope::Loopback);
     match format {
         Format::Json => json!({
             "token": token.map(ToString::to_string),
             "code": response.code,
             "server_cert_fingerprint": response.server_cert_fingerprint,
             "expires_at_unix_ms": expires_at_unix_ms,
+            "local_only": local_only,
         })
         .to_string(),
         Format::Human => match token {
+            Some(token) if local_only => format!(
+                "token {token}\nexpires-at-unix-ms {expires_at_unix_ms}\n\
+                 note: this token names {}, so only this machine can redeem it; for another \
+                 machine, mint through a name it can dial (--endpoint https://<host>:<port>, \
+                 one of the server's --san names)",
+                token.host()
+            ),
             Some(token) => format!("token {token}\nexpires-at-unix-ms {expires_at_unix_ms}"),
             None => format!(
                 "code {}\nexpires-at-unix-ms {expires_at_unix_ms}",
@@ -834,17 +846,29 @@ pub fn mcp_removed(name: &str, format: Format) -> String {
 
 /// Renders a completed join: who this machine now is, and where that lives.
 #[must_use]
-pub fn joined(principal: &str, directory: &std::path::Path, format: Format) -> String {
+pub fn joined(
+    principal: &str,
+    directory: &std::path::Path,
+    backup: Option<&std::path::Path>,
+    format: Format,
+) -> String {
     match format {
         Format::Json => json!({
             "principal": principal,
             "identity_dir": directory.display().to_string(),
+            "backup": backup.map(|path| path.display().to_string()),
         })
         .to_string(),
-        Format::Human => format!(
-            "enrolled as {principal}; identity in {}",
-            directory.display()
-        ),
+        Format::Human => {
+            let joined = format!(
+                "enrolled as {principal}; identity in {}",
+                directory.display()
+            );
+            match backup {
+                Some(path) => format!("{joined}\nprevious identity kept at {}", path.display()),
+                None => joined,
+            }
+        }
     }
 }
 
@@ -2188,19 +2212,32 @@ mod enrollment_render_tests {
 
     #[test]
     fn a_minted_code_prints_the_token_and_its_deadline_in_both_formats() {
-        let token = horde_identity::JoinToken::new(
-            "localhost:7778",
-            horde_identity::JoinCode {
-                secret: "00ff".to_owned(),
-                server_fingerprint: "a".repeat(64),
-            },
-        );
+        let code = horde_identity::JoinCode {
+            secret: "00ff".to_owned(),
+            server_fingerprint: "a".repeat(64),
+        };
+        let token = horde_identity::JoinToken::new("box.lan:7778", code.clone());
         let human = minted(&response("s.fp"), Some(&token), Format::Human);
         assert_eq!(human, format!("token {token}\nexpires-at-unix-ms 1755500"));
+
+        // A loopback token says it is this machine's only, in both formats.
+        let local = horde_identity::JoinToken::new("localhost:7778", code);
+        let human = minted(&response("s.fp"), Some(&local), Format::Human);
+        assert!(
+            human.starts_with(&format!("token {local}\nexpires-at-unix-ms 1755500\n"))
+                && human.contains("only this machine")
+                && human.contains("--san"),
+            "{human}"
+        );
+        let local_json: serde_json::Value =
+            serde_json::from_str(&minted(&response("s.fp"), Some(&local), Format::Json))
+                .expect("json mode emits json");
+        assert_eq!(local_json["local_only"], true);
 
         let json: serde_json::Value =
             serde_json::from_str(&minted(&response("s.fp"), Some(&token), Format::Json))
                 .expect("json mode emits json");
+        assert_eq!(json["local_only"], false);
         assert_eq!(json["token"], token.to_string());
         assert_eq!(json["code"], "s.fp");
         assert_eq!(json["expires_at_unix_ms"], 1_755_500);
@@ -2272,14 +2309,27 @@ mod enrollment_render_tests {
     fn a_join_reports_the_principal_and_where_the_identity_lives() {
         let dir = std::path::Path::new("/tmp/id");
         assert_eq!(
-            joined("client:laptop", dir, Format::Human),
+            joined("client:laptop", dir, None, Format::Human),
             "enrolled as client:laptop; identity in /tmp/id"
         );
         let json: serde_json::Value =
-            serde_json::from_str(&joined("client:laptop", dir, Format::Json))
+            serde_json::from_str(&joined("client:laptop", dir, None, Format::Json))
                 .expect("json mode emits json");
         assert_eq!(json["principal"], "client:laptop");
         assert_eq!(json["identity_dir"], "/tmp/id");
+        assert!(json["backup"].is_null());
+
+        // A forced re-join says where the replaced identity went.
+        let backup = std::path::Path::new("/tmp/id.backup-17");
+        assert_eq!(
+            joined("client:laptop", dir, Some(backup), Format::Human),
+            "enrolled as client:laptop; identity in /tmp/id\n\
+             previous identity kept at /tmp/id.backup-17"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&joined("client:laptop", dir, Some(backup), Format::Json))
+                .expect("json mode emits json");
+        assert_eq!(json["backup"], "/tmp/id.backup-17");
     }
 }
 

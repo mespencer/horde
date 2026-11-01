@@ -25,6 +25,9 @@ path = "src/bin/fake_login.rs"
 # types and no client library of its own (the raw-client stand-ins left with
 # fix a12).
 horde-server-testkit = { workspace = true }
+# One fact read straight off disk: `horde up`'s teardown is proven by the
+# daemons' state locks being free, not by probing a port.
+horde-identity = { workspace = true }
 # The login scenarios drive the real `horde worker login` inside a pty —
 # the raw-mode terminal shell is part of what they hold to account.
 portable-pty = "0.9.0"
