@@ -17,6 +17,8 @@
 
 use std::path::PathBuf;
 
+use clap::builder::NonEmptyStringValueParser;
+
 /// The journal's file name inside the state directory.
 pub const JOURNAL_FILE: &str = "journal.sqlite3";
 
@@ -228,7 +230,7 @@ pub enum Parsed {
 struct WorkerArgs {
     /// The server's main mTLS endpoint (`https://host:port`). Overrides
     /// HORDE_SERVER, which overrides the endpoint a join stored.
-    #[arg(long, value_parser = non_empty())]
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     server: Option<String>,
 
     /// Holds `identity/` and the journal. Defaults to `~/.horde/worker`,
@@ -239,7 +241,7 @@ struct WorkerArgs {
     /// A one-time join token (`horde://join/<host:port>/<secret>.<fingerprint>`)
     /// to redeem first. Prefer --join-file or HORDE_JOIN_TOKEN: argv is
     /// visible to every user on the machine.
-    #[arg(long, value_parser = non_empty(), conflicts_with = "join_file")]
+    #[arg(long, value_parser = NonEmptyStringValueParser::new(), conflicts_with = "join_file")]
     join: Option<String>,
 
     /// A file holding the join token.
@@ -248,7 +250,7 @@ struct WorkerArgs {
 
     /// The display name (and the plaintext worker id under --insecure). An
     /// enrolled identity's principal always outranks it.
-    #[arg(long, value_parser = non_empty())]
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     name: Option<String>,
 
     /// A harness to register (`fake`, `claude`, `codex`); repeatable, the
@@ -277,15 +279,15 @@ struct WorkerArgs {
     workspace_root: Option<PathBuf>,
 
     /// The git Relay payload shares stage to and fetch through.
-    #[arg(long, value_parser = non_empty())]
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     relay: Option<String>,
 
     /// A placement tag this worker advertises; repeatable.
-    #[arg(long = "tag", value_parser = non_empty())]
+    #[arg(long = "tag", value_parser = NonEmptyStringValueParser::new())]
     tags: Vec<String>,
 
     /// A remote URL this machine's credentials can reach; repeatable.
-    #[arg(long = "advertise-remote", value_parser = non_empty())]
+    #[arg(long = "advertise-remote", value_parser = NonEmptyStringValueParser::new())]
     advertised_remotes: Vec<String>,
 
     /// Dial plaintext with no identity — the in-process-test-server shape.
@@ -295,10 +297,6 @@ struct WorkerArgs {
     /// The codex `approvalsReviewer`; only `user` is admitted.
     #[arg(long, value_parser = reviewer)]
     codex_approvals_reviewer: Option<String>,
-}
-
-fn non_empty() -> clap::builder::NonEmptyStringValueParser {
-    clap::builder::NonEmptyStringValueParser::new()
 }
 
 /// Rejected at parse, not at spawn: `auto_review` had codex's own subagent
@@ -482,5 +480,22 @@ mod tests {
         let swallowed =
             parsed_with(&["--state-dir", "--insecure"], &[]).expect_err("no dash-prefixed path");
         assert!(swallowed.contains("--state-dir"), "{swallowed}");
+    }
+
+    /// An empty value is no value: every string flag refuses one by name,
+    /// rather than dialing, joining, or naming "".
+    #[test]
+    fn empty_string_values_are_refused_by_name() {
+        for flag in [
+            "--server",
+            "--join",
+            "--name",
+            "--relay",
+            "--tag",
+            "--advertise-remote",
+        ] {
+            let refused = parsed_with(&[flag, ""], &[]).expect_err("an empty value");
+            assert!(refused.contains(flag), "{flag}: {refused}");
+        }
     }
 }

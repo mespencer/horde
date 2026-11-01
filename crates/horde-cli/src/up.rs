@@ -62,7 +62,7 @@ const HELLO_CEILING: std::time::Duration = std::time::Duration::from_secs(20);
 /// killed outright.
 const TEARDOWN_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How much of a daemon's stdout is kept for the waits to read. The lines
+/// How much of a daemon's stdout is kept for the waits to read (64 KiB). The lines
 /// they wait on come first; a chatty daemon must not grow `up` without
 /// bound.
 const STDOUT_CAP: usize = 64 * 1024;
@@ -224,7 +224,7 @@ pub async fn run(args: &UpArgs, identity: Option<&Path>) -> Result<(), ClientErr
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let root = resolve_root(args.state_dir.clone(), home.clone())?;
     let paths = paths_under(&root, identity);
-    let export_identity = paths.client_identity != crate::cli::default_identity_dir(home);
+    let export_identity = needs_export(&paths.client_identity, home);
     let own = std::env::current_exe()
         .map_err(|error| ClientError::Up(format!("cannot locate its own binary: {error}")))?;
     let environment = UpEnvironment {
@@ -243,6 +243,13 @@ pub async fn run(args: &UpArgs, identity: Option<&Path>) -> Result<(), ClientErr
     };
     let forward: Forward = Arc::new(|line| println!("{line}"));
     stand_up(&environment, &mut |line| println!("{line}"), forward, stop).await
+}
+
+/// Whether the client identity sits somewhere a bare `horde` would not look
+/// (its default is `~/.horde/id`) — then the ready line is followed by the
+/// `export HORDE_IDENTITY=…` that makes later invocations find it.
+fn needs_export(client_identity: &Path, home: Option<PathBuf>) -> bool {
+    client_identity != crate::cli::default_identity_dir(home)
 }
 
 /// The stop signals, registered now (registration happens at creation for
@@ -605,15 +612,14 @@ async fn await_hello(
             directory: id_dir.clone(),
             source,
         })?;
-    let deadline = tokio::time::Instant::now() + HELLO_CEILING;
+    let started = tokio::time::Instant::now();
     loop {
         let error = match hello_once(&server.endpoint, &identity).await {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        let transient =
-            horde_identity::diagnosis::cause(&error).is_none_or(|cause| cause.is_transient());
-        if !transient || tokio::time::Instant::now() >= deadline {
+        let cause = horde_identity::diagnosis::cause(&error);
+        if hello_gives_up(cause.as_ref(), started, tokio::time::Instant::now()) {
             return Err(ClientError::Up(format!(
                 "the server at {} did not answer a Hello: {}",
                 server.endpoint,
@@ -625,6 +631,19 @@ async fn await_hello(
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// Whether a failed readiness `Hello` is final: a cause that waiting cannot
+/// cure (a certificate problem) at once, anything else (refused, timed
+/// out, unrecognized) only once [`HELLO_CEILING`] has passed since
+/// `started`.
+fn hello_gives_up(
+    cause: Option<&horde_identity::diagnosis::Cause>,
+    started: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    let transient = cause.is_none_or(horde_identity::diagnosis::Cause::is_transient);
+    !transient || now >= started + HELLO_CEILING
 }
 
 /// One bounded `Hello` as `identity`.
@@ -980,15 +999,26 @@ async fn pump(
             continue;
         }
         pending.push_str(&text);
-        while let Some(newline) = pending.find('\n') {
-            let line: String = pending.drain(..=newline).collect();
-            forward(forwarded_line(&name, line.trim_end()));
-        }
-        if pending.len() > LINE_CAP {
-            forward(forwarded_line(&name, &pending));
-            pending.clear();
+        for line in complete_lines(&mut pending) {
+            forward(forwarded_line(&name, &line));
         }
     }
+}
+
+/// Takes every complete line out of `pending`, and — when what remains
+/// has grown past [`LINE_CAP`] with no newline in sight — that remainder
+/// too, so a daemon that never prints a newline cannot grow `up` without
+/// bound. A remainder of exactly the cap waits for more.
+fn complete_lines(pending: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(newline) = pending.find('\n') {
+        let line: String = pending.drain(..=newline).collect();
+        lines.push(line.trim_end().to_owned());
+    }
+    if pending.len() > LINE_CAP {
+        lines.push(std::mem::take(pending));
+    }
+    lines
 }
 
 #[cfg(test)]

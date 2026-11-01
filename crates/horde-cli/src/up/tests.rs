@@ -156,6 +156,108 @@ fn forwarded_lines_and_kept_stdout_are_capped() {
     assert_eq!(kept.len(), super::STDOUT_CAP);
 }
 
+/// The caps as literal bytes: they are policy, and a policy asserted only
+/// through its own symbols survives any rewrite of itself.
+#[test]
+fn the_forwarding_caps_are_exactly_the_documented_sizes() {
+    assert_eq!(super::STDOUT_CAP, 65_536, "64 KiB of kept stdout");
+    assert_eq!(super::LINE_CAP, 2_048, "2 KiB per forwarded line");
+}
+
+/// Line framing: complete lines leave trimmed; a newline-less remainder
+/// leaves only once it is *past* the cap — at exactly the cap it waits.
+#[test]
+fn complete_lines_take_whole_lines_and_only_an_overgrown_remainder() {
+    let mut pending = "one\ntwo\r\npart".to_owned();
+    assert_eq!(super::complete_lines(&mut pending), vec!["one", "two"]);
+    assert_eq!(pending, "part", "the partial line waits for its newline");
+
+    let mut at_cap = "x".repeat(super::LINE_CAP);
+    assert!(
+        super::complete_lines(&mut at_cap).is_empty(),
+        "exactly the cap waits"
+    );
+    assert_eq!(at_cap.len(), super::LINE_CAP);
+
+    let mut past_cap = "x".repeat(super::LINE_CAP + 1);
+    assert_eq!(
+        super::complete_lines(&mut past_cap),
+        vec!["x".repeat(super::LINE_CAP + 1)],
+        "past the cap the remainder is flushed whole (the forward clips it)"
+    );
+    assert!(past_cap.is_empty());
+
+    let mut far_past = format!("a\n{}", "y".repeat(super::LINE_CAP + 7));
+    assert_eq!(super::complete_lines(&mut far_past).len(), 2);
+}
+
+/// The export hint is owed exactly when the identity is not the default
+/// `~/.horde/id` a bare `horde` resolves.
+#[test]
+fn the_export_hint_is_owed_only_off_the_default_identity_dir() {
+    let home = Some(std::path::PathBuf::from("/home/me"));
+    assert!(!super::needs_export(
+        std::path::Path::new("/home/me/.horde/id"),
+        home.clone()
+    ));
+    assert!(super::needs_export(
+        std::path::Path::new("/tmp/up/id"),
+        home
+    ));
+}
+
+/// The readiness Hello's give-up table: a certificate cause at once; a
+/// transient or unrecognized one only once the ceiling has passed.
+#[test]
+fn the_hello_gives_up_on_certificates_at_once_and_on_weather_at_the_ceiling() {
+    use horde_identity::diagnosis::Cause;
+    let started = tokio::time::Instant::now();
+    let early = started + std::time::Duration::from_millis(1);
+    let at_ceiling = started + super::HELLO_CEILING;
+    assert!(super::hello_gives_up(
+        Some(&Cause::UnknownIssuer),
+        started,
+        early
+    ));
+    for transient in [Some(&Cause::NothingListening), Some(&Cause::TimedOut), None] {
+        assert!(
+            !super::hello_gives_up(transient, started, early),
+            "{transient:?} is retried before the ceiling"
+        );
+        assert!(
+            super::hello_gives_up(transient, started, at_ceiling),
+            "{transient:?} gives up at the ceiling"
+        );
+    }
+}
+
+/// The CA check, without a network: an identity trusting the state's own
+/// CA passes, one trusting another CA is refused, and a state with no CA
+/// published is not judged here.
+#[test]
+fn the_ca_check_admits_the_states_own_ca_and_refuses_another() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let state = root.path().join("server");
+    let id_dir = root.path().join("id");
+    let generate =
+        || horde_identity::CertificateAuthority::generate(1_754_956_800_000).expect("a CA");
+    let ours = generate();
+    horde_identity::StoredIdentity {
+        certificate_pem: "CERT".to_owned(),
+        key_pem: "KEY".to_owned(),
+        ca_pem: ours.certificate_pem().to_owned(),
+    }
+    .save(&id_dir)
+    .expect("saves");
+
+    super::check_same_ca(&id_dir, &state).expect("no published CA is not judged");
+    ours.persist(&state.join("ca")).expect("persists");
+    super::check_same_ca(&id_dir, &state).expect("the same CA is admitted");
+    generate().persist(&state.join("ca")).expect("replaces");
+    let refused = super::check_same_ca(&id_dir, &state).expect_err("another CA");
+    assert!(refused.to_string().contains("different CA"), "{refused}");
+}
+
 /// The stop wait ends on a signal and nothing else.
 #[tokio::test]
 async fn the_stop_wait_outlives_a_ready_future() {

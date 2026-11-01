@@ -249,6 +249,21 @@ pub fn identity_plan(
     }
 }
 
+/// The operator line owed when an ambient `HORDE_JOIN_TOKEN` is ignored —
+/// exactly when there is one *and* an identity already exists (see
+/// [`identity_plan`]); `None` otherwise.
+#[must_use]
+pub fn ignored_ambient_join(config: &WorkerConfig, enrolled: bool) -> Option<String> {
+    let ambient = config.join.as_ref().is_some_and(|join| join.ambient);
+    (enrolled && ambient).then(|| {
+        format!(
+            "ignoring {}: {} already holds an identity",
+            crate::flags::JOIN_TOKEN_VAR,
+            config.identity_dir().display()
+        )
+    })
+}
+
 /// Where this run dials (ADR-0007, 2026-10-31 amendment): `--server`, then
 /// `HORDE_SERVER` (both already folded into [`WorkerConfig::server`]), then
 /// the endpoint the identity dir stored at join. Nothing from any source is
@@ -419,12 +434,8 @@ pub async fn prepare(
     let state_lock = horde_identity::StateLock::acquire(&config.state_dir, STATE_LOCK_FILE)
         .map_err(|error| format!("could not hold the state directory: {error}"))?;
     let enrolled = StoredIdentity::exists(&config.identity_dir());
-    if enrolled && config.join.as_ref().is_some_and(|join| join.ambient) {
-        announce(format!(
-            "ignoring {}: {} already holds an identity",
-            crate::flags::JOIN_TOKEN_VAR,
-            config.identity_dir().display()
-        ));
+    if let Some(line) = ignored_ambient_join(config, enrolled) {
+        announce(line);
     }
     let plan = identity_plan(config, enrolled)?;
     let provisional_name = config.name.as_deref().unwrap_or(DEFAULT_NAME);
@@ -1122,6 +1133,27 @@ mod tests {
             identity_plan(&ambient, false),
             Ok(IdentityPlan::Join { .. })
         ));
+    }
+
+    /// The ignored-ambient-token line is owed only for an ambient token
+    /// over an existing identity — not for an explicit one, not for no
+    /// token, not before anything is enrolled.
+    #[test]
+    fn an_ambient_token_is_announced_ignored_only_over_an_identity() {
+        let bare = parsed(&["--state-dir", "/tmp/w"]).expect("parses");
+        let with = |join: Option<JoinRequest>| WorkerConfig {
+            join,
+            ..bare.clone()
+        };
+        let ambient = with(Some(JoinRequest::ambient("t".to_owned())));
+        assert_eq!(
+            super::ignored_ambient_join(&ambient, true),
+            Some("ignoring HORDE_JOIN_TOKEN: /tmp/w/identity already holds an identity".to_owned())
+        );
+        assert_eq!(super::ignored_ambient_join(&ambient, false), None);
+        let explicit = with(Some(JoinRequest::explicit("t".to_owned())));
+        assert_eq!(super::ignored_ambient_join(&explicit, true), None);
+        assert_eq!(super::ignored_ambient_join(&with(None), true), None);
     }
 
     /// Where to dial, by precedence: the configured server, then the

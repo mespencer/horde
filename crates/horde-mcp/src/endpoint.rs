@@ -780,11 +780,14 @@ pub fn horde_tool(name: &str) -> Option<&str> {
 /// `horde/report_result` covers a Claude agent and a codex agent alike.
 #[must_use]
 pub fn canonical_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
-    match horde_tool(name) {
-        Some(tool) if name.starts_with(CLAUDE_TOOL_PREFIX) => {
-            std::borrow::Cow::Owned(codex_tool_name(tool))
-        }
-        _ => std::borrow::Cow::Borrowed(name),
+    // Only Claude's spelling is rewritten; `horde/{tool}` already is the
+    // canonical form and passes through borrowed with everything else.
+    match name
+        .strip_prefix(CLAUDE_TOOL_PREFIX)
+        .filter(|tool| !tool.is_empty())
+    {
+        Some(tool) => std::borrow::Cow::Owned(codex_tool_name(tool)),
+        None => std::borrow::Cow::Borrowed(name),
     }
 }
 
@@ -1385,5 +1388,12 @@ mod tests {
         assert_eq!(horde_tool("horde/spawn_agent"), Some("spawn_agent"));
         assert_eq!(horde_tool("horde/"), None, "no tool is no tool");
         assert_eq!(horde_tool("Write"), None);
+        assert!(
+            matches!(
+                canonical_tool_name("horde/report_result"),
+                std::borrow::Cow::Borrowed(_)
+            ),
+            "the canonical spelling is never rebuilt"
+        );
     }
 }
