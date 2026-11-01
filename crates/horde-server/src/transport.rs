@@ -82,11 +82,11 @@ pub async fn serve_main(
         crate::service::Blobs::new(core.blobs.clone()),
         crate::trust::door(deny.clone()),
     );
-    let worker_facing = WorkerServiceServer::with_interceptor(
+    let worker_facing = tonic::service::interceptor::InterceptedService::new(
         // The deny-list rides into the service too: the per-RPC interceptor
         // cannot reach a stream already in flight, so the streams re-check it
         // themselves and are severed on revocation (fix a4).
-        WorkerFacing::new(core).with_deny(deny.clone()),
+        worker_service(WorkerFacing::new(core).with_deny(deny.clone())),
         crate::trust::door(deny),
     );
 
@@ -121,6 +121,17 @@ pub async fn serve_main(
     });
 
     Ok(BoundListener { addr, task })
+}
+
+/// The worker spine with the message limits every Worker client agrees to
+/// ([`horde_proto::limits`]) — set here deliberately rather than inherited
+/// from tonic's silent 4 MiB, which refused an oversized push batch with an
+/// opaque status the Worker could only redial into.
+#[must_use]
+pub fn worker_service(service: WorkerFacing) -> WorkerServiceServer<WorkerFacing> {
+    WorkerServiceServer::new(service)
+        .max_decoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
 }
 
 /// Binds the enrollment listener: `Join` alone, server-auth TLS.

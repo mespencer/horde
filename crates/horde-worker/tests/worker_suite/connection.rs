@@ -357,6 +357,51 @@ async fn a_partitioned_worker_journals_locally_and_reconciles_on_reconnect() {
     run.abort();
 }
 
+/// A journal heavier than one message crosses whole and in order: the
+/// push is bounded by bytes, so many large events split across batches, and
+/// one event past tonic's silent 4 MiB default still fits the limit both
+/// ends now set deliberately — where it used to be refused and redialed
+/// forever.
+#[tokio::test]
+async fn a_heavy_journal_crosses_in_byte_bounded_batches() {
+    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
+    let endpoint = harness::serve(core.clone()).await;
+    let journal = Journal::in_memory().expect("an in-memory journal");
+    let sink = journal.sink();
+
+    let big = "x".repeat(5 * 1024 * 1024);
+    sink.record(harness::marker_entry("s1", &big))
+        .await
+        .expect("the journal accepts");
+    let medium = "m".repeat(300 * 1024);
+    for _ in 0..6 {
+        sink.record(harness::marker_entry("s1", &medium))
+            .await
+            .expect("the journal accepts");
+    }
+
+    let config = harness::bare_config(&endpoint, "worker-a");
+    let (run, _) = harness::dial_and_run(&config, &journal, Runtime::new(journal.clone())).await;
+    harness::server_log_at_least(&core.log, "s1", 7).await;
+    let sizes: Vec<usize> = harness::decoded_session_log(&core.log, "s1")
+        .await
+        .iter()
+        .filter_map(|event| match &event.kind {
+            Some(horde_proto::v1::event::Kind::TurnInterrupted(interrupted)) => {
+                Some(interrupted.reason.len())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        [vec![big.len()], vec![medium.len(); 6]].concat(),
+        "every event arrived whole, once, in order"
+    );
+    harness::journal_truncated_to(&journal, 8).await;
+    run.abort();
+}
+
 /// The live half of the seam: the same wire path as everything above, driven
 /// through the **real** `claude` binary instead of the fake. Manual only —
 /// costs tokens, needs a login, and runs on the harness's default model

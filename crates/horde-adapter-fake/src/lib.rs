@@ -320,6 +320,7 @@ impl FakeSession {
                 Step::Say(text) => self.emit_output(OutputChannel::Assistant, text),
                 Step::Think(text) => self.emit_output(OutputChannel::Reasoning, text),
                 Step::Stall(duration) => self.stall = Some(duration),
+                Step::Exit => self.finished = true,
                 Step::UseHordeTool {
                     tool_call_id,
                     tool_name,
@@ -1531,6 +1532,51 @@ mod steering_and_revival_tests {
             !said.iter().any(|text| text == "never played"),
             "the aborted turn's remaining steps must not play: {said:?}"
         );
+    }
+
+    /// An `Exit` step kills the harness quietly: its turn still ends, the
+    /// next send finds nobody there, and a resumed session carries on with
+    /// the rest of the script — the idle death a Worker revives through.
+    #[tokio::test]
+    async fn an_exit_step_dies_after_its_turn_and_a_resume_carries_on() {
+        let adapter = FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("last words").with_step(Step::Exit),
+            ScriptedTurn::saying("back again"),
+        ]));
+        let mut session = adapter.spawn(&spec()).await.expect("spawns");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        let mut ended = false;
+        while let Ok(Some(event)) = session.next_event().await {
+            ended |= matches!(event, AgentEvent::TurnEnded(_));
+        }
+        assert!(ended, "the dying turn still closes");
+        let refused = session.send(TurnInput::queued("anyone?")).await;
+        assert!(
+            matches!(
+                refused,
+                Err(horde_adapter::AdapterError::HarnessExited { .. })
+            ),
+            "the dead harness refuses the next send: {refused:?}"
+        );
+
+        let mut resumed = adapter
+            .resume(
+                &spec().with_turns_taken(1),
+                &ProviderSessionId::new("fake-session-1"),
+            )
+            .await
+            .expect("resumes");
+        resumed
+            .send(TurnInput::queued("anyone?"))
+            .await
+            .expect("the revived harness takes the message");
+        let mut said = Vec::new();
+        while let Ok(Some(event)) = resumed.next_event().await {
+            if let AgentEvent::Output { text, .. } = event {
+                said.push(text);
+            }
+        }
+        assert!(said.iter().any(|text| text == "back again"), "{said:?}");
     }
 
     /// The other half of the abort-first guard: a *queued* send mid-turn must

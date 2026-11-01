@@ -38,8 +38,22 @@ use tonic::transport::Channel;
 use crate::error::WorkerError;
 use crate::journal::Journal;
 
-/// How many journaled events ride one batch.
+/// How many journaled events ride one batch, at most. Batches are also bounded
+/// by encoded bytes ([`horde_proto::limits::PUSH_BATCH_BYTES`]): a count alone
+/// let 256 large tool outputs exceed the wire's decoding limit, and a refused
+/// batch is redialed into forever.
 const PAGE: u32 = 256;
+
+/// The Worker's client of the worker spine, with the message limits the
+/// Server's side agrees to ([`horde_proto::limits`]). Every Worker client of
+/// `WorkerService` is built here, so no stream can drift back to tonic's
+/// silent 4 MiB default.
+#[must_use]
+pub fn worker_service(channel: Channel) -> WorkerServiceClient<Channel> {
+    WorkerServiceClient::new(channel)
+        .max_decoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
+}
 
 /// What the command feed drives — the seam between the wire and the Runtime.
 ///
@@ -47,11 +61,14 @@ const PAGE: u32 = 256;
 /// against a recorder, and so the Runtime never learns about tonic.
 #[async_trait]
 pub trait ApplyCommand: Send {
-    /// Applies one command: dedupe, execute, and journal its effect —
-    /// atomically, per the journal's contract.
+    /// Applies one command — for the Runtime, accepts it durably into the
+    /// journaled inbox (ADR-0012), which is what the ack then stands for.
     ///
-    /// An error is fatal to the command loop on purpose: acking past a command
-    /// that was never applied tells the Server work happened that did not.
+    /// An error is fatal to the command loop on purpose, and so is reserved
+    /// for failures that are the *Worker's*, not the command's: a journal
+    /// that cannot record the command. A command that cannot be applied is
+    /// journaled against its agent and acked — redelivering it forever would
+    /// not make it whole, and stopping the loop would stop every agent.
     async fn apply(&mut self, command: StreamCommandsResponse) -> Result<(), WorkerError>;
 }
 
@@ -148,7 +165,7 @@ impl Connection {
     /// [`WorkerError::Incomplete`] when the response is missing a field the
     /// protocol requires.
     pub async fn dial(config: &DialConfig) -> Result<(Self, RegisterWorkerResponse), WorkerError> {
-        let mut client = WorkerServiceClient::new(config.channel().await?);
+        let mut client = worker_service(config.channel().await?);
 
         let response = client
             .register_worker(horde_proto::v1::RegisterWorkerRequest {
@@ -302,7 +319,9 @@ impl Connection {
         let mut cursor = accepted.resume_from_journal_sequence;
         let mut head = journal.watch_head();
         loop {
-            let events = journal.read_from(cursor, PAGE).await?;
+            let events = journal
+                .read_batch(cursor, PAGE, horde_proto::limits::PUSH_BATCH_BYTES)
+                .await?;
             if events.is_empty() {
                 // Nothing owed: park until the journal moves. A closed watch
                 // means the journal's last handle is gone — the Worker is

@@ -203,6 +203,18 @@ impl Journal {
     /// cannot be created.
     pub fn open(path: &Path) -> Result<Self, WorkerError> {
         let connection = Connection::open(path).map_err(open_error)?;
+        // WAL with `synchronous=NORMAL`: every pump journals each event in its
+        // own transaction, and the rollback journal's fsync-per-commit made
+        // that the Worker's hottest cost. Under WAL, NORMAL still never
+        // corrupts the file; what a power loss can cost is the last few
+        // commits — which is the same window a crash before the commit
+        // always had, and the at-least-once rules above already cover it
+        // (an unjournaled command is redelivered, an unjournaled event was
+        // never acked). Durability against a process crash is unchanged.
+        connection
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+            .and_then(|_mode| connection.pragma_update(None, "synchronous", "NORMAL"))
+            .map_err(open_error)?;
         Self::from_connection(connection)
     }
 
@@ -234,6 +246,13 @@ impl Journal {
                      spawn               BLOB NOT NULL,
                      provider_session_id TEXT,
                      turns_taken         INTEGER NOT NULL DEFAULT 0
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS inbox (
+                     ordinal    INTEGER PRIMARY KEY AUTOINCREMENT,
+                     command_id TEXT NOT NULL UNIQUE,
+                     lane       TEXT NOT NULL,
+                     command    BLOB NOT NULL,
+                     handed     INTEGER NOT NULL DEFAULT 0
                  ) STRICT;
                  CREATE TABLE IF NOT EXISTS harness_group (
                      pgid        INTEGER PRIMARY KEY,
@@ -424,31 +443,11 @@ impl Journal {
         let (application, head) = self
             .with_connection(CONTEXT, move |connection| {
                 in_transaction(connection, CONTEXT, |transaction| {
-                    let seen: Option<u64> = transaction
-                        .query_row(
-                            "SELECT command_sequence FROM applied_command WHERE command_id = ?1",
-                            params![command_id],
-                            |row| row.get(0),
-                        )
-                        .map(Some)
-                        .or_else(|error| match error {
-                            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                            other => Err(other),
-                        })?;
-                    if seen.is_some() {
+                    if mark_applied(transaction, &command_id, command_sequence, log_position)?
+                        == CommandApplication::AlreadyApplied
+                    {
                         return Ok((CommandApplication::AlreadyApplied, None));
                     }
-
-                    transaction.execute(
-                        "INSERT INTO applied_command (command_id, command_sequence)
-                             VALUES (?1, ?2)",
-                        params![command_id, command_sequence],
-                    )?;
-                    let acked = meta(transaction, APPLIED_COMMAND)?;
-                    set_meta(transaction, APPLIED_COMMAND, acked.max(command_sequence))?;
-                    let reached = meta(transaction, APPLIED_POSITION)?;
-                    set_meta(transaction, APPLIED_POSITION, reached.max(log_position))?;
-
                     let last = append_all(transaction, &effects)?;
                     apply_bookkeeping(transaction, &bookkeeping)?;
                     Ok((CommandApplication::Applied, Some(last)))
@@ -476,6 +475,23 @@ impl Journal {
         from_sequence: u64,
         limit: u32,
     ) -> Result<Vec<JournaledEvent>, WorkerError> {
+        self.read_batch(from_sequence, limit, usize::MAX).await
+    }
+
+    /// [`Self::read_from`], bounded by encoded bytes as well as by count:
+    /// rows are taken in order while their encoded events fit `max_bytes`,
+    /// and the first row is always taken, so one event larger than the
+    /// budget still travels (alone) instead of wedging the push forever.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_from`].
+    pub async fn read_batch(
+        &self,
+        from_sequence: u64,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<JournaledEvent>, WorkerError> {
         self.with_connection("reading the journal", move |connection| {
             let floor = meta(connection, FLOOR).map_err(read_error)?;
             if from_sequence < floor {
@@ -484,7 +500,7 @@ impl Journal {
                     floor,
                 });
             }
-            read_rows(connection, from_sequence, limit)
+            read_rows(connection, from_sequence, limit, max_bytes)
         })
         .await
     }
@@ -659,7 +675,7 @@ impl Journal {
         self.head.subscribe()
     }
 
-    fn announce(&self, sequence: u64) {
+    pub(crate) fn announce(&self, sequence: u64) {
         // send_replace, not send: an announcement with no listener is normal.
         self.head.send_replace(sequence);
     }
@@ -669,7 +685,7 @@ impl Journal {
     /// A poisoned mutex means an earlier operation panicked while holding the
     /// connection; that is reported rather than propagated, because one bad
     /// statement must not take down a Worker that is supervising live agents.
-    async fn with_connection<T, F>(
+    pub(crate) async fn with_connection<T, F>(
         &self,
         context: &'static str,
         operation: F,
@@ -689,8 +705,42 @@ impl Journal {
     }
 }
 
+/// Marks `command_id` applied and ratchets both watermarks — or reports a
+/// redelivery and touches nothing. The dedupe half of every command
+/// transaction, whether it commits the command's effects at once
+/// ([`Journal::apply_command_at`]) or only its acceptance into the inbox.
+///
+/// The watermarks ratchet to the highest sequence and position ever applied,
+/// so a redelivery of an old command cannot regress them.
+pub(crate) fn mark_applied(
+    transaction: &rusqlite::Transaction<'_>,
+    command_id: &str,
+    command_sequence: u64,
+    log_position: u64,
+) -> Result<CommandApplication, rusqlite::Error> {
+    let seen = transaction
+        .query_row(
+            "SELECT 1 FROM applied_command WHERE command_id = ?1",
+            params![command_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if seen.is_some() {
+        return Ok(CommandApplication::AlreadyApplied);
+    }
+    transaction.execute(
+        "INSERT INTO applied_command (command_id, command_sequence) VALUES (?1, ?2)",
+        params![command_id, command_sequence],
+    )?;
+    let acked = meta(transaction, APPLIED_COMMAND)?;
+    set_meta(transaction, APPLIED_COMMAND, acked.max(command_sequence))?;
+    let reached = meta(transaction, APPLIED_POSITION)?;
+    set_meta(transaction, APPLIED_POSITION, reached.max(log_position))?;
+    Ok(CommandApplication::Applied)
+}
+
 /// Runs one transaction, mapping any database failure to `context`.
-fn in_transaction<T>(
+pub(crate) fn in_transaction<T>(
     connection: &mut Connection,
     context: &'static str,
     operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, rusqlite::Error>,
@@ -704,11 +754,13 @@ fn in_transaction<T>(
     attempt.map_err(|source| WorkerError::Journal { context, source })
 }
 
-/// Reads and decodes journal rows from `from_sequence`, in order.
+/// Reads and decodes journal rows from `from_sequence`, in order, while the
+/// encoded events taken so far fit `max_bytes` — always at least one.
 fn read_rows(
     connection: &Connection,
     from_sequence: u64,
     limit: u32,
+    max_bytes: usize,
 ) -> Result<Vec<JournaledEvent>, WorkerError> {
     let mut statement = connection
         .prepare(
@@ -729,8 +781,13 @@ fn read_rows(
         .map_err(read_error)?;
 
     let mut events = Vec::new();
+    let mut taken = 0_usize;
     for row in rows {
         let (journal_sequence, session_id, payload) = row.map_err(read_error)?;
+        taken = taken.saturating_add(payload.len());
+        if taken > max_bytes && !events.is_empty() {
+            break;
+        }
         let event = Event::decode(payload.as_slice()).map_err(|source| {
             WorkerError::CorruptJournalEntry {
                 journal_sequence,
@@ -750,7 +807,7 @@ fn read_rows(
 ///
 /// The counter advances with the rows inside the same transaction, so a
 /// rollback rolls both back together and density survives any failure.
-fn append_all(
+pub(crate) fn append_all(
     transaction: &rusqlite::Transaction<'_>,
     entries: &[JournalEntry],
 ) -> Result<u64, rusqlite::Error> {
@@ -783,8 +840,12 @@ fn append_all(
 /// `Remember` upserts: a redelivered spawn after a partial crash must land on
 /// the same row, not fail on it. `Forget` tolerates an absent row for the same
 /// reason an archive for an unknown agent applies — the fact it removes is
-/// already gone.
-fn apply_bookkeeping(
+/// already gone. `Forget` also drops the messages the forgotten incarnation
+/// was handed and never sent (ADR-0012): its context is gone, and a fresh
+/// placement gets the Server's own re-delivery, so replaying them too would
+/// deliver each one twice. Commands accepted but not yet run stay — they are
+/// the agent's *next* commands, a re-placement's spawn among them.
+pub(crate) fn apply_bookkeeping(
     transaction: &rusqlite::Transaction<'_>,
     bookkeeping: &AgentBookkeeping,
 ) -> Result<(), rusqlite::Error> {
@@ -804,6 +865,10 @@ fn apply_bookkeeping(
         }
         AgentBookkeeping::Forget { agent_id } => {
             transaction.execute("DELETE FROM agent WHERE agent_id = ?1", params![agent_id])?;
+            transaction.execute(
+                "DELETE FROM inbox WHERE lane = ?1 AND handed = 1",
+                params![agent_id],
+            )?;
         }
     }
     Ok(())
@@ -899,7 +964,7 @@ fn open_error(source: rusqlite::Error) -> WorkerError {
     }
 }
 
-fn read_error(source: rusqlite::Error) -> WorkerError {
+pub(crate) fn read_error(source: rusqlite::Error) -> WorkerError {
     WorkerError::Journal {
         context: "reading the journal",
         source,
@@ -992,6 +1057,56 @@ mod tests {
         );
         let sequence = reopened.record(entry("s1", "k3")).await.expect("append");
         assert_eq!(sequence, 3, "numbering continues across restarts");
+    }
+
+    /// A push batch is bounded by bytes as well as count: rows are taken
+    /// while their encoded events fit, exactly at the edge included — and an
+    /// event bigger than the whole budget still travels alone rather than
+    /// wedging the push behind it.
+    #[tokio::test]
+    async fn a_batch_read_is_bounded_by_encoded_bytes() {
+        use horde_proto::prost::Message;
+        let journal = journal();
+        for key in ["k1", "k2", "k3"] {
+            journal.record(entry("s1", key)).await.expect("append");
+        }
+        let sizes: Vec<usize> = journal
+            .read_from(1, 10)
+            .await
+            .expect("readable")
+            .iter()
+            .map(|journaled| journaled.event.as_ref().map_or(0, Message::encoded_len))
+            .collect();
+        let two = sizes[0] + sizes[1];
+
+        let exact = journal.read_batch(1, 10, two).await.expect("readable");
+        assert_eq!(exact.len(), 2, "a budget met exactly takes both rows");
+        let short = journal.read_batch(1, 10, two - 1).await.expect("readable");
+        assert_eq!(short.len(), 1, "one byte short leaves the second row");
+        let tiny = journal.read_batch(1, 10, 1).await.expect("readable");
+        assert_eq!(tiny.len(), 1, "the first row always travels");
+        let counted = journal
+            .read_batch(1, 2, usize::MAX)
+            .await
+            .expect("readable");
+        assert_eq!(counted.len(), 2, "the count bound still holds");
+    }
+
+    /// An on-disk journal runs WAL with `synchronous=NORMAL` — per-commit
+    /// fsync was the pump's hottest cost, and WAL keeps NORMAL crash-safe.
+    #[tokio::test]
+    async fn an_on_disk_journal_runs_wal_with_normal_sync() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let journal = Journal::open(&dir.path().join("journal.sqlite")).expect("a journal");
+        let connection = journal.connection.lock().expect("an unpoisoned connection");
+        let mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the mode reads");
+        let sync: i64 = connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .expect("the sync level reads");
+        assert_eq!(mode, "wal");
+        assert_eq!(sync, 1, "NORMAL is 1; FULL (the default) is 2");
     }
 
     #[tokio::test]

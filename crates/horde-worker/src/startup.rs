@@ -51,13 +51,86 @@ pub const IDENTITY_DIR: &str = "identity";
 /// The display name used before any identity names this Worker.
 pub const DEFAULT_NAME: &str = "horde-worker";
 
-/// How long the daemon waits before redialing a Server it lost.
+/// The ceiling on the first redial's wait — and on every redial right after
+/// a connection that registered. A half-second keeps reconnection after a
+/// blip feeling immediate (DESIGN.md §2: spotty networks are the norm).
+pub const RETRY_BASE: core::time::Duration = core::time::Duration::from_millis(500);
+
+/// The most any redial waits. Failures in a row double the ceiling up to
+/// here: a Server that is down for minutes is dialed every few seconds, not
+/// twice a second by every Worker at once.
+pub const RETRY_CAP: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// The redial schedule: jittered exponential backoff.
 ///
-/// A constant rather than a backoff schedule on purpose: the Worker is
-/// designed for spotty networks (DESIGN.md §2), a half-second is slow enough
-/// not to be a hot spin and fast enough that reconciliation feels immediate,
-/// and a schedule would be tuning nobody has measured a need for.
-pub const RETRY_DELAY: core::time::Duration = core::time::Duration::from_millis(500);
+/// The ceiling doubles per consecutive failure from [`RETRY_BASE`] to
+/// [`RETRY_CAP`], and each wait is drawn from the upper half of it ("equal
+/// jitter"): never shorter than half the ceiling, so a run of failures
+/// genuinely backs off, and never in lockstep with every other Worker that
+/// lost the same Server at the same instant — a restart is not followed by
+/// a synchronized stampede. A connection that registers resets it. A push
+/// that fails ends its connection, so push retries ride the same schedule.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    failures: u32,
+    random: fn() -> u64,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::with_random(entropy)
+    }
+}
+
+impl Backoff {
+    /// A schedule drawing its jitter from `random` — the seam that lets a
+    /// test pin the draws.
+    #[must_use]
+    pub fn with_random(random: fn() -> u64) -> Self {
+        Self {
+            failures: 0,
+            random,
+        }
+    }
+
+    /// The wait before the next redial, counting this as one more failure.
+    pub fn next_delay(&mut self) -> core::time::Duration {
+        let delay = jittered(backoff_ceiling(self.failures), (self.random)());
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+
+    /// A connection registered: the next loss starts from the base again.
+    pub fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+/// The ceiling after `failures` consecutive failures: the base doubled that
+/// many times, capped.
+fn backoff_ceiling(failures: u32) -> core::time::Duration {
+    RETRY_BASE
+        .saturating_mul(2_u32.saturating_pow(failures.min(16)))
+        .min(RETRY_CAP)
+}
+
+/// A draw from the upper half of `ceiling`: `[ceiling/2, ceiling]`.
+fn jittered(ceiling: core::time::Duration, random: u64) -> core::time::Duration {
+    let millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+    let half = millis / 2;
+    core::time::Duration::from_millis(half + random % (millis - half + 1))
+}
+
+/// Jitter entropy from the OS, falling back to the clock: a jitter source
+/// needs to differ between Workers, not to be unpredictable.
+fn entropy() -> u64 {
+    getrandom::u64().unwrap_or_else(|_| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| u64::from(since.subsec_nanos()))
+            .unwrap_or_default()
+    })
+}
 
 /// A provider harness the daemon can register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -868,7 +941,7 @@ async fn fresh_dial_config(prepared: &PreparedWorker) -> DialConfig {
 /// What one connection's end means for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fate {
-    /// Wait [`RETRY_DELAY`] and dial again — transport weather, a Server
+    /// Wait out the [`Backoff`] and dial again — transport weather, a Server
     /// restart, a stream the Server closed.
     Redial(String),
     /// Stop the daemon with this reason — a refusal a redial cannot heal.
@@ -985,7 +1058,16 @@ pub async fn run(
 ) -> Result<(), String> {
     tokio::pin!(shutdown);
     let mut prepared = prepared;
-    let failure = connection_loop(&mut prepared, shutdown.as_mut(), announce).await;
+    // What the last run accepted and never finished runs first, connected or
+    // not (ADR-0012): a revival owed to a held message must not wait for the
+    // Server to come back.
+    let failure = match prepared.runtime.replay_inbox().await {
+        Ok(replayed) => {
+            announce(format!("inbox-replayed commands={replayed}"));
+            connection_loop(&mut prepared, shutdown.as_mut(), announce).await
+        }
+        Err(error) => Some(error.to_string()),
+    };
 
     let reaped = prepared.runtime.shutdown().await;
     announce(format!("shutdown reaped={reaped}"));
@@ -1002,6 +1084,7 @@ async fn connection_loop(
     mut shutdown: core::pin::Pin<&mut impl Future<Output = ()>>,
     announce: &mut dyn FnMut(String),
 ) -> Option<String> {
+    let mut backoff = Backoff::default();
     loop {
         let config = fresh_dial_config(prepared).await;
         let dialed = tokio::select! {
@@ -1014,13 +1097,14 @@ async fn connection_loop(
                 Fate::Fatal(reason) => return Some(reason),
                 Fate::Redial(reason) => {
                     announce(format!("dial-failed reason={reason}"));
-                    if pause_before_redial(shutdown.as_mut()).await {
+                    if pause_before_redial(shutdown.as_mut(), backoff.next_delay()).await {
                         continue;
                     }
                     return None;
                 }
             },
         };
+        backoff.reset();
         announce(format!(
             "registered worker={} resume={}",
             connection.worker_id(),
@@ -1042,7 +1126,7 @@ async fn connection_loop(
             Fate::Fatal(reason) => return Some(reason),
             Fate::Redial(reason) => {
                 announce(format!("disconnected reason={reason}"));
-                if !pause_before_redial(shutdown.as_mut()).await {
+                if !pause_before_redial(shutdown.as_mut(), backoff.next_delay()).await {
                     return None;
                 }
             }
@@ -1050,13 +1134,16 @@ async fn connection_loop(
     }
 }
 
-/// Parks for [`RETRY_DELAY`] unless shutdown arrives first.
+/// Parks for `delay` unless shutdown arrives first.
 ///
 /// `true` means "keep going"; `false` means shutdown won the wait.
-async fn pause_before_redial(shutdown: core::pin::Pin<&mut impl Future<Output = ()>>) -> bool {
+async fn pause_before_redial(
+    shutdown: core::pin::Pin<&mut impl Future<Output = ()>>,
+    delay: core::time::Duration,
+) -> bool {
     tokio::select! {
         () = shutdown => false,
-        () = tokio::time::sleep(RETRY_DELAY) => true,
+        () = tokio::time::sleep(delay) => true,
     }
 }
 
@@ -1070,6 +1157,56 @@ mod tests {
 
     fn parsed(arguments: &[&str]) -> Result<WorkerConfig, String> {
         invocation(arguments.iter().map(|s| (*s).to_owned()))
+    }
+
+    /// The backoff ceiling doubles per consecutive failure from the base and
+    /// stops at the cap — including past any shift that could overflow.
+    #[test]
+    fn the_backoff_ceiling_doubles_to_the_cap() {
+        use super::{RETRY_BASE, RETRY_CAP, backoff_ceiling};
+        use core::time::Duration;
+        assert_eq!(backoff_ceiling(0), RETRY_BASE);
+        assert_eq!(backoff_ceiling(1), Duration::from_secs(1));
+        assert_eq!(backoff_ceiling(2), Duration::from_secs(2));
+        assert_eq!(backoff_ceiling(4), Duration::from_secs(8));
+        assert_eq!(backoff_ceiling(5), RETRY_CAP, "16 s is capped to 10");
+        assert_eq!(backoff_ceiling(u32::MAX), RETRY_CAP);
+    }
+
+    /// Each wait is drawn from the upper half of its ceiling: the lowest
+    /// draw is exactly half, the highest exactly the ceiling, and the draw
+    /// wraps rather than overshooting.
+    #[test]
+    fn a_jittered_wait_lies_in_the_upper_half_of_its_ceiling() {
+        use super::jittered;
+        use core::time::Duration;
+        let ceiling = Duration::from_millis(1000);
+        assert_eq!(jittered(ceiling, 0), Duration::from_millis(500));
+        assert_eq!(jittered(ceiling, 500), Duration::from_millis(1000));
+        assert_eq!(jittered(ceiling, 501), Duration::from_millis(500));
+        assert_eq!(jittered(ceiling, 123), Duration::from_millis(623));
+        assert_eq!(
+            jittered(Duration::from_millis(1), 7),
+            Duration::from_millis(1)
+        );
+    }
+
+    /// The schedule counts failures and a registration resets it; real
+    /// entropy stays within the same bounds.
+    #[test]
+    fn the_backoff_grows_with_failures_and_resets_on_registration() {
+        use super::{Backoff, RETRY_BASE};
+        use core::time::Duration;
+        let mut backoff = Backoff::with_random(|| 0);
+        assert_eq!(backoff.next_delay(), Duration::from_millis(250));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(1000));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(250));
+
+        let mut real = Backoff::default();
+        let first = real.next_delay();
+        assert!(first >= RETRY_BASE / 2 && first <= RETRY_BASE, "{first:?}");
     }
 
     #[test]
@@ -1555,8 +1692,8 @@ mod tests {
     }
 
     /// The redial pause's whole contract, on the paused clock: with no
-    /// shutdown it waits exactly [`RETRY_DELAY`] and says keep-going (a
-    /// pause that returns early is a hot spin against a dead server; one
+    /// shutdown it waits exactly the delay it was given and says keep-going
+    /// (a pause that returns early is a hot spin against a dead server; one
     /// that returns `false` shuts a healthy daemon down), and a completed
     /// shutdown wins the pause immediately.
     #[tokio::test(start_paused = true)]
@@ -1565,12 +1702,12 @@ mod tests {
         tokio::pin!(pending);
         let before = tokio::time::Instant::now();
         assert!(
-            super::pause_before_redial(pending.as_mut()).await,
+            super::pause_before_redial(pending.as_mut(), super::RETRY_BASE).await,
             "no shutdown means keep going"
         );
         assert_eq!(
             before.elapsed(),
-            super::RETRY_DELAY,
+            super::RETRY_BASE,
             "the pause is the delay, exactly — the paused clock makes this deterministic"
         );
 
@@ -1578,7 +1715,7 @@ mod tests {
         tokio::pin!(ready);
         let before = tokio::time::Instant::now();
         assert!(
-            !super::pause_before_redial(ready.as_mut()).await,
+            !super::pause_before_redial(ready.as_mut(), super::RETRY_BASE).await,
             "a completed shutdown wins the pause"
         );
         assert_eq!(

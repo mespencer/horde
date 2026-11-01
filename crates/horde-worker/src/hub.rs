@@ -47,7 +47,7 @@ impl ForwardedHubLink {
         session_id: &str,
         agent_id: &str,
     ) -> Result<Self, WorkerError> {
-        let mut client = WorkerServiceClient::new(channel);
+        let mut client = crate::client::worker_service(channel);
         let listed = client
             .list_hub_tools(ListHubToolsRequest {
                 worker_id: Some(WorkerId::new(worker_id)),

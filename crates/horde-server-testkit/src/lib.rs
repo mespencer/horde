@@ -37,7 +37,6 @@ use horde_cli::Client;
 use horde_proto::v1::blob_service_server::BlobServiceServer;
 use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
-use horde_proto::v1::worker_service_server::WorkerServiceServer;
 use horde_proto::v1::{
     Event, JournaledEvent, JournaledEventBatch, PushEventsRequest, PushEventsResponse,
     PushEventsStart, SessionId, WorkerId, push_events_request,
@@ -140,7 +139,11 @@ pub async fn serve_core(core: ServerCore) -> Setup<String> {
             .add_service(BlobServiceServer::new(horde_server::service::Blobs::new(
                 core.blobs.clone(),
             )))
-            .add_service(WorkerServiceServer::new(WorkerFacing::new(core)))
+            // The production limits too, so a batch the real listener takes
+            // is a batch this one takes.
+            .add_service(horde_server::transport::worker_service(WorkerFacing::new(
+                core,
+            )))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;
     });

@@ -318,6 +318,19 @@ impl WorkspaceManager {
         }
     }
 
+    /// Where [`Self::checkout`] composes `agent_id`'s private checkout of
+    /// `definition_id` — whether or not one is there. What an archive gives
+    /// back for an agent no pump is running, which has no registered
+    /// checkout to ask. `None` when either id is not a directory name.
+    #[must_use]
+    pub fn agent_root(&self, definition_id: &str, agent_id: &str) -> Option<PathBuf> {
+        (is_path_safe(definition_id) && is_path_safe(agent_id)).then(|| {
+            self.instance_root(definition_id)
+                .join(AGENTS_DIR)
+                .join(agent_id)
+        })
+    }
+
     /// `(instance root, agent id)` when `root` is exactly an agent-private
     /// checkout under this manager: `<root>/<definition>/.horde-agents/<agent>`.
     fn agent_private(&self, root: &Path) -> Option<(PathBuf, String)> {

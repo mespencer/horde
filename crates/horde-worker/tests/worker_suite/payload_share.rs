@@ -78,6 +78,8 @@ mod suite {
                 .apply(spawn(2, agent))
                 .await
                 .expect("the spawn applies");
+            // Acceptance is not completion: the spawn runs on its lane.
+            within("the spawn completes", self.runtime.settled()).await;
             assert_eq!(self.runtime.running_agents(), 1);
         }
 
@@ -362,6 +364,7 @@ mod suite {
             .apply(deliver(3, "agent-b", "review the feature", Some(payload)))
             .await
             .expect("the delivery applies");
+        within("the delivery completes", receiver.runtime.settled()).await;
 
         assert!(
             holds_commit(&b_repo, &shared).await,
@@ -424,6 +427,7 @@ mod suite {
             .apply(deliver(3, "agent-c", "act on this", Some(absent)))
             .await
             .expect("the command applies; the failure is the agent's");
+        within("the delivery completes", lonely.runtime.settled()).await;
 
         assert_eq!(
             lonely.runtime.running_agents(),

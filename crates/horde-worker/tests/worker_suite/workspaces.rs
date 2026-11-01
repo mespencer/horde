@@ -196,6 +196,8 @@ async fn a_spawned_child_starts_at_its_parents_committed_head() {
         .apply(command(2, spawn("parent-1", None)))
         .await
         .expect("the parent spawns");
+    // Accepted is not run: the spawn completes on its own lane.
+    crate::support::within("the parent's spawn", runtime.settled()).await;
 
     // The parent's work: a commit in its worktree, past the instance HEAD.
     let checkout_of = |agent: &str| {
@@ -212,6 +214,7 @@ async fn a_spawned_child_starts_at_its_parents_committed_head() {
         .apply(command(3, spawn("child-1", Some("parent-1"))))
         .await
         .expect("the child spawns");
+    crate::support::within("the child's spawn", runtime.settled()).await;
     let child_head = harness::git(&checkout_of("child-1"), &["rev-parse", "HEAD"])
         .trim()
         .to_owned();

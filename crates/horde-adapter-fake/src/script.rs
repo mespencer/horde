@@ -53,6 +53,11 @@ pub enum Step {
     /// (`#[tokio::test(start_paused = true)]`) so the wait costs nothing in
     /// wall-clock time while still exercising whatever timeout is under test.
     Stall(Duration),
+    /// The harness process dies here, quietly: the turn still plays out and
+    /// ends, but the next send finds nobody listening — the between-turns
+    /// death a Worker only discovers as a broken pipe. A *resumed* session
+    /// carries on with the rest of the script, as a real revival would.
+    Exit,
 }
 
 /// One scripted turn.

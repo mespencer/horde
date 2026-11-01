@@ -353,6 +353,15 @@ async fn the_run_loop_survives_a_partition_and_registers_again() {
         Some("shutdown reaped=0"),
         "the last word is the reap count"
     );
+    assert_eq!(
+        lines
+            .lock()
+            .expect("an unpoisoned recorder")
+            .first()
+            .map(String::as_str),
+        Some("inbox-replayed commands=0"),
+        "the first word is the inbox replay, before any dial"
+    );
 }
 
 /// `tokio::join!` as a function, so the select-free test body stays

@@ -55,6 +55,17 @@ pub enum WorkerError {
         source: horde_proto::prost::DecodeError,
     },
 
+    /// An accepted command held in the inbox no longer decodes.
+    ///
+    /// Same standing as [`Self::CorruptAgentRecord`]: this Worker encoded
+    /// the row when it accepted the command, so a row that will not decode
+    /// is corruption, scoped to the command it strands.
+    #[error("the inbox entry for command {command_id} is not decodable: {source}")]
+    CorruptInboxEntry {
+        command_id: String,
+        source: horde_proto::prost::DecodeError,
+    },
+
     /// The Server asked the Worker to replay from a position it has truncated.
     ///
     /// The mirror image of the Server's own `JournalRegressed`. Sending only the
