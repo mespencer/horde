@@ -1224,8 +1224,11 @@ async fn a_harness_that_dies_mid_handshake_reads_as_its_death() {
 
 /// The other order: the child lets go of stdin before the adapter's next
 /// write. The stub closes stdin and only then answers `initialize`, so once
-/// the adapter has its answer the `initialized` write is certain to meet
-/// EPIPE — and that is the same death, never "harness io failed".
+/// the adapter has its answer the child is no longer a reader, and the
+/// handshake's next write meets EPIPE — the same death, never "harness io
+/// failed". (A sibling test's spawn can hold the read end a moment longer;
+/// the handshake's later read then meets the EOF instead, which is the same
+/// death. The pipe-level test below pins that the write side is a hang-up.)
 #[tokio::test]
 async fn a_harness_that_hangs_up_mid_handshake_reads_as_its_death() {
     let (adapter, _dir) = adapter_for(&basic_turn(), &[("HORDE_CODEX_STUB_DIE", "hangup")]);
@@ -1276,7 +1279,13 @@ async fn each_forced_death_order_is_met_where_it_says() {
         matches!(read, Ok(Some(_))),
         "hangup answers first: {read:?}"
     );
-    let refused = hangup.write_line(initialize).await;
+    // Bounded repeats, not one write: a sibling test's spawn can briefly
+    // hold the read end too (see `support::first_refusal`).
+    let refused = within(
+        "the hang-up is met",
+        crate::support::first_refusal(async || hangup.write_line(initialize).await),
+    )
+    .await;
     assert!(
         matches!(refused, Err(SupervisorError::HungUp)),
         "then the next write meets the closed stdin: {refused:?}"

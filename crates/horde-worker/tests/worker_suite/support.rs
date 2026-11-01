@@ -63,6 +63,38 @@ pub(crate) async fn within<F: std::future::Future>(what: &str, future: F) -> F::
     }
 }
 
+/// Repeats `write` until it is refused and returns the refusal, or `Ok(())`
+/// if every one of a bounded number of attempts landed.
+///
+/// A child that has closed its stdin is not always the pipe's last reader.
+/// Another test in this process can be mid-spawn at that moment, and the new
+/// process holds a copy of every descriptor the suite has open, including
+/// this child's stdin read end. Close-on-exec drops that copy only when the
+/// exec completes. The same hazard is documented on `StateLock` in
+/// horde-identity. Until then the pipe still has a reader and a write simply
+/// lands. A suite run as one process (plain `cargo test`, `cargo llvm-cov`)
+/// hits that window often. So the hang-up tests write until refused: every
+/// write before the refusal must land, the refusal itself must arrive within
+/// the bound, and the caller asserts what it is. Nothing here accepts a
+/// landed write as the outcome.
+pub(crate) async fn first_refusal<E>(
+    mut write: impl AsyncFnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    for _ in 0..REFUSAL_ATTEMPTS {
+        write().await?;
+        tokio::time::sleep(REFUSAL_PAUSE).await;
+    }
+    Ok(())
+}
+
+/// How many writes [`first_refusal`] spends before giving up: with
+/// [`REFUSAL_PAUSE`] between them, about a second, against a spawn window
+/// that closes in milliseconds.
+const REFUSAL_ATTEMPTS: u32 = 50;
+
+/// The pause between [`first_refusal`]'s attempts.
+const REFUSAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Polls a child's control log, bounded by count, until `expected` holds.
 ///
 /// The predicate is the full expected content rather than "non-empty" because
