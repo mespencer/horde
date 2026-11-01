@@ -2053,14 +2053,9 @@ async fn archiving_a_workspace_agent_gives_its_checkout_back() {
 #[tokio::test]
 async fn finished_retired_tasks_do_not_accumulate() {
     let mut retired = Vec::new();
-    for _ in 0..3 {
-        let task = tokio::spawn(async {});
-        // Finished before the next keep, as a fact rather than a sleep.
-        while !task.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        super::lane::keep(&mut retired, task);
-    }
+    super::lane::keep(&mut retired, finished_task().await);
+    super::lane::keep(&mut retired, finished_task().await);
+    super::lane::keep(&mut retired, finished_task().await);
     assert_eq!(
         retired.len(),
         1,
@@ -2069,9 +2064,16 @@ async fn finished_retired_tasks_do_not_accumulate() {
     super::lane::keep(&mut retired, tokio::spawn(std::future::pending::<()>()));
     super::lane::keep(&mut retired, tokio::spawn(std::future::pending::<()>()));
     assert_eq!(retired.len(), 2, "unfinished tasks are always kept");
-    for task in &retired {
-        task.abort();
+    retired.iter().for_each(tokio::task::JoinHandle::abort);
+}
+
+/// A task that has provably finished — waited for as a fact, not a sleep.
+async fn finished_task() -> tokio::task::JoinHandle<()> {
+    let task = tokio::spawn(async {});
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
     }
+    task
 }
 
 /// A pump around `journal`, for driving
