@@ -155,14 +155,13 @@ impl Adapter for ClaudeAdapter {
         // PROVISIONAL until verified against the live CLI (see the W9a
         // handoff flags). It signs in the Worker-owned config directory the
         // agents run under (ADR-0010), not the operator's own.
-        Some(
+        Some(self.profile.signing_in(
             horde_adapter::LoginRecipe::terminal_only(
                 self.program.clone(),
                 vec!["login".to_owned()],
-            )
-            .with_env(self.profile.login_env(CONFIG_ENV_VAR))
-            .with_accounts(CONFIG_ENV_VAR, self.profile.root()),
-        )
+            ),
+            CONFIG_ENV_VAR,
+        ))
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {

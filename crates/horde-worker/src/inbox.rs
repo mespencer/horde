@@ -209,23 +209,24 @@ fn inbox_rows(
                  ORDER BY ordinal",
         )
         .map_err(read_error)?;
-    let rows = statement
+    let stored: Vec<(String, String, Vec<u8>)> = statement
         .query_map(params![agent], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get("command_id")?,
+                row.get("lane")?,
+                row.get("command")?,
             ))
         })
+        .and_then(Iterator::collect)
         .map_err(read_error)?;
-    let mut entries = Vec::new();
-    for row in rows {
-        let (command_id, lane, encoded) = row.map_err(read_error)?;
-        let command = StreamCommandsResponse::decode(encoded.as_slice())
-            .map_err(|source| WorkerError::CorruptInboxEntry { command_id, source })?;
-        entries.push(InboxEntry { lane, command });
-    }
-    Ok(entries)
+    stored
+        .into_iter()
+        .map(|(command_id, lane, encoded)| {
+            StreamCommandsResponse::decode(encoded.as_slice())
+                .map(|command| InboxEntry { lane, command })
+                .map_err(|source| WorkerError::CorruptInboxEntry { command_id, source })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -352,14 +353,22 @@ mod tests {
 
         accepted(&journal, 5, "a2").await;
         complete(&journal, "c5", InboxDisposition::Settle).await;
-        let left: Vec<String> = journal
+        assert_eq!(
+            replayed_ids(&journal).await,
+            vec!["c3".to_owned()],
+            "a settled command is gone"
+        );
+    }
+
+    /// The command ids a replay would run, in order.
+    async fn replayed_ids(journal: &Journal) -> Vec<String> {
+        journal
             .replay_inbox()
             .await
             .expect("readable")
             .into_iter()
             .map(|entry| entry.command.command_id)
-            .collect();
-        assert_eq!(left, vec!["c3".to_owned()], "a settled command is gone");
+            .collect()
     }
 
     /// A replay hands every row back unhanded, in acceptance order: after a
@@ -406,14 +415,7 @@ mod tests {
             .await
             .expect("the forget completes");
 
-        let left: Vec<String> = journal
-            .replay_inbox()
-            .await
-            .expect("readable")
-            .into_iter()
-            .map(|entry| entry.command.command_id)
-            .collect();
-        assert_eq!(left, vec!["c3".to_owned()]);
+        assert_eq!(replayed_ids(&journal).await, vec!["c3".to_owned()]);
     }
 
     /// A row this Worker wrote that no longer decodes is named, not skipped.

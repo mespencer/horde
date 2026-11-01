@@ -284,15 +284,11 @@ impl Adapter for CodexAdapter {
         // live CLI (see the W9a handoff flags).
         // It signs in the Worker-owned CODEX_HOME the agents run under
         // (ADR-0010), not the operator's own.
-        Some(
-            horde_adapter::LoginRecipe::with_callback(
-                self.program.clone(),
-                vec!["login".to_owned()],
-                1455,
-            )
-            .with_env(self.profile.login_env(CONFIG_ENV_VAR))
-            .with_accounts(CONFIG_ENV_VAR, self.profile.root()),
-        )
+        let login = vec!["login".to_owned()];
+        Some(self.profile.signing_in(
+            horde_adapter::LoginRecipe::with_callback(self.program.clone(), login, 1455),
+            CONFIG_ENV_VAR,
+        ))
     }
 
     async fn spawn(&self, spec: &AgentSpec) -> Result<Box<dyn AgentSession>> {

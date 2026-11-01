@@ -174,13 +174,27 @@ impl HarnessProfile {
         })
     }
 
-    /// The environment a login command needs to sign in the directory an
+    /// `recipe`, made to sign in this profile: by default the directory an
     /// account-less agent runs under — without it, `claude login` would sign
-    /// in the operator's own directory and every agent would stay logged out.
+    /// in the operator's own directory and every agent would stay logged out
+    /// — and, for a login naming an account, that account's directory.
     ///
     /// Infallible on purpose: the directory is prepared owner-only when it
     /// can be, and when it cannot the login command still gets the path (and
     /// creates it, or fails loudly in the operator's terminal).
+    #[must_use]
+    pub fn signing_in(
+        &self,
+        recipe: horde_adapter::LoginRecipe,
+        config_env_var: &str,
+    ) -> horde_adapter::LoginRecipe {
+        recipe
+            .with_env(self.login_env(config_env_var))
+            .with_accounts(config_env_var, self.root())
+    }
+
+    /// The environment a login command needs to sign in the directory an
+    /// account-less agent runs under (see [`Self::signing_in`]).
     #[must_use]
     pub fn login_env(&self, config_env_var: &str) -> Vec<(String, String)> {
         let dir = self.root.join(DEFAULT_DIR);

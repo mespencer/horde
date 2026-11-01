@@ -705,12 +705,15 @@ mod tests {
         let dispatched = within("the dispatch reaches the lane", lane.recv())
             .await
             .expect("a login request");
-        assert_eq!(dispatched.provider, "fake");
-        assert_eq!((dispatched.cols, dispatched.rows), (80, 24));
         assert_eq!(
-            dispatched.account.as_deref(),
-            Some("work"),
-            "the client's account rides through the relay to the worker"
+            (
+                dispatched.provider.as_str(),
+                dispatched.cols,
+                dispatched.rows,
+                dispatched.account.as_deref()
+            ),
+            ("fake", 80, 24, Some("work")),
+            "provider, size and the client's account ride through the relay"
         );
 
         let (worker_send, _worker_inbound) = worker_tunnel(

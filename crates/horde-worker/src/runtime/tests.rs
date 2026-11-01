@@ -362,15 +362,54 @@ async fn a_narrowing_decision_is_refused_when_the_adapter_cannot_rewrite() {
 
 /// Whether any journaled event is a harness diagnostic containing `needle`.
 fn diagnostic_saying(events: &[horde_proto::v1::JournaledEvent], needle: &str) -> bool {
+    any_chunk(events, |chunk| {
+        chunk.channel == i32::from(horde_proto::v1::AgentOutputChannel::HarnessDiagnostic)
+            && chunk.text.contains(needle)
+    })
+}
+
+/// Whether any journaled output chunk contains `needle`.
+fn echoed(events: &[horde_proto::v1::JournaledEvent], needle: &str) -> bool {
+    any_chunk(events, |chunk| chunk.text.contains(needle))
+}
+
+/// Whether any journaled output chunk satisfies `accept`.
+fn any_chunk(
+    events: &[horde_proto::v1::JournaledEvent],
+    accept: impl Fn(&horde_proto::v1::AgentOutputChunk) -> bool,
+) -> bool {
     events.iter().any(|journaled| {
         matches!(
             journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-            Some(Kind::AgentOutputChunk(chunk))
-                if chunk.channel
-                    == i32::from(horde_proto::v1::AgentOutputChannel::HarnessDiagnostic)
-                    && chunk.text.contains(needle)
+            Some(Kind::AgentOutputChunk(chunk)) if accept(chunk)
         )
     })
+}
+
+/// Spawns `agent-1` and waits until its turn is parked on a permission
+/// request — the preamble the decision and held-message tests share.
+async fn spawned_awaiting_permission(runtime: &mut Runtime) {
+    runtime
+        .apply(spawn_command(1, "agent-1", "go"))
+        .await
+        .expect("the spawn applies");
+    journal_satisfying(runtime, "the permission request", |events| {
+        kinds(events).contains(&"permission-requested")
+    })
+    .await;
+}
+
+/// The first journaled event, which must be a workspace instance report.
+async fn first_instance_report(runtime: &Runtime) -> horde_proto::v1::WorkspaceInstanceReport {
+    let events = journal_at_least(runtime, 1).await;
+    match events[0]
+        .event
+        .as_ref()
+        .and_then(|event| event.kind.as_ref())
+    {
+        Some(Kind::WorkspaceInstanceChanged(changed)) => changed.report.clone().expect("a report"),
+        other => panic!("expected a workspace instance report, got {other:?}"),
+    }
 }
 
 /// A decision missing its request id cannot be applied, and is journaled
@@ -379,14 +418,7 @@ fn diagnostic_saying(events: &[horde_proto::v1::JournaledEvent], needle: &str) -
 #[tokio::test]
 async fn a_malformed_command_is_journaled_against_its_agent() {
     let mut runtime = runtime_with(asking_permission());
-    runtime
-        .apply(spawn_command(1, "agent-1", "go"))
-        .await
-        .expect("the spawn applies");
-    journal_satisfying(&runtime, "the permission request", |events| {
-        kinds(events).contains(&"permission-requested")
-    })
-    .await;
+    spawned_awaiting_permission(&mut runtime).await;
 
     let mut malformed = decision_command(2, "agent-1", "call-1", None);
     if let Some(Command::DeliverPermissionDecision(deliver)) = &mut malformed.command
@@ -732,12 +764,7 @@ async fn a_message_to_a_harness_that_died_idle_reaches_its_revival() {
         .expect("the delivery applies");
 
     let events = journal_satisfying(&runtime, "the revived turn", |events| {
-        events.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("back from the dead")
-            )
-        })
+        echoed(events, "back from the dead")
     })
     .await;
     assert!(
@@ -771,14 +798,7 @@ async fn a_held_message_survives_a_worker_restart() {
                 input: json!({ "command": "ls" }),
             }),
         ]))));
-    runtime
-        .apply(spawn_command(1, "agent-1", "go"))
-        .await
-        .expect("the spawn applies");
-    journal_satisfying(&runtime, "the permission request", |events| {
-        kinds(events).contains(&"permission-requested")
-    })
-    .await;
+    spawned_awaiting_permission(&mut runtime).await;
     runtime
         .apply(note_command(2, "held for the boundary"))
         .await
@@ -803,12 +823,7 @@ async fn a_held_message_survives_a_worker_restart() {
     assert_eq!(second.replay_inbox().await.expect("replays"), 1);
     assert_eq!(second.replay_inbox().await.expect("idempotent"), 0);
     journal_satisfying(&second, "the held message's echo", |events| {
-        events.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("held for the boundary")
-            )
-        })
+        echoed(events, "held for the boundary")
     })
     .await;
     second.shutdown().await;
@@ -1343,26 +1358,16 @@ async fn materialize_workspace_is_refused_loudly() {
         .apply(command)
         .await
         .expect("an unsupported command is not fatal to the Worker");
-    let events = journal_at_least(&runtime, 1).await;
-    match events[0]
-        .event
-        .as_ref()
-        .and_then(|event| event.kind.as_ref())
-    {
-        Some(Kind::WorkspaceInstanceChanged(changed)) => {
-            let report = changed.report.as_ref().expect("a report");
-            assert_eq!(
-                report.state,
-                horde_proto::v1::WorkspaceInstanceState::Degraded as i32
-            );
-            assert!(
-                report.detail.contains("materialize workspace"),
-                "the report names what this worker cannot do: {}",
-                report.detail
-            );
-        }
-        other => panic!("expected a degraded instance report, got {other:?}"),
-    }
+    let report = first_instance_report(&runtime).await;
+    assert_eq!(
+        report.state,
+        horde_proto::v1::WorkspaceInstanceState::Degraded as i32
+    );
+    assert!(
+        report.detail.contains("materialize workspace"),
+        "the report names what this worker cannot do: {}",
+        report.detail
+    );
 }
 
 /// A materialize command missing what the protocol requires cannot be
@@ -1485,23 +1490,13 @@ async fn a_materialize_then_spawn_runs_the_agent_in_its_checkout() {
     let (_temp, workspaces_root, mut runtime) =
         materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
 
-    let events = journal_at_least(&runtime, 1).await;
-    match events[0]
-        .event
-        .as_ref()
-        .and_then(|event| event.kind.as_ref())
-    {
-        Some(Kind::WorkspaceInstanceChanged(changed)) => {
-            let report = changed.report.as_ref().expect("a report");
-            assert_eq!(
-                report.state,
-                horde_proto::v1::WorkspaceInstanceState::Ready as i32,
-                "detail: {}",
-                report.detail
-            );
-        }
-        other => panic!("expected a workspace instance report, got {other:?}"),
-    }
+    let report = first_instance_report(&runtime).await;
+    assert_eq!(
+        report.state,
+        horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+        "detail: {}",
+        report.detail
+    );
 
     let spawn = workspace_spawn(2, "agent-1", "ws-1");
     runtime.apply(spawn).await.expect("the spawn applies");
@@ -1920,12 +1915,7 @@ async fn a_slow_materialize_blocks_only_what_depends_on_it() {
         .expect("accepted");
 
     let events = journal_satisfying(&runtime, "agent-b's message echoed", |events| {
-        events.iter().any(|journaled| {
-            matches!(
-                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-                Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("right behind the spawn")
-            )
-        })
+        echoed(events, "right behind the spawn")
     })
     .await;
     let about = |agent: &str| {
