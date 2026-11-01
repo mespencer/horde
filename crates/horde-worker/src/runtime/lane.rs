@@ -54,7 +54,7 @@ pub(super) enum LaneMessage {
     /// A command to run, after `after` resolves when it is set — the fence
     /// a spawn waits on so a materialize dispatched before it finishes first.
     Command {
-        command: StreamCommandsResponse,
+        command: Box<StreamCommandsResponse>,
         after: Option<oneshot::Receiver<()>>,
     },
     /// Answer once everything sent to this lane before has run.
@@ -278,7 +278,7 @@ impl Lane {
                 if let Some(after) = after {
                     let _ = after.await;
                 }
-                let forgotten = self.run_command(command).await;
+                let forgotten = self.run_command(*command).await;
                 self.ledger.completed();
                 forgotten
             }
@@ -943,10 +943,10 @@ impl Lane {
         if let Some(agent) = self.agent.take() {
             reaped += 1;
             drop(agent.control);
-            if let Some(pump) = agent.pump {
-                if let Err(error) = pump.await {
-                    tracing::warn!(%error, "an agent pump ended abnormally during shutdown");
-                }
+            if let Some(pump) = agent.pump
+                && let Err(error) = pump.await
+            {
+                tracing::warn!(%error, "an agent pump ended abnormally during shutdown");
             }
             self.ledger.running().remove(&self.key);
         }

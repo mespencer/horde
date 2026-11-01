@@ -236,7 +236,13 @@ impl Runtime {
     fn dispatch(&mut self, lane: String, command: StreamCommandsResponse) {
         let after = self.fence_for(&command);
         self.ledger.dispatched();
-        self.send(lane, LaneMessage::Command { command, after });
+        self.send(
+            lane,
+            LaneMessage::Command {
+                command: Box::new(command),
+                after,
+            },
+        );
     }
 
     /// A fence through the lane of the workspace a spawn names, when that

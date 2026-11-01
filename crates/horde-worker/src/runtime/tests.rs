@@ -1697,7 +1697,7 @@ async fn failed_spawn_reason(runtime: &mut Runtime, command: StreamCommandsRespo
         .apply(command)
         .await
         .expect("the command applies; the agent is what failed");
-    settle(&runtime).await;
+    settle(runtime).await;
 
     assert_eq!(runtime.running_agents(), 0);
     let events = journal_at_least(runtime, 1).await;
