@@ -139,6 +139,7 @@ impl FakeAdapter {
             finished: false,
             misbehaviour: self.script.misbehaviour,
             stall: None,
+            stall_deadline: None,
         }
     }
 }
@@ -245,6 +246,10 @@ struct CurrentTurn {
 /// that starves every clock.
 const EVENT_LOOP_CEILING: u32 = 10_000;
 
+/// Where a stall too long to add to the clock ends instead: far enough to
+/// read as forever to any test, without an overflowing deadline.
+const YEAR: Duration = Duration::from_secs(365 * 24 * 3600);
+
 /// A live scripted agent.
 pub struct FakeSession {
     script: Script,
@@ -282,6 +287,9 @@ pub struct FakeSession {
     /// Set by a `Stall` step; awaited by `next_event`, which is the only async
     /// point in the session.
     stall: Option<Duration>,
+    /// When the standing stall ends, fixed by the first wait on it, so a
+    /// dropped `next_event` neither loses nor restarts it.
+    stall_deadline: Option<tokio::time::Instant>,
 }
 
 impl FakeSession {
@@ -560,6 +568,7 @@ impl FakeSession {
         self.steps.clear();
         self.waiting_on = None;
         self.stall = None;
+        self.stall_deadline = None;
         self.pending_call = None;
         // An interrupted call must actually stop: aborting the task drops
         // the HTTP wait, the way killing a real harness would.
@@ -658,8 +667,19 @@ impl AgentSession for FakeSession {
                 });
             }
 
-            if let Some(duration) = self.stall.take() {
-                tokio::time::sleep(duration).await;
+            if let Some(duration) = self.stall {
+                // The deadline is stored, not the remaining sleep: a caller
+                // that polls once and drops this future (a pump peeking for
+                // ready output) must find the stall still standing — and no
+                // longer — when it comes back, exactly as a real harness's
+                // silence does not restart because nobody was listening.
+                let deadline = *self.stall_deadline.get_or_insert_with(|| {
+                    let now = tokio::time::Instant::now();
+                    now.checked_add(duration).unwrap_or(now + YEAR)
+                });
+                tokio::time::sleep_until(deadline).await;
+                self.stall = None;
+                self.stall_deadline = None;
                 continue;
             }
 
@@ -1741,6 +1761,57 @@ mod stall_tests {
         assert!(
             !seen.iter().any(is_the_step_behind_the_stall),
             "the step behind the stall was played before the stall elapsed: {seen:?}"
+        );
+    }
+
+    /// A stall survives a dropped `next_event`: a caller that polls once and
+    /// gives up (the Worker's pump peeking for ready output) finds it still
+    /// standing — and ending at its original deadline, not restarted and not
+    /// skipped — when it comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_survives_a_dropped_wait_and_keeps_its_deadline() {
+        let mut session = started(Script::of(vec![ScriptedTurn {
+            steps: vec![
+                Step::Stall(Duration::from_secs(10)),
+                Step::Say("after the stall".to_owned()),
+            ],
+            ..ScriptedTurn::saying("done")
+        }]))
+        .await;
+        let began = tokio::time::Instant::now();
+        let mut said = Vec::new();
+        // Take what is ready ahead of the stall; the first poll that is not
+        // ready is the one dropped mid-stall.
+        let mut reached_the_stall = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(Duration::ZERO, session.next_event()).await {
+                Ok(Ok(Some(AgentEvent::Output { text, .. }))) => said.push(text),
+                Ok(_) => {}
+                Err(_not_ready) => {
+                    reached_the_stall = true;
+                    break;
+                }
+            }
+        }
+        assert!(reached_the_stall, "the stall holds: {said:?}");
+        assert!(!said.iter().any(|text| text == "after the stall"));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        while let Ok(Some(event)) = session.next_event().await {
+            if let AgentEvent::Output { text, .. } = event {
+                if text == "after the stall" {
+                    assert_eq!(
+                        began.elapsed(),
+                        Duration::from_secs(10),
+                        "the stall ends at its first deadline"
+                    );
+                }
+                said.push(text);
+            }
+        }
+        assert!(
+            said.iter().any(|text| text == "after the stall"),
+            "{said:?}"
         );
     }
 
