@@ -32,6 +32,11 @@
 //! * `HORDE_CODEX_STUB_MUTE=1` — read (and log) everything, answer nothing:
 //!   the wedged harness whose silence the adapter's response ceiling exists
 //!   to bound.
+//! * `HORDE_CODEX_STUB_DIE` — read the first request, then exit nonzero.
+//!   `eof` leaves it unanswered, so the client's read sees EOF; `hangup`
+//!   closes stdin first and then answers it, so the client's next write is
+//!   guaranteed EPIPE. The two orders a mid-handshake death can take, each
+//!   forced rather than left to the scheduler. No script needed.
 //!
 //! The decision logic is pure and unit-tested in this file; only `main`,
 //! `run`, and the two byte-shovels touch real stdio.
@@ -45,10 +50,33 @@ fn main() -> std::process::ExitCode {
         println!("{version}");
         return std::process::ExitCode::SUCCESS;
     }
+    if let Ok(death) = std::env::var("HORDE_CODEX_STUB_DIE") {
+        return die_mid_handshake(death == "hangup");
+    }
     let Some(contents) = script() else {
         return std::process::ExitCode::FAILURE;
     };
     run(&blocks(&contents), &StubConfig::from_env())
+}
+
+/// Dies after the client's first request, in the order a test asked for.
+///
+/// Reading that request first is what makes the order certain: the client's
+/// write has landed before anything closes. Then either the stub exits with
+/// the request unanswered (the client's next read sees EOF), or it closes
+/// stdin *before* answering — so a client that has read the answer is
+/// guaranteed that its next write meets EPIPE.
+fn die_mid_handshake(hang_up: bool) -> std::process::ExitCode {
+    let stdin = std::io::stdin();
+    let message = next_message(&mut stdin.lock());
+    if hang_up {
+        let _ = nix::unistd::close(0);
+        if let Some(reply) = message.and_then(|m| reply_for(&m, &StubConfig::default())) {
+            emit(&reply.line);
+        }
+    }
+    eprintln!("the stub died mid-handshake, as HORDE_CODEX_STUB_DIE told it to");
+    std::process::ExitCode::FAILURE
 }
 
 /// The script this run replays, or `None` having said why on stderr.
