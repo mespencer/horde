@@ -123,3 +123,23 @@ Consequences of the ruling, recorded while they are fresh:
 Still open after this amendment: secrets in journaled stdio `env`,
 multiplexing under concurrency (unchanged risk, now with the forwarding hop
 in front of the one shared upstream session), and `tools/list_changed`.
+
+## Amendment (2026-10-31): one name per Horde tool in the permission chain
+
+Each harness spells a Horde-served tool its own way, and that does not
+change: Claude Code sees and sends `mcp__horde__<tool>`, while codex (and
+every elicitation the worker raises) uses `horde/<tool>`. Hub tools ride the
+same prefix (`horde/github__create_issue`). Before this amendment the
+chain's deterministic rules matched tool names exactly. A rule written as
+`horde/report_result` therefore never covered a Claude agent, and an
+operator would have to write every Horde rule twice. Only the shipped
+orchestrator-verb predicate had a private list of both prefixes.
+
+The canonical internal name is `horde/<tool>`, mapped per harness in one
+place: `horde_mcp::endpoint::{horde_tool, canonical_tool_name}`. Rules
+compare both the selector and the call in canonical form, and the
+orchestrator verbs read the verb through `horde_tool`. Names that are not
+Horde's (`Bash`, another server's `mcp__other__x`) still compare exactly.
+What each harness sees and sends, what the journal records, and what an
+approver reads are all unchanged. So one rule, in either spelling, now
+covers both harnesses.

@@ -269,19 +269,13 @@ async fn horde_up_stands_up_this_machine_and_tears_it_down() {
     let (status, _, stderr) = up.wait().await.expect("up exits");
     assert!(status.success(), "a torn-down up exits cleanly: {stderr}");
 
-    // ...and the server it started is gone with it: the port stops
-    // answering. Polled bounded, because the OS reaps at its own pace.
-    let addr = endpoint
-        .strip_prefix("https://")
-        .expect("an https endpoint")
-        .to_owned();
-    let mut silent = false;
-    for _ in 0_u32..100 {
-        if tokio::net::TcpStream::connect(&addr).await.is_err() {
-            silent = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // ...and the daemons it started are gone with it: `up` waits on each
+    // child before exiting, and a dead process holds no state lock — the
+    // fact the OS keeps, rather than a port that may or may not answer.
+    for (state, lock) in [("server", "server.lock"), ("worker", "worker.lock")] {
+        assert!(
+            !horde_identity::StateLock::is_held(&root.path().join(state), lock),
+            "the {state} up started must die with it"
+        );
     }
-    assert!(silent, "the server up started must die with it: {addr}");
 }

@@ -63,6 +63,14 @@ pub enum SupervisorError {
     Exited {
         code: Option<i32>,
     },
+    /// The child closed its stdin while the supervisor was writing to it.
+    ///
+    /// The write-side face of a death: a child that exits closes both pipes,
+    /// and whether the supervisor's next write (EPIPE) or its next read (EOF)
+    /// notices first is the scheduler's choice. Kept apart from [`Self::Io`]
+    /// so an adapter reports it as the harness's death, exactly as it does
+    /// EOF, and never as a protocol accident.
+    HungUp,
 }
 
 impl core::fmt::Display for SupervisorError {
@@ -75,6 +83,7 @@ impl core::fmt::Display for SupervisorError {
                 Some(code) => write!(f, "the harness exited with status {code}"),
                 None => write!(f, "the harness exited without a status"),
             },
+            Self::HungUp => write!(f, "the harness closed its stdin"),
         }
     }
 }
@@ -286,11 +295,20 @@ impl SupervisedHarness {
     }
 
     /// Writes one protocol line to the harness.
+    ///
+    /// # Errors
+    ///
+    /// [`SupervisorError::HungUp`] when the child has closed its stdin — a
+    /// dead child, seen from the write side — and [`SupervisorError::Io`]
+    /// for any other failure.
     pub async fn write_line(&mut self, line: &str) -> Result<(), SupervisorError> {
+        self.write_raw(line).await.map_err(write_failure)
+    }
+
+    async fn write_raw(&mut self, line: &str) -> std::io::Result<()> {
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
-        Ok(())
+        self.stdin.flush().await
     }
 
     /// Reads one protocol line, or `None` at EOF.
@@ -418,6 +436,16 @@ impl Drop for SupervisedHarness {
     }
 }
 
+/// Classifies a failed write: EPIPE means nobody holds the child's stdin any
+/// more, which for a harness is its death; anything else is plain I/O.
+fn write_failure(source: std::io::Error) -> SupervisorError {
+    if source.kind() == std::io::ErrorKind::BrokenPipe {
+        SupervisorError::HungUp
+    } else {
+        SupervisorError::Io(source)
+    }
+}
+
 /// Appends one stderr line to a bounded tail, dropping the oldest.
 fn keep_tail(tail: &mut VecDeque<String>, mut line: String) {
     // The longest char-boundary prefix within the bound (a short line is
@@ -529,6 +557,7 @@ mod tests {
 
     use super::{
         Leftover, STDERR_LINE_BYTES, STDERR_LINES, SupervisorError, classify, group_pid, keep_tail,
+        write_failure,
     };
 
     /// The messages an operator reads when a harness will not start.
@@ -565,6 +594,27 @@ mod tests {
                 .to_string()
                 .contains("pipe broke")
         );
+
+        assert!(
+            SupervisorError::HungUp
+                .to_string()
+                .contains("closed its stdin"),
+            "a hang-up names which pipe the child let go of"
+        );
+    }
+
+    /// EPIPE is the child's death seen from the write side; every other
+    /// write failure stays plain I/O.
+    #[test]
+    fn a_broken_pipe_is_a_hang_up_and_nothing_else_is() {
+        assert!(matches!(
+            write_failure(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            SupervisorError::HungUp
+        ));
+        assert!(matches!(
+            write_failure(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            SupervisorError::Io(_)
+        ));
     }
 
     /// The stderr tail keeps the newest lines and never grows past its bound.

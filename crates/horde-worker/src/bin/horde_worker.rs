@@ -13,10 +13,21 @@ use horde_worker::startup;
 fn main() -> ExitCode {
     // A `String` error is a startup refusal, printed before any subscriber
     // exists to log it.
-    let outcome = startup::invocation(std::env::args().skip(1)).and_then(|config| {
-        startup::with_observability(&config.state_dir, |runtime| {
-            runtime.block_on(serve_until_terminated(&config))
-        })
+    let parsed = horde_worker::flags::parse(
+        std::env::args().skip(1),
+        |name| std::env::var(name).ok(),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+    );
+    let outcome = parsed.and_then(|parsed| match parsed {
+        horde_worker::flags::Parsed::Print(text) => {
+            print!("{text}");
+            Ok(ExitCode::SUCCESS)
+        }
+        horde_worker::flags::Parsed::Run(config) => {
+            startup::with_observability(&config.state_dir, |runtime| {
+                runtime.block_on(serve_until_terminated(&config))
+            })
+        }
     });
     outcome.unwrap_or_else(|refusal| {
         eprintln!("{refusal}");

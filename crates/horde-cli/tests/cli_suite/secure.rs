@@ -23,6 +23,111 @@ async fn invoke(args: &[&str]) -> Setup<()> {
     Ok(())
 }
 
+/// A TLS failure is diagnosed from its source chain (ADR-0007, 2026-10-31
+/// amendment): an identity from another server's CA names that cause, not
+/// a bare `transport error`. (The other rustls causes are tabled in
+/// `horde_identity::diagnosis`'s own tests.)
+#[tokio::test]
+async fn tls_failures_are_diagnosed_in_plain_words() -> Setup<()> {
+    let serving = serve_secured().await?;
+    let other = serve_secured().await?;
+    let identity_dir = tempfile::tempdir()?;
+    let foreign = identity_dir.path().join("foreign");
+    other
+        .enroll(PrincipalRole::Client, "laptop")
+        .await?
+        .save(&foreign)?;
+    let refused = invoke(&[
+        "--identity",
+        &foreign.to_string_lossy(),
+        "--endpoint",
+        &serving.main_endpoint(),
+        "hello",
+    ])
+    .await
+    .expect_err("an identity from another CA must not connect");
+    let refusal = refused.to_string();
+    let cli_error = refused
+        .downcast_ref::<horde_cli::ClientError>()
+        .ok_or("a client error")?;
+    assert!(
+        cli_error
+            .report()
+            .contains("hint: the server's certificate was not issued by the CA"),
+        "{refusal}: {}",
+        cli_error.report()
+    );
+    Ok(())
+}
+
+/// Re-joining over an existing identity refuses without `--force`
+/// (spending no code), and with it backs the old identity up first.
+#[tokio::test]
+async fn a_rejoin_needs_force_and_keeps_a_backup() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let root = tempfile::tempdir()?;
+    let identity_path = root.path().join("id");
+    let principal = horde_identity::Principal::new(PrincipalRole::Client, "laptop")?;
+    let mint = || async {
+        harness
+            .authority
+            .mint(
+                &principal,
+                0,
+                horde_server::service::enrollment::wall_clock_ms(),
+            )
+            .await
+            .map(|minted| harness.join_token(&minted).to_string())
+    };
+    let first = mint().await?;
+    invoke(&[
+        "--identity",
+        &identity_path.to_string_lossy(),
+        "enroll",
+        "join",
+        &first,
+    ])
+    .await?;
+
+    let second = mint().await?;
+    let refused = invoke(&[
+        "--identity",
+        &identity_path.to_string_lossy(),
+        "enroll",
+        "join",
+        &second,
+    ])
+    .await
+    .expect_err("an existing identity is not replaced silently");
+    assert!(refused.to_string().contains("--force"), "{refused}");
+
+    let token_file = root.path().join("token");
+    std::fs::write(&token_file, format!("{second}\n"))?;
+    invoke(&[
+        "--identity",
+        &identity_path.to_string_lossy(),
+        "enroll",
+        "join",
+        "--token-file",
+        &token_file.to_string_lossy(),
+        "--force",
+    ])
+    .await?;
+    let backups: Vec<_> = std::fs::read_dir(root.path())?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("id.backup-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "one backup of the replaced identity");
+    assert!(horde_identity::StoredIdentity::exists(&backups[0].path()));
+    assert!(horde_identity::StoredIdentity::exists(&identity_path));
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_join_stores_an_identity_that_opens_the_control_plane() -> Setup<()> {
     let harness = serve_secured().await?;

@@ -12,10 +12,10 @@ use horde_proto::v1::{DeliveryMode, PermissionOutcome};
 use crate::client::{PermissionAnswer, SyncOptions};
 use crate::{Client, ClientError, Format, render};
 
-/// The last-resort plaintext endpoint, used only when no identity exists
-/// anywhere (ADR-0007): a machine that has joined a server never needs it,
-/// and against a secured server it could never connect.
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7777";
+/// The ambient join token `enroll join` reads when neither a token nor
+/// `--token-file` is given — argv is visible to every user on a machine,
+/// the environment and a file are not.
+pub const JOIN_TOKEN_VAR: &str = "HORDE_JOIN_TOKEN";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -332,10 +332,21 @@ pub enum EnrollCommand {
     /// enrollment listener and the server fingerprint this machine pins —
     /// nothing else is trusted yet — and the join stores the server's
     /// endpoint beside the credential, so later invocations need no flag.
+    ///
+    /// An existing identity is never replaced silently: `--force` moves it
+    /// aside to `<dir>.backup-<unix-time>` first.
     Join {
         /// The token exactly as the server printed it:
-        /// `horde://join/<host:port>/<secret>.<fingerprint>`.
-        token: String,
+        /// `horde://join/<host:port>/<secret>.<fingerprint>`. Absent, it is
+        /// read from `--token-file`, then `HORDE_JOIN_TOKEN` — both keep
+        /// the secret out of the process list.
+        token: Option<String>,
+        /// A file holding the token.
+        #[arg(long, conflicts_with = "token")]
+        token_file: Option<std::path::PathBuf>,
+        /// Replace an existing identity (it is backed up first).
+        #[arg(long)]
+        force: bool,
     },
     /// Mint a one-time enrollment code for another client machine.
     Client {
@@ -742,13 +753,23 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     // The one verb that must work *before* any identity exists: joining is
     // how this machine gets one, so it dials the enrollment listener rather
     // than the control plane.
-    if let Some(Command::Enroll(EnrollCommand::Join { token })) = &cli.command {
-        return run_join(cli, token, format).await;
+    if let Some(Command::Enroll(EnrollCommand::Join {
+        token,
+        token_file,
+        force,
+    })) = &cli.command
+    {
+        let text = join_token_text(
+            token.as_deref(),
+            token_file.as_deref(),
+            std::env::var(JOIN_TOKEN_VAR).ok(),
+        )?;
+        return run_join(cli, &text, *force, format).await;
     }
     // `up` orchestrates its own enrollments and connections, starting from
     // a machine that may hold nothing yet.
     if let Some(Command::Up(args)) = &cli.command {
-        return crate::up::run(args).await;
+        return crate::up::run(args, cli.identity.as_deref()).await;
     }
 
     let resolved = resolve_connection(
@@ -880,15 +901,15 @@ pub struct ResolvedConnection {
 ///
 /// Endpoint precedence: explicit flag, then environment (clap merges those
 /// two before this runs), then the endpoint the identity dir stored at
-/// join. The plaintext localhost default survives only as the last resort
-/// for a machine with no identity at all — an enrolled machine with no
-/// endpoint from any source is a refusal that says where endpoints come
-/// from, because the old always-there default could never connect to the
-/// server it implied.
+/// join. There is no default: the old plaintext `http://127.0.0.1:7777`
+/// could never connect to the secured server it implied (ADR-0007,
+/// 2026-10-31 amendment). No endpoint from any source is a refusal — for
+/// an enrolled machine, one that says where endpoints come from; for a
+/// machine with nothing, one that says how to get a server at all.
 ///
 /// # Errors
 ///
-/// The enrolled-but-endpointless refusal.
+/// The enrolled-but-endpointless refusal, or the no-server refusal.
 pub fn resolve_connection(
     endpoint: Option<&str>,
     identity: Option<&std::path::Path>,
@@ -905,7 +926,11 @@ pub fn resolve_connection(
                     directory: identity_dir,
                 });
             }
-            None => DEFAULT_ENDPOINT.to_owned(),
+            None => {
+                return Err(ClientError::NoServer {
+                    directory: identity_dir,
+                });
+            }
         },
     };
     Ok(ResolvedConnection {
@@ -1020,6 +1045,34 @@ pub fn token_from_mint(
     ))
 }
 
+/// A mint answer rendered for the operator, refused when the token would
+/// name the unspecified address (ADR-0007, 2026-10-31 amendment): a token
+/// for `0.0.0.0` names no listener any machine can dial, and printing it
+/// would only defer the failure to the joiner. A loopback token prints,
+/// with the render's local-only note.
+///
+/// # Errors
+///
+/// The unspecified-host refusal.
+pub fn minted_line(
+    dialed_endpoint: &str,
+    minted: &horde_proto::v1::MintEnrollmentCodeResponse,
+    format: Format,
+) -> Result<String, ClientError> {
+    let token = token_from_mint(dialed_endpoint, minted);
+    if let Some(token) = &token
+        && token.scope() == horde_identity::HostScope::Unspecified
+    {
+        return Err(ClientError::Enrollment(format!(
+            "this invocation dialed {dialed_endpoint}, so the token would name {}, which no \
+             machine can dial; mint through the server's real name (--endpoint \
+             https://<host>:<port>)",
+            token.host()
+        )));
+    }
+    Ok(render::minted(minted, token.as_ref(), format))
+}
+
 /// The principal held by `--identity`'s directory, as its common name
 /// (`client:laptop`), for stamping telemetry with who this invocation is.
 ///
@@ -1059,18 +1112,92 @@ pub(crate) async fn redeem_client_token(
     .map_err(|error| ClientError::Enrollment(error.to_string()))
 }
 
-async fn run_join(cli: &Cli, token: &str, format: Format) -> Result<(), ClientError> {
+/// The join token's text, by precedence: the argument, then `--token-file`,
+/// then the ambient `HORDE_JOIN_TOKEN` (ADR-0007, 2026-10-31 amendment).
+///
+/// # Errors
+///
+/// An unreadable token file, or no token from any source.
+pub fn join_token_text(
+    argument: Option<&str>,
+    file: Option<&std::path::Path>,
+    ambient: Option<String>,
+) -> Result<String, ClientError> {
+    if let Some(token) = argument {
+        return Ok(token.to_owned());
+    }
+    if let Some(path) = file {
+        return std::fs::read_to_string(path)
+            .map(|text| text.trim().to_owned())
+            .map_err(|source| ClientError::File {
+                path: path.to_owned(),
+                source,
+            });
+    }
+    ambient
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            ClientError::Enrollment(format!(
+                "no join token: pass it, --token-file <path>, or set {JOIN_TOKEN_VAR}"
+            ))
+        })
+}
+
+/// The pre-dial checks a join makes, so a refusal never spends the
+/// one-time code: an existing identity is replaced only under `--force`,
+/// and a token naming the unspecified address is no server to remember.
+///
+/// # Errors
+///
+/// Either refusal, naming the fix.
+fn join_preflight(
+    token: &horde_identity::JoinToken,
+    directory: &std::path::Path,
+    force: bool,
+) -> Result<(), ClientError> {
+    if horde_identity::StoredIdentity::exists(directory) && !force {
+        return Err(ClientError::Enrollment(format!(
+            "{} already holds an identity; pass --force to replace it (the old one is moved \
+             aside as a timestamped backup), or --identity <dir> to join into another",
+            directory.display()
+        )));
+    }
+    if token.scope() == horde_identity::HostScope::Unspecified {
+        return Err(ClientError::Enrollment(format!(
+            "the token names {}, a bind address no machine can dial; ask for a token minted \
+             through the server's real name or address",
+            token.host()
+        )));
+    }
+    Ok(())
+}
+
+async fn run_join(cli: &Cli, token: &str, force: bool, format: Format) -> Result<(), ClientError> {
     // The token's own parse error names the expected horde://join/… shape:
     // the refusal diagnoses the mistake, not the paste (ADR-0007).
     let token = horde_identity::JoinToken::parse(token)
         .map_err(|error| ClientError::Enrollment(error.to_string()))?;
-
-    let enrolled = redeem_client_token(&token, "horde").await?;
-
     let directory = cli
         .identity
         .clone()
         .unwrap_or_else(|| default_identity_dir(std::env::var_os("HOME").map(Into::into)));
+    join_preflight(&token, &directory, force)?;
+
+    let enrolled = redeem_client_token(&token, "horde").await?;
+
+    // Only now, with a fresh credential in hand, does the old one move.
+    let backup = if horde_identity::StoredIdentity::exists(&directory) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        Some(
+            horde_identity::StoredIdentity::back_up(&directory, now)
+                .map_err(|error| ClientError::Enrollment(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     enrolled
         .identity
         .save(&directory)
@@ -1078,8 +1205,8 @@ async fn run_join(cli: &Cli, token: &str, format: Format) -> Result<(), ClientEr
 
     // The join teaches the machine its server (ADR-0007): the token's host,
     // the answer's control-plane port, stored beside the credential so a
-    // bare `horde hello` works from here on. An answer without the port
-    // (an older server) stores nothing rather than guessing.
+    // bare `horde hello` works from here on. The store validates it first.
+    // An answer without the port (an older server) stores nothing.
     if let Some(port) = enrolled.control_plane_port {
         let endpoint = format!("https://{}:{port}", token.host());
         horde_identity::store::save_endpoint(&directory, &endpoint)
@@ -1088,7 +1215,12 @@ async fn run_join(cli: &Cli, token: &str, format: Format) -> Result<(), ClientEr
 
     println!(
         "{}",
-        render::joined(&enrolled.principal.to_string(), &directory, format)
+        render::joined(
+            &enrolled.principal.to_string(),
+            &directory,
+            backup.as_deref(),
+            format
+        )
     );
     Ok(())
 }
@@ -1334,8 +1466,7 @@ async fn run_worker(
             let minted = client
                 .mint_enrollment_code(horde_proto::v1::Role::Worker, name, *ttl_minutes)
                 .await?;
-            let token = token_from_mint(endpoint, &minted);
-            println!("{}", render::minted(&minted, token.as_ref(), format));
+            println!("{}", minted_line(endpoint, &minted, format)?);
         }
         WorkerCommand::Revoke { name, reason } => {
             let serials = client
@@ -1382,8 +1513,7 @@ async fn run_enroll(
             let minted = client
                 .mint_enrollment_code(horde_proto::v1::Role::Client, name, *ttl_minutes)
                 .await?;
-            let token = token_from_mint(endpoint, &minted);
-            println!("{}", render::minted(&minted, token.as_ref(), format));
+            println!("{}", minted_line(endpoint, &minted, format)?);
             Ok(())
         }
         EnrollCommand::RevokeClient { name, reason } => {
@@ -2503,6 +2633,7 @@ mod enrollment_tests {
     use clap::Parser;
 
     use super::{Cli, Command, EnrollCommand, WorkerCommand, default_identity_dir};
+    use crate::Format;
 
     /// Writes a complete, CA-signed `client:laptop` identity into `dir` —
     /// the production `StoredIdentity` layout, for the tests that need a
@@ -2617,8 +2748,14 @@ mod enrollment_tests {
             Some(std::path::Path::new("/tmp/id"))
         );
         match cli.command {
-            Some(Command::Enroll(EnrollCommand::Join { token })) => {
-                assert_eq!(token, "horde://join/host:7778/s.fp");
+            Some(Command::Enroll(EnrollCommand::Join {
+                token,
+                token_file,
+                force,
+            })) => {
+                assert_eq!(token.as_deref(), Some("horde://join/host:7778/s.fp"));
+                assert_eq!(token_file, None);
+                assert!(!force, "replacing an identity is never the default");
             }
             other => panic!("expected enroll join, got {other:?}"),
         }
@@ -2627,6 +2764,85 @@ mod enrollment_tests {
             Cli::try_parse_from(["horde", "enroll", "join", "https://host:7778", "s.fp"]).is_err(),
             "the old endpoint-and-code pair must be a parse error, not a guess"
         );
+        let from_file = Cli::try_parse_from([
+            "horde",
+            "enroll",
+            "join",
+            "--token-file",
+            "/tmp/t",
+            "--force",
+        ])
+        .expect("a file-sourced forced join parses");
+        assert!(matches!(
+            from_file.command,
+            Some(Command::Enroll(EnrollCommand::Join {
+                token: None,
+                force: true,
+                ..
+            }))
+        ));
+        assert!(
+            Cli::try_parse_from(["horde", "enroll", "join", "t", "--token-file", "/tmp/t"])
+                .is_err(),
+            "one token source at a time"
+        );
+    }
+
+    /// The token by precedence — argument, file, ambient variable — and no
+    /// token from any source is a refusal naming all three.
+    #[test]
+    fn the_join_token_is_argument_then_file_then_environment() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = dir.path().join("token");
+        std::fs::write(&file, "  from-file\n").expect("writes");
+        let env = || Some("from-env".to_owned());
+        assert_eq!(
+            super::join_token_text(Some("arg"), Some(&file), env()).expect("a token"),
+            "arg"
+        );
+        assert_eq!(
+            super::join_token_text(None, Some(&file), env()).expect("a token"),
+            "from-file"
+        );
+        assert_eq!(
+            super::join_token_text(None, None, env()).expect("a token"),
+            "from-env"
+        );
+        let unreadable = super::join_token_text(None, Some(&dir.path().join("nope")), env())
+            .expect_err("an unreadable file refuses");
+        assert!(unreadable.to_string().contains("nope"), "{unreadable}");
+        for nothing in [None, Some("  ".to_owned())] {
+            let refused = super::join_token_text(None, None, nothing).expect_err("no token");
+            let text = refused.to_string();
+            assert!(
+                text.contains("--token-file") && text.contains("HORDE_JOIN_TOKEN"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The pre-dial checks: an existing identity needs `--force`, and a
+    /// token naming the unspecified address is refused — both before the
+    /// one-time code is spent.
+    #[test]
+    fn a_join_preflights_the_existing_identity_and_the_token_host() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let code = horde_identity::JoinCode {
+            secret: "00ff".to_owned(),
+            server_fingerprint: "a".repeat(64),
+        };
+        let routable = horde_identity::JoinToken::new("box.lan:7778", code.clone());
+        let wildcard = horde_identity::JoinToken::new("0.0.0.0:7778", code);
+
+        super::join_preflight(&routable, dir.path(), false).expect("an empty dir joins");
+        let refused = super::join_preflight(&wildcard, dir.path(), false).expect_err("0.0.0.0");
+        assert!(refused.to_string().contains("0.0.0.0"), "{refused}");
+
+        seeded_identity(dir.path());
+        let refused =
+            super::join_preflight(&routable, dir.path(), false).expect_err("needs --force");
+        assert!(refused.to_string().contains("--force"), "{refused}");
+        super::join_preflight(&routable, dir.path(), true).expect("forced");
     }
 
     #[test]
@@ -2662,6 +2878,8 @@ mod enrollment_tests {
             "127.0.0.1:0",
             "--enrollment-bind",
             "127.0.0.1:0",
+            "--san",
+            "box.lan",
         ])
         .expect("a full up line parses");
         let Some(Command::Up(args)) = &cli.command else {
@@ -2675,6 +2893,7 @@ mod enrollment_tests {
         assert_eq!(args.name.as_deref(), Some("den"));
         assert_eq!(args.bind, "127.0.0.1:0");
         assert_eq!(args.enrollment_bind, "127.0.0.1:0");
+        assert_eq!(args.subject_names, vec!["box.lan"]);
 
         let bare = Cli::try_parse_from(["horde", "up"]).expect("bare up parses");
         let Some(Command::Up(args)) = &bare.command else {
@@ -2685,21 +2904,29 @@ mod enrollment_tests {
         assert!(args.adapters.is_empty() && args.state_dir.is_none());
     }
 
-    /// ADR-0007's endpoint precedence, whole: explicit beats stored beats
-    /// the last-resort default, the stored endpoint only exists after a
-    /// join, and an enrolled-but-endpointless invocation is a refusal that
-    /// says where endpoints come from.
+    /// ADR-0007's endpoint precedence, whole: explicit beats stored, the
+    /// stored endpoint only exists after a join, and with no endpoint from
+    /// any source there is no default — a refusal that says where servers
+    /// come from (join or `up`), or where endpoints come from.
     #[test]
-    fn endpoint_resolution_prefers_explicit_then_stored_then_refuses_or_defaults() {
+    fn endpoint_resolution_prefers_explicit_then_stored_then_refuses() {
         let home = tempfile::tempdir().expect("a temp dir");
         let home_path = || Some(home.path().to_path_buf());
         let id_dir = super::default_identity_dir(home_path());
 
-        // No identity anywhere: the plaintext default is the last resort.
-        let fresh = super::resolve_connection(None, None, home_path()).expect("resolves");
-        assert_eq!(fresh.endpoint, "http://127.0.0.1:7777");
-        assert_eq!(fresh.identity_dir, id_dir);
-        assert!(!fresh.enrolled && !fresh.explicit_identity);
+        // Nothing anywhere: no plaintext guess, a refusal naming the fixes.
+        let refused = super::resolve_connection(None, None, home_path())
+            .expect_err("no server from any source");
+        let refusal = refused.to_string();
+        assert!(
+            refusal.contains("horde enroll join") && refusal.contains("horde up"),
+            "{refusal}"
+        );
+        let explicit_plain =
+            super::resolve_connection(Some("http://127.0.0.1:1"), None, home_path())
+                .expect("an explicit plaintext endpoint is still asked-for");
+        assert_eq!(explicit_plain.identity_dir, id_dir);
+        assert!(!explicit_plain.enrolled && !explicit_plain.explicit_identity);
 
         // An explicit endpoint outranks everything, stored included.
         horde_identity::store::save_endpoint(&id_dir, "https://stored:7777").expect("saves");
@@ -2819,6 +3046,29 @@ mod enrollment_tests {
             None,
             "no host means no token"
         );
+
+        // The rendered mint: a wildcard-dialed token is refused, a routable
+        // one prints, a portless answer prints the bare code.
+        let refused = super::minted_line(
+            "https://0.0.0.0:7777",
+            &response(&code, 7778),
+            Format::Human,
+        )
+        .expect_err("0.0.0.0 names no listener anyone can dial");
+        assert!(refused.to_string().contains("0.0.0.0"), "{refused}");
+        let printed = super::minted_line(
+            "https://box.lan:7777",
+            &response(&code, 7778),
+            Format::Human,
+        )
+        .expect("a routable mint prints");
+        assert!(
+            printed.starts_with("token horde://join/box.lan:7778/"),
+            "{printed}"
+        );
+        let bare = super::minted_line("https://box.lan:7777", &response(&code, 0), Format::Human)
+            .expect("a portless mint prints the code");
+        assert!(bare.starts_with("code "), "{bare}");
     }
 
     /// The identity read back for telemetry is the one enrollment wrote: a

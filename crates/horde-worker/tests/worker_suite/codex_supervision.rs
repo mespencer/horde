@@ -1202,15 +1202,14 @@ async fn a_mute_harness_fails_the_spawn_on_the_response_ceiling() {
 
 /// A harness that exits during the handshake reads as its death, not as a
 /// protocol accident — EOF is how a dead child announces itself.
+///
+/// The stub reads `initialize` before it dies, so the adapter's write has
+/// certainly landed and the death is met on the read side, as EOF. Without
+/// that read the order was the scheduler's: under load the child could be
+/// gone before the first write, which then met EPIPE instead.
 #[tokio::test]
 async fn a_harness_that_dies_mid_handshake_reads_as_its_death() {
-    // No script in the environment: the stub prints why to stderr and exits
-    // nonzero, which is exactly a binary that starts and immediately dies.
-    let scratch = tempfile::tempdir().expect("a scratch dir");
-    let adapter = horde_worker::CodexAdapter::new(horde_worker::HarnessProfile::new(
-        scratch.path().join("harness"),
-    ))
-    .with_program(harness::stub_binary().to_string_lossy());
+    let (adapter, _dir) = adapter_for(&basic_turn(), &[("HORDE_CODEX_STUB_DIE", "eof")]);
 
     let error = adapter
         .spawn(&AgentSpec::default())
@@ -1220,6 +1219,67 @@ async fn a_harness_that_dies_mid_handshake_reads_as_its_death() {
     assert!(
         matches!(error, AdapterError::HarnessExited { .. }),
         "EOF during the handshake is the child's death: {error:?}"
+    );
+}
+
+/// The other order: the child lets go of stdin before the adapter's next
+/// write. The stub closes stdin and only then answers `initialize`, so once
+/// the adapter has its answer the `initialized` write is certain to meet
+/// EPIPE — and that is the same death, never "harness io failed".
+#[tokio::test]
+async fn a_harness_that_hangs_up_mid_handshake_reads_as_its_death() {
+    let (adapter, _dir) = adapter_for(&basic_turn(), &[("HORDE_CODEX_STUB_DIE", "hangup")]);
+
+    let error = adapter
+        .spawn(&AgentSpec::default())
+        .await
+        .err()
+        .expect("a dead child must fail the spawn");
+    assert!(
+        matches!(error, AdapterError::HarnessExited { .. }),
+        "EPIPE during the handshake is the child's death: {error:?}"
+    );
+}
+
+/// Each forced order really is the order it names, seen at the pipe: `eof`
+/// is met by the read, `hangup` answers and then refuses the next write.
+/// Without this, the two adapter tests above could swap orders unnoticed —
+/// both end in the same death.
+#[tokio::test]
+async fn each_forced_death_order_is_met_where_it_says() {
+    use horde_worker::{SupervisedHarness, SupervisorError};
+
+    let spawn = |death: &str| {
+        let mut spec =
+            horde_worker::process::HarnessSpec::new(harness::stub_binary().to_string_lossy());
+        spec.env = vec![("HORDE_CODEX_STUB_DIE".to_owned(), death.to_owned())];
+        spec
+    };
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
+    let mut eof = SupervisedHarness::spawn(&spawn("eof"))
+        .await
+        .expect("spawns");
+    eof.write_line(initialize).await.expect("the request lands");
+    let read = within("EOF arrives", eof.read_line()).await;
+    assert!(matches!(read, Ok(None)), "eof answers nothing: {read:?}");
+
+    let mut hangup = SupervisedHarness::spawn(&spawn("hangup"))
+        .await
+        .expect("spawns");
+    hangup
+        .write_line(initialize)
+        .await
+        .expect("the request lands");
+    let read = within("the answer arrives", hangup.read_line()).await;
+    assert!(
+        matches!(read, Ok(Some(_))),
+        "hangup answers first: {read:?}"
+    );
+    let refused = hangup.write_line(initialize).await;
+    assert!(
+        matches!(refused, Err(SupervisorError::HungUp)),
+        "then the next write meets the closed stdin: {refused:?}"
     );
 }
 

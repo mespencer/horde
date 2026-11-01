@@ -17,16 +17,12 @@ use horde_proto::v1::ProposedToolCall;
 
 use crate::state::SessionState;
 
-/// The harness-side spellings of a horde tool: Codex names MCP tools
-/// `server/tool`, Claude Code names them `mcp__server__tool`.
-const PREFIXES: [&str; 2] = ["horde/", "mcp__horde__"];
-
-/// The orchestrator verb a tool name spells, if it spells one.
+/// The orchestrator verb a tool name spells, if it spells one — under
+/// either harness's spelling, which `horde_mcp::endpoint::horde_tool` owns
+/// (ADR-0004, 2026-10-31 amendment).
 #[must_use]
 pub fn orchestrator_verb(tool_name: &str) -> Option<&str> {
-    let verb = PREFIXES
-        .iter()
-        .find_map(|prefix| tool_name.strip_prefix(prefix))?;
+    let verb = horde_mcp::endpoint::horde_tool(tool_name)?;
     matches!(
         verb,
         "spawn_agent" | "report_result" | "send_message" | "wait_for_agent"

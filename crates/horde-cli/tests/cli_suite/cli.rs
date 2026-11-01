@@ -207,6 +207,11 @@ async fn a_server_that_is_not_there_is_reported_as_unreachable() {
         "the message must point at the connection, not at a verb: {:?}",
         run.stderr
     );
+    assert!(
+        run.stderr.contains("hint: nothing is listening"),
+        "the source chain is walked to the cause, in plain words: {:?}",
+        run.stderr
+    );
 }
 
 #[tokio::test]

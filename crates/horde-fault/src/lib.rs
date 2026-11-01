@@ -421,9 +421,7 @@ pub fn fixture_serve_config(
 ) -> Result<horde_server::startup::ServeConfig, String> {
     match horde_server::startup::invocation(arguments)? {
         horde_server::startup::Invocation::Serve(config) => Ok(*config),
-        horde_server::startup::Invocation::CheckOnly { .. } => {
-            Err("this fixture only serves; pass --serve".to_owned())
-        }
+        _ => Err("this fixture only serves; pass --serve".to_owned()),
     }
 }
 
@@ -568,8 +566,9 @@ mod tests {
         assert_eq!(config.enrollment_bind.to_string(), "127.0.0.1:7072");
         assert_eq!(config.state_dir, std::path::PathBuf::from("/tmp/state"));
 
-        let bare = super::fixture_serve_config(["/tmp/x.db".to_owned()].into_iter())
-            .expect_err("the health-check shape is refused");
+        let bare =
+            super::fixture_serve_config(["--check".to_owned(), "/tmp/x.db".to_owned()].into_iter())
+                .expect_err("the health-check shape is refused");
         assert!(bare.contains("--serve"), "the refusal says what to pass");
 
         let wrong = super::fixture_serve_config(["--bogus".to_owned()].into_iter())

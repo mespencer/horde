@@ -41,13 +41,9 @@ async fn main() -> ExitCode {
     let code = match run(&cli, format).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            // An unbuilt verb is a roadmap fact, not a fault. Saying "not built
-            // yet" beats printing a raw status a user would file a bug about.
-            if error.is_unimplemented() {
-                eprintln!("not built yet: {error}");
-            } else {
-                eprintln!("error: {error}");
-            }
+            // Decided in the library (`ClientError::report`), where it is
+            // tested: the refusal, and the diagnosed cause beneath it.
+            eprintln!("{}", error.report());
             ExitCode::FAILURE
         }
     };

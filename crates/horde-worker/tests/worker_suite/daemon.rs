@@ -22,8 +22,8 @@ mod harness {
     /// [`DAEMON`], its first-exec admission paid (`support::admitted_binary`
     /// explains the mechanism): the refusal tests below run the binary under
     /// the suite's 5s ceiling, and a fresh tree's first launch pays macOS
-    /// validation that must not land inside that bound. `--help` is not a
-    /// flag the daemon knows, so the probe refuses and exits at once.
+    /// validation that must not land inside that bound. `--help` prints
+    /// and exits at once.
     pub(crate) fn admitted_daemon() -> &'static str {
         crate::support::admit(std::path::Path::new(DAEMON), &["--help"]);
         DAEMON
@@ -38,6 +38,26 @@ mod harness {
             &[],
         )
         .expect("the daemon spawns")
+    }
+
+    /// A one-time worker join token for `name`, minted by the harness's
+    /// production authority and in the token form a mint prints.
+    pub(crate) async fn worker_token(
+        secured: &horde_server_testkit::secure::SecureHarness,
+        name: &str,
+    ) -> String {
+        let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, name)
+            .expect("a valid name");
+        let minted = secured
+            .authority
+            .mint(
+                &principal,
+                0,
+                horde_server::service::enrollment::wall_clock_ms(),
+            )
+            .await
+            .expect("the code mints");
+        secured.join_token(&minted).to_string()
     }
 
     /// The insecure fake-adapter shape both in-process loop tests drive:
@@ -130,21 +150,9 @@ async fn the_daemon_joins_registers_and_a_sigterm_ends_it_cleanly() {
     let secured = horde_server_testkit::secure::serve_secured()
         .await
         .expect("a secured server comes up");
-    let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w-1")
-        .expect("a valid name");
-    let minted = secured
-        .authority
-        .mint(
-            &principal,
-            0,
-            horde_server::service::enrollment::wall_clock_ms(),
-        )
-        .await
-        .expect("the code mints");
-
     let state = tempfile::tempdir().expect("a temp dir");
     // One token, one flag (ADR-0007): the listener rides inside it.
-    let token = secured.join_token(&minted).to_string();
+    let token = harness::worker_token(&secured, "w-1").await;
     let mut daemon = harness::daemon(&[
         "--server",
         &secured.main_endpoint(),
@@ -183,6 +191,81 @@ async fn the_daemon_joins_registers_and_a_sigterm_ends_it_cleanly() {
         stdout.contains("shutdown reaped=0"),
         "shutdown reports what it reaped — zero agents, honestly: {stdout}"
     );
+}
+
+/// The token is the only input (ADR-0007, 2026-10-31 amendment): a daemon
+/// joined from a token *file* with no `--server` stores the server the
+/// token taught and dials it; while it runs, a second daemon on the same
+/// state refuses naming the lock; and a restart with no flags at all finds
+/// the stored server again. `--help` is output and a success.
+#[tokio::test]
+async fn a_token_joined_daemon_remembers_its_server_and_holds_its_state() {
+    let secured = horde_server_testkit::secure::serve_secured()
+        .await
+        .expect("a secured server comes up");
+    let state = tempfile::tempdir().expect("a temp dir");
+    let token_file = state.path().join("token");
+    std::fs::write(
+        &token_file,
+        format!("{}\n", harness::worker_token(&secured, "w-9").await),
+    )
+    .expect("the token file writes");
+    let state_dir = state.path().join("worker");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+
+    let mut first = harness::daemon(&[
+        "--join-file",
+        &token_file.to_string_lossy(),
+        "--state-dir",
+        &state_arg,
+    ]);
+    first
+        .await_stdout("the registration line", |out| {
+            out.contains("registered worker=w-9")
+        })
+        .await
+        .expect("a token-file join registers with no --server");
+    assert_eq!(
+        horde_identity::store::load_endpoint(&state_dir.join("identity")),
+        Some(secured.main_endpoint()),
+        "the join stored the server the token taught"
+    );
+
+    let second = support::within(
+        "a held state refuses at once",
+        tokio::process::Command::new(harness::admitted_daemon())
+            .args(["--state-dir", &state_arg])
+            .output(),
+    )
+    .await
+    .expect("the binary runs");
+    assert!(!second.status.success(), "one daemon per state dir");
+    let refusal = String::from_utf8_lossy(&second.stderr);
+    assert!(refusal.contains("worker.lock"), "{refusal}");
+
+    first.terminate().await.expect("SIGTERM sends");
+    first.wait().await.expect("the daemon exits");
+
+    let mut again = harness::daemon(&["--state-dir", &state_arg]);
+    again
+        .await_stdout("the re-registration", |out| {
+            out.contains("registered worker=w-9")
+        })
+        .await
+        .expect("a bare restart dials the stored server");
+    again.terminate().await.expect("SIGTERM sends");
+    again.wait().await.expect("the daemon exits");
+
+    let help = support::within(
+        "help exits at once",
+        tokio::process::Command::new(harness::admitted_daemon())
+            .arg("--help")
+            .output(),
+    )
+    .await
+    .expect("the binary runs");
+    assert!(help.status.success(), "help is not a failure");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--join-file"));
 }
 
 /// The whole worker, as a process, over plaintext loopback: a placed agent's

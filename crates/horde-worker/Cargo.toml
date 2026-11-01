@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+# The daemon's command line (`--help`, and refusals that name the flag),
+# the same parser the `horde` CLI and `horde-server` use.
+clap = { version = "4.5", features = ["derive"] }
 horde-adapter = { workspace = true }
 # The scripted hermetic provider (TESTING.md §3) is a product surface of the
 # daemon, not only a test double: `horde-worker --adapter fake` is what lets

@@ -40,7 +40,7 @@ pub enum ClientError {
     /// mistyped an address, and telling them the server is unreachable would
     /// send them looking in the wrong place.
     #[error(
-        "{endpoint} is not a valid endpoint URI (expected something like http://127.0.0.1:7777)"
+        "{endpoint} is not a valid endpoint URI (expected something like https://127.0.0.1:7777)"
     )]
     Endpoint { endpoint: String },
 
@@ -83,6 +83,11 @@ pub enum ClientError {
     #[error("enrollment failed: {0}")]
     Enrollment(String),
 
+    /// `horde up` could not stand this machine up, or a daemon it started
+    /// died — in operator words, with what the daemon said.
+    #[error("horde up: {0}")]
+    Up(String),
+
     /// An enrolled identity with no endpoint from any source (ADR-0007).
     ///
     /// A refusal that says where endpoints come from, replacing the old
@@ -106,6 +111,17 @@ pub enum ClientError {
         endpoint: String,
         directory: std::path::PathBuf,
     },
+
+    /// No endpoint from any source and nothing joined (ADR-0007, 2026-10-31
+    /// amendment): there is no default server to guess at — the old
+    /// plaintext default could never reach a secured one — so the refusal
+    /// names the two ways a machine comes to have a server.
+    #[error(
+        "no server to talk to: no --endpoint, no HORDE_ENDPOINT, and nothing joined in \
+         {directory}; join one with `horde enroll join <token>` (a token its operator minted), \
+         or stand one up on this machine with `horde up`"
+    )]
+    NoServer { directory: std::path::PathBuf },
 
     /// A local file the verb needed could not be read or written.
     ///
@@ -204,6 +220,31 @@ impl ClientError {
     #[must_use]
     pub fn is_unimplemented(&self) -> bool {
         matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Unimplemented)
+    }
+
+    /// The actionable cause buried in this error's source chain — a TLS
+    /// refusal, nothing listening — in plain words, when there is one
+    /// ([`horde_identity::diagnosis`]). A top-level `transport error`
+    /// alone sends the operator nowhere.
+    #[must_use]
+    pub fn diagnosis(&self) -> Option<String> {
+        horde_identity::diagnosis::diagnose(self)
+    }
+
+    /// The stderr text the binary prints for this refusal: an unbuilt verb
+    /// is a roadmap fact (`not built yet: …`), anything else `error: …`,
+    /// followed by a `hint:` line when the chain names a cause.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let head = if self.is_unimplemented() {
+            format!("not built yet: {self}")
+        } else {
+            format!("error: {self}")
+        };
+        match self.diagnosis() {
+            Some(hint) => format!("{head}\nhint: {hint}"),
+            None => head,
+        }
     }
 }
 

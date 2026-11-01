@@ -1219,6 +1219,7 @@ dependencies = [
 name = "horde-e2e"
 version = "0.1.0"
 dependencies = [
+ "horde-identity",
  "horde-server-testkit",
  "portable-pty",
  "serde_json",
@@ -1362,6 +1363,7 @@ name = "horde-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "horde-cli",
  "horde-identity",
  "horde-mcp",
@@ -1436,6 +1438,7 @@ name = "horde-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "getrandom 0.3.4",
  "hex",
  "horde-adapter",

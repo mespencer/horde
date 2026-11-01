@@ -13,7 +13,7 @@ use horde_adapter_claude::launch::IsolationFlags;
 use horde_adapter_claude::turn::TurnAssembler;
 
 use crate::harness::HarnessProfile;
-use crate::process::{HarnessSpec, SupervisedHarness};
+use crate::process::{HarnessSpec, SupervisedHarness, SupervisorError};
 
 /// The variable `claude` reads its config directory from.
 const CONFIG_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
@@ -255,6 +255,22 @@ impl LiveClaudeSession {
         }
         AdapterError::HarnessExited { exit_code }
     }
+
+    /// Writes one line, or reports the harness dead.
+    ///
+    /// A hang-up is the write-side face of the death EOF announces on the
+    /// read side — which one the session meets first is the scheduler's race
+    /// — so it is reported identically, exit status and stderr included.
+    async fn write(&mut self, line: &str) -> Result<()> {
+        match self.harness.write_line(line).await {
+            Ok(()) => Ok(()),
+            Err(SupervisorError::HungUp) => Err(self.report_death().await),
+            Err(error) => Err(AdapterError::Protocol {
+                message: error.to_string(),
+                raw: String::new(),
+            }),
+        }
+    }
 }
 
 /// The `--mcp-config` JSON handing one agent its Horde endpoint.
@@ -316,13 +332,7 @@ impl AgentSession for LiveClaudeSession {
         if input.delivery == Delivery::Interrupt {
             self.interrupt().await?;
         }
-        self.harness
-            .write_line(&encode_user_message(&input.text))
-            .await
-            .map_err(|e| AdapterError::Protocol {
-                message: e.to_string(),
-                raw: String::new(),
-            })
+        self.write(&encode_user_message(&input.text)).await
     }
 
     async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
@@ -375,13 +385,7 @@ impl AgentSession for LiveClaudeSession {
         // leaves the session usable (ADR-0003): SIGINT ends the process, and
         // closing stdin does not interrupt at all — it lets the turn run to
         // completion.
-        self.harness
-            .write_line(&encode_interrupt("horde-interrupt"))
-            .await
-            .map_err(|e| AdapterError::Protocol {
-                message: e.to_string(),
-                raw: String::new(),
-            })
+        self.write(&encode_interrupt("horde-interrupt")).await
     }
 
     async fn shutdown(&mut self) -> Result<()> {
