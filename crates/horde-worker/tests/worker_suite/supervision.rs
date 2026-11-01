@@ -373,7 +373,9 @@ mod failure_modes {
     /// A write to a child that has let go of its stdin is a hang-up — the
     /// death seen from the write side — never a bare I/O failure. The stub
     /// closes stdin before serving the turn, so having read the turn the
-    /// next write is certain to meet EPIPE: no race, no sleep.
+    /// child is no longer a reader. A sibling test's spawn can still hold a
+    /// copy of the read end for a moment, so the writes repeat, bounded,
+    /// until the refusal arrives (see `support::first_refusal`).
     #[tokio::test]
     async fn a_write_after_the_child_hangs_up_is_a_hang_up() {
         let (spec, _dir) = spec_with(super::harness::RESULT_ONLY, &[("HORDE_STUB_HANG_UP", "1")]);
@@ -388,7 +390,11 @@ mod failure_modes {
             "the turn proves stdin is closed: {served:?}"
         );
 
-        let refused = harness.write_line("{\"type\":\"user\"}").await;
+        let refused = within(
+            "the hang-up is met",
+            crate::support::first_refusal(async || harness.write_line("{\"type\":\"user\"}").await),
+        )
+        .await;
         assert!(
             matches!(refused, Err(super::SupervisorError::HungUp)),
             "EPIPE is the child hanging up: {refused:?}"
@@ -416,7 +422,11 @@ mod failure_modes {
 
         let refused = within(
             "the death is reported",
-            session.send(horde_adapter::TurnInput::queued("again")),
+            crate::support::first_refusal(async || {
+                session
+                    .send(horde_adapter::TurnInput::queued("again"))
+                    .await
+            }),
         )
         .await;
         assert!(
