@@ -1815,6 +1815,35 @@ mod stall_tests {
         );
     }
 
+    /// A stall too long for the clock to add ends a year out — no sooner,
+    /// no later — instead of overflowing the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unaddable_stall_ends_a_year_out() {
+        let mut session = started(Script::of(vec![ScriptedTurn {
+            steps: vec![
+                Step::Stall(Duration::MAX),
+                Step::Say("after the stall".to_owned()),
+            ],
+            ..ScriptedTurn::saying("done")
+        }]))
+        .await;
+        let year = Duration::from_secs(365 * 24 * 3600);
+        let began = tokio::time::Instant::now();
+        let mut said = Vec::new();
+        while let Ok(Some(event)) = session.next_event().await {
+            if let AgentEvent::Output { text, .. } = event {
+                if text == "after the stall" {
+                    assert_eq!(began.elapsed(), year, "the stall lasts exactly a year");
+                }
+                said.push(text);
+            }
+        }
+        assert!(
+            said.iter().any(|text| text == "after the stall"),
+            "{said:?}"
+        );
+    }
+
     fn is_the_step_behind_the_stall(event: &AgentEvent) -> bool {
         matches!(event, AgentEvent::Output { text, .. } if text == "played on regardless")
     }

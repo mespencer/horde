@@ -298,6 +298,17 @@ mod tests {
         assert_eq!(shape(&shaper.flush())[0].2, "é");
     }
 
+    /// A limit landing inside a character backs the cut up to that
+    /// character's start, so no chunk ever exceeds the limit.
+    #[test]
+    fn a_cut_inside_a_character_backs_up_to_its_start() {
+        let mut shaper = OutputShaper::with_max_chunk(4);
+        // "a" then two two-byte "é": byte 4 is the middle of the second.
+        let ready = shaper.absorb(turn("t1"), OutputChannel::Assistant, "aéé");
+        assert_eq!(shape(&ready)[0].2, "aé");
+        assert_eq!(shape(&shaper.flush())[0].2, "é");
+    }
+
     /// The floor keeps one character always fitting, and the default is the
     /// inline threshold.
     #[test]

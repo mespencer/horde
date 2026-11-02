@@ -368,6 +368,86 @@ fn diagnostic_saying(events: &[horde_proto::v1::JournaledEvent], needle: &str) -
     })
 }
 
+/// Each workspace gets its own lane, apart from every agent's: two
+/// definitions' materializations never queue behind each other.
+#[test]
+fn a_workspace_lane_is_named_for_its_definition() {
+    assert_eq!(super::lane::workspace_lane("ws-1"), "workspace:ws-1");
+    assert_ne!(
+        super::lane::workspace_lane("ws-1"),
+        super::lane::workspace_lane("ws-2")
+    );
+    assert_eq!(
+        super::lane::lane_key(&materialize_command(1, std::path::Path::new("/o"))),
+        "workspace:ws-1"
+    );
+}
+
+/// A revival that cannot happen — the harness died idle before it ever
+/// named its conversation — fails the agent and settles every message it
+/// was handed with that failure, rather than leaving them to replay forever.
+#[tokio::test]
+async fn a_failed_revival_settles_what_the_agent_was_handed() {
+    let mut runtime = runtime_with(
+        Script::of(vec![
+            ScriptedTurn::saying("last words").with_step(Step::Exit),
+        ])
+        .misbehaving(horde_adapter_fake::Misbehaviour::SkipSessionEstablished),
+    );
+    runtime
+        .apply(spawn_command(1, "agent-1", "go"))
+        .await
+        .expect("the spawn applies");
+    journal_satisfying(&runtime, "the first turn's usage", |events| {
+        kinds(events).contains(&"usage")
+    })
+    .await;
+    runtime
+        .apply(note_command(2, "into the void"))
+        .await
+        .expect("the delivery applies");
+    journal_satisfying(&runtime, "the failed revival", |events| {
+        failed_with_reason(events, |reason| reason.contains("no provider session"))
+    })
+    .await;
+    settle(&runtime).await;
+    assert!(
+        runtime
+            .shared
+            .journal
+            .handed_deliveries("agent-1")
+            .await
+            .expect("readable")
+            .is_empty(),
+        "the failure is the handed message's answer"
+    );
+    runtime.shutdown().await;
+}
+
+/// Deltas the harness has already produced are coalesced before they are
+/// journaled: two ready `Say` steps land as one chunk, in order.
+#[tokio::test]
+async fn ready_deltas_are_journaled_as_one_chunk() {
+    let mut runtime = runtime_with(Script::of(vec![
+        ScriptedTurn::saying("done")
+            .with_step(Step::Say("tok-a ".to_owned()))
+            .with_step(Step::Say("tok-b".to_owned())),
+    ]));
+    runtime
+        .apply(spawn_command(1, "agent-1", "go"))
+        .await
+        .expect("the spawn applies");
+    let events = journal_satisfying(&runtime, "the turn's usage", |events| {
+        kinds(events).contains(&"usage")
+    })
+    .await;
+    assert!(
+        echoed(&events, "tok-a tok-b"),
+        "the two deltas merged into one chunk: {events:?}"
+    );
+    runtime.shutdown().await;
+}
+
 /// Whether any journaled output chunk contains `needle`.
 fn echoed(events: &[horde_proto::v1::JournaledEvent], needle: &str) -> bool {
     any_chunk(events, |chunk| chunk.text.contains(needle))
@@ -439,11 +519,21 @@ async fn a_malformed_command_is_journaled_against_its_agent() {
         .apply(malformed)
         .await
         .expect("a malformed command is not fatal");
-    journal_satisfying(&runtime, "the diagnostic", |events| {
+    let events = journal_satisfying(&runtime, "the diagnostic", |events| {
         diagnostic_saying(events, "could not apply command s1:102")
             && diagnostic_saying(events, "permission request id")
     })
     .await;
+    let diagnosed_in: Vec<Option<String>> = events
+        .iter()
+        .filter(|journaled| diagnostic_saying(std::slice::from_ref(journaled), "s1:102"))
+        .map(|journaled| journaled.session_id.as_ref().map(ToString::to_string))
+        .collect();
+    assert_eq!(
+        diagnosed_in,
+        vec![Some("s1".to_owned())],
+        "the diagnostic lands in the agent's own session"
+    );
 
     // The agent still answers to a well-formed decision.
     runtime
@@ -527,8 +617,36 @@ async fn archiving_ends_the_agent_and_journals_the_transition() {
             )
         });
     assert!(archived, "the archive is an event like everything else");
-    // Shutdown must complete even though the pump was already retired.
-    runtime.shutdown().await;
+
+    // The ended agent's lane retires itself; the next apply prunes it from
+    // the map and keeps the pump it reaped for shutdown's count.
+    tokio::time::timeout(core::time::Duration::from_secs(15), async {
+        while !runtime
+            .lanes
+            .get("agent-1")
+            .is_none_or(|lane| lane.task.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the archived agent's lane never retired"));
+    runtime
+        .apply(StreamCommandsResponse {
+            command_sequence: 3,
+            command_id: "s1:empty".to_owned(),
+            log_position: 0,
+            command: None,
+        })
+        .await
+        .expect("an empty command applies");
+    assert!(
+        !runtime.lanes.contains_key("agent-1"),
+        "a retired lane is pruned, not kept for the Worker's life"
+    );
+    // Shutdown must complete even though the pump was already retired, and
+    // must still count it.
+    assert_eq!(runtime.shutdown().await, 1);
 }
 
 fn deliver_command(
@@ -580,18 +698,20 @@ async fn a_delivered_note_reaches_the_agent_and_its_echo_the_journal() {
         .await
         .expect("the delivery applies");
 
-    let events = journal_at_least(&runtime, settled + 2).await;
-    let echoed = events.iter().any(|journaled| {
-        matches!(
-            journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
-            Some(Kind::AgentOutputChunk(chunk)) if chunk.text.contains("a mid-life note")
-        )
-    });
+    let events = journal_satisfying(&runtime, "the note's echo", |events| {
+        echoed(events, "a mid-life note")
+    })
+    .await;
+    // The live pump took it: the lane kept its agent across the spawn, so
+    // nothing had to be revived to reach it.
     assert!(
-        echoed,
-        "the note must reach the agent, not just the journal"
+        !any_kind(&events[settled..], |kind| matches!(
+            kind,
+            Kind::AgentLifecycleChanged(changed) if changed.reason.contains("revived")
+        )),
+        "the note reached the running agent, not a revival: {events:?}"
     );
-    runtime.shutdown().await;
+    assert_eq!(runtime.shutdown().await, 1, "one live pump, reaped");
 }
 
 /// Did any journaled event mark the agent Failed, with a reason this
@@ -1371,6 +1491,15 @@ async fn materialize_workspace_is_refused_loudly() {
     assert_eq!(
         report.state,
         horde_proto::v1::WorkspaceInstanceState::Degraded as i32
+    );
+    assert_eq!(
+        report
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("ws-1"),
+        "the report names which instance this worker cannot hold"
     );
     assert!(
         report.detail.contains("materialize workspace"),

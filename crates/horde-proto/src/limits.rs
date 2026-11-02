@@ -17,3 +17,14 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// [`MAX_MESSAGE_BYTES`], so a batch never nears the ceiling and one slow
 /// batch never holds megabytes hostage across a flaky link.
 pub const PUSH_BATCH_BYTES: usize = MAX_MESSAGE_BYTES / 16;
+
+#[cfg(test)]
+mod tests {
+    /// The ceiling both ends agree on, pinned by value: a different number
+    /// on either side is a refusal the other side cannot explain.
+    #[test]
+    fn the_limits_are_sixteen_mebibytes_and_one_for_a_batch() {
+        assert_eq!(super::MAX_MESSAGE_BYTES, 16_777_216);
+        assert_eq!(super::PUSH_BATCH_BYTES, 1_048_576);
+    }
+}

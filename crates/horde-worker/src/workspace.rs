@@ -629,6 +629,19 @@ async fn required_state(
 mod tests {
     use super::*;
 
+    /// An agent's private root is composed only from two directory names:
+    /// either id unsafe is no path at all.
+    #[test]
+    fn an_agent_root_needs_both_ids_to_be_directory_names() {
+        let manager = WorkspaceManager::new("w", "/root");
+        assert_eq!(
+            manager.agent_root("ws-1", "agent-1"),
+            Some(PathBuf::from("/root/ws-1/.horde-agents/agent-1"))
+        );
+        assert_eq!(manager.agent_root("../x", "agent-1"), None);
+        assert_eq!(manager.agent_root("ws-1", "../x"), None);
+    }
+
     #[test]
     fn a_directory_component_admits_no_traversal_and_no_hidden_names() {
         assert!(is_path_safe("ws-1a2b-3"));

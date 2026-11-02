@@ -246,7 +246,10 @@ impl Lane {
                 LaneStep::Exited(exit) => self.on_pump_exit(exit).await,
                 LaneStep::Message(Some(message)) => {
                     let forgotten = self.handle(message).await;
-                    if forgotten && self.agent.is_none() && receiver.is_empty() {
+                    // A forget always leaves the lane without an agent (the
+                    // archive retired it, or there was none), so a forgotten
+                    // lane with nothing queued is done.
+                    if forgotten && receiver.is_empty() {
                         // An ended agent's lane retires rather than parking
                         // for the Worker's whole life. Closing first makes
                         // the dispatcher's next send fail (it then starts a

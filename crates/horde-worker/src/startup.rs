@@ -964,6 +964,11 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_millis(250));
 
+        // The jitter source genuinely varies: eight equal 64-bit draws would
+        // be Workers redialing in lockstep, which is what jitter is for.
+        let draws: std::collections::BTreeSet<u64> = (0..8).map(|_| super::entropy()).collect();
+        assert!(draws.len() > 1, "the jitter never varies: {draws:?}");
+
         let mut real = Backoff::default();
         let first = real.next_delay();
         assert!(first >= RETRY_BASE / 2 && first <= RETRY_BASE, "{first:?}");
