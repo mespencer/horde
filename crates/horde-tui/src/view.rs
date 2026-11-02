@@ -34,33 +34,34 @@ fn render_forwards(app: &App, frame: &mut Frame<'_>) {
         forwards
             .iter()
             .enumerate()
-            .map(|(index, status)| forward_row(status, index == app.forwards_selected()))
+            .map(|(index, status)| forward_row(app, status, index == app.forwards_selected()))
             .collect()
     };
 
     render_rows(
         frame,
-        header_line("forwards", 0, app.stream_stale(), app.status()),
+        header_line("forwards", 0, app),
         rows,
         "[r] refresh  [o] overview  [q] quit",
     );
 }
 
-/// One forward as a panel row: `> vite  expose 5173  session s1  worker ok  backed by laptop`.
-fn forward_row(status: &horde_proto::v1::ForwardStatus, selected: bool) -> String {
+/// One forward as a panel row: `> vite  expose 5173  session ci-fix  worker ok  backed by laptop`.
+fn forward_row(app: &App, status: &horde_proto::v1::ForwardStatus, selected: bool) -> String {
     let intent = status.intent.clone().unwrap_or_default();
     let spec = intent.spec.unwrap_or_default();
     let direction = crate::state::forward_direction_name(spec.direction);
+    let session_id = intent
+        .session_id
+        .as_ref()
+        .map_or_else(String::new, ToString::to_string);
     let mut row = format!(
         "{} {}  {} {}  session {}",
         marker(selected),
         spec.name,
         direction,
         spec.worker_port,
-        intent
-            .session_id
-            .as_ref()
-            .map_or_else(String::new, ToString::to_string),
+        app.session_name(&session_id),
     );
     row.push_str(if status.worker_reachable {
         "  worker ok"
@@ -103,12 +104,7 @@ fn render_overview(app: &App, frame: &mut Frame<'_>) {
 
     render_rows(
         frame,
-        header_line(
-            "horde — sessions",
-            app.waiting_total(),
-            app.stream_stale(),
-            app.status(),
-        ),
+        header_line("horde — sessions", app.waiting_total(), app),
         rows,
         "[enter] attach  [i] inbox  [f] forwards  [r] refresh  [q] quit",
     );
@@ -127,7 +123,7 @@ fn render_inbox(app: &App, frame: &mut Frame<'_>) {
                 format!(
                     "{} {}  {}",
                     marker(index == app.inbox_selected()),
-                    entry.session_id,
+                    entry.title,
                     permission_summary(&entry.permission),
                 )
             })
@@ -136,7 +132,7 @@ fn render_inbox(app: &App, frame: &mut Frame<'_>) {
 
     render_rows(
         frame,
-        header_line("inbox", entries.len(), app.stream_stale(), app.status()),
+        header_line("inbox", entries.len(), app),
         rows,
         "[y] allow  [n] deny  [enter] attach  [o] overview  [q] quit",
     );
@@ -173,7 +169,7 @@ fn render_session(app: &App, frame: &mut Frame<'_>) {
         areas[0],
     );
     frame.render_widget(
-        Paragraph::new(feed_lines(&session.feed, app.scroll(), areas[1].height)),
+        Paragraph::new(feed_lines(session, app.scroll(), areas[1].height)),
         areas[1],
     );
     frame.render_widget(Paragraph::new(rows_to_lines(prompt_rows)), areas[2]);
@@ -199,20 +195,38 @@ fn rows_to_lines(rows: Vec<String>) -> Vec<Line<'static>> {
     rows.into_iter().map(Line::from).collect()
 }
 
-/// A screen title, the waiting badge when anything waits, and the last
-/// refusal when there was one.
-fn header_line(title: &str, waiting: usize, stale: bool, status: &str) -> Line<'static> {
+/// A screen title, the waiting badge when anything waits, and the stream and
+/// status badges.
+fn header_line(title: &str, waiting: usize, app: &App) -> Line<'static> {
     let mut text = format!(" {title}");
     if waiting > 0 {
         text.push_str(&format!("  — {waiting} waiting"));
     }
-    if stale {
-        text.push_str(STALE_BADGE);
-    }
-    if !status.is_empty() {
-        text.push_str(&format!("  ⚠ {status}"));
-    }
+    text.push_str(&badges(app));
     Line::from(text)
+}
+
+/// The badges every header ends with: the stream's health, then the last
+/// refusal when there was one.
+fn badges(app: &App) -> String {
+    let mut text = stream_badge(app.stream_ended(), app.stream_stale()).to_owned();
+    if let Some(reason) = app.stream_ended().filter(|reason| !reason.is_empty()) {
+        text.push_str(&format!(" ({reason})"));
+    }
+    if !app.status().is_empty() {
+        text.push_str(&format!("  ⚠ {}", app.status()));
+    }
+    text
+}
+
+/// The stream-health badge. An ended stream outranks a stale one: once the
+/// server has hung up, "no heartbeat" is a guess about something known.
+fn stream_badge(ended: Option<&str>, stale: bool) -> &'static str {
+    match (ended, stale) {
+        (Some(_), _) => ENDED_BADGE,
+        (None, true) => STALE_BADGE,
+        (None, false) => "",
+    }
 }
 
 /// The staleness badge (fix a9): rendered when the follow stream has been
@@ -220,14 +234,29 @@ fn header_line(title: &str, waiting: usize, stale: bool, status: &str) -> Line<'
 /// not look like a quiet one anywhere.
 const STALE_BADGE: &str = "  ⚠ stream stale — no heartbeat";
 
+/// The ended badge: the server closed the follow stream, so nothing on
+/// screen will move again until the TUI is restarted. Short, because the
+/// reason follows it on a header line that is often 80 columns.
+const ENDED_BADGE: &str = "  ⚠ stream ended";
+
+/// A session as a human names it, with the short id beside a title so two
+/// same-titled sessions stay tellable apart — the id alone when untitled.
+fn session_label(session: &SessionState) -> String {
+    let short = crate::state::short_id(&session.session_id);
+    if session.title.is_empty() {
+        short
+    } else {
+        format!("{}  {short}", session.title)
+    }
+}
+
 fn overview_row(session: &SessionState, selected: bool) -> String {
     let mut row = format!(
-        "{} {}  {}  head={}  {}",
+        "{} {}  {}  head={}",
         marker(selected),
-        session.session_id,
+        session_label(session),
         session.lifecycle,
         session.head,
-        session.title,
     );
     if !session.pending.is_empty() {
         row.push_str(&format!("  [{} waiting]", session.pending.len()));
@@ -242,11 +271,8 @@ fn marker(selected: bool) -> &'static str {
 /// The attached header: where you are, what you are scoped to, what is
 /// happening elsewhere — the passive badge DESIGN.md §11 asks for.
 fn session_header(app: &App, session: &SessionState, agent_id: Option<&str>) -> Line<'static> {
-    let scope = agent_id.map_or_else(|| "session root".to_owned(), ToString::to_string);
-    let mut text = format!(
-        " {}  {}  attached: {scope}",
-        session.session_id, session.title
-    );
+    let scope = agent_id.map_or_else(|| "session root".to_owned(), |id| session.agent_name(id));
+    let mut text = format!(" {}  attached: {scope}", session_label(session));
     if !session.caught_up {
         text.push_str("  (syncing)");
     }
@@ -254,28 +280,28 @@ fn session_header(app: &App, session: &SessionState, agent_id: Option<&str>) -> 
     if elsewhere > 0 {
         text.push_str(&format!("  — {elsewhere} waiting elsewhere"));
     }
-    if app.stream_stale() {
-        text.push_str(STALE_BADGE);
-    }
-    if !app.status().is_empty() {
-        text.push_str(&format!("  ⚠ {}", app.status()));
-    }
+    text.push_str(&badges(app));
     Line::from(text)
 }
 
 /// The last lines that fit, honouring how far back the view is scrolled.
-fn feed_lines(feed: &[FeedLine], scroll: usize, height: u16) -> Vec<Line<'static>> {
-    let end = feed.len().saturating_sub(scroll);
+fn feed_lines(session: &SessionState, scroll: usize, height: u16) -> Vec<Line<'static>> {
+    let end = session.feed.len().saturating_sub(scroll);
     let start = end.saturating_sub(height as usize);
-    feed[start..end].iter().map(rendered_feed_line).collect()
+    session
+        .feed
+        .range(start..end)
+        .map(|line| rendered_feed_line(session, line))
+        .collect()
 }
 
-fn rendered_feed_line(line: &FeedLine) -> Line<'static> {
+/// One feed line, its agent named the way a human knows it.
+fn rendered_feed_line(session: &SessionState, line: &FeedLine) -> Line<'static> {
     Line::from(format!(
         "{:>5}  {:<11} {:<14} {}",
         line.sequence,
         line.label,
-        clipped(&line.agent_id, 14),
+        clipped(&session.agent_name(&line.agent_id), 14),
         line.text,
     ))
 }
@@ -296,7 +322,7 @@ fn prompt_panel(pending: &[PendingPermission]) -> Vec<String> {
 /// One escalation in a row: who wants what, under which mode.
 fn permission_summary(permission: &PendingPermission) -> String {
     let who = if permission.tree_path.is_empty() {
-        permission.agent_id.clone()
+        crate::state::short_id(&permission.agent_id)
     } else {
         permission.tree_path.join(" > ")
     };
@@ -365,6 +391,17 @@ mod tests {
     /// Asserted here rather than left to the screen snapshots, because on an
     /// 80-column screen a long prompt pushes the suffix past the right edge —
     /// where every miscounted variant clips to the same pixels.
+    /// The stream badge's truth table: ended outranks stale, either alone
+    /// shows its own badge, and a healthy stream shows nothing.
+    #[test]
+    fn an_ended_stream_outranks_a_stale_one() {
+        use super::{ENDED_BADGE, STALE_BADGE, stream_badge};
+        assert_eq!(stream_badge(Some(""), true), ENDED_BADGE);
+        assert_eq!(stream_badge(Some("why"), false), ENDED_BADGE);
+        assert_eq!(stream_badge(None, true), STALE_BADGE);
+        assert_eq!(stream_badge(None, false), "");
+    }
+
     #[test]
     fn the_prompt_panel_counts_only_what_it_hides() {
         assert!(

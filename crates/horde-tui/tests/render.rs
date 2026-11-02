@@ -268,6 +268,39 @@ fn a_refusal_shows_in_the_header_without_costing_the_screen() {
     insta::assert_snapshot!(drawn(&app));
 }
 
+/// The server closing the follow stream says so on the attached view, with
+/// the reason when there is one — a frozen feed must not pass for a quiet one.
+#[test]
+fn a_closed_stream_says_it_ended_and_why() {
+    let mut app = App::overview();
+    busy_session(&mut app);
+    press(&mut app, KeyCode::Enter);
+    app.apply(Update::StreamEnded {
+        reason: "server unavailable".to_owned(),
+    });
+    insta::assert_snapshot!(drawn(&app));
+}
+
+/// A clean close ends the stream with no reason, and the ended badge
+/// outranks the stale one: once the server has hung up, "no heartbeat" is a
+/// guess about something already known.
+#[test]
+fn a_cleanly_closed_stream_outranks_the_stale_badge() {
+    let mut app = App::overview();
+    busy_session(&mut app);
+    app.apply(Update::Tick {
+        now: std::time::Instant::now() + horde_tui::app::STALE_AFTER * 2,
+    });
+    assert!(
+        app.stream_stale(),
+        "the fixture must be stale to be outranked"
+    );
+    app.apply(Update::StreamEnded {
+        reason: String::new(),
+    });
+    insta::assert_snapshot!(drawn(&app));
+}
+
 /// One forward of each shape (ADR-0006): a reachable expose, a backed
 /// inject, and an unbacked inject whose row names the detached backer —
 /// because the unbacked state's remedy is that principal's return.
