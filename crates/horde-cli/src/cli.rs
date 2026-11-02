@@ -3473,28 +3473,22 @@ mod forward_flow_tests {
         assert!(lines[0].contains("5432"), "{}", lines[0]);
     }
 
-    /// Stopping every realization is provable, twice over: the port stops
-    /// answering, and — through an owned witness — the accept loop is
-    /// already gone when `stop_all` returns. The second half is what
-    /// separates a real stop from `Drop`'s fire-and-forget abort: on a
-    /// current-thread runtime, an un-awaited abort has not run when the
-    /// assertion looks.
+    /// Stopping every realization is provable through an owned witness:
+    /// each accept loop is already gone when `stop_all` returns — what
+    /// separates a real stop from `Drop`'s fire-and-forget abort, since on
+    /// a current-thread runtime an un-awaited abort has not run when the
+    /// assertion looks. A real realization rides in the same batch, so the
+    /// witness proves the whole batch was awaited; OS port state is never
+    /// asserted (a sibling test may rebind the freed ephemeral port).
     #[tokio::test]
     async fn stop_all_reaps_every_listener() {
         let (_core, client) = placed_server().await;
         let realized = crate::forward::realize_expose(&client, "fwd-x", "x", 4242, 0)
             .await
             .expect("the listener binds");
-        let local_addr = realized.local_addr;
-
-        super::stop_all(vec![realized]).await;
-        assert!(
-            tokio::net::TcpStream::connect(local_addr).await.is_err(),
-            "a stopped listener must not keep its port"
-        );
 
         let (guarded, mut reaped) = crate::forward::testing::guarded_realization();
-        super::stop_all(vec![guarded]).await;
+        super::stop_all(vec![realized, guarded]).await;
         assert!(
             matches!(
                 reaped.try_recv(),
