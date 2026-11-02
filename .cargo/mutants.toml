@@ -40,6 +40,14 @@ exclude_re = [
     # tests also include by #[path]. The suite runs both; it tests neither.
     'crates/horde-mcp/src/bin/mcp_stub_server/main\.rs',
     'crates/horde-mcp/src/bin/mcp_stub_server/tools\.rs',
+    # A different criterion, and the only entry under it: code that sends
+    # real signals to targets chosen at runtime must never be mutated,
+    # because a mutant runs for real. Its mutants are not equivalent; they
+    # are dangerous. Flipping `ppid == parent` in an earlier version of this
+    # file made a test SIGKILL every process on the machine. The file holds
+    # only the signal guard, the orphan sweep's selection and the sending;
+    # the harmless table reading it needs lives in `ps.rs` and is mutated.
+    'crates/horde-server-testkit/src/reap\.rs',
 ]
 
 # Parallelism is not settable here — cargo-mutants takes `--jobs` on the command

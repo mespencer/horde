@@ -1442,7 +1442,8 @@ mod tests {
         let (running, mut hangups) = super::serve_with_hangups(&config)
             .await
             .expect("the server starts");
-        crate::remint::send_hangup(std::process::id()).expect("a hang-up to ourselves");
+        // Raised, not sent: `send_hangup` refuses its own process by design.
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).expect("a hang-up to ourselves");
         tokio::time::timeout(std::time::Duration::from_secs(10), hangups.recv())
             .await
             .expect("the hang-up arrives within the ceiling")

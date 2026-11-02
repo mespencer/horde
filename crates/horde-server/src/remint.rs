@@ -98,21 +98,65 @@ async fn fresh_token(file: &Path, before: &str, deadline: Duration) -> Option<St
     }
 }
 
-/// Sends SIGHUP to `pid` through `kill(1)`, the re-mint request a running
-/// server listens for.
+/// Sends SIGHUP to `pid`, the re-mint request a running server listens for.
+///
+/// The pid comes from a file on disk, not from a process this one spawned,
+/// so [`hangup_target`] vets it first.
 ///
 /// # Errors
 ///
-/// `kill` failing to run, or refusing (the pid gone, or not ours).
+/// The pid refused, or the signal failing (the pid gone, or not ours).
 pub fn send_hangup(pid: u32) -> std::io::Result<()> {
-    let status = std::process::Command::new("kill")
-        .args(["-HUP", &pid.to_string()])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -HUP {pid} exited {status}"
-        )))
+    let target = hangup_target(pid)?;
+    nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGHUP)
+        .map_err(|errno| std::io::Error::other(format!("SIGHUP to {pid} failed: {errno}")))
+}
+
+/// `pid` as a single process this verb may hang up: never 0 (our own group,
+/// to `kill`), 1 (init), a value that would go negative as a `pid_t` (a
+/// group, or every process), this process, or its own process group.
+///
+/// # Errors
+///
+/// A refusal naming the pid.
+fn hangup_target(pid: u32) -> std::io::Result<nix::unistd::Pid> {
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal pid {pid}: it is not a running server's"),
+        )
+    };
+    let raw = i32::try_from(pid).map_err(|_| refused())?;
+    let ours = [nix::unistd::getpid(), nix::unistd::getpgrp()];
+    if raw <= 1 || ours.iter().any(|own| own.as_raw() == raw) {
+        return Err(refused());
+    }
+    Ok(nix::unistd::Pid::from_raw(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The guard alone answers: no signal is sent to learn any of this.
+    #[test]
+    fn a_hangup_never_targets_reserved_or_own_pids() {
+        let own_pid = std::process::id();
+        let own_group =
+            u32::try_from(nix::unistd::getpgrp().as_raw()).expect("a positive process group");
+        for refused in [0, 1, u32::MAX, 1 << 31, own_pid, own_group] {
+            let error = super::hangup_target(refused).expect_err("refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{refused}");
+            assert!(error.to_string().contains(&refused.to_string()), "{error}");
+        }
+        let stranger = [2, 3]
+            .into_iter()
+            .find(|pid| ![own_pid, own_group].contains(pid))
+            .expect("two pids cannot both be ours");
+        assert_eq!(
+            super::hangup_target(stranger)
+                .map(|pid| i64::from(pid.as_raw()))
+                .ok(),
+            Some(i64::from(stranger)),
+            "an ordinary pid passes (it is only vetted here, never signalled)"
+        );
     }
 }

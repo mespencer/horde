@@ -190,6 +190,9 @@ pub fn value_after<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 pub struct SpawnedProcess {
     name: String,
     child: tokio::process::Child,
+    /// The group the child leads, recorded at spawn: `process_group(0)`
+    /// makes it the child's own pid.
+    pgid: u32,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
 }
@@ -213,11 +216,12 @@ where
 impl SpawnedProcess {
     /// Spawns `program` with `args` and `envs`, watching both output streams.
     ///
-    /// `name` labels every failure this handle reports. The child is
-    /// kill-on-drop, its descendants with it: a panicking test must not
-    /// leak a live daemon. The first spawn in each test process also reaps
-    /// the orphans an earlier, killed test process left behind
-    /// ([`crate::reap`]).
+    /// `name` labels every failure this handle reports. The child leads a
+    /// process group of its own, and the drop SIGKILLs that whole group: a
+    /// panicking test must not leak a live daemon, nor the server and
+    /// worker a `horde up` started in its group. The first spawn in each
+    /// test process also reaps the orphans an earlier, killed test process
+    /// left behind ([`crate::reap`]).
     ///
     /// # Errors
     ///
@@ -229,11 +233,15 @@ impl SpawnedProcess {
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         for (key, value) in envs {
             command.env(key, value);
         }
         let mut child = command.spawn()?;
+        let pgid = child
+            .id()
+            .ok_or_else(|| format!("{name} has no pid to lead its group"))?;
 
         let stdout = Arc::new(Mutex::new(String::new()));
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -251,9 +259,19 @@ impl SpawnedProcess {
         Ok(Self {
             name: name.to_owned(),
             child,
+            pgid,
             stdout,
             stderr,
         })
+    }
+
+    /// SIGKILLs the child's group while the child is unreaped. Its pid is
+    /// held until it is reaped, so the group id cannot yet name anyone else.
+    fn kill_group(&self) {
+        if self.child.id().is_some() {
+            let _already_gone =
+                crate::reap::signal_group(self.pgid, Some(nix::sys::signal::Signal::SIGKILL));
+        }
     }
 
     /// Everything the process has written to stdout so far.
@@ -305,22 +323,19 @@ impl SpawnedProcess {
             .child
             .id()
             .ok_or_else(|| format!("{} has already exited", self.name))?;
-        let status = tokio::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .await?;
-        if !status.success() {
-            return Err(format!("kill -TERM {pid} failed for {}", self.name).into());
-        }
+        crate::reap::signal_pid(pid, Some(nix::sys::signal::Signal::SIGTERM))
+            .map_err(|unsent| format!("SIGTERM to {pid} failed for {}: {unsent}", self.name))?;
         Ok(())
     }
 
-    /// Kills the process without ceremony — the crash the fault tier injects.
+    /// Kills the process and its group without ceremony — the crash the
+    /// fault tier injects — and reaps it.
     ///
     /// # Errors
     ///
     /// The kill failing.
     pub async fn kill(&mut self) -> Setup<()> {
+        self.kill_group();
         self.child.kill().await?;
         Ok(())
     }
@@ -351,12 +366,10 @@ impl SpawnedProcess {
 }
 
 impl Drop for SpawnedProcess {
-    /// Kills the child's whole tree before kill-on-drop takes the child: a
+    /// Kills the child's whole group before kill-on-drop takes the child: a
     /// dropped `horde up` must not leave its server and worker to init.
     fn drop(&mut self) {
-        if let Some(pid) = self.child.id() {
-            crate::reap::reap_descendants(pid);
-        }
+        self.kill_group();
     }
 }
 

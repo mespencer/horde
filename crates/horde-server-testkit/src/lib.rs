@@ -30,6 +30,7 @@
 //! returned value.
 
 pub mod process;
+pub mod ps;
 pub mod pty;
 pub mod reap;
 pub mod secure;
