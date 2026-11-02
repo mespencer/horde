@@ -238,6 +238,42 @@ async fn serve_prints_the_operator_interface_and_stays_up() -> Setup<()> {
         exited.is_err(),
         "the server must keep serving after printing its interface; it exited: {exited:?}"
     );
+
+    // `--remint` against the live server: it signals, the server re-mints
+    // and announces on its own stdout, and the verb prints the same fresh
+    // token — still serving afterwards.
+    let state = directory.path().join("state");
+    let reminted =
+        horde_server_with_env(&["--remint", "--state-dir", &state.to_string_lossy()], &[]).await?;
+    let printed = String::from_utf8_lossy(&reminted.stdout).trim().to_owned();
+    assert!(
+        reminted.status.success(),
+        "{printed} / {}",
+        String::from_utf8_lossy(&reminted.stderr)
+    );
+    let announced = tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+        .await
+        .map_err(|_| "timed out waiting for the re-mint announcement")??
+        .ok_or("stdout ended before the re-mint was announced")?;
+    assert_eq!(announced, printed, "the verb prints what the server minted");
+    assert_ne!(
+        announced, seen[3],
+        "a re-mint is a fresh token, not the old one"
+    );
+    assert!(
+        child.try_wait()?.is_none(),
+        "a SIGHUP does not stop the server"
+    );
     child.kill().await?;
+
+    // With the server gone, `--remint` refuses naming why.
+    child.wait().await?;
+    let refused =
+        horde_server_with_env(&["--remint", "--state-dir", &state.to_string_lossy()], &[]).await?;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("no server is running"),
+        "{refused:?}"
+    );
     Ok(())
 }

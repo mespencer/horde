@@ -85,6 +85,8 @@ pub enum Invocation {
     CheckOnly { database: String },
     /// `--serve`: the networked server.
     Serve(Box<ServeConfig>),
+    /// `--remint`: have the server on this state re-mint its bootstrap token.
+    Remint { state_dir: PathBuf },
     /// `--help` or `--version`: text for stdout, then a successful exit.
     Print(String),
 }
@@ -100,11 +102,13 @@ pub enum Invocation {
     name = "horde-server",
     version,
     about = "The Horde control plane: the event log, the mTLS listeners, and the enrollment CA.",
-    group = clap::ArgGroup::new("mode").required(true).args(["serve", "check"])
+    group = clap::ArgGroup::new("mode").required(true).args(["serve", "check", "remint"]),
+    group = clap::ArgGroup::new("stateful").multiple(false).args(["serve", "remint"])
 )]
 struct ServerArgs {
     /// The event log's SQLite file. Defaults to `~/.horde/server/horde.db`
     /// (inside the default state directory).
+    #[arg(conflicts_with = "remint")]
     database: Option<PathBuf>,
 
     /// Run the networked server.
@@ -115,9 +119,16 @@ struct ServerArgs {
     #[arg(long)]
     check: bool,
 
+    /// Ask the server running on this state directory to re-mint its
+    /// bootstrap client token (it was printed at start and may have
+    /// expired), and print the fresh one. Same-machine only: the state
+    /// directory is the trust.
+    #[arg(long)]
+    remint: bool,
+
     /// Where the CA, blobs, and bootstrap token live. Defaults to
     /// `~/.horde/server`, created owner-only.
-    #[arg(long, requires = "serve")]
+    #[arg(long, requires = "stateful")]
     state_dir: Option<PathBuf>,
 
     /// The mTLS listener both spines share.
@@ -134,8 +145,10 @@ struct ServerArgs {
 
     /// An extra name the listener certificate answers to — the host other
     /// machines dial. Repeatable. Join tokens name the first one when the
-    /// listener binds the unspecified address.
-    #[arg(long = "san", requires = "serve")]
+    /// listener binds the unspecified address. Must be an IP literal or a
+    /// well-formed host name: an obvious typo is refused here rather than
+    /// minted into the certificate every joiner pins.
+    #[arg(long = "san", requires = "serve", value_parser = subject_name)]
     subject_names: Vec<String>,
 
     /// The blob store's per-blob cap in bytes.
@@ -146,6 +159,11 @@ struct ServerArgs {
     /// declared lost.
     #[arg(long, requires = "serve", value_parser = clap::value_parser!(u64).range(1..))]
     worker_lease: Option<u64>,
+}
+
+/// `--san`'s parser: the name, once it passes the certificate-name checks.
+fn subject_name(value: &str) -> Result<String, String> {
+    horde_identity::check_subject_name(value).map(|()| value.to_owned())
 }
 
 /// Parses the command line, defaulting under `$HOME`.
@@ -186,6 +204,9 @@ pub fn invocation_in(
             return Err("HOME is unset, so pass --state-dir (and a database path)".to_owned());
         }
     };
+    if args.remint {
+        return Ok(Invocation::Remint { state_dir });
+    }
     let database = args
         .database
         .unwrap_or_else(|| state_dir.join(DATABASE_FILE))
@@ -254,6 +275,71 @@ pub struct RunningServer {
     /// live in a deployed server, not only in tests. Held so its lifetime is
     /// the server's.
     pub permission_chain: ChainTask,
+    /// The enrollment authority both listeners share, kept so a hang-up can
+    /// re-mint the bootstrap code without a restart ([`Self::remint_bootstrap`]).
+    authority: Arc<EnrollmentAuthority>,
+    /// Where the bootstrap-token file lives.
+    state_dir: PathBuf,
+}
+
+/// The operator line a re-mint that found the bootstrap door closed prints.
+pub const BOOTSTRAP_CLOSED_LINE: &str = "bootstrap-closed a client is enrolled; mint a code from it \
+     with `horde enroll client <name>`";
+
+impl RunningServer {
+    /// Re-mints the bootstrap code on a running server (ADR-0007's deferred
+    /// re-mint): a fresh code and token file while no client is enrolled —
+    /// the earlier code stays redeemable until its own expiry — or, once
+    /// one is, the file retired and the closed door named. Returns the
+    /// operator line to print.
+    ///
+    /// # Errors
+    ///
+    /// The mint, the log, or the token file failing.
+    pub async fn remint_bootstrap(&mut self) -> Result<String, ServerError> {
+        let code = bootstrap_code_if_unclaimed(&self.authority, wall_clock_ms()).await?;
+        sync_bootstrap_token_file(&self.state_dir, code.as_ref(), &self.advertised_enrollment)?;
+        self.bootstrap_code = code;
+        Ok(self
+            .bootstrap_line()
+            .unwrap_or_else(|| BOOTSTRAP_CLOSED_LINE.to_owned()))
+    }
+
+    /// The `bootstrap-client-token` line, while a bootstrap code is open.
+    fn bootstrap_line(&self) -> Option<String> {
+        self.bootstrap_code.as_ref().map(|code| {
+            format!(
+                "bootstrap-client-token {}",
+                join_token_of(code, &self.advertised_enrollment)
+            )
+        })
+    }
+}
+
+/// Holds a running server up until `shutdown` resolves, re-minting its
+/// bootstrap code on every `hangups` message (the binary forwards SIGHUP
+/// there) and handing each resulting operator line to `announce`. A closed
+/// `hangups` only stops the re-minting; the server stays up.
+pub async fn hold_until(
+    running: &mut RunningServer,
+    shutdown: impl std::future::Future<Output = ()>,
+    hangups: &mut tokio::sync::mpsc::Receiver<()>,
+    announce: &mut (dyn FnMut(String) + Send),
+) {
+    tokio::pin!(shutdown);
+    let mut listening = true;
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return,
+            got = hangups.recv(), if listening => match got {
+                Some(()) => announce(match running.remint_bootstrap().await {
+                    Ok(line) => line,
+                    Err(error) => format!("bootstrap-remint-failed {error}"),
+                }),
+                None => listening = false,
+            },
+        }
+    }
 }
 
 /// The chain driver's task, stopped when the server is dropped — the same
@@ -336,9 +422,12 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let hub_lines = warm_hub(&core).await?;
 
     let main = crate::transport::serve_main(main_listener, core, Arc::clone(&authority)).await?;
-    let enrollment = crate::transport::serve_enrollment(enrollment_listener, authority).await?;
+    let enrollment =
+        crate::transport::serve_enrollment(enrollment_listener, Arc::clone(&authority)).await?;
 
     Ok(RunningServer {
+        authority,
+        state_dir: config.state_dir.clone(),
         main,
         enrollment,
         server_fingerprint,
@@ -593,15 +682,10 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
         lines.push(format!("listening relay={}", relay.server.addr()));
     }
     lines.extend(running.hub_lines.iter().cloned());
-    if let Some(code) = &running.bootstrap_code {
-        // The same token the state dir's bootstrap-token file carries: the
-        // stdout line and the file must never disagree about what is
-        // mintable (ADR-0007).
-        lines.push(format!(
-            "bootstrap-client-token {}",
-            join_token_of(code, &running.advertised_enrollment)
-        ));
-    }
+    // The same token the state dir's bootstrap-token file carries: the
+    // stdout line and the file must never disagree about what is mintable
+    // (ADR-0007).
+    lines.extend(running.bootstrap_line());
     lines
 }
 
@@ -804,6 +888,13 @@ mod tests {
             (&["--serve", "--worker-lease", "soon"][..], "soon"),
             (&["--serve", "--worker-lease", "0"][..], "--worker-lease"),
             (&["--serve", "a.db", "b.db"][..], "b.db"),
+            // An obviously invalid certificate name is refused at mint time,
+            // naming the name and what is wrong with it.
+            (
+                &["--serve", "--san", "https://box.lan"][..],
+                "\"https://box.lan\" is not a usable certificate name",
+            ),
+            (&["--serve", "--san", "box.lan:7777"][..], "port"),
         ] {
             let refused = parsed(arguments).expect_err("must refuse");
             assert!(
@@ -1135,6 +1226,203 @@ mod tests {
         assert!(
             !token_file.exists(),
             "a client-holding restart removes the stale file"
+        );
+    }
+
+    #[test]
+    fn remint_names_its_state_and_takes_no_database() {
+        assert_eq!(
+            parsed(&["--remint", "--state-dir", "/srv/horde"]),
+            Ok(super::Invocation::Remint {
+                state_dir: "/srv/horde".into()
+            })
+        );
+        assert_eq!(
+            parsed(&["--remint"]),
+            Ok(super::Invocation::Remint {
+                state_dir: "/home/me/.horde/server".into()
+            })
+        );
+        for refused in [
+            &["--remint", "x.db"][..],
+            &["--remint", "--serve"][..],
+            &["--check", "--state-dir", "/x"][..],
+        ] {
+            assert!(parsed(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    fn redeem(token: &str) -> horde_identity::JoinToken {
+        horde_identity::JoinToken::parse(token.trim()).expect("the token parses")
+    }
+
+    /// The re-mint end to end, minus only the signal: `--remint`'s side
+    /// finds this server by its state lock and asks through the channel the
+    /// binary feeds from SIGHUP; the held server mints, files, and
+    /// announces a fresh token, which redeems — and once a client exists,
+    /// the next ask is refused naming the closed door.
+    #[tokio::test]
+    async fn a_running_server_remints_its_bootstrap_token_on_request() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(&directory, None);
+        let mut running = super::serve(&config).await.expect("the server comes up");
+        let first = running.bootstrap_line().expect("a first token");
+        let pid = std::process::id();
+
+        let (ask, mut hangups) = tokio::sync::mpsc::channel(1);
+        let (stop, shutdown) = tokio::sync::oneshot::channel::<()>();
+        let (announce, mut announced) = tokio::sync::mpsc::unbounded_channel();
+        let held = tokio::spawn(async move {
+            super::hold_until(
+                &mut running,
+                async move {
+                    let _ = shutdown.await;
+                },
+                &mut hangups,
+                &mut |line| {
+                    let _ = announce.send(line);
+                },
+            )
+            .await;
+            running
+        });
+        let mut next_line = async || {
+            tokio::time::timeout(std::time::Duration::from_secs(10), announced.recv())
+                .await
+                .expect("an announcement")
+                .expect("the hold is alive")
+        };
+
+        let asked = ask.clone();
+        let fresh = crate::remint::remint_running(
+            &config.state_dir,
+            move |signalled| {
+                assert_eq!(signalled, pid, "the lock names this server");
+                asked.try_send(()).map_err(std::io::Error::other)
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("a fresh token");
+        assert_ne!(format!("bootstrap-client-token {fresh}"), first);
+        assert_eq!(next_line().await, format!("bootstrap-client-token {fresh}"));
+        let enrolled = horde_identity::join(
+            &redeem(&fresh).enrollment_endpoint(),
+            &redeem(&fresh).code,
+            horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                capability_flags: Vec::new(),
+                role: horde_proto::v1::Role::Client as i32,
+                display_name: "remint".to_owned(),
+            },
+        )
+        .await
+        .expect("the re-minted token enrolls");
+        assert_eq!(enrolled.principal.to_string(), "client:operator");
+
+        let closed = crate::remint::remint_running(
+            &config.state_dir,
+            |_| panic!("a closed door is refused before any signal"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a client exists");
+        assert!(closed.contains("horde enroll client"), "{closed}");
+
+        // Asked directly, the held server retires the door and says so.
+        ask.send(()).await.expect("the hold listens");
+        assert_eq!(next_line().await, super::BOOTSTRAP_CLOSED_LINE);
+        // A closed hang-up channel stops only the re-minting: the hold
+        // stays up until shutdown, which then ends it.
+        drop(ask);
+        tokio::task::yield_now().await;
+        assert!(!held.is_finished(), "the server outlives its SIGHUP feed");
+        let _ = stop.send(());
+        let running = tokio::time::timeout(std::time::Duration::from_secs(10), held)
+            .await
+            .expect("the hold ends on shutdown")
+            .expect("the hold task");
+        assert!(running.bootstrap_code.is_none());
+    }
+
+    /// A re-mint that cannot file its token says so on the operator
+    /// interface instead of ending the server.
+    #[tokio::test]
+    async fn a_failed_remint_is_announced_and_the_server_holds() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(&directory, None);
+        let mut running = super::serve(&config).await.expect("the server comes up");
+        let token_file = super::bootstrap_token_path(&config.state_dir);
+        std::fs::remove_file(&token_file).expect("the token file goes");
+        std::fs::create_dir(&token_file).expect("a directory squats its path");
+
+        let (ask, mut hangups) = tokio::sync::mpsc::channel(1);
+        ask.send(()).await.expect("queued");
+        drop(ask);
+        let mut announced = Vec::new();
+        let shutdown = tokio::time::sleep(std::time::Duration::from_millis(300));
+        super::hold_until(&mut running, shutdown, &mut hangups, &mut |line| {
+            announced.push(line);
+        })
+        .await;
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert!(
+            announced[0].starts_with("bootstrap-remint-failed "),
+            "{announced:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remint_refuses_without_a_server_and_bounds_its_wait() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let refused = crate::remint::remint_running(
+            directory.path(),
+            |_| panic!("nobody to signal"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("no server");
+        assert!(refused.contains("no server is running"), "{refused}");
+
+        // A held lock and a token that never changes: the wait gives up.
+        let _held = horde_identity::StateLock::acquire(directory.path(), super::STATE_LOCK_FILE)
+            .expect("the lock");
+        std::fs::write(super::bootstrap_token_path(directory.path()), "same\n").expect("token");
+        let silent = crate::remint::remint_running(
+            directory.path(),
+            |_| Ok(()),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect_err("nothing re-minted");
+        assert!(silent.contains("did not re-mint"), "{silent}");
+        let unsignalled = crate::remint::remint_running(
+            directory.path(),
+            |_| Err(std::io::Error::other("no such process")),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the signal failed");
+        assert!(unsignalled.contains("could not signal"), "{unsignalled}");
+    }
+
+    #[tokio::test]
+    async fn a_hangup_reaches_a_real_process_and_a_dead_pid_is_refused() {
+        let mut sleeper = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep spawns");
+        let pid = sleeper.id().expect("a pid");
+        crate::remint::send_hangup(pid).expect("the hang-up sends");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), sleeper.wait())
+            .await
+            .expect("SIGHUP ends sleep")
+            .expect("a status");
+        assert!(!ended.success());
+        assert!(
+            crate::remint::send_hangup(pid).is_err(),
+            "a reaped pid refuses"
         );
     }
 }
