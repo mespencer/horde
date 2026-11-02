@@ -46,6 +46,11 @@ pub enum Update {
     /// [`Update::Sessions`], not a fold: the log deliberately carries no
     /// listener state, so a fold could never say "unbacked".
     Forwards(Vec<horde_proto::v1::ForwardStatus>),
+    /// The follow stream closed — the server hung up, or refused the
+    /// subscription. Carries why, when the runtime knows; empty for a clean
+    /// end-of-stream. Nothing more will arrive, and saying so beats a feed
+    /// that silently freezes until the stale badge eventually guesses.
+    StreamEnded { reason: String },
 }
 
 /// How long the stream may say nothing — no events, no heartbeats — before
@@ -145,6 +150,10 @@ pub struct App {
     last_stream_activity: Option<std::time::Instant>,
     /// Judged on each [`Update::Tick`] against [`STALE_AFTER`].
     stream_stale: bool,
+    /// Set once the follow stream has closed, with its reason (possibly
+    /// empty). Never cleared: this loop opens one stream and does not
+    /// reopen it, so an ended stream stays ended.
+    stream_ended: Option<String>,
     quit: bool,
 }
 
@@ -166,6 +175,7 @@ impl App {
             launched_scope: None,
             last_stream_activity: None,
             stream_stale: false,
+            stream_ended: None,
             quit: false,
         }
     }
@@ -226,6 +236,17 @@ impl App {
         self.sessions.get(session_id)
     }
 
+    /// What a human calls the session with this id: its title once known,
+    /// a short id prefix otherwise — including for a session this App has
+    /// never heard of (a forward can name one the stream has not replayed).
+    #[must_use]
+    pub fn session_name(&self, session_id: &str) -> String {
+        self.sessions.get(session_id).map_or_else(
+            || crate::state::short_id(session_id),
+            SessionState::display_name,
+        )
+    }
+
     /// Sessions in stable id order — the overview's rows.
     #[must_use]
     pub fn sessions_in_order(&self) -> Vec<&SessionState> {
@@ -274,7 +295,7 @@ impl App {
                     .into_iter()
                     .map(|permission| InboxEntry {
                         session_id: session.session_id.clone(),
-                        title: session.title.clone(),
+                        title: session.display_name(),
                         permission: permission.clone(),
                     })
             })
@@ -357,7 +378,15 @@ impl App {
                     .forwards_selected
                     .min(self.forwards.len().saturating_sub(1));
             }
+            Update::StreamEnded { reason } => self.stream_ended = Some(reason),
         }
+    }
+
+    /// Why the follow stream ended — `Some("")` for a clean close, `None`
+    /// while it is still open.
+    #[must_use]
+    pub fn stream_ended(&self) -> Option<&str> {
+        self.stream_ended.as_deref()
     }
 
     /// Every stream-borne update — an event, a caught-up, a heartbeat — is
@@ -1280,5 +1309,29 @@ mod tests {
         let mut app = App::overview();
         app.report_error("the server said no");
         assert_eq!(app.status(), "the server said no");
+    }
+
+    /// An open stream has not ended; an ended one keeps its reason, and a
+    /// later heartbeat-shaped surprise does not reopen it.
+    #[test]
+    fn a_stream_ends_once_and_stays_ended() {
+        let mut app = App::overview();
+        assert_eq!(app.stream_ended(), None);
+        app.apply(Update::StreamEnded {
+            reason: "server unavailable".to_owned(),
+        });
+        app.apply(Update::Heartbeat);
+        assert_eq!(app.stream_ended(), Some("server unavailable"));
+    }
+
+    /// Sessions answer to their titles; a known but untitled session, and
+    /// one this App has never heard of, answer to a short id.
+    #[test]
+    fn a_session_is_named_by_title_or_short_id() {
+        let mut app = App::attached("0123456789-untitled", None);
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        assert_eq!(app.session_name("s1"), "ci-fix");
+        assert_eq!(app.session_name("0123456789-untitled"), "01234567");
+        assert_eq!(app.session_name("abcdefghij-unknown"), "abcdefgh");
     }
 }

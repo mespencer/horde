@@ -3,9 +3,9 @@ source: crates/horde-tui/tests/render.rs
 expression: drawn(&app)
 ---
 " forwards                                                                       "
-"  vite  expose 5173  session s1  worker ok                                      "
-"> db  inject 15432  session s1  worker ok  backed by laptop                     "
-"  cache  inject 15432  session s1  worker unreachable  UNBACKED — desk is detach"
+"  vite  expose 5173  session ci-fix  worker ok                                  "
+"> db  inject 15432  session ci-fix  worker ok  backed by laptop                 "
+"  cache  inject 15432  session ci-fix  worker unreachable  UNBACKED — desk is de"
 "                                                                                "
 "                                                                                "
 "                                                                                "

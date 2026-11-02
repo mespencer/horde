@@ -7,7 +7,7 @@
 //! yet, which is exactly what makes it correct under replay and reconnect
 //! (ADR-0001: sync-from-offset is the one mechanism).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use horde_proto::v1::{
     AgentLifecycleState, AgentOutputChannel, Event, EventEnvelope, PermissionOutcome,
@@ -66,8 +66,24 @@ pub struct SessionState {
     pub agents: BTreeMap<String, AgentNode>,
     /// Escalations awaiting a human, by request id.
     pub pending: BTreeMap<String, PendingPermission>,
-    pub feed: Vec<FeedLine>,
+    /// The most recent [`FEED_CAPACITY`] lines, oldest first. Bounded: a
+    /// session attached for a day must not grow the client without limit,
+    /// and the log — not the feed — is the record.
+    pub feed: VecDeque<FeedLine>,
 }
+
+/// How many feed lines a session keeps. Far more than any terminal shows or
+/// a human scrolls back through; older lines fall off the front.
+pub const FEED_CAPACITY: usize = 2_000;
+
+/// How many characters of an id stand in for it when there is no name, once
+/// its kind stem is gone: the short-prefix convention git uses.
+pub const SHORT_ID_LEN: usize = 8;
+
+/// The kind stems server-minted ids open with (`session-…`, `agent-…`).
+/// Every id of a kind shares its stem, so a prefix that keeps it spends
+/// most of its characters saying nothing.
+const ID_STEMS: [&str; 2] = ["session-", "agent-"];
 
 impl SessionState {
     #[must_use]
@@ -103,7 +119,7 @@ impl SessionState {
         let Some(event) = envelope.event.as_ref() else {
             // An event with no body is still a position in the log; dropping
             // it would make the feed's sequence column look gapped.
-            self.feed.push(FeedLine {
+            self.push_feed(FeedLine {
                 sequence: envelope.sequence,
                 agent_id: String::new(),
                 label: "unknown",
@@ -113,7 +129,41 @@ impl SessionState {
         };
 
         self.fold(envelope.sequence, event);
-        self.feed.push(feed_line(envelope.sequence, event));
+        if !is_internal(event) {
+            self.push_feed(feed_line(envelope.sequence, event));
+        }
+    }
+
+    /// Appends one line, dropping the oldest once the feed is full.
+    fn push_feed(&mut self, line: FeedLine) {
+        if self.feed.len() >= FEED_CAPACITY {
+            self.feed.pop_front();
+        }
+        self.feed.push_back(line);
+    }
+
+    /// What a human calls this session: its title, or a short id while it
+    /// has none.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        if self.title.is_empty() {
+            short_id(&self.session_id)
+        } else {
+            self.title.clone()
+        }
+    }
+
+    /// What a human calls an agent: the last element of its spawn-time tree
+    /// path (its own display name), or a short id for an agent the replay
+    /// never saw spawn. Empty for session-scoped events, which have no agent.
+    #[must_use]
+    pub fn agent_name(&self, agent_id: &str) -> String {
+        self.agents
+            .get(agent_id)
+            .and_then(|node| node.tree_path.last())
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_else(|| short_id(agent_id))
     }
 
     /// The state-changing half of [`Self::apply`]: tree, inbox, lifecycle.
@@ -226,6 +276,30 @@ impl SessionState {
         }
         false
     }
+}
+
+/// Whether an event is the harness talking to itself — warnings, retries,
+/// rate-limit notices (`HARNESS_DIAGNOSTIC`). Still folded, never fed: a
+/// human steering an agent reads what the agent said and what happened to
+/// it, and the CLI's `sync` remains the place to read the raw log.
+fn is_internal(event: &Event) -> bool {
+    matches!(
+        event.kind.as_ref(),
+        Some(Kind::AgentOutputChunk(chunk))
+            if chunk.channel == AgentOutputChannel::HarnessDiagnostic as i32
+    )
+}
+
+/// The first [`SHORT_ID_LEN`] characters of an id after its kind stem —
+/// `session-18f3a2b4c5d6-0` shows as `18f3a2b4`. Display only: unlike the
+/// CLI's resolvable short ids, nothing parses this back.
+#[must_use]
+pub fn short_id(id: &str) -> String {
+    let unstemmed = ID_STEMS
+        .iter()
+        .find_map(|stem| id.strip_prefix(stem))
+        .unwrap_or(id);
+    unstemmed.chars().take(SHORT_ID_LEN).collect()
 }
 
 /// Renders one event into its feed line. Total: an event kind this build does
@@ -520,7 +594,86 @@ mod tests {
         WorkspaceInstanceChanged, WorkspaceInstanceReport, event::Kind,
     };
 
-    use super::{AgentNode, SessionState};
+    use super::{AgentNode, FEED_CAPACITY, SessionState, short_id};
+
+    fn chunk(channel: AgentOutputChannel, text: &str) -> Kind {
+        Kind::AgentOutputChunk(AgentOutputChunk {
+            channel: channel as i32,
+            text: text.to_owned(),
+            ..AgentOutputChunk::default()
+        })
+    }
+
+    /// The feed keeps the newest [`FEED_CAPACITY`] lines and no more: the
+    /// oldest falls off the front, exactly one per line past the cap.
+    #[test]
+    fn the_feed_is_bounded_and_drops_its_oldest_lines() {
+        let mut state = SessionState::new("s1");
+        let total = FEED_CAPACITY as u64 + 3;
+        for sequence in 1..=total {
+            state.apply(&envelope(
+                sequence,
+                "a1",
+                chunk(AgentOutputChannel::Assistant, "x"),
+            ));
+        }
+        assert_eq!(state.feed.len(), FEED_CAPACITY);
+        assert_eq!(state.feed.front().map(|line| line.sequence), Some(4));
+        assert_eq!(state.feed.back().map(|line| line.sequence), Some(total));
+        assert_eq!(
+            state.head, total,
+            "trimming the feed never rewinds the head"
+        );
+    }
+
+    /// Harness diagnostics are the harness talking to itself: they advance
+    /// the head but never reach the feed. Every other channel still does.
+    #[test]
+    fn harness_diagnostics_stay_out_of_the_feed() {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(
+            1,
+            "a1",
+            chunk(AgentOutputChannel::HarnessDiagnostic, "retrying"),
+        ));
+        assert!(state.feed.is_empty(), "a diagnostic is not a feed line");
+        assert_eq!(state.head, 1);
+        state.apply(&envelope(
+            2,
+            "a1",
+            chunk(AgentOutputChannel::Reasoning, "hmm"),
+        ));
+        assert_eq!(
+            state.feed.len(),
+            1,
+            "reasoning is the agent, not the harness"
+        );
+    }
+
+    /// Names, not raw ids: an agent answers to its own tree-path name, a
+    /// session to its title; either falls back to a short id prefix when
+    /// nothing better is known, and an empty id stays empty.
+    #[test]
+    fn agents_and_sessions_answer_to_names_with_a_short_id_fallback() {
+        let mut state = SessionState::new("0123456789abcdef");
+        assert_eq!(state.display_name(), "01234567");
+        state.apply(&envelope(1, "agent-root-xyz", spawned(None, &["ci-fix"])));
+        state.apply(&envelope(
+            2,
+            "agent-child-xyz",
+            spawned(Some("agent-root-xyz"), &["ci-fix", "reviewer"]),
+        ));
+        state.apply(&envelope(3, "agent-blank-xyz", spawned(None, &[""])));
+        assert_eq!(state.display_name(), "ci-fix");
+        assert_eq!(state.agent_name("agent-root-xyz"), "ci-fix");
+        assert_eq!(state.agent_name("agent-child-xyz"), "reviewer");
+        assert_eq!(state.agent_name("agent-blank-xyz"), "blank-xy");
+        assert_eq!(state.agent_name("never-spawned-1"), "never-sp");
+        assert_eq!(state.agent_name(""), "");
+        assert_eq!(short_id("abc"), "abc", "a short id never pads");
+        assert_eq!(short_id("session-18f3a2b4c5d6-0"), "18f3a2b4");
+        assert_eq!(short_id("session-key-1-root"), "key-1-ro");
+    }
 
     /// One event at a log position, about one agent.
     fn envelope(sequence: u64, agent: &str, kind: Kind) -> EventEnvelope {
@@ -694,7 +847,7 @@ mod tests {
         for (kind, label, text) in cases {
             let mut state = SessionState::new("s1");
             state.apply(&envelope(3, "agent-1", kind));
-            let line = state.feed.last().expect("a feed line per event");
+            let line = state.feed.back().expect("a feed line per event");
             assert_eq!(line.label, label);
             assert_eq!(line.text, text, "for label {label}");
             assert_eq!(line.sequence, 3);
@@ -729,7 +882,7 @@ mod tests {
         ] {
             let mut state = SessionState::new("s1");
             state.apply(&envelope(1, "", kind));
-            let line = state.feed.last().expect("a feed line");
+            let line = state.feed.back().expect("a feed line");
             assert_eq!(line.label, label);
             assert_eq!(line.text, "");
         }
@@ -747,7 +900,7 @@ mod tests {
             event: None,
         });
         assert_eq!(state.head, 9);
-        let line = state.feed.last().expect("a line for the position");
+        let line = state.feed.back().expect("a line for the position");
         assert_eq!((line.label, line.sequence), ("unknown", 9));
     }
 

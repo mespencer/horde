@@ -2,7 +2,7 @@
 source: crates/horde-tui/tests/render.rs
 expression: drawn(&app)
 ---
-" s1  ci-fix  attached: session root  (syncing)                                  "
+" ci-fix  s1  attached: session root  (syncing)                                  "
 "                                                                                "
 "                                                                                "
 "                                                                                "

@@ -26,6 +26,30 @@ fn spawn_horde(endpoint: &str, args: &[&str]) -> Setup<PtyProcess> {
     PtyProcess::spawn(command)
 }
 
+const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+
+/// Waits for the way-out sequence and pins the terminal it leaves behind:
+/// the alternate screen left, and the cursor's *last* word being "shown" —
+/// a TUI that hides the cursor to draw and exits without showing it again
+/// leaves the user's shell with no cursor at all.
+async fn await_restored(horde: &mut PtyProcess) -> Setup<()> {
+    horde.await_painted(LEAVE_ALTERNATE_SCREEN).await?;
+    horde.await_painted(SHOW_CURSOR).await?;
+    assert!(
+        horde.seen.rfind(SHOW_CURSOR) > horde.seen.rfind(HIDE_CURSOR),
+        "the cursor must end visible: {:?}",
+        horde.seen
+    );
+    Ok(())
+}
+
+/// The id prefix the TUI shows beside a session's name.
+fn short(session_id: &str) -> String {
+    horde_tui::state::short_id(session_id)
+}
+
 /// ADR-0008's front door, arm two: exactly one live session skips the picker
 /// and attaches — bare `horde` puts the human in front of that session.
 #[tokio::test]
@@ -47,7 +71,7 @@ async fn bare_horde_with_one_session_attaches_it_directly() {
         .await
         .expect("the attached session is the seeded one");
     assert!(
-        horde.seen.contains(&session_id),
+        horde.seen.contains(&short(&session_id)),
         "the header names the session that was entered"
     );
 
@@ -200,23 +224,34 @@ async fn horde_new_with_a_terminal_creates_and_attaches() {
 /// dismissal is a decision, not a failure.
 #[tokio::test]
 async fn the_picker_dismisses_on_esc_without_attaching() {
-    let endpoint = serve().await.expect("a listening server");
-    let (mut client, _, _) = seeded(&endpoint, "stay-out")
+    leave_the_picker_with(&[0x1b])
         .await
-        .expect("a seeded session");
-    client
-        .create_session("stay-away", "key-2")
-        .await
-        .expect("a second session");
+        .expect("esc dismisses the picker");
+}
 
-    let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
-    horde
-        .await_painted("pick")
+/// Raw mode turns Ctrl-C into a keypress, so the picker must honour it
+/// itself: it leaves cleanly, attaches nothing, and gives the cursor back.
+#[tokio::test]
+async fn ctrl_c_leaves_the_picker_without_attaching() {
+    leave_the_picker_with(&[0x03])
         .await
-        .expect("the picker paints");
-    horde.type_bytes(&[0x1b]).expect("esc reaches the pty");
+        .expect("ctrl-c dismisses the picker");
+}
+
+/// Opens the picker over two sessions, types `key`, and pins a clean
+/// dismissal: success, nothing attached, the terminal restored (cursor
+/// included).
+async fn leave_the_picker_with(key: &[u8]) -> Setup<()> {
+    let endpoint = serve().await?;
+    let (mut client, _, _) = seeded(&endpoint, "stay-out").await?;
+    client.create_session("stay-away", "key-2").await?;
+
+    let mut horde = spawn_horde(&endpoint, &[])?;
+    horde.await_painted("pick").await?;
+    horde.type_bytes(key)?;
+    await_restored(&mut horde).await?;
     let seen = horde.seen.clone();
-    let status = horde.exit_status().await.expect("the process exits");
+    let status = horde.exit_status().await?;
     assert!(
         status.success(),
         "a dismissal exits cleanly, got {status:?}"
@@ -225,6 +260,7 @@ async fn the_picker_dismisses_on_esc_without_attaching() {
         !seen.contains("attached:"),
         "nothing may have been attached: {seen:?}"
     );
+    Ok(())
 }
 
 #[tokio::test]
@@ -244,7 +280,7 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
         .await
         .expect("the session view must reach the real terminal");
     horde
-        .await_painted(&session_id)
+        .await_painted(&short(&session_id))
         .await
         .expect("the name resolved to the seeded session's id");
     horde
@@ -253,6 +289,9 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
         .expect("the replayed root spawn must be painted into the feed");
 
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
+    await_restored(&mut horde)
+        .await
+        .expect("ctrl-c restores the terminal, cursor included");
     let status = horde.exit_status().await.expect("the TUI exits");
     assert!(
         status.success(),

@@ -53,13 +53,11 @@ pub async fn enter(client: &mut Client, interactive: bool) -> Result<(), ClientE
         Entry::Create => create_and_attach(client).await,
         Entry::Attach(session_id) => attach_if_still_live(client, &session_id).await,
         Entry::Pick => {
-            let terminal = ratatui::try_init().map_err(ClientError::Terminal)?;
+            // Restored (cursor included) before any error is reported, same
+            // as `tui::launch`: a refusal printed into raw mode is unreadable.
+            let (terminal, _restore) = crate::tui::RawTerminal::engage()?;
             let input = crate::tui::spawn_input_reader();
-            let outcome = pick_and_enter(client, terminal, input, &sessions).await;
-            // Restored before any error is reported, same as `tui::launch`:
-            // a refusal printed into raw mode is unreadable.
-            ratatui::restore();
-            outcome
+            pick_and_enter(client, terminal, input, &sessions).await
         }
     }
 }

@@ -3,8 +3,8 @@ source: crates/horde-tui/tests/render.rs
 expression: drawn(&app)
 ---
 " inbox  — 2 waiting                                                             "
-"  s1  ci-fix > reviewer > test-runner wants `docker rm horde-test`  (mode cautio"
-"> s2  write the docs wants `rm -rf ./stale-docs`  (mode cautious)               "
+"  ci-fix  ci-fix > reviewer > test-runner wants `docker rm horde-test`  (mode ca"
+"> write the docs  write the docs wants `rm -rf ./stale-docs`  (mode cautious)   "
 "                                                                                "
 "                                                                                "
 "                                                                                "
