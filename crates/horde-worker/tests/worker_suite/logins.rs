@@ -71,6 +71,24 @@ async fn announce_reaches(
     );
 }
 
+/// A server on loopback and a login plane whose one provider, `fake`, signs
+/// in with `recipe`, its operator lines readable by the test.
+async fn plane_over_a_server(
+    recipe: horde_adapter::LoginRecipe,
+) -> (
+    ServerCore,
+    String,
+    Arc<horde_worker::login::LoginPlane>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
+    let endpoint = serve(core.clone()).await;
+    let (announce, lines) = announcing();
+    let recipes = std::collections::BTreeMap::from([("fake".to_owned(), recipe)]);
+    let plane = Arc::new(horde_worker::login::LoginPlane::new(recipes, announce));
+    (core, endpoint, plane, lines)
+}
+
 /// The whole worker half over the real spine: the plane registers its
 /// dispatch stream, a client's open reaches it, the PTY spawns and attaches
 /// (the client hears accepted — a handle hollowed to nothing leaves the
@@ -78,19 +96,12 @@ async fn announce_reaches(
 /// provably reaps the command, announced only after the wait returned.
 #[tokio::test]
 async fn a_real_login_dispatch_is_answered_and_a_vanished_client_reaped() {
-    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
-    let endpoint = serve(core.clone()).await;
-
-    let (announce, mut lines) = announcing();
-    let mut recipes = std::collections::BTreeMap::new();
-    recipes.insert(
-        "fake".to_owned(),
-        horde_adapter::LoginRecipe::terminal_only(
+    let (core, endpoint, plane, mut lines) =
+        plane_over_a_server(horde_adapter::LoginRecipe::terminal_only(
             "/bin/sh",
             vec!["-c".to_owned(), "read line; printf ok".to_owned()],
-        ),
-    );
-    let plane = Arc::new(horde_worker::login::LoginPlane::new(recipes, announce));
+        ))
+        .await;
 
     let worker_client =
         horde_proto::v1::worker_service_client::WorkerServiceClient::connect(endpoint.clone())
@@ -166,14 +177,8 @@ async fn placement_of(endpoint: &str, session_id: &str, agent: &str) -> Option<i
 /// agent bound to the account launches under — and the queued spawn places.
 #[tokio::test]
 async fn an_account_login_makes_a_spawn_requiring_that_account_placeable() {
-    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
-    let endpoint = serve(core.clone()).await;
     let profile = tempfile::tempdir().expect("a profile root");
-
-    let (announce, mut lines) = announcing();
-    let mut recipes = std::collections::BTreeMap::new();
-    recipes.insert(
-        "fake".to_owned(),
+    let (core, endpoint, plane, mut lines) = plane_over_a_server(
         horde_adapter::LoginRecipe::terminal_only(
             "/bin/sh",
             vec![
@@ -182,8 +187,8 @@ async fn an_account_login_makes_a_spawn_requiring_that_account_placeable() {
             ],
         )
         .with_accounts("FAKE_CONFIG_DIR", profile.path()),
-    );
-    let plane = Arc::new(horde_worker::login::LoginPlane::new(recipes, announce));
+    )
+    .await;
     assert!(
         plane.held_accounts().is_empty(),
         "nothing is signed in yet, so nothing is advertised"
