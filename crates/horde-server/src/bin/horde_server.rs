@@ -8,7 +8,7 @@
 
 use std::process::ExitCode;
 
-use horde_server::startup::{Invocation, invocation, open_log, serve};
+use horde_server::startup::{Invocation, invocation, open_log};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
@@ -88,22 +88,12 @@ fn check_only(database: &str) -> ExitCode {
 /// [`horde_server::startup::operator_lines`], where it is tested; this stays
 /// plumbing an exit code, like `main`.
 async fn serve_until_interrupted(config: &horde_server::startup::ServeConfig) -> ExitCode {
-    // SIGHUP is caught before the state lock exists: `--remint` finds this
-    // process by that lock, and a hang-up landing before the handler would
-    // take SIGHUP's default action — ending the server.
-    let hangups = match forwarded_hangups() {
-        Ok(hangups) => hangups,
-        Err(error) => {
-            tracing::error!(%error, "could not listen for SIGHUP");
-            return ExitCode::FAILURE;
-        }
-    };
-    match serve(config).await {
+    match horde_server::startup::serve_with_hangups(config).await {
         Err(error) => {
             tracing::error!(%error, "horde-server failed to start");
             ExitCode::FAILURE
         }
-        Ok(running) => announce_and_wait(running, hangups).await,
+        Ok((running, hangups)) => announce_and_wait(running, hangups).await,
     }
 }
 
@@ -126,20 +116,6 @@ async fn announce_and_wait(
     })
     .await;
     ExitCode::SUCCESS
-}
-
-/// SIGHUP, as a channel `hold_until` can own.
-fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
-    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let (sender, receiver) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-        while signal.recv().await.is_some() {
-            if sender.send(()).await.is_err() {
-                return;
-            }
-        }
-    });
-    Ok(receiver)
 }
 
 /// `--remint`: signal the running server, print the fresh token.

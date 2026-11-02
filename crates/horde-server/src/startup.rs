@@ -357,6 +357,41 @@ impl Drop for ChainTask {
 
 /// Brings the networked server up (DESIGN §3, activated in wave 5).
 ///
+/// SIGHUP, as a channel [`hold_until`] can own. Installing it also replaces
+/// SIGHUP's default action (ending the process) for good.
+///
+/// # Errors
+///
+/// The signal handler failing to install.
+pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        while signal.recv().await.is_some() {
+            if sender.send(()).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(receiver)
+}
+
+/// `--serve`'s start: SIGHUP caught *before* the state lock exists —
+/// `--remint` finds this process by that lock, and a hang-up landing before
+/// the handler would end the server — then the server itself.
+///
+/// # Errors
+///
+/// The handler or the server failing to start, in words.
+pub async fn serve_with_hangups(
+    config: &ServeConfig,
+) -> Result<(RunningServer, tokio::sync::mpsc::Receiver<()>), String> {
+    let hangups =
+        forwarded_hangups().map_err(|error| format!("could not listen for SIGHUP: {error}"))?;
+    let running = serve(config).await.map_err(|error| error.to_string())?;
+    Ok((running, hangups))
+}
+
 /// The CA persists in the state directory and is created on first start; the
 /// listener credential is issued fresh each start (it never leaves the
 /// process, and peers verify it against the CA — only an in-flight join
@@ -1395,6 +1430,29 @@ mod tests {
         .await
         .expect_err("the signal failed");
         assert!(unsignalled.contains("could not signal"), "{unsignalled}");
+    }
+
+    /// `--serve`'s start catches SIGHUP before serving — a hang-up to this
+    /// very process arrives on the channel instead of ending it — and a
+    /// server that cannot start is refused in words.
+    #[tokio::test]
+    async fn serving_catches_hangups_first_and_refuses_a_held_state() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(&directory, None);
+        let (running, mut hangups) = super::serve_with_hangups(&config)
+            .await
+            .expect("the server starts");
+        crate::remint::send_hangup(std::process::id()).expect("a hang-up to ourselves");
+        tokio::time::timeout(std::time::Duration::from_secs(10), hangups.recv())
+            .await
+            .expect("the hang-up arrives within the ceiling")
+            .expect("the channel is open");
+
+        let refused = super::serve_with_hangups(&config)
+            .await
+            .expect_err("the state is held by the running server");
+        assert!(!refused.is_empty());
+        drop(running);
     }
 
     #[tokio::test]
