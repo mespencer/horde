@@ -358,9 +358,18 @@ fn placed_worker(placement: &horde_proto::v1::Placement) -> Option<String> {
 /// Returns the highest journal sequence durably stored — accepted or
 /// dead-lettered — which is what the worker needs in order to truncate.
 ///
+/// The whole batch is one transaction (ADR-0013): every entry is judged
+/// first, against the origin view as it stood when the batch arrived —
+/// exactly what the one-append-per-entry loop judged against, which caught
+/// the view up once per batch too — and then every resulting row, dead
+/// letters included, is appended in entry order with one commit. A key
+/// collision, only knowable at the append, is dead-lettered directly behind
+/// the write that collided, where the loop put it.
+///
 /// # Errors
 ///
-/// A batch from a stream that never named its worker, or the log failing.
+/// A batch from a stream that never named its worker, or the log failing —
+/// in which case nothing of the batch is stored, and the worker re-sends it.
 /// Never a refused event: those are dead letters.
 pub async fn ingest_batch(
     core: &ServerCore,
@@ -376,20 +385,78 @@ pub async fn ingest_batch(
     origins.catch_up(&core.log).await?;
 
     let mut highest = 0_u64;
+    let mut rows = Vec::with_capacity(events.len());
+    let mut landings = Vec::with_capacity(events.len());
     for journaled in events {
         highest = highest.max(journaled.journal_sequence);
-        ingest_one(core, origins, worker_id, journaled).await?;
+        let (row, landing) = planned(origins, worker_id, journaled);
+        rows.push(row);
+        landings.push(landing);
+    }
+
+    let landings = std::sync::Arc::new(landings);
+    let checked = std::sync::Arc::clone(&landings);
+    let appended = core
+        .log
+        .append_batch(rows, move |index, appended| {
+            checked
+                .get(index)
+                .and_then(Option::as_ref)
+                .and_then(|landing| landing.collided(appended))
+        })
+        .await?;
+
+    // A journaled instance report is also the freshest fact about that
+    // worker's disk, so the cache placement reads hears it too — once it
+    // has landed.
+    for (landing, appended) in landings.iter().zip(&appended) {
+        if let Some(landing) = landing
+            && landing.collided(appended).is_none()
+            && let Some(Kind::WorkspaceInstanceChanged(changed)) = &landing.event.kind
+            && let Some(report) = &changed.report
+        {
+            core.instances.record(report);
+        }
     }
     Ok(highest)
 }
 
-/// One journal entry: appended when admissible, dead-lettered otherwise.
-async fn ingest_one(
-    core: &ServerCore,
+/// An admitted entry's event, kept beside its row so the append's outcome
+/// can be checked against it.
+struct Landing {
+    session_id: String,
+    event: Event,
+    refusal: Refusal,
+}
+
+impl Landing {
+    /// The dead letter owed when the append stored nothing new under a key
+    /// another event already holds.
+    ///
+    /// A journal replay is at-least-once and deduplicates silently, as it
+    /// should. Two *different* events under one key is a different thing
+    /// entirely: nothing new was stored, so it is dead-lettered rather than
+    /// left to wedge the watermark.
+    fn collided(&self, appended: &crate::log::Appended) -> Option<PendingEvent> {
+        crate::service::shared::refuse_kind_collision(
+            appended,
+            &self.session_id,
+            &self.event.idempotency_key,
+            &self.event,
+        )
+        .err()
+        .map(|collision| dead_letter(&self.refusal, collision.to_string()))
+    }
+}
+
+/// One journal entry's row — the event itself when admissible, its stale
+/// record when late, a dead letter otherwise — and, for an admitted event,
+/// what its append's outcome is checked against.
+fn planned(
     origins: &OriginView,
     worker_id: &str,
     journaled: JournaledEvent,
-) -> Result<(), ServerError> {
+) -> (PendingEvent, Option<Landing>) {
     // Stored above the worker's journal floor (ADR-0011): after a reset its
     // fresh journal restarts at one, and the log must neither dedupe those
     // entries onto the lost journal's rows nor take them for a regression.
@@ -402,7 +469,7 @@ async fn ingest_one(
         .map(ToString::to_string)
         .filter(|id| !id.is_empty());
     let refusal = Refusal {
-        worker_id,
+        worker_id: worker_id.to_owned(),
         journal_sequence,
         session_id: session_id.clone(),
         kind: journaled
@@ -415,52 +482,38 @@ async fn ingest_one(
 
     let (session_id, event) = match shaped(session_id, journaled.event) {
         Ok(shaped) => shaped,
-        Err(reason) => return dead_letter(core, refusal, reason).await,
+        Err(reason) => return (dead_letter(&refusal, reason), None),
     };
     match origins.lateness(worker_id, &session_id, &event) {
         Some(Late::Land) => {}
         Some(Late::Record { current_worker_id }) => {
-            return record_stale(core, &refusal, &session_id, event, current_worker_id).await;
+            return (
+                stale_record(&refusal, &session_id, event, current_worker_id),
+                None,
+            );
         }
         None => {
             if let Err(reason) = origins.judge(worker_id, &session_id, &event) {
-                return dead_letter(core, refusal, reason).await;
+                return (dead_letter(&refusal, reason), None);
             }
         }
     }
 
-    let appended = core
-        .log
-        .append(PendingEvent {
-            session_id: session_id.clone(),
-            origin_worker_id: worker_id.to_owned(),
-            journal_sequence: Some(refusal.journal_sequence),
-            idempotency_key: event.idempotency_key.clone(),
-            payload: event.encode_to_vec(),
-        })
-        .await?;
-
-    // A journal replay is at-least-once and deduplicates silently, as it
-    // should. Two *different* events under one key is a different thing
-    // entirely: nothing new was stored, so it is dead-lettered rather than
-    // left to wedge the watermark.
-    if let Err(collision) = crate::service::shared::refuse_kind_collision(
-        &appended,
-        &session_id,
-        &event.idempotency_key,
-        &event,
-    ) {
-        return dead_letter(core, refusal, collision.to_string()).await;
-    }
-
-    // A journaled instance report is also the freshest fact about that
-    // worker's disk, so the cache placement reads hears it too.
-    if let Some(Kind::WorkspaceInstanceChanged(changed)) = &event.kind
-        && let Some(report) = &changed.report
-    {
-        core.instances.record(report);
-    }
-    Ok(())
+    let row = PendingEvent {
+        session_id: session_id.clone(),
+        origin_worker_id: worker_id.to_owned(),
+        journal_sequence: Some(journal_sequence),
+        idempotency_key: event.idempotency_key.clone(),
+        payload: event.encode_to_vec(),
+    };
+    (
+        row,
+        Some(Landing {
+            session_id,
+            event,
+            refusal,
+        }),
+    )
 }
 
 /// The shape checks, in one place: a session, an event, no inline bulk.
@@ -480,13 +533,12 @@ fn shaped(session_id: Option<String>, event: Option<Event>) -> Result<(String, E
 /// session (ADR-0011), whole, under the worker's origin and the entry's
 /// journal position — visible where the agent is, and still advancing the
 /// worker's watermark like any other stored row.
-async fn record_stale(
-    core: &ServerCore,
-    refusal: &Refusal<'_>,
+fn stale_record(
+    refusal: &Refusal,
     session_id: &str,
     event: Event,
     current_worker_id: Option<String>,
-) -> Result<(), ServerError> {
+) -> PendingEvent {
     let reason = match current_worker_id.as_deref() {
         Some(current) => format!(
             "journaled by worker {} after the agent was placed on worker {current}",
@@ -509,7 +561,7 @@ async fn record_stale(
         occurred_at: None,
         idempotency_key: String::new(),
         kind: Some(Kind::StaleJournalEvent(Box::new(StaleJournalEvent {
-            worker_id: Some(WorkerId::new(refusal.worker_id)),
+            worker_id: Some(WorkerId::new(refusal.worker_id.as_str())),
             journal_sequence: refusal.journal_sequence,
             current_worker_id: current_worker_id.map(WorkerId::new),
             kind: refusal.kind.to_owned(),
@@ -517,32 +569,35 @@ async fn record_stale(
             event: Some(Box::new(event)),
         }))),
     };
-    core.log
-        .append(PendingEvent {
-            session_id: session_id.to_owned(),
-            origin_worker_id: refusal.worker_id.to_owned(),
-            journal_sequence: Some(refusal.journal_sequence),
-            idempotency_key: String::new(),
-            payload: stale.encode_to_vec(),
-        })
-        .await?;
-    Ok(())
+    refusal.row(session_id, &stale)
 }
 
 /// Everything a dead letter records except its reason.
-struct Refusal<'a> {
-    worker_id: &'a str,
+struct Refusal {
+    worker_id: String,
     journal_sequence: u64,
     session_id: Option<String>,
     kind: &'static str,
 }
 
-/// Records a refused journal entry in its place (see the module docs).
-async fn dead_letter(
-    core: &ServerCore,
-    refusal: Refusal<'_>,
-    reason: String,
-) -> Result<(), ServerError> {
+impl Refusal {
+    /// A server-shaped row standing in for the refused entry: under the
+    /// worker's origin and the entry's journal position, so it advances the
+    /// worker's watermark like the entry would have, and carries no key.
+    fn row(&self, session_id: &str, event: &Event) -> PendingEvent {
+        PendingEvent {
+            session_id: session_id.to_owned(),
+            origin_worker_id: self.worker_id.clone(),
+            journal_sequence: Some(self.journal_sequence),
+            idempotency_key: String::new(),
+            payload: event.encode_to_vec(),
+        }
+    }
+}
+
+/// The row recording a refused journal entry in its place (see the module
+/// docs).
+fn dead_letter(refusal: &Refusal, reason: String) -> PendingEvent {
     tracing::warn!(
         worker_id = refusal.worker_id,
         journal_sequence = refusal.journal_sequence,
@@ -555,23 +610,14 @@ async fn dead_letter(
         occurred_at: None,
         idempotency_key: String::new(),
         kind: Some(Kind::JournalEventRefused(JournalEventRefused {
-            worker_id: Some(WorkerId::new(refusal.worker_id)),
+            worker_id: Some(WorkerId::new(refusal.worker_id.as_str())),
             journal_sequence: refusal.journal_sequence,
-            session_id: refusal.session_id.map(SessionId::new),
+            session_id: refusal.session_id.clone().map(SessionId::new),
             kind: refusal.kind.to_owned(),
             reason,
         })),
     };
-    core.log
-        .append(PendingEvent {
-            session_id: DEAD_LETTER_STREAM.to_owned(),
-            origin_worker_id: refusal.worker_id.to_owned(),
-            journal_sequence: Some(refusal.journal_sequence),
-            idempotency_key: String::new(),
-            payload: event.encode_to_vec(),
-        })
-        .await?;
-    Ok(())
+    refusal.row(DEAD_LETTER_STREAM, &event)
 }
 
 /// Places `agent_id` on `worker_id` in `session_id` through the production
@@ -652,6 +698,31 @@ mod tests {
             session_id: Some(SessionId::new(session)),
             event: Some(event),
         }
+    }
+
+    /// `kind` about `agent-1`, under the idempotency key `k`.
+    fn keyed(kind: Kind) -> Event {
+        Event {
+            idempotency_key: "k".to_owned(),
+            ..event(Some("agent-1"), kind)
+        }
+    }
+
+    /// A keyed interrupt in `s1` at `journal_sequence` — the write a later
+    /// entry under the same key collides with.
+    fn keyed_interrupt(journal_sequence: u64) -> JournaledEvent {
+        journaled(
+            "s1",
+            journal_sequence,
+            keyed(Kind::TurnInterrupted(TurnInterrupted::default())),
+        )
+    }
+
+    /// Ingests `entries` as `worker-a`'s batch, which must not fail.
+    async fn ingest_from_a(core: &ServerCore, entries: Vec<JournaledEvent>) {
+        ingest_batch(core, &mut OriginView::new(), "worker-a", entries)
+            .await
+            .expect("refusals are dead letters, not batch failures");
     }
 
     /// The reasons recorded in the dead-letter stream, in order.
@@ -828,20 +899,10 @@ mod tests {
     async fn a_kind_collision_is_dead_lettered() {
         let core = core();
         placed_for_test(&core, "s1", "agent-1", "worker-a").await;
-        let keyed = |kind: Kind| Event {
-            idempotency_key: "k".to_owned(),
-            ..event(Some("agent-1"), kind)
-        };
-        ingest_batch(
+        ingest_from_a(
             &core,
-            &mut OriginView::new(),
-            "worker-a",
             vec![
-                journaled(
-                    "s1",
-                    1,
-                    keyed(Kind::TurnInterrupted(TurnInterrupted::default())),
-                ),
+                keyed_interrupt(1),
                 journaled(
                     "s1",
                     2,
@@ -851,8 +912,7 @@ mod tests {
                 ),
             ],
         )
-        .await
-        .expect("a collision is a refusal");
+        .await;
         assert_eq!(
             core.log
                 .worker_journal_watermark("worker-a")
@@ -861,6 +921,59 @@ mod tests {
             2
         );
         assert_eq!(dead_letters(&core).await.len(), 1);
+    }
+
+    /// One batch, one transaction (ADR-0013), in the one-at-a-time order: a
+    /// collision's dead letter lands directly behind the write that collided,
+    /// ahead of a later entry's refusal; and only an instance report that
+    /// actually landed reaches the placement cache.
+    #[tokio::test]
+    async fn a_batch_keeps_entry_order_and_caches_only_landed_reports() {
+        let core = core();
+        placed_for_test(&core, "s1", "agent-1", "worker-a").await;
+        let report = |definition: &str| {
+            Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged {
+                report: Some(WorkspaceInstanceReport {
+                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                        definition,
+                    )),
+                    worker_id: Some(WorkerId::new("worker-a")),
+                    ..WorkspaceInstanceReport::default()
+                }),
+                progress: None,
+            })
+        };
+        let orphan = JournaledEvent {
+            journal_sequence: 3,
+            session_id: None,
+            event: Some(Event::default()),
+        };
+        let mut notifications = core.log.subscribe();
+
+        ingest_from_a(
+            &core,
+            vec![
+                keyed_interrupt(1),
+                journaled("s1", 2, keyed(report("collided"))),
+                orphan,
+                journaled("s1", 4, event(Some("agent-1"), report("landed"))),
+            ],
+        )
+        .await;
+
+        let order: Vec<u64> = dead_letters(&core).await.into_iter().map(|l| l.0).collect();
+        assert_eq!(
+            order,
+            vec![2, 3],
+            "the collision's letter precedes entry 3's"
+        );
+        assert!(core.instances.for_definition("collided").is_empty());
+        assert_eq!(core.instances.for_definition("landed").len(), 1);
+        let mut announced = 0;
+        while notifications.try_recv().is_ok() {
+            announced += 1;
+        }
+        assert_eq!(announced, 4, "two events and two dead letters were new");
     }
 
     #[tokio::test]

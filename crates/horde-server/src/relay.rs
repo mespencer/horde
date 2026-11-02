@@ -23,8 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::ServerError;
-use crate::log::EventLog;
-use crate::workspace::{CATALOG_STREAM, WorkspaceCatalog};
+use crate::log::{EventLog, Notification};
+use crate::workspace::{CATALOG_STREAM, WorkspaceCatalog, is_catalog_stream};
 
 /// The served Relay and the task keeping its registry current.
 #[derive(Debug)]
@@ -68,9 +68,9 @@ pub async fn mount(
         .map_err(|error| ServerError::Internal(format!("binding the relay at {bind}: {error}")))?;
 
     // Definitions created after startup register their repos too. The
-    // follower re-projects the whole catalog per notification: registration
-    // is an idempotent upsert, the catalog is small, and a fold that cannot
-    // drift beats a delta that can.
+    // follower re-projects the whole catalog per catalog notification:
+    // registration is an idempotent upsert, the catalog is small, and a fold
+    // that cannot drift beats a delta that can.
     let follower = tokio::spawn(follow_catalog(store, log.clone()));
 
     Ok(MountedRelay { server, follower })
@@ -114,17 +114,42 @@ async fn register_catalog(
 async fn follow_catalog(store: Arc<horde_relay::MirrorStore>, log: EventLog) {
     let mut notifications = log.subscribe();
     loop {
-        match notifications.recv().await {
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Lagging is survivable for the reason every other follower's
-                // is: the channel is a hint, the log is the truth, and the
-                // re-projection reads the truth.
+        match wake_for(&notifications.recv().await) {
+            Wake::Reproject => {
                 if let Err(error) = register_catalog(&store, &log).await {
                     tracing::warn!(%error, "the relay registry could not re-read the catalog");
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Wake::Ignore => {}
+            Wake::Closed => return,
         }
+    }
+}
+
+/// What the follower does about one thing the notification channel said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// The catalog may have moved: re-project it.
+    Reproject,
+    /// Another stream moved; the catalog did not.
+    Ignore,
+    /// The log is gone.
+    Closed,
+}
+
+/// Filters the follower to the catalog stream (ADR-0013): every other
+/// session's append — every output chunk of every agent — used to re-read
+/// and re-fold the whole catalog only to register nothing new.
+///
+/// A lag still re-projects, for the reason every other follower's does: the
+/// channel is a hint, the log is the truth, and a dropped notification may
+/// have been the catalog's.
+fn wake_for(received: &Result<Notification, tokio::sync::broadcast::error::RecvError>) -> Wake {
+    match received {
+        Ok(notification) if is_catalog_stream(&notification.session_id) => Wake::Reproject,
+        Ok(_) => Wake::Ignore,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Wake::Reproject,
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Closed,
     }
 }
 
@@ -132,6 +157,27 @@ async fn follow_catalog(store: Arc<horde_relay::MirrorStore>, log: EventLog) {
 mod tests {
     use super::mount;
     use crate::log::EventLog;
+
+    /// The follower wakes for the catalog, a lag and a close — and sleeps
+    /// through every other stream's appends.
+    #[test]
+    fn the_follower_wakes_only_for_the_catalog_a_lag_or_a_close() {
+        use super::{Wake, wake_for};
+        use tokio::sync::broadcast::error::RecvError;
+        let moved = |session: &str| {
+            Ok(crate::log::Notification {
+                session_id: session.to_owned(),
+                sequence: 1,
+            })
+        };
+        assert_eq!(
+            wake_for(&moved(crate::workspace::CATALOG_STREAM)),
+            Wake::Reproject
+        );
+        assert_eq!(wake_for(&moved("session-1")), Wake::Ignore);
+        assert_eq!(wake_for(&Err(RecvError::Lagged(3))), Wake::Reproject);
+        assert_eq!(wake_for(&Err(RecvError::Closed)), Wake::Closed);
+    }
 
     /// Journals one definition into the catalog stream under `key` — the
     /// append every catalog-shaped arrangement here shares.

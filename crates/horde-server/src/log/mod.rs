@@ -19,6 +19,12 @@
 //! transaction isolation being right every time rather than on there being only
 //! one writer.
 //!
+//! Reads do not share that serialization (ADR-0013). A file-backed log keeps
+//! a small pool of query-only connections beside the writer, and WAL lets
+//! each read its own snapshot while an append is in flight — so a replay, a
+//! projection catch-up or a placement pass never queues behind a batch of
+//! journal appends, and never holds the writer up either.
+//!
 //! # Why a tail cannot miss an event
 //!
 //! [`EventLog::tail`] uses two independent mechanisms, because the first one
@@ -69,11 +75,73 @@ pub struct Notification {
     pub sequence: u64,
 }
 
+/// How many read connections a file-backed log keeps beside its writer.
+///
+/// Enough that the projection's catch-up, a replaying tail and a placement
+/// pass do not queue behind one another; few enough that file handles are
+/// not a concern. A busy pool is waited on, never grown.
+const READ_POOL_SIZE: usize = 4;
+
 /// The append-only log, shared by every service.
 #[derive(Clone)]
 pub struct EventLog {
+    /// The one writer. Every append goes through it, which is what keeps
+    /// per-session sequences dense (see the module docs).
     connection: Arc<Mutex<Connection>>,
+    /// Query-only connections for reads, so a read never waits on the writer
+    /// (ADR-0013). Empty for an in-memory log, whose database is private to
+    /// its one connection: there reads share the writer.
+    readers: Arc<ReadPool>,
     notifier: broadcast::Sender<Notification>,
+}
+
+/// The read connections, handed out round-robin.
+#[derive(Default)]
+struct ReadPool {
+    connections: Vec<Mutex<Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadPool {
+    /// `size` query-only connections onto the database at `path`.
+    fn open(path: &str, size: usize) -> Result<Self, ServerError> {
+        let mut connections = Vec::with_capacity(size);
+        for _ in 0..size {
+            connections.push(Mutex::new(store::open_reader(path)?));
+        }
+        Ok(Self {
+            connections,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// The connection a read should use: the first idle one from this
+    /// read's starting turn, or — every one busy — the turn's own, waited
+    /// on. `None` when the pool is empty.
+    fn checkout(&self) -> Option<Result<std::sync::MutexGuard<'_, Connection>, ServerError>> {
+        let count = self.connections.len();
+        let start = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .checked_rem(count)?;
+        let own = self.connections.get(start)?;
+        let idle = self
+            .connections
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(count)
+            .find_map(|connection| connection.try_lock().ok());
+        Some(idle.map_or_else(|| own.lock().map_err(|_| poisoned()), Ok))
+    }
+}
+
+/// The failure a poisoned connection mutex reports.
+fn poisoned() -> ServerError {
+    ServerError::Storage {
+        context: "acquiring the connection after an earlier panic",
+        source: rusqlite::Error::InvalidQuery,
+    }
 }
 
 impl std::fmt::Debug for EventLog {
@@ -87,19 +155,30 @@ impl std::fmt::Debug for EventLog {
 
 impl EventLog {
     /// Opens (or creates) a log at `path`.
+    ///
+    /// The writer opens first, so the schema exists before any reader
+    /// connects to it.
     pub fn open(path: &str) -> Result<Self, ServerError> {
-        Ok(Self::from_connection(store::open(path)?))
+        let writer = store::open(path)?;
+        Ok(Self::from_connections(
+            writer,
+            ReadPool::open(path, READ_POOL_SIZE)?,
+        ))
     }
 
     /// Opens a private in-memory log.
     pub fn in_memory() -> Result<Self, ServerError> {
-        Ok(Self::from_connection(store::open_in_memory()?))
+        Ok(Self::from_connections(
+            store::open_in_memory()?,
+            ReadPool::default(),
+        ))
     }
 
-    fn from_connection(connection: Connection) -> Self {
+    fn from_connections(connection: Connection, readers: ReadPool) -> Self {
         let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         Self {
             connection: Arc::new(Mutex::new(connection)),
+            readers: Arc::new(readers),
             notifier,
         }
     }
@@ -116,11 +195,29 @@ impl EventLog {
     {
         let connection = Arc::clone(&self.connection);
         tokio::task::spawn_blocking(move || {
-            let mut guard = connection.lock().map_err(|_| ServerError::Storage {
-                context: "acquiring the connection after an earlier panic",
-                source: rusqlite::Error::InvalidQuery,
-            })?;
+            let mut guard = connection.lock().map_err(|_| poisoned())?;
             operation(&mut guard)
+        })
+        .await?
+    }
+
+    /// Runs a blocking read on a pool connection, or on the writer when the
+    /// log has no pool (in memory).
+    ///
+    /// Safe to route every read here because a read is its own implicit
+    /// transaction: under WAL it sees every commit made before it began, so
+    /// an append that has returned is visible to the next read wherever it
+    /// runs.
+    async fn with_reader<T, F>(&self, operation: F) -> Result<T, ServerError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, ServerError> + Send + 'static,
+    {
+        let readers = Arc::clone(&self.readers);
+        let writer = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || match readers.checkout() {
+            Some(guard) => operation(&*guard?),
+            None => operation(&*writer.lock().map_err(|_| poisoned())?),
         })
         .await?
     }
@@ -144,12 +241,57 @@ impl EventLog {
             return Ok(appended);
         }
 
+        self.announce(session_id, appended.sequence);
+        Ok(appended)
+    }
+
+    /// Tells every subscriber an append landed.
+    fn announce(&self, session_id: String, sequence: u64) {
         // A send error means nobody is listening, which is normal.
         let _ = self.notifier.send(Notification {
             session_id,
-            sequence: appended.sequence,
+            sequence,
         });
-        Ok(appended)
+    }
+
+    /// Appends `events` in one transaction (ADR-0013) — see
+    /// [`store::append_all`] for the ordering, the dedupe and `follow_up` —
+    /// and announces every new row in append order once it has committed.
+    ///
+    /// Answers each event's own outcome, in order; follow-ups are announced
+    /// but not answered, since the caller wrote them.
+    #[instrument(skip_all, fields(events = events.len()))]
+    pub async fn append_batch<F>(
+        &self,
+        events: Vec<PendingEvent>,
+        follow_up: F,
+    ) -> Result<Vec<Appended>, ServerError>
+    where
+        F: FnMut(usize, &Appended) -> Option<PendingEvent> + Send + 'static,
+    {
+        let sessions: Vec<String> = events
+            .iter()
+            .map(|event| event.session_id.clone())
+            .collect();
+        let batched = self
+            .with_connection(move |connection| store::append_all(connection, &events, follow_up))
+            .await?;
+        let mut answers = Vec::with_capacity(batched.len());
+        for (session_id, landed) in sessions.into_iter().zip(batched) {
+            let writes = std::iter::once((session_id, &landed.appended)).chain(
+                landed
+                    .follow_up
+                    .iter()
+                    .map(|(session, appended)| (session.clone(), appended)),
+            );
+            for (session_id, appended) in writes {
+                if !appended.deduplicated {
+                    self.announce(session_id, appended.sequence);
+                }
+            }
+            answers.push(landed.appended);
+        }
+        Ok(answers)
     }
 
     /// Reads up to `limit` events from `from_sequence` inclusive.
@@ -160,7 +302,7 @@ impl EventLog {
         limit: u32,
     ) -> Result<Vec<StoredEvent>, ServerError> {
         let session_id = session_id.to_owned();
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             store::read_from(connection, &session_id, from_sequence, limit)
         })
         .await
@@ -177,7 +319,7 @@ impl EventLog {
     /// Highest sequence in a session; zero when it has none.
     pub async fn head(&self, session_id: &str) -> Result<u64, ServerError> {
         let session_id = session_id.to_owned();
-        self.with_connection(move |connection| store::head(connection, &session_id))
+        self.with_reader(move |connection| store::head(connection, &session_id))
             .await
     }
 
@@ -191,16 +333,13 @@ impl EventLog {
         after_row: u64,
         limit: u32,
     ) -> Result<Vec<GlobalEvent>, ServerError> {
-        self.with_connection(move |connection| {
-            store::read_global_from(connection, after_row, limit)
-        })
-        .await
+        self.with_reader(move |connection| store::read_global_from(connection, after_row, limit))
+            .await
     }
 
     /// Every session that has at least one event, oldest first.
     pub async fn session_ids(&self) -> Result<Vec<String>, ServerError> {
-        self.with_connection(|connection| store::session_ids(connection))
-            .await
+        self.with_reader(store::session_ids).await
     }
 
     /// The event already stored under `(session_id, key)`: its sequence and
@@ -212,19 +351,15 @@ impl EventLog {
     ) -> Result<Option<(u64, Vec<u8>)>, ServerError> {
         let session_id = session_id.to_owned();
         let key = key.to_owned();
-        self.with_connection(move |connection| {
-            store::stored_under_key(connection, &session_id, &key)
-        })
-        .await
+        self.with_reader(move |connection| store::stored_under_key(connection, &session_id, &key))
+            .await
     }
 
     /// The highest journal sequence durably stored for a worker.
     pub async fn worker_journal_watermark(&self, worker_id: &str) -> Result<u64, ServerError> {
         let worker_id = worker_id.to_owned();
-        self.with_connection(move |connection| {
-            store::worker_journal_watermark(connection, &worker_id)
-        })
-        .await
+        self.with_reader(move |connection| store::worker_journal_watermark(connection, &worker_id))
+            .await
     }
 
     /// Subscribes to append notifications from this moment on.
@@ -607,6 +742,116 @@ impl MultiTail {
 mod tests {
     use super::store::pending;
     use super::{EventLog, PendingEvent};
+
+    /// The ceiling on any wait in these tests, so a hang fails fast.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A file-backed log — so it has a read pool — holding one event in
+    /// `s1`, and the directory that must outlive it.
+    async fn file_backed_with_one_event() -> (tempfile::TempDir, EventLog) {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("log.sqlite");
+        let log = EventLog::open(path.to_str().expect("a utf-8 path")).expect("a log");
+        log.append(pending("s1", b"a")).await.expect("append");
+        (directory, log)
+    }
+
+    /// The read pool's whole point: with the writer held — an append in
+    /// flight, as far as a reader can tell — every kind of read still
+    /// answers, from its own connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "holding the writer across the reads is the arrangement under test"
+    )]
+    async fn reads_on_a_file_backed_log_do_not_wait_for_the_writer() {
+        let (_directory, log) = file_backed_with_one_event().await;
+
+        let held = log.connection.lock().expect("the writer");
+        let reads = async {
+            assert_eq!(log.head("s1").await.expect("head"), 1);
+            assert_eq!(log.read_all("s1").await.expect("replay").len(), 1);
+            assert_eq!(log.read_global_from(0, 10).await.expect("global").len(), 1);
+            assert_eq!(log.session_ids().await.expect("ids"), vec!["s1".to_owned()]);
+            assert_eq!(log.stored_under_key("s1", "k").await.expect("key"), None);
+            assert_eq!(log.worker_journal_watermark("w").await.expect("mark"), 0);
+        };
+        tokio::time::timeout(BOUND, reads)
+            .await
+            .expect("no read waited on the held writer");
+        drop(held);
+    }
+
+    /// Every pool connection busy is a wait, not a failure: the read lands
+    /// once one frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "holding every reader across the wait is the arrangement under test"
+    )]
+    async fn a_read_waits_for_a_busy_pool_rather_than_failing() {
+        let (_directory, log) = file_backed_with_one_event().await;
+
+        let busy: Vec<_> = log
+            .readers
+            .connections
+            .iter()
+            .map(|connection| connection.lock().expect("a reader"))
+            .collect();
+        let read = tokio::spawn({
+            let log = log.clone();
+            async move { log.head("s1").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!read.is_finished(), "every reader is held");
+        drop(busy);
+        let head = tokio::time::timeout(BOUND, read)
+            .await
+            .expect("the read lands once a reader frees")
+            .expect("the task")
+            .expect("head");
+        assert_eq!(head, 1);
+    }
+
+    /// A batch announces each new row once it has committed — follow-ups
+    /// included, in append order — and answers each event's own outcome.
+    #[tokio::test]
+    async fn a_batch_announces_every_new_row_in_order_and_answers_its_events() {
+        let log = EventLog::in_memory().expect("log");
+        log.append(pending("s1", b"a")).await.expect("append");
+        let mut notifications = log.subscribe();
+        let key = |session: &str, key: &str| PendingEvent {
+            idempotency_key: key.to_owned(),
+            ..pending(session, b"k")
+        };
+
+        let answers = log
+            .append_batch(
+                vec![key("s1", "dup"), key("s2", "x"), key("s1", "dup")],
+                |index, _| (index == 1).then(|| pending("dead", b"d")),
+            )
+            .await
+            .expect("the batch");
+
+        let positions: Vec<(u64, bool)> = answers
+            .iter()
+            .map(|appended| (appended.sequence, appended.deduplicated))
+            .collect();
+        assert_eq!(positions, vec![(2, false), (1, false), (2, true)]);
+        let mut announced = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            announced.push((notification.session_id, notification.sequence));
+        }
+        assert_eq!(
+            announced,
+            vec![
+                ("s1".to_owned(), 2),
+                ("s2".to_owned(), 1),
+                ("dead".to_owned(), 1)
+            ],
+            "the deduplicated write is not announced"
+        );
+    }
 
     /// A log with two events already in session `s1`.
     async fn log_with_two_events() -> EventLog {

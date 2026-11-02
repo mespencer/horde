@@ -10,6 +10,7 @@
 //! tell "there are none" from "this is not built"; a client that receives
 //! `Unimplemented` can.
 
+use std::ops::ControlFlow;
 use std::pin::Pin;
 
 use horde_proto::v1::{
@@ -251,15 +252,15 @@ impl ControlPlane {
         Ok(current)
     }
 
-    /// Projects a session, refusing one that has no events.
+    /// A session's projected state, refusing one that has no events.
     async fn project(&self, session_id: &str) -> Result<SessionState, ServerError> {
-        let events = self.core.log.read_all(session_id).await?;
-        if events.is_empty() {
-            return Err(ServerError::NoSuchSession {
+        self.core
+            .sessions
+            .state(session_id)
+            .await?
+            .ok_or_else(|| ServerError::NoSuchSession {
                 session_id: session_id.to_owned(),
-            });
-        }
-        SessionState::project(session_id, &events)
+            })
     }
 
     /// The session a request names, and its projection — refused, as a
@@ -330,22 +331,22 @@ impl ControlPlane {
 
     /// Finds which session an agent belongs to.
     ///
-    /// A scan across sessions today. It is correct and it is honest about being
-    /// the naive implementation; an agent→session index is a wave-4 concern
-    /// once there are enough sessions for it to matter.
+    /// A walk of the live projection (ADR-0013): in-memory states, no log
+    /// reads beyond the catch-up.
     async fn session_of_agent(&self, agent_id: &str) -> Result<String, ServerError> {
-        for session_id in self.core.log.session_ids().await? {
-            if crate::enrollment::is_reserved_stream(&session_id) {
-                continue;
-            }
-            let state = self.project(&session_id).await?;
-            if state.agents.contains_key(agent_id) {
-                return Ok(session_id);
-            }
-        }
-        Err(ServerError::NoSuchAgent {
-            agent_id: agent_id.to_owned(),
-        })
+        self.core
+            .sessions
+            .walk(crate::enrollment::is_session_stream, |state| {
+                if state.agents.contains_key(agent_id) {
+                    ControlFlow::Break(state.session_id.clone())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .await?
+            .ok_or_else(|| ServerError::NoSuchAgent {
+                agent_id: agent_id.to_owned(),
+            })
     }
 
     fn server_hello() -> ServerHello {
@@ -380,6 +381,19 @@ impl ControlPlane {
             )),
         }
     }
+}
+
+/// Whether `ListSessions` lists a session: an archived one only when the
+/// request includes archived sessions, and — when the request names one —
+/// only a session whose name (its title, the root spawn's first tree-path
+/// element) is exactly that name.
+fn listed(state: &SessionState, request: &ListSessionsRequest) -> bool {
+    let archived = state.lifecycle == horde_proto::v1::SessionLifecycleState::Archived;
+    (request.include_archived || !archived)
+        && request
+            .name
+            .as_ref()
+            .is_none_or(|name| state.title == *name)
 }
 
 #[tonic::async_trait]
@@ -486,22 +500,21 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<ListSessionsResponse>, Status> {
-        let include_archived = request.into_inner().include_archived;
+        let request = request.into_inner();
 
+        // The reserved streams (catalog, enrollment) live in the log but are
+        // not sessions; the walk turns them away by id.
         let mut sessions = Vec::new();
-        for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
-            // The reserved streams (catalog, enrollment) live in the log but
-            // are not sessions.
-            if crate::enrollment::is_reserved_stream(&session_id) {
-                continue;
-            }
-            let state = self.project(&session_id).await.map_err(Status::from)?;
-            let archived = state.lifecycle == horde_proto::v1::SessionLifecycleState::Archived;
-            if archived && !include_archived {
-                continue;
-            }
-            sessions.push(Self::summary(&state));
-        }
+        self.core
+            .sessions
+            .walk(crate::enrollment::is_session_stream, |state| {
+                if listed(state, &request) {
+                    sessions.push(Self::summary(state));
+                }
+                ControlFlow::<()>::Continue(())
+            })
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(ListSessionsResponse {
             sessions,
@@ -829,18 +842,28 @@ impl ControlPlaneService for ControlPlane {
 
         // The decision is an event like everything else, which is what makes it
         // answerable from any attached client (DESIGN.md §10).
-        let mut found = None;
-        for session_id in self.core.log.session_ids().await.map_err(Status::from)? {
-            let state = self.project(&session_id).await.map_err(Status::from)?;
-            if let Some(pending) = state.pending_permissions.get(&request_id) {
-                let rewrites = state
-                    .agents
-                    .get(&pending.agent_id)
-                    .is_some_and(|agent| agent.rewrites_tool_input);
-                found = Some((session_id, pending.agent_id.clone(), rewrites));
-                break;
-            }
-        }
+        let found = self
+            .core
+            .sessions
+            .walk(
+                |_| true,
+                |state| match state.pending_permissions.get(&request_id) {
+                    Some(pending) => {
+                        let rewrites = state
+                            .agents
+                            .get(&pending.agent_id)
+                            .is_some_and(|agent| agent.rewrites_tool_input);
+                        ControlFlow::Break((
+                            state.session_id.clone(),
+                            pending.agent_id.clone(),
+                            rewrites,
+                        ))
+                    }
+                    None => ControlFlow::Continue(()),
+                },
+            )
+            .await
+            .map_err(Status::from)?;
         let (session_id, agent_id, rewrites) = found.ok_or_else(|| {
             Status::from(ServerError::Invalid(format!(
                 "no permission request {request_id} is awaiting a decision"
@@ -2460,5 +2483,94 @@ mod delivery_tests {
             .await
             .expect_err("a reset must name its worker");
         assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use horde_proto::v1::control_plane_service_server::ControlPlaneService;
+    use horde_proto::v1::{
+        ArchiveSessionRequest, CreateSessionRequest, ListSessionsRequest, SessionId,
+    };
+    use tonic::Request;
+
+    use super::ControlPlane;
+    use crate::EventLog;
+    use crate::service::shared::ServerCore;
+
+    /// A session titled `title`, created under `key`; its id.
+    async fn titled(plane: &ControlPlane, title: &str, key: &str) -> String {
+        plane
+            .create_session(Request::new(CreateSessionRequest {
+                title: title.to_owned(),
+                idempotency_key: key.to_owned(),
+                ..CreateSessionRequest::default()
+            }))
+            .await
+            .expect("the session is created")
+            .into_inner()
+            .session
+            .and_then(|summary| summary.session_id)
+            .map(|id| id.to_string())
+            .expect("a session id")
+    }
+
+    /// The ids `ListSessions` answers for `request`, in listing order.
+    async fn listed(plane: &ControlPlane, request: ListSessionsRequest) -> Vec<String> {
+        plane
+            .list_sessions(Request::new(request))
+            .await
+            .expect("the list")
+            .into_inner()
+            .sessions
+            .into_iter()
+            .filter_map(|summary| summary.session_id.map(|id| id.to_string()))
+            .collect()
+    }
+
+    /// The name filter lists exactly the sessions with that name, still
+    /// honouring `include_archived`; no name lists every session.
+    #[tokio::test]
+    async fn the_name_filter_lists_exactly_the_sessions_with_that_name() {
+        let plane = ControlPlane::new(ServerCore::new(
+            EventLog::in_memory().expect("in-memory log"),
+        ));
+        let first = titled(&plane, "alpha", "one").await;
+        let other = titled(&plane, "beta", "two").await;
+        let archived = titled(&plane, "alpha", "three").await;
+        plane
+            .archive_session(Request::new(ArchiveSessionRequest {
+                session_id: Some(SessionId::new(archived.clone())),
+                reason: String::new(),
+            }))
+            .await
+            .expect("archived");
+        let named = |name: &str, include_archived: bool| ListSessionsRequest {
+            name: Some(name.to_owned()),
+            include_archived,
+            ..ListSessionsRequest::default()
+        };
+
+        assert_eq!(
+            listed(&plane, named("alpha", false)).await,
+            vec![first.clone()]
+        );
+        assert_eq!(
+            listed(&plane, named("alpha", true)).await,
+            vec![first.clone(), archived.clone()]
+        );
+        assert_eq!(
+            listed(&plane, named("beta", false)).await,
+            vec![other.clone()]
+        );
+        assert!(
+            listed(&plane, named("alph", true)).await.is_empty(),
+            "exact, not a prefix"
+        );
+        assert_eq!(
+            listed(&plane, ListSessionsRequest::default()).await,
+            vec![first, other],
+            "no name is no filter"
+        );
     }
 }

@@ -27,8 +27,9 @@
 
 /// Statements applied to every connection, in order.
 ///
-/// Idempotent by construction (`IF NOT EXISTS`), so opening an existing
-/// database is the same code path as creating one.
+/// Idempotent by construction (`IF NOT EXISTS`, `IF EXISTS`), so opening an
+/// existing database is the same code path as creating one — and migrating
+/// one is the same code path too: there is no version table to consult.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
     -- Per-session, dense, 1-based. Assigned by the server on append.
@@ -67,9 +68,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_idempotency
     ON events (session_id, idempotency_key)
     WHERE idempotency_key <> '';
 
--- Replay is always 'this session, from this offset, in order'.
-CREATE INDEX IF NOT EXISTS events_session_sequence
-    ON events (session_id, sequence);
+-- Replay is always 'this session, from this offset, in order' — which the
+-- primary key's own index already answers. An earlier schema created a
+-- second, identical index for it, paid for on every append (ADR-0013); this
+-- statement is the migration that retires it from databases that have one.
+DROP INDEX IF EXISTS events_session_sequence;
 ";
 
 /// Pragmas applied per connection.

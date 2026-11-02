@@ -143,18 +143,13 @@ pub fn placeable(session: SessionLifecycleState, agent: AgentLifecycleState) -> 
     session != SessionLifecycleState::Archived && agent != AgentLifecycleState::Archived
 }
 
-/// Projects every session — the reserved streams (catalog, enrollment) are
-/// not sessions.
+/// Every session's projected state — the reserved streams (catalog,
+/// enrollment) are not sessions. Read from the live projection (ADR-0013),
+/// not re-folded out of the log per pass.
 pub(crate) async fn session_states(core: &ServerCore) -> Result<Vec<SessionState>, ServerError> {
-    let mut states = Vec::new();
-    for session_id in core.log.session_ids().await? {
-        if crate::enrollment::is_reserved_stream(&session_id) {
-            continue;
-        }
-        let events = core.log.read_all(&session_id).await?;
-        states.push(SessionState::project(&session_id, &events)?);
-    }
-    Ok(states)
+    core.sessions
+        .states(crate::enrollment::is_session_stream)
+        .await
 }
 
 /// Active agents per worker, across every session — the capacity input.

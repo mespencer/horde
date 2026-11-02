@@ -385,7 +385,9 @@ pub fn advertised_host(bound: IpAddr, subject_names: &[String]) -> String {
 /// reconciled at boot (ADR-0011) — this process holds no registrations, so
 /// every agent the log places on a worker is on a worker that is away until
 /// it dials in, treated exactly as a disconnect, lease and all, rather than
-/// left placed forever on a machine nobody may ever see again.
+/// left placed forever on a machine nobody may ever see again. The session
+/// projection is rebuilt from the log first, so the reconcile and the first
+/// client read find it warm.
 ///
 /// # Errors
 ///
@@ -398,6 +400,9 @@ async fn reconciled_core(config: &ServeConfig, log: EventLog) -> Result<ServerCo
                 .worker_lease
                 .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
         );
+    // The one cold fold of the whole log (ADR-0013); every read after it
+    // folds only what was appended since.
+    core.sessions.rebuild().await?;
     crate::liveness::reconcile_at_boot(&core).await?;
     Ok(core)
 }

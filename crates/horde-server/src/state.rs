@@ -163,21 +163,37 @@ impl SessionState {
     /// what lets a test assert the projection without a database and what makes
     /// "state is a function of the log" checkable rather than merely claimed.
     pub fn project(session_id: &str, events: &[StoredEvent]) -> Result<Self, ServerError> {
-        let mut state = Self {
-            session_id: session_id.to_owned(),
-            lifecycle: SessionLifecycleState::Active,
-            ..Self::default()
-        };
+        let mut state = Self::new(session_id);
         for stored in events {
             state.apply(stored)?;
         }
         Ok(state)
     }
 
+    /// The state of a session before any of its events: where [`project`]
+    /// starts its fold, and where the live projection (ADR-0013) starts one
+    /// for a session it sees for the first time.
+    ///
+    /// [`project`]: Self::project
+    #[must_use]
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            lifecycle: SessionLifecycleState::Active,
+            ..Self::default()
+        }
+    }
+
     /// Folds one more event in. Advancing the head is unconditional: an event
     /// this build does not model still occupies a position, and a client
     /// resuming from a stale head would replay it forever.
-    pub fn apply(&mut self, stored: &StoredEvent) -> Result<(), ServerError> {
+    ///
+    /// The only failure is an undecodable payload, answered as the decode
+    /// error itself so a caller that keeps the failure (the live projection
+    /// does) can report it exactly as a cold [`project`] would.
+    ///
+    /// [`project`]: Self::project
+    pub fn apply(&mut self, stored: &StoredEvent) -> Result<(), prost::DecodeError> {
         self.head_sequence = self.head_sequence.max(stored.sequence);
         // Every event is activity, modeled or not: an output chunk from an
         // unknown kind still proves the session moved.

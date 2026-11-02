@@ -476,6 +476,7 @@ impl Client {
                 include_archived,
                 page_size: 0,
                 page_token: String::new(),
+                name: None,
             })
             .await?
             .into_inner()

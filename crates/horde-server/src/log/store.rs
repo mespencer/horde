@@ -90,6 +90,26 @@ pub fn open(path: &str) -> Result<Connection, ServerError> {
     Ok(connection)
 }
 
+/// Opens a read-only companion connection onto a database [`open`] already
+/// brought up to schema — one member of the read pool (ADR-0013).
+///
+/// `query_only` rather than a read-only open: a read-only handle cannot
+/// create the WAL index when it is the first to need one, while a
+/// query-only handle shares the writer's WAL like any other connection and
+/// still refuses every write. No schema is applied: the writer owns it.
+pub fn open_reader(path: &str) -> Result<Connection, ServerError> {
+    let connection =
+        Connection::open(path).map_err(ServerError::storage("opening a read connection"))?;
+    connection
+        .execute_batch(READER_PRAGMAS)
+        .map_err(ServerError::storage("applying reader pragmas"))?;
+    Ok(connection)
+}
+
+/// Pragmas for a read-pool connection: wait out a checkpoint rather than
+/// fail, and refuse any write that reaches it by mistake.
+const READER_PRAGMAS: &str = "PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;";
+
 /// Opens a private in-memory database. Used by tests and by `--ephemeral`.
 pub fn open_in_memory() -> Result<Connection, ServerError> {
     let connection = Connection::open_in_memory()
@@ -122,8 +142,71 @@ pub fn append(connection: &mut Connection, event: &PendingEvent) -> Result<Appen
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(ServerError::storage("beginning an append"))?;
+    let appended = append_within(&transaction, event)?;
+    transaction
+        .commit()
+        .map_err(ServerError::storage("committing an append"))?;
+    Ok(appended)
+}
 
-    if let Some((sequence, existing_payload)) = find_duplicate(&transaction, event)? {
+/// One write of a batch, and the write its outcome called for, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batched {
+    pub appended: Appended,
+    /// The follow-up appended straight after this write: its session and
+    /// where it landed.
+    pub follow_up: Option<(String, Appended)>,
+}
+
+/// Appends `events` in order inside **one** `IMMEDIATE` transaction
+/// (ADR-0013), each exactly as [`append`] would — the same dedupe, the same
+/// dense per-session sequences — so a batch is indistinguishable from the
+/// same appends made one at a time, except that it commits once.
+///
+/// `follow_up` is asked after each write, with the write's index and
+/// outcome, whether that outcome calls for another write; one it returns is
+/// appended immediately after, still inside the transaction. That is what
+/// keeps an ingest dead letter for a key collision in the place the
+/// one-at-a-time loop gave it — directly behind the write that collided,
+/// ahead of the next entry's.
+///
+/// All or nothing: a failure anywhere rolls the whole batch back, which a
+/// journal batch can afford because its sender re-sends it whole.
+pub fn append_all<F>(
+    connection: &mut Connection,
+    events: &[PendingEvent],
+    mut follow_up: F,
+) -> Result<Vec<Batched>, ServerError>
+where
+    F: FnMut(usize, &Appended) -> Option<PendingEvent>,
+{
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(ServerError::storage("beginning a batch append"))?;
+    let mut batched = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        let appended = append_within(&transaction, event)?;
+        let follow_up = match follow_up(index, &appended) {
+            Some(next) => Some((next.session_id.clone(), append_within(&transaction, &next)?)),
+            None => None,
+        };
+        batched.push(Batched {
+            appended,
+            follow_up,
+        });
+    }
+    transaction
+        .commit()
+        .map_err(ServerError::storage("committing a batch append"))?;
+    Ok(batched)
+}
+
+/// One append inside a transaction the caller owns and commits.
+fn append_within(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &PendingEvent,
+) -> Result<Appended, ServerError> {
+    if let Some((sequence, existing_payload)) = find_duplicate(transaction, event)? {
         return Ok(Appended {
             sequence,
             deduplicated: true,
@@ -131,7 +214,7 @@ pub fn append(connection: &mut Connection, event: &PendingEvent) -> Result<Appen
         });
     }
 
-    let next = head_within(&transaction, &event.session_id)?.saturating_add(1);
+    let next = head_within(transaction, &event.session_id)?.saturating_add(1);
     let recorded_at_unix_ms = now_unix_ms();
 
     transaction
@@ -151,10 +234,6 @@ pub fn append(connection: &mut Connection, event: &PendingEvent) -> Result<Appen
             ],
         )
         .map_err(ServerError::storage("inserting an event"))?;
-
-    transaction
-        .commit()
-        .map_err(ServerError::storage("committing an append"))?;
 
     Ok(Appended {
         sequence: next,
@@ -178,8 +257,7 @@ fn find_duplicate(
     {
         let existing: Option<(u64, Vec<u8>)> = transaction
             .query_row(
-                "SELECT sequence, payload FROM events
-                 WHERE origin_worker_id = ?1 AND journal_sequence = ?2",
+                JOURNAL_DUPLICATE_SQL,
                 params![event.origin_worker_id, journal_sequence],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -196,14 +274,34 @@ fn find_duplicate(
 
     transaction
         .query_row(
-            "SELECT sequence, payload FROM events
-             WHERE session_id = ?1 AND idempotency_key = ?2",
+            KEY_LOOKUP_SQL,
             params![event.session_id, event.idempotency_key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(ServerError::storage("checking the idempotency key"))
 }
+
+/// The journal dedupe probe. `journal_sequence IS NOT NULL` is spelled out,
+/// though the equality implies it, so the probe visibly matches the partial
+/// `events_worker_journal` index's predicate (ADR-0013).
+const JOURNAL_DUPLICATE_SQL: &str = "SELECT sequence, payload FROM events
+     WHERE origin_worker_id = ?1 AND journal_sequence = ?2
+       AND journal_sequence IS NOT NULL";
+
+/// The idempotency-key probe. `idempotency_key <> ''` is what lets the
+/// planner use the partial `events_idempotency` index: a bound parameter
+/// does not imply the index's predicate the way a literal would. Every
+/// caller has already refused the empty key, so the term changes no answer.
+const KEY_LOOKUP_SQL: &str = "SELECT sequence, payload FROM events
+     WHERE session_id = ?1 AND idempotency_key = ?2 AND idempotency_key <> ''";
+
+/// A worker's watermark. Without `journal_sequence IS NOT NULL` the planner
+/// cannot use the partial `events_worker_journal` index and scans every row
+/// the worker's id appears on — server-originated rows included, which never
+/// carry a journal sequence (ADR-0013).
+const WATERMARK_SQL: &str = "SELECT MAX(journal_sequence) FROM events
+     WHERE origin_worker_id = ?1 AND journal_sequence IS NOT NULL";
 
 /// The event already stored under `(session_id, key)`, if one is: its
 /// sequence and payload — the same question the append's dedupe asks,
@@ -219,12 +317,9 @@ pub fn stored_under_key(
         return Ok(None); // Empty is the log's "never deduplicate".
     }
     connection
-        .query_row(
-            "SELECT sequence, payload FROM events
-             WHERE session_id = ?1 AND idempotency_key = ?2",
-            params![session_id, key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .query_row(KEY_LOOKUP_SQL, params![session_id, key], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()
         .map_err(ServerError::storage("looking up an idempotency key"))
 }
@@ -377,11 +472,7 @@ pub fn worker_journal_watermark(
     worker_id: &str,
 ) -> Result<u64, ServerError> {
     let watermark: Option<u64> = connection
-        .query_row(
-            "SELECT MAX(journal_sequence) FROM events WHERE origin_worker_id = ?1",
-            params![worker_id],
-            |row| row.get(0),
-        )
+        .query_row(WATERMARK_SQL, params![worker_id], |row| row.get(0))
         .optional()
         .map_err(ServerError::storage("reading a worker watermark"))?
         .flatten();
@@ -593,6 +684,131 @@ mod tests {
         assert_eq!(
             worker_journal_watermark(&connection, "worker-b").expect("watermark"),
             0
+        );
+    }
+
+    /// What the planner does with one of this module's probes: the detail
+    /// column of `EXPLAIN QUERY PLAN`, joined.
+    fn plan_of(connection: &rusqlite::Connection, sql: &str) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("explainable");
+        let arguments = std::iter::repeat_n("w", statement.parameter_count());
+        let details: Vec<String> = statement
+            .query_map(rusqlite::params_from_iter(arguments), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("a plan")
+            .map(|row| row.expect("a plan row"))
+            .collect();
+        details.join(" | ")
+    }
+
+    /// The probes the review flagged reach their partial indexes instead of
+    /// scanning — the predicate is what makes the index usable at all.
+    #[test]
+    fn the_journal_and_key_probes_use_their_partial_indexes() {
+        let connection = open_in_memory().expect("in-memory database");
+        let watermark = plan_of(&connection, super::WATERMARK_SQL);
+        assert!(watermark.contains("events_worker_journal"), "{watermark}");
+        let duplicate = plan_of(&connection, super::JOURNAL_DUPLICATE_SQL);
+        assert!(duplicate.contains("events_worker_journal"), "{duplicate}");
+        let key = plan_of(&connection, super::KEY_LOOKUP_SQL);
+        assert!(key.contains("events_idempotency"), "{key}");
+    }
+
+    /// Opening a database that still carries the old duplicate replay index
+    /// drops it, and replay keeps using the primary key's index.
+    #[test]
+    fn opening_an_older_database_drops_the_duplicate_replay_index() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("log.sqlite");
+        let path = path.to_str().expect("a utf-8 path");
+        {
+            let connection = super::open(path).expect("a database");
+            connection
+                .execute_batch(
+                    "CREATE INDEX events_session_sequence ON events (session_id, sequence)",
+                )
+                .expect("the old index");
+        }
+        let connection = super::open(path).expect("reopened");
+        let indexes: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'events_session_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("a count");
+        assert_eq!(indexes, 0, "the migration retires the duplicate index");
+    }
+
+    /// A batch is the same appends made one at a time: dense sequences, the
+    /// journal dedupe applied within the batch too, and each follow-up landing
+    /// directly behind the write that asked for it.
+    #[test]
+    fn a_batch_appends_in_order_with_follow_ups_behind_their_writes() {
+        let mut connection = open_in_memory().expect("in-memory database");
+        let batch = vec![
+            journaled("worker-a", 1),
+            journaled("worker-a", 2),
+            journaled("worker-a", 1),
+        ];
+        let batched = super::append_all(&mut connection, &batch, |index, appended| {
+            let marker = u8::try_from(index).expect("a small batch");
+            (index == 0 || appended.deduplicated).then(|| pending("dead", &[marker]))
+        })
+        .expect("the batch");
+
+        let positions: Vec<(u64, bool)> = batched
+            .iter()
+            .map(|landed| (landed.appended.sequence, landed.appended.deduplicated))
+            .collect();
+        assert_eq!(positions, vec![(1, false), (2, false), (1, true)]);
+        let follow_ups: Vec<Option<(String, u64)>> = batched
+            .iter()
+            .map(|landed| {
+                landed
+                    .follow_up
+                    .as_ref()
+                    .map(|(session, appended)| (session.clone(), appended.sequence))
+            })
+            .collect();
+        assert_eq!(
+            follow_ups,
+            vec![
+                Some(("dead".to_owned(), 1)),
+                None,
+                Some(("dead".to_owned(), 2))
+            ]
+        );
+        let dead = read_from(&connection, "dead", 1, 10).expect("replay");
+        let payloads: Vec<Vec<u8>> = dead.into_iter().map(|event| event.payload).collect();
+        assert_eq!(payloads, vec![vec![0], vec![2]], "in the order asked for");
+        let global = super::read_global_from(&connection, 0, 10).expect("the log");
+        let order: Vec<&str> = global
+            .iter()
+            .map(|row| row.event.session_id.as_str())
+            .collect();
+        assert_eq!(order, vec!["s1", "dead", "s1", "dead"]);
+    }
+
+    /// A read-pool connection reads what the writer committed and refuses
+    /// to write.
+    #[test]
+    fn a_reader_sees_committed_rows_and_cannot_write() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("log.sqlite");
+        let path = path.to_str().expect("a utf-8 path");
+        let mut writer = super::open(path).expect("the writer");
+        let mut reader = super::open_reader(path).expect("a reader");
+        append(&mut writer, &pending("s1", b"a")).expect("append");
+
+        assert_eq!(head(&reader, "s1").expect("head"), 1);
+        assert!(
+            append(&mut reader, &pending("s1", b"b")).is_err(),
+            "a query-only connection refuses writes"
         );
     }
 }

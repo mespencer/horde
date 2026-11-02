@@ -814,13 +814,14 @@ async fn push_intents(
     last_sent: &mut Option<Vec<horde_proto::v1::ForwardIntent>>,
     sender: &tokio::sync::mpsc::Sender<Result<horde_proto::v1::StreamForwardsResponse, Status>>,
 ) -> bool {
-    let mut intents = match crate::forward::intent::intents_for_worker(&core.log, worker_id).await {
-        Ok(intents) => intents,
-        Err(error) => {
-            let _ = sender.send(Err(Status::from(error))).await;
-            return false;
-        }
-    };
+    let mut intents =
+        match crate::forward::intent::intents_for_worker(&core.sessions, worker_id).await {
+            Ok(intents) => intents,
+            Err(error) => {
+                let _ = sender.send(Err(Status::from(error))).await;
+                return false;
+            }
+        };
     // Live logins' callback exposes ride every push (DESIGN §4): the worker
     // replaces its dialable map wholesale per set, so a merge done in only
     // some pushes would flap the callback route mid-login. Merged from the

@@ -38,6 +38,8 @@ gRPC (tonic) everywhere. Resilience comes from state, not transport: every sessi
 
 **A worker accepts commands into a journaled inbox (ADR-0012).** The ack means *accepted*: each command is written to the worker's inbox in the transaction that acks it, then run on a per-agent lane — in order for that agent, without blocking any other — and completed in a second transaction. A crash in between replays the inbox at the next start. A command that cannot be applied is journaled against its agent as a diagnostic and never stops the worker; only journal failures are fatal. A message stays in the inbox until the harness has actually taken it, so a harness that died holding steering, or died idle between turns (found by a broken pipe), is revived and handed it — never double-delivered alongside ADR-0011's server-side buffer, because forgetting an incarnation drops what it was handed.
 
+**The server reads a live projection (ADR-0013).** Session state stays a pure function of the log, but it is folded once rather than per request. An in-memory projection, rebuilt from the log at boot, catches up on newly appended rows before each read, using the same fold a cold replay uses. Reads go through a pool of query-only WAL connections, so they never queue behind the writer. A worker's journal batch is appended in one transaction, with the same ordering and dedupe as one append per event. `ListSessions` can filter by exact session name.
+
 ### Version skew
 
 Hello handshake on every connection: semver + capability flags. Server enforces a minimum supported version per role; above the minimum, features gate on advertised flags rather than version comparisons. Protobuf evolution discipline (no field reuse, additive changes) carries the rest.

@@ -13,11 +13,14 @@ use horde_proto::v1::{
     Actor, AgentId, ClientId, Event, ForwardDirection, ForwardId, ForwardIntent, ForwardOpened,
     ForwardSpec, PermissionDecision, PermissionOutcome, SessionId, event::Kind,
 };
+use std::ops::ControlFlow;
+
 use prost::Message;
 
 use crate::error::ServerError;
 use crate::log::{EventLog, GlobalEvent};
-use crate::state::{PendingPermission, SessionState, forward_is_live};
+use crate::projection::SessionProjection;
+use crate::state::{ForwardState, PendingPermission, SessionState, forward_is_live};
 
 /// Why a spec cannot become an intent. Rendered to the caller verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,25 +239,29 @@ fn opened_event(
 ///
 /// Whatever reading the log refuses.
 pub async fn intents_for_worker(
-    log: &EventLog,
+    sessions: &SessionProjection,
     worker_id: &str,
 ) -> Result<Vec<ForwardIntent>, ServerError> {
     let mut intents = Vec::new();
-    for session_id in log.session_ids().await? {
-        let events = log.read_all(&session_id).await?;
-        let state = SessionState::project(&session_id, &events)?;
-        for forward in state.live_forwards() {
-            if placed_on(&state, &forward.agent_id) == Some(worker_id) {
-                intents.push(ForwardIntent {
-                    forward_id: Some(ForwardId::new(forward.forward_id.clone())),
-                    session_id: Some(SessionId::new(session_id.clone())),
-                    agent_id: Some(AgentId::new(forward.agent_id.clone())),
-                    spec: forward.spec.clone(),
-                    backer_client_id: forward.backer_client_id.clone().map(ClientId::new),
-                });
-            }
-        }
-    }
+    sessions
+        .walk(
+            |_| true,
+            |state| {
+                for forward in state.live_forwards() {
+                    if placed_on(state, &forward.agent_id) == Some(worker_id) {
+                        intents.push(ForwardIntent {
+                            forward_id: Some(ForwardId::new(forward.forward_id.clone())),
+                            session_id: Some(SessionId::new(state.session_id.clone())),
+                            agent_id: Some(AgentId::new(forward.agent_id.clone())),
+                            spec: forward.spec.clone(),
+                            backer_client_id: forward.backer_client_id.clone().map(ClientId::new),
+                        });
+                    }
+                }
+                ControlFlow::<()>::Continue(())
+            },
+        )
+        .await?;
     intents.sort_by(|a, b| {
         let key = |intent: &ForwardIntent| {
             intent
@@ -299,37 +306,44 @@ pub struct ResolvedForward {
 ///
 /// Whatever reading the log refuses.
 pub async fn resolve_live(
-    log: &EventLog,
+    sessions: &SessionProjection,
     forward_id: &str,
 ) -> Result<Option<ResolvedForward>, ServerError> {
-    for session_id in log.session_ids().await? {
-        let events = log.read_all(&session_id).await?;
-        let state = SessionState::project(&session_id, &events)?;
-        let Some(forward) = state.forwards.get(forward_id) else {
-            continue;
-        };
-        if !forward_is_live(forward, &state.agents) {
-            return Ok(None);
-        }
-        let direction = forward
+    let found = sessions
+        .walk(
+            |_| true,
+            |state| match state.forwards.get(forward_id) {
+                Some(forward) => ControlFlow::Break(resolved(state, forward)),
+                None => ControlFlow::Continue(()),
+            },
+        )
+        .await?;
+    Ok(found.flatten())
+}
+
+/// The forward the first session holding its id says it is — `None` when
+/// that session's intent is not live.
+fn resolved(state: &SessionState, forward: &ForwardState) -> Option<ResolvedForward> {
+    if !forward_is_live(forward, &state.agents) {
+        return None;
+    }
+    let direction = forward
+        .spec
+        .as_ref()
+        .and_then(|spec| ForwardDirection::try_from(spec.direction).ok())
+        .unwrap_or(ForwardDirection::Unspecified);
+    Some(ResolvedForward {
+        forward_id: forward.forward_id.clone(),
+        session_id: state.session_id.clone(),
+        direction,
+        name: forward
             .spec
             .as_ref()
-            .and_then(|spec| ForwardDirection::try_from(spec.direction).ok())
-            .unwrap_or(ForwardDirection::Unspecified);
-        return Ok(Some(ResolvedForward {
-            forward_id: forward.forward_id.clone(),
-            session_id,
-            direction,
-            name: forward
-                .spec
-                .as_ref()
-                .map(|spec| spec.name.clone())
-                .unwrap_or_default(),
-            placed_worker: placed_on(&state, &forward.agent_id).map(ToString::to_string),
-            backer: forward.backer_client_id.clone(),
-        }));
-    }
-    Ok(None)
+            .map(|spec| spec.name.clone())
+            .unwrap_or_default(),
+        placed_worker: placed_on(state, &forward.agent_id).map(ToString::to_string),
+        backer: forward.backer_client_id.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -471,6 +485,7 @@ mod log_backed_tests {
     use super::super::testfix::{append, placed_expose};
     use super::{intents_for_worker, placed_on, resolve_live};
     use crate::log::EventLog;
+    use crate::projection::SessionProjection;
     use crate::state::SessionState;
 
     /// The set is exactly the placed worker's live intents, whole — id,
@@ -480,8 +495,9 @@ mod log_backed_tests {
         let log = EventLog::in_memory().expect("log");
         placed_expose(&log, "s1", "agent-1", "w1").await;
         placed_expose(&log, "s2", "agent-2", "w2").await;
+        let sessions = SessionProjection::new(log.clone());
 
-        let intents = intents_for_worker(&log, "w1").await.expect("intents");
+        let intents = intents_for_worker(&sessions, "w1").await.expect("intents");
         assert_eq!(intents.len(), 1, "w2's intent is not w1's to realize");
         assert_eq!(
             intents[0].forward_id.as_ref().map(ToString::to_string),
@@ -502,7 +518,7 @@ mod log_backed_tests {
         );
 
         assert!(
-            intents_for_worker(&log, "w3")
+            intents_for_worker(&sessions, "w3")
                 .await
                 .expect("intents")
                 .is_empty(),
@@ -528,8 +544,9 @@ mod log_backed_tests {
     async fn resolve_live_finds_live_intents_and_refuses_dead_ones() {
         let log = EventLog::in_memory().expect("log");
         placed_expose(&log, "s1", "agent-1", "w1").await;
+        let sessions = SessionProjection::new(log.clone());
 
-        let resolved = resolve_live(&log, "fwd-agent-1")
+        let resolved = resolve_live(&sessions, "fwd-agent-1")
             .await
             .expect("read")
             .expect("a live forward resolves");
@@ -541,7 +558,7 @@ mod log_backed_tests {
         assert_eq!(resolved.backer, None);
 
         assert!(
-            resolve_live(&log, "fwd-nothing")
+            resolve_live(&sessions, "fwd-nothing")
                 .await
                 .expect("read")
                 .is_none(),
@@ -561,7 +578,7 @@ mod log_backed_tests {
         )
         .await;
         assert!(
-            resolve_live(&log, "fwd-agent-1")
+            resolve_live(&sessions, "fwd-agent-1")
                 .await
                 .expect("read")
                 .is_none(),

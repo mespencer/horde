@@ -179,6 +179,12 @@ message ListSessionsRequest {
   uint32 page_size = 2;
 
   string page_token = 3;
+
+  // When set, only sessions whose name (SessionSummary.title) is exactly
+  // this string. Unset lists every session. Optional so that "match the
+  // empty name" stays expressible and an older client's request — which
+  // never carries the field — keeps meaning "no filter".
+  optional string name = 4;
 }
 
 message ListSessionsResponse {

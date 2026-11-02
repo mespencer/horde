@@ -47,6 +47,13 @@ pub fn is_reserved_stream(session_id: &str) -> bool {
         || crate::liveness::is_worker_journal_stream(session_id)
 }
 
+/// Whether a stream is a session — any stream that is not reserved. The
+/// admission the session-wide projection walks use (ADR-0013).
+#[must_use]
+pub fn is_session_stream(session_id: &str) -> bool {
+    !is_reserved_stream(session_id)
+}
+
 /// The wire form of a principal role.
 #[must_use]
 pub fn role_to_wire(role: PrincipalRole) -> Role {

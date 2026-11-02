@@ -21,6 +21,7 @@ pub mod login;
 pub mod mcp;
 pub mod permission;
 pub mod placement;
+pub mod projection;
 pub mod relay;
 pub mod scheduler;
 pub mod service;

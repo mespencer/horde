@@ -29,7 +29,6 @@ use horde_proto::v1::McpServerConfig;
 use crate::error::ServerError;
 use crate::mcp::{MCP_CATALOG_STREAM, McpServerCatalog, visible_to};
 use crate::service::shared::ServerCore;
-use crate::state::SessionState;
 
 /// The hub's connected upstreams, keyed by server name.
 ///
@@ -230,13 +229,13 @@ async fn admitted_caller(
     session_id: &str,
     agent_id: &str,
 ) -> Result<ForwardedCaller, ServerError> {
-    let events = core.log.read_all(session_id).await?;
-    if events.is_empty() {
-        return Err(ServerError::NoSuchSession {
-            session_id: session_id.to_owned(),
-        });
-    }
-    let state = SessionState::project(session_id, &events)?;
+    let state =
+        core.sessions
+            .state(session_id)
+            .await?
+            .ok_or_else(|| ServerError::NoSuchSession {
+                session_id: session_id.to_owned(),
+            })?;
     let agent = state
         .agents
         .get(agent_id)

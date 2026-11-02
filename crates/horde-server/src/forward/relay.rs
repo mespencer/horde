@@ -27,7 +27,7 @@ use tonic::Status;
 
 use super::intent::{self, ResolvedForward};
 use super::registry::{Claim, ForwardRegistry, PassiveLeg, PassiveTarget, TunnelPrincipal};
-use crate::log::EventLog;
+use crate::projection::SessionProjection;
 
 /// How long the opening frame may take to arrive.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
@@ -61,7 +61,7 @@ impl LegIo {
 /// Runs one tunnel stream to completion: handshake, claim-or-originate,
 /// splice.
 pub async fn run_tunnel(
-    log: &EventLog,
+    sessions: &SessionProjection,
     registry: &ForwardRegistry,
     logins: &crate::login::registry::LoginRegistry,
     caller: TunnelPrincipal,
@@ -84,7 +84,7 @@ pub async fn run_tunnel(
             ))
             .await;
         }
-        Claim::Unknown => run_originator(log, registry, logins, caller, open, io).await,
+        Claim::Unknown => run_originator(sessions, registry, logins, caller, open, io).await,
     }
 }
 
@@ -124,14 +124,14 @@ async fn run_passive(pair: tokio::sync::oneshot::Sender<PassiveLeg>, io: LegIo) 
 
 /// The originating side: validate, dispatch, wait for the pairing, splice.
 async fn run_originator(
-    log: &EventLog,
+    sessions: &SessionProjection,
     registry: &ForwardRegistry,
     logins: &crate::login::registry::LoginRegistry,
     caller: TunnelPrincipal,
     open: ForwardTunnelOpen,
     mut io: LegIo,
 ) {
-    let leg = match originate(log, registry, logins, &caller, &open).await {
+    let leg = match originate(sessions, registry, logins, &caller, &open).await {
         Ok(leg) => leg,
         Err(refusal) => return io.say(refusal).await,
     };
@@ -141,7 +141,7 @@ async fn run_originator(
 
 /// Everything between "an open frame arrived" and "both legs are up".
 async fn originate(
-    log: &EventLog,
+    sessions: &SessionProjection,
     registry: &ForwardRegistry,
     logins: &crate::login::registry::LoginRegistry,
     caller: &TunnelPrincipal,
@@ -152,7 +152,7 @@ async fn originate(
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
-    let resolved = intent::resolve_live(log, &forward_id)
+    let resolved = intent::resolve_live(sessions, &forward_id)
         .await
         .map_err(|error| {
             refusal_frame(
@@ -678,11 +678,11 @@ mod tests {
         caller: TunnelPrincipal,
     ) -> LegHandles {
         let (io, feed, out) = scripted_leg();
-        let log = log.clone();
+        let sessions = crate::projection::SessionProjection::new(log.clone());
         let registry = registry.clone();
         let task = tokio::spawn(async move {
             let logins = crate::login::registry::LoginRegistry::new();
-            super::run_tunnel(&log, &registry, &logins, caller, io).await;
+            super::run_tunnel(&sessions, &registry, &logins, caller, io).await;
         });
         (feed, out, task)
     }

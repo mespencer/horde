@@ -18,6 +18,7 @@ use crate::error::ServerError;
 use crate::forward::registry::ForwardRegistry;
 use crate::log::store::Appended;
 use crate::log::{EventLog, PendingEvent};
+use crate::projection::SessionProjection;
 use crate::scheduler::{CapabilityScheduler, Scheduler, WorkerRegistry};
 use crate::workspace::InstanceCache;
 
@@ -35,6 +36,9 @@ use crate::workspace::InstanceCache;
 #[derive(Clone)]
 pub struct ServerCore {
     pub log: EventLog,
+    /// Every session's state, folded incrementally out of `log` (ADR-0013):
+    /// what the read paths consult instead of re-folding the log per call.
+    pub sessions: SessionProjection,
     pub workers: WorkerRegistry,
     pub instances: InstanceCache,
     pub scheduler: Arc<dyn Scheduler>,
@@ -78,6 +82,7 @@ impl ServerCore {
         let instances = InstanceCache::new();
         let scheduler = Arc::new(CapabilityScheduler::new(workers.clone(), instances.clone()));
         Self {
+            sessions: SessionProjection::new(log.clone()),
             log,
             workers,
             instances,

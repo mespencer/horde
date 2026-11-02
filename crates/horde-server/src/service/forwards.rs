@@ -87,8 +87,7 @@ pub async fn open_forward(
         });
     }
 
-    let events = core.log.read_all(&session_id).await?;
-    let state = SessionState::project(&session_id, &events)?;
+    let state = core.sessions.state_or_new(&session_id).await?;
     check_owner(&state, &agent_id)?;
     if name_in_use(&state, &spec.name) {
         return Err(ServerError::Invalid(format!(
@@ -218,8 +217,7 @@ pub async fn close_forward(
     forward_id: &str,
     reason: String,
 ) -> Result<u64, ServerError> {
-    let events = core.log.read_all(session_id).await?;
-    let state = SessionState::project(session_id, &events)?;
+    let state = core.sessions.state_or_new(session_id).await?;
     let Some(forward) = state.forwards.get(forward_id) else {
         return Err(ServerError::Invalid(format!(
             "session {session_id} has no forward {forward_id}"
@@ -256,17 +254,15 @@ pub async fn list_forwards(
     core: &ServerCore,
     session_filter: Option<String>,
 ) -> Result<ListForwardsResponse, ServerError> {
-    let sessions = match session_filter {
-        Some(session_id) => vec![session_id],
-        None => core.log.session_ids().await?,
+    let states = match session_filter {
+        Some(session_id) => vec![core.sessions.state_or_new(&session_id).await?],
+        None => core.sessions.states(|_| true).await?,
     };
 
     let mut forwards = Vec::new();
-    for session_id in sessions {
-        let events = core.log.read_all(&session_id).await?;
-        let state = SessionState::project(&session_id, &events)?;
+    for state in &states {
         for forward in state.live_forwards() {
-            forwards.push(status_of(core, &session_id, &state, forward));
+            forwards.push(status_of(core, &state.session_id, state, forward));
         }
     }
     Ok(ListForwardsResponse { forwards })
@@ -357,14 +353,14 @@ where
 {
     let (typed, stream) = tokio::sync::mpsc::channel(16);
     let (frames, frame_rx) = tokio::sync::mpsc::channel(16);
-    let log = core.log.clone();
+    let sessions = core.sessions.clone();
     let registry = core.forwards.clone();
     let logins = core.logins.clone();
 
     super::shared::lift_frames(frame_rx, typed.clone(), wrap);
     tokio::spawn(async move {
         let pump = crate::forward::relay::run_tunnel(
-            &log,
+            &sessions,
             &registry,
             &logins,
             caller,
