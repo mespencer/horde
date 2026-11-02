@@ -2249,6 +2249,32 @@ mod delivery_tests {
         (ControlPlane::new(core.clone()), core)
     }
 
+    /// The handshake answers with the principal the channel's certificate
+    /// names, through the production handler.
+    #[tokio::test]
+    async fn the_hello_answer_carries_the_callers_principal() {
+        let (plane, _core) = plane();
+        let mut request = Request::new(horde_proto::v1::HelloRequest {
+            hello: Some(horde_proto::v1::Hello {
+                semver: env!("CARGO_PKG_VERSION").to_owned(),
+                role: horde_proto::v1::Role::Client as i32,
+                ..horde_proto::v1::Hello::default()
+            }),
+        });
+        request.extensions_mut().insert(PeerIdentity {
+            principal: Principal::new(PrincipalRole::Client, "laptop").expect("a valid name"),
+            serial_hex: "aa".to_owned(),
+        });
+        let server = plane
+            .hello(request)
+            .await
+            .expect("the handshake answers")
+            .into_inner()
+            .server
+            .expect("a server hello");
+        assert_eq!(server.principal, "client:laptop");
+    }
+
     /// A fresh session: its id and its root agent.
     async fn session(plane: &ControlPlane) -> (String, String) {
         let created = plane

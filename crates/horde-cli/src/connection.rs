@@ -127,3 +127,6 @@ pub fn default_identity_dir(home: Option<std::path::PathBuf>) -> std::path::Path
         |home| home.join(".horde").join("id"),
     )
 }
+
+#[cfg(test)]
+mod tests;

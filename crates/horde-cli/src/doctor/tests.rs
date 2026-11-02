@@ -311,3 +311,61 @@ async fn a_corrupt_identity_and_a_dead_server_are_named() {
     assert_eq!(server.verdict, Verdict::Fail, "{checks:?}");
     assert!(!server.detail.contains('\n'), "one line: {server:?}");
 }
+
+/// The thresholds at their exact edges: one KiB under each disk floor
+/// takes the stricter verdict, and a certificate inside the last week
+/// warns.
+#[test]
+fn every_threshold_holds_at_its_edge() {
+    const NOW_MS: i64 = 1_700_000_000_000;
+    assert_eq!(
+        disk_verdict("d", Some(2 * 1024 * 1024 - 1)).verdict,
+        Verdict::Warn
+    );
+    assert_eq!(
+        disk_verdict("d", Some(256 * 1024 - 1)).verdict,
+        Verdict::Fail
+    );
+    let ca = horde_identity::CertificateAuthority::generate(NOW_MS).expect("a CA");
+    let pem = ca.certificate_pem();
+    let (_, not_after) = horde_identity::validity_of_pem(pem).expect("parses");
+    let inside_the_week = certificate_check("ca", pem, not_after - 7 * DAY + 1);
+    assert_eq!(
+        inside_the_week.verdict,
+        Verdict::Warn,
+        "{inside_the_week:?}"
+    );
+}
+
+/// The doctor's clock is the wall clock, in seconds.
+#[test]
+fn the_doctor_reads_the_wall_clock_in_seconds() {
+    let expected = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0));
+    let read = super::unix_now_secs();
+    assert!((read - expected).abs() <= 5, "{read} vs {expected}");
+}
+
+/// The verb itself fails — a non-zero exit — when a check fails: here a
+/// machine with no identity and no endpoint.
+#[tokio::test]
+async fn the_verb_fails_when_a_check_fails() {
+    let dir = tempfile::tempdir().expect("a dir");
+    let args = super::DoctorArgs {
+        harnesses: vec!["claude".to_owned()],
+        state_dirs: vec![dir.path().join("absent")],
+    };
+    let identity = dir.path().join("id");
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        super::run(None, Some(&identity), &args, Format::Json),
+    )
+    .await
+    .expect("bounded")
+    .expect_err("no identity, no endpoint");
+    assert!(
+        matches!(refused, crate::ClientError::Unhealthy { failures: 2 }),
+        "{refused:?}"
+    );
+}

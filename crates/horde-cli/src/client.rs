@@ -1623,6 +1623,37 @@ impl SyncOptions {
 mod tests {
     use super::{ClientError, SyncOptions};
 
+    /// The name filter asks the server for exactly the sessions titled so —
+    /// not everything, and not nothing.
+    #[tokio::test]
+    async fn the_named_listing_returns_exactly_the_titled_sessions() {
+        let (_core, mut client) = crate::forward::testing::served().await;
+        for (title, key) in [("alpha", "k-1"), ("beta", "k-2")] {
+            client
+                .create_session(title, key)
+                .await
+                .expect("a session creates");
+        }
+        let named = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.list_sessions_named("beta", false),
+        )
+        .await
+        .expect("bounded")
+        .expect("lists");
+        assert_eq!(
+            named.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+        assert!(
+            client
+                .list_sessions_named("gamma", true)
+                .await
+                .expect("lists")
+                .is_empty()
+        );
+    }
+
     /// A server refusal reads as plain words — the code's phrase and the
     /// server's message — never tonic's `status: …, metadata: …` dump.
     #[test]

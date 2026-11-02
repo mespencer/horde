@@ -24,6 +24,21 @@ fn ttl_minutes() -> clap::builder::RangedU64ValueParser<u32> {
     clap::builder::RangedU64ValueParser::new().range(1..)
 }
 
+/// What the binary prints for a parse failure in place of clap's own
+/// output: the JSON refusal when `args` asked for `--json` and the failure
+/// is a real mistake; `None` (clap prints, as always) otherwise.
+#[must_use]
+pub fn argument_refusal(
+    error: &clap::Error,
+    mut args: impl Iterator<Item = String>,
+) -> Option<String> {
+    if args.any(|arg| arg == "--json") {
+        argument_refusal_json(error)
+    } else {
+        None
+    }
+}
+
 /// A usage mistake as the JSON object `--json` promises on stderr —
 /// `None` for clap's help and version displays, which are not refusals.
 #[must_use]
@@ -2524,6 +2539,18 @@ mod tests {
                     .as_str()
                     .is_some_and(|message| message.contains("ttl-minutes")),
                 "{json}"
+            );
+            let owned = |list: &[&str]| list.iter().map(|&arg| arg.to_owned()).collect::<Vec<_>>();
+            let mut with_json = owned(&argv);
+            with_json.push("--json".to_owned());
+            assert!(
+                super::argument_refusal(&refused, with_json.into_iter()).is_some(),
+                "--json asks for the JSON form"
+            );
+            assert_eq!(
+                super::argument_refusal(&refused, owned(&argv).into_iter()),
+                None,
+                "without --json clap prints"
             );
             argv.pop();
             argv.push("1");

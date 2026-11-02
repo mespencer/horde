@@ -17,13 +17,12 @@ async fn main() -> ExitCode {
         Err(error) => {
             // Under `--json` a usage mistake is a JSON object on stderr like
             // every other refusal; help and version still print as clap says.
-            let json = std::env::args().any(|arg| arg == "--json");
-            match horde_cli::cli::argument_refusal_json(&error) {
-                Some(refusal) if json => {
+            match horde_cli::cli::argument_refusal(&error, std::env::args()) {
+                Some(refusal) => {
                     eprintln!("{refusal}");
                     return ExitCode::from(2);
                 }
-                _ => error.exit(),
+                None => error.exit(),
             }
         }
     };

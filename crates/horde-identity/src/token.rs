@@ -350,6 +350,12 @@ mod tests {
                 format!("horde://join/host:7778/00ff.{}", "a".repeat(65)),
                 TokenError::MalformedCode,
             ),
+            // A whole 64-digit fingerprint is not truncation, whatever
+            // else is wrong with the code.
+            (
+                format!("horde://join/host:7778/zz.{fp}"),
+                TokenError::MalformedCode,
+            ),
             (
                 format!("horde://join/host:7778/00ff.{}", "g".repeat(10)),
                 TokenError::MalformedCode,
