@@ -31,6 +31,7 @@
 
 pub mod process;
 pub mod pty;
+pub mod reap;
 pub mod secure;
 
 use horde_cli::Client;
