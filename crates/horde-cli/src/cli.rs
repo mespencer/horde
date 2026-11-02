@@ -262,6 +262,9 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         etag: String,
     },
+    /// Rename a definition, re-lay its repos, or replace its unmanaged
+    /// paths, at the version `--etag` names.
+    Update(crate::workspace_update::UpdateArgs),
     /// Remove a definition at the version `--etag` names.
     Delete {
         workspace_definition_id: String,
@@ -1418,6 +1421,9 @@ async fn run_workspace(
                 .add_workspace_repo(workspace_definition_id, repo_from(repo)?, etag)
                 .await?;
             println!("{}", render::workspace(&definition, format));
+        }
+        WorkspaceCommand::Update(args) => {
+            crate::workspace_update::run(client, args, format).await?;
         }
         WorkspaceCommand::Delete {
             workspace_definition_id,
