@@ -386,6 +386,10 @@ fn check_advertising(environment: &UpEnvironment) -> Result<(), ClientError> {
         return Ok(());
     }
     for name in &environment.subject_names {
+        // The server refuses a malformed name too, but only after `up` has
+        // started it; said here first, naming the flaw.
+        horde_identity::check_subject_name(name)
+            .map_err(|flaw| ClientError::Up(format!("--san {name}: {flaw}")))?;
         if horde_identity::token::host_scope(name) != horde_identity::HostScope::Routable {
             return Err(ClientError::Up(format!(
                 "--san {name} is not a name another machine can dial"

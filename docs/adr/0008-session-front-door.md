@@ -101,3 +101,16 @@ included — is one object on stderr (`kind`, gRPC `code`, `message`, `hint`,
 everywhere (`not found: …`), never tonic's debug dump. `horde doctor` checks
 a machine end to end with an actionable fix per line, and `Hello` now echoes
 the principal the server derived from the channel's certificate.
+
+**ADR-0007 leftovers, settled alongside.** `horde-server --remint` re-mints a
+running server's bootstrap token: same-machine only (access to the state
+dir is the trust, as for the token file), delivered as SIGHUP to the pid in
+`server.lock`; the previous code stays redeemable until its own TTL. Once a
+client is enrolled there is no bootstrap token to re-mint — `--remint`
+refuses and names `horde enroll client <name>`. `--san` names are checked
+syntactically at mint time (an IP literal, or a DNS name of letter/digit/
+inner-hyphen labels ≤ 63, ≤ 253 in all; URLs, ports, wildcards, whitespace
+and an all-digit last label refused naming the flaw) — resolution is still
+the dial-time certificate check's job. Placement refuses a worker that does
+not advertise the requested harness as installed, so a spawn queues with
+"lacks harness `x`" instead of failing on the worker.

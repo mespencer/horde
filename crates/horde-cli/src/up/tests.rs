@@ -867,6 +867,17 @@ async fn san_advertising_is_refused_when_nobody_else_could_dial_it() {
     let refusal = refusal_of(&environment).await;
     assert!(refusal.contains("--san 0.0.0.0"), "{refusal}");
 
+    environment.subject_names = vec!["https://box.lan".to_owned()];
+    let refusal = refusal_of(&environment).await;
+    assert!(
+        refusal.starts_with("horde up: --san https://box.lan: "),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("not a name another machine can dial"),
+        "the syntax flaw is named before the scope: {refusal}"
+    );
+
     environment.subject_names = vec!["box.lan".to_owned()];
     environment.bind = "not-an-address".to_owned();
     let refusal = refusal_of(&environment).await;
