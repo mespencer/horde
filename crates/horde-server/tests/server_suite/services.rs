@@ -1606,5 +1606,22 @@ async fn a_usage_query_must_name_a_grouping_and_a_real_session() {
     assert_eq!(missing.code(), Code::NotFound);
 }
 
+/// An event over tonic's 4 MiB default is one the worker spine ingests, so
+/// it must be one the control plane can send back — and one an operator's
+/// note can be: the server's control plane decodes and encodes at the same
+/// ceiling as its worker spine.
+#[tokio::test]
+async fn an_event_over_four_mebibytes_round_trips_through_the_control_plane() -> Setup<()> {
+    let endpoint = horde_server_testkit::serve().await?;
+    let bytes = 5 * 1024 * 1024;
+    let read = horde_server_testkit::oversized_events_read_back(&endpoint, bytes).await?;
+    assert_eq!(
+        read,
+        vec![bytes, bytes],
+        "the note and the chunk both come back whole over SyncEvents"
+    );
+    Ok(())
+}
+
 /// Keeps `DuplexStream` referenced so the import cannot rot unnoticed.
 const _: fn(DuplexStream) = |_stream| {};

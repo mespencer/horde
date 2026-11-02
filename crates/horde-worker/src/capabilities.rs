@@ -45,9 +45,11 @@ pub struct DeclaredFacts {
 /// The full advertisement placement matches on, from the registered adapters,
 /// the Instances actually on disk, and the operator's declared facts.
 ///
-/// Provider accounts stay empty until the subsystem that owns that fact
-/// exists; advertising them earlier would have the scheduler matching on
-/// facts nothing maintains. Warm instances and workspace support come from
+/// Provider accounts are not the adapters' fact but the login plane's —
+/// [`crate::login::LoginPlane::held_accounts`], read from the account
+/// directories logins sign in — so the daemon fills them from there; left
+/// empty here, nothing is claimed that nothing maintains. Warm instances and
+/// workspace support come from
 /// the workspace half: `None` honestly advertises a Worker that would refuse
 /// a materialize command.
 #[must_use]

@@ -50,9 +50,7 @@ const PAGE: u32 = 256;
 /// silent 4 MiB default.
 #[must_use]
 pub fn worker_service(channel: Channel) -> WorkerServiceClient<Channel> {
-    WorkerServiceClient::new(channel)
-        .max_decoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
+    horde_proto::limited!(WorkerServiceClient::new(channel))
 }
 
 /// What the command feed drives — the seam between the wire and the Runtime.
@@ -152,6 +150,9 @@ pub const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub struct Connection {
     client: WorkerServiceClient<Channel>,
     worker_id: String,
+    /// The registration this connection opened with — what a mid-connection
+    /// re-advertisement starts from.
+    registered: horde_proto::v1::RegisterWorkerRequest,
 }
 
 impl Connection {
@@ -167,13 +168,14 @@ impl Connection {
     pub async fn dial(config: &DialConfig) -> Result<(Self, RegisterWorkerResponse), WorkerError> {
         let mut client = worker_service(config.channel().await?);
 
+        let registered = horde_proto::v1::RegisterWorkerRequest {
+            hello: Some(config.hello.clone()),
+            worker_id: Some(WorkerId::new(config.worker_id.clone())),
+            capabilities: Some(config.capabilities.clone()),
+            last_local_journal_sequence: config.last_local_journal_sequence,
+        };
         let response = client
-            .register_worker(horde_proto::v1::RegisterWorkerRequest {
-                hello: Some(config.hello.clone()),
-                worker_id: Some(WorkerId::new(config.worker_id.clone())),
-                capabilities: Some(config.capabilities.clone()),
-                last_local_journal_sequence: config.last_local_journal_sequence,
-            })
+            .register_worker(registered.clone())
             .await?
             .into_inner();
 
@@ -184,7 +186,14 @@ impl Connection {
             .filter(|id| !id.is_empty())
             .ok_or(WorkerError::Incomplete("worker id"))?;
 
-        Ok((Self { client, worker_id }, response))
+        Ok((
+            Self {
+                client,
+                worker_id,
+                registered,
+            },
+            response,
+        ))
     }
 
     /// The identity the Server registered this connection under.
@@ -257,6 +266,7 @@ impl Connection {
         let forward_worker = self.worker_id.clone();
         let login_client = self.service_client();
         let login_worker = self.worker_id.clone();
+        let registered = self.registered.clone();
         tokio::select! {
             outcome = self.feed_commands(journal, target) => outcome,
             outcome = push_side.push_events(journal) => outcome,
@@ -269,7 +279,9 @@ impl Connection {
             // dispatch stream dies here; each live login session is a
             // detached task that ends itself through its own tunnel dying —
             // via kill-and-reap, never around it (see `login`'s module docs).
-            outcome = crate::login::serve(login_client, &login_worker, logins) => outcome,
+            // It also re-advertises after a login exits cleanly, so the
+            // accounts it signed in are placeable on this connection.
+            outcome = crate::login::serve(login_client, &login_worker, &registered, logins) => outcome,
         }
     }
 

@@ -20,6 +20,8 @@ mod joining;
 #[cfg(test)]
 mod lifecycle;
 #[cfg(test)]
+mod lineage;
+#[cfg(test)]
 mod logins;
 #[cfg(test)]
 mod relay_payload;

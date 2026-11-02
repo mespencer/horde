@@ -296,6 +296,35 @@ impl ControlPlane {
         Ok(workspace)
     }
 
+    /// The spec a spawn runs with: what it asked for, with every unset field
+    /// filled from the named parent's spec as the log recorded it — never
+    /// from anything the spawner asserts (DESIGN §5). A spawn an agent made
+    /// through its worker is then refused if the result holds more than that
+    /// parent does (ADR-0009). A spawn naming no parent, or a parent the
+    /// session has never seen, is what it asked for.
+    async fn lineage_spec(
+        &self,
+        state: &SessionState,
+        named_parent: Option<&str>,
+        from_agent: bool,
+        asked: horde_proto::v1::AgentSpec,
+    ) -> Result<horde_proto::v1::AgentSpec, Status> {
+        let Some(parent) = named_parent
+            .and_then(|id| state.agents.get(id))
+            .map(|agent| agent.spec.clone().unwrap_or_default())
+        else {
+            return Ok(asked);
+        };
+        let spec = crate::lineage::inherited(&parent, asked);
+        if from_agent {
+            let catalog = self.mcp_catalog().await.map_err(Status::from)?;
+            if let Some(reason) = crate::lineage::exceeds(&parent, &spec, &catalog) {
+                return Err(Status::permission_denied(reason));
+            }
+        }
+        Ok(spec)
+    }
+
     /// The two answers a spawn owes before it creates anything (ADR-0011),
     /// asked under the placement lock: a retry answers with the agent the
     /// first attempt created, placed wherever it is now — instead of a
@@ -948,7 +977,14 @@ impl ControlPlaneService for ControlPlane {
             .map(ToString::to_string)
             .or_else(|| state.root_agent_id.clone());
         let agent_id = format!("agent-{}", uuid_like());
-        let spec = request.spec.unwrap_or_default();
+        let spec = self
+            .lineage_spec(
+                &state,
+                request.parent_agent_id.as_ref().map(|id| id.value.as_str()),
+                conduit.is_some(),
+                request.spec.unwrap_or_default(),
+            )
+            .await?;
 
         let workspace = self.validated_workspace(&spec).await?;
 

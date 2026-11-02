@@ -215,6 +215,6 @@ impl SecureHarness {
         identity: &StoredIdentity,
     ) -> Setup<WorkerServiceClient<tonic::transport::Channel>> {
         let channel = self.main_endpoint_as(identity)?.connect().await?;
-        Ok(WorkerServiceClient::new(channel))
+        Ok(horde_proto::limited!(WorkerServiceClient::new(channel)))
     }
 }

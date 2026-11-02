@@ -18,6 +18,22 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// batch never holds megabytes hostage across a flaky link.
 pub const PUSH_BATCH_BYTES: usize = MAX_MESSAGE_BYTES / 16;
 
+/// Holds a generated tonic server or client to [`MAX_MESSAGE_BYTES`] in both
+/// directions. Every server and client in the workspace is built through
+/// this, so no channel falls back to tonic's 4 MiB: an event the worker
+/// spine can ingest is one every reader can be sent back.
+///
+/// A macro because tonic's generated types share no trait for the two
+/// setters; the one spelling keeps the ceiling from drifting per call site.
+#[macro_export]
+macro_rules! limited {
+    ($service:expr) => {
+        $service
+            .max_decoding_message_size($crate::limits::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size($crate::limits::MAX_MESSAGE_BYTES)
+    };
+}
+
 #[cfg(test)]
 mod tests {
     /// The ceiling both ends agree on, pinned by value: a different number

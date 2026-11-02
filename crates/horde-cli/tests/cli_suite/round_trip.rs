@@ -488,3 +488,16 @@ async fn next_update_replays_in_order_and_reports_the_head_at_catch_up() {
     }
     assert_eq!(sequences, vec![1, 2, 3, 4], "replay is dense and in order");
 }
+
+/// The client half of the shared ceiling: a replay carrying an event over
+/// tonic's 4 MiB default decodes whole, because `Client` is built at
+/// `horde_proto::limits` like the server that sends it.
+#[tokio::test]
+async fn a_replay_carrying_an_event_over_four_mebibytes_decodes_whole() {
+    let endpoint = common::serve().await.expect("a server must start");
+    let bytes = 5 * 1024 * 1024;
+    let read = horde_server_testkit::oversized_events_read_back(&endpoint, bytes)
+        .await
+        .expect("the oversized events round-trip");
+    assert_eq!(read, vec![bytes, bytes], "both events decode whole");
+}

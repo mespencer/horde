@@ -96,7 +96,7 @@ pub async fn join(
         .await
         .map_err(transport)?;
 
-    let response = EnrollmentServiceClient::new(channel)
+    let response = horde_proto::limited!(EnrollmentServiceClient::new(channel))
         .join(JoinRequest {
             enrollment_code: code.secret.clone(),
             csr_pem,

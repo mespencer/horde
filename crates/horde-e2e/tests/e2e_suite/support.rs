@@ -305,6 +305,38 @@ impl System {
         (session_id, root)
     }
 
+    /// An origin repo under the system's state with one seed commit on its
+    /// default branch — what a workspace definition's `atlas` points at.
+    pub(crate) async fn seeded_origin(&self) -> PathBuf {
+        let origin = self.state.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("the origin dir");
+        git(&origin, &["init"]).await;
+        std::fs::write(origin.join("README.md"), "atlas\n").expect("the seed file");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-m", "seed"]).await;
+        origin
+    }
+
+    /// Waits until `agent`'s checkout exists *and* is composed. A directory
+    /// existing is not a checkout finished: `git worktree add` creates it
+    /// first and only then checks out and writes the index, so a commit made
+    /// in between is silently reset away. The worker journals the agent's
+    /// first lifecycle transition only once its whole checkout is composed.
+    pub(crate) async fn checkout_composed(&self, session_id: &str, agent: &str, checkout: &Path) {
+        path_appears(&format!("{agent}'s checkout"), checkout).await;
+        self.sync_until(
+            session_id,
+            &format!("{agent}'s checkout is composed"),
+            |events| {
+                events.iter().any(|event| {
+                    event["kind"] == "agent_lifecycle_changed"
+                        && event["agent_id"].as_str() == Some(agent)
+                })
+            },
+        )
+        .await;
+    }
+
     /// Starts a worker daemon named `name` over `state_dir`, enrolling it
     /// first when the directory holds no identity yet, and waits for its
     /// registration line. `extra` carries scenario flags (`--fake-script`,
@@ -361,6 +393,27 @@ pub(crate) async fn bounded_output(
         .await
         .unwrap_or_else(|_| panic!("{what} must finish rather than hang"))
         .expect("the command runs")
+}
+
+/// Waits until `path` exists on disk — the observable half of a materialize
+/// or checkout that happened inside a worker daemon. Bounded.
+pub(crate) async fn path_appears(what: &str, path: &Path) {
+    for _ in 0..300_u32 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("{what} never appeared at {}", path.display());
+}
+
+/// The agent-checkout path the worker's WorkspaceManager composes for the
+/// `atlas` repo: `<workspace root>/<definition id>/.horde-agents/<agent>/atlas`.
+pub(crate) fn checkout_path(root: &Path, definition_id: &str, agent_id: &str) -> PathBuf {
+    root.join(definition_id)
+        .join(".horde-agents")
+        .join(agent_id)
+        .join("atlas")
 }
 
 /// The texts of every output chunk in a replay, in log order.

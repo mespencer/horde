@@ -54,7 +54,7 @@ impl AttachmentBroker {
     fn client(&self, needed_for: &str) -> Result<BlobServiceClient<Channel>, WorkerError> {
         self.service
             .clone()
-            .map(BlobServiceClient::new)
+            .map(|channel| horde_proto::limited!(BlobServiceClient::new(channel)))
             .ok_or_else(|| {
                 WorkerError::Attachment(format!(
                     "no blob service is configured on this worker, and {needed_for} \

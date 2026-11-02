@@ -36,8 +36,6 @@ pub mod reap;
 pub mod secure;
 
 use horde_cli::Client;
-use horde_proto::v1::blob_service_server::BlobServiceServer;
-use horde_proto::v1::control_plane_service_server::ControlPlaneServiceServer;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{
     Event, JournaledEvent, JournaledEventBatch, PushEventsRequest, PushEventsResponse,
@@ -133,16 +131,16 @@ pub async fn serve_core(core: ServerCore) -> Setup<String> {
         let _ = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(horde_server::transport::KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(horde_server::transport::KEEPALIVE_TIMEOUT))
-            .add_service(ControlPlaneServiceServer::new(ControlPlane::new(
-                core.clone(),
-            )))
+            // The production limits on every service, so a message the real
+            // listener takes is a message this one takes.
+            .add_service(horde_server::transport::control_plane_service(
+                ControlPlane::new(core.clone()),
+            ))
             // Blobs ride the same endpoint they share in production; a core
             // without a store answers the verbs `Unimplemented`, honestly.
-            .add_service(BlobServiceServer::new(horde_server::service::Blobs::new(
-                core.blobs.clone(),
-            )))
-            // The production limits too, so a batch the real listener takes
-            // is a batch this one takes.
+            .add_service(horde_server::transport::blob_service(
+                horde_server::service::Blobs::new(core.blobs.clone()),
+            ))
             .add_service(horde_server::transport::worker_service(WorkerFacing::new(
                 core,
             )))
@@ -232,9 +230,7 @@ pub async fn journal_event_at(
     journal_sequence: u64,
     event: Event,
 ) -> Setup<()> {
-    let mut worker =
-        WorkerServiceClient::connect(tonic::transport::Endpoint::try_from(endpoint.to_owned())?)
-            .await?;
+    let mut worker = worker_spine(endpoint).await?;
 
     let (to_server, mut acks) = open_journal(
         &mut worker,
@@ -267,6 +263,83 @@ pub async fn journal_event_at(
     Ok(())
 }
 
+/// A worker-spine client of the plaintext harness at `endpoint`, held to the
+/// production ceiling ([`horde_proto::limits`]).
+///
+/// # Errors
+///
+/// The endpoint not parsing, or the dial failing.
+pub async fn worker_spine(endpoint: &str) -> Setup<WorkerServiceClient<tonic::transport::Channel>> {
+    let worker =
+        WorkerServiceClient::connect(tonic::transport::Endpoint::try_from(endpoint.to_owned())?)
+            .await?;
+    Ok(horde_proto::limited!(worker))
+}
+
+/// Writes two events of `bytes` bytes each — an output chunk journaled
+/// through the worker spine at `endpoint`, then a note sent over the control
+/// plane — and replays the session with `horde_cli::Client`: every ceiling
+/// on both spines, in both directions, must admit them. Returns the size of
+/// each oversized text the replay handed back, in log order. Bounded: a
+/// replay that cannot finish is an error.
+///
+/// # Errors
+///
+/// The seeding, the journal push, the send, or the replay failing — an
+/// encode or decode ceiling below `bytes` anywhere on the way lands here.
+pub async fn oversized_events_read_back(endpoint: &str, bytes: usize) -> Setup<Vec<usize>> {
+    let (mut client, session_id, root) = seeded(endpoint, "oversized").await?;
+    let text = "x".repeat(bytes);
+    client
+        .send_note(
+            &root,
+            &text,
+            horde_proto::v1::DeliveryMode::TurnBoundary,
+            "oversized-note",
+        )
+        .await?;
+    journal_event(
+        endpoint,
+        &session_id,
+        Event {
+            agent_id: Some(horde_proto::v1::AgentId::new(root.clone())),
+            occurred_at: None,
+            idempotency_key: "oversized-chunk".to_owned(),
+            kind: Some(horde_proto::v1::event::Kind::AgentOutputChunk(
+                horde_proto::v1::AgentOutputChunk {
+                    text,
+                    ..horde_proto::v1::AgentOutputChunk::default()
+                },
+            )),
+        },
+    )
+    .await?;
+    let mut read = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.sync(
+            &horde_cli::client::SyncOptions::new(session_id),
+            |envelope| {
+                use horde_proto::v1::event::Kind;
+                match envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                {
+                    Some(Kind::AgentOutputChunk(chunk)) => read.push(chunk.text.len()),
+                    Some(Kind::NoteSent(sent)) => {
+                        read.extend(sent.note.as_ref().map(|note| note.text.len()));
+                    }
+                    _ => {}
+                }
+            },
+            |_| {},
+        ),
+    )
+    .await??;
+    Ok(read)
+}
+
 /// Journals one event as a worker's first, and waits for the server's ack.
 ///
 /// [`journal_event_at`] with the sequence a fresh worker would use — enough
@@ -290,9 +363,7 @@ pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup
     use horde_proto::v1::{
         AdapterCapability, HarnessCapability, Hello, RegisterWorkerRequest, WorkerCapabilities,
     };
-    let mut worker =
-        WorkerServiceClient::connect(tonic::transport::Endpoint::try_from(endpoint.to_owned())?)
-            .await?;
+    let mut worker = worker_spine(endpoint).await?;
     worker
         .register_worker(RegisterWorkerRequest {
             hello: Some(Hello {

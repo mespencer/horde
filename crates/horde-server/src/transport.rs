@@ -71,15 +71,15 @@ pub async fn serve_main(
 
     // Every guarded service sits behind the trust door (ADR-0009): enrolled
     // and unrevoked, *and* of a role the called method admits.
-    let control_plane = ControlPlaneServiceServer::with_interceptor(
-        ControlPlane::with_enrollment(core.clone(), authority),
+    let control_plane = tonic::service::interceptor::InterceptedService::new(
+        control_plane_service(ControlPlane::with_enrollment(core.clone(), authority)),
         crate::trust::door(deny.clone()),
     );
     // Blob transfer rides the same listener and the same enrolled door:
     // workers and clients both move attachments, so the service is
     // principal-agnostic rather than duplicated onto each spine.
-    let blobs = BlobServiceServer::with_interceptor(
-        crate::service::Blobs::new(core.blobs.clone()),
+    let blobs = tonic::service::interceptor::InterceptedService::new(
+        blob_service(crate::service::Blobs::new(core.blobs.clone())),
         crate::trust::door(deny.clone()),
     );
     let worker_facing = tonic::service::interceptor::InterceptedService::new(
@@ -129,9 +129,28 @@ pub async fn serve_main(
 /// opaque status the Worker could only redial into.
 #[must_use]
 pub fn worker_service(service: WorkerFacing) -> WorkerServiceServer<WorkerFacing> {
-    WorkerServiceServer::new(service)
-        .max_decoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(horde_proto::limits::MAX_MESSAGE_BYTES)
+    horde_proto::limited!(WorkerServiceServer::new(service))
+}
+
+/// The control plane with the same limits as the worker spine. An event a
+/// worker may push (up to [`horde_proto::limits::MAX_MESSAGE_BYTES`]) is one
+/// `SyncEvents` must be able to hand back: a smaller ceiling here would let
+/// the log ingest an event no client can then read.
+#[must_use]
+pub fn control_plane_service(service: ControlPlane) -> ControlPlaneServiceServer<ControlPlane> {
+    horde_proto::limited!(ControlPlaneServiceServer::new(service))
+}
+
+/// The blob service with the shared limits ([`horde_proto::limits`]).
+#[must_use]
+pub fn blob_service(service: crate::service::Blobs) -> BlobServiceServer<crate::service::Blobs> {
+    horde_proto::limited!(BlobServiceServer::new(service))
+}
+
+/// The enrollment service with the shared limits ([`horde_proto::limits`]).
+#[must_use]
+pub fn enrollment_service(service: Enrollment) -> EnrollmentServiceServer<Enrollment> {
+    horde_proto::limited!(EnrollmentServiceServer::new(service))
 }
 
 /// Binds the enrollment listener: `Join` alone, server-auth TLS.
@@ -149,7 +168,7 @@ pub async fn serve_enrollment(
     let router = tonic::transport::Server::builder()
         .tls_config(tls)
         .map_err(|e| ServerError::Internal(format!("TLS configuration refused: {e}")))?
-        .add_service(EnrollmentServiceServer::new(Enrollment::new(authority)));
+        .add_service(enrollment_service(Enrollment::new(authority)));
 
     let task = tokio::spawn(async move {
         if let Err(error) = router

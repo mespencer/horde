@@ -331,6 +331,67 @@ async fn a_registration_places_what_was_queued_before_it() {
     );
 }
 
+/// A spawn requiring a provider account queues, with the account named,
+/// against a worker that holds none — and places when that same worker
+/// registers again advertising it, which is what a worker does after
+/// `horde worker login --account` signs the account in.
+#[tokio::test]
+async fn a_spawn_requiring_an_account_places_once_its_worker_advertises_it() {
+    let mut harness = connect().await.expect("a harness");
+    register(&mut harness, "acct", WorkerCapabilities::default())
+        .await
+        .expect("register without the account");
+    let (session_id, _root) = seed(&mut harness, "accounts", "key-1")
+        .await
+        .expect("a session");
+
+    let needs_work = AgentSpec {
+        placement: Some(PlacementConstraints {
+            required_provider_accounts: vec!["work".to_owned()],
+            ..PlacementConstraints::default()
+        }),
+        ..AgentSpec::default()
+    };
+    let (agent, placement) = spawn_under(&mut harness, &session_id, None, needs_work)
+        .await
+        .expect("the spawn is answered");
+    assert_eq!(placement.state, PlacementState::Queued as i32);
+    assert!(
+        placement
+            .reason
+            .contains("lacks provider accounts [`work`]"),
+        "{}",
+        placement.reason
+    );
+
+    register(
+        &mut harness,
+        "acct",
+        WorkerCapabilities {
+            provider_accounts: vec![horde_proto::v1::ProviderAccountCapability {
+                provider: "claude".to_owned(),
+                account: "work".to_owned(),
+                ..horde_proto::v1::ProviderAccountCapability::default()
+            }],
+            ..WorkerCapabilities::default()
+        },
+    )
+    .await
+    .expect("re-register holding the account");
+    let observed = placements_until(&mut harness, &session_id, 3)
+        .await
+        .expect("the drain");
+    assert_eq!(
+        observed.last(),
+        Some(&Observed {
+            agent_id: agent,
+            state: PlacementState::Placed,
+            worker_id: Some("acct".to_owned()),
+        }),
+        "the advertised account is what placement matched: {observed:?}"
+    );
+}
+
 /// Re-placement on worker loss (DESIGN §6): a worker whose command stream is
 /// gone loses its never-started agents back to the queue, the replacement
 /// worker gets their spawns, and the lost worker's replayable stream carries

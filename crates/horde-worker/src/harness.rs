@@ -125,6 +125,28 @@ impl HarnessProfile {
         Ok(dir)
     }
 
+    /// The accounts this profile holds a sign-in for, in name order: every
+    /// `<root>/accounts/<account>` directory the harness has written into.
+    /// A login prepares the directory empty before the provider's command
+    /// runs, so an empty one is a login that never got as far as saving
+    /// anything — not an account placement may count on.
+    #[must_use]
+    pub fn signed_in_accounts(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.root.join(ACCOUNTS_DIR)) else {
+            return Vec::new();
+        };
+        let mut accounts: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                std::fs::read_dir(entry.path()).is_ok_and(|mut inside| inside.next().is_some())
+            })
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| crate::workspace::is_path_safe(name))
+            .collect();
+        accounts.sort();
+        accounts
+    }
+
     /// Writes `contents` to a fresh owner-only (0600) file under the
     /// profile's run directory. The file is deleted when the last clone of
     /// the returned handle drops — hand it to the [`HarnessSpec`] and it
@@ -294,6 +316,39 @@ mod tests {
         );
         assert_eq!(mode(&default), 0o700, "config dirs hold credentials");
         assert_eq!(mode(&work), 0o700);
+    }
+
+    /// The accounts a profile holds are the account directories a sign-in
+    /// wrote into — in name order — and not the ones merely prepared, not
+    /// the account-less default, and not stray files beside them.
+    #[test]
+    fn the_signed_in_accounts_are_the_account_dirs_holding_a_sign_in() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let profile = HarnessProfile::new(scratch.path().join("claude"));
+        assert!(
+            profile.signed_in_accounts().is_empty(),
+            "no accounts directory, no accounts"
+        );
+
+        for account in ["work", "personal", "prepared"] {
+            profile
+                .config_dir(Some(&ProviderAccount::new(account)))
+                .expect("an account dir");
+        }
+        let default = profile.config_dir(None).expect("the default dir");
+        for signed_in in [
+            profile.root().join("accounts").join("work"),
+            profile.root().join("accounts").join("personal"),
+            default,
+        ] {
+            std::fs::write(signed_in.join(".credentials.json"), "{}").expect("a sign-in");
+        }
+        std::fs::write(profile.root().join("accounts").join("stray"), "x").expect("a stray file");
+
+        assert_eq!(
+            profile.signed_in_accounts(),
+            vec!["personal".to_owned(), "work".to_owned()]
+        );
     }
 
     /// A relative root is made absolute at construction, so no account can

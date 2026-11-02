@@ -97,7 +97,8 @@ async fn a_real_login_dispatch_is_answered_and_a_vanished_client_reaped() {
             .await
             .expect("the worker spine dials");
     let serving = tokio::spawn(async move {
-        let _ = horde_worker::login::serve(worker_client, "w-login", plane).await;
+        let registered = horde_proto::v1::RegisterWorkerRequest::default();
+        let _ = horde_worker::login::serve(worker_client, "w-login", &registered, plane).await;
     });
     lane_registers(&core, "w-login").await;
 
@@ -121,5 +122,168 @@ async fn a_real_login_dispatch_is_answered_and_a_vanished_client_reaped() {
     })
     .await;
 
+    serving.abort();
+}
+
+/// The latest placement state the log records for `agent`, replayed over
+/// the control plane.
+async fn placement_of(endpoint: &str, session_id: &str, agent: &str) -> Option<i32> {
+    let mut client = horde_cli::Client::connect(endpoint)
+        .await
+        .expect("the client dials");
+    let mut state = None;
+    client
+        .sync(
+            &horde_cli::client::SyncOptions::new(session_id.to_owned()),
+            |envelope| {
+                if let Some(horde_proto::v1::event::Kind::PlacementChanged(changed)) = envelope
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref())
+                    && let Some(placement) = &changed.placement
+                    && placement
+                        .agent_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref()
+                        == Some(agent)
+                {
+                    state = Some(placement.state);
+                }
+            },
+            |_| {},
+        )
+        .await
+        .expect("the replay finishes");
+    state
+}
+
+/// The account a login signs in is one placement can match, end to end:
+/// a spawn requiring the account `work` queues against a Worker that holds
+/// no sign-in for it; `horde worker login --account work` runs, its command
+/// writes into the account's profile directory and exits cleanly; the
+/// Worker re-advertises what it now holds — from that directory, the one an
+/// agent bound to the account launches under — and the queued spawn places.
+#[tokio::test]
+async fn an_account_login_makes_a_spawn_requiring_that_account_placeable() {
+    let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
+    let endpoint = serve(core.clone()).await;
+    let profile = tempfile::tempdir().expect("a profile root");
+
+    let (announce, mut lines) = announcing();
+    let mut recipes = std::collections::BTreeMap::new();
+    recipes.insert(
+        "fake".to_owned(),
+        horde_adapter::LoginRecipe::terminal_only(
+            "/bin/sh",
+            vec![
+                "-c".to_owned(),
+                r#"printf signed > "$FAKE_CONFIG_DIR/credentials""#.to_owned(),
+            ],
+        )
+        .with_accounts("FAKE_CONFIG_DIR", profile.path()),
+    );
+    let plane = Arc::new(horde_worker::login::LoginPlane::new(recipes, announce));
+    assert!(
+        plane.held_accounts().is_empty(),
+        "nothing is signed in yet, so nothing is advertised"
+    );
+
+    // The worker registers holding no account, the way a dial would.
+    let mut worker_client = horde_worker::client::worker_service(
+        tonic::transport::Endpoint::try_from(endpoint.clone())
+            .expect("an endpoint")
+            .connect()
+            .await
+            .expect("the worker spine dials"),
+    );
+    let mut advertised = horde_worker::capabilities::advertise(
+        [],
+        None,
+        &horde_worker::capabilities::DeclaredFacts::default(),
+    );
+    advertised.provider_accounts = plane.held_accounts();
+    let registered = horde_proto::v1::RegisterWorkerRequest {
+        hello: Some(horde_worker::capabilities::hello("w-acct")),
+        worker_id: Some(horde_proto::v1::WorkerId::new("w-acct")),
+        capabilities: Some(advertised),
+        last_local_journal_sequence: None,
+    };
+    worker_client
+        .register_worker(registered.clone())
+        .await
+        .expect("the worker registers");
+
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("the client dials");
+    let (summary, _root) = client
+        .create_session("accounts", "")
+        .await
+        .expect("a session");
+    let session_id = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .expect("a session id");
+    let spawned = client
+        .spawn_agent_with_spec(
+            &session_id,
+            None,
+            horde_proto::v1::AgentSpec {
+                placement: Some(horde_proto::v1::PlacementConstraints {
+                    required_provider_accounts: vec!["work".to_owned()],
+                    ..horde_proto::v1::PlacementConstraints::default()
+                }),
+                ..horde_proto::v1::AgentSpec::default()
+            },
+            "needs-work",
+        )
+        .await
+        .expect("the spawn is accepted");
+    let child = spawned
+        .agent_id
+        .as_ref()
+        .map(ToString::to_string)
+        .expect("an agent id");
+    let queued = spawned.placement.expect("a placement");
+    assert_eq!(
+        queued.state,
+        horde_proto::v1::PlacementState::Queued as i32,
+        "no worker holds `work` yet"
+    );
+    assert!(
+        queued.reason.contains("lacks provider accounts [`work`]"),
+        "{}",
+        queued.reason
+    );
+
+    let serving = tokio::spawn(async move {
+        let _ = horde_worker::login::serve(worker_client, "w-acct", &registered, plane).await;
+    });
+    lane_registers(&core, "w-acct").await;
+    let opened = horde_cli::login::open_login(&mut client, "w-acct", "fake", Some("work"), 80, 24)
+        .await
+        .expect("the worker's plane attaches");
+    announce_reaches(&mut lines, |line| {
+        line.contains("readvertised provider_accounts=1")
+    })
+    .await;
+
+    let mut placed = None;
+    for _ in 0..POLLS {
+        placed = placement_of(&endpoint, &session_id, &child).await;
+        if placed == Some(horde_proto::v1::PlacementState::Placed as i32) {
+            break;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    assert_eq!(
+        placed,
+        Some(horde_proto::v1::PlacementState::Placed as i32),
+        "the re-advertised account places the queued spawn"
+    );
+
+    drop(opened);
     serving.abort();
 }

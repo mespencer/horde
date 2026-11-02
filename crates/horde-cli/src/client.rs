@@ -522,9 +522,18 @@ impl Client {
     #[must_use]
     pub fn with_channel(channel: Channel) -> Self {
         Self {
-            inner: ControlPlaneServiceClient::new(channel.clone()),
+            // The shared ceiling (`horde_proto::limits`), so an event the
+            // worker spine ingests is one this client can be sent back.
+            inner: horde_proto::limited!(ControlPlaneServiceClient::new(channel.clone())),
             channel,
         }
+    }
+
+    /// The blob service over this client's channel, at the shared ceiling.
+    fn blobs(&self) -> horde_proto::v1::blob_service_client::BlobServiceClient<Channel> {
+        horde_proto::limited!(
+            horde_proto::v1::blob_service_client::BlobServiceClient::new(self.channel.clone())
+        )
     }
 
     /// Stashes bytes into the server's Blob Store, returning the verified
@@ -538,9 +547,7 @@ impl Client {
         &mut self,
         bytes: &[u8],
     ) -> Result<horde_proto::v1::UploadBlobResponse, ClientError> {
-        let mut blobs =
-            horde_proto::v1::blob_service_client::BlobServiceClient::new(self.channel.clone());
-        Ok(horde_proto::blob::upload_blob(&mut blobs, bytes).await?)
+        Ok(horde_proto::blob::upload_blob(&mut self.blobs(), bytes).await?)
     }
 
     /// Fetches one blob by address, verified against it before returning.
@@ -557,9 +564,7 @@ impl Client {
                 given: address.to_owned(),
             }
         })?;
-        let mut blobs =
-            horde_proto::v1::blob_service_client::BlobServiceClient::new(self.channel.clone());
-        Ok(horde_proto::blob::download_blob(&mut blobs, &digest).await?)
+        Ok(horde_proto::blob::download_blob(&mut self.blobs(), &digest).await?)
     }
 
     /// Version and capability handshake.

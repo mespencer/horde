@@ -11,11 +11,12 @@ use horde_identity::{PrincipalRole, StoredIdentity};
 use horde_proto::prost::Message;
 use horde_proto::prost_types::{Struct, Value, value::Kind as ValueKind};
 use horde_proto::v1::{
-    AdapterCapability, AgentId, AnswerPermissionRequest, Event, HarnessCapability, JournaledEvent,
-    JournaledEventBatch, McpServerConfigChanged, PermissionOutcome, PermissionRequest,
-    PermissionRequestId, PermissionRequested, PushEventsRequest, RegisterWorkerRequest, SessionId,
-    WorkerCapabilities, WorkerId, control_plane_service_client::ControlPlaneServiceClient,
-    event::Kind, push_events_request, push_events_response,
+    AdapterCapability, AgentId, AgentSpec, AnswerPermissionRequest, ConcreteModel, Event,
+    HarnessCapability, JournaledEvent, JournaledEventBatch, McpServerConfigChanged, ModelSelection,
+    PermissionOutcome, PermissionRequest, PermissionRequestId, PermissionRequested,
+    PushEventsRequest, RegisterWorkerRequest, SessionId, SpawnAgentRequest, WorkerCapabilities,
+    WorkerId, control_plane_service_client::ControlPlaneServiceClient, event::Kind,
+    model_selection::Selection, push_events_request, push_events_response,
     worker_service_client::WorkerServiceClient,
 };
 use horde_server::trust::{Admits, admits, guarded_method_paths};
@@ -416,6 +417,126 @@ async fn a_narrowing_is_refused_for_an_adapter_that_cannot_rewrite() -> Setup<()
     .await??;
     assert_eq!(harness_decisions(&harness).await?.len(), 1);
     Ok(())
+}
+
+/// A spawn an agent makes through its worker is its parent's child in full:
+/// every field it leaves unset is the parent's, as the log recorded it —
+/// type, model, permission mode — and it may not ask for more than the
+/// parent holds (ADR-0009). An operator naming the same parent is a human
+/// and is not narrowed.
+#[tokio::test]
+async fn an_agents_child_inherits_its_parent_and_may_not_exceed_it() -> Setup<()> {
+    let harness = serve_secured().await?;
+    let worker_identity = harness.enroll(PrincipalRole::Worker, "mac-studio").await?;
+    let mut worker = harness.worker_client(&worker_identity).await?;
+    within(
+        "the registration",
+        worker.register_worker(registration("mac-studio", capabilities(false))),
+    )
+    .await??;
+    let operator = harness.enroll(PrincipalRole::Client, "laptop").await?;
+    let mut client = harness.client(&operator).await?;
+    let parent_spec = AgentSpec {
+        agent_type: "reviewer".to_owned(),
+        model: Some(ModelSelection {
+            selection: Some(Selection::Concrete(ConcreteModel {
+                provider: "fake".to_owned(),
+                model: "m1".to_owned(),
+                provider_account: String::new(),
+            })),
+        }),
+        permission_mode: "careful".to_owned(),
+        ..AgentSpec::default()
+    };
+    let (summary, root) = within(
+        "the session",
+        client.create_session_with("lineage", parent_spec.clone(), ""),
+    )
+    .await??;
+    let session = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or("a session id")?;
+    let spawn = |key: &str, spec: AgentSpec| SpawnAgentRequest {
+        session_id: Some(SessionId::new(&session)),
+        parent_agent_id: Some(root.clone()),
+        spec: Some(spec),
+        idempotency_key: key.to_owned(),
+    };
+    let mut as_worker = ControlPlaneServiceClient::new(
+        harness
+            .main_endpoint_as(&worker_identity)?
+            .connect()
+            .await?,
+    );
+
+    let child = within(
+        "the agent's spawn",
+        as_worker.spawn_agent(spawn("child", AgentSpec::default())),
+    )
+    .await??
+    .into_inner();
+    let child_id = child.agent_id.map(|id| id.to_string()).unwrap_or_default();
+    let recorded = spawned_spec(&harness, &session, &child_id).await?;
+    assert_eq!(
+        recorded,
+        Some(parent_spec.clone()),
+        "the child is its parent's type, model, and mode"
+    );
+    assert_eq!(
+        child.placement.map(|placement| placement.state),
+        Some(horde_proto::v1::PlacementState::Placed as i32),
+        "the inherited model is what placement matched"
+    );
+
+    let looser = AgentSpec {
+        permission_mode: "loose".to_owned(),
+        ..AgentSpec::default()
+    };
+    let refused = within(
+        "the wider spawn",
+        as_worker.spawn_agent(spawn("wider", looser.clone())),
+    )
+    .await?
+    .expect_err("an agent may not hand its child a mode it does not hold");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert!(refused.message().contains("permission mode"), "{refused}");
+
+    let operators = within(
+        "the operator's spawn",
+        client.spawn_agent_with_spec(&session, Some(&root.to_string()), looser, "operator"),
+    )
+    .await??;
+    let operators_id = operators
+        .agent_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        spawned_spec(&harness, &session, &operators_id)
+            .await?
+            .map(|spec| (spec.permission_mode, spec.agent_type)),
+        Some(("loose".to_owned(), "reviewer".to_owned())),
+        "an operator's choice stands, and what it left unset is still inherited"
+    );
+    Ok(())
+}
+
+/// The spec `agent_id`'s `AgentSpawned` recorded, if the log holds one.
+async fn spawned_spec(
+    harness: &SecureHarness,
+    session: &str,
+    agent_id: &str,
+) -> Setup<Option<AgentSpec>> {
+    for stored in harness.log.read_all(session).await? {
+        let event = Event::decode(stored.payload.as_slice())?;
+        if let Some(Kind::AgentSpawned(spawned)) = event.kind
+            && event.agent_id.map(|id| id.to_string()).as_deref() == Some(agent_id)
+        {
+            return Ok(spawned.spec);
+        }
+    }
+    Ok(None)
 }
 
 /// Every permission decision in every session of the harness's log.

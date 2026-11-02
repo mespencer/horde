@@ -24,8 +24,8 @@ use horde_proto::login::{
 };
 use horde_proto::v1::worker_service_client::WorkerServiceClient;
 use horde_proto::v1::{
-    LoginFrame, LoginRefusalReason, LoginSessionRequest, StreamLoginsRequest, WorkerId,
-    login_frame::Frame,
+    LoginFrame, LoginRefusalReason, LoginSessionRequest, RegisterWorkerRequest,
+    StreamLoginsRequest, login_frame::Frame,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio_stream::StreamExt;
@@ -54,6 +54,13 @@ const DEFAULT_ROWS: u16 = 24;
 pub struct LoginPlane {
     recipes: BTreeMap<String, LoginRecipe>,
     announce: Announce,
+    /// Woken by every login that exits cleanly: what it signed in may be an
+    /// account placement can now match, so the advertisement is refreshed.
+    signed_in: tokio::sync::Notify,
+    /// The instances a re-advertisement reports, rescanned rather than
+    /// carried over from the dial — a re-registration replaces the Server's
+    /// view of this Worker's instances wholesale.
+    workspaces: Option<crate::WorkspaceManager>,
 }
 
 impl std::fmt::Debug for LoginPlane {
@@ -69,7 +76,46 @@ impl LoginPlane {
     /// A plane over explicit recipes — the test constructor.
     #[must_use]
     pub fn new(recipes: BTreeMap<String, LoginRecipe>, announce: Announce) -> Self {
-        Self { recipes, announce }
+        Self {
+            recipes,
+            announce,
+            signed_in: tokio::sync::Notify::new(),
+            workspaces: None,
+        }
+    }
+
+    /// Re-advertisements report the instances `workspaces` holds on disk.
+    #[must_use]
+    pub fn with_workspaces(mut self, workspaces: Option<crate::WorkspaceManager>) -> Self {
+        self.workspaces = workspaces;
+        self
+    }
+
+    /// The provider accounts this Worker holds a sign-in for — the
+    /// advertisement's `provider_accounts`. Read from the very directories a
+    /// per-account login signs in (`<profile>/accounts/<account>`, ADR-0010)
+    /// and an agent bound to that account launches under, for every provider
+    /// whose recipe signs in per account.
+    #[must_use]
+    pub fn held_accounts(&self) -> Vec<horde_proto::v1::ProviderAccountCapability> {
+        self.recipes
+            .iter()
+            .filter_map(|(provider, recipe)| {
+                recipe
+                    .accounts
+                    .as_ref()
+                    .map(|(_, root)| (provider, crate::harness::HarnessProfile::new(root)))
+            })
+            .flat_map(|(provider, profile)| {
+                profile.signed_in_accounts().into_iter().map(|account| {
+                    horde_proto::v1::ProviderAccountCapability {
+                        provider: provider.clone(),
+                        account,
+                        ..horde_proto::v1::ProviderAccountCapability::default()
+                    }
+                })
+            })
+            .collect()
     }
 
     /// A plane over the registered adapters' recipes — the daemon path. An
@@ -88,7 +134,7 @@ impl LoginPlane {
                     .map(|recipe| (adapter.provider().to_owned(), recipe))
             })
             .collect();
-        Self { recipes, announce }
+        Self::new(recipes, announce)
     }
 
     /// A plane whose operator lines go nowhere — for in-process test
@@ -154,27 +200,59 @@ impl LoginPlane {
 pub async fn serve(
     mut client: WorkerServiceClient<Channel>,
     worker_id: &str,
+    registered: &RegisterWorkerRequest,
     plane: Arc<LoginPlane>,
 ) -> Result<(), WorkerError> {
     let mut stream = client
         .stream_logins(StreamLoginsRequest {
-            worker_id: Some(WorkerId::new(worker_id)),
+            worker_id: Some(horde_proto::v1::WorkerId::new(worker_id)),
         })
         .await?
         .into_inner();
 
     loop {
-        let Some(update) = stream.message().await? else {
-            return Ok(());
-        };
-        let Some(request) = update.request else {
-            continue;
-        };
-        // Detached on purpose (module docs): the session ends when its own
-        // tunnel does, through the kill-and-reap path — an abort here would
-        // leak the child mid-kill.
-        tokio::spawn(handle_login(client.clone(), request, Arc::clone(&plane)));
+        tokio::select! {
+            update = stream.message() => {
+                let Some(update) = update? else {
+                    return Ok(());
+                };
+                let Some(request) = update.request else {
+                    continue;
+                };
+                // Detached on purpose (module docs): the session ends when
+                // its own tunnel does, through the kill-and-reap path — an
+                // abort here would leak the child mid-kill.
+                tokio::spawn(handle_login(client.clone(), request, Arc::clone(&plane)));
+            }
+            () = plane.signed_in.notified() => {
+                readvertise(&mut client, registered, &plane).await?;
+            }
+        }
     }
+}
+
+/// Registers again with what a login may have changed — the accounts held,
+/// and the instances on disk now — so a spawn requiring the account just
+/// signed in is placeable without waiting for a reconnect. The rest is the
+/// registration this connection opened with; the journal head is left
+/// unset, because the regression check belongs to the dial, and a head
+/// carried from then would only be stale.
+async fn readvertise(
+    client: &mut WorkerServiceClient<Channel>,
+    registered: &RegisterWorkerRequest,
+    plane: &LoginPlane,
+) -> Result<(), WorkerError> {
+    let mut request = registered.clone();
+    request.last_local_journal_sequence = None;
+    let capabilities = request.capabilities.get_or_insert_default();
+    capabilities.provider_accounts = plane.held_accounts();
+    if let Some(workspaces) = &plane.workspaces {
+        capabilities.warm_instances = workspaces.warm_instances().await;
+    }
+    let accounts = capabilities.provider_accounts.len();
+    client.register_worker(request).await?;
+    (plane.announce)(format!("readvertised provider_accounts={accounts}"));
+    Ok(())
 }
 
 /// One login tunnel leg on the worker spine, stripped to bare frames.
@@ -288,7 +366,7 @@ async fn answer_dispatch(tunnel: LoginTunnel, request: LoginSessionRequest, plan
         request.provider
     ));
 
-    pump_login(
+    let exited = pump_login(
         tunnel,
         session,
         &login_id,
@@ -296,6 +374,9 @@ async fn answer_dispatch(tunnel: LoginTunnel, request: LoginSessionRequest, plan
         &plane.announce,
     )
     .await;
+    if exited == Some(0) {
+        plane.signed_in.notify_one();
+    }
 }
 
 /// The PTY size a request asks for, defaulted and clamped to what a PTY can
@@ -412,13 +493,15 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
 }
 
 /// Relays until the command exits or the tunnel dies, then reaps either way.
+/// Returns the command's exit code when it exited on its own; `None` when it
+/// was killed because its tunnel died, or its code is unknown.
 async fn pump_login(
     mut tunnel: LoginTunnel,
     mut session: PtySession,
     login_id: &str,
     provider: &str,
     announce: &Announce,
-) {
+) -> Option<u32> {
     loop {
         tokio::select! {
             frame = tunnel.from_relay.next() => {
@@ -447,7 +530,7 @@ async fn pump_login(
                              reason=client-vanished exit={}",
                             code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
                         ));
-                        return;
+                        return None;
                     }
                 }
             }
@@ -461,7 +544,7 @@ async fn pump_login(
                                  reason=relay-gone exit={}",
                                 code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
                             ));
-                            return;
+                            return None;
                         }
                     }
                     // PTY EOF: the command is done. Reap, report, finish.
@@ -476,7 +559,7 @@ async fn pump_login(
                             code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
                         ));
                         tunnel.finish().await;
-                        return;
+                        return code;
                     }
                 }
             }

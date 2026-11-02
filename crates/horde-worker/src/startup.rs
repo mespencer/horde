@@ -676,21 +676,24 @@ fn server_channel(
 }
 
 /// The dial for one connection attempt, advertisement rebuilt fresh so a
-/// registration after a materialize advertises the instances now on disk.
-async fn fresh_dial_config(prepared: &PreparedWorker) -> DialConfig {
+/// registration after a materialize advertises the instances now on disk —
+/// and after a login, the accounts `logins` now holds a sign-in for.
+async fn fresh_dial_config(
+    prepared: &PreparedWorker,
+    logins: &crate::login::LoginPlane,
+) -> DialConfig {
     let warm = match prepared.runtime.workspaces() {
         Some(workspaces) => Some(workspaces.warm_instances().await),
         None => None,
     };
+    let mut advertised =
+        capabilities::advertise(prepared.runtime.adapters(), warm, &prepared.declared);
+    advertised.provider_accounts = logins.held_accounts();
     DialConfig {
         endpoint: prepared.server.clone(),
         worker_id: prepared.name.clone(),
         hello: capabilities::hello(&prepared.name),
-        capabilities: capabilities::advertise(
-            prepared.runtime.adapters(),
-            warm,
-            &prepared.declared,
-        ),
+        capabilities: advertised,
         identity: prepared.identity.clone(),
         // An unreadable head reports nothing rather than zero: zero would
         // read as a lost journal and refuse a healthy Worker.
@@ -846,7 +849,18 @@ async fn connection_loop(
 ) -> Option<String> {
     let mut backoff = Backoff::default();
     loop {
-        let config = fresh_dial_config(prepared).await;
+        // Rebuilt per connection from the registered adapters: recipes are
+        // static data, and collecting them here keeps the borrow on the
+        // runtime out of the mutable run below. Built before the dial,
+        // because the accounts its recipes sign in are advertised.
+        let logins = Arc::new(
+            crate::login::LoginPlane::from_adapters(
+                prepared.runtime.adapters(),
+                prepared.login_announce.clone(),
+            )
+            .with_workspaces(prepared.runtime.workspaces().cloned()),
+        );
+        let config = fresh_dial_config(prepared, &logins).await;
         let dialed = tokio::select! {
             () = shutdown.as_mut() => return None,
             dialed = Connection::dial(&config) => dialed,
@@ -871,13 +885,6 @@ async fn connection_loop(
             registration.resume_from_journal_sequence
         ));
 
-        // Rebuilt per connection from the registered adapters: recipes are
-        // static data, and collecting them here keeps the borrow on the
-        // runtime out of the mutable run below.
-        let logins = Arc::new(crate::login::LoginPlane::from_adapters(
-            prepared.runtime.adapters(),
-            prepared.login_announce.clone(),
-        ));
         let ended = tokio::select! {
             () = shutdown.as_mut() => return None,
             ended = connection.run(&prepared.journal, &mut prepared.runtime, logins) => ended,

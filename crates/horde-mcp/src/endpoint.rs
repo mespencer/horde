@@ -65,6 +65,13 @@ pub struct SpawnParams {
     /// idle child to be assigned later.
     #[serde(default)]
     pub task: String,
+    /// Another agent type for the child. Omitted, it is yours. A type that
+    /// would see a tool server yours cannot is refused.
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    /// Another model tier for the child, e.g. "fast". Omitted, it is yours.
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -409,7 +416,7 @@ impl HordeEndpoint {
 
     #[tool(
         name = "spawn_agent",
-        description = "Spawn a child agent under yourself. Never blocks: an agent with nowhere to run comes back queued with the reason."
+        description = "Spawn a child agent under yourself, in your workspace, with your agent type and model unless you name another type or tier. Never blocks: an agent with nowhere to run comes back queued with the reason."
     )]
     async fn spawn_agent(
         &self,
@@ -422,9 +429,13 @@ impl HordeEndpoint {
         // text would silently collapse them into one (the audit's collision
         // #1). The task itself rides the spec as the initial assignment.
         let key = self.minted_request_id(&identity);
+        let overrides = crate::verbs::ChildOverrides {
+            agent_type: params.agent_type,
+            tier: params.tier,
+        };
         let outcome = self
             .verbs()
-            .spawn_agent(&identity, &params.task, &key)
+            .spawn_agent(&identity, &params.task, &overrides, &key)
             .await
             .map_err(internal)?;
 

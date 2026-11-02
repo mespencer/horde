@@ -15,6 +15,7 @@ pub mod enrollment;
 pub mod error;
 pub mod forward;
 pub mod hub;
+pub mod lineage;
 pub mod liveness;
 pub mod log;
 pub mod login;

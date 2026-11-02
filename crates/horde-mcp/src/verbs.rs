@@ -114,6 +114,17 @@ pub struct SpawnOutcome {
     pub reason: String,
 }
 
+/// What a spawning agent may change about its child. Anything unset is the
+/// parent's — inherited by the Server from the log, not restated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildOverrides {
+    /// Another agent type; the Server refuses one that sees an MCP server
+    /// the parent's type cannot.
+    pub agent_type: Option<String>,
+    /// Another tier from the catalog, e.g. `fast`.
+    pub tier: Option<String>,
+}
+
 /// The orchestrator verbs for one Agent's endpoint.
 #[derive(Debug)]
 pub struct Verbs {
@@ -134,6 +145,12 @@ impl Verbs {
     /// first turn input, and a separate send could race the placement. An
     /// empty task spawns an idle child, honestly — some parents assign later.
     ///
+    /// Everything else the spec leaves unset — workspace, agent type, model,
+    /// permission mode — the Server fills from the parent's spec as the log
+    /// recorded it, not from anything said here; `overrides` may name another
+    /// type or tier, and the Server refuses one that would give the child
+    /// more than its parent holds (ADR-0009).
+    ///
     /// # Errors
     ///
     /// [`VerbError::ControlPlane`] if the Server refused. A *queued* spawn is
@@ -142,6 +159,7 @@ impl Verbs {
         &self,
         identity: &AgentIdentity,
         task: &str,
+        overrides: &ChildOverrides,
         idempotency_key: &str,
     ) -> Result<SpawnOutcome, VerbError> {
         let spec = horde_proto::v1::AgentSpec {
@@ -150,6 +168,14 @@ impl Verbs {
                 text: task.to_owned(),
                 payload: None,
             }),
+            agent_type: overrides.agent_type.clone().unwrap_or_default(),
+            model: overrides
+                .tier
+                .clone()
+                .filter(|tier| !tier.is_empty())
+                .map(|tier| horde_proto::v1::ModelSelection {
+                    selection: Some(horde_proto::v1::model_selection::Selection::Tier(tier)),
+                }),
             ..horde_proto::v1::AgentSpec::default()
         };
         // The parent is the authenticated caller, never a value the Agent

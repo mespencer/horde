@@ -19,32 +19,8 @@
 //! payload-carrying send all go through `horde`'s verbs (fix a12) — this
 //! scenario is also the end-to-end proof of that surface.
 
-use std::path::{Path, PathBuf};
-
-use crate::support::{System, git, outputs};
-
-/// Waits until `path` exists on disk — the observable half of a materialize
-/// or checkout that happened inside a worker daemon. Bounded.
-async fn path_appears(what: &str, path: &Path) {
-    for _ in 0..300_u32 {
-        if path.exists() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("{what} never appeared at {}", path.display());
-}
-
+use crate::support::{System, checkout_path, git, outputs, path_appears};
 use horde_server_testkit::process::holds_commit;
-
-/// The agent-checkout path the worker's WorkspaceManager composes:
-/// `<workspace root>/<definition id>/.horde-agents/<agent>/<layout path>`.
-fn checkout_path(root: &Path, definition_id: &str, agent_id: &str) -> PathBuf {
-    root.join(definition_id)
-        .join(".horde-agents")
-        .join(agent_id)
-        .join("atlas")
-}
 
 /// Two workers, one Relay, one commit that only the Relay can carry.
 #[tokio::test]
@@ -52,12 +28,7 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     let system = System::launch().await;
 
     // The origin repo both Instances clone from, with one seed commit.
-    let origin = system.state.path().join("origin");
-    std::fs::create_dir_all(&origin).expect("the origin dir");
-    git(&origin, &["init"]).await;
-    std::fs::write(origin.join("README.md"), "atlas\n").expect("the seed file");
-    git(&origin, &["add", "."]).await;
-    git(&origin, &["commit", "-m", "seed"]).await;
+    let origin = system.seeded_origin().await;
 
     // The server's own mounted Relay: its registry learns `atlas` from the
     // workspace definition created below, through the catalog follower.
@@ -164,19 +135,9 @@ async fn a_payload_crosses_two_workers_via_the_relay() {
     // Both daemons materialized their Instances and produced checkouts.
     let sender_checkout = checkout_path(&root_a, &definition_id, &sender);
     let receiver_checkout = checkout_path(&root_b, &definition_id, &receiver);
-    path_appears("the sender's checkout", &sender_checkout).await;
     path_appears("the receiver's checkout", &receiver_checkout).await;
-    // A directory existing is not a checkout finished: `git worktree add`
-    // creates it first and only then checks out and writes the index, so a
-    // commit made in between is silently reset away. The worker journals the
-    // sender's Starting transition only once its whole checkout is composed.
     system
-        .sync_until(&session_id, "the sender's checkout is composed", |events| {
-            events.iter().any(|event| {
-                event["kind"] == "agent_lifecycle_changed"
-                    && event["agent_id"].as_str() == Some(sender.as_str())
-            })
-        })
+        .checkout_composed(&session_id, &sender, &sender_checkout)
         .await;
 
     // The sender's work: a commit that exists only on worker A. Then the
