@@ -55,6 +55,10 @@ pub struct PlacementRequest<'a> {
     /// The workspace the agent will occupy. Requires workspace support on the
     /// chosen worker, and makes warmth the strongest preference.
     pub workspace_definition_id: Option<&'a str>,
+    /// The harness (adapter key) the spawn binds, when it names one. Required
+    /// of the chosen worker: a worker without it would refuse the spawn
+    /// command, so placing there only converts a queue into a failure.
+    pub harness: Option<&'a str>,
     /// Active agents per worker, for capacity. Computed from the log by the
     /// caller (`placement::worker_load`) so the scheduler stays a pure
     /// decision over facts it is handed.
@@ -76,6 +80,7 @@ impl<'a> PlacementRequest<'a> {
             constraints,
             parent_worker_id: None,
             workspace_definition_id: None,
+            harness: None,
             load,
             now_unix_ms: 0,
         }
@@ -232,7 +237,7 @@ impl Scheduler for CapabilityScheduler {
         // proto's words) — connected or not is the one thing it cannot skip.
         if let Some(pinned) = pinned_worker(request.constraints) {
             return match workers.iter().find(|worker| worker.worker_id == pinned) {
-                Some(worker) => match workspace_refusal(request, &worker.capabilities) {
+                Some(worker) => match pinned_refusal(request, &worker.capabilities) {
                     // A pinned worker that would refuse the materialize
                     // command is not a placement, it is a queued failure with
                     // the pin's name on it.
@@ -384,9 +389,7 @@ fn refusals(
         ));
     }
 
-    if let Some(refusal) = workspace_refusal(request, capabilities) {
-        refusals.push(refusal);
-    }
+    refusals.extend(pinned_refusal(request, capabilities));
 
     if at_capacity(capabilities.max_concurrent_agents, load) {
         refusals.push(format!(
@@ -396,6 +399,33 @@ fn refusals(
     }
 
     refusals
+}
+
+/// Why this worker could never run the spawn at all — the checks a pin
+/// cannot skip, because the worker would refuse the command it is sent.
+fn pinned_refusal(
+    request: &PlacementRequest<'_>,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    let refusals: Vec<String> = [
+        workspace_refusal(request, capabilities),
+        harness_refusal(request.harness, capabilities),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!refusals.is_empty()).then(|| refusals.join(", "))
+}
+
+/// Why this worker cannot run the requested harness, if it cannot: it must
+/// advertise that provider as installed.
+fn harness_refusal(harness: Option<&str>, capabilities: &WorkerCapabilities) -> Option<String> {
+    let wanted = harness?;
+    let runs = capabilities
+        .harnesses
+        .iter()
+        .any(|advertised| advertised.provider == wanted && advertised.installed);
+    (!runs).then(|| format!("lacks harness `{wanted}`"))
 }
 
 /// Why this worker cannot host the requested workspace, if it cannot.
@@ -1088,5 +1118,82 @@ mod tests {
             "no connected worker matches: a lacks tags [`gpu`]; \
              b is at capacity (1/1)"
         );
+    }
+
+    fn running(providers: &[(&str, bool)]) -> WorkerCapabilities {
+        WorkerCapabilities {
+            harnesses: providers
+                .iter()
+                .map(|(provider, installed)| horde_proto::v1::HarnessCapability {
+                    provider: (*provider).to_owned(),
+                    installed: *installed,
+                    ..horde_proto::v1::HarnessCapability::default()
+                })
+                .collect(),
+            ..capabilities(&[])
+        }
+    }
+
+    #[test]
+    fn a_spawn_naming_a_harness_skips_workers_that_lack_it() {
+        let harness = harness();
+        harness
+            .registry
+            .register("aaa-fake", running(&[("fake", true)]));
+        harness
+            .registry
+            .register("bbb-shelf", running(&[("codex", false)]));
+        harness
+            .registry
+            .register("ccc-codex", running(&[("codex", true)]));
+        let placed = harness.scheduler.place(&PlacementRequest {
+            harness: Some("codex"),
+            ..request_defaults()
+        });
+        assert_eq!(placed_on(placed), "ccc-codex");
+
+        harness.registry.deregister("ccc-codex");
+        let reason = queued_reason(harness.scheduler.place(&PlacementRequest {
+            harness: Some("codex"),
+            ..request_defaults()
+        }));
+        assert_eq!(
+            reason,
+            "no connected worker matches: aaa-fake lacks harness `codex`; \
+             bbb-shelf lacks harness `codex`"
+        );
+        assert_eq!(
+            placed_on(place_default(&harness)),
+            "aaa-fake",
+            "a spawn naming no harness runs anywhere"
+        );
+    }
+
+    #[test]
+    fn a_pinned_worker_lacking_the_harness_queues_with_both_refusals_named() {
+        let harness = harness();
+        let mut bare = running(&[("fake", true)]);
+        bare.supports_workspaces = false;
+        harness.registry.register("pin", bare);
+        let constraints = PlacementConstraints {
+            pinned_worker_id: Some(horde_proto::v1::WorkerId::new("pin")),
+            ..PlacementConstraints::default()
+        };
+        let reason = queued_reason(harness.scheduler.place(&PlacementRequest {
+            constraints: &constraints,
+            harness: Some("claude"),
+            workspace_definition_id: Some("ws"),
+            ..request_defaults()
+        }));
+        assert_eq!(
+            reason,
+            "pinned worker `pin` does not support workspaces, lacks harness `claude`"
+        );
+        let placed = harness.scheduler.place(&PlacementRequest {
+            constraints: &constraints,
+            harness: Some("fake"),
+            ..request_defaults()
+        });
+        assert_eq!(placed_on(placed), "pin");
     }
 }

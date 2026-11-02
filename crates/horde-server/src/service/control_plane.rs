@@ -973,10 +973,12 @@ impl ControlPlaneService for ControlPlane {
             .and_then(|parent_id| state.agents.get(parent_id))
             .and_then(|parent_state| parent_state.worker_id.clone());
         let constraints = spec.placement.clone().unwrap_or_default();
+        let harness = placement::requested_provider(Some(&spec));
         let placement = self.core.scheduler.place(&PlacementRequest {
             constraints: &constraints,
             parent_worker_id: parent_worker.as_deref(),
             workspace_definition_id: workspace.as_deref(),
+            harness: harness.as_deref(),
             load: &load,
             now_unix_ms: placement::now_unix_ms(),
         });

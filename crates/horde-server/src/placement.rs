@@ -238,10 +238,7 @@ pub fn adapter_capabilities(
     capabilities: &horde_proto::v1::WorkerCapabilities,
     spec: Option<&AgentSpec>,
 ) -> Vec<i32> {
-    let provider = crate::service::commands::binding_for(spec)
-        .map(|binding| binding.provider)
-        .filter(|provider| !provider.is_empty());
-    let harness = match provider {
+    let harness = match requested_provider(spec) {
         Some(provider) => capabilities
             .harnesses
             .iter()
@@ -251,6 +248,17 @@ pub fn adapter_capabilities(
     harness
         .map(|harness| harness.capabilities.clone())
         .unwrap_or_default()
+}
+
+/// The harness a spawn binds — named concretely or through a tier — or
+/// `None` when it names no provider and runs on the worker's default.
+/// Placement demands this harness of the chosen worker: a worker without
+/// it would refuse the spawn command with an unknown provider.
+#[must_use]
+pub fn requested_provider(spec: Option<&AgentSpec>) -> Option<String> {
+    crate::service::commands::binding_for(spec)
+        .map(|binding| binding.provider)
+        .filter(|provider| !provider.is_empty())
 }
 
 /// Records the prewarm the command fold turns into a materialize command,
@@ -352,11 +360,13 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
             let constraints = spec.placement.clone().unwrap_or_default();
             let workspace = workspace_of(&spec);
             let parent_worker = parent_worker_of(state, agent);
+            let harness = requested_provider(Some(&spec));
 
             let placement = core.scheduler.place(&PlacementRequest {
                 constraints: &constraints,
                 parent_worker_id: parent_worker.as_deref(),
                 workspace_definition_id: workspace,
+                harness: harness.as_deref(),
                 load: &load,
                 now_unix_ms: now,
             });
