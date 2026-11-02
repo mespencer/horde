@@ -182,9 +182,54 @@ pub fn principal_of_pem(certificate_pem: &str) -> Result<Principal, IdentityErro
     Ok(peer_identity(&der)?.principal)
 }
 
+/// A certificate's validity window, as unix seconds `(not_before,
+/// not_after)` — what `horde doctor` reads to say "expires in 3 days"
+/// before a handshake says it the hard way.
+///
+/// # Errors
+///
+/// [`IdentityError::UnreadablePem`] when the input holds no certificate,
+/// [`IdentityError::UnreadableCertificate`] when its DER does not parse.
+pub fn validity_of_pem(certificate_pem: &str) -> Result<(i64, i64), IdentityError> {
+    use rustls_pki_types::{CertificateDer, pem::PemObject};
+
+    let der = CertificateDer::from_pem_slice(certificate_pem.as_bytes()).map_err(|_| {
+        IdentityError::UnreadablePem {
+            what: "a certificate",
+        }
+    })?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|_| IdentityError::UnreadableCertificate)?;
+    let validity = certificate.validity();
+    Ok((
+        validity.not_before.timestamp(),
+        validity.not_after.timestamp(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Principal, PrincipalRole, is_valid_principal_name, principal_of_pem};
+    use super::{
+        Principal, PrincipalRole, is_valid_principal_name, principal_of_pem, validity_of_pem,
+    };
+
+    /// The window reads back as issued (the CA backdates five minutes and
+    /// issues principals for a year), and a non-certificate is refused.
+    #[test]
+    fn a_certificates_validity_window_reads_back() {
+        const NOW_MS: i64 = 1_700_000_000_000;
+        let ca = crate::CertificateAuthority::generate(NOW_MS).expect("a CA");
+        let (not_before, not_after) =
+            validity_of_pem(ca.certificate_pem()).expect("the CA certificate parses");
+        assert!(not_before < NOW_MS / 1_000, "backdated: {not_before}");
+        assert!(
+            not_after > NOW_MS / 1_000 + 86_400,
+            "valid for long: {not_after}"
+        );
+        assert!(validity_of_pem("not a pem").is_err());
+        let garbled = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert!(validity_of_pem(garbled).is_err());
+    }
 
     #[test]
     fn the_name_alphabet_admits_machine_names_and_nothing_hostile() {

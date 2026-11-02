@@ -11,8 +11,10 @@
 //! [`Client`] returns wire types and domain values, and [`render`] holds the
 //! CLI's two presentations of them.
 
+pub mod agent;
 pub mod cli;
 pub mod client;
+pub mod doctor;
 pub mod forward;
 pub mod front_door;
 pub mod login;

@@ -37,7 +37,30 @@ pub enum TokenError {
          expected {EXPECTED}"
     )]
     MalformedCode,
+
+    /// A link of another kind — an endpoint URL, say — pasted where the
+    /// token goes.
+    #[error(
+        "the join token starts with {found:?}, not {PREFIX}: that is another kind of link (an \
+         endpoint URL is not a token); expected {EXPECTED}"
+    )]
+    WrongScheme { found: String },
+
+    /// The right shape, cut short — the commonest copy-and-paste failure.
+    #[error("the join token is truncated: {detail}; copy the whole line. Expected {EXPECTED}")]
+    Truncated { detail: String },
+
+    /// Whitespace inside the token: a terminal wrapped the line and the
+    /// paste kept the break, or two pieces were pasted apart.
+    #[error(
+        "the join token has whitespace inside it (at character {at}): a wrapped or split \
+         paste; rejoin it on one line. Expected {EXPECTED}"
+    )]
+    Whitespace { at: usize },
 }
+
+/// The hex digits a code half's fingerprint carries when whole.
+const FINGERPRINT_DIGITS: usize = 64;
 
 /// One self-contained join token, ready to redeem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,17 +91,24 @@ impl JoinToken {
     ///
     /// [`TokenError`], naming which part was wrong and the expected form.
     pub fn parse(token: &str) -> Result<Self, TokenError> {
+        let token = token.trim();
+        if let Some(at) = token.chars().position(char::is_whitespace) {
+            return Err(TokenError::Whitespace { at });
+        }
         let rest = token
-            .trim()
             .strip_prefix(PREFIX)
-            .ok_or(TokenError::WrongPrefix)?;
-        let (host_port, code) = rest.split_once('/').ok_or(TokenError::MissingEndpoint)?;
+            .ok_or_else(|| wrong_start(token))?;
+        let (host_port, code) = match rest.split_once('/') {
+            Some(split) => split,
+            None if is_host_port(rest) => (rest, ""),
+            None => return Err(TokenError::MissingEndpoint),
+        };
         if !is_host_port(host_port) {
             return Err(TokenError::MalformedEndpoint {
                 endpoint: host_port.to_owned(),
             });
         }
-        let code = JoinCode::parse(code).ok_or(TokenError::MalformedCode)?;
+        let code = JoinCode::parse(code).ok_or_else(|| code_refusal(code))?;
         Ok(Self {
             host_port: host_port.to_owned(),
             code,
@@ -101,6 +131,42 @@ impl JoinToken {
         self.host_port
             .rsplit_once(':')
             .map_or(self.host_port.as_str(), |(host, _)| host)
+    }
+}
+
+/// The refusal for a token that does not start with [`PREFIX`]: a link of
+/// another scheme names its scheme; anything else gets the plain prefix
+/// refusal.
+fn wrong_start(token: &str) -> TokenError {
+    match token.split_once("://") {
+        Some((scheme, _)) if !scheme.is_empty() => TokenError::WrongScheme {
+            found: format!("{scheme}://"),
+        },
+        _ => TokenError::WrongPrefix,
+    }
+}
+
+/// Why a code half did not parse: missing or cut short (a hex fingerprint
+/// with too few digits) is truncation; anything else is malformed.
+fn code_refusal(code: &str) -> TokenError {
+    if code.is_empty() {
+        return TokenError::Truncated {
+            detail: "it ends after the enrollment listener, with no code half".to_owned(),
+        };
+    }
+    match code.split_once('.') {
+        Some((_, fingerprint))
+            if fingerprint.len() < FINGERPRINT_DIGITS
+                && fingerprint.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            TokenError::Truncated {
+                detail: format!(
+                    "its fingerprint has {} of {FINGERPRINT_DIGITS} hex digits",
+                    fingerprint.len()
+                ),
+            }
+        }
+        _ => TokenError::MalformedCode,
     }
 }
 
@@ -196,8 +262,52 @@ mod tests {
             // The pre-token ceremony's inputs, pasted whole: a bare code and
             // a bare endpoint were exactly the two things people swapped.
             (format!("00ff.{fp}"), TokenError::WrongPrefix),
-            ("https://host:7778".to_owned(), TokenError::WrongPrefix),
+            ("://host".to_owned(), TokenError::WrongPrefix),
+            (
+                "https://host:7778".to_owned(),
+                TokenError::WrongScheme {
+                    found: "https://".to_owned(),
+                },
+            ),
+            (
+                format!("horde://enroll/host:7778/00ff.{fp}"),
+                TokenError::WrongScheme {
+                    found: "horde://".to_owned(),
+                },
+            ),
             ("horde://join/".to_owned(), TokenError::MissingEndpoint),
+            // Cut short: the code half gone, or the fingerprint clipped.
+            (
+                "horde://join/host:7778".to_owned(),
+                TokenError::Truncated {
+                    detail: "it ends after the enrollment listener, with no code half".to_owned(),
+                },
+            ),
+            (
+                "horde://join/host:7778/".to_owned(),
+                TokenError::Truncated {
+                    detail: "it ends after the enrollment listener, with no code half".to_owned(),
+                },
+            ),
+            (
+                format!("horde://join/host:7778/00ff.{}", "a".repeat(40)),
+                TokenError::Truncated {
+                    detail: "its fingerprint has 40 of 64 hex digits".to_owned(),
+                },
+            ),
+            // A wrapped paste: the break survives inside the token.
+            (
+                format!(
+                    "horde://join/host:7778/00ff.{}\n{}",
+                    "a".repeat(30),
+                    "a".repeat(34)
+                ),
+                TokenError::Whitespace { at: 58 },
+            ),
+            (
+                format!("horde://join/host:7778/00ff. {fp}"),
+                TokenError::Whitespace { at: 28 },
+            ),
             (
                 format!("horde://join/00ff.{fp}"),
                 TokenError::MissingEndpoint,
@@ -232,6 +342,16 @@ mod tests {
             ),
             (
                 format!("horde://join/host:7778/00ff.{}", "a".repeat(63)),
+                TokenError::Truncated {
+                    detail: "its fingerprint has 63 of 64 hex digits".to_owned(),
+                },
+            ),
+            (
+                format!("horde://join/host:7778/00ff.{}", "a".repeat(65)),
+                TokenError::MalformedCode,
+            ),
+            (
+                format!("horde://join/host:7778/00ff.{}", "g".repeat(10)),
                 TokenError::MalformedCode,
             ),
         ];

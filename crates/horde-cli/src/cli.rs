@@ -17,13 +17,38 @@ use crate::{Client, ClientError, Format, render};
 /// the environment and a file are not.
 pub const JOIN_TOKEN_VAR: &str = "HORDE_JOIN_TOKEN";
 
+/// The mint verbs' `--ttl-minutes` domain: zero is refused at parse time,
+/// naming the floor, rather than sent for the server to clamp into
+/// something the operator did not ask for.
+fn ttl_minutes() -> clap::builder::RangedU64ValueParser<u32> {
+    clap::builder::RangedU64ValueParser::new().range(1..)
+}
+
+/// A usage mistake as the JSON object `--json` promises on stderr —
+/// `None` for clap's help and version displays, which are not refusals.
+#[must_use]
+pub fn argument_refusal_json(error: &clap::Error) -> Option<String> {
+    if !error.use_stderr() {
+        return None;
+    }
+    let message = error.render().to_string();
+    Some(
+        serde_json::json!({
+            "error": {
+                "kind": "usage",
+                "message": message.trim(),
+                "code": null,
+                "hint": null,
+                "candidates": null,
+                "unimplemented": false,
+            }
+        })
+        .to_string(),
+    )
+}
+
 #[derive(Parser, Debug)]
-#[command(
-    name = "horde",
-    about = "Drive the Horde control plane.",
-    version,
-    disable_help_subcommand = true
-)]
+#[command(name = "horde", about = "Drive the Horde control plane.", version)]
 pub struct Cli {
     /// Server address. An override, not a requirement (ADR-0007): absent,
     /// `HORDE_ENDPOINT` is read, then the endpoint the identity dir stored
@@ -67,6 +92,13 @@ pub enum Command {
     Approve(ApproveArgs),
     /// Spawn an agent under an existing one.
     Spawn(SpawnArgs),
+    /// One agent's lifecycle: state, worker, last change.
+    #[command(subcommand)]
+    Agent(crate::agent::AgentCommand),
+    /// Check this machine's setup end to end — identity, endpoint,
+    /// certificates, server reachability, harness binaries, state dirs and
+    /// disk — and say what to fix.
+    Doctor(crate::doctor::DoctorArgs),
     /// Attach to a session interactively. `sync --follow` is the headless,
     /// scriptable form of the same subscription.
     Attach(AttachArgs),
@@ -289,8 +321,10 @@ pub enum WorkerCommand {
     Enroll {
         /// The worker's principal name, fixed here at mint time.
         name: String,
-        /// Code lifetime; the server clamps it (default 10, cap 60).
-        #[arg(long)]
+        /// Code lifetime in minutes, at least 1 (a zero-minute code would
+        /// expire before anyone could paste it); the server clamps it
+        /// (default 10, cap 60).
+        #[arg(long, value_parser = ttl_minutes())]
         ttl_minutes: Option<u32>,
     },
     /// Revoke every certificate a worker holds, by name.
@@ -351,7 +385,9 @@ pub enum EnrollCommand {
     /// Mint a one-time enrollment code for another client machine.
     Client {
         name: String,
-        #[arg(long)]
+        /// Code lifetime in minutes, at least 1; the server clamps it
+        /// (default 10, cap 60).
+        #[arg(long, value_parser = ttl_minutes())]
         ttl_minutes: Option<u32>,
     },
     /// Revoke every certificate a client holds, by name.
@@ -391,14 +427,16 @@ pub enum SessionCommand {
     },
     /// List sessions.
     List {
-        #[arg(long)]
-        include_archived: bool,
+        /// List archived sessions too.
+        // `--include-archived`, the old spelling, parses as a hidden alias.
+        #[arg(long, alias = "include-archived")]
+        all: bool,
     },
     /// Show one session, by name, id, or unique id prefix.
     Get {
         session_id: String,
         /// Resolve against archived sessions too.
-        #[arg(long)]
+        #[arg(long, alias = "include-archived")]
         all: bool,
     },
     /// Archive a session. This, not a result, is what ends its agents.
@@ -420,7 +458,7 @@ pub struct SyncArgs {
     #[arg(long)]
     pub follow: bool,
     /// Resolve against archived sessions too.
-    #[arg(long)]
+    #[arg(long, alias = "include-archived")]
     pub all: bool,
 }
 
@@ -551,7 +589,7 @@ pub struct AttachArgs {
     #[arg(long)]
     pub agent: Option<String>,
     /// Resolve against archived sessions too.
-    #[arg(long)]
+    #[arg(long, alias = "include-archived")]
     pub all: bool,
 }
 
@@ -771,6 +809,11 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     if let Some(Command::Up(args)) = &cli.command {
         return crate::up::run(args, cli.identity.as_deref()).await;
     }
+    // `doctor` diagnoses the very connection the other verbs need, so it
+    // must run whether or not one can be made.
+    if let Some(Command::Doctor(args)) = &cli.command {
+        return crate::doctor::run(cli, args, format).await;
+    }
 
     let resolved = resolve_connection(
         cli.endpoint.as_deref(),
@@ -845,6 +888,7 @@ async fn dispatch_admin(
         Command::Blob(command) => run_blob(client, command, format).await,
         Command::Mcp(command) => run_mcp(client, command, format).await,
         Command::Usage(args) => run_usage(client, args, format).await,
+        Command::Agent(command) => crate::agent::run(client, command, format).await,
         Command::Workspace(command) => run_workspace(client, command, format).await,
         Command::Prewarm(args) => run_prewarm(client, args, format).await,
         Command::Worker(command) => run_worker(client, command, &resolved.endpoint, format).await,
@@ -977,7 +1021,7 @@ pub fn transport_for(resolved: &ResolvedConnection) -> Transport {
 }
 
 /// Connects as the resolution says.
-async fn connect(resolved: &ResolvedConnection) -> Result<Client, ClientError> {
+pub(crate) async fn connect(resolved: &ResolvedConnection) -> Result<Client, ClientError> {
     match transport_for(resolved) {
         Transport::Mtls => {
             let identity =
@@ -1921,8 +1965,8 @@ async fn run_session(
             .await?;
             println!("{}", render::created(&summary, &root, format));
         }
-        SessionCommand::List { include_archived } => {
-            let summaries = client.list_sessions(*include_archived).await?;
+        SessionCommand::List { all } => {
+            let summaries = client.list_sessions(*all).await?;
             println!("{}", render::sessions(&summaries, format));
         }
         SessionCommand::Get { session_id, all } => {
@@ -1976,7 +2020,8 @@ async fn run_send(client: &mut Client, args: &SendArgs, format: Format) -> Resul
             delivery_for(args.interrupt),
             &args.idempotency_key,
         )
-        .await?;
+        .await
+        .map_err(|error| error.for_send(&agent_id))?;
     println!("{}", render::sent(&response, format));
     Ok(())
 }
@@ -2499,15 +2544,93 @@ mod tests {
         );
     }
 
+    /// `--all` is the one canonical spelling on every verb that can look at
+    /// archived sessions; `--include-archived` still parses everywhere, as
+    /// a hidden alias.
     #[test]
     fn archived_sessions_are_hidden_unless_requested() {
-        let cli = Cli::try_parse_from(["horde", "session", "list", "--include-archived"])
-            .expect("valid arguments");
-        match cli.command {
-            Some(Command::Session(SessionCommand::List { include_archived })) => {
-                assert!(include_archived);
+        for flag in ["--all", "--include-archived"] {
+            let cli =
+                Cli::try_parse_from(["horde", "session", "list", flag]).expect("valid arguments");
+            match cli.command {
+                Some(Command::Session(SessionCommand::List { all })) => assert!(all, "{flag}"),
+                other => panic!("expected session list, got {other:?}"),
             }
-            other => panic!("expected session list, got {other:?}"),
+            let cli = Cli::try_parse_from(["horde", "sync", "s1", flag]).expect("parses");
+            assert!(
+                matches!(cli.command, Some(Command::Sync(args)) if args.all),
+                "{flag}"
+            );
+            let cli = Cli::try_parse_from(["horde", "attach", "s1", flag]).expect("parses");
+            assert!(
+                matches!(cli.command, Some(Command::Attach(args)) if args.all),
+                "{flag}"
+            );
+            let cli = Cli::try_parse_from(["horde", "session", "get", "s1", flag]).expect("parses");
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Command::Session(SessionCommand::Get { all: true, .. }))
+                ),
+                "{flag}"
+            );
+            let cli =
+                Cli::try_parse_from(["horde", "agent", "status", "a1", flag]).expect("parses");
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Command::Agent(crate::agent::AgentCommand::Status(args))) if args.all
+                ),
+                "{flag}"
+            );
+        }
+        let help = Cli::try_parse_from(["horde", "session", "list", "--help"])
+            .expect_err("help is a display")
+            .to_string();
+        assert!(
+            !help.contains("include-archived"),
+            "the alias stays hidden: {help}"
+        );
+    }
+
+    /// `horde help` is `--help`, and `horde help <verb>` the verb's help.
+    #[test]
+    fn help_is_a_verb_too() {
+        let shown = Cli::try_parse_from(["horde", "help"]).expect_err("a display");
+        assert_eq!(shown.kind(), clap::error::ErrorKind::DisplayHelp);
+        let shown = Cli::try_parse_from(["horde", "help", "sync"]).expect_err("a display");
+        assert_eq!(shown.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(shown.to_string().contains("--follow"), "{shown}");
+        assert_eq!(super::argument_refusal_json(&shown), None);
+    }
+
+    /// A zero ttl is refused at parse, naming the floor; a usage mistake
+    /// under `--json` is a JSON object.
+    #[test]
+    fn a_zero_ttl_is_refused_and_usage_errors_have_a_json_form() {
+        for verb in [
+            &["worker", "enroll", "w"][..],
+            &["enroll", "client", "c"][..],
+        ] {
+            let mut argv = vec!["horde"];
+            argv.extend_from_slice(verb);
+            argv.extend_from_slice(&["--ttl-minutes", "0"]);
+            let refused = Cli::try_parse_from(&argv).expect_err("zero minutes");
+            assert!(refused.to_string().contains("1.."), "{refused}");
+            let json: serde_json::Value = serde_json::from_str(
+                &super::argument_refusal_json(&refused).expect("an error, not a display"),
+            )
+            .expect("json");
+            assert_eq!(json["error"]["kind"], "usage");
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("ttl-minutes")),
+                "{json}"
+            );
+            argv.pop();
+            argv.push("1");
+            Cli::try_parse_from(&argv).expect("one minute is a lifetime");
         }
     }
 
@@ -3369,7 +3492,7 @@ mod forward_flow_tests {
     /// (ADR-0008): a name becomes the id, absence stays absent, and an
     /// unmatched reference passes through for the server to refuse.
     #[tokio::test]
-    async fn the_session_filter_resolves_names_and_absence_stays_absent() {
+    async fn the_session_filter_resolves_names_and_refuses_the_unknown() {
         let (_core, mut client) = crate::forward::testing::served().await;
         let (summary, _root) = client
             .create_session("Fwd Home", "key-9")
@@ -3389,11 +3512,15 @@ mod forward_flow_tests {
                 .expect("no filter is no filter"),
             None
         );
-        assert_eq!(
-            super::resolved_filter(&mut client, Some("session-nope"))
-                .await
-                .expect("unmatched passes through"),
-            Some("session-nope".to_owned())
+        let refused = super::resolved_filter(&mut client, Some("session-nope"))
+            .await
+            .expect_err("a session nothing answers to is refused, not filtered to nothing");
+        assert!(
+            matches!(
+                refused,
+                crate::ClientError::UnknownSession { ref reference } if reference == "session-nope"
+            ),
+            "{refused:?}"
         );
     }
 

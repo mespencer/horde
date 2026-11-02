@@ -14,6 +14,9 @@ const KEY_FILE: &str = "identity.key";
 const CA_FILE: &str = "ca.pem";
 const ENDPOINT_FILE: &str = "endpoint";
 
+/// How many same-second backups `back_up` will name before refusing.
+const MAX_BACKUPS_PER_SECOND: u32 = 100;
+
 /// An enrolled peer's identity material, loaded into memory.
 #[derive(Clone)]
 pub struct StoredIdentity {
@@ -95,13 +98,24 @@ impl StoredIdentity {
                 )
             })?;
         let stem = format!("{name}.backup-{unix_secs}");
-        let target = (0_u32..)
+        // Bounded: a hundred same-second backups is no real directory, and
+        // an unbounded probe would spin forever on a filesystem that
+        // reports every name taken.
+        let target = (0_u32..MAX_BACKUPS_PER_SECOND)
             .map(|n| match n {
                 0 => directory.with_file_name(&stem),
                 n => directory.with_file_name(format!("{stem}-{n}")),
             })
             .find(|candidate| !candidate.exists())
-            .unwrap_or_else(|| directory.with_file_name(&stem));
+            .ok_or_else(|| {
+                IdentityError::io(
+                    directory.display().to_string(),
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{MAX_BACKUPS_PER_SECOND} backups named {stem} already exist"),
+                    ),
+                )
+            })?;
         std::fs::rename(directory, &target)
             .map_err(|e| IdentityError::io(directory.display().to_string(), e))?;
         Ok(target)
@@ -565,6 +579,38 @@ mod tests {
         assert!(
             nameless.to_string().contains("no directory name"),
             "{nameless}"
+        );
+    }
+
+    /// The backup-name probe is bounded: with every name taken it refuses,
+    /// naming the cap, rather than probing forever — and the last free
+    /// name under the cap is still found.
+    #[test]
+    fn the_backup_name_probe_is_bounded() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("id");
+        identity().save(&dir).expect("saves");
+        std::fs::create_dir(root.path().join("id.backup-7")).expect("mkdir");
+        for n in 1..super::MAX_BACKUPS_PER_SECOND - 1 {
+            std::fs::create_dir(root.path().join(format!("id.backup-7-{n}"))).expect("mkdir");
+        }
+        let last = StoredIdentity::back_up(&dir, 7).expect("one name is left");
+        assert_eq!(
+            last,
+            root.path()
+                .join(format!("id.backup-7-{}", super::MAX_BACKUPS_PER_SECOND - 1))
+        );
+        identity().save(&dir).expect("saves again");
+        let refused = StoredIdentity::back_up(&dir, 7).expect_err("every name taken");
+        assert!(
+            refused
+                .to_string()
+                .contains("backups named id.backup-7 already exist"),
+            "{refused}"
+        );
+        assert!(
+            StoredIdentity::exists(&dir),
+            "a refused backup moves nothing"
         );
     }
 

@@ -2,32 +2,85 @@
 //!
 //! Wherever a verb takes a session, a name or a unique id prefix resolves to
 //! the id, git-style, against the session list — the wire keeps speaking
-//! ids, and nothing here adds an RPC to the protocol. Ambiguity is an error
-//! naming the candidates, never a guess; a reference nothing matches passes
-//! through unchanged, so a full id the list omits (an archived session
-//! without `--all`, say) still reaches the server and earns the server's own
-//! refusal rather than a client-side reinterpretation.
+//! ids. The exact-name case — the common one, since generated names are
+//! titles — asks the server's `ListSessions` name filter (ADR-0013) rather
+//! than listing everything; only a slug, an id or a prefix falls back to the
+//! whole list. Ambiguity is an error naming the candidates, never a guess.
+//! A reference nothing matches is refused here, naming the fix — and when
+//! what it matches is archived and the verb was not asked to look there,
+//! the refusal says so and names `--all`.
 
-use horde_proto::v1::SessionSummary;
+use horde_proto::v1::{SessionLifecycleState, SessionSummary};
 
 use crate::names::slugify;
 use crate::{Client, ClientError};
+
+/// The prefix the server mints every agent id with: a reference carrying it
+/// is an agent id already, so resolving it needs no session list.
+const AGENT_ID_PREFIX: &str = "agent-";
 
 /// The session id `reference` names, against the live list (or the whole
 /// list with `include_archived`).
 ///
 /// # Errors
 ///
-/// Listing failing, or the reference matching more than one session.
+/// Listing failing, the reference matching more than one session, matching
+/// none, or matching only an archived session without `include_archived`.
 pub async fn session_id(
     client: &mut Client,
     reference: &str,
     include_archived: bool,
 ) -> Result<String, ClientError> {
-    let sessions = client.list_sessions(include_archived).await?;
-    Ok(resolve(&sessions, reference)?
-        .and_then(|summary| summary.session_id.as_ref().map(ToString::to_string))
-        .unwrap_or_else(|| reference.to_owned()))
+    let named = client.list_sessions_named(reference, true).await?;
+    if let Some(id) = pick(&named, reference, include_archived)? {
+        return Ok(id);
+    }
+    let everything = client.list_sessions(true).await?;
+    pick(&everything, reference, include_archived)?.ok_or_else(|| ClientError::UnknownSession {
+        reference: reference.to_owned(),
+    })
+}
+
+/// The id `reference` resolves to among `sessions` — the visible ones
+/// (live, or all with `include_archived`) — or the archived refusal when
+/// only a hidden session answers.
+///
+/// # Errors
+///
+/// Ambiguity among the visible sessions, or the archived refusal.
+pub fn pick(
+    sessions: &[SessionSummary],
+    reference: &str,
+    include_archived: bool,
+) -> Result<Option<String>, ClientError> {
+    // A full id is exact whatever the session's state: nothing that named
+    // an archived session by id needs `--all` to keep working.
+    if let Some(exact) = sessions.iter().find(|summary| id_of(summary) == reference) {
+        return Ok(Some(id_of(exact)));
+    }
+    let (visible, hidden): (Vec<SessionSummary>, Vec<SessionSummary>) = sessions
+        .iter()
+        .cloned()
+        .partition(|summary| include_archived || !is_archived(summary));
+    if let Some(found) = resolve(&visible, reference)? {
+        return Ok(Some(id_of(found)));
+    }
+    match resolve(&hidden, reference) {
+        Ok(None) => Ok(None),
+        Ok(Some(archived)) => Err(archived_refusal(reference, &id_of(archived))),
+        Err(_) => Err(archived_refusal(reference, "(several)")),
+    }
+}
+
+fn archived_refusal(reference: &str, session_id: &str) -> ClientError {
+    ClientError::ArchivedSession {
+        reference: reference.to_owned(),
+        session_id: session_id.to_owned(),
+    }
+}
+
+fn is_archived(summary: &SessionSummary) -> bool {
+    summary.state == SessionLifecycleState::Archived as i32
 }
 
 /// The agent id `reference` names: a session's name resolves to that
@@ -40,6 +93,13 @@ pub async fn session_id(
 ///
 /// Listing failing, or the name matching more than one session.
 pub async fn agent_id(client: &mut Client, reference: &str) -> Result<String, ClientError> {
+    let named = client.list_sessions_named(reference, false).await?;
+    if let Some(root) = root_agent_for(&named, reference)? {
+        return Ok(root);
+    }
+    if reference.starts_with(AGENT_ID_PREFIX) {
+        return Ok(reference.to_owned());
+    }
     let sessions = client.list_sessions(false).await?;
     Ok(root_agent_for(&sessions, reference)?.unwrap_or_else(|| reference.to_owned()))
 }
@@ -108,8 +168,10 @@ fn id_of(summary: &SessionSummary) -> String {
         .map_or_else(String::new, ToString::to_string)
 }
 
+/// Answers to its name — the slug — or to its title verbatim, which is
+/// what the server's exact-name filter matched on.
 fn named_exactly(summary: &SessionSummary, reference: &str) -> bool {
-    !reference.is_empty() && name_of(summary) == reference
+    !reference.is_empty() && (name_of(summary) == reference || summary.title == reference)
 }
 
 fn id_starts_with(summary: &SessionSummary, reference: &str) -> bool {
@@ -228,6 +290,63 @@ mod tests {
     fn no_match_passes_through_and_empty_matches_nothing() {
         assert_eq!(resolved_id("archived-elsewhere"), None);
         assert_eq!(resolved_id(""), None);
+    }
+
+    fn archived(id: &str, title: &str) -> SessionSummary {
+        SessionSummary {
+            state: horde_proto::v1::SessionLifecycleState::Archived as i32,
+            ..session(id, title, "r")
+        }
+    }
+
+    /// The visible sessions answer first; a reference only an archived
+    /// session answers is refused naming `--all`, unless `--all` was given;
+    /// nothing at all is `None` for the caller to refuse.
+    #[test]
+    fn pick_hides_archived_sessions_behind_a_hint_naming_all() {
+        let sessions = vec![
+            session("session-live", "deploy", "r1"),
+            archived("session-gone", "old-work"),
+        ];
+        assert_eq!(
+            super::pick(&sessions, "deploy", false).expect("live"),
+            Some("session-live".to_owned())
+        );
+        let refused = super::pick(&sessions, "old-work", false).expect_err("archived");
+        assert!(
+            refused.to_string().contains("--all") && refused.to_string().contains("session-gone"),
+            "{refused}"
+        );
+        assert_eq!(
+            super::pick(&sessions, "old-work", true).expect("--all looks there"),
+            Some("session-gone".to_owned())
+        );
+        assert_eq!(
+            super::pick(&sessions, "nothing", false).expect("no match"),
+            None
+        );
+        assert_eq!(
+            super::pick(&sessions, "session-gone", false).expect("a full id is exact"),
+            Some("session-gone".to_owned())
+        );
+        assert!(
+            super::pick(&sessions, "session-go", false).is_err(),
+            "an archived id's prefix is hidden like its name"
+        );
+
+        let twins = vec![archived("session-a", "x"), archived("session-b", "x")];
+        let refused = super::pick(&twins, "x", false).expect_err("archived twins");
+        assert!(refused.to_string().contains("--all"), "{refused}");
+    }
+
+    /// The title verbatim answers too — what the server's exact-name filter
+    /// matched on — beside the slug.
+    #[test]
+    fn a_title_verbatim_resolves_like_its_slug() {
+        assert_eq!(
+            resolved_id("Fix Auth Timeout").as_deref(),
+            Some("session-a1f0-0")
+        );
     }
 
     /// The agent alias: a session name yields its root agent, anything else

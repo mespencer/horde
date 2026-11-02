@@ -30,8 +30,10 @@ pub enum ClientError {
     /// The server answered, and said no.
     ///
     /// Kept distinct from a transport failure because the two need different
-    /// reactions: one is retried, the other is read.
-    #[error("{0}")]
+    /// reactions: one is retried, the other is read. Displayed as the
+    /// server's own words under a plain-language code — never tonic's
+    /// `Debug`-shaped `status: …, metadata: …` dump.
+    #[error("{}", status_text(.0))]
     Rpc(#[from] tonic::Status),
 
     /// The endpoint string itself is not a URI.
@@ -195,6 +197,116 @@ pub enum ClientError {
     /// names the remedy still beats an infinite redraw.
     #[error("every generated name is taken by a live session; pass a title instead")]
     NamesExhausted,
+
+    /// A session reference nothing answers to — no name, no id, no prefix,
+    /// live or archived.
+    ///
+    /// Refused client-side because the list resolution consulted is the
+    /// whole list: passing the reference on would only earn the server's
+    /// less specific "not found" for the same fact.
+    #[error(
+        "no session is named {reference:?} or has an id starting with it; `horde session list` \
+         shows the live ones"
+    )]
+    UnknownSession { reference: String },
+
+    /// The reference names only an archived session, and the verb was not
+    /// asked to look there (ADR-0008: archived sessions stay out of name
+    /// resolution unless `--all`).
+    #[error("{reference:?} names the archived session {session_id}; pass --all to address it")]
+    ArchivedSession {
+        reference: String,
+        session_id: String,
+    },
+
+    /// No searched session's log mentions the agent.
+    #[error(
+        "no agent {reference:?} in the searched sessions; pass --session <name> to look in one, \
+         or --all to search archived sessions too"
+    )]
+    UnknownAgent { reference: String },
+
+    /// A message to an agent that has ended — failed, lost with its worker
+    /// (ADR-0011), or archived. The server refuses it (`FAILED_PRECONDITION`,
+    /// `ServerError::AgentEnded`); the CLI refuses with what to do instead
+    /// rather than a bare status.
+    #[error(
+        "cannot send to {agent_id}: {detail}. Its context is gone, so nothing will deliver \
+         this; `horde agent status {agent_id}` shows why, and `horde spawn` starts an agent \
+         to carry the work on"
+    )]
+    AgentEnded { agent_id: String, detail: String },
+
+    /// `horde doctor` found something to fix; the report above says what.
+    #[error("doctor found {failures} problem(s); each FAIL line above names its fix")]
+    Unhealthy { failures: usize },
+}
+
+impl ClientError {
+    /// A send's refusal, read for the one case that needs its own words:
+    /// the server's ended-agent `FAILED_PRECONDITION`. Anything else is
+    /// returned as it came.
+    #[must_use]
+    pub fn for_send(self, agent_id: &str) -> Self {
+        match self {
+            Self::Rpc(status) if status.code() == tonic::Code::FailedPrecondition => {
+                Self::AgentEnded {
+                    agent_id: agent_id.to_owned(),
+                    detail: status.message().to_owned(),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// The plain-language names of the gRPC codes a server answers with, in the
+/// order a refusal reads ("not found: …"). A table rather than a match so
+/// the phrasing stays data and the function under it stays trivial.
+const CODE_PHRASES: &[(tonic::Code, &str)] = &[
+    (tonic::Code::Cancelled, "cancelled"),
+    (tonic::Code::InvalidArgument, "invalid request"),
+    (tonic::Code::DeadlineExceeded, "timed out"),
+    (tonic::Code::NotFound, "not found"),
+    (tonic::Code::AlreadyExists, "already exists"),
+    (tonic::Code::PermissionDenied, "permission denied"),
+    (tonic::Code::ResourceExhausted, "limit reached"),
+    (tonic::Code::FailedPrecondition, "refused"),
+    (tonic::Code::Aborted, "conflict"),
+    (tonic::Code::OutOfRange, "out of range"),
+    (tonic::Code::Unimplemented, "not built on this server"),
+    (tonic::Code::Internal, "server error"),
+    (tonic::Code::Unavailable, "server unavailable"),
+    (tonic::Code::DataLoss, "data loss"),
+    (tonic::Code::Unauthenticated, "not authenticated"),
+];
+
+/// A server refusal as one plain line: the code's phrase, then the server's
+/// message when it gave one.
+#[must_use]
+pub fn status_text(status: &tonic::Status) -> String {
+    let phrase = CODE_PHRASES
+        .iter()
+        .find(|(code, _)| *code == status.code())
+        .map_or("error", |(_, phrase)| phrase);
+    if status.message().is_empty() {
+        phrase.to_owned()
+    } else {
+        format!("{phrase}: {}", status.message())
+    }
+}
+
+/// `CamelCase` as `snake_case`: the stable machine name a JSON error's
+/// `kind` carries, derived from the variant so a new variant names itself.
+fn snake_case(camel: &str) -> String {
+    let mut out = String::with_capacity(camel.len() + 4);
+    for (index, c) in camel.chars().enumerate() {
+        if c.is_ascii_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// The headless bare-invocation message: what exists, and what to run next —
@@ -244,6 +356,56 @@ impl ClientError {
         match self.diagnosis() {
             Some(hint) => format!("{head}\nhint: {hint}"),
             None => head,
+        }
+    }
+
+    /// The variant's machine name (`unknown_session`, `rpc`), read off the
+    /// `Debug` spelling so it can never disagree with the type.
+    #[must_use]
+    pub fn kind(&self) -> String {
+        let debug = format!("{self:?}");
+        let name: String = debug
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        snake_case(&name)
+    }
+
+    /// The refusal as one JSON object, for `--json` invocations: a script
+    /// branches on `kind` (and `code`, for a server refusal) and reads
+    /// `message`, `hint` and any `candidates` without parsing prose.
+    #[must_use]
+    pub fn report_json(&self) -> String {
+        let code = match self {
+            Self::Rpc(status) => Some(format!("{:?}", status.code())),
+            _ => None,
+        };
+        let candidates = match self {
+            Self::AmbiguousSession { candidates, .. } | Self::Headless { candidates } => {
+                Some(candidates.clone())
+            }
+            _ => None,
+        };
+        serde_json::json!({
+            "error": {
+                "kind": self.kind(),
+                "message": self.to_string(),
+                "code": code,
+                "hint": self.diagnosis(),
+                "candidates": candidates,
+                "unimplemented": self.is_unimplemented(),
+            }
+        })
+        .to_string()
+    }
+
+    /// The stderr text for `format`: [`Self::report`] for a terminal,
+    /// [`Self::report_json`] under `--json`.
+    #[must_use]
+    pub fn report_for(&self, format: crate::Format) -> String {
+        match format {
+            crate::Format::Human => self.report(),
+            crate::Format::Json => self.report_json(),
         }
     }
 }
@@ -470,13 +632,33 @@ impl Client {
         &mut self,
         include_archived: bool,
     ) -> Result<Vec<SessionSummary>, ClientError> {
+        self.list_sessions_filtered(include_archived, None).await
+    }
+
+    /// The sessions titled exactly `name`, filtered server-side
+    /// (ADR-0013) — what name resolution asks first, instead of listing
+    /// everything to find one.
+    pub async fn list_sessions_named(
+        &mut self,
+        name: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SessionSummary>, ClientError> {
+        self.list_sessions_filtered(include_archived, Some(name.to_owned()))
+            .await
+    }
+
+    async fn list_sessions_filtered(
+        &mut self,
+        include_archived: bool,
+        name: Option<String>,
+    ) -> Result<Vec<SessionSummary>, ClientError> {
         Ok(self
             .inner
             .list_sessions(ListSessionsRequest {
                 include_archived,
                 page_size: 0,
                 page_token: String::new(),
-                name: None,
+                name,
             })
             .await?
             .into_inner()
@@ -1440,6 +1622,83 @@ impl SyncOptions {
 #[cfg(test)]
 mod tests {
     use super::{ClientError, SyncOptions};
+
+    /// A server refusal reads as plain words — the code's phrase and the
+    /// server's message — never tonic's `status: …, metadata: …` dump.
+    #[test]
+    fn server_refusals_read_as_plain_text() {
+        let refused = ClientError::Rpc(tonic::Status::not_found("no session s1"));
+        assert_eq!(refused.to_string(), "not found: no session s1");
+        assert_eq!(
+            super::status_text(&tonic::Status::failed_precondition("")),
+            "refused"
+        );
+        for (code, phrase) in super::CODE_PHRASES {
+            let text = super::status_text(&tonic::Status::new(*code, "m"));
+            assert_eq!(text, format!("{phrase}: m"));
+            assert!(!text.contains("metadata"), "{text}");
+        }
+        assert_eq!(
+            super::status_text(&tonic::Status::new(tonic::Code::Unknown, "odd")),
+            "error: odd",
+            "a code without a phrase still reads plainly"
+        );
+    }
+
+    /// Under `--json` a refusal is one object a script branches on: the
+    /// variant's machine name, the gRPC code for a server refusal, the
+    /// message, and any candidates.
+    #[test]
+    fn refusals_have_a_json_form() {
+        let rpc = ClientError::Rpc(tonic::Status::unimplemented("later"));
+        let json: serde_json::Value = serde_json::from_str(&rpc.report_json()).expect("json");
+        assert_eq!(json["error"]["kind"], "rpc");
+        assert_eq!(json["error"]["code"], "Unimplemented");
+        assert_eq!(json["error"]["message"], "not built on this server: later");
+        assert_eq!(json["error"]["unimplemented"], true);
+        assert_eq!(json["error"]["candidates"], serde_json::Value::Null);
+
+        let ambiguous = ClientError::AmbiguousSession {
+            reference: "deploy".to_owned(),
+            candidates: vec!["deploy  s1".to_owned(), "deploy  s2".to_owned()],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&ambiguous.report_for(crate::Format::Json)).expect("json");
+        assert_eq!(json["error"]["kind"], "ambiguous_session");
+        assert_eq!(json["error"]["code"], serde_json::Value::Null);
+        assert_eq!(json["error"]["candidates"][1], "deploy  s2");
+        let headless = ClientError::Headless {
+            candidates: vec!["a".to_owned()],
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&headless.report_json()).expect("json")["error"]
+                ["candidates"][0],
+            "a"
+        );
+        assert_eq!(ClientError::NamesExhausted.kind(), "names_exhausted");
+        assert_eq!(
+            ambiguous.report_for(crate::Format::Human),
+            ambiguous.report(),
+            "a terminal gets the prose"
+        );
+    }
+
+    /// A send refused because the agent ended becomes the refusal that says
+    /// what to do; any other refusal passes through untouched.
+    #[test]
+    fn an_ended_agents_send_refusal_names_the_way_forward() {
+        let ended = ClientError::Rpc(tonic::Status::failed_precondition("agent-a has failed"))
+            .for_send("agent-a");
+        let message = ended.to_string();
+        assert!(
+            message.starts_with("cannot send to agent-a: agent-a has failed")
+                && message.contains("horde agent status agent-a")
+                && message.contains("horde spawn"),
+            "{message}"
+        );
+        let other = ClientError::Rpc(tonic::Status::not_found("x")).for_send("agent-a");
+        assert!(matches!(other, ClientError::Rpc(_)), "{other:?}");
+    }
 
     /// Minutes to wire seconds, exactly: a ttl silently divided or offset
     /// would mint codes that die early or linger.

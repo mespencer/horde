@@ -211,8 +211,8 @@ pub fn event(envelope: &EventEnvelope, format: Format) -> String {
         })
         .to_string(),
         Format::Human => {
-            let detail = detail(inner.and_then(|event| event.kind.as_ref()));
-            let rendered = detail.as_str().unwrap_or_default();
+            let kind = inner.and_then(|event| event.kind.as_ref());
+            let rendered = human_detail(kind, &detail(kind));
             format!(
                 "{sequence:>6}  {kind_name:<24} {}{}",
                 agent_id.unwrap_or_else(|| "-".to_owned()),
@@ -270,6 +270,45 @@ fn detail(kind: Option<&Kind>) -> Value {
                 .unwrap_or_default(),
         ),
         Some(Kind::TurnInterrupted(interrupted)) => Value::String(interrupted.reason.clone()),
+        other => structured_detail(other),
+    }
+}
+
+/// The prose a human line shows beside the kind: the detail's text, or —
+/// for a lifecycle change, whose JSON is structured — the transition in
+/// words, so a FAILED agent (a lost worker's, ADR-0011) reads at a glance.
+fn human_detail(kind: Option<&Kind>, detail: &Value) -> String {
+    match kind {
+        Some(Kind::AgentLifecycleChanged(changed)) => lifecycle_line(changed),
+        _ => detail.as_str().unwrap_or_default().to_owned(),
+    }
+}
+
+/// `running -> failed: worker lease lapsed`.
+#[must_use]
+pub fn lifecycle_line(changed: &horde_proto::v1::AgentLifecycleChanged) -> String {
+    let transition = format!(
+        "{} -> {}",
+        horde_tui::state::agent_lifecycle_name(changed.previous_state),
+        horde_tui::state::agent_lifecycle_name(changed.state)
+    );
+    if changed.reason.is_empty() {
+        transition
+    } else {
+        format!("{transition}: {}", changed.reason)
+    }
+}
+
+/// The kinds whose detail is an object a script branches on.
+fn structured_detail(kind: Option<&Kind>) -> Value {
+    match kind {
+        // Structured like a result: a follower scripting around failures
+        // branches on the state, not on a sentence.
+        Some(Kind::AgentLifecycleChanged(changed)) => json!({
+            "previous_state": horde_tui::state::agent_lifecycle_name(changed.previous_state),
+            "state": horde_tui::state::agent_lifecycle_name(changed.state),
+            "reason": changed.reason,
+        }),
         // Structured, not a prose line: a script following a session needs
         // the outcome it can branch on, and burying it in a sentence would
         // make every consumer a parser (W7b finding 4).
@@ -382,8 +421,14 @@ pub fn hello(server: &horde_proto::v1::ServerHello, format: Format) -> String {
             } else {
                 server.capability_flags.join(",")
             };
+            let principal = if server.principal.is_empty() {
+                "none (an unauthenticated channel)"
+            } else {
+                server.principal.as_str()
+            };
             format!(
-                "horde-server {} (min supported client {})\ncapabilities: {flags}",
+                "horde-server {} (min supported client {})\ncapabilities: {flags}\nyou are: \
+                 {principal}",
                 server.semver, server.min_supported_semver
             )
         }
@@ -411,10 +456,26 @@ pub fn created(
         }
         // The root agent id is what the next command needs, so it goes on the
         // line the user will copy from.
+        // The name leads: it is the handle every later verb accepts.
         Format::Human => format!(
-            "{}\nroot agent: {root_agent_id}",
+            "created {}\n{}\nroot agent: {root_agent_id}",
+            handle_of(summary),
             session(summary, Format::Human)
         ),
+    }
+}
+
+/// The handle a session answers to: its name, or its id when untitled.
+#[must_use]
+pub fn handle_of(summary: &SessionSummary) -> String {
+    let name = crate::resolve::name_of(summary);
+    if name.is_empty() {
+        summary
+            .session_id
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), ToString::to_string)
+    } else {
+        name
     }
 }
 
@@ -502,21 +563,45 @@ pub fn minted(
             "local_only": local_only,
         })
         .to_string(),
-        Format::Human => match token {
-            Some(token) if local_only => format!(
-                "token {token}\nexpires-at-unix-ms {expires_at_unix_ms}\n\
-                 note: this token names {}, so only this machine can redeem it; for another \
-                 machine, mint through a name it can dial (--endpoint https://<host>:<port>, \
-                 one of the server's --san names)",
-                token.host()
-            ),
-            Some(token) => format!("token {token}\nexpires-at-unix-ms {expires_at_unix_ms}"),
-            None => format!(
-                "code {}\nexpires-at-unix-ms {expires_at_unix_ms}",
-                response.code
-            ),
-        },
+        Format::Human => {
+            let expiry = format!(
+                "expires-at-unix-ms {expires_at_unix_ms}\n{}",
+                expiry_in(expires_at_unix_ms, now_unix_ms())
+            );
+            match token {
+                Some(token) if local_only => format!(
+                    "token {token}\n{expiry}\n\
+                     note: this token names {}, so only this machine can redeem it; for another \
+                     machine, mint through a name it can dial (--endpoint https://<host>:<port>, \
+                     one of the server's --san names)",
+                    token.host()
+                ),
+                Some(token) => format!("token {token}\n{expiry}"),
+                None => format!("code {}\n{expiry}", response.code),
+            }
+        }
     }
+}
+
+/// How long until `expires_at_unix_ms`, in the words an operator pasting a
+/// token needs: `expires in 9m 58s`, or `already expired`.
+#[must_use]
+pub fn expiry_in(expires_at_unix_ms: i64, now_unix_ms: i64) -> String {
+    let remaining_secs = expires_at_unix_ms.saturating_sub(now_unix_ms) / 1_000;
+    if remaining_secs <= 0 {
+        return "already expired".to_owned();
+    }
+    let (hours, minutes, seconds) = (
+        remaining_secs / 3_600,
+        remaining_secs % 3_600 / 60,
+        remaining_secs % 60,
+    );
+    let span = match (hours, minutes) {
+        (0, 0) => format!("{seconds}s"),
+        (0, _) => format!("{minutes}m {seconds}s"),
+        _ => format!("{hours}h {minutes}m"),
+    };
+    format!("expires in {span}")
 }
 
 /// Renders a revocation: who, and which serials stopped working.
@@ -795,6 +880,7 @@ pub fn workers(workers: &[horde_proto::v1::WorkerSummary], format: Format) -> St
                     "name": worker.name,
                     "state": worker_state(worker.state),
                     "semver": worker.semver,
+                    "harnesses": harnesses_of(worker),
                 }))
                 .collect::<Vec<_>>(),
         })
@@ -803,18 +889,41 @@ pub fn workers(workers: &[horde_proto::v1::WorkerSummary], format: Format) -> St
         Format::Human => workers
             .iter()
             .map(|worker| {
+                let harnesses = harnesses_of(worker);
                 format!(
-                    "{}  {}",
+                    "{}  {}  harnesses={}",
                     worker
                         .worker_id
                         .as_ref()
                         .map_or_else(|| "-".to_owned(), ToString::to_string),
-                    worker_state(worker.state)
+                    worker_state(worker.state),
+                    if harnesses.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        harnesses.join(",")
+                    }
                 )
             })
             .collect::<Vec<_>>()
             .join("\n"),
     }
+}
+
+/// The harnesses a worker advertises as installed — what placement can
+/// actually run there (an installable-but-absent harness runs nothing).
+fn harnesses_of(worker: &horde_proto::v1::WorkerSummary) -> Vec<String> {
+    worker
+        .capabilities
+        .as_ref()
+        .map(|capabilities| {
+            capabilities
+                .harnesses
+                .iter()
+                .filter(|harness| harness.installed)
+                .map(|harness| harness.provider.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn instance_state(state: i32) -> &'static str {
@@ -1916,10 +2025,107 @@ mod tests {
 
         let human = hello(&server, Format::Human);
         assert!(human.contains("0.1.0") && human.contains("payload.attachments"));
+        assert!(
+            human.ends_with("\nyou are: none (an unauthenticated channel)"),
+            "{human}"
+        );
 
         let parsed: serde_json::Value =
             serde_json::from_str(&hello(&server, Format::Json)).expect("valid JSON");
         assert_eq!(parsed["semver"], "0.1.0");
+
+        let enrolled = horde_proto::v1::ServerHello {
+            principal: "client:laptop".to_owned(),
+            ..server
+        };
+        assert!(
+            hello(&enrolled, Format::Human).ends_with("\nyou are: client:laptop"),
+            "the principal the server derived is shown"
+        );
+    }
+
+    /// Lifecycle changes, a lost agent's FAILED among them, read as a
+    /// transition in prose and as structured states in JSON.
+    #[test]
+    fn a_lifecycle_change_renders_its_transition_in_both_formats() {
+        use horde_proto::v1::{AgentLifecycleChanged, AgentLifecycleState};
+        let failed = AgentLifecycleChanged {
+            previous_state: AgentLifecycleState::Running as i32,
+            state: AgentLifecycleState::Failed as i32,
+            reason: "worker w1 lost".to_owned(),
+        };
+        let envelope = envelope(Some(Kind::AgentLifecycleChanged(failed.clone())));
+        let human = event(&envelope, Format::Human);
+        assert!(
+            human.ends_with("  running -> failed: worker w1 lost"),
+            "{human}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&event(&envelope, Format::Json)).expect("json");
+        assert_eq!(json["kind"], "agent_lifecycle_changed");
+        assert_eq!(json["detail"]["previous_state"], "running");
+        assert_eq!(json["detail"]["state"], "failed");
+        assert_eq!(json["detail"]["reason"], "worker w1 lost");
+
+        let quiet = AgentLifecycleChanged {
+            reason: String::new(),
+            ..failed
+        };
+        assert_eq!(super::lifecycle_line(&quiet), "running -> failed");
+    }
+
+    /// The worker list names each worker's installed harnesses — the ones
+    /// placement can run — in both formats.
+    #[test]
+    fn workers_render_their_installed_harnesses() {
+        use horde_proto::v1::{HarnessCapability, WorkerCapabilities, WorkerSummary};
+        let harness = |provider: &str, installed| HarnessCapability {
+            provider: provider.to_owned(),
+            installed,
+            ..HarnessCapability::default()
+        };
+        let worker = WorkerSummary {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            capabilities: Some(WorkerCapabilities {
+                harnesses: vec![
+                    harness("claude", true),
+                    harness("codex", false),
+                    harness("fake", true),
+                ],
+                ..WorkerCapabilities::default()
+            }),
+            ..WorkerSummary::default()
+        };
+        let human = workers(std::slice::from_ref(&worker), Format::Human);
+        assert!(human.ends_with("harnesses=claude,fake"), "{human}");
+        let json: serde_json::Value =
+            serde_json::from_str(&workers(std::slice::from_ref(&worker), Format::Json))
+                .expect("json");
+        assert_eq!(
+            json["workers"][0]["harnesses"],
+            serde_json::json!(["claude", "fake"])
+        );
+        let bare = WorkerSummary {
+            capabilities: None,
+            ..worker
+        };
+        assert!(workers(&[bare], Format::Human).ends_with("harnesses=none"));
+    }
+
+    /// A create leads with the handle later verbs accept: the name, or the
+    /// id for an untitled session.
+    #[test]
+    fn a_create_leads_with_the_name_to_come_back_with() {
+        let root = horde_proto::v1::AgentId::new("agent-r");
+        let named = listed("session-1", "Fix Auth", 1, 0);
+        assert!(
+            created(&named, &root, Format::Human).starts_with("created fix-auth\n"),
+            "{}",
+            created(&named, &root, Format::Human)
+        );
+        let untitled = listed("session-2", "", 1, 0);
+        assert!(created(&untitled, &root, Format::Human).starts_with("created session-2\n"));
+        assert_eq!(super::handle_of(&SessionSummary::default()), "-");
     }
 
     /// A server advertising nothing must not render an empty field that reads
@@ -2210,6 +2416,24 @@ mod enrollment_render_tests {
         }
     }
 
+    /// The deadline in words: seconds, minutes and seconds, hours and
+    /// minutes — and the instant itself is already expired.
+    #[test]
+    fn expiry_reads_as_a_span_or_already_expired() {
+        use super::expiry_in;
+        let now = 1_000_000;
+        assert_eq!(expiry_in(now + 45_000, now), "expires in 45s");
+        assert_eq!(expiry_in(now + 45_999, now), "expires in 45s");
+        assert_eq!(expiry_in(now + 600_000, now), "expires in 10m 0s");
+        assert_eq!(expiry_in(now + 598_000, now), "expires in 9m 58s");
+        assert_eq!(expiry_in(now + 3_600_000, now), "expires in 1h 0m");
+        assert_eq!(expiry_in(now + 7_380_000, now), "expires in 2h 3m");
+        assert_eq!(expiry_in(now + 1_000, now), "expires in 1s");
+        assert_eq!(expiry_in(now + 999, now), "already expired");
+        assert_eq!(expiry_in(now, now), "already expired");
+        assert_eq!(expiry_in(now - 5_000, now), "already expired");
+    }
+
     #[test]
     fn a_minted_code_prints_the_token_and_its_deadline_in_both_formats() {
         let code = horde_identity::JoinCode {
@@ -2217,8 +2441,12 @@ mod enrollment_render_tests {
             server_fingerprint: "a".repeat(64),
         };
         let token = horde_identity::JoinToken::new("box.lan:7778", code.clone());
+        // A deadline long past by the wall clock: said in words too.
         let human = minted(&response("s.fp"), Some(&token), Format::Human);
-        assert_eq!(human, format!("token {token}\nexpires-at-unix-ms 1755500"));
+        assert_eq!(
+            human,
+            format!("token {token}\nexpires-at-unix-ms 1755500\nalready expired")
+        );
 
         // A loopback token says it is this machine's only, in both formats.
         let local = horde_identity::JoinToken::new("localhost:7778", code);
@@ -2247,7 +2475,10 @@ mod enrollment_render_tests {
         // honestly is — a `token` line here would name a listener nobody
         // declared.
         let bare = minted(&response("s.fp"), None, Format::Human);
-        assert_eq!(bare, "code s.fp\nexpires-at-unix-ms 1755500");
+        assert_eq!(
+            bare,
+            "code s.fp\nexpires-at-unix-ms 1755500\nalready expired"
+        );
         let bare: serde_json::Value =
             serde_json::from_str(&minted(&response("s.fp"), None, Format::Json))
                 .expect("json mode emits json");

@@ -118,6 +118,9 @@ pub async fn new_session(
         println!("{}", render::created(&summary, &root, format));
         return Ok(());
     }
+    // On stderr, before the TUI takes the screen: it is still there after
+    // detaching, so the handle to come back with is never lost.
+    eprintln!("created {}", render::handle_of(&summary));
     attach(client, &id_of(&summary)).await
 }
 
@@ -188,13 +191,8 @@ async fn attach_if_still_live(client: &mut Client, session_id: &str) -> Result<(
 async fn refuse_archived(client: &mut Client, session_id: &str) -> Result<(), ClientError> {
     let summary = client.get_session(session_id).await?;
     if summary.state == horde_proto::v1::SessionLifecycleState::Archived as i32 {
-        let name = resolve::name_of(&summary);
         return Err(ClientError::ArchivedWhileChoosing {
-            reference: if name.is_empty() {
-                session_id.to_owned()
-            } else {
-                name
-            },
+            reference: render::handle_of(&summary),
         });
     }
     Ok(())

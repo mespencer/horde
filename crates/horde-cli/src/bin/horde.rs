@@ -6,13 +6,27 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::Parser as _;
 use horde_cli::Format;
 use horde_cli::cli::{Cli, run};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Under `--json` a usage mistake is a JSON object on stderr like
+            // every other refusal; help and version still print as clap says.
+            let json = std::env::args().any(|arg| arg == "--json");
+            match horde_cli::cli::argument_refusal_json(&error) {
+                Some(refusal) if json => {
+                    eprintln!("{refusal}");
+                    return ExitCode::from(2);
+                }
+                _ => error.exit(),
+            }
+        }
+    };
     let format = Format::from_flag(cli.json);
 
     // OTLP export opts in via the environment (DESIGN §12); off installs no
@@ -43,7 +57,7 @@ async fn main() -> ExitCode {
         Err(error) => {
             // Decided in the library (`ClientError::report`), where it is
             // tested: the refusal, and the diagnosed cause beneath it.
-            eprintln!("{}", error.report());
+            eprintln!("{}", error.report_for(format));
             ExitCode::FAILURE
         }
     };

@@ -456,6 +456,19 @@ async fn archived_sessions_resolve_only_with_all_but_full_ids_always_do() {
         !hidden.success,
         "an archived session's name is out of resolution by default"
     );
+    assert!(
+        hidden.stderr.contains("archived") && hidden.stderr.contains("--all"),
+        "the refusal says it is archived and names the flag: {}",
+        hidden.stderr
+    );
+
+    let unknown = horde(&endpoint, &["--json", "session", "get", "never-was"])
+        .await
+        .expect("run");
+    assert!(!unknown.success, "an unknown name is refused");
+    let refusal: serde_json::Value =
+        serde_json::from_str(unknown.stderr.trim()).expect("--json refusals are JSON on stderr");
+    assert_eq!(refusal["error"]["kind"], "unknown_session");
 
     let widened = horde(
         &endpoint,
@@ -475,6 +488,74 @@ async fn archived_sessions_resolve_only_with_all_but_full_ids_always_do() {
         "the full id reaches an archived session without --all: {}",
         by_id.stderr
     );
+}
+
+/// `agent status` finds an agent by a session name (its root) or by id,
+/// searching the live sessions, and refuses an agent no log mentions.
+#[tokio::test]
+async fn agent_status_reads_the_agent_off_its_sessions_log() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, root) = common::seeded(&endpoint, "status-check")
+        .await
+        .expect("seed");
+
+    let by_name = horde(&endpoint, &["--json", "agent", "status", "status-check"])
+        .await
+        .expect("run");
+    assert!(by_name.success, "{}", by_name.stderr);
+    let status: serde_json::Value = serde_json::from_str(by_name.stdout.trim()).expect("JSON");
+    assert_eq!(status["agent_id"], root.as_str());
+    assert_eq!(status["session_id"], session_id.as_str());
+
+    let by_id = horde(
+        &endpoint,
+        &["agent", "status", &root, "--session", &session_id],
+    )
+    .await
+    .expect("run");
+    assert!(by_id.success, "{}", by_id.stderr);
+    assert!(
+        by_id.stdout.starts_with(&format!("agent {root}\n")),
+        "{}",
+        by_id.stdout
+    );
+
+    let unknown = horde(&endpoint, &["agent", "status", "agent-never"])
+        .await
+        .expect("run");
+    assert!(!unknown.success);
+    assert!(
+        unknown.stderr.contains("no agent \"agent-never\""),
+        "{}",
+        unknown.stderr
+    );
+}
+
+/// `horde help` is `--help`; a usage mistake under `--json` is a JSON
+/// object on stderr with a non-zero exit.
+#[tokio::test]
+async fn help_is_a_verb_and_usage_errors_honor_json() {
+    let endpoint = serve().await.expect("a listening server");
+    let help = horde(&endpoint, &["help"]).await.expect("run");
+    assert!(help.success, "{}", help.stderr);
+    assert!(help.stdout.contains("Usage: horde"), "{}", help.stdout);
+
+    let refused = horde(
+        &endpoint,
+        &["--json", "worker", "enroll", "w", "--ttl-minutes", "0"],
+    )
+    .await
+    .expect("run");
+    assert!(!refused.success);
+    let error: serde_json::Value =
+        serde_json::from_str(refused.stderr.trim()).expect("a JSON refusal");
+    assert_eq!(error["error"]["kind"], "usage");
+
+    let prose = horde(&endpoint, &["worker", "enroll", "w", "--ttl-minutes", "0"])
+        .await
+        .expect("run");
+    assert!(!prose.success);
+    assert!(prose.stderr.contains("--ttl-minutes"), "{}", prose.stderr);
 }
 
 /// `horde new --detach` is the scripting form: create, print, no attach —

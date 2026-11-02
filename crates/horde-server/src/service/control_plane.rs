@@ -403,11 +403,18 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<HelloRequest>,
     ) -> Result<Response<HelloResponse>, Status> {
+        // Echoed per `handshake.proto`: whom the channel's certificate
+        // names, so a client can show who it is talking as. Empty on a
+        // plaintext channel, which carries no identity.
+        let principal = principal_of(&request);
         // The version gate (DESIGN §2, fix a6): the client's Hello is read
         // and compared, not discarded.
         super::shared::version_gate(request.into_inner().hello.as_ref())?;
         Ok(Response::new(HelloResponse {
-            server: Some(Self::server_hello()),
+            server: Some(ServerHello {
+                principal,
+                ..Self::server_hello()
+            }),
             // Assigned from the client certificate once enrollment exists.
             client_id: None,
         }))
@@ -1740,6 +1747,16 @@ fn actor_of<T>(request: &Request<T>) -> Option<horde_proto::v1::Actor> {
     })
 }
 
+/// The common name (`client:laptop`) of whatever principal a request's
+/// channel certificate names — any role — or empty on a plaintext channel.
+fn principal_of<T>(request: &Request<T>) -> String {
+    request
+        .extensions()
+        .get::<horde_identity::PeerIdentity>()
+        .map(|identity| identity.principal.common_name())
+        .unwrap_or_default()
+}
+
 /// The client principal name a request's channel carries, if any — the key
 /// forward backing is registered under. Same identity rules as [`actor_of`];
 /// this is the bare name where that is the wire's `Actor`.
@@ -1998,6 +2015,21 @@ mod tests {
             });
         }
         request
+    }
+
+    /// The Hello's echoed principal: whatever the certificate names, any
+    /// role, and nobody on a plaintext channel.
+    #[test]
+    fn the_hello_echoes_the_channels_principal() {
+        assert_eq!(
+            super::principal_of(&request_as(Some(PrincipalRole::Client))),
+            "client:laptop"
+        );
+        assert_eq!(
+            super::principal_of(&request_as(Some(PrincipalRole::Worker))),
+            "worker:laptop"
+        );
+        assert_eq!(super::principal_of(&request_as(None)), "");
     }
 
     /// Attribution's truth table (fix a13): a client certificate names the

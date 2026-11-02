@@ -465,7 +465,11 @@ fn permission_outcome_name(outcome: i32) -> &'static str {
     }
 }
 
-fn agent_lifecycle_name(state: i32) -> &'static str {
+/// The word an agent lifecycle state renders as — public for the same
+/// one-vocabulary reason as [`placement_state_name`]: the CLI's `sync` and
+/// `agent status` say these words too.
+#[must_use]
+pub fn agent_lifecycle_name(state: i32) -> &'static str {
     match AgentLifecycleState::try_from(state) {
         Ok(AgentLifecycleState::Queued) => "queued",
         Ok(AgentLifecycleState::Starting) => "starting",

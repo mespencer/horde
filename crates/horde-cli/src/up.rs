@@ -73,6 +73,31 @@ const LINE_CAP: usize = 2048;
 /// The cadence every poll in this module waits at.
 const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// The adapter whose harness is built into the worker — no binary to find.
+const BUILT_IN_ADAPTER: &str = "fake";
+
+/// Every bound `up` waits under, injected so a test can shrink them: a
+/// wait that a broken build would stretch must end inside the test's own
+/// deadline, never hang it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpTimings {
+    /// Any single wait on a spawned daemon's announcement.
+    pub startup: std::time::Duration,
+    /// How long the readiness `Hello` keeps meeting a server still coming up.
+    pub hello: std::time::Duration,
+    /// How long a SIGTERMed child may take before it is killed.
+    pub teardown: std::time::Duration,
+}
+
+impl UpTimings {
+    /// The bounds `horde up` itself runs under.
+    pub const PRODUCTION: Self = Self {
+        startup: STARTUP_CEILING,
+        hello: HELLO_CEILING,
+        teardown: TEARDOWN_CEILING,
+    };
+}
+
 /// What `horde up` takes: everything else is composition of defaults.
 #[derive(clap::Args, Debug)]
 pub struct UpArgs {
@@ -206,6 +231,10 @@ pub struct UpEnvironment {
     /// Whether the client identity sits somewhere a bare `horde` would not
     /// look — then the ready line is followed by the `export` that fixes it.
     pub export_identity: bool,
+    /// The `PATH` the local worker will find its harness binaries on —
+    /// read once by [`run`], so the warning about a missing one is testable.
+    pub harness_path: Option<std::ffi::OsString>,
+    pub timings: UpTimings,
 }
 
 /// The `horde up` verb: install the stop signals, resolve the environment,
@@ -240,6 +269,8 @@ pub async fn run(args: &UpArgs, identity: Option<&Path>) -> Result<(), ClientErr
             .unwrap_or_else(|| worker_name_from(hostname())),
         subject_names: args.subject_names.clone(),
         export_identity,
+        harness_path: std::env::var_os("PATH"),
+        timings: UpTimings::PRODUCTION,
     };
     let forward: Forward = Arc::new(|line| println!("{line}"));
     stand_up(&environment, &mut |line| println!("{line}"), forward, stop).await
@@ -298,7 +329,7 @@ pub async fn stand_up(
             Ok(())
         }
     };
-    tear_down(owned, announce).await;
+    tear_down(owned, announce, environment.timings.teardown).await;
     outcome
 }
 
@@ -459,7 +490,13 @@ async fn ensure_server(
         &[],
         Arc::clone(forward),
     )?);
-    let stdout = await_on_last(owned, "the server's listening lines", announced_server).await?;
+    let stdout = await_on_last(
+        owned,
+        "the server's listening lines",
+        environment.timings.startup,
+        announced_server,
+    )
+    .await?;
     started_server_facts(&stdout, announce)
 }
 
@@ -619,7 +656,13 @@ async fn await_hello(
             Err(error) => error,
         };
         let cause = horde_identity::diagnosis::cause(&error);
-        if hello_gives_up(cause.as_ref(), started, tokio::time::Instant::now()) {
+        let ceiling = environment.timings.hello;
+        if hello_gives_up(
+            cause.as_ref(),
+            started,
+            tokio::time::Instant::now(),
+            ceiling,
+        ) {
             return Err(ClientError::Up(format!(
                 "the server at {} did not answer a Hello: {}",
                 server.endpoint,
@@ -635,15 +678,15 @@ async fn await_hello(
 
 /// Whether a failed readiness `Hello` is final: a cause that waiting cannot
 /// cure (a certificate problem) at once, anything else (refused, timed
-/// out, unrecognized) only once [`HELLO_CEILING`] has passed since
-/// `started`.
+/// out, unrecognized) only once `ceiling` has passed since `started`.
 fn hello_gives_up(
     cause: Option<&horde_identity::diagnosis::Cause>,
     started: tokio::time::Instant,
     now: tokio::time::Instant,
+    ceiling: std::time::Duration,
 ) -> bool {
     let transient = cause.is_none_or(horde_identity::diagnosis::Cause::is_transient);
-    !transient || now >= started + HELLO_CEILING
+    !transient || now >= started + ceiling
 }
 
 /// One bounded `Hello` as `identity`.
@@ -690,6 +733,9 @@ async fn ensure_worker(
     for adapter in &environment.adapters {
         args.extend(["--adapter".to_owned(), adapter.clone()]);
     }
+    for warning in harness_warnings(&environment.adapters, environment.harness_path.as_deref()) {
+        announce(warning);
+    }
     let mut envs: Vec<(String, String)> = Vec::new();
     if !horde_identity::StoredIdentity::exists(&state.join("identity")) {
         let token = mint_worker_token(environment, &server.endpoint).await?;
@@ -702,15 +748,45 @@ async fn ensure_worker(
         &envs,
         Arc::clone(forward),
     )?);
-    let stdout = await_on_last(owned, "the worker's registration line", |out| {
-        registered_name(out).is_some()
-    })
+    let stdout = await_on_last(
+        owned,
+        "the worker's registration line",
+        environment.timings.startup,
+        |out| registered_name(out).is_some(),
+    )
     .await?;
     let name = registered_name(&stdout)
         .unwrap_or(&environment.worker_name)
         .to_owned();
     announce(format!("worker registered name={name}"));
     Ok(name)
+}
+
+/// What a worker this invocation starts cannot run, said before it starts:
+/// no `--adapter` at all means no agent can ever be placed on it, and an
+/// adapter whose harness binary is not on `path` means every agent placed
+/// there fails to start. Warnings, not refusals — the operator may install
+/// the harness next, and the worker re-detects it.
+#[must_use]
+pub fn harness_warnings(adapters: &[String], path: Option<&std::ffi::OsStr>) -> Vec<String> {
+    if adapters.is_empty() {
+        return vec![
+            "warning: the local worker runs no harness (no --adapter), so no agent can be \
+             placed on it; re-run with --adapter claude, codex or fake"
+                .to_owned(),
+        ];
+    }
+    adapters
+        .iter()
+        .filter(|adapter| adapter.as_str() != BUILT_IN_ADAPTER)
+        .filter(|adapter| crate::doctor::on_path(adapter, path).is_none())
+        .map(|adapter| {
+            format!(
+                "warning: --adapter {adapter}, but no {adapter} binary is on PATH; agents placed \
+                 on this worker will fail to start until it is installed (`horde doctor` checks)"
+            )
+        })
+        .collect()
 }
 
 /// The name on the first complete `registered worker=<name> …` line — any
@@ -763,10 +839,11 @@ fn announce_ready(
 async fn await_on_last(
     owned: &mut [WatchedChild],
     what: &str,
+    ceiling: std::time::Duration,
     holds: impl Fn(&str) -> bool,
 ) -> Result<String, ClientError> {
     match owned.last_mut() {
-        Some(child) => child.await_stdout(what, holds).await,
+        Some(child) => child.await_stdout(what, ceiling, holds).await,
         None => Err(ClientError::Up(format!(
             "nothing was spawned to wait for {what}"
         ))),
@@ -831,32 +908,44 @@ fn line_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// One daemon line as forwarded: tagged with its daemon, clipped to
 /// [`LINE_CAP`] bytes on a character boundary.
 fn forwarded_line(name: &str, line: &str) -> String {
-    if line.len() <= LINE_CAP {
-        return format!("[{name}] {line}");
+    let kept = clip(line, LINE_CAP);
+    if kept.len() == line.len() {
+        format!("[{name}] {line}")
+    } else {
+        format!("[{name}] {kept}…")
     }
-    let mut end = LINE_CAP;
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("[{name}] {}…", &line[..end])
 }
 
 /// Appends to the kept stdout without passing [`STDOUT_CAP`] bytes.
 fn push_capped(buffer: &mut String, text: &str) {
-    let room = STDOUT_CAP.saturating_sub(buffer.len());
-    let mut end = text.len().min(room);
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    buffer.push_str(clip(text, STDOUT_CAP.saturating_sub(buffer.len())));
+}
+
+/// The longest prefix of `text` within `cap` bytes that ends on a
+/// character boundary. A bounded scan of the four positions a boundary
+/// must fall among (a UTF-8 character is at most four bytes) — never an
+/// open-ended loop a broken step could spin forever.
+fn clip(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
     }
-    buffer.push_str(&text[..end]);
+    let end = (cap.saturating_sub(3)..=cap)
+        .rev()
+        .find(|&end| text.is_char_boundary(end))
+        .unwrap_or(0);
+    &text[..end]
 }
 
 /// Ends every owned child, newest first (the worker before the server it
-/// dials): SIGTERM, a bounded wait, and only then a kill.
-async fn tear_down(owned: Vec<WatchedChild>, announce: &mut dyn FnMut(String)) {
+/// dials): SIGTERM, a wait bounded by `ceiling`, and only then a kill.
+async fn tear_down(
+    owned: Vec<WatchedChild>,
+    announce: &mut dyn FnMut(String),
+    ceiling: std::time::Duration,
+) {
     for child in owned.into_iter().rev() {
         let name = child.name.clone();
-        child.stop().await;
+        child.stop(ceiling).await;
         announce(format!("stopped {name}"));
     }
 }
@@ -931,14 +1020,15 @@ impl WatchedChild {
         )))
     }
 
-    /// Waits under [`STARTUP_CEILING`] until stdout satisfies `holds`,
-    /// failing at once (with the output) if the child exits first.
+    /// Waits under `ceiling` until stdout satisfies `holds`, failing at
+    /// once (with the output) if the child exits first.
     async fn await_stdout(
         &mut self,
         what: &str,
+        ceiling: std::time::Duration,
         holds: impl Fn(&str) -> bool,
     ) -> Result<String, ClientError> {
-        let deadline = tokio::time::Instant::now() + STARTUP_CEILING;
+        let deadline = tokio::time::Instant::now() + ceiling;
         loop {
             let snapshot = self.stdout_so_far();
             if holds(&snapshot) {
@@ -957,16 +1047,16 @@ impl WatchedChild {
         }
     }
 
-    /// SIGTERM, a bounded wait, then SIGKILL — a clean shutdown offered,
-    /// never depended on.
-    async fn stop(mut self) {
+    /// SIGTERM, a wait bounded by `ceiling`, then SIGKILL — a clean
+    /// shutdown offered, never depended on.
+    async fn stop(mut self, ceiling: std::time::Duration) {
         if let Some(pid) = self.child.id() {
             let _best_effort_term = tokio::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status()
                 .await;
         }
-        if tokio::time::timeout(TEARDOWN_CEILING, self.child.wait())
+        if tokio::time::timeout(ceiling, self.child.wait())
             .await
             .is_err()
         {

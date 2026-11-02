@@ -138,10 +138,13 @@ fn forwarded_lines_and_kept_stdout_are_capped() {
     assert_eq!(forwarded_line("w", "hi"), "[w] hi");
     let long = format!("{}é", "a".repeat(super::LINE_CAP - 1));
     let clipped = forwarded_line("w", &long);
-    assert!(
-        clipped.ends_with('…') && !clipped.contains('é'),
-        "{clipped}"
+    assert_eq!(
+        clipped,
+        format!("[w] {}…", "a".repeat(super::LINE_CAP - 1)),
+        "clipped at the last boundary under the cap"
     );
+    let exact = "b".repeat(super::LINE_CAP);
+    assert_eq!(forwarded_line("w", &exact), format!("[w] {exact}"));
 
     let mut kept = String::new();
     push_capped(&mut kept, &"x".repeat(super::STDOUT_CAP - 1));
@@ -213,22 +216,74 @@ fn the_hello_gives_up_on_certificates_at_once_and_on_weather_at_the_ceiling() {
     use horde_identity::diagnosis::Cause;
     let started = tokio::time::Instant::now();
     let early = started + std::time::Duration::from_millis(1);
-    let at_ceiling = started + super::HELLO_CEILING;
+    let ceiling = super::HELLO_CEILING;
+    let at_ceiling = started + ceiling;
     assert!(super::hello_gives_up(
         Some(&Cause::UnknownIssuer),
         started,
-        early
+        early,
+        ceiling
     ));
     for transient in [Some(&Cause::NothingListening), Some(&Cause::TimedOut), None] {
         assert!(
-            !super::hello_gives_up(transient, started, early),
+            !super::hello_gives_up(transient, started, early, ceiling),
             "{transient:?} is retried before the ceiling"
         );
         assert!(
-            super::hello_gives_up(transient, started, at_ceiling),
+            super::hello_gives_up(transient, started, at_ceiling, ceiling),
             "{transient:?} gives up at the ceiling"
         );
     }
+}
+
+/// The production bounds as literal durations — policy, asserted apart
+/// from its own symbols.
+#[test]
+fn the_production_timings_are_the_documented_ceilings() {
+    assert_eq!(
+        super::UpTimings::PRODUCTION,
+        super::UpTimings {
+            startup: std::time::Duration::from_secs(60),
+            hello: std::time::Duration::from_secs(20),
+            teardown: std::time::Duration::from_secs(10),
+        }
+    );
+}
+
+/// A worker `up` starts is warned about before it starts: no adapter at
+/// all, or a harness binary missing from PATH; the built-in fake and a
+/// harness that is on PATH earn nothing.
+#[test]
+fn harness_warnings_name_what_the_local_worker_cannot_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let none = super::harness_warnings(&[], None);
+    assert_eq!(none.len(), 1);
+    assert!(none[0].contains("no --adapter"), "{none:?}");
+
+    let bin = tempfile::tempdir().expect("a dir");
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\n").expect("writes");
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).expect("chmods");
+    let path = std::env::join_paths([bin.path()]).expect("a path");
+    let adapters = ["fake", "codex", "claude"].map(str::to_owned);
+    let warnings = super::harness_warnings(&adapters, Some(&path));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("--adapter claude") && warnings[0].contains("no claude binary"),
+        "{warnings:?}"
+    );
+}
+
+/// Clipping is to the last character boundary within the cap — exactly,
+/// not merely somewhere short of it.
+#[test]
+fn clipping_keeps_the_longest_whole_character_prefix() {
+    assert_eq!(super::clip("abc", 3), "abc");
+    assert_eq!(super::clip("abcd", 3), "abc");
+    assert_eq!(super::clip("aé", 2), "a", "é straddles the cap");
+    assert_eq!(super::clip("a😀b", 4), "a", "a four-byte char straddles");
+    assert_eq!(super::clip("a😀b", 5), "a😀");
+    assert_eq!(super::clip("😀", 0), "");
 }
 
 /// The CA check, without a network: an identity trusting the state's own
@@ -348,8 +403,24 @@ fn environment_under(
         worker_name: "up-test".to_owned(),
         subject_names: Vec::new(),
         export_identity: false,
+        harness_path: None,
+        timings: TEST_TIMINGS,
     }
 }
+
+/// The bounds the flow tests run under: short enough that a flow which
+/// should have answered is caught waiting well inside [`TEST_CEILING`],
+/// long enough for a loaded machine's real server and scripted daemons.
+const TEST_TIMINGS: super::UpTimings = super::UpTimings {
+    startup: std::time::Duration::from_secs(20),
+    hello: std::time::Duration::from_secs(10),
+    teardown: std::time::Duration::from_secs(5),
+};
+
+/// The most any one flow test waits for `stand_up` to return. A build
+/// that never announces ready, or never gives up a Hello, fails here
+/// instead of hanging the suite.
+const TEST_CEILING: std::time::Duration = std::time::Duration::from_secs(45);
 
 fn no_forward() -> super::Forward {
     Arc::new(|_| {})
@@ -462,22 +533,26 @@ async fn stood_up(environment: &UpEnvironment) -> (Result<(), crate::ClientError
     let (ready, is_ready) = tokio::sync::oneshot::channel::<()>();
     let mut ready = Some(ready);
     let mut lines = Vec::new();
-    let outcome = super::stand_up(
-        environment,
-        &mut |line| {
-            if line.starts_with("ready ")
-                && let Some(ready) = ready.take()
-            {
-                let _ = ready.send(());
-            }
-            lines.push(line);
-        },
-        no_forward(),
-        async move {
-            let _ = is_ready.await;
-        },
+    let outcome = tokio::time::timeout(
+        TEST_CEILING,
+        super::stand_up(
+            environment,
+            &mut |line| {
+                if line.starts_with("ready ")
+                    && let Some(ready) = ready.take()
+                {
+                    let _ = ready.send(());
+                }
+                lines.push(line);
+            },
+            no_forward(),
+            async move {
+                let _ = is_ready.await;
+            },
+        ),
     )
-    .await;
+    .await
+    .expect("stand_up returns within the test ceiling: ready, or a refusal");
     (outcome, lines)
 }
 
@@ -630,6 +705,12 @@ async fn a_found_server_and_existing_identities_are_left_alone() {
         "the registered name, not the flag: {lines:?}"
     );
     assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("warning: the local worker runs no harness")),
+        "a worker started with no adapter is warned about: {lines:?}"
+    );
+    assert!(
         !stopped(root.path(), "server"),
         "never spawned, never stopped"
     );
@@ -705,7 +786,7 @@ async fn a_daemon_dying_during_bring_up_fails_with_its_output() {
         "{refusal}"
     );
     assert!(
-        started.elapsed() < super::STARTUP_CEILING,
+        started.elapsed() < TEST_TIMINGS.startup,
         "reported on the exit, not the ceiling"
     );
 }
@@ -835,7 +916,7 @@ async fn the_hello_probe_diagnoses_a_server_from_another_ca() {
         "{refusal}"
     );
     assert!(
-        started.elapsed() < super::HELLO_CEILING,
+        started.elapsed() < TEST_TIMINGS.hello,
         "a certificate failure is not retried"
     );
 }
@@ -924,5 +1005,5 @@ async fn forwarded_daemon_lines_are_tagged_and_clipped() {
         seen.get(1).is_some_and(|line| line.ends_with('…')),
         "{seen:?}"
     );
-    child.stop().await;
+    child.stop(TEST_TIMINGS.teardown).await;
 }
