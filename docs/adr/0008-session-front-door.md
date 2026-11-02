@@ -57,3 +57,47 @@ design, and nothing here reaches past the moment attach begins.
   sessions only.
 - Sequenced as wave 10 alongside ADR-0007's `horde up`, which ends its
   stand-up by walking through this same front door.
+
+## Amendment (2026-11-01): resolution that explains itself, and refusals a script can read
+
+Wave 11h's usability pass settles what the front door says when it cannot
+do what was asked.
+
+**Resolution asks the server first, and refuses what it cannot find.** A
+session reference is first sent through `ListSessions`' exact-name filter
+(ADR-0013) — the common case, since generated names are titles — and only a
+slug, an id or a prefix falls back to the whole list. A title matches
+verbatim as well as by its slug. Because the fallback consults *every*
+session, archived included, a reference nothing answers to is now refused
+client-side (`no session is named …`) instead of passed through for the
+server's less specific "not found". A full id stays exact whatever the
+session's state, so nothing that addressed an archived session by id needs
+`--all`; a name or prefix that only an archived session answers is refused
+naming that session and `--all`. Duplicate titles remain an ambiguity
+refusal listing every candidate.
+
+**One flag for "archived too".** `--all` is canonical on every verb that can
+look at archived sessions (`session list` included); `--include-archived`
+parses everywhere as a hidden alias. `horde help [verb]` works again, as the
+original consequences promised.
+
+**Sending to an ended agent is refused, not warned.** ADR-0011 already has
+the server refuse a message to a failed, lost or archived agent with
+`FAILED_PRECONDITION`; the CLI turns that refusal into one that says what to
+do (`horde agent status`, `horde spawn`). A warning-then-send would claim a
+delivery that cannot happen — the context died with the agent — and a
+client-side pre-check would race the server's own, authoritative one.
+
+**Agent status is a fold, not an RPC.** `horde agent status <agent>` replays
+the session (the named one, or each live one) and folds
+`AgentLifecycleChanged` and `PlacementChanged` into state, worker and last
+change, naming a `LOST` placement as "lost with its worker". `sync` renders
+the same lifecycle changes: a transition line in prose, structured states in
+`--json`.
+
+**Refusals have a JSON form.** Under `--json`, every refusal — usage errors
+included — is one object on stderr (`kind`, gRPC `code`, `message`, `hint`,
+`candidates`) with a non-zero exit, and server refusals read as plain text
+everywhere (`not found: …`), never tonic's debug dump. `horde doctor` checks
+a machine end to end with an actionable fix per line, and `Hello` now echoes
+the principal the server derived from the channel's certificate.
