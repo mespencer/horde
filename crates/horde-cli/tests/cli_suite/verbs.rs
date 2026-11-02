@@ -337,6 +337,37 @@ async fn the_workspace_verbs_round_trip_through_the_dispatch() {
     );
     let definition = renamed;
 
+    // The same edit through the verb, by name: the unmanaged paths it does
+    // not mention survive, and a stale etag aborts rather than overwrites.
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "update",
+            "atlas-renamed",
+            "--etag",
+            &definition.etag,
+            "--name",
+            "atlas-verb",
+        ],
+    )
+    .await
+    .expect("the update verb applies at the current etag");
+    let definition = client
+        .get_workspace_definition(&id)
+        .await
+        .expect("the updated definition reads back")
+        .definition
+        .expect("a definition");
+    assert_eq!(definition.name, "atlas-verb");
+    assert_eq!(definition.unmanaged_paths, vec!["datasets".to_owned()]);
+    invoke(
+        &endpoint,
+        &["workspace", "update", &id, "--etag", "stale", "--name", "x"],
+    )
+    .await
+    .expect_err("a stale etag is refused");
+
     invoke(
         &endpoint,
         &["workspace", "delete", &id, "--etag", &definition.etag],

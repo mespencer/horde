@@ -23,6 +23,7 @@ pub mod permission;
 pub mod placement;
 pub mod projection;
 pub mod relay;
+pub mod remint;
 pub mod scheduler;
 pub mod service;
 pub mod startup;

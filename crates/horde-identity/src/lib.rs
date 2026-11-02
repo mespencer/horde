@@ -36,6 +36,7 @@ pub mod interceptor;
 pub mod principal;
 pub mod revocation;
 pub mod store;
+pub mod subject_name;
 pub mod tls;
 pub mod token;
 
@@ -47,4 +48,5 @@ pub use interceptor::{admit_request, require_enrolled};
 pub use principal::{PeerIdentity, Principal, PrincipalRole, principal_of_pem, validity_of_pem};
 pub use revocation::RevocationList;
 pub use store::{StateLock, StoredIdentity};
+pub use subject_name::check_subject_name;
 pub use token::{HostScope, JoinToken, TokenError};

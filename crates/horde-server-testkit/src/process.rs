@@ -214,12 +214,16 @@ impl SpawnedProcess {
     /// Spawns `program` with `args` and `envs`, watching both output streams.
     ///
     /// `name` labels every failure this handle reports. The child is
-    /// kill-on-drop: a panicking test must not leak a live daemon.
+    /// kill-on-drop, its descendants with it: a panicking test must not
+    /// leak a live daemon. The first spawn in each test process also reaps
+    /// the orphans an earlier, killed test process left behind
+    /// ([`crate::reap`]).
     ///
     /// # Errors
     ///
     /// The spawn failing, or a pipe missing.
     pub fn spawn(name: &str, program: &Path, args: &[&str], envs: &[(&str, &str)]) -> Setup<Self> {
+        crate::reap::reap_orphans_once();
         let mut command = tokio::process::Command::new(program);
         command
             .args(args)
@@ -343,6 +347,16 @@ impl SpawnedProcess {
         // one bounded beat so the captured streams are complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         Ok((status, self.stdout_so_far(), self.stderr_so_far()))
+    }
+}
+
+impl Drop for SpawnedProcess {
+    /// Kills the child's whole tree before kill-on-drop takes the child: a
+    /// dropped `horde up` must not leave its server and worker to init.
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            crate::reap::reap_descendants(pid);
+        }
     }
 }
 

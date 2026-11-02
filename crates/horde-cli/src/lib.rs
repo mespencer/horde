@@ -24,6 +24,7 @@ pub mod render;
 pub mod resolve;
 pub mod tui;
 pub mod up;
+pub mod workspace_update;
 
 pub use client::{Client, ClientError, SyncOptions};
 pub use render::Format;

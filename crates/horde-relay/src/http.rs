@@ -17,7 +17,8 @@
 //! handshake, and the certificate's principal lands in `REMOTE_USER`, the
 //! seam W4b left ready. Bodies are buffered whole rather than streamed —
 //! honest for the repos Horde relays today, and a contained upgrade when it
-//! stops being.
+//! stops being — and buffering is bounded: a body past
+//! [`MAX_REQUEST_BODY_BYTES`] is refused `413` before it can exhaust memory.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -26,8 +27,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
@@ -301,27 +301,44 @@ pub fn cgi_environment(
     env
 }
 
+/// The largest request body the Relay buffers: 1 GiB. A push's pack is the
+/// only large body git sends, and one bigger than this is far past what the
+/// whole-body buffering above was sized for — refusing it with a named
+/// `413` beats letting one client exhaust the Server's memory.
+pub const MAX_REQUEST_BODY_BYTES: usize = 1 << 30;
+
 /// One Relay: a mirror store plus the bridge that serves it.
 #[derive(Debug, Clone)]
 pub struct Relay {
     store: Arc<MirrorStore>,
+    body_limit: usize,
 }
 
 impl Relay {
     #[must_use]
     pub fn new(store: Arc<MirrorStore>) -> Self {
-        Self { store }
+        Self::with_body_limit(store, MAX_REQUEST_BODY_BYTES)
+    }
+
+    /// A Relay that refuses request bodies longer than `body_limit` bytes.
+    #[must_use]
+    pub fn with_body_limit(store: Arc<MirrorStore>, body_limit: usize) -> Self {
+        Self { store, body_limit }
     }
 
     /// Answers one HTTP request. Infallible by design: every failure has an
     /// HTTP shape, and a bridge that errors the connection instead of the
     /// request tells the git client nothing.
-    pub async fn respond(
+    pub async fn respond<B>(
         &self,
-        request: Request<Incoming>,
+        request: Request<B>,
         peer: SocketAddr,
         remote_user: &str,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<Full<Bytes>>
+    where
+        B: hyper::body::Body,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let (parts, body) = request.into_parts();
         let Some(route) = parse_route(&parts.method, parts.uri.path(), parts.uri.query()) else {
             return plain_response(
@@ -329,11 +346,9 @@ impl Relay {
                 "not a git smart-HTTP route this Relay serves",
             );
         };
-        let Ok(body) = body.collect().await else {
-            return plain_response(
-                StatusCode::BAD_REQUEST,
-                "the request body could not be read",
-            );
+        let body = match Limited::new(body, self.body_limit).collect().await {
+            Ok(body) => body,
+            Err(error) => return body_refusal(&*error, self.body_limit),
         };
 
         let header = |name: &str| {
@@ -373,6 +388,25 @@ impl Relay {
         self.store.ensure(route.repo()).await?;
         let env = cgi_environment(route, self.store.root(), context);
         run_http_backend(&env, &body).await
+    }
+}
+
+/// The answer to a body that could not be buffered: `413` naming the limit
+/// when it was too long, `400` when it could not be read at all.
+fn body_refusal(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+    limit: usize,
+) -> Response<Full<Bytes>> {
+    if error.is::<http_body_util::LengthLimitError>() {
+        plain_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("the request body exceeds the Relay's {limit}-byte limit"),
+        )
+    } else {
+        plain_response(
+            StatusCode::BAD_REQUEST,
+            "the request body could not be read",
+        )
     }
 }
 
@@ -585,6 +619,52 @@ mod tests {
         parse_route,
     };
     use http::Method;
+
+    async fn answer_to_body(limit: usize, body: &'static [u8]) -> http::StatusCode {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let store = std::sync::Arc::new(super::MirrorStore::new(scratch.path().to_path_buf()));
+        let relay = super::Relay::with_body_limit(store, limit);
+        let request = http::Request::post("/atlas/git-upload-pack")
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(body)))
+            .expect("request");
+        let peer = "127.0.0.1:9".parse().expect("peer");
+        relay.respond(request, peer, "horde").await.status()
+    }
+
+    /// A body past the limit is refused `413` before any mirror is touched;
+    /// one exactly at it reaches the store (which knows no `atlas`: `404`).
+    #[tokio::test]
+    async fn a_request_body_past_the_limit_is_refused_payload_too_large() {
+        assert_eq!(
+            answer_to_body(4, b"12345").await,
+            http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            answer_to_body(5, b"12345").await,
+            http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn the_body_refusal_tells_a_length_error_from_an_unreadable_body() {
+        use http_body_util::BodyExt;
+        let too_long = http_body_util::Limited::new(
+            http_body_util::Full::new(bytes::Bytes::from_static(b"12345")),
+            4,
+        )
+        .collect()
+        .await
+        .expect_err("past the limit");
+        assert_eq!(
+            super::body_refusal(&*too_long, 7).status(),
+            http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let unreadable = std::io::Error::other("reset");
+        assert_eq!(
+            super::body_refusal(&unreadable, 7).status(),
+            http::StatusCode::BAD_REQUEST
+        );
+    }
 
     /// The four requests a real git client sends, and nothing else.
     #[test]
