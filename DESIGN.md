@@ -2,7 +2,7 @@
 
 A multi-provider agent orchestrator. One control plane through which *all* agents flow — the ones you drive directly and the ones agents spawn themselves — with session trees, cross-machine placement, subscription-based provider accounts, and attach-from-anywhere clients.
 
-Status: design settled 2026-08-09 after initial brainstorm + grill session. No code yet.
+Status: design settled 2026-08-09 after initial brainstorm + grill session; built in waves since (IMPLEMENTATION.md), measured against this document in docs/CONFORMANCE.md.
 
 **This document defines the end state.** Nothing in it is a "v1 feature" versus a "someday feature" — the shape of every mechanism is designed in from the start, and only *activation* is sequenced (§14). When a section says "bootstrap phase," that is a stepping stone inside the designed shape, not a scope cut to be revisited.
 
@@ -26,7 +26,7 @@ Status: design settled 2026-08-09 after initial brainstorm + grill session. No c
 | **Worker** | `horde-worker` | Agent process supervisor. Runs provider harnesses as child processes, materializes workspace instances, applies deterministic permission layers, journals events. Dials the server outbound (NAT-friendly). |
 | **Client** | `horde` | Ratatui TUI + CLI. Top-level session views, per-session attach, enrollment, config authoring. Later: GUI/mobile. |
 
-All Rust. Shipped as three separate binaries — combining them invites designs that break once they're apart. Convenience affordance: `horde-server --with-local-worker` supervises a real `horde-worker` child that connects over gRPC on localhost. Same wire path as remote; no in-process shortcut exists.
+All Rust. Shipped as three separate binaries — combining them invites designs that break once they're apart. Convenience affordance: `horde up` (ADR-0007) starts a real `horde-server` and a real `horde-worker` as separate processes that connect over gRPC on localhost (the `horde-server --with-local-worker` flag this replaced was never built). Same wire path as remote; no in-process shortcut exists.
 
 ### Transport and resilience
 
@@ -49,14 +49,14 @@ Hello handshake on every connection: semver + capability flags. Server enforces 
 The server is remote-code-execution-as-a-service by design; the trust boundary is real.
 
 - **mTLS for every principal** (workers *and* clients), certs issued by the server's internal CA.
-- **Enrollment (ADR-0007):** `horde worker enroll <name>` on a trusted client prints one short-lived join token, `horde://join/<host:port>/<secret>.<fingerprint>`. The token carries the enrollment listener, the one-time secret, and the server cert fingerprint. On the new machine, `horde-worker --join <token>` (or `--join-file`, or `HORDE_JOIN_TOKEN`) verifies the server against the fingerprint, generates a keypair locally, submits a CSR, and the server signs it. Private keys never travel. Clients enroll identically with `horde enroll join <token>`, which refuses to replace an existing identity without `--force` (and then backs the old one up). The join stores the server's endpoint beside the credential, so later invocations need no flag. There is no default server: with no flag, env var, or stored endpoint, the CLI and the worker both refuse and point at `enroll join` or `horde up`.
+- **Enrollment (ADR-0007):** `horde worker enroll <name>` on a trusted client prints one short-lived join token, `horde://join/<host:port>/<secret>.<fingerprint>`. The token carries the enrollment listener, the one-time secret, and the server cert fingerprint. On the new machine, `horde-worker --join <token>` (or `--join-file`, or `HORDE_JOIN_TOKEN`) verifies the server against the fingerprint, generates a keypair locally, submits a CSR, and the server signs it. Private keys never travel. Clients enroll identically with `horde enroll join <token>`, which refuses to replace an existing identity without `--force` (and then backs the old one up). The join stores the server's endpoint beside the credential, so later invocations need no flag. There is no default server: with no flag, env var, or stored endpoint, both refuse rather than guess: the CLI points at `enroll join` or `horde up`, the worker at `--server`, `HORDE_SERVER`, or `--join <token>`.
 - **Quick start, one machine:** `horde up --adapter claude` starts a server (state under `~/.horde`), enrolls the local client through the server's user-only bootstrap-token file, mints and joins a local worker, and prints one ready line. A second machine joins with a token minted through a name it can dial: `horde up --san box.lan --bind 0.0.0.0:7777 --enrollment-bind 0.0.0.0:7778` on the server, then `horde worker enroll gpu-box --endpoint https://box.lan:7777` there and `horde-worker --join-file <token-file>` on the new machine.
-- **State directories:** each daemon keeps its state under `~/.horde` (`server/`, `worker/`, `id/`), owner-only, and holds an exclusive lock on it while running. `horde-server` needs `--serve` (or `--check` for the health check) and never writes to the working directory.
+- **State directories:** each daemon keeps its state under `~/.horde` (`server/`, `worker/`, `id/`), owner-only, and holds an exclusive lock on it while running. `horde-server` needs one mode — `--serve`, `--check` (the health check), or `--remint` (below) — and never writes to the working directory.
 - **Revocation:** per-cert denylist by serial (`horde worker revoke <name>`), journaled as events and seeded from the log at startup. Reach (wave-7 fix): unary calls are checked per request, and revoking a principal also severs its live streams — a revoked worker does not keep pumping commands until it happens to reconnect.
 - **Minting and revoking require a Client-role principal** (wave-7 fix): enrollment alone does not confer them, so a worker cert can neither mint codes nor revoke peers.
 - **Every RPC has a role, and a worker is its certificate** (ADR-0009): one table decides, per gRPC method, whether clients, workers, or either may call it — the worker spine is workers only, the control plane clients only except the agent conduit (spawn, send, sync, hello) a worker drives for its own placed agents — and a method without a row is refused. Worker-spine handlers take the worker from the certificate and refuse a body naming another. Ingest is origin-aware: a worker may journal only observations about agents placed on it, and a refused entry is dead-lettered in its place so the journal never wedges. A worker's `SyncEvents` reads only sessions it holds agents in, never all sessions (ADR-0011).
 - **Journal reset** (ADR-0011): a worker whose journal regressed (a fresh state directory after a disk loss) is refused at registration, and `horde worker reset <name>` is the explicit recovery — its fresh journal is numbered above the old one's floor, its command stream starts over, and the agents it held are declared lost.
-- **Bootstrap trust root:** at `--serve` startup, exactly when no client holds an active cert, the server mints a first client enrollment code and prints it to stdout. Whoever reads the server's stdout already owns the disk the CA key lives on — the same trust, no new surface.
+- **Bootstrap trust root:** at `--serve` startup, exactly when no client holds an active cert, the server mints a first client join token, prints it to stdout (`bootstrap-client-token horde://join/…`), and writes it to a user-read-only `bootstrap-token` file in its state directory, removed once a client has enrolled. Whoever reads either already owns the disk the CA key lives on — the same trust, no new surface. An expired bootstrap token is re-minted on the running server by `horde-server --remint` on the same state directory (SIGHUP to the server does the same).
 - **Rotation:** lifetimes are CA 20y, listener 2y, principal 1y. No renewal RPC and no expiry warning yet; rotation is manual re-enrollment under the same name, which the roster supports by keeping every serial a name has held.
 - No non-localhost binding before auth exists — auth ships with the first networked build, not as a follow-up.
 
@@ -129,7 +129,7 @@ Unspecified = inherit the spawner's tier. Within a tier, a per-tier **selection 
 
 Every agent gets exactly one horde-controlled MCP endpoint carrying:
 
-1. Orchestrator verbs: `spawn_agent`, `send_message` (assign/note), `report_result`, `wait_for_agent`, list/query.
+1. Orchestrator verbs: `spawn_agent`, `send_message` (assign/note), `report_result`, `wait_for_agent`, `approve`, and the port-forward verbs `expose`/`inject` (ADR-0006). A list/query verb is not built yet. Permission rules name these as `horde/<tool>` (ADR-0004 amendment).
 2. Proxied hub MCP tools (§9).
 3. Worker-local MCP tools (config-flagged `local`).
 
@@ -150,7 +150,7 @@ Native subagent tools (CC Task, etc.) are suppressed and substituted — not yet
 
 Split: **definition** (portable) vs **instance** (per-worker materialization). See also ADR-0002.
 
-- **Definition:** name + 1..N repos (remote URL, default branch) + layout + optional `unmanaged` paths. Lives in server SQLite, managed by CLI (`horde workspace add/add-repo/...`). Repo set is fixed at definition; additions are explicit (a permission-style event). Single-repo definitions are auto-registered from cwd by `horde new`; manual definition is only needed for multi-repo.
+- **Definition:** name + 1..N repos (remote URL, default branch) + layout + optional `unmanaged` paths. Lives in server SQLite, managed by CLI (`horde workspace create/add-repo/update/...`). Repo set is fixed at definition; additions are explicit (a permission-style event). Auto-registering a single-repo definition from cwd in `horde new` is not built yet; today `new` takes `--workspace` explicitly.
 - **Instance:** checkouts on a worker's disk. Worker-local state file is the truth; reported to the server on connect (server treats it as cache; reconciliation handles wiped disks / out-of-band deletion). Created by server command at placement time; never self-initiated.
 - **Per-agent checkout policy:** `shared` (parent's instance — rare but real), `worktree` (default for mutating agents; one worktree per repo composed under an agent-private root), `fresh-clone` (full isolation).
 - **`unmanaged` paths** (datasets, weights, build caches): per-instance, never synced, not covered by payloads. Cross-worker artifact passing is the blob store's job, not git's.
@@ -199,9 +199,9 @@ Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), an
 
 ## 11. Clients (CLI and TUI)
 
-**CLI parity is a hard rule: the TUI is optional.** Every operation is a server RPC; the TUI and plain CLI subcommands are two frontends over the same client library, so anything the TUI can do has a scriptable `horde <verb>` equivalent (`horde sessions`, `horde spawn`, `horde approve <id>`, `horde workspace add`, …). This is also what makes "Claude Code as a client" work — a CC wrapper or MCP shim drives the same verbs. New capability = new RPC + CLI verb first; TUI surface second.
+**CLI parity is a hard rule: the TUI is optional.** Every operation is a server RPC; the TUI and plain CLI subcommands are two frontends over the same client library, so anything the TUI can do has a scriptable `horde <verb>` equivalent (`horde session list`, `horde spawn`, `horde approve <id>`, `horde workspace create`, `horde agent status`, …). This is also what makes "Claude Code as a client" work — a CC wrapper or MCP shim drives the same verbs. New capability = new RPC + CLI verb first; TUI surface second.
 
-- **Two zoom levels, one binary, same rendering machinery:** top-level multi-session view (`horde`) and per-session attach (`horde attach <session>`; `horde new` creates from cwd, auto-resolving the workspace — the CC-per-tmux-pane flow, nearly verbatim). Detach to overview and back without restarting.
+- **Two zoom levels, one binary, same rendering machinery:** top-level multi-session view and per-session attach (`horde attach <session>`; `horde new` creates and attaches — the CC-per-tmux-pane flow, nearly verbatim). A bare `horde` is the front door (ADR-0008): with no live session it creates one, with one it attaches, with several it opens a picker. Detach to overview and back without restarting.
 - **Attached to a session:** you see the top-level agent; prompts from anywhere in the tree bubble up CC-style, stamped with tree path.
 - **Attached to a subagent:** you see prompts from that agent's subtree only, plus a passive badge ("2 agents elsewhere waiting"). Session-root attachment sees everything.
 - **Global inbox view:** all agents blocked on human input across all sessions — the primary "what needs me" surface.

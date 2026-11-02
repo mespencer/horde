@@ -1,4 +1,125 @@
-# DESIGN.md Conformance Audit (W7d)
+# DESIGN.md Conformance Audit
+
+This file has two parts. **Part 1** is the wave-11 refresh, checked against the
+code at `22f2599` (2026-11-02): current verdicts, the surfaces waves 8–11 added,
+the status of every W7d gap and contract disagreement, and the deferred list.
+Every claim in Part 1 was checked against code, and its file:line citations are
+for `22f2599`. **Part 2** is the original W7d audit at `dddec01`, kept as the
+record the fix lists below refer to; its verdicts and line numbers are historical.
+
+## Part 1 — Wave-11 refresh (`22f2599`)
+
+### Summary
+
+| Section | Verdict | One line |
+|---|---|---|
+| §1 Goals and constraints | CONFORMS (index) | Each goal resolves below; single-user still holds everywhere. |
+| §2 Three roles, three binaries | CONFORMS | All three binaries exist (`crates/horde-worker/src/bin/horde_worker.rs:13`); `horde up` stands in for the unbuilt `--with-local-worker`; the version gate is enforced (`service/shared.rs:268`, called at Hello `control_plane.rs:412` and registration `service/worker.rs:85`). |
+| §2 Transport and resilience | CONFORMS | Worker redials on 0.5 s→10 s backoff (`horde-worker/src/startup.rs:54-59,814-852`); lease, boot reconcile, journaled inbox (ADR-0011, ADR-0012). |
+| §3 Identity and security | CONFORMS | Role table per RPC, worker identity from its certificate, mint/revoke Client-only, revocation severs streams, journal reset, `--remint` (ADR-0009). Rotation is still manual re-enrollment. |
+| §4 Providers and adapters | PARTIAL | Both adapters run under worker-owned profiles (ADR-0010); interactive-auth relay built with `--account`. Provider accounts are still advertised empty (`horde-worker/src/capabilities.rs:62`). |
+| §5 Agent model | PARTIAL | The endpoint is wired and agents spawn agents — but an MCP `spawn_agent` sends a default spec (`horde-mcp/src/verbs.rs:147-153`): no workspace, no agent type. Reaper and native-tool suppression not built. |
+| §6 Sessions, placement, scheduling | CONFORMS | Placement skips workers lacking the harness; messages to unplaced agents buffer; idempotent retries. `MaterializationProgress` still has no producer. |
+| §7 Workspaces | PARTIAL | `horde workspace create/list/get/add-repo/update/delete`; `unmanaged_paths` stored but read by no worker code; no cwd auto-registration. |
+| §8 Git backbone, relay, blob store | CONFORMS (as built) | Relay mounted by `--relay-bind`; dirty trees refused on the stamp path (`horde-worker/src/share.rs:139-144`); blob GC absent by design. |
+| §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. Allowlists fail closed for every MCP-spawned child (see §5). |
+| §10 Permissions | PARTIAL | Chain driver runs in `serve()` with `PermissionModes::shipped()` (`horde-server/src/startup.rs:443-451`); the judge is still a seam with no production implementation. |
+| §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. Archive and workspace/MCP edits stay unattributed. |
+| §12 Usage and observability | PARTIAL | Usage folds conform; threshold alerts absent; OTLP plaintext only; hard budgets shape-only. |
+| §13 Configuration layering | ABSENT | No config file is loaded anywhere; tiers are `TierCatalog::shipped_defaults()` (`service/commands.rs:646`). |
+| §14–§15 | CONFORMS | Unchanged. |
+| §16 Development quality | CONFORMS | Ten blocking gates; coverage has a 95.0 floor (`horde-gauntlet/src/gates/coverage.rs:20`). |
+
+### Surfaces added in waves 8–11
+
+| Surface | Implementation | Proving test |
+|---|---|---|
+| `horde up` — takes `up.lock`, finds or starts a server, enrolls the client from the bootstrap-token file only for a server it started (fingerprint-matched), proves the pair with a Hello, mints a worker token and passes it as `HORDE_JOIN_TOKEN`, prints `ready`; every wait is bounded (startup 60 s, Hello 20 s, teardown 10 s) | `crates/horde-cli/src/up.rs:52-74,316,448-505,530-767,806-838` | `crates/horde-cli/src/up/tests.rs:242,565`; `crates/horde-e2e/tests/e2e_suite/joining.rs:275` |
+| `horde doctor` — identity, certificate windows (warn under 7 days), endpoint, Hello within 5 s, harness binaries on PATH, state-dir modes, disk (warn under 2 GiB, FAIL under 256 MiB); any FAIL exits 1 | `crates/horde-cli/src/doctor.rs:19-28,172`; `bin/horde.rs:60` | `crates/horde-cli/src/doctor/tests.rs:319,353` |
+| `horde agent status` — folds lifecycle and placement client-side; names a LOST placement | `crates/horde-cli/src/agent.rs:76-219` | `agent.rs:270`; `crates/horde-cli/tests/cli_suite/cli.rs:496` |
+| `horde worker reset` — records the journal floor as `WorkerJournalReset` and declares the worker's agents lost; Client-only | `crates/horde-server/src/liveness.rs:315`; `trust.rs:169` | `liveness.rs:650`; `cli_suite/verbs.rs:301` |
+| `horde workspace update` — rename, re-lay a repo's branch or path, set or clear unmanaged paths, always at the caller's etag; the repo set cannot change | `crates/horde-cli/src/workspace_update.rs`; `crates/horde-server/src/workspace.rs:216,249` | `workspace_update.rs:128,145`; `workspace.rs:465`; `server_suite/contracts.rs:504` |
+| `horde-server --remint` — finds the running server through its state lock and SIGHUPs it; the server re-mints while no client is enrolled; signals are guarded | `crates/horde-server/src/remint.rs:34`; `startup.rs:299,323,379-390` | `startup.rs:1303,1460` |
+| `--san` validated as an IP literal or well-formed host name at parse | `crates/horde-server/src/startup.rs:151,165` | `startup.rs:896` |
+| Worker inbox (ADR-0012) — commands accepted into a journaled `inbox` in the acking transaction, run on per-agent lanes, replayed at start | `crates/horde-worker/src/runtime/mod.rs:304`; `journal.rs:252`; `startup.rs:824` | `inbox.rs:149`; `runtime/tests.rs:920,2003,332` |
+| Per-account login — `horde worker login --account` signs in `harness/<provider>/accounts/<name>` | `crates/horde-cli/src/cli.rs:376`; `crates/horde-server/src/login/relay.rs:149`; `crates/horde-worker/src/login.rs:120-141` | `login/relay.rs:477`; `horde-worker/src/harness.rs:280` |
+| Worker lease and LOST agents (ADR-0011) — 120 s default, `--worker-lease`; HTTP/2 keepalive 20 s/10 s both ends; boot reconcile | `crates/horde-server/src/liveness.rs:56,211,229,279`; `transport.rs:52-55` | `liveness.rs:426,583,596` |
+| Session projection and read pool (ADR-0013) — in-memory projection, four `query_only` WAL readers, one-transaction batch ingest, ListSessions name filter | `crates/horde-server/src/projection.rs:52`; `log/mod.rs:83,264`; `log/store.rs:111`; `service/ingest.rs:374`; `control_plane.rs:390` | `projection.rs:396`; `log/mod.rs:792`; `store.rs:710,751`; `ingest.rs:931`; `control_plane.rs:2594` |
+| Trust boundary (ADR-0009) — per-method role table, unknown methods refused; worker from its certificate; dead letters to `horde-dead-letters`; worker sync scoped to its sessions | `crates/horde-server/src/trust.rs:129-205,270`; `service/ingest.rs:52,536,600`; `control_plane.rs:634-671,1840` | `trust.rs:344,496`; `ingest.rs:807,1300`; `server_suite/trust.rs:390` |
+| Harness isolation (ADR-0010) — `CLAUDE_CONFIG_DIR`/`CODEX_HOME` under `<state>/harness/<provider>`; MCP tokens in env or 0600 files; one process group per harness, leftovers swept at start | `crates/horde-worker/src/harness.rs:42`; `claude.rs:19`; `codex.rs:45,324`; `process.rs:223,519` | `claude.rs:542,637`; `worker_suite/supervision.rs:897,940,1037` |
+| Wire limits — 16 MiB messages and 1 MiB push batches on the worker spine; 64 KiB output chunks | `crates/horde-proto/src/limits.rs:14,19`; `horde-server/src/transport.rs:133`; `horde-worker/src/client.rs:54`; `runtime/shape.rs:25` | `limits.rs:26`; `shape.rs:319` |
+
+### Status of the W7d fix list (Part 2, (a))
+
+| # | Status | Evidence at `22f2599` |
+|---|---|---|
+| a1 worker binary and endpoint | CLOSED | `horde-worker/src/bin/horde_worker.rs:13`; journal, adapters, redial in `startup.rs:519,571,814-852`; endpoint `endpoint.rs:145,338,363`. `--with-local-worker` superseded by `horde up`. |
+| a2 `spawn_agent` routing | CLOSED | Task becomes the initial assignment (`horde-mcp/src/verbs.rs:147-153`); keys minted unique (`endpoint.rs:420-424`). |
+| a3 mint/revoke authz | CLOSED | `horde-server/src/trust.rs:167-176`; `control_plane.rs:1376,1416`. |
+| a4 revocation reaches streams | CLOSED | `service/shared.rs:182-219` wraps every long-lived stream. Test `server_suite/enrollment.rs:458`. |
+| a5 chain driver in `serve()` | CLOSED | `startup.rs:443-451`. |
+| a6 version gate | CLOSED | `service/shared.rs:268`. |
+| a7 archive producer | CLOSED | Session archive folds into `ArchiveAgentCommand` (`service/commands.rs:381-406`). |
+| a8 children from parent HEAD | PARTIAL | Checkouts start at the parent's HEAD on the same worker (`horde-worker/src/runtime/shared.rs:196-243`), but an MCP-spawned child names no workspace, so it gets no checkout — while the endpoint still tells agents children "start from your latest commit" (`horde-mcp/src/endpoint.rs:935-937`). |
+| a9 TUI staleness | CLOSED | `horde-tui/src/app.rs:68,403`; badge `view.rs:224-235`. |
+| a10 relay and hub in `--serve` | CLOSED | `startup.rs:456-457,594-628`. |
+| a11 `require_committed` on stamp | CLOSED | `horde-worker/src/share.rs:139-144`. |
+| a12 real `AgentSpec` from clients | CLOSED | `SpecArgs` (`horde-cli/src/cli.rs:683-794`); workspace, prewarm, worker list verbs exist. |
+| a13 `Actor` attribution | PARTIAL | `actor_of` (`control_plane.rs:1740`) fills every event with an `Actor` field; archive-session and workspace/MCP-config events have none. |
+| a14 TUI subtree scope | CLOSED | `horde-cli/src/tui.rs:160-165,252-267`; `horde-tui/src/app.rs:144-197`. |
+| a15 advertisement fed | CLOSED | Warm instances, tags, remotes on every registration (`horde-worker/src/startup.rs:534-536,678-691`). The worker never calls `ReportCapabilities`/`ReportWorkspaceInstances`, so warmth refreshes only at re-registration. |
+| a16 coverage threshold | CLOSED | `FLOOR_PERCENT = 95.0` (`gates/coverage.rs:20`). |
+
+**Contract disagreements (Part 2):** 1 CLOSED (unique keys; a reused key on a different event kind is refused loudly, `service/shared.rs:370,422-442`). 2 PARTIAL (as a8). 3 PARTIAL — clients send full specs, but MCP-spawned children carry an empty `agent_type`, so hub allowlists fail closed for them (`horde-server/src/hub.rs:18,415`). 4, 5, 6, 9, 11 CLOSED (a6, a4, a9, a11, a14). 7 OPEN — `RevivalIdentity::is_resumable_under` (`horde-adapter/src/identity.rs:24,61`) is still called only by its tests. 8 OPEN — journal and session sequences are both raw `uint64` on the wire. 10 PARTIAL (as a13). 12 PARTIAL — `workspace_definition_id` is read and `horde new` exists; `MaterializationProgress` has no producer (its comment now says so) and `unmanaged_paths` is read by no worker code.
+
+**DESIGN amendments (Part 2, (b)):** landed in W7f and kept current since; spot-checked at `22f2599`: §4's Codex bullet (DESIGN.md §4), ADR-0001's worker-table scope ruling, TESTING.md §5, and the `horde new` proto comment.
+
+### Open findings at `22f2599`
+
+1. **Agent-spawned children get a default spec** (`horde-mcp/src/verbs.rs:147-153`): no workspace, no agent type, no inheritance from the parent. Consequences: a8, c2, c3 above.
+2. **The control plane keeps tonic's 4 MiB message default.** Only `WorkerService` sets 16 MiB (`horde-server/src/transport.rs:131-135`, `horde-worker/src/client.rs:54-55`); the `ControlPlane` server and the CLI's client do not. An event between 4 and 16 MiB can be ingested from a worker but not read back over `SyncEvents`. Not exercised by any test.
+3. **Provider accounts are advertised empty** (`horde-worker/src/capabilities.rs:62`) while the scheduler matches `required_provider_accounts` against them (`horde-server/src/scheduler.rs:361-376`): a spawn requiring an account looks unplaceable. Not traced end to end.
+4. **ADR text behind the code:** ADR-0007 still lists a re-mint verb as not done; ADR-0010 says the login wire does not yet carry the account; ADR-0013 says the CLI consumes the name filter "in a later change". All three are built.
+
+### ADR verdicts at `22f2599`
+
+| ADR | Verdict | Notes |
+|---|---|---|
+| 0001 event log | CONFORMS | Worker-table scope ruled (amendment); batch ingest is still appends only. |
+| 0002 git backbone | CONFORMS | Relay mounted by `--relay-bind`; clones go through git's transport (`--no-local`). |
+| 0003 claude stream-json | CONFORMS | Hardening now reachable; `--setting-sources ''`/`--strict-mcp-config` per ADR-0010. |
+| 0004 central hub | CONFORMS | Hub calls are worker-forwarded (W9b, `horde-worker/src/hub.rs`); canonical `horde/<tool>` names (amendment). |
+| 0005 codex app-server | CONFORMS | The exec re-probe is done (2026-08-19 amendment); per-call usage differencing (2026-10-30 amendment). |
+| 0006 port forwards | BUILT (wave 8) | Not re-audited in this refresh. |
+| 0007 joining UX | CONFORMS | Join token, stored endpoint, `horde up`, state locks; amendment text lags on re-mint (finding 4). |
+| 0008 session front door | CONFORMS | Front door, names through the server's name filter, JSON refusals. |
+| 0009 trust boundary | CONFORMS | See the surfaces table. |
+| 0010 harness isolation | CONFORMS | See the surfaces table; account-wire text lags (finding 4). |
+| 0011 delivery and liveness | CONFORMS | Lease, boot reconcile, reset, position resume. |
+| 0012 worker inbox | CONFORMS | Inbox, lanes, replay. |
+| 0013 read path and ingest | CONFORMS | Projection, read pool, batch ingest, name filter. |
+
+### Deferred by design (supersedes Part 2 (c))
+
+| Item | Where deferred | Status at `22f2599` |
+|---|---|---|
+| ssh worker bootstrap + harness install recipes | §3/§14 | Absent: no ssh code anywhere. |
+| Raw/self-hosted model harness | §4/§14 | Absent: `--adapter` takes only `fake`, `claude`, `codex` (`horde-worker/src/flags.rs:43-47`). |
+| Hard budgets | §12/§14 | Proto shape only (`agent.proto:155`); the CLI sends `budget: None` and nothing reads it. Budget unit (§15) undecided. |
+| Threshold usage alerts | §12 | Absent. |
+| OTLP over TLS | §12 | Absent: the exporter has no TLS (`horde-observe/src/pipeline.rs:131`). |
+| Blob GC and deletion | §8/§15 | Absent by design (`horde-server/src/blob.rs:24-37`). |
+| Orchestrator-level sandbox profiles | §10/§14 | Absent; the harnesses' own sandboxes carry it. |
+| Credential-less workers (relay-only git) | §8/§14 | Absent: workers clone remotes with ambient credentials (`horde-worker/src/workspace.rs:458`). |
+| Configuration layering | §13 | Absent. |
+| Multi-user server | §1/§15 | Deferred; single-user assumptions remain load-bearing. |
+| Policy judge (production implementation) | §10 | A seam; a missing judge escalates to the human (`startup.rs:446`). |
+
+Delivered since W7d and removed from this list: port forwards (wave 8), the interactive-auth relay (W9a), the hub wire (W9b, worker-forwarded calls), the codex re-probe (ADR-0005 amendment), and Gherkin, fault injection and e2e hardening (wave 7).
+
+---
+
+## Part 2 — W7d audit at `dddec01` (historical)
 
 Audited: `main` @ `dddec01`, 2026-08-17. Method: every numbered DESIGN.md section,
 every ADR, and every behavioral claim in CONTEXT.md was traced to implementing

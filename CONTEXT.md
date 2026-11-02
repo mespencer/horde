@@ -15,11 +15,11 @@ A machine-resident supervisor that runs agent processes and materializes workspa
 _Avoid_: runner, node, host
 
 **Client**:
-A user-facing program (TUI today) attached to the server to view, steer, and approve.
+A user-facing program (the `horde` CLI and TUI today) attached to the server to view, steer, and approve.
 _Avoid_: frontend, terminal
 
 **Command Stream**:
-One worker's sequence of commands, folded out of the event log rather than stored. Densely numbered per worker, so a reconnecting worker resumes from its own ack.
+One worker's sequence of commands, folded out of the event log rather than stored. Densely numbered per worker, so a reconnecting worker resumes from its own ack — or, when it knows one, from the log position of the event that caused its last command, which takes precedence (ADR-0011).
 _Avoid_: command queue, outbox, mailbox
 
 ### Agents and sessions
@@ -120,7 +120,7 @@ _Avoid_: driver, harness (that's the provider's own CLI)
 One authenticated subscription login for one provider, isolated per config dir; a worker-level capability.
 
 **Enrollment**:
-The one-time-code flow by which a new worker or client obtains its mTLS identity from the server's CA.
+The flow by which a new worker or client obtains its mTLS identity from the server's CA, by redeeming a one-time join token (`horde://join/<host:port>/<secret>.<fingerprint>`) that carries the enrollment listener, the secret, and the server fingerprint to pin (ADR-0007).
 
 **Policy Judge**:
 The cheap-model evaluator that applies a plain-text permission mode to a proposed tool call, between the deterministic layers and human approval.

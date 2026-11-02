@@ -40,8 +40,20 @@ Dependencies flow downward; items within a wave run in parallel worktrees.
 | 5 | Enrollment + mTLS everywhere | wave 4 | delivered |
 | 6 | MCP hub + `local` servers; blob store; usage/tiers/headroom; OTLP | wave 5 | delivered |
 | 7 | Fault-injection suite; Gherkin features; full e2e hardening; DESIGN.md conformance audit | all | delivered (audit fixes in flight) |
-| 8 | Port forwards: expose/inject relayed through the server (ADR-0006) | wave 7 | — |
+| 8 | Port forwards: expose/inject relayed through the server (ADR-0006) | wave 7 | delivered |
 | 9 | **W9a** Interactive-auth relay: `horde worker login` remote PTY + ephemeral callback expose (DESIGN §4) | wave 8 | delivered |
+| 10 | Session front door (ADR-0008, integrated at `c7b3c13`) and joining UX (ADR-0007: one `horde://join` token, `horde up`) | wave 9 | delivered |
+| 11 | **W11a** Trust boundary: role-gated RPCs, worker identity from its certificate, origin-aware ingest and dead letters, narrowing capability gate (ADR-0009) — merged at `d3e6a4e` | wave 10 | delivered |
+| 11 | **W11b** Harness isolation: worker-owned `CLAUDE_CONFIG_DIR`/`CODEX_HOME` profile, secrets off argv, process groups, path/git hardening (ADR-0010) — merged at `d38cff3` | wave 10 | delivered |
+| 11 | **W11c** Adapters: codex usage by thread-total difference, single MCP gating, `wait_for_agent` redialing cursor (ADR-0005 amendment) — merged at `d562762` | wave 10 | delivered |
+| 11 | **W11d** Delivery and liveness: worker lease and LOST agents, boot reconcile, buffered messages, terminal archive, position resume, `horde worker reset` (ADR-0011) — merged at `38b3c38` | W11a–c | delivered |
+| 11 | **W11e** Worker robustness: journaled worker inbox, per-agent lanes, commands fail instead of the Worker, per-account login (ADR-0012) — merged at `5d7c193` | W11a–c | delivered |
+| 11 | **W11f** Joining and identity: state under `~/.horde`, required server mode, state locks, guarded re-join, hardened `horde up`, canonical `horde/<tool>` names (ADR-0007, ADR-0004 amendments) — merged at `ca88af7` | W11a–c | delivered |
+| 11 | **W11g** Server read path: in-memory session projection over a WAL read pool, one-transaction batch ingest, name filter (ADR-0013) — merged at `b3adf29` | W11d–f | delivered |
+| 11 | **W11h** CLI/TUI usability: `horde doctor`, `agent status`, `workspace update`, `--remint`, JSON refusals, TUI fixes (ADR-0008 amendment) — merged at `47e2612`; testkit reaper fix at `22f2599` | W11g | delivered |
+| 11 | **W11i** Docs refresh: CONFORMANCE, DESIGN/CONTEXT drift, README | W11h | delivered |
+
+**Wave-11 incident — the testkit reaper.** Under cargo-mutants, a mutant that flipped `ppid == parent` in the testkit's descendant hunt made a test SIGKILL every process on the machine. The fix (`22f2599`) signals only process groups the testkit spawned, routes every signal through one guard (`crates/horde-server-testkit/src/reap.rs`) that refuses pid 0, 1, its own process, group, session and parent, and moves the harmless process-table parsing to `ps.rs`. **Rule:** code that sends real signals to targets chosen at runtime is excluded from mutation, because a mutant of it runs for real. `reap.rs` is the only entry under that criterion in `.cargo/mutants.toml`; every other exclusion there is a test fixture or a mutation equivalent to the original.
 
 Wave contents will be refined as reality reports back; the dependency spine holds.
 
