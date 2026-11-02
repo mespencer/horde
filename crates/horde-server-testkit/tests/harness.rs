@@ -488,3 +488,24 @@ async fn seed_mcp_server_lands_one_decodable_catalog_entry() {
         .unwrap_or_else(|| panic!("the config must fold back out of the payload"));
     assert!(!folded.local);
 }
+
+/// The oversized round trip reads back what it wrote: both events, whole,
+/// in log order — past tonic's 4 MiB default on every leg. The server and
+/// CLI suites lean on this helper for their ceilings; this pins that the
+/// helper itself cannot report a round trip it did not observe.
+#[tokio::test]
+async fn the_oversized_round_trip_reads_back_the_note_and_the_chunk_whole() {
+    let endpoint = within("the server", serve()).await.expect("a server");
+    let bytes = 5 * 1024 * 1024;
+    let read = within(
+        "the oversized round trip",
+        horde_server_testkit::oversized_events_read_back(&endpoint, bytes),
+    )
+    .await
+    .expect("the oversized events round-trip");
+    assert_eq!(
+        read,
+        vec![bytes, bytes],
+        "the note, then the chunk, both whole"
+    );
+}

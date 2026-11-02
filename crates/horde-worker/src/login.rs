@@ -703,6 +703,19 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o700);
 
+        // Prepared is not signed in; once the login writes there, the
+        // account is advertised under the provider whose recipe signs it in.
+        assert!(plane.held_accounts().is_empty());
+        std::fs::write(dir.join(".credentials.json"), "{}").expect("a sign-in");
+        assert_eq!(
+            plane.held_accounts(),
+            vec![horde_proto::v1::ProviderAccountCapability {
+                provider: "claude".to_owned(),
+                account: "work".to_owned(),
+                ..horde_proto::v1::ProviderAccountCapability::default()
+            }]
+        );
+
         let refused = |provider: &str, account: Option<&str>| {
             plane
                 .resolve(provider, account)
