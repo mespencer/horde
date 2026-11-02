@@ -1405,10 +1405,14 @@ mod tests {
             .spawn()
             .expect("sleep spawns");
         let pid = sleeper.id().expect("a pid");
+        // Delivery to a live pid succeeds. Whether the hang-up *ends* the
+        // child is not asserted: a test run under `nohup` hands every child
+        // an ignored SIGHUP, and `sleep` keeps it ignored.
         crate::remint::send_hangup(pid).expect("the hang-up sends");
+        sleeper.start_kill().expect("the sleeper is killed");
         let ended = tokio::time::timeout(std::time::Duration::from_secs(10), sleeper.wait())
             .await
-            .expect("SIGHUP ends sleep")
+            .expect("a killed sleep ends")
             .expect("a status");
         assert!(!ended.success());
         assert!(

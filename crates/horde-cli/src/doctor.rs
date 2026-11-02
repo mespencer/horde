@@ -115,7 +115,8 @@ pub struct Inputs {
 ///
 /// [`ClientError::Unhealthy`] naming how many checks failed.
 pub async fn run(
-    cli: &crate::cli::Cli,
+    endpoint: Option<&str>,
+    identity: Option<&Path>,
     args: &DoctorArgs,
     format: Format,
 ) -> Result<(), ClientError> {
@@ -129,8 +130,8 @@ pub async fn run(
         args.state_dirs.clone()
     };
     let inputs = Inputs {
-        endpoint: cli.endpoint.clone(),
-        identity: cli.identity.clone(),
+        endpoint: endpoint.map(str::to_owned),
+        identity: identity.map(Path::to_path_buf),
         home,
         path: std::env::var_os("PATH"),
         harnesses: args.harnesses.clone(),
@@ -173,7 +174,7 @@ pub async fn report(inputs: &Inputs) -> Vec<Check> {
     let identity_dir = inputs
         .identity
         .clone()
-        .unwrap_or_else(|| crate::cli::default_identity_dir(inputs.home.clone()));
+        .unwrap_or_else(|| crate::connection::default_identity_dir(inputs.home.clone()));
     let identity = identity_check(&identity_dir, &mut checks);
     if let Some(identity) = &identity {
         checks.extend(certificate_checks(identity, inputs.now_unix_secs));
@@ -271,8 +272,8 @@ pub fn certificate_check(name: &str, pem: &str, now: i64) -> Check {
 fn endpoint_check(
     inputs: &Inputs,
     checks: &mut Vec<Check>,
-) -> Option<crate::cli::ResolvedConnection> {
-    match crate::cli::resolve_connection(
+) -> Option<crate::connection::ResolvedConnection> {
+    match crate::connection::resolve_connection(
         inputs.endpoint.as_deref(),
         inputs.identity.as_deref(),
         inputs.home.clone(),
@@ -295,9 +296,9 @@ fn endpoint_check(
 
 /// A real connection and `Hello`, as every verb would make it, bounded by
 /// [`REACH_CEILING`].
-async fn server_check(resolved: &crate::cli::ResolvedConnection) -> Check {
+async fn server_check(resolved: &crate::connection::ResolvedConnection) -> Check {
     let attempt = async {
-        let mut client = crate::cli::connect(resolved).await?;
+        let mut client = crate::connection::connect(resolved).await?;
         client.hello(env!("CARGO_PKG_VERSION")).await
     };
     let outcome = tokio::time::timeout(REACH_CEILING, attempt)
