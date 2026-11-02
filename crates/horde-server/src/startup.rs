@@ -1190,20 +1190,7 @@ mod tests {
         // Enroll a client through the real listener, using the filed token —
         // exactly what `horde up` does — and watch the file retire.
         let token = std::fs::read_to_string(&token_file).expect("the token reads");
-        let token = horde_identity::JoinToken::parse(token.trim()).expect("the filed token parses");
-        let enrolled = horde_identity::join(
-            &token.enrollment_endpoint(),
-            &token.code,
-            horde_proto::v1::Hello {
-                semver: "0.1.0".to_owned(),
-                capability_flags: Vec::new(),
-                role: horde_proto::v1::Role::Client as i32,
-                display_name: "up".to_owned(),
-            },
-        )
-        .await
-        .expect("the filed token enrolls");
-        assert_eq!(enrolled.principal.to_string(), "client:operator");
+        let enrolled = enroll_client(&token).await;
         assert_eq!(
             enrolled.control_plane_port,
             Some(running.main.addr.port()),
@@ -1252,8 +1239,24 @@ mod tests {
         }
     }
 
-    fn redeem(token: &str) -> horde_identity::JoinToken {
-        horde_identity::JoinToken::parse(token.trim()).expect("the token parses")
+    /// Enrolls a client through the real listener with `token` — exactly
+    /// what `horde up` does — asserting it became the bootstrap operator.
+    async fn enroll_client(token: &str) -> horde_identity::EnrolledIdentity {
+        let token = horde_identity::JoinToken::parse(token.trim()).expect("the token parses");
+        let enrolled = horde_identity::join(
+            &token.enrollment_endpoint(),
+            &token.code,
+            horde_proto::v1::Hello {
+                semver: "0.1.0".to_owned(),
+                capability_flags: Vec::new(),
+                role: horde_proto::v1::Role::Client as i32,
+                display_name: "up".to_owned(),
+            },
+        )
+        .await
+        .expect("the token enrolls");
+        assert_eq!(enrolled.principal.to_string(), "client:operator");
+        enrolled
     }
 
     /// The re-mint end to end, minus only the signal: `--remint`'s side
@@ -1306,19 +1309,7 @@ mod tests {
         .expect("a fresh token");
         assert_ne!(format!("bootstrap-client-token {fresh}"), first);
         assert_eq!(next_line().await, format!("bootstrap-client-token {fresh}"));
-        let enrolled = horde_identity::join(
-            &redeem(&fresh).enrollment_endpoint(),
-            &redeem(&fresh).code,
-            horde_proto::v1::Hello {
-                semver: "0.1.0".to_owned(),
-                capability_flags: Vec::new(),
-                role: horde_proto::v1::Role::Client as i32,
-                display_name: "remint".to_owned(),
-            },
-        )
-        .await
-        .expect("the re-minted token enrolls");
-        assert_eq!(enrolled.principal.to_string(), "client:operator");
+        enroll_client(&fresh).await;
 
         let closed = crate::remint::remint_running(
             &config.state_dir,
