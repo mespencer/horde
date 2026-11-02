@@ -71,6 +71,12 @@ impl Picker {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        // Raw mode turns Ctrl-C into a keypress rather than SIGINT, so
+        // unless the picker honours it the one universal way out of a
+        // terminal program does nothing at all.
+        if is_interrupt(key) {
+            return Some(Choice::Dismissed);
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
@@ -127,9 +133,17 @@ fn render(picker: &Picker, frame: &mut Frame<'_>) {
     frame.render_widget(Paragraph::new("horde — pick a session"), areas[0]);
     frame.render_widget(Paragraph::new(lines), areas[1]);
     frame.render_widget(
-        Paragraph::new("[enter] attach  [j/k] move  [esc] leave"),
+        Paragraph::new("[enter] attach  [j/k] move  [esc/ctrl-c] leave"),
         areas[2],
     );
+}
+
+/// Ctrl-C, and only Ctrl-C: a plain `c` is not a way out.
+fn is_interrupt(key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Char('c')
+        && key
+            .modifiers
+            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
 }
 
 fn marker(selected: bool) -> &'static str {
@@ -280,6 +294,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Ctrl-C leaves the picker, like Esc; a plain `c`, or Ctrl with any
+    /// other key, does nothing.
+    #[test]
+    fn ctrl_c_dismisses_and_nothing_near_it_does() {
+        use ratatui::crossterm::event::KeyModifiers;
+        let mut picker = picker();
+        let ctrl = |code| TermEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL));
+        assert_eq!(picker.on_input(&ctrl(KeyCode::Char('x'))), None);
+        assert_eq!(press(&mut picker, KeyCode::Char('c')), None);
+        assert_eq!(
+            picker.on_input(&ctrl(KeyCode::Char('c'))),
+            Some(Choice::Dismissed)
+        );
     }
 
     /// A key release is not a keypress: terminals that report both would

@@ -173,7 +173,8 @@ async fn the_overview_shows_a_live_session_and_quits_cleanly() {
     assert!(app.should_quit());
     let screen = terminal.backend().to_string();
     assert!(
-        screen.contains("tui-overview") && screen.contains(&session_id),
+        screen.contains("tui-overview")
+            && screen.contains(&horde_tui::state::short_id(&session_id)),
         "the last drawn frame must show the session: {screen}"
     );
 }
@@ -358,6 +359,64 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
     );
 
     harness.press(KeyCode::Esc).await.expect("clear nothing");
+    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// Attaching replays the target session alone: another session's history
+/// stays on the server, while its *live* traffic still arrives — the
+/// all-sessions net — so detaching shows it moving. The live event is the
+/// proof the stream reached that session at all, and because one stream
+/// delivers in order, any replay of the other's past would have landed
+/// before it.
+#[tokio::test]
+async fn attaching_replays_only_the_target_while_the_rest_stays_live() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, target, _) = seeded(&endpoint, "the-target")
+        .await
+        .expect("a seeded target");
+    let (neighbour, other_root) = client
+        .create_session("the-other", "key-2")
+        .await
+        .expect("a neighbour session");
+    let other = neighbour
+        .session_id
+        .map(|id| id.to_string())
+        .expect("a created session has an id");
+
+    let mut harness = start(&endpoint, App::attached(target.clone(), None))
+        .await
+        .expect("a running loop");
+    harness
+        .state("the target's replay to catch up", |app| {
+            app.session(&target)
+                .is_some_and(|session| session.caught_up && !session.feed.is_empty())
+        })
+        .await
+        .expect("the target replays");
+
+    client
+        .send_assignment(
+            &other_root.to_string(),
+            "live next door",
+            horde_proto::v1::DeliveryMode::TurnBoundary,
+            "",
+        )
+        .await
+        .expect("a live event in the other session");
+    let app = harness
+        .state("the neighbour's live event", |app| {
+            feed_has(app, &other, "assign", "live next door")
+        })
+        .await
+        .expect("the rest of the server stays live");
+    let neighbour = app.session(&other).expect("the neighbour is known");
+    assert!(
+        neighbour.feed.iter().all(|line| line.label != "spawned"),
+        "the neighbour's history must not have been replayed: {:?}",
+        neighbour.feed
+    );
+
     harness.press(KeyCode::Esc).await.expect("detach");
     harness.quit_from_list_screen().await.expect("q exits");
 }

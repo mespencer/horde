@@ -50,13 +50,50 @@ pub enum Launch {
 /// event loop dying mid-flight. Terminal state is restored on every path out.
 pub async fn launch(mut client: Client, launch: Launch) -> Result<(), ClientError> {
     let app = app_for(&mut client, launch).await?;
-    let terminal = ratatui::try_init().map_err(ClientError::Terminal)?;
+    // Restored before the error is reported — the guard drops at the end of
+    // this function, before the caller prints anything: a panic message or an
+    // error line printed into raw mode is unreadable, which is nearly as bad
+    // as losing it.
+    let (terminal, _restore) = RawTerminal::engage()?;
     let input = spawn_input_reader();
-    let outcome = drive(terminal, input, client, app, |_| {}).await;
-    // Restored before the error is reported: a panic message or an error line
-    // printed into raw mode is unreadable, which is nearly as bad as losing it.
-    ratatui::restore();
-    outcome.map(|_| ())
+    drive(terminal, input, client, app, |_| {}).await.map(drop)
+}
+
+/// Ownership of the real terminal's raw mode: engaging enters raw mode and
+/// the alternate screen; dropping restores both *and* shows the cursor.
+///
+/// A guard rather than a call at the end of each happy path, so every way
+/// out — an early `?`, an error from the loop, a panic unwinding through —
+/// restores the same way. `ratatui::restore` alone leaves the cursor hidden
+/// (ratatui shows it only from `Terminal`'s own drop, which a leaked or
+/// moved terminal may never reach), and stops at the first failing step;
+/// here each step is attempted regardless of the others.
+pub(crate) struct RawTerminal(());
+
+impl RawTerminal {
+    /// Enters raw mode and the alternate screen.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Terminal`] when the terminal refuses either.
+    pub(crate) fn engage() -> Result<(ratatui::DefaultTerminal, Self), ClientError> {
+        // The guard exists before the fallible init, so a half-done init
+        // (raw mode on, alternate screen refused) is still undone.
+        let guard = Self(());
+        let terminal = ratatui::try_init().map_err(ClientError::Terminal)?;
+        Ok((terminal, guard))
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        use ratatui::crossterm::{cursor, execute, terminal};
+        // Best effort, every step: a failure to leave raw mode must not also
+        // cost the user their cursor.
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), cursor::Show);
+    }
 }
 
 /// Builds the starting [`App`], validating an attach target against the
@@ -131,6 +168,9 @@ where
     // only a tick can notice its silence — and redraw the badge in.
     let mut ticker = tokio::time::interval(TICK_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Once the pump hangs up the channel answers `None` instantly, forever;
+    // polling it then would spin the loop redrawing at full speed.
+    let mut stream_open = true;
 
     while !app.should_quit() {
         terminal
@@ -147,13 +187,12 @@ where
                 // The terminal went away under us; there is no one left to draw for.
                 None => app.request_quit(),
             },
-            update = inbox.recv() => {
-                if let Some(update) = update {
-                    app.apply(update);
-                }
-                // `None` cannot happen while `streams` holds a sender; if it
-                // ever does, the next input still exits cleanly.
-            }
+            update = inbox.recv(), if stream_open => match update {
+                Some(update) => drain_into(&mut app, update, &mut inbox),
+                // The pump already said why in its `StreamEnded`; the
+                // channel closing is only its sender going away.
+                None => stream_open = false,
+            },
             _ = ticker.tick() => {
                 app.apply(Update::Tick { now: std::time::Instant::now() });
             }
@@ -162,6 +201,27 @@ where
 
     Ok((terminal, app))
 }
+
+/// Folds `first` and then everything already queued behind it before the
+/// next redraw. One redraw per update would make a replay of a few thousand
+/// events cost a few thousand frames, and the screen would crawl through
+/// history the human only wants the end of.
+///
+/// Bounded by [`DRAIN_CEILING`] all the same: the pump refills the channel
+/// while this drains it, and a firehose must not starve keys and redraws.
+fn drain_into(app: &mut App, first: Update, inbox: &mut mpsc::Receiver<Update>) {
+    app.apply(first);
+    for _ in 1..DRAIN_CEILING {
+        match inbox.try_recv() {
+            Ok(update) => app.apply(update),
+            Err(_) => return,
+        }
+    }
+}
+
+/// The most updates one frame folds. Comfortably above the channel's
+/// capacity, so a full channel drains in one frame.
+const DRAIN_CEILING: usize = 1_024;
 
 /// How often the staleness clock ticks. A third of the badge threshold: the
 /// badge may appear up to one tick late, and ticking faster buys nothing.
@@ -180,21 +240,30 @@ enum Subscription {
 }
 
 /// The subscription a launch shape calls for: `--agent` scopes the stream
-/// server-side; everything else follows everything.
+/// server-side to that agent's subtree; a session attach replays only the
+/// target session; the overview replays everything listed.
+///
+/// An attach still follows every session — the all-sessions net carries the
+/// unnamed ones live from their current heads — so detaching to the
+/// overview shows the rest moving. What it no longer does is replay every
+/// other session's whole history into memory before the one the human
+/// asked for: that cost grew with the server's lifetime, not with the
+/// attach.
 fn subscription_for(
     attachment: Option<&horde_tui::app::Attachment>,
     sessions: &[horde_proto::v1::SessionSummary],
 ) -> Subscription {
-    if let Some(attachment) = attachment
-        && let Some(agent_id) = &attachment.agent_id
-    {
-        return Subscription::Subtree {
-            session_id: attachment.session_id.clone(),
+    match attachment {
+        Some(horde_tui::app::Attachment {
+            session_id,
+            agent_id: Some(agent_id),
+        }) => Subscription::Subtree {
+            session_id: session_id.clone(),
             agent_id: agent_id.clone(),
-        };
+        },
+        Some(attachment) => Subscription::Everything(vec![(attachment.session_id.clone(), 0)]),
+        None => Subscription::Everything(overview_cursors(sessions)),
     }
-    let attachment = attachment.map(|attachment| attachment.session_id.clone());
-    Subscription::Everything(overview_cursors(sessions, attachment.as_deref()))
 }
 
 /// Executes what the App asked for, reporting refusals into its status line.
@@ -250,45 +319,58 @@ async fn refresh_sessions(
     Ok(sessions)
 }
 
-/// The cursors the TUI's one merged stream opens with: every listed session
-/// replayed from its start, plus the attach target when the list omits it —
-/// an archived session is attachable but unlisted. The server's all-sessions
-/// net carries everything born later, so nothing else needs naming.
-///
-/// Extracted as a pure function because the deduplication condition inside
-/// `drive` is a compound predicate in an event loop — unreachable as a truth
-/// table there, ordinary here (docs/QUALITY_GATES.md).
-fn overview_cursors(
-    sessions: &[horde_proto::v1::SessionSummary],
-    attachment: Option<&str>,
-) -> Vec<(String, u64)> {
-    let mut cursors: Vec<(String, u64)> = sessions
+/// The cursors the overview's merged stream opens with: every listed session
+/// replayed from its start. The server's all-sessions net carries everything
+/// born later, so nothing else needs naming.
+fn overview_cursors(sessions: &[horde_proto::v1::SessionSummary]) -> Vec<(String, u64)> {
+    sessions
         .iter()
         .filter_map(|summary| summary.session_id.as_ref().map(ToString::to_string))
         .map(|session_id| (session_id, 0))
-        .collect();
-    if let Some(target) = attachment
-        && !cursors.iter().any(|(session_id, _)| session_id == target)
-    {
-        cursors.push((target.to_owned(), 0));
-    }
-    cursors
+        .collect()
 }
 
 /// The TUI's one stream: opens the subscription and forwards it onto the
 /// shared channel — heartbeats included, because they are what the
-/// staleness clock judges against. Ends silently when the receiver goes
-/// away (the loop exited) or the stream does (the server went away — the
-/// stale badge takes it from here).
+/// staleness clock judges against. When the stream ends — the server hung
+/// up, or refused the subscription — it says so with a final
+/// [`Update::StreamEnded`] rather than letting the feed freeze silently. A
+/// send that fails means the loop already exited, and there is no one to tell.
 async fn pump(mut client: Client, subscription: Subscription, updates: mpsc::Sender<Update>) {
-    let _ = follow_into(&mut client, subscription, &updates).await;
+    if let Some(ended) = ended_update(follow_into(&mut client, subscription, &updates).await) {
+        let _ = updates.send(ended).await;
+    }
+}
+
+/// What the end of [`follow_into`] tells the App: `None` when the loop hung
+/// up first (nothing to tell), otherwise why the stream closed — empty for a
+/// clean end-of-stream, the refusal's words for an error.
+fn ended_update(outcome: Result<FollowEnd, ClientError>) -> Option<Update> {
+    match outcome {
+        Ok(FollowEnd::LoopGone) => None,
+        Ok(FollowEnd::StreamClosed) => Some(Update::StreamEnded {
+            reason: String::new(),
+        }),
+        Err(error) => Some(Update::StreamEnded {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// How [`follow_into`] stopped without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowEnd {
+    /// The receiving loop is gone; nobody is listening.
+    LoopGone,
+    /// The server ended the stream.
+    StreamClosed,
 }
 
 async fn follow_into(
     client: &mut Client,
     subscription: Subscription,
     updates: &mpsc::Sender<Update>,
-) -> Result<(), ClientError> {
+) -> Result<FollowEnd, ClientError> {
     let mut stream = match subscription {
         Subscription::Everything(cursors) => client.follow_everything(&cursors).await?,
         Subscription::Subtree {
@@ -311,17 +393,22 @@ async fn follow_into(
             StreamUpdate::Heartbeat => Update::Heartbeat,
         };
         if updates.send(update).await.is_err() {
-            return Ok(());
+            return Ok(FollowEnd::LoopGone);
         }
     }
-    Ok(())
+    Ok(FollowEnd::StreamClosed)
 }
 
 #[cfg(test)]
 mod tests {
-    use horde_proto::v1::{SessionId, SessionSummary};
+    use horde_proto::v1::{EventEnvelope, SessionId, SessionSummary};
+    use horde_tui::app::Attachment;
+    use horde_tui::{App, Update};
 
-    use super::overview_cursors;
+    use super::{
+        DRAIN_CEILING, FollowEnd, Subscription, drain_into, ended_update, subscription_for,
+    };
+    use crate::ClientError;
 
     fn listed(session_id: &str) -> SessionSummary {
         SessionSummary {
@@ -330,40 +417,107 @@ mod tests {
         }
     }
 
-    /// The truth table the drive loop cannot exercise: an attach target
-    /// already in the list must not be named twice (a duplicate cursor
-    /// replays the session's history twice into the feed), and one the list
-    /// omits — archived, say — is still owed its replay.
+    fn attachment(session_id: &str, agent_id: Option<&str>) -> Attachment {
+        Attachment {
+            session_id: session_id.to_owned(),
+            agent_id: agent_id.map(ToOwned::to_owned),
+        }
+    }
+
+    /// The overview replays every listed session (an id-less summary is
+    /// unaddressable and yields no cursor); a session attach replays only
+    /// its target — listed or not, archived ones are attachable but
+    /// unlisted — and an agent attach scopes to that agent's subtree.
     #[test]
-    fn the_attach_target_is_named_exactly_once() {
-        let sessions = [listed("s1"), listed("s2")];
+    fn each_launch_shape_replays_only_what_it_shows() {
+        let sessions = [listed("s1"), SessionSummary::default(), listed("s2")];
 
         assert_eq!(
-            overview_cursors(&sessions, Some("s2")),
-            vec![("s1".to_owned(), 0), ("s2".to_owned(), 0)],
-            "a listed attach target must not become a duplicate cursor"
+            subscription_for(None, &sessions),
+            Subscription::Everything(vec![("s1".to_owned(), 0), ("s2".to_owned(), 0)]),
         );
         assert_eq!(
-            overview_cursors(&sessions, Some("archived-one")),
-            vec![
-                ("s1".to_owned(), 0),
-                ("s2".to_owned(), 0),
-                ("archived-one".to_owned(), 0),
-            ],
-            "an unlisted attach target is still owed its replay"
+            subscription_for(Some(&attachment("s2", None)), &sessions),
+            Subscription::Everything(vec![("s2".to_owned(), 0)]),
+            "attaching must not replay the other sessions' histories"
         );
         assert_eq!(
-            overview_cursors(&sessions, None),
-            vec![("s1".to_owned(), 0), ("s2".to_owned(), 0)],
-            "no attachment adds nothing"
+            subscription_for(Some(&attachment("archived-one", None)), &sessions),
+            Subscription::Everything(vec![("archived-one".to_owned(), 0)]),
+            "an unlisted target is still owed its replay"
+        );
+        assert_eq!(
+            subscription_for(Some(&attachment("s1", Some("agent-7"))), &sessions),
+            Subscription::Subtree {
+                session_id: "s1".to_owned(),
+                agent_id: "agent-7".to_owned(),
+            },
         );
     }
 
-    /// A summary with no id is unaddressable and yields no cursor — same
-    /// rule the App applies when folding summaries.
+    fn event(sequence: u64) -> Update {
+        Update::Event(Box::new(EventEnvelope {
+            sequence,
+            session_id: Some(SessionId::new("s1")),
+            ..EventEnvelope::default()
+        }))
+    }
+
+    fn feed_len(app: &App) -> usize {
+        app.session("s1").map_or(0, |session| session.feed.len())
+    }
+
+    /// One frame folds everything already queued, not one update per
+    /// redraw — but never more than the ceiling, so a firehose cannot
+    /// starve the keys. What the ceiling leaves stays queued for the next
+    /// frame, in order.
+    #[tokio::test]
+    async fn a_frame_drains_the_queue_up_to_the_ceiling() {
+        let (sender, mut inbox) = tokio::sync::mpsc::channel(DRAIN_CEILING * 2);
+        for sequence in 2..=4 {
+            sender
+                .send(event(sequence))
+                .await
+                .expect("the channel has room");
+        }
+        let mut app = App::attached("s1", None);
+        drain_into(&mut app, event(1), &mut inbox);
+        assert_eq!(feed_len(&app), 4, "the first update and all three queued");
+        assert!(inbox.try_recv().is_err(), "nothing is left behind");
+
+        let backlog = DRAIN_CEILING as u64 + 5;
+        for sequence in 10..10 + backlog {
+            sender
+                .send(event(sequence))
+                .await
+                .expect("the channel has room");
+        }
+        let mut app = App::attached("s1", None);
+        drain_into(&mut app, event(9), &mut inbox);
+        assert_eq!(feed_len(&app), DRAIN_CEILING, "one frame folds the ceiling");
+        let next = inbox
+            .try_recv()
+            .expect("the remainder waits for the next frame");
+        assert_eq!(next, event(10 + DRAIN_CEILING as u64 - 1));
+    }
+
+    /// The end of the stream reaches the App as words: nothing when the loop
+    /// is already gone, an empty reason for a clean close, the error's own
+    /// text for a refusal.
     #[test]
-    fn a_summary_without_an_id_yields_no_cursor() {
-        let cursors = overview_cursors(&[SessionSummary::default()], Some("s9"));
-        assert_eq!(cursors, vec![("s9".to_owned(), 0)]);
+    fn a_closed_stream_tells_the_app_why() {
+        assert_eq!(ended_update(Ok(FollowEnd::LoopGone)), None);
+        assert_eq!(
+            ended_update(Ok(FollowEnd::StreamClosed)),
+            Some(Update::StreamEnded {
+                reason: String::new()
+            })
+        );
+        let refusal = ClientError::Terminal(std::io::Error::other("server went away"));
+        let words = refusal.to_string();
+        assert_eq!(
+            ended_update(Err(refusal)),
+            Some(Update::StreamEnded { reason: words })
+        );
     }
 }
