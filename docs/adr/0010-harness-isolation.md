@@ -69,6 +69,15 @@ servers, and stdio MCP servers running after archive.
   its environment, so `horde worker login <w> <provider>` signs in exactly the
   directory account-less agents run under. Per-account login needs the login
   request to name an account, which the wire does not yet carry.
+
+  **Amendment (2026-11-02):** the wire now carries the account. The login
+  request has `optional string account = 5` (`proto/horde/v1/login.proto`),
+  and `horde worker login <w> <provider> --account <a>` sets it. The worker
+  then signs in `<root>/accounts/<a>` (`crates/horde-worker/src/login.rs`,
+  `LoginPlane::resolve`). The worker also advertises each account directory
+  that a sign-in has written into as a provider account. It re-registers
+  after a login that exits cleanly, so a spawn that requires the account can
+  be placed.
 - Operator conveniences no longer reach agents: user `CLAUDE.md`, user hooks,
   plugins, user-scope MCP servers, and codex profiles are all gone. Project
   `CLAUDE.md` in the checkout still loads — that is repo context, not

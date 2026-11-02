@@ -166,3 +166,10 @@ prints with a note that only this machine can redeem it.
   (restarting re-mints), and validating `--san` names against DNS at mint
   time. The certificate check at dial time, with its diagnosis, is the
   backstop.
+
+  **Amendment (2026-11-02):** the re-mint verb is now built.
+  `horde-server --remint` finds the running server through its state lock
+  and sends it SIGHUP. The server then re-mints its bootstrap token, but only
+  while no client is enrolled (`crates/horde-server/src/remint.rs`,
+  `startup.rs`). Validating `--san` against DNS is still not done. `--san`
+  is now checked at parse time as an IP literal or a well-formed host name.

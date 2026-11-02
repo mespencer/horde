@@ -107,6 +107,11 @@ older client's request, never carrying the field, means. The field is
 is wire- and source-compatible for every existing caller. The CLI and TUI
 consume it in a later change.
 
+**Amendment (2026-11-02):** the CLI now uses the filter. Session-name
+resolution asks the Server for the named session
+(`Client::list_sessions_named`, called from `crates/horde-cli/src/resolve.rs`)
+rather than listing every session and matching on the client.
+
 ## Consequences
 
 - The Server holds every session's state in memory: memory now grows with
