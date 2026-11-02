@@ -7,6 +7,10 @@ Every claim in Part 1 was checked against code, and its file:line citations are
 for `22f2599`. **Part 2** is the original W7d audit at `dddec01`, kept as the
 record the fix lists below refer to; its verdicts and line numbers are historical.
 
+The summary rows for §4, §5 and §9, the a8 row, and contract disagreements 2 and
+3 were re-checked at `9218ac2` after the three wave-11 resolutions below; their
+citations are for `9218ac2`.
+
 ## Part 1 — Wave-11 refresh (`22f2599`)
 
 ### Summary
@@ -17,12 +21,12 @@ record the fix lists below refer to; its verdicts and line numbers are historica
 | §2 Three roles, three binaries | CONFORMS | All three binaries exist (`crates/horde-worker/src/bin/horde_worker.rs:13`); `horde up` stands in for the unbuilt `--with-local-worker`; the version gate is enforced (`service/shared.rs:268`, called at Hello `control_plane.rs:412` and registration `service/worker.rs:85`). |
 | §2 Transport and resilience | CONFORMS | Worker redials on 0.5 s→10 s backoff (`horde-worker/src/startup.rs:54-59,814-852`); lease, boot reconcile, journaled inbox (ADR-0011, ADR-0012). |
 | §3 Identity and security | CONFORMS | Role table per RPC, worker identity from its certificate, mint/revoke Client-only, revocation severs streams, journal reset, `--remint` (ADR-0009). Rotation is still manual re-enrollment. |
-| §4 Providers and adapters | PARTIAL | Both adapters run under worker-owned profiles (ADR-0010); interactive-auth relay built with `--account`. Provider accounts are still advertised empty (`horde-worker/src/capabilities.rs:62`). |
-| §5 Agent model | PARTIAL | The endpoint is wired and agents spawn agents — but an MCP `spawn_agent` sends a default spec (`horde-mcp/src/verbs.rs:147-153`): no workspace, no agent type. Reaper and native-tool suppression not built. |
+| §4 Providers and adapters | CONFORMS | Both adapters run under worker-owned profiles (ADR-0010); interactive-auth relay built with `--account`. Held provider accounts are advertised on every dial and re-advertised after a sign-in (`horde-worker/src/login.rs:100,248`; `startup.rs:691`) — checked at `9218ac2`. |
+| §5 Agent model | PARTIAL | The endpoint is wired and agents spawn agents; an MCP-spawned child inherits its parent's spec — workspace, agent type, model, permission mode — and may not exceed it (`horde-server/src/lineage.rs:28,54`, applied at `service/control_plane.rs:318,321`) — checked at `9218ac2`. Reaper and native-tool suppression not built. |
 | §6 Sessions, placement, scheduling | CONFORMS | Placement skips workers lacking the harness; messages to unplaced agents buffer; idempotent retries. `MaterializationProgress` still has no producer. |
 | §7 Workspaces | PARTIAL | `horde workspace create/list/get/add-repo/update/delete`; `unmanaged_paths` stored but read by no worker code; no cwd auto-registration. |
 | §8 Git backbone, relay, blob store | CONFORMS (as built) | Relay mounted by `--relay-bind`; dirty trees refused on the stamp path (`horde-worker/src/share.rs:139-144`); blob GC absent by design. |
-| §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. Allowlists fail closed for every MCP-spawned child (see §5). |
+| §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. MCP-spawned children carry their parent's agent type, so allowlists resolve for them (`horde-server/src/lineage.rs:28`; `hub.rs:152,194`) — checked at `9218ac2`. |
 | §10 Permissions | PARTIAL | Chain driver runs in `serve()` with `PermissionModes::shipped()` (`horde-server/src/startup.rs:443-451`); the judge is still a seam with no production implementation. |
 | §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. Archive and workspace/MCP edits stay unattributed. |
 | §12 Usage and observability | PARTIAL | Usage folds conform; threshold alerts absent; OTLP plaintext only; hard budgets shape-only. |
@@ -60,7 +64,7 @@ record the fix lists below refer to; its verdicts and line numbers are historica
 | a5 chain driver in `serve()` | CLOSED | `startup.rs:443-451`. |
 | a6 version gate | CLOSED | `service/shared.rs:268`. |
 | a7 archive producer | CLOSED | Session archive folds into `ArchiveAgentCommand` (`service/commands.rs:381-406`). |
-| a8 children from parent HEAD | PARTIAL | Checkouts start at the parent's HEAD on the same worker (`horde-worker/src/runtime/shared.rs:196-243`), but an MCP-spawned child names no workspace, so it gets no checkout — while the endpoint still tells agents children "start from your latest commit" (`horde-mcp/src/endpoint.rs:935-937`). |
+| a8 children from parent HEAD | CLOSED | At `9218ac2`: an MCP-spawned child inherits its parent's workspace (`horde-server/src/lineage.rs:28`) and its own checkout starts at the parent's committed HEAD (`horde-worker/src/runtime/shared.rs:204-243`), as the endpoint tells agents (`horde-mcp/src/endpoint.rs:947`). Test `horde-e2e/tests/e2e_suite/lineage.rs:11`. |
 | a9 TUI staleness | CLOSED | `horde-tui/src/app.rs:68,403`; badge `view.rs:224-235`. |
 | a10 relay and hub in `--serve` | CLOSED | `startup.rs:456-457,594-628`. |
 | a11 `require_committed` on stamp | CLOSED | `horde-worker/src/share.rs:139-144`. |
@@ -70,7 +74,7 @@ record the fix lists below refer to; its verdicts and line numbers are historica
 | a15 advertisement fed | CLOSED | Warm instances, tags, remotes on every registration (`horde-worker/src/startup.rs:534-536,678-691`). The worker never calls `ReportCapabilities`/`ReportWorkspaceInstances`, so warmth refreshes only at re-registration. |
 | a16 coverage threshold | CLOSED | `FLOOR_PERCENT = 95.0` (`gates/coverage.rs:20`). |
 
-**Contract disagreements (Part 2):** 1 CLOSED (unique keys; a reused key on a different event kind is refused loudly, `service/shared.rs:370,422-442`). 2 PARTIAL (as a8). 3 PARTIAL — clients send full specs, but MCP-spawned children carry an empty `agent_type`, so hub allowlists fail closed for them (`horde-server/src/hub.rs:18,415`). 4, 5, 6, 9, 11 CLOSED (a6, a4, a9, a11, a14). 7 OPEN — `RevivalIdentity::is_resumable_under` (`horde-adapter/src/identity.rs:24,61`) is still called only by its tests. 8 OPEN — journal and session sequences are both raw `uint64` on the wire. 10 PARTIAL (as a13). 12 PARTIAL — `workspace_definition_id` is read and `horde new` exists; `MaterializationProgress` has no producer (its comment now says so) and `unmanaged_paths` is read by no worker code.
+**Contract disagreements (Part 2):** 1 CLOSED (unique keys; a reused key on a different event kind is refused loudly, `service/shared.rs:370,422-442`). 2 CLOSED (as a8). 3 CLOSED — clients send full specs, and MCP-spawned children inherit the parent's `agent_type` unless they name another (`horde-server/src/lineage.rs:28`; `horde-mcp/src/verbs.rs:171`), so hub allowlists resolve for them (checked at `9218ac2`). 4, 5, 6, 9, 11 CLOSED (a6, a4, a9, a11, a14). 7 OPEN — `RevivalIdentity::is_resumable_under` (`horde-adapter/src/identity.rs:24,61`) is still called only by its tests. 8 OPEN — journal and session sequences are both raw `uint64` on the wire. 10 PARTIAL (as a13). 12 PARTIAL — `workspace_definition_id` is read and `horde new` exists; `MaterializationProgress` has no producer (its comment now says so) and `unmanaged_paths` is read by no worker code.
 
 **DESIGN amendments (Part 2, (b)):** landed in W7f and kept current since; spot-checked at `22f2599`: §4's Codex bullet (DESIGN.md §4), ADR-0001's worker-table scope ruling, TESTING.md §5, and the `horde new` proto comment.
 
