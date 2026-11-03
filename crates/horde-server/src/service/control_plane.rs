@@ -2311,6 +2311,87 @@ mod delivery_tests {
         assert_eq!(server.principal, "client:laptop");
     }
 
+    /// `message` as the channel would deliver it: stamped with `role`'s
+    /// certificate identity, or carrying none at all.
+    fn calling_as<T>(message: T, role: Option<PrincipalRole>, name: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        if let Some(role) = role {
+            request.extensions_mut().insert(PeerIdentity {
+                principal: Principal::new(role, name).expect("a valid name"),
+                serial_hex: "aa".to_owned(),
+            });
+        }
+        request
+    }
+
+    /// Mint and revoke are operator verbs (wave-7 fix a3), and the handler
+    /// holds that line itself: a worker certificate, or a request with no
+    /// identity at all, is refused `PermissionDenied` naming what it is,
+    /// while a client mints. On the wire the interceptor's method table
+    /// refuses a worker first; this is the handler's own check behind it, so
+    /// a route that skipped the table still finds the door shut.
+    #[tokio::test]
+    async fn the_enrollment_verbs_refuse_every_caller_but_a_client() {
+        use horde_proto::v1::{
+            ClientId, MintEnrollmentCodeRequest, RevokeEnrollmentRequest, Role,
+            revoke_enrollment_request::Principal as Revoked,
+        };
+        let authority = crate::service::enrollment::tests::bare_authority().await;
+        let plane = ControlPlane::with_enrollment(
+            ServerCore::new(EventLog::in_memory().expect("in-memory log")),
+            std::sync::Arc::new(authority),
+        );
+        let mint = || MintEnrollmentCodeRequest {
+            role: Role::Worker as i32,
+            name: "gpu-box".to_owned(),
+            ttl: None,
+        };
+
+        let refused = plane
+            .mint_enrollment_code(calling_as(
+                mint(),
+                Some(PrincipalRole::Worker),
+                "mac-studio",
+            ))
+            .await
+            .expect_err("a worker identity must not mint");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(
+            refused.message().contains("worker:mac-studio"),
+            "the refusal names the caller: {}",
+            refused.message()
+        );
+        let refused = plane
+            .revoke_enrollment(calling_as(
+                RevokeEnrollmentRequest {
+                    principal: Some(Revoked::ClientId(ClientId::new("laptop"))),
+                    reason: "a worker trying to revoke the operator".to_owned(),
+                },
+                Some(PrincipalRole::Worker),
+                "mac-studio",
+            ))
+            .await
+            .expect_err("a worker identity must not revoke");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        let refused = plane
+            .mint_enrollment_code(calling_as(mint(), None, ""))
+            .await
+            .expect_err("no identity must not mint");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(
+            refused.message().contains("no peer identity"),
+            "{}",
+            refused.message()
+        );
+
+        let minted = plane
+            .mint_enrollment_code(calling_as(mint(), Some(PrincipalRole::Client), "laptop"))
+            .await
+            .expect("a client identity mints")
+            .into_inner();
+        assert!(!minted.code.is_empty(), "the client got a code");
+    }
+
     /// A fresh session: its id and its root agent.
     async fn session(plane: &ControlPlane) -> (String, String) {
         let created = plane

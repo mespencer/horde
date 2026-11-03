@@ -1244,6 +1244,55 @@ async fn a_harness_that_hangs_up_mid_handshake_reads_as_its_death() {
     );
 }
 
+/// Once the read side has met EOF the session is over, even while the
+/// child's stdin would still take bytes: a send or an interrupt is refused
+/// as the harness's exit, never written into a harness that cannot answer.
+/// The stub hangs up its stdout mid-turn and keeps reading, so the refusal
+/// can only come from the session knowing it ended — the write would have
+/// succeeded.
+#[tokio::test]
+async fn an_ended_session_refuses_sends_and_interrupts_while_stdin_still_reads() {
+    let script = [
+        harness::thread_started(),
+        harness::turn_started("turn-1"),
+        "!CLOSE_STDOUT".to_owned(),
+    ]
+    .join("\n");
+    let (mut session, _dir) = session_on(&script, &[]).await;
+    session
+        .send(TurnInput::queued("start"))
+        .await
+        .expect("sends");
+    within("the stream ends at EOF", async {
+        loop {
+            match session.next_event().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return,
+                Err(error) => panic!("EOF ends the stream quietly, not as {error:?}"),
+            }
+        }
+    })
+    .await;
+
+    let refused = session
+        .send(TurnInput::queued("anyone there?"))
+        .await
+        .expect_err("an ended session takes no input");
+    assert!(
+        matches!(refused, AdapterError::HarnessExited { exit_code: None }),
+        "the refusal is the harness's exit: {refused:?}"
+    );
+    let refused = session
+        .interrupt()
+        .await
+        .expect_err("an ended session has nothing to interrupt");
+    assert!(
+        matches!(refused, AdapterError::HarnessExited { exit_code: None }),
+        "the refusal is the harness's exit: {refused:?}"
+    );
+    session.shutdown().await.expect("shuts down");
+}
+
 /// Each forced order really is the order it names, seen at the pipe: `eof`
 /// is met by the read, `hangup` answers and then refuses the next write.
 /// Without this, the two adapter tests above could swap orders unnoticed —

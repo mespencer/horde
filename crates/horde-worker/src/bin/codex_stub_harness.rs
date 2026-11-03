@@ -16,7 +16,9 @@
 //!   block behind the marker stands in for what the harness does once
 //!   answered. `!EXEC_APPROVAL ` does the same on
 //!   `item/commandExecution/requestApproval`, the exec seam the 2026-08-19
-//!   re-probe measured.
+//!   re-probe measured. A `!CLOSE_STDOUT` line closes the stub's stdout and
+//!   leaves stdin open (still read, still logged): the client sees the
+//!   harness end while its writes would still succeed.
 //! * `codex-stub-harness --version` prints `HORDE_CODEX_STUB_VERSION` (default
 //!   `codex-cli 0.148.0`) and exits — the version probe's happy path, without
 //!   a script.
@@ -42,6 +44,9 @@
 //! `run`, and the two byte-shovels touch real stdio.
 
 use std::io::{BufRead, Write};
+
+/// The script line that hangs up the stub's stdout mid-block.
+const CLOSE_STDOUT: &str = "!CLOSE_STDOUT";
 
 fn main() -> std::process::ExitCode {
     if std::env::args().any(|argument| argument == "--version") {
@@ -263,9 +268,16 @@ fn next_message(stdin: &mut impl BufRead) -> Option<serde_json::Value> {
 
 /// Plays one block: raw lines are emitted; an `!ELICIT` or `!EXEC_APPROVAL`
 /// marker sends a server request on its method and blocks until the client
-/// answers it.
+/// answers it; `!CLOSE_STDOUT` hangs up the output alone.
 fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u64) {
     for line in block {
+        if line == CLOSE_STDOUT {
+            // The client's read meets EOF while its writes still land: the
+            // only state in which a session can tell "ended" from "unwritable".
+            let _ = std::io::stdout().flush();
+            let _ = nix::unistd::close(1);
+            continue;
+        }
         match server_request_marker(line) {
             Some((method, params)) => {
                 *next_server_id += 1;

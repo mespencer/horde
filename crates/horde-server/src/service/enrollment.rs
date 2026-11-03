@@ -417,7 +417,7 @@ impl EnrollmentService for Enrollment {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // The authority's decisions (mint → join → refused re-join, expiry,
     // revocation reaching the deny-list) are exercised over real TLS
     // listeners in `tests/enrollment.rs`, where the same certificates then
@@ -428,8 +428,9 @@ mod tests {
     use super::MintedCode;
 
     /// A bare authority over an in-memory log — the arrangement the
-    /// authority-shape tests below share.
-    async fn bare_authority() -> super::EnrollmentAuthority {
+    /// authority-shape tests below share, and the control plane's
+    /// enrollment-verb tests build on.
+    pub(crate) async fn bare_authority() -> super::EnrollmentAuthority {
         let now = super::wall_clock_ms();
         let ca = horde_identity::CertificateAuthority::generate(now).expect("a CA generates");
         let credential = ca.issue_localhost_server(now).expect("issues");

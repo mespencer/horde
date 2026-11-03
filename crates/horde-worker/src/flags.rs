@@ -430,6 +430,29 @@ mod tests {
         assert!(refused.contains("https://"), "{refused}");
     }
 
+    /// `--insecure` dials plaintext, so only an `http://` server takes it:
+    /// an `https://` server, a schemeless one, or none at all is refused by
+    /// name rather than left to fail later as a TLS error.
+    #[test]
+    fn an_insecure_dial_takes_only_an_http_server() {
+        let plaintext =
+            parsed_with(&["--insecure", "--server", "http://lab:1"], &[]).expect("parses");
+        assert_eq!(plaintext.server.as_deref(), Some("http://lab:1"));
+        assert!(plaintext.insecure);
+
+        for server in ["https://lab:1", "lab:1"] {
+            let refused = parsed_with(&["--insecure", "--server", server], &[])
+                .expect_err("an insecure dial needs an http:// server");
+            assert!(
+                refused.contains("--insecure") && refused.contains(server),
+                "{server}: {refused}"
+            );
+        }
+        let nowhere =
+            parsed_with(&["--insecure"], &[]).expect_err("an insecure dial needs a server");
+        assert!(nowhere.contains("not nothing"), "{nowhere}");
+    }
+
     /// The token by precedence — flag, file, ambient variable — and only
     /// the variable is ambient. A blank variable is no token.
     #[test]
