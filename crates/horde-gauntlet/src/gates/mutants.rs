@@ -106,6 +106,20 @@ pub const ARTIFACTS: &str = "mutants";
 /// The commit of the last green, unnarrowed full sweep, under `target/quality`.
 pub const LAST_FULL_SWEEP: &str = "mutants-last-green-full-sweep";
 
+/// Tests the mutation run leaves out of its oracle, each with why.
+///
+/// Gamma passes test arguments after `--` to every test binary, and libtest's
+/// `--skip` takes a name filter, so each entry is a test's full path. The bar
+/// is the exclusion bar: a test is left out only when it cannot pass under
+/// gamma for a reason that has nothing to do with any mutant, *and* it judges
+/// no mutated code. A test that merely fails is a finding, not an entry here.
+pub const SKIPPED_TESTS: &[(&str, &str)] = &[(
+    "reap::tests::a_real_orphaned_leader_is_reaped_by_its_directory",
+    "it waits for init (pid 1) to adopt an orphan, but gamma runs the suite inside a \
+     systemd user scope for its memory cgroup, where a subreaper adopts orphans instead; \
+     it tests reap.rs, which is never mutated",
+)];
+
 /// What a diff-scoped run is measured against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Since {
@@ -499,6 +513,11 @@ pub fn run_spec(
     args.push("--jobs".to_owned());
     args.push(settings.jobs.to_string());
     args.extend(memory_args(settings.memory));
+    args.push("--".to_owned());
+    for (test, _) in SKIPPED_TESTS {
+        args.push("--skip".to_owned());
+        args.push((*test).to_owned());
+    }
     CommandSpec::owned("cargo", args, &ctx.workspace_root)
         .with_env("CARGO_ENCODED_RUSTFLAGS", settings.rustflags.clone())
 }
