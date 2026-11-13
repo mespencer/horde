@@ -8,7 +8,7 @@ came from `statvfs` or `df`; homes came from `$HOME`; unmanaged workspace
 paths were symlinks; the test tiers sent signals to process groups and read
 `ps`. None of that exists on Windows, so nothing compiled for it.
 
-The operator decided on 2026-11-13 (docs/WAVE12.md, W12g) that a Windows
+The operator decided on 2026-11-13 that a Windows
 machine must be able to be a Worker running `claude.exe` and `codex.exe`,
 with the CLI and the server building there too. This ADR records how.
 
