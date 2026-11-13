@@ -216,7 +216,9 @@ mod tests {
     #[tokio::test]
     async fn a_record_must_agree_with_its_file_name() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write(dir.path(), &record("agent-a")).await.expect("written");
+        write(dir.path(), &record("agent-a"))
+            .await
+            .expect("written");
         let liar = ledger_dir(dir.path()).join("agent-z.json");
         tokio::fs::copy(ledger_dir(dir.path()).join("agent-a.json"), &liar)
             .await

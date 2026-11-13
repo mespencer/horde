@@ -1129,7 +1129,8 @@ impl ControlPlaneService for ControlPlane {
         let request = request.into_inner();
         let repos = normalized_repos(request.repos);
         validate_definition(&request.name, &repos).map_err(Status::from)?;
-        let mode = horde_proto::v1::CheckoutMode::try_from(request.checkout_mode).unwrap_or_default();
+        let mode =
+            horde_proto::v1::CheckoutMode::try_from(request.checkout_mode).unwrap_or_default();
         crate::workspace_policy::validate_definition_fields(&repos, &request.unmanaged_paths, mode)
             .map_err(Status::from)?;
 
@@ -1381,8 +1382,11 @@ impl ControlPlaneService for ControlPlane {
             .as_ref()
             .map(ToString::to_string)
             .filter(|id| !id.is_empty());
-        let workers =
-            super::workspace_gc::workers_for(&self.core, &request.worker_ids, definition_id.as_deref());
+        let workers = super::workspace_gc::workers_for(
+            &self.core,
+            &request.worker_ids,
+            definition_id.as_deref(),
+        );
         let targets = super::workspace_gc::targets(&self.core, workers);
         let (request_id, sequence) = super::workspace_gc::request_gc(
             &self.core,
@@ -1401,13 +1405,15 @@ impl ControlPlaneService for ControlPlane {
         .await
         .map_err(Status::from)?;
         let ids = |workers: &[String]| workers.iter().map(horde_proto::v1::WorkerId::new).collect();
-        Ok(Response::new(horde_proto::v1::CollectWorkspaceGarbageResponse {
-            request_id,
-            targeted: ids(&targets.targeted),
-            offline: ids(&targets.offline),
-            unsupported: ids(&targets.unsupported),
-            sequence,
-        }))
+        Ok(Response::new(
+            horde_proto::v1::CollectWorkspaceGarbageResponse {
+                request_id,
+                targeted: ids(&targets.targeted),
+                offline: ids(&targets.offline),
+                unsupported: ids(&targets.unsupported),
+                sequence,
+            },
+        ))
     }
 
     #[instrument(skip_all)]
@@ -1451,11 +1457,13 @@ impl ControlPlaneService for ControlPlane {
         )
         .await
         .map_err(Status::from)?;
-        Ok(Response::new(horde_proto::v1::RemoveWorkspaceInstanceResponse {
-            request_id,
-            sequence,
-            targeted: !targets.targeted.is_empty(),
-        }))
+        Ok(Response::new(
+            horde_proto::v1::RemoveWorkspaceInstanceResponse {
+                request_id,
+                sequence,
+                targeted: !targets.targeted.is_empty(),
+            },
+        ))
     }
 
     #[instrument(skip_all)]
@@ -1464,18 +1472,24 @@ impl ControlPlaneService for ControlPlane {
         request: Request<horde_proto::v1::ListWorkspaceInstancesRequest>,
     ) -> Result<Response<horde_proto::v1::ListWorkspaceInstancesResponse>, Status> {
         let request = request.into_inner();
-        let worker = request.worker_id.as_ref().map(ToString::to_string).filter(|id| !id.is_empty());
+        let worker = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
         let definition = request
             .workspace_definition_id
             .as_ref()
             .map(ToString::to_string)
             .filter(|id| !id.is_empty());
-        Ok(Response::new(horde_proto::v1::ListWorkspaceInstancesResponse {
-            instances: self
-                .core
-                .instances
-                .filtered(worker.as_deref(), definition.as_deref()),
-        }))
+        Ok(Response::new(
+            horde_proto::v1::ListWorkspaceInstancesResponse {
+                instances: self
+                    .core
+                    .instances
+                    .filtered(worker.as_deref(), definition.as_deref()),
+            },
+        ))
     }
 
     #[instrument(skip_all)]

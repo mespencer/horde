@@ -1220,7 +1220,10 @@ mod tests {
             Kind::CheckoutPrepared(horde_proto::v1::CheckoutPrepared::default()),
         );
         assert!(view.judge("worker-a", "s1", &prepared).is_ok());
-        assert!(view.judge("worker-b", "s1", &prepared).is_err(), "not its agent");
+        assert!(
+            view.judge("worker-b", "s1", &prepared).is_err(),
+            "not its agent"
+        );
 
         let cleanup = |worker: &str| {
             event(
@@ -1231,9 +1234,19 @@ mod tests {
                 }),
             )
         };
-        assert!(view.judge("worker-a", housekeeping, &cleanup("worker-a")).is_ok());
-        assert!(view.judge("worker-a", housekeeping, &cleanup("worker-b")).is_err(), "another worker's");
-        assert!(view.judge("worker-a", "s1", &cleanup("worker-a")).is_err(), "not into a session");
+        assert!(
+            view.judge("worker-a", housekeeping, &cleanup("worker-a"))
+                .is_ok()
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &cleanup("worker-b"))
+                .is_err(),
+            "another worker's"
+        );
+        assert!(
+            view.judge("worker-a", "s1", &cleanup("worker-a")).is_err(),
+            "not into a session"
+        );
         let pressure = event(
             None,
             Kind::WorkspaceDiskPressure(horde_proto::v1::WorkspaceDiskPressure {
@@ -1254,9 +1267,13 @@ mod tests {
                 }),
             )
         };
-        assert!(view.judge("worker-a", housekeeping, &completed("gc-1")).is_ok());
         assert!(
-            view.judge("worker-a", housekeeping, &completed("gc-ghost")).is_err(),
+            view.judge("worker-a", housekeeping, &completed("gc-1"))
+                .is_ok()
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &completed("gc-ghost"))
+                .is_err(),
             "no request asked"
         );
         let missing = event(
@@ -1277,7 +1294,10 @@ mod tests {
             None,
             Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested::default()),
         );
-        assert!(view.judge("worker-a", housekeeping, &forged).is_err(), "server-written only");
+        assert!(
+            view.judge("worker-a", housekeeping, &forged).is_err(),
+            "server-written only"
+        );
     }
 
     #[tokio::test]

@@ -484,7 +484,9 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
 }
 
 /// The cleanup pass an explicit, non-dry-run removal runs under.
-fn explicit_pass(policy: &horde_worker::workspace::policy::WorkspacePolicy) -> horde_worker::workspace::cleanup::Pass<'_> {
+fn explicit_pass(
+    policy: &horde_worker::workspace::policy::WorkspacePolicy,
+) -> horde_worker::workspace::cleanup::Pass<'_> {
     horde_worker::workspace::cleanup::Pass {
         trigger: horde_proto::v1::CleanupTrigger::Explicit,
         gc_request_id: "gc-test",
@@ -494,7 +496,10 @@ fn explicit_pass(policy: &horde_worker::workspace::policy::WorkspacePolicy) -> h
 }
 
 /// One agent's ledger record, archived.
-async fn archived(manager: &WorkspaceManager, agent: &str) -> horde_worker::workspace::ledger::LedgerRecord {
+async fn archived(
+    manager: &WorkspaceManager,
+    agent: &str,
+) -> horde_worker::workspace::ledger::LedgerRecord {
     manager
         .mark_archived("ws-1", agent)
         .await
@@ -538,13 +543,24 @@ async fn a_lossless_hard_removal_removes_the_worktree_and_pins_its_head() {
         "only the archived agent's branch is deleted: {branches}"
     );
     assert_eq!(
-        harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-1"]).trim(),
+        harness::git(
+            &instance_repo,
+            &["rev-parse", "refs/horde/archived/agent-1"]
+        )
+        .trim(),
         work,
         "the agent's last commit stays reachable"
     );
-    assert!(sibling.join("atlas").join(".git").is_file(), "the sibling is untouched");
     assert!(
-        manager.records("ws-1").await.iter().all(|r| r.agent_id != "agent-1"),
+        sibling.join("atlas").join(".git").is_file(),
+        "the sibling is untouched"
+    );
+    assert!(
+        manager
+            .records("ws-1")
+            .await
+            .iter()
+            .all(|r| r.agent_id != "agent-1"),
         "the ledger record goes last"
     );
 }
@@ -570,15 +586,25 @@ async fn a_fresh_clone_is_pinned_then_removed_and_shared_roots_are_left_alone() 
     assert!(!clone.exists());
     let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
     assert_eq!(
-        harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-1"]).trim(),
+        harness::git(
+            &instance_repo,
+            &["rev-parse", "refs/horde/archived/agent-1"]
+        )
+        .trim(),
         work
     );
 
     let shared = harness::checkout(&manager, "ws-1", "agent-2", CheckoutPolicy::Shared)
         .await
         .expect("the shared checkout");
-    assert!(manager.mark_archived("ws-1", "agent-2").await.is_none(), "no ledger, nothing to remove");
-    assert!(shared.join("atlas").join(".git").is_dir(), "the instance survives");
+    assert!(
+        manager.mark_archived("ws-1", "agent-2").await.is_none(),
+        "no ledger, nothing to remove"
+    );
+    assert!(
+        shared.join("atlas").join(".git").is_dir(),
+        "the instance survives"
+    );
 }
 
 /// A dirty checkout is retained, its reason recorded in the ledger; only a
@@ -603,11 +629,16 @@ async fn a_dirty_checkout_is_retained_unless_forced() {
         i32::from(horde_proto::v1::workspace_cleanup::repo_action::Outcome::Refused)
     );
     assert_eq!(event.repos[0].reason, "untracked files: 1");
-    assert!(checkout.join("atlas").join("scratch.txt").exists(), "nothing was lost");
+    assert!(
+        checkout.join("atlas").join("scratch.txt").exists(),
+        "nothing was lost"
+    );
     let retained = manager.records("ws-1").await;
     assert_eq!(retained[0].retained_reason, "untracked files: 1");
 
-    let head = harness::git(&checkout.join("atlas"), &["rev-parse", "HEAD"]).trim().to_owned();
+    let head = harness::git(&checkout.join("atlas"), &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
     let (event, removed) = manager
         .hard_remove("ws-1", &retained[0], explicit_pass(&policy), true)
         .await;
@@ -615,7 +646,11 @@ async fn a_dirty_checkout_is_retained_unless_forced() {
     assert!(event.repos[0].reason.starts_with("forced:"), "{event:?}");
     let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
     assert_eq!(
-        harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-1"]).trim(),
+        harness::git(
+            &instance_repo,
+            &["rev-parse", "refs/horde/archived/agent-1"]
+        )
+        .trim(),
         head
     );
 }
@@ -800,9 +835,14 @@ async fn a_checkout_for_a_path_hostile_agent_id_is_refused() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
-    let refused = harness::checkout(&manager, "ws-1", "agent/../escape", CheckoutPolicy::Worktree)
-        .await
-        .expect_err("a separator in an agent id is an escape, not a name");
+    let refused = harness::checkout(
+        &manager,
+        "ws-1",
+        "agent/../escape",
+        CheckoutPolicy::Worktree,
+    )
+    .await
+    .expect_err("a separator in an agent id is an escape, not a name");
     assert!(
         refused.to_string().contains("not directory names"),
         "the refusal says why: {refused}"

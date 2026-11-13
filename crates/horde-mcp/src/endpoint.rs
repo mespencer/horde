@@ -514,7 +514,10 @@ impl HordeEndpoint {
     ) -> Result<Json<crate::workspace::CheckoutAnswer>, ErrorData> {
         let identity = Self::caller(&context)?;
         let workspace = self.context.workspace().ok_or_else(|| {
-            ErrorData::invalid_params("this agent runs without a workspace; there is nothing to check out", None)
+            ErrorData::invalid_params(
+                "this agent runs without a workspace; there is nothing to check out",
+                None,
+            )
         })?;
         workspace
             .checkout(identity.agent_id(), &params.repo, params.base.as_deref())

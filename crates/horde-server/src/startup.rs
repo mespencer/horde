@@ -104,7 +104,9 @@ impl WorkspaceFlags {
         crate::workspace_policy::WorkspacePolicyConfig {
             fetch_throttle: self.fetch_throttle.unwrap_or(defaults.fetch_throttle),
             fetch_timeout: self.fetch_timeout.unwrap_or(defaults.fetch_timeout),
-            idle_reclaim_after: self.idle_reclaim_after.unwrap_or(defaults.idle_reclaim_after),
+            idle_reclaim_after: self
+                .idle_reclaim_after
+                .unwrap_or(defaults.idle_reclaim_after),
             archived_grace: self.archived_grace.unwrap_or(defaults.archived_grace),
             reclaim_timeout: self.reclaim_timeout.unwrap_or(defaults.reclaim_timeout),
             archived_pin_ttl: self.archived_pin_ttl.or(defaults.archived_pin_ttl),

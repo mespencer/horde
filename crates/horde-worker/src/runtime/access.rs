@@ -50,11 +50,12 @@ impl WorkspaceAccess for WorkerWorkspaceAccess {
             )
             .await
             .map_err(|error| error.to_string())?;
-        shared.broker.add_repo(agent_id, repo, added.relative.clone());
-        let resolution = horde_proto::v1::checkout_prepared::BaseResolution::try_from(
-            added.prepared.resolution,
-        )
-        .unwrap_or_default();
+        shared
+            .broker
+            .add_repo(agent_id, repo, added.relative.clone());
+        let resolution =
+            horde_proto::v1::checkout_prepared::BaseResolution::try_from(added.prepared.resolution)
+                .unwrap_or_default();
         if let Ok(Some(record)) = shared.journal.revivable_agent(agent_id).await {
             let available = workspaces
                 .instance_repos(&definition_id)

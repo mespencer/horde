@@ -44,7 +44,11 @@ pub(crate) async fn git(cwd: &Path, arguments: &[&str]) -> Result<String, String
 }
 
 /// Runs one git invocation as `run` says.
-pub(crate) async fn git_with(cwd: &Path, arguments: &[&str], run: GitRun) -> Result<String, String> {
+pub(crate) async fn git_with(
+    cwd: &Path,
+    arguments: &[&str],
+    run: GitRun,
+) -> Result<String, String> {
     let mut command = tokio::process::Command::new("git");
     command
         .args(arguments)
@@ -52,7 +56,9 @@ pub(crate) async fn git_with(cwd: &Path, arguments: &[&str], run: GitRun) -> Res
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     if run.no_prompt {
-        command.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "");
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "");
     }
     let ran = tokio::time::timeout(run.timeout, command.output())
         .await

@@ -54,7 +54,10 @@ fn upstream_commit(origin: &Path, file: &str) -> String {
     head(origin)
 }
 
-async fn checkout(manager: &WorkspaceManager, request: &CheckoutRequest) -> horde_worker::workspace::PreparedCheckout {
+async fn checkout(
+    manager: &WorkspaceManager,
+    request: &CheckoutRequest,
+) -> horde_worker::workspace::PreparedCheckout {
     manager
         .checkout_agent(request, &NoSource)
         .await
@@ -80,10 +83,20 @@ async fn a_new_agent_starts_from_the_freshly_fetched_default_branch() {
     let repo = &prepared.prepared.repos[0];
     assert_eq!(repo.base_commit_sha, tip);
     assert_eq!(repo.resolution, i32::from(BaseResolution::Fresh));
-    assert!(repo.fetched_at.is_some() && repo.stale_reason.is_empty(), "{repo:?}");
+    assert!(
+        repo.fetched_at.is_some() && repo.stale_reason.is_empty(),
+        "{repo:?}"
+    );
     assert_eq!(head(&prepared.root.join("atlas")), tip);
-    assert_eq!(head(&instance_repo), cloned_at, "the instance HEAD never moves");
-    assert!(!instance_repo.join("new.txt").exists(), "nor its working tree");
+    assert_eq!(
+        head(&instance_repo),
+        cloned_at,
+        "the instance HEAD never moves"
+    );
+    assert!(
+        !instance_repo.join("new.txt").exists(),
+        "nor its working tree"
+    );
 }
 
 /// The throttle: two spawns inside it share one fetch — the same
@@ -98,15 +111,32 @@ async fn spawns_inside_the_throttle_share_one_fetch() {
     let wrapper = temp.path().join("count-upload-pack");
     std::fs::write(
         &wrapper,
-        format!("#!/bin/sh\necho x >> {}\nexec git-upload-pack \"$@\"\n", counter.display()),
+        format!(
+            "#!/bin/sh\necho x >> {}\nexec git-upload-pack \"$@\"\n",
+            counter.display()
+        ),
     )
     .expect("the wrapper");
-    std::process::Command::new("chmod").args(["+x"]).arg(&wrapper).status().expect("chmod");
-    harness::git(&instance_repo, &["config", "remote.origin.uploadpack", &wrapper.display().to_string()]);
+    std::process::Command::new("chmod")
+        .args(["+x"])
+        .arg(&wrapper)
+        .status()
+        .expect("chmod");
+    harness::git(
+        &instance_repo,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            &wrapper.display().to_string(),
+        ],
+    );
 
     let first = checkout(&manager, &request("agent-1")).await;
     let second = checkout(&manager, &request("agent-2")).await;
-    assert_eq!(first.prepared.repos[0].fetched_at, second.prepared.repos[0].fetched_at);
+    assert_eq!(
+        first.prepared.repos[0].fetched_at,
+        second.prepared.repos[0].fetched_at
+    );
     assert_eq!(manager.fetches_run(), 1);
     let packs = std::fs::read_to_string(&counter).expect("the wrapper ran");
     assert_eq!(packs.lines().count(), 1, "one upload-pack for two spawns");
@@ -180,7 +210,12 @@ async fn lazy_pair(temp: &Path) -> (WorkspaceManager, WorkspaceDefinition) {
     definition.checkout_mode = CheckoutMode::Lazy.into();
     let manager = harness::manager_under(temp);
     let report = manager.materialize(&definition).await;
-    assert_eq!(report.state, horde_proto::v1::WorkspaceInstanceState::Ready as i32, "{}", report.detail);
+    assert_eq!(
+        report.state,
+        horde_proto::v1::WorkspaceInstanceState::Ready as i32,
+        "{}",
+        report.detail
+    );
     (manager, definition)
 }
 
@@ -196,9 +231,13 @@ async fn a_lazy_agent_checks_out_only_what_it_asks_for() {
     assert_eq!(prepared.prepared.mode, i32::from(CheckoutMode::Lazy));
     assert_eq!(prepared.prepared.available_repos, vec!["atlas", "docs"]);
     assert!(!prepared.root.join("atlas").exists() && !prepared.root.join("docs").exists());
-    let overlay = prepared.overlay.expect("a lazy agent is told how to check out");
+    let overlay = prepared
+        .overlay
+        .expect("a lazy agent is told how to check out");
     assert!(overlay.contains("workspace_checkout"), "{overlay}");
-    let manifest = horde_worker::workspace::manifest::read(&prepared.root).await.expect("a manifest");
+    let manifest = horde_worker::workspace::manifest::read(&prepared.root)
+        .await
+        .expect("a manifest");
     assert_eq!(manifest.mode, "lazy");
     assert!(manifest.repos.iter().all(|repo| !repo.checked_out));
 
@@ -215,18 +254,31 @@ async fn a_lazy_agent_checks_out_only_what_it_asks_for() {
         .expect("idempotent");
     assert_eq!(again.prepared.resolution, i32::from(BaseResolution::Reused));
     assert_eq!(again.path, added.path);
-    let manifest = horde_worker::workspace::manifest::read(&prepared.root).await.expect("a manifest");
-    assert!(manifest.repos.iter().any(|repo| repo.name == "docs" && repo.checked_out));
+    let manifest = horde_worker::workspace::manifest::read(&prepared.root)
+        .await
+        .expect("a manifest");
+    assert!(
+        manifest
+            .repos
+            .iter()
+            .any(|repo| repo.name == "docs" && repo.checked_out)
+    );
 
     let unknown = manager
         .add_repo("ws-1", "agent-1", "ghost", None, eager_fetch(), &NoSource)
         .await
         .expect_err("ghost is not a repo");
-    assert!(unknown.to_string().contains("valid repos: atlas, docs"), "{unknown}");
+    assert!(
+        unknown.to_string().contains("valid repos: atlas, docs"),
+        "{unknown}"
+    );
 
     let revived = checkout(&manager, &request("agent-1")).await;
     assert_eq!(revived.repos.len(), 1, "the same subset");
-    assert_eq!(revived.prepared.repos[0].resolution, i32::from(BaseResolution::Reused));
+    assert_eq!(
+        revived.prepared.repos[0].resolution,
+        i32::from(BaseResolution::Reused)
+    );
 }
 
 /// Initial repos imply lazy, and stamping covers exactly the checked-out
@@ -240,7 +292,10 @@ async fn initial_repos_check_out_at_spawn_and_only_they_are_stamped() {
     let mut named = request("agent-1");
     named.checkout_repos = vec!["docs".to_owned()];
     let prepared = checkout(&manager, &named).await;
-    assert_eq!(prepared.repos, vec![("docs".to_owned(), PathBuf::from("docs"))]);
+    assert_eq!(
+        prepared.repos,
+        vec![("docs".to_owned(), PathBuf::from("docs"))]
+    );
 
     let broker = horde_worker::ShareBroker::new(None);
     broker.register(
@@ -250,8 +305,16 @@ async fn initial_repos_check_out_at_spawn_and_only_they_are_stamped() {
             repos: prepared.repos.clone(),
         },
     );
-    let payload = broker.stamp("agent-1").await.expect("stamps").expect("a payload");
-    let stamped: Vec<&str> = payload.git_refs.iter().map(|r| r.repo_name.as_str()).collect();
+    let payload = broker
+        .stamp("agent-1")
+        .await
+        .expect("stamps")
+        .expect("a payload");
+    let stamped: Vec<&str> = payload
+        .git_refs
+        .iter()
+        .map(|r| r.repo_name.as_str())
+        .collect();
     assert_eq!(stamped, vec!["docs"]);
 }
 
@@ -274,8 +337,14 @@ async fn a_branch_spans_repos_is_held_once_and_continues_from_origin() {
     }
     let mut twin = request("agent-2");
     twin.branch = "feat/login".to_owned();
-    let refused = manager.checkout_agent(&twin, &NoSource).await.expect_err("held");
-    assert!(refused.to_string().contains("checked out by agent agent-1"), "{refused}");
+    let refused = manager
+        .checkout_agent(&twin, &NoSource)
+        .await
+        .expect_err("held");
+    assert!(
+        refused.to_string().contains("checked out by agent agent-1"),
+        "{refused}"
+    );
 
     harness::git(&atlas_origin, &["checkout", "-qb", "feat/existing"]);
     let tip = upstream_commit(&atlas_origin, "existing.txt");
@@ -284,7 +353,12 @@ async fn a_branch_spans_repos_is_held_once_and_continues_from_origin() {
     continuing.branch = "feat/existing".to_owned();
     continuing.fetch = eager_fetch();
     let prepared = checkout(&manager, &continuing).await;
-    let atlas = prepared.prepared.repos.iter().find(|r| r.repo_name == "atlas").expect("atlas");
+    let atlas = prepared
+        .prepared
+        .repos
+        .iter()
+        .find(|r| r.repo_name == "atlas")
+        .expect("atlas");
     assert_eq!(atlas.base_commit_sha, tip);
     assert_eq!(atlas.resolution, i32::from(BaseResolution::Requested));
     assert_eq!(atlas.requested_ref, "origin/feat/existing");
@@ -306,7 +380,9 @@ fn crate_origin(root: &Path) -> PathBuf {
     origin
 }
 
-fn explicit(policy: &horde_worker::workspace::policy::WorkspacePolicy) -> horde_worker::workspace::cleanup::Pass<'_> {
+fn explicit(
+    policy: &horde_worker::workspace::policy::WorkspacePolicy,
+) -> horde_worker::workspace::cleanup::Pass<'_> {
     horde_worker::workspace::cleanup::Pass {
         trigger: CleanupTrigger::Explicit,
         gc_request_id: "gc-1",
@@ -333,7 +409,9 @@ async fn soft_reclaim_runs_cargo_clean_and_keeps_the_work() {
     let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
     let record = manager.records("ws-1").await.remove(0);
 
-    let event = manager.soft_reclaim("ws-1", &record, explicit(&policy)).await;
+    let event = manager
+        .soft_reclaim("ws-1", &record, explicit(&policy))
+        .await;
     let action = &event.repos[0];
     assert_eq!(action.outcome, i32::from(Outcome::Done), "{action:?}");
     assert_eq!(action.argv, vec!["cargo", "clean"]);
@@ -341,12 +419,24 @@ async fn soft_reclaim_runs_cargo_clean_and_keeps_the_work() {
     assert!(!repo.join("target").exists(), "target/ is gone");
     assert_eq!(head(&repo), work, "the commit stays");
     assert!(repo.join("src/lib.rs").exists(), "the worktree stays");
-    assert!(manager.records("ws-1").await[0].soft_reclaimed_at_ms.is_some());
+    assert!(
+        manager.records("ws-1").await[0]
+            .soft_reclaimed_at_ms
+            .is_some()
+    );
 
     std::fs::create_dir_all(repo.join("target/debug")).expect("rebuilt");
-    let archived = manager.mark_archived("ws-1", "agent-1").await.expect("archived");
-    let (event, removed) = manager.hard_remove("ws-1", &archived, explicit(&policy), false).await;
-    assert!(removed, "target/ is the reclaim's output, not loss: {event:?}");
+    let archived = manager
+        .mark_archived("ws-1", "agent-1")
+        .await
+        .expect("archived");
+    let (event, removed) = manager
+        .hard_remove("ws-1", &archived, explicit(&policy), false)
+        .await;
+    assert!(
+        removed,
+        "target/ is the reclaim's output, not loss: {event:?}"
+    );
 }
 
 /// A repo whose reclaim is disabled is skipped with the reason, and an
@@ -364,7 +454,10 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
     let prepared = checkout(&manager, &request("agent-1")).await;
     std::fs::write(prepared.root.join("crate/.env"), "SECRET=1").expect("an agent's .env");
     let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
-    let archived = manager.mark_archived("ws-1", "agent-1").await.expect("archived");
+    let archived = manager
+        .mark_archived("ws-1", "agent-1")
+        .await
+        .expect("archived");
 
     let dry = horde_worker::workspace::cleanup::Pass {
         dry_run: true,
@@ -377,7 +470,9 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
     assert_eq!(action.unrecoverable_files.len(), 1, "{action:?}");
     assert_eq!(action.unrecoverable_files[0].path, ".env");
     assert_eq!(action.unrecoverable_files[0].bytes, 8);
-    let (event, removed) = manager.hard_remove("ws-1", &archived, explicit(&policy), true).await;
+    let (event, removed) = manager
+        .hard_remove("ws-1", &archived, explicit(&policy), true)
+        .await;
     assert!(removed, "{event:?}");
 
     definition.repos[0].reclaim = Some(horde_proto::v1::ReclaimPolicy {
@@ -388,7 +483,9 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
     manager.materialize(&definition).await;
     checkout(&manager, &request("agent-2")).await;
     let record = manager.records("ws-1").await.remove(0);
-    let event = manager.soft_reclaim("ws-1", &record, explicit(&policy)).await;
+    let event = manager
+        .soft_reclaim("ws-1", &record, explicit(&policy))
+        .await;
     assert_eq!(event.repos[0].outcome, i32::from(Outcome::Skipped));
     assert_eq!(event.repos[0].reason, "no reclaim command");
 }
@@ -489,7 +586,11 @@ fn policy(grace_s: u64, idle_s: u64) -> ResolvedWorkspacePolicy {
     }
 }
 
-async fn materialize(rig: &mut Rig, definition: &WorkspaceDefinition, policy: ResolvedWorkspacePolicy) {
+async fn materialize(
+    rig: &mut Rig,
+    definition: &WorkspaceDefinition,
+    policy: ResolvedWorkspacePolicy,
+) {
     rig.runtime
         .apply(command(
             "m-1",
@@ -512,7 +613,9 @@ async fn spawn(rig: &mut Rig, agent: &str) {
                 session_id: Some(horde_proto::v1::SessionId::new("s1")),
                 agent_id: Some(horde_proto::v1::AgentId::new(agent)),
                 spec: Some(horde_proto::v1::AgentSpec {
-                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                        "ws-1",
+                    )),
                     checkout_policy: CheckoutPolicy::Worktree.into(),
                     ..horde_proto::v1::AgentSpec::default()
                 }),
@@ -538,7 +641,14 @@ async fn archive(rig: &mut Rig, agent: &str) {
     crate::support::within("the archive", rig.runtime.settled()).await;
 }
 
-async fn gc(rig: &mut Rig, id: &str, level: GcLevel, force: bool, dry_run: bool, include_pins: bool) {
+async fn gc(
+    rig: &mut Rig,
+    id: &str,
+    level: GcLevel,
+    force: bool,
+    dry_run: bool,
+    include_pins: bool,
+) {
     rig.runtime
         .apply(command(
             id,
@@ -589,7 +699,10 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let atlas = harness::origin(temp.path(), "atlas");
     let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(&temp.path().join("workspaces"), Journal::in_memory().expect("journal"));
+    let mut rig = rig(
+        &temp.path().join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    );
     materialize(&mut rig, &definition, policy(1, 0)).await;
     assert!(rig.reporter.count() >= 1, "a materialize reports");
     spawn(&mut rig, "agent-1").await;
@@ -602,7 +715,11 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     .await;
 
     let events = cleanups(&rig.journal).await;
-    assert_eq!(events.len(), 1, "a soft reclaim only, inside the grace: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "a soft reclaim only, inside the grace: {events:?}"
+    );
     assert_eq!(events[0].tier, i32::from(CleanupTier::Soft));
     assert_eq!(events[0].trigger, i32::from(CleanupTrigger::Archive));
     assert!(agent_root(&rig, "agent-1").exists());
@@ -621,7 +738,10 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert!(rig.runtime.scan_workspaces().await);
-    assert!(!agent_root(&rig, "agent-1").exists(), "removed after the grace");
+    assert!(
+        !agent_root(&rig, "agent-1").exists(),
+        "removed after the grace"
+    );
     let events = cleanups(&rig.journal).await;
     let hard = events.last().expect("a removal");
     assert_eq!(hard.tier, i32::from(CleanupTier::Hard));
@@ -637,7 +757,10 @@ async fn an_idle_agent_is_reclaimed_once_per_idle_period() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let atlas = harness::origin(temp.path(), "atlas");
     let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(&temp.path().join("workspaces"), Journal::in_memory().expect("journal"));
+    let mut rig = rig(
+        &temp.path().join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    );
     materialize(&mut rig, &definition, policy(0, 1)).await;
     spawn(&mut rig, "agent-1").await;
     tokio::time::sleep(Duration::from_millis(1_100)).await;
@@ -649,12 +772,21 @@ async fn an_idle_agent_is_reclaimed_once_per_idle_period() {
         .filter(|c| c.trigger == i32::from(CleanupTrigger::Idle))
         .collect();
     assert_eq!(idle.len(), 1);
-    assert_eq!(rig.reporter.last()[0].checkouts[0].state, i32::from(CheckoutState::Idle));
-    assert!(!rig.runtime.scan_workspaces().await, "not again in the same idle period");
+    assert_eq!(
+        rig.reporter.last()[0].checkouts[0].state,
+        i32::from(CheckoutState::Idle)
+    );
+    assert!(
+        !rig.runtime.scan_workspaces().await,
+        "not again in the same idle period"
+    );
 
     let activity = rig.runtime.activity();
     activity.set_busy("agent-1", true);
-    assert!(!rig.runtime.scan_workspaces().await, "never under a turn in flight");
+    assert!(
+        !rig.runtime.scan_workspaces().await,
+        "never under a turn in flight"
+    );
     activity.set_busy("agent-1", false);
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert!(rig.runtime.scan_workspaces().await, "a turn re-arms it");
@@ -668,7 +800,10 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let atlas = harness::origin(temp.path(), "atlas");
     let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(&temp.path().join("workspaces"), Journal::in_memory().expect("journal"));
+    let mut rig = rig(
+        &temp.path().join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    );
     // A long grace and no idle reclaim: only pressure acts.
     materialize(&mut rig, &definition, policy(86_400, 0)).await;
     spawn(&mut rig, "agent-old").await;
@@ -689,13 +824,21 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
         .filter(|c| c.tier == i32::from(CleanupTier::Soft))
         .filter_map(|c| c.agent_id.as_ref().map(ToString::to_string))
         .collect();
-    assert_eq!(order, vec!["agent-live"], "the archived one was reclaimed at archive already");
+    assert_eq!(
+        order,
+        vec!["agent-live"],
+        "the archived one was reclaimed at archive already"
+    );
     let removed: Vec<String> = pressure
         .iter()
         .filter(|c| c.tier == i32::from(CleanupTier::Hard))
         .filter_map(|c| c.agent_id.as_ref().map(ToString::to_string))
         .collect();
-    assert_eq!(removed, vec!["agent-old"], "a lossless archived checkout goes, grace or not");
+    assert_eq!(
+        removed,
+        vec!["agent-old"],
+        "a lossless archived checkout goes, grace or not"
+    );
     let exhausted: Vec<_> = journaled(&rig.journal)
         .await
         .into_iter()
@@ -703,7 +846,10 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
         .collect();
     assert_eq!(exhausted.len(), 1);
     assert!(!agent_root(&rig, "agent-old").exists());
-    assert!(agent_root(&rig, "agent-live").exists(), "a live checkout is never removed");
+    assert!(
+        agent_root(&rig, "agent-live").exists(),
+        "a live checkout is never removed"
+    );
     let before = journaled(&rig.journal).await.len();
     rig.runtime.scan_workspaces().await;
     let repeated = journaled(&rig.journal)
@@ -733,18 +879,45 @@ async fn orphans_after_a_reset_are_reported_soft_at_most_and_removed_by_hard_gc(
     let mut reset = rig(&root, Journal::in_memory().expect("a fresh journal"));
     assert!(reset.runtime.scan_workspaces().await);
     let reported = reset.reporter.last();
-    assert_eq!(reported[0].checkouts[0].state, i32::from(CheckoutState::Orphan));
+    assert_eq!(
+        reported[0].checkouts[0].state,
+        i32::from(CheckoutState::Orphan)
+    );
     let events = cleanups(&reset.journal).await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].trigger, i32::from(CleanupTrigger::Scan));
-    assert_eq!(events[0].session_id.as_ref().map(ToString::to_string).as_deref(), Some("s1"));
+    assert_eq!(
+        events[0]
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("s1")
+    );
     assert!(!reset.runtime.scan_workspaces().await, "reported once");
-    assert!(agent_root(&reset, "agent-1").exists(), "a scan never removes an orphan");
+    assert!(
+        agent_root(&reset, "agent-1").exists(),
+        "a scan never removes an orphan"
+    );
 
-    gc(&mut reset, "gc-auto", GcLevel::Automatic, false, false, false).await;
-    assert!(agent_root(&reset, "agent-1").exists(), "nor does an automatic gc");
+    gc(
+        &mut reset,
+        "gc-auto",
+        GcLevel::Automatic,
+        false,
+        false,
+        false,
+    )
+    .await;
+    assert!(
+        agent_root(&reset, "agent-1").exists(),
+        "nor does an automatic gc"
+    );
     gc(&mut reset, "gc-hard", GcLevel::Hard, false, false, false).await;
-    assert!(!agent_root(&reset, "agent-1").exists(), "a hard gc removes a lossless orphan");
+    assert!(
+        !agent_root(&reset, "agent-1").exists(),
+        "a hard gc removes a lossless orphan"
+    );
     let completed = journaled(&reset.journal)
         .await
         .into_iter()
@@ -762,7 +935,10 @@ async fn gc_dry_runs_refuses_forces_and_drops_only_safe_pins() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let atlas = harness::origin(temp.path(), "atlas");
     let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(&temp.path().join("workspaces"), Journal::in_memory().expect("journal"));
+    let mut rig = rig(
+        &temp.path().join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    );
     materialize(&mut rig, &definition, policy(86_400, 0)).await;
     spawn(&mut rig, "agent-dirty").await;
     std::fs::write(agent_root(&rig, "agent-dirty").join("atlas/wip.txt"), "wip").expect("dirty");
@@ -775,26 +951,68 @@ async fn gc_dry_runs_refuses_forces_and_drops_only_safe_pins() {
     };
     let before = listing(&agent_root(&rig, "agent-dirty"));
     gc(&mut rig, "gc-dry", GcLevel::Hard, true, true, false).await;
-    assert_eq!(listing(&agent_root(&rig, "agent-dirty")), before, "a dry run changes nothing");
-    let dry: Vec<_> = cleanups(&rig.journal).await.into_iter().filter(|c| c.gc_request_id == "gc-dry").collect();
+    assert_eq!(
+        listing(&agent_root(&rig, "agent-dirty")),
+        before,
+        "a dry run changes nothing"
+    );
+    let dry: Vec<_> = cleanups(&rig.journal)
+        .await
+        .into_iter()
+        .filter(|c| c.gc_request_id == "gc-dry")
+        .collect();
     assert!(dry.iter().all(|c| c.dry_run));
-    assert!(dry.iter().flat_map(|c| &c.repos).any(|a| a.outcome == i32::from(Outcome::WouldDo)));
+    assert!(
+        dry.iter()
+            .flat_map(|c| &c.repos)
+            .any(|a| a.outcome == i32::from(Outcome::WouldDo))
+    );
 
     gc(&mut rig, "gc-hard", GcLevel::Hard, false, false, false).await;
-    assert!(agent_root(&rig, "agent-dirty").exists(), "not provably lossless: refused");
-    let refused = cleanups(&rig.journal).await.into_iter().filter(|c| c.gc_request_id == "gc-hard");
-    assert!(refused.flat_map(|c| c.repos).any(|a| a.outcome == i32::from(Outcome::Refused) && a.reason.contains("untracked")));
+    assert!(
+        agent_root(&rig, "agent-dirty").exists(),
+        "not provably lossless: refused"
+    );
+    let refused = cleanups(&rig.journal)
+        .await
+        .into_iter()
+        .filter(|c| c.gc_request_id == "gc-hard");
+    assert!(
+        refused
+            .flat_map(|c| c.repos)
+            .any(|a| a.outcome == i32::from(Outcome::Refused) && a.reason.contains("untracked"))
+    );
 
     gc(&mut rig, "gc-force", GcLevel::Hard, true, false, false).await;
     assert!(!agent_root(&rig, "agent-dirty").exists(), "forced");
     let instance_repo = rig.root.join("ws-1").join("atlas");
-    let pinned = harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-dirty"]);
+    let pinned = harness::git(
+        &instance_repo,
+        &["rev-parse", "refs/horde/archived/agent-dirty"],
+    );
     // The pinned commit is the clone point, which origin holds: droppable.
-    harness::git(&instance_repo, &["update-ref", "refs/horde/archived/unpushed", &make_unpushed(&instance_repo)]);
+    harness::git(
+        &instance_repo,
+        &[
+            "update-ref",
+            "refs/horde/archived/unpushed",
+            &make_unpushed(&instance_repo),
+        ],
+    );
     gc(&mut rig, "gc-pins", GcLevel::Hard, false, false, true).await;
-    let pins = harness::git(&instance_repo, &["for-each-ref", "--format=%(refname)", "refs/horde/archived"]);
-    assert!(!pins.contains("agent-dirty"), "a pin origin holds goes: {pins} (was {})", pinned.trim());
-    assert!(pins.contains("unpushed"), "a pin nobody else holds stays: {pins}");
+    let pins = harness::git(
+        &instance_repo,
+        &["for-each-ref", "--format=%(refname)", "refs/horde/archived"],
+    );
+    assert!(
+        !pins.contains("agent-dirty"),
+        "a pin origin holds goes: {pins} (was {})",
+        pinned.trim()
+    );
+    assert!(
+        pins.contains("unpushed"),
+        "a pin nobody else holds stays: {pins}"
+    );
     rig.runtime.shutdown().await;
 }
 
@@ -841,13 +1059,22 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
     let atlas = harness::origin(temp.path(), "atlas");
     let mut definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
     definition.unmanaged_paths = vec!["data".to_owned()];
-    let mut rig = rig(&temp.path().join("workspaces"), Journal::in_memory().expect("journal"));
+    let mut rig = rig(
+        &temp.path().join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    );
     materialize(&mut rig, &definition, policy(0, 0)).await;
     spawn(&mut rig, "agent-1").await;
     let link = agent_root(&rig, "agent-1").join("data");
-    assert!(link.is_symlink(), "the unmanaged path is linked into the checkout");
+    assert!(
+        link.is_symlink(),
+        "the unmanaged path is linked into the checkout"
+    );
     std::fs::write(link.join("weights.bin"), vec![0_u8; 64]).expect("data through the link");
-    assert!(rig.root.join("ws-1/data/weights.bin").exists(), "it lands in the instance");
+    assert!(
+        rig.root.join("ws-1/data/weights.bin").exists(),
+        "it lands in the instance"
+    );
 
     let remove = |id: &str, force: bool| {
         command(
@@ -862,9 +1089,15 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
             }),
         )
     };
-    rig.runtime.apply(remove("rm-live", true)).await.expect("applies");
+    rig.runtime
+        .apply(remove("rm-live", true))
+        .await
+        .expect("applies");
     crate::support::within("the removal", rig.runtime.settled()).await;
-    assert!(rig.root.join("ws-1").exists(), "refused with a live agent, even forced");
+    assert!(
+        rig.root.join("ws-1").exists(),
+        "refused with a live agent, even forced"
+    );
 
     archive(&mut rig, "agent-1").await;
     crate::support::within("the archive's removal", async {
@@ -873,16 +1106,33 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
         }
     })
     .await;
-    assert!(rig.root.join("ws-1/data/weights.bin").exists(), "removing a checkout leaves the data");
-    rig.runtime.apply(remove("rm-data", false)).await.expect("applies");
+    assert!(
+        rig.root.join("ws-1/data/weights.bin").exists(),
+        "removing a checkout leaves the data"
+    );
+    rig.runtime
+        .apply(remove("rm-data", false))
+        .await
+        .expect("applies");
     crate::support::within("the removal", rig.runtime.settled()).await;
-    assert!(rig.root.join("ws-1").exists(), "non-empty unmanaged data needs --force");
-    let refused = cleanups(&rig.journal).await.into_iter().filter(|c| c.gc_request_id == "rm-data");
-    assert!(refused
-        .flat_map(|c| c.repos)
-        .any(|a| a.unrecoverable_files.iter().any(|f| f.path == "data" && f.bytes == 64)));
+    assert!(
+        rig.root.join("ws-1").exists(),
+        "non-empty unmanaged data needs --force"
+    );
+    let refused = cleanups(&rig.journal)
+        .await
+        .into_iter()
+        .filter(|c| c.gc_request_id == "rm-data");
+    assert!(refused.flat_map(|c| c.repos).any(|a| {
+        a.unrecoverable_files
+            .iter()
+            .any(|f| f.path == "data" && f.bytes == 64)
+    }));
 
-    rig.runtime.apply(remove("rm-force", true)).await.expect("applies");
+    rig.runtime
+        .apply(remove("rm-force", true))
+        .await
+        .expect("applies");
     crate::support::within("the removal", rig.runtime.settled()).await;
     assert!(!rig.root.join("ws-1").exists(), "forced");
     let missing = journaled(&rig.journal).await.into_iter().any(|kind| {
@@ -890,7 +1140,10 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
             if c.report.as_ref().is_some_and(|r| r.state == i32::from(horde_proto::v1::WorkspaceInstanceState::Missing)))
     });
     assert!(missing);
-    assert!(rig.reporter.last().is_empty(), "the authoritative set is empty now");
+    assert!(
+        rig.reporter.last().is_empty(),
+        "the authoritative set is empty now"
+    );
     rig.runtime.shutdown().await;
 }
 
@@ -904,7 +1157,10 @@ async fn materialization_journals_its_progress_and_reports() {
         .map(|name| harness::repo(name, &harness::origin(temp.path(), name)))
         .collect();
     let definition = harness::definition("ws-1", repos);
-    let mut rig = rig(&temp.path().join("workspaces"), Journal::in_memory().expect("journal"));
+    let mut rig = rig(
+        &temp.path().join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    );
     materialize(&mut rig, &definition, policy(0, 0)).await;
     let steps: Vec<(String, u32, u32)> = journaled(&rig.journal)
         .await
@@ -927,7 +1183,16 @@ async fn materialization_journals_its_progress_and_reports() {
     let reported = rig.reporter.last();
     assert_eq!(reported.len(), 1);
     assert_eq!(reported[0].repos.len(), 3);
-    assert!(reported[0].repos.iter().all(|r| r.head_commit_sha.len() == 40), "real HEADs now");
-    assert!(reported[0].filesystem_total_bytes > 0, "disk facts ride the report");
+    assert!(
+        reported[0]
+            .repos
+            .iter()
+            .all(|r| r.head_commit_sha.len() == 40),
+        "real HEADs now"
+    );
+    assert!(
+        reported[0].filesystem_total_bytes > 0,
+        "disk facts ride the report"
+    );
     rig.runtime.shutdown().await;
 }

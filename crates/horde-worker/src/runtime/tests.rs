@@ -502,12 +502,14 @@ async fn first_instance_report(runtime: &Runtime) -> horde_proto::v1::WorkspaceI
 fn final_report(
     events: &[horde_proto::v1::JournaledEvent],
 ) -> Option<horde_proto::v1::WorkspaceInstanceReport> {
-    events.iter().find_map(|journaled| match journaled.event.as_ref()?.kind.as_ref()? {
-        Kind::WorkspaceInstanceChanged(changed) if changed.progress.is_none() => {
-            changed.report.clone()
-        }
-        _ => None,
-    })
+    events
+        .iter()
+        .find_map(|journaled| match journaled.event.as_ref()?.kind.as_ref()? {
+            Kind::WorkspaceInstanceChanged(changed) if changed.progress.is_none() => {
+                changed.report.clone()
+            }
+            _ => None,
+        })
 }
 
 /// A decision missing its request id cannot be applied, and is journaled

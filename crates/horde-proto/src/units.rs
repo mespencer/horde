@@ -14,7 +14,9 @@ use std::time::Duration;
 pub fn parse_duration(value: &str) -> Result<Duration, String> {
     let refuse = || format!("{value:?} is not a duration such as 90s, 10m, 4h or 1d");
     let value = value.trim();
-    let split = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
     let (digits, unit) = value.split_at(split);
     let amount: u64 = digits.parse().map_err(|_| refuse())?;
     let scale = match unit {
@@ -38,7 +40,9 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
 pub fn parse_size(value: &str) -> Result<u64, String> {
     let refuse = || format!("{value:?} is not a size such as 512MiB or 20GiB");
     let value = value.trim();
-    let split = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
     let (digits, unit) = value.split_at(split);
     let amount: u64 = digits.parse().map_err(|_| refuse())?;
     let scale: u64 = match unit {
@@ -82,8 +86,19 @@ mod tests {
 
     #[test]
     fn durations_take_seconds_minutes_hours_and_days() {
-        for (value, seconds) in [("0", 0), ("90", 90), ("90s", 90), ("10m", 600), ("4h", 14_400), ("1d", 86_400)] {
-            assert_eq!(parse_duration(value), Ok(Duration::from_secs(seconds)), "{value}");
+        for (value, seconds) in [
+            ("0", 0),
+            ("90", 90),
+            ("90s", 90),
+            ("10m", 600),
+            ("4h", 14_400),
+            ("1d", 86_400),
+        ] {
+            assert_eq!(
+                parse_duration(value),
+                Ok(Duration::from_secs(seconds)),
+                "{value}"
+            );
         }
         for wrong in ["", "4w", "h", "-1s", "1.5h", "99999999999999999999d"] {
             assert!(parse_duration(wrong).is_err(), "{wrong}");

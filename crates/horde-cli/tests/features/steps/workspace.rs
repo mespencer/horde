@@ -56,7 +56,10 @@ async fn a_workspace_over(world: &mut HordeWorld, workspace: String, origin: Str
     let endpoint = world.endpoint()?.to_owned();
     let repo = format!("{origin}={url}");
     world
-        .run_horde(&endpoint, &["--json", "workspace", "create", &workspace, "--repo", &repo])
+        .run_horde(
+            &endpoint,
+            &["--json", "workspace", "create", &workspace, "--repo", &repo],
+        )
         .await?;
     let run = world.last_run()?;
     if !run.success {
@@ -112,7 +115,11 @@ async fn starts_a_session(world: &mut HordeWorld, workspace: String) -> StepResu
 }
 
 #[when(expr = "the user starts a session in workspace {string} with {string}")]
-async fn starts_a_session_with(world: &mut HordeWorld, workspace: String, flags: String) -> StepResult {
+async fn starts_a_session_with(
+    world: &mut HordeWorld,
+    workspace: String,
+    flags: String,
+) -> StepResult {
     start(world, &workspace, &flags).await
 }
 
@@ -138,12 +145,20 @@ async fn start(world: &mut HordeWorld, workspace: &str, flags: &str) -> StepResu
 
 #[then(expr = "the user eventually sees the checkout start {string} at the origin's tip")]
 async fn sees_the_checkout_at_the_tip(world: &mut HordeWorld, resolution: String) -> StepResult {
-    let tip = world.notes.get("tip").cloned().ok_or("no tip was recorded")?;
+    let tip = world
+        .notes
+        .get("tip")
+        .cloned()
+        .ok_or("no tip was recorded")?;
     sees_checkout(world, &format!("atlas@{tip} {resolution}")).await
 }
 
 #[then(expr = "the user eventually sees the checkout start {string} on {string}")]
-async fn sees_the_checkout_on(world: &mut HordeWorld, resolution: String, branch: String) -> StepResult {
+async fn sees_the_checkout_on(
+    world: &mut HordeWorld,
+    resolution: String,
+    branch: String,
+) -> StepResult {
     sees_checkout(world, &format!("{resolution} on {branch}")).await
 }
 
@@ -152,7 +167,11 @@ async fn sees_the_checkout_on(world: &mut HordeWorld, resolution: String, branch
 async fn sees_checkout(world: &mut HordeWorld, needle: &str) -> StepResult {
     world
         .await_event("the checkout's provenance", |envelope| {
-            matches!(envelope.event.as_ref()?.kind.as_ref()?, Kind::CheckoutPrepared(_)).then_some(())
+            matches!(
+                envelope.event.as_ref()?.kind.as_ref()?,
+                Kind::CheckoutPrepared(_)
+            )
+            .then_some(())
         })
         .await?;
     let endpoint = world.endpoint()?.to_owned();

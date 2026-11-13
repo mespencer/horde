@@ -57,8 +57,12 @@ pub trait CommitSource: Send + Sync {
     /// # Errors
     ///
     /// Why the commit could not be obtained, in words.
-    async fn obtain_into(&self, instance_repo: &Path, repo_name: &str, sha: &str)
-    -> Result<(), String>;
+    async fn obtain_into(
+        &self,
+        instance_repo: &Path,
+        repo_name: &str,
+        sha: &str,
+    ) -> Result<(), String>;
 }
 
 /// A source that has nothing: every obtain fails. For checkouts with no
@@ -362,7 +366,8 @@ pub(crate) async fn plan_branch(
              (`horde workspace gc --hard --agent <id> [--force]`)"
         ));
     }
-    if tip == base || git_check(instance_repo, &["merge-base", "--is-ancestor", &tip, base]).await? {
+    if tip == base || git_check(instance_repo, &["merge-base", "--is-ancestor", &tip, base]).await?
+    {
         return Ok(BranchPlan::Adopt);
     }
     Err(format!(
@@ -416,7 +421,10 @@ mod tests {
             holder_name("/ws/def-1/.horde-agents/agent-7/atlas"),
             "agent agent-7"
         );
-        assert_eq!(holder_name("/elsewhere/atlas"), "a worktree Horde did not create");
+        assert_eq!(
+            holder_name("/elsewhere/atlas"),
+            "a worktree Horde did not create"
+        );
         assert_eq!(holder_name(""), "a worktree Horde did not create");
     }
 

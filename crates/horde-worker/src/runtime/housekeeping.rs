@@ -276,7 +276,11 @@ impl Housekeeper {
         let lock = self.shared.checkout_locks.of(agent_id);
         let _held = lock.lock().await;
         self.shared.activity.forget(agent_id);
-        let Some(record) = self.workspaces.mark_archived(&definition_id, agent_id).await else {
+        let Some(record) = self
+            .workspaces
+            .mark_archived(&definition_id, agent_id)
+            .await
+        else {
             return;
         };
         let policy = self.policy(&definition_id);
@@ -288,10 +292,17 @@ impl Housekeeper {
         };
         let mut events = Vec::new();
         if !abandoned {
-            events.push(self.workspaces.soft_reclaim(&definition_id, &record, pass).await);
+            events.push(
+                self.workspaces
+                    .soft_reclaim(&definition_id, &record, pass)
+                    .await,
+            );
         }
         if abandoned || policy.archived_grace.is_zero() {
-            let (event, _) = self.workspaces.hard_remove(&definition_id, &record, pass, false).await;
+            let (event, _) = self
+                .workspaces
+                .hard_remove(&definition_id, &record, pass, false)
+                .await;
             events.push(event);
         }
         self.journal_cleanups(events).await;
@@ -321,11 +332,16 @@ impl Housekeeper {
         let mut events = Vec::new();
         let mut missing = Vec::new();
         for (definition_id, _) in self.workspaces.instances().await {
-            if wanted_definition.as_ref().is_some_and(|wanted| *wanted != definition_id) {
+            if wanted_definition
+                .as_ref()
+                .is_some_and(|wanted| *wanted != definition_id)
+            {
                 continue;
             }
             if command.remove_instance {
-                let (instance_events, gone) = self.remove_instance(&definition_id, pass, command.force).await;
+                let (instance_events, gone) = self
+                    .remove_instance(&definition_id, pass, command.force)
+                    .await;
                 events.extend(instance_events);
                 missing.extend(gone);
                 continue;
@@ -397,7 +413,11 @@ impl Housekeeper {
             let _held = lock.lock().await;
             let busy = self.shared.activity.is_busy(&record.agent_id);
             if !busy && record.soft_reclaimed_at_ms.is_none() {
-                events.push(self.workspaces.soft_reclaim(definition_id, &record, pass).await);
+                events.push(
+                    self.workspaces
+                        .soft_reclaim(definition_id, &record, pass)
+                        .await,
+                );
             }
             let removable = match (level, standing) {
                 (GcLevel::Soft, _) | (_, Standing::Live | Standing::Remembered) => false,
@@ -407,7 +427,10 @@ impl Housekeeper {
             };
             if removable {
                 let force = level == GcLevel::Hard && command.force;
-                let (event, _) = self.workspaces.hard_remove(definition_id, &record, pass, force).await;
+                let (event, _) = self
+                    .workspaces
+                    .hard_remove(definition_id, &record, pass, force)
+                    .await;
                 events.push(event);
             }
         }
@@ -430,7 +453,10 @@ impl Housekeeper {
     ) -> (Vec<WorkspaceCleanup>, Option<WorkspaceInstanceReport>) {
         let mut live = Vec::new();
         for record in self.workspaces.records(definition_id).await {
-            if matches!(self.standing(&record).await, Standing::Live | Standing::Remembered) {
+            if matches!(
+                self.standing(&record).await,
+                Standing::Live | Standing::Remembered
+            ) {
                 live.push(record.agent_id.clone());
             }
         }
@@ -472,7 +498,10 @@ impl Housekeeper {
                     dry_run: false,
                     policy: &policy,
                 };
-                let event = self.workspaces.soft_reclaim(definition_id, record, pass).await;
+                let event = self
+                    .workspaces
+                    .soft_reclaim(definition_id, record, pass)
+                    .await;
                 self.journal_cleanups(vec![event]).await;
                 true
             }
@@ -482,10 +511,17 @@ impl Housekeeper {
 
     /// A live agent: write activity through, and soft-reclaim once per idle
     /// period past the policy's idle time.
-    async fn scan_live(&self, definition_id: &str, record: &LedgerRecord, policy: &WorkspacePolicy) -> bool {
+    async fn scan_live(
+        &self,
+        definition_id: &str,
+        record: &LedgerRecord,
+        policy: &WorkspacePolicy,
+    ) -> bool {
         let activity = &self.shared.activity;
         if let Some(at) = activity.due_for_write(&record.agent_id) {
-            self.workspaces.note_activity(definition_id, &record.agent_id, at).await;
+            self.workspaces
+                .note_activity(definition_id, &record.agent_id, at)
+                .await;
         }
         let Some(after) = policy.idle_reclaim_after else {
             return false;
@@ -515,7 +551,10 @@ impl Housekeeper {
             dry_run: false,
             policy,
         };
-        let event = self.workspaces.soft_reclaim(definition_id, record, pass).await;
+        let event = self
+            .workspaces
+            .soft_reclaim(definition_id, record, pass)
+            .await;
         self.journal_cleanups(vec![event]).await;
         true
     }
@@ -523,7 +562,12 @@ impl Housekeeper {
     /// An archived checkout past its grace: the lossless hard removal. A
     /// refusal is journaled only when its reason changed, so a retained
     /// checkout costs one event, not one a minute.
-    async fn scan_archived(&self, definition_id: &str, record: &LedgerRecord, policy: &WorkspacePolicy) -> bool {
+    async fn scan_archived(
+        &self,
+        definition_id: &str,
+        record: &LedgerRecord,
+        policy: &WorkspacePolicy,
+    ) -> bool {
         let Some(archived_at) = record.archived_at_ms else {
             return false;
         };
@@ -537,7 +581,10 @@ impl Housekeeper {
             dry_run: false,
             policy,
         };
-        let (event, removed) = self.workspaces.hard_remove(definition_id, record, pass, false).await;
+        let (event, removed) = self
+            .workspaces
+            .hard_remove(definition_id, record, pass, false)
+            .await;
         let reason_now = self
             .workspaces
             .records(definition_id)
@@ -573,7 +620,11 @@ impl Housekeeper {
         let mut changed = false;
         let candidates = self.pressure_candidates().await;
         for (definition_id, record) in &candidates {
-            if self.workspaces.filesystem().is_some_and(|(free, _)| free >= high) {
+            if self
+                .workspaces
+                .filesystem()
+                .is_some_and(|(free, _)| free >= high)
+            {
                 return changed;
             }
             let lock = self.shared.checkout_locks.of(&record.agent_id);
@@ -590,12 +641,19 @@ impl Housekeeper {
                 dry_run: false,
                 policy: &policy,
             };
-            let event = self.workspaces.soft_reclaim(definition_id, record, pass).await;
+            let event = self
+                .workspaces
+                .soft_reclaim(definition_id, record, pass)
+                .await;
             self.journal_cleanups(vec![event]).await;
             changed = true;
         }
         for (definition_id, record) in self.archived_oldest_first().await {
-            if self.workspaces.filesystem().is_some_and(|(free, _)| free >= high) {
+            if self
+                .workspaces
+                .filesystem()
+                .is_some_and(|(free, _)| free >= high)
+            {
                 return changed;
             }
             let lock = self.shared.checkout_locks.of(&record.agent_id);
@@ -609,7 +667,10 @@ impl Housekeeper {
                 dry_run: false,
                 policy: &policy,
             };
-            let (event, removed) = self.workspaces.hard_remove(&definition_id, &record, pass, false).await;
+            let (event, removed) = self
+                .workspaces
+                .hard_remove(&definition_id, &record, pass, false)
+                .await;
             if removed {
                 self.journal_cleanups(vec![event]).await;
                 changed = true;
@@ -643,7 +704,9 @@ impl Housekeeper {
         let mut idle = Vec::new();
         for (definition_id, _) in self.workspaces.instances().await {
             for record in self.workspaces.records(&definition_id).await {
-                if record.soft_reclaimed_at_ms.is_some() || self.shared.activity.is_busy(&record.agent_id) {
+                if record.soft_reclaimed_at_ms.is_some()
+                    || self.shared.activity.is_busy(&record.agent_id)
+                {
                     continue;
                 }
                 match self.standing(&record).await {
@@ -698,7 +761,9 @@ impl Housekeeper {
                     .filter(|event| {
                         event.repos.iter().any(|action| {
                             action.outcome
-                                == i32::from(horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done)
+                                == i32::from(
+                                    horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done,
+                                )
                         })
                     }),
             );
@@ -808,8 +873,16 @@ mod tests {
             basis_points: 1_000,
             bytes: 20 << 30,
         };
-        assert_eq!(mark.bytes_of(100 << 30), 20 << 30, "10% of 100 GiB is under the 20 GiB floor");
-        assert_eq!(mark.bytes_of(1 << 40), (1 << 40) / 10, "10% of 1 TiB is over it");
+        assert_eq!(
+            mark.bytes_of(100 << 30),
+            20 << 30,
+            "10% of 100 GiB is under the 20 GiB floor"
+        );
+        assert_eq!(
+            mark.bytes_of(1 << 40),
+            (1 << 40) / 10,
+            "10% of 1 TiB is over it"
+        );
         let share_only = Watermark {
             basis_points: 1_500,
             bytes: 0,
@@ -862,7 +935,10 @@ mod tests {
         let locks = CheckoutLocks::default();
         let first = locks.of("a");
         let _held = first.lock().await;
-        assert!(locks.of("a").try_lock().is_err(), "the same agent's lock is held");
+        assert!(
+            locks.of("a").try_lock().is_err(),
+            "the same agent's lock is held"
+        );
         assert!(locks.of("b").try_lock().is_ok(), "another agent's is not");
     }
 }

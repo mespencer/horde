@@ -72,7 +72,9 @@ impl Manifest {
                     path,
                     default_branch: repo.default_branch.clone(),
                     checked_out: checked.is_some(),
-                    base: checked.map(|c| c.base_commit_sha.clone()).unwrap_or_default(),
+                    base: checked
+                        .map(|c| c.base_commit_sha.clone())
+                        .unwrap_or_default(),
                     resolution: checked.map(|c| c.resolution.clone()).unwrap_or_default(),
                     pending_commits,
                 })
@@ -243,8 +245,14 @@ mod tests {
         let manifest = Manifest::describe(&definition(), &record(), None);
         let overlay = lazy_overlay(&manifest, Path::new("/a/.horde/workspace.json"));
         assert!(overlay.contains("workspace_checkout"), "{overlay}");
-        assert!(overlay.contains("- atlas at ./atlas (checked out)"), "{overlay}");
-        assert!(overlay.contains("- proto at ./proto (not checked out)"), "{overlay}");
+        assert!(
+            overlay.contains("- atlas at ./atlas (checked out)"),
+            "{overlay}"
+        );
+        assert!(
+            overlay.contains("- proto at ./proto (not checked out)"),
+            "{overlay}"
+        );
         assert!(overlay.contains("/a/.horde/workspace.json"), "{overlay}");
     }
 }

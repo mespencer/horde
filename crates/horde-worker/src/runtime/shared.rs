@@ -13,9 +13,9 @@ use horde_proto::v1::{
     DeliverMessageCommand, DeliveryMode, SpawnAgentCommand, deliver_message_command, event::Kind,
 };
 
+use super::housekeeping::{Activity, CheckoutLocks, Housekeeper, InstanceReporter};
 use crate::error::WorkerError;
 use crate::journal::{Journal, JournalEntry, RevivableAgent};
-use super::housekeeping::{Activity, CheckoutLocks, Housekeeper, InstanceReporter};
 use crate::share::{AgentCheckout, ShareBroker, StampingSink};
 use crate::translate::AgentContext;
 use crate::workspace::policy::WorkspacePolicy;
@@ -288,7 +288,9 @@ impl Shared {
         let provider_session_id = record.provider_session_id.as_deref().unwrap_or_default();
         let adapter = self.adapter_for(&record.spawn)?;
         let checkout = self.agent_checkout(&record.spawn).await?;
-        let cwd = checkout.as_ref().map(|checkout| checkout.checkout.root.clone());
+        let cwd = checkout
+            .as_ref()
+            .map(|checkout| checkout.checkout.root.clone());
         let spawn = with_overlay(&record.spawn, checkout.as_ref());
         // A fresh endpoint identity per incarnation, and a re-assembled MCP
         // surface: the token the previous process held is replaced, never
@@ -386,7 +388,10 @@ impl Shared {
         let mut rest = payload.clone();
         rest.git_refs.clear();
         for git_ref in &payload.git_refs {
-            let checked_out = checkout.repos.iter().any(|(name, _)| *name == git_ref.repo_name);
+            let checked_out = checkout
+                .repos
+                .iter()
+                .any(|(name, _)| *name == git_ref.repo_name);
             if checked_out || !known.contains(&git_ref.repo_name) {
                 rest.git_refs.push(git_ref.clone());
                 continue;

@@ -5,10 +5,10 @@
 use horde_proto::v1::stream_commands_response::Command;
 use horde_proto::v1::{
     AgentSpec, CheckoutMode, CollectWorkspaceGarbageRequest, CreateWorkspaceDefinitionRequest,
-    DeleteWorkspaceDefinitionRequest, GcLevel, ListWorkspaceInstancesRequest, RegisterWorkerRequest,
-    ReportWorkspaceInstancesRequest, SessionId, SpawnAgentRequest, StreamCommandsRequest,
-    WorkerCapabilities, WorkerId, WorkspaceDefinitionId, WorkspaceInstanceReport,
-    WorkspaceInstanceState, WorkspaceRepo,
+    DeleteWorkspaceDefinitionRequest, GcLevel, ListWorkspaceInstancesRequest,
+    RegisterWorkerRequest, ReportWorkspaceInstancesRequest, SessionId, SpawnAgentRequest,
+    StreamCommandsRequest, WorkerCapabilities, WorkerId, WorkspaceDefinitionId,
+    WorkspaceInstanceReport, WorkspaceInstanceState, WorkspaceRepo,
 };
 
 use crate::common::{Harness, Setup, connect, seed};
@@ -23,7 +23,10 @@ fn repo(name: &str, layout: &str) -> WorkspaceRepo {
     }
 }
 
-async fn define(harness: &mut Harness, request: CreateWorkspaceDefinitionRequest) -> Result<String, tonic::Status> {
+async fn define(
+    harness: &mut Harness,
+    request: CreateWorkspaceDefinitionRequest,
+) -> Result<String, tonic::Status> {
     Ok(harness
         .control
         .create_workspace_definition(request)
@@ -97,7 +100,10 @@ async fn definition_rules_are_refused_at_create() {
     let mut harness = connect().await.expect("a harness");
     let refused = |request| async {
         let mut harness = connect().await.expect("a harness");
-        define(&mut harness, request).await.expect_err("refused").code()
+        define(&mut harness, request)
+            .await
+            .expect_err("refused")
+            .code()
     };
     let base = || CreateWorkspaceDefinitionRequest {
         name: "x".to_owned(),
@@ -158,7 +164,11 @@ async fn definition_rules_are_refused_at_create() {
     .expect("nested layouts are fine under ALL");
 }
 
-async fn spawn(harness: &mut Harness, session: &str, spec: AgentSpec) -> Result<horde_proto::v1::SpawnAgentResponse, tonic::Status> {
+async fn spawn(
+    harness: &mut Harness,
+    session: &str,
+    spec: AgentSpec,
+) -> Result<horde_proto::v1::SpawnAgentResponse, tonic::Status> {
     Ok(harness
         .control
         .spawn_agent(SpawnAgentRequest {
@@ -188,33 +198,49 @@ async fn a_held_branch_is_refused_with_its_holder_named() {
     )
     .await
     .expect("another workspace");
-    let (session, _root) = seed(&mut harness, "claims", "k-claims").await.expect("a session");
+    let (session, _root) = seed(&mut harness, "claims", "k-claims")
+        .await
+        .expect("a session");
     let on = |workspace: &str| AgentSpec {
         workspace_definition_id: Some(WorkspaceDefinitionId::new(workspace)),
         branch: "feat/login".to_owned(),
         ..AgentSpec::default()
     };
-    let first = spawn(&mut harness, &session, on(&workspace)).await.expect("the first holds it");
+    let first = spawn(&mut harness, &session, on(&workspace))
+        .await
+        .expect("the first holds it");
     let holder = first.agent_id.map(|id| id.to_string()).unwrap_or_default();
 
-    let refused = spawn(&mut harness, &session, on(&workspace)).await.expect_err("held");
+    let refused = spawn(&mut harness, &session, on(&workspace))
+        .await
+        .expect_err("held");
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(refused.message().contains(&holder), "{}", refused.message());
-    spawn(&mut harness, &session, on(&other)).await.expect("another workspace's branch is its own");
+    spawn(&mut harness, &session, on(&other))
+        .await
+        .expect("another workspace's branch is its own");
 
     let bad = AgentSpec {
         branch: "horde/someone-else".to_owned(),
         ..on(&workspace)
     };
-    let refused = spawn(&mut harness, &session, bad).await.expect_err("another agent's default name");
+    let refused = spawn(&mut harness, &session, bad)
+        .await
+        .expect_err("another agent's default name");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
     let ghost = AgentSpec {
         workspace_definition_id: Some(WorkspaceDefinitionId::new(&workspace)),
         checkout_repos: vec!["ghost".to_owned()],
         ..AgentSpec::default()
     };
-    let refused = spawn(&mut harness, &session, ghost).await.expect_err("an unknown repo");
-    assert!(refused.message().contains("valid repos: atlas, proto"), "{}", refused.message());
+    let refused = spawn(&mut harness, &session, ghost)
+        .await
+        .expect_err("an unknown repo");
+    assert!(
+        refused.message().contains("valid repos: atlas, proto"),
+        "{}",
+        refused.message()
+    );
 }
 
 /// A spawn naming a branch is placed only on a protocol-2 worker; an older
@@ -223,8 +249,12 @@ async fn a_held_branch_is_refused_with_its_holder_named() {
 async fn new_checkout_fields_wait_for_a_protocol_two_worker() {
     let mut harness = connect().await.expect("a harness");
     let workspace = plain_workspace(&mut harness).await.expect("a workspace");
-    register(&mut harness, "old-worker", 0).await.expect("registers");
-    let (session, _root) = seed(&mut harness, "fence", "k-fence").await.expect("a session");
+    register(&mut harness, "old-worker", 0)
+        .await
+        .expect("registers");
+    let (session, _root) = seed(&mut harness, "fence", "k-fence")
+        .await
+        .expect("a session");
     let spawned = spawn(
         &mut harness,
         &session,
@@ -237,8 +267,15 @@ async fn new_checkout_fields_wait_for_a_protocol_two_worker() {
     .await
     .expect("queued, not refused");
     let placement = spawned.placement.expect("a placement");
-    assert_eq!(placement.state, i32::from(horde_proto::v1::PlacementState::Queued));
-    assert!(placement.reason.contains("workspace protocol 0"), "{}", placement.reason);
+    assert_eq!(
+        placement.state,
+        i32::from(horde_proto::v1::PlacementState::Queued)
+    );
+    assert!(
+        placement.reason.contains("workspace protocol 0"),
+        "{}",
+        placement.reason
+    );
 }
 
 /// gc resolves its targets from the Instance cache and the registry, splits
@@ -248,10 +285,18 @@ async fn new_checkout_fields_wait_for_a_protocol_two_worker() {
 async fn gc_targets_holders_and_commands_them() {
     let mut harness = connect().await.expect("a harness");
     let workspace = plain_workspace(&mut harness).await.expect("a workspace");
-    register(&mut harness, "new-worker", 2).await.expect("registers");
-    report_instance(&mut harness, "new-worker", &workspace).await.expect("reports");
-    register(&mut harness, "old-worker", 0).await.expect("registers");
-    report_instance(&mut harness, "old-worker", &workspace).await.expect("reports");
+    register(&mut harness, "new-worker", 2)
+        .await
+        .expect("registers");
+    report_instance(&mut harness, "new-worker", &workspace)
+        .await
+        .expect("reports");
+    register(&mut harness, "old-worker", 0)
+        .await
+        .expect("registers");
+    report_instance(&mut harness, "old-worker", &workspace)
+        .await
+        .expect("reports");
 
     let listed = harness
         .control
@@ -270,7 +315,11 @@ async fn gc_targets_holders_and_commands_them() {
         .control
         .collect_workspace_garbage(CollectWorkspaceGarbageRequest {
             workspace_definition_id: Some(WorkspaceDefinitionId::new(&workspace)),
-            worker_ids: vec![WorkerId::new("new-worker"), WorkerId::new("old-worker"), WorkerId::new("away")],
+            worker_ids: vec![
+                WorkerId::new("new-worker"),
+                WorkerId::new("old-worker"),
+                WorkerId::new("away"),
+            ],
             level: GcLevel::Hard.into(),
             dry_run: true,
             ..CollectWorkspaceGarbageRequest::default()
@@ -325,8 +374,12 @@ async fn gc_targets_holders_and_commands_them() {
 async fn delete_purge_requests_instance_removal_and_a_dry_run_keeps_the_definition() {
     let mut harness = connect().await.expect("a harness");
     let workspace = plain_workspace(&mut harness).await.expect("a workspace");
-    register(&mut harness, "new-worker", 2).await.expect("registers");
-    report_instance(&mut harness, "new-worker", &workspace).await.expect("reports");
+    register(&mut harness, "new-worker", 2)
+        .await
+        .expect("registers");
+    report_instance(&mut harness, "new-worker", &workspace)
+        .await
+        .expect("reports");
     let current = |harness: &mut Harness| {
         let mut control = harness.control.clone();
         let workspace = workspace.clone();
@@ -337,16 +390,22 @@ async fn delete_purge_requests_instance_removal_and_a_dry_run_keeps_the_definiti
                     name: String::new(),
                 })
                 .await
-                .map(|r| r.into_inner().definition.map(|d| d.etag).unwrap_or_default())
+                .map(|r| {
+                    r.into_inner()
+                        .definition
+                        .map(|d| d.etag)
+                        .unwrap_or_default()
+                })
         }
     };
-    let delete = |etag: String, purge: bool, force: bool, dry_run: bool| DeleteWorkspaceDefinitionRequest {
-        workspace_definition_id: Some(WorkspaceDefinitionId::new(&workspace)),
-        etag,
-        purge,
-        force,
-        dry_run,
-    };
+    let delete =
+        |etag: String, purge: bool, force: bool, dry_run: bool| DeleteWorkspaceDefinitionRequest {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new(&workspace)),
+            etag,
+            purge,
+            force,
+            dry_run,
+        };
 
     let tag = current(&mut harness).await.expect("exists");
     let refused = harness
@@ -363,7 +422,10 @@ async fn delete_purge_requests_instance_removal_and_a_dry_run_keeps_the_definiti
         .expect("a dry run")
         .into_inner();
     assert!(!dry.purge_request_id.is_empty());
-    assert!(current(&mut harness).await.is_ok(), "the dry run kept the definition");
+    assert!(
+        current(&mut harness).await.is_ok(),
+        "the dry run kept the definition"
+    );
 
     let purged = harness
         .control

@@ -36,21 +36,14 @@ impl Targets {
     /// Every Worker the request is folded into a command for.
     #[must_use]
     pub fn commanded(&self) -> Vec<String> {
-        self.targeted
-            .iter()
-            .chain(&self.offline)
-            .cloned()
-            .collect()
+        self.targeted.iter().chain(&self.offline).cloned().collect()
     }
 }
 
 /// Splits `workers` by what the registry says of each now. A pure function
 /// of the registry's answers, so the split is a truth table.
 #[must_use]
-pub fn split_targets(
-    workers: Vec<String>,
-    protocol_of: impl Fn(&str) -> Option<u32>,
-) -> Targets {
+pub fn split_targets(workers: Vec<String>, protocol_of: impl Fn(&str) -> Option<u32>) -> Targets {
     let mut targets = Targets::default();
     for worker in workers {
         match protocol_of(&worker) {
@@ -65,7 +58,11 @@ pub fn split_targets(
 /// The Workers a request names: the ones asked for, or every Worker the
 /// cache says holds a matching Instance.
 #[must_use]
-pub fn workers_for(core: &ServerCore, asked: &[WorkerId], definition_id: Option<&str>) -> Vec<String> {
+pub fn workers_for(
+    core: &ServerCore,
+    asked: &[WorkerId],
+    definition_id: Option<&str>,
+) -> Vec<String> {
     let mut workers: Vec<String> = if asked.is_empty() {
         core.instances.holders(definition_id)
     } else {
@@ -154,12 +151,13 @@ pub async fn branch_holder(
         return Ok(None);
     }
     core.sessions
-        .walk(crate::enrollment::is_session_stream, |state| {
-            match claimant(state, definition_id, branch) {
+        .walk(
+            crate::enrollment::is_session_stream,
+            |state| match claimant(state, definition_id, branch) {
                 Some(agent) => ControlFlow::Break((agent, state.session_id.clone())),
                 None => ControlFlow::Continue(()),
-            }
-        })
+            },
+        )
         .await
 }
 
@@ -203,7 +201,11 @@ mod tests {
         assert_eq!(targets.targeted, vec!["new"]);
         assert_eq!(targets.unsupported, vec!["old"]);
         assert_eq!(targets.offline, vec!["gone"]);
-        assert_eq!(targets.commanded(), vec!["new", "gone"], "an older worker is never commanded");
+        assert_eq!(
+            targets.commanded(),
+            vec!["new", "gone"],
+            "an older worker is never commanded"
+        );
         let newer = split_targets(vec!["v3".to_owned()], |_| Some(3));
         assert_eq!(newer.targeted, vec!["v3"]);
     }
@@ -241,7 +243,10 @@ mod tests {
     #[test]
     fn a_claim_is_a_live_agents_branch_in_its_own_workspace() {
         let state = state_with("agent-1", "feat/login", "ws-1");
-        assert_eq!(claimant(&state, "ws-1", "feat/login"), Some("agent-1".to_owned()));
+        assert_eq!(
+            claimant(&state, "ws-1", "feat/login"),
+            Some("agent-1".to_owned())
+        );
         assert_eq!(claimant(&state, "ws-2", "feat/login"), None);
         assert_eq!(claimant(&state, "ws-1", "feat/other"), None);
 

@@ -74,10 +74,9 @@ pub async fn resolve(
 
 /// Whether a rule runs cargo, and so needs the target-directory guard.
 fn is_cargo(command: &CommandSpec) -> bool {
-    command
-        .argv
-        .first()
-        .is_some_and(|program| Path::new(program).file_name().and_then(|n| n.to_str()) == Some("cargo"))
+    command.argv.first().is_some_and(|program| {
+        Path::new(program).file_name().and_then(|n| n.to_str()) == Some("cargo")
+    })
 }
 
 /// The cargo target directory relative to the repo, when it lies inside it.
@@ -89,7 +88,13 @@ async fn cargo_target_inside(repo_dir: &Path) -> Result<String, String> {
     let ran = tokio::time::timeout(
         Duration::from_secs(60),
         tokio::process::Command::new("cargo")
-            .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--offline",
+            ])
             .current_dir(repo_dir)
             .env_remove("CARGO_TARGET_DIR")
             .stdin(std::process::Stdio::null())
@@ -122,7 +127,9 @@ fn relative_inside(outer: &Path, inner: &Path) -> Option<String> {
     // The target dir may not exist yet; canonicalize its nearest parent.
     let inner = match std::fs::canonicalize(inner) {
         Ok(inner) => inner,
-        Err(_) => std::fs::canonicalize(inner.parent()?).ok()?.join(inner.file_name()?),
+        Err(_) => std::fs::canonicalize(inner.parent()?)
+            .ok()?
+            .join(inner.file_name()?),
     };
     let relative = inner.strip_prefix(&outer).ok()?;
     let relative = relative.to_str()?.to_owned();
@@ -130,7 +137,12 @@ fn relative_inside(outer: &Path, inner: &Path) -> Option<String> {
 }
 
 /// Runs one resolved reclaim in `repo_dir`, measuring what it freed.
-pub async fn run(repo_name: &str, repo_dir: &Path, resolved: &Resolved, default_timeout: Duration) -> RepoAction {
+pub async fn run(
+    repo_name: &str,
+    repo_dir: &Path,
+    resolved: &Resolved,
+    default_timeout: Duration,
+) -> RepoAction {
     let command = match resolved {
         Resolved::Skip(reason) => {
             return RepoAction {
@@ -208,8 +220,14 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
     };
     let tail = Arc::new(Mutex::new(Vec::new()));
     let readers = [
-        child.stdout.take().map(|out| collect(out, Arc::clone(&tail))),
-        child.stderr.take().map(|err| collect(err, Arc::clone(&tail))),
+        child
+            .stdout
+            .take()
+            .map(|out| collect(out, Arc::clone(&tail))),
+        child
+            .stderr
+            .take()
+            .map(|err| collect(err, Arc::clone(&tail))),
     ];
     let leader = child.id();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
@@ -248,7 +266,10 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
 async fn terminate(leader: Option<u32>, child: &mut tokio::process::Child) {
     if let Some(leader) = leader {
         crate::process::signal_spawned_group(leader, Signal::SIGTERM);
-        if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
+        if tokio::time::timeout(KILL_GRACE, child.wait())
+            .await
+            .is_err()
+        {
             crate::process::signal_spawned_group(leader, Signal::SIGKILL);
         }
     }
@@ -363,7 +384,11 @@ mod tests {
         // SAFETY of the claim: a variable the Worker has is not passed on
         // unless it is on the kept list.
         let ran = execute(
-            &["sh".to_owned(), "-c".to_owned(), "pwd; echo \"[$CARGO_TARGET_DIR]\"; env | wc -l".to_owned()],
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "pwd; echo \"[$CARGO_TARGET_DIR]\"; env | wc -l".to_owned(),
+            ],
             dir.path(),
             Duration::from_secs(10),
         )
@@ -371,7 +396,10 @@ mod tests {
         assert!(ran.succeeded, "{ran:?}");
         assert_eq!(ran.exit_code, 0);
         let canonical = std::fs::canonicalize(dir.path()).expect("canonical");
-        assert!(ran.output_tail.contains(&canonical.display().to_string()), "{ran:?}");
+        assert!(
+            ran.output_tail.contains(&canonical.display().to_string()),
+            "{ran:?}"
+        );
         assert!(ran.output_tail.contains("[]"), "{ran:?}");
     }
 
@@ -379,7 +407,11 @@ mod tests {
     async fn a_failing_command_reports_its_status_and_output() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ran = execute(
-            &["sh".to_owned(), "-c".to_owned(), "echo boom >&2; exit 3".to_owned()],
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "echo boom >&2; exit 3".to_owned(),
+            ],
             dir.path(),
             Duration::from_secs(10),
         )
@@ -393,12 +425,26 @@ mod tests {
     #[tokio::test]
     async fn a_missing_or_relative_program_is_refused_without_running() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let missing = execute(&["horde-no-such-program".to_owned()], dir.path(), Duration::from_secs(5)).await;
-        assert!(!missing.succeeded && missing.reason.contains("could not run"), "{missing:?}");
+        let missing = execute(
+            &["horde-no-such-program".to_owned()],
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            !missing.succeeded && missing.reason.contains("could not run"),
+            "{missing:?}"
+        );
         let relative = execute(&["./x".to_owned()], dir.path(), Duration::from_secs(5)).await;
-        assert!(!relative.succeeded && relative.reason.contains("neither"), "{relative:?}");
+        assert!(
+            !relative.succeeded && relative.reason.contains("neither"),
+            "{relative:?}"
+        );
         let empty = execute(&[], dir.path(), Duration::from_secs(5)).await;
-        assert!(!empty.succeeded && empty.reason.contains("empty"), "{empty:?}");
+        assert!(
+            !empty.succeeded && empty.reason.contains("empty"),
+            "{empty:?}"
+        );
     }
 
     /// A command past its timeout is killed with its whole group: a child it
@@ -441,7 +487,13 @@ mod tests {
     #[tokio::test]
     async fn a_skip_reports_its_reason_and_runs_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let action = run("atlas", dir.path(), &Resolved::Skip("no reclaim command".to_owned()), Duration::from_secs(1)).await;
+        let action = run(
+            "atlas",
+            dir.path(),
+            &Resolved::Skip("no reclaim command".to_owned()),
+            Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(action.outcome, i32::from(Outcome::Skipped));
         assert_eq!(action.reason, "no reclaim command");
         assert!(action.argv.is_empty());
@@ -514,7 +566,11 @@ mod tests {
         );
         let other = tempfile::tempdir().expect("tempdir");
         assert_eq!(relative_inside(dir.path(), other.path()), None);
-        assert_eq!(relative_inside(dir.path(), dir.path()), None, "the repo itself is not inside it");
+        assert_eq!(
+            relative_inside(dir.path(), dir.path()),
+            None,
+            "the repo itself is not inside it"
+        );
     }
 
     #[tokio::test]

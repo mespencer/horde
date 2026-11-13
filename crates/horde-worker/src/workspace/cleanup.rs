@@ -113,16 +113,29 @@ impl WorkspaceManager {
     ) -> WorkspaceCleanup {
         let instance_root = self.instance_root(definition_id);
         let Some(definition) = read_state_file(&instance_root).await else {
-            return self.event(definition_id, Some(record), CleanupTier::Soft, pass, Vec::new());
+            return self.event(
+                definition_id,
+                Some(record),
+                CleanupTier::Soft,
+                pass,
+                Vec::new(),
+            );
         };
         let mut actions = Vec::new();
-        for (located, resolved) in self.locate(definition_id, &definition, record, pass.policy).await
+        for (located, resolved) in self
+            .locate(definition_id, &definition, record, pass.policy)
+            .await
         {
             actions.push(if pass.dry_run {
                 would_reclaim(&located.name, &resolved)
             } else {
-                reclaim::run(&located.name, &located.checkout, &resolved, pass.policy.reclaim_timeout)
-                    .await
+                reclaim::run(
+                    &located.name,
+                    &located.checkout,
+                    &resolved,
+                    pass.policy.reclaim_timeout,
+                )
+                .await
             });
         }
         if !pass.dry_run {
@@ -141,7 +154,13 @@ impl WorkspaceManager {
                 let _ = ledger::write(&self.agents_dir(definition_id), &updated).await;
             }
         }
-        self.event(definition_id, Some(record), CleanupTier::Soft, pass, actions)
+        self.event(
+            definition_id,
+            Some(record),
+            CleanupTier::Soft,
+            pass,
+            actions,
+        )
     }
 
     /// Hard removal of one archived or orphaned checkout: every repo must be
@@ -158,11 +177,19 @@ impl WorkspaceManager {
         let instance_root = self.instance_root(definition_id);
         let Some(definition) = read_state_file(&instance_root).await else {
             return (
-                self.event(definition_id, Some(record), CleanupTier::Hard, pass, Vec::new()),
+                self.event(
+                    definition_id,
+                    Some(record),
+                    CleanupTier::Hard,
+                    pass,
+                    Vec::new(),
+                ),
                 false,
             );
         };
-        let located = self.locate(definition_id, &definition, record, pass.policy).await;
+        let located = self
+            .locate(definition_id, &definition, record, pass.policy)
+            .await;
         let mut proofs = Vec::new();
         for (repo, _) in &located {
             proofs.push(
@@ -183,7 +210,13 @@ impl WorkspaceManager {
                 self.retain(definition_id, record, &proofs).await;
             }
             return (
-                self.event(definition_id, Some(record), CleanupTier::Hard, pass, actions),
+                self.event(
+                    definition_id,
+                    Some(record),
+                    CleanupTier::Hard,
+                    pass,
+                    actions,
+                ),
                 false,
             );
         }
@@ -200,7 +233,13 @@ impl WorkspaceManager {
                 })
                 .collect();
             return (
-                self.event(definition_id, Some(record), CleanupTier::Hard, pass, actions),
+                self.event(
+                    definition_id,
+                    Some(record),
+                    CleanupTier::Hard,
+                    pass,
+                    actions,
+                ),
                 false,
             );
         }
@@ -208,7 +247,13 @@ impl WorkspaceManager {
             .remove_checkout(definition_id, record, &located, &proofs, force)
             .await;
         (
-            self.event(definition_id, Some(record), CleanupTier::Hard, pass, actions),
+            self.event(
+                definition_id,
+                Some(record),
+                CleanupTier::Hard,
+                pass,
+                actions,
+            ),
             removed,
         )
     }
@@ -373,7 +418,14 @@ impl WorkspaceManager {
                         .archived_pin_ttl
                         .is_some_and(|ttl| commit_older_than(&instance_repo, &pin, ttl));
                 let action = self
-                    .unpin_one(&instance_repo, &repo.name, &pin, &proof, expired, pass.dry_run)
+                    .unpin_one(
+                        &instance_repo,
+                        &repo.name,
+                        &pin,
+                        &proof,
+                        expired,
+                        pass.dry_run,
+                    )
                     .await;
                 let record = LedgerRecord {
                     agent_id: agent,
@@ -471,7 +523,10 @@ impl WorkspaceManager {
         if !live_agents.is_empty() {
             return (
                 refuse(
-                    format!("agents still live in this instance: {}", live_agents.join(", ")),
+                    format!(
+                        "agents still live in this instance: {}",
+                        live_agents.join(", ")
+                    ),
                     Vec::new(),
                 ),
                 None,
@@ -481,10 +536,10 @@ impl WorkspaceManager {
         let mut blocked = Vec::new();
         for record in self.records(definition_id).await {
             let (event, removed) = self.hard_remove(definition_id, &record, pass, force).await;
-            let refused = event
-                .repos
-                .iter()
-                .any(|action| action.outcome != i32::from(Outcome::Done) && action.outcome != i32::from(Outcome::WouldDo));
+            let refused = event.repos.iter().any(|action| {
+                action.outcome != i32::from(Outcome::Done)
+                    && action.outcome != i32::from(Outcome::WouldDo)
+            });
             if (!removed && !pass.dry_run) || refused {
                 blocked.push(format!("checkout of agent {}", record.agent_id));
             }
@@ -492,10 +547,15 @@ impl WorkspaceManager {
         }
         let mut unrecoverable = Vec::new();
         if !force {
-            blocked.extend(self.instance_blockers(&definition, relay_repo_url, pass).await);
+            blocked.extend(
+                self.instance_blockers(&definition, relay_repo_url, pass)
+                    .await,
+            );
         }
         for path in &definition.unmanaged_paths {
-            let bytes = reclaim::dir_size(&instance_root.join(path)).await.unwrap_or_default();
+            let bytes = reclaim::dir_size(&instance_root.join(path))
+                .await
+                .unwrap_or_default();
             if bytes > 0 || has_entries(&instance_root.join(path)) {
                 unrecoverable.push(RetainedFile {
                     path: path.clone(),
@@ -534,7 +594,13 @@ impl WorkspaceManager {
             }
         };
         let gone = action.outcome == i32::from(Outcome::Done);
-        events.push(self.event(definition_id, None, CleanupTier::Instance, pass, vec![action]));
+        events.push(self.event(
+            definition_id,
+            None,
+            CleanupTier::Instance,
+            pass,
+            vec![action],
+        ));
         let missing = gone.then(|| WorkspaceInstanceReport {
             workspace_definition_id: Some(WorkspaceDefinitionId::new(definition_id)),
             worker_id: Some(WorkerId::new(self.worker_id.clone())),
@@ -577,7 +643,11 @@ impl WorkspaceManager {
                     for reference in refs {
                         let proof = removal::reachable(&instance_repo, &reference, &keepers).await;
                         if !proof.is_lossless() {
-                            blocked.push(format!("repo {} {reference}: {}", repo.name, proof.reason()));
+                            blocked.push(format!(
+                                "repo {} {reference}: {}",
+                                repo.name,
+                                proof.reason()
+                            ));
                         }
                     }
                 }
@@ -662,7 +732,10 @@ fn commit_older_than(repo: &Path, reference: &str, ttl: std::time::Duration) -> 
     else {
         return false;
     };
-    let Ok(seconds) = String::from_utf8_lossy(&output.stdout).trim().parse::<i64>() else {
+    let Ok(seconds) = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i64>()
+    else {
         return false;
     };
     let age_ms = now_ms().saturating_sub(seconds.saturating_mul(1000));

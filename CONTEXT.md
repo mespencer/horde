@@ -87,7 +87,7 @@ The operator's recovery for a worker whose journal regressed (`horde worker rese
 A named set of 1..N repos an agent tree works in. Exists as a portable Definition and per-worker Instances.
 
 **Workspace Definition**:
-The portable description: repos, layout, unmanaged paths. Server-owned.
+The portable description: repos, layout, unmanaged paths, checkout mode, per-repo reclaim commands and cleanup overrides. Server-owned; always created deliberately, never from cwd on its own.
 
 **Workspace Instance**:
 A Definition materialized on one worker's disk. Worker-owned; server's view is cache.
@@ -97,7 +97,29 @@ _Avoid_: checkout (that's per-agent)
 How an agent occupies an instance: shared, worktree (default), or fresh-clone.
 
 **Unmanaged Path**:
-A directory in a workspace that git never covers and payloads never sync (datasets, weights, caches).
+A directory in a workspace that git never covers and payloads never sync (datasets, weights, caches). Lives once in the instance and is linked into every checkout.
+
+**Checkout**:
+One agent's private worktrees (or clones) of an instance's repos, under its own root, on its own branch. Recorded in a ledger beside it so it outlives a journal reset.
+_Avoid_: instance (that's per-worker)
+
+**Base**:
+The commit a checkout's repo starts from: the freshly fetched `origin/<default branch>` by default, a parent's committed HEAD for a child, or a commit, branch or tag a spawn names. Never the instance's own HEAD unless nothing else exists.
+
+**Checkout Mode**:
+Whether an agent checks out every repo of its workspace at spawn (all) or only the ones it names, the rest on demand through `workspace_checkout` (lazy).
+
+**Soft Reclaim**:
+Running a repo's reclaim command (`cargo clean` for a Rust repo) in a checkout; the worktree, branch and commits stay.
+
+**Hard Removal**:
+Deleting a checkout's worktree and branch after pinning its HEAD under `refs/horde/archived/<agent>`. Automatic only when provably lossless; otherwise only `gc --hard --force`.
+
+**Archive Pin**:
+The ref (`refs/horde/archived/<agent>`) that keeps a removed checkout's last commit reachable; dropped only when origin or the relay holds the commit.
+
+**Orphan**:
+A checkout on a worker's disk whose agent the worker no longer knows — what a journal reset leaves. Reported, soft-reclaimed at most, removed only by an explicit hard gc.
 
 ### Services
 
