@@ -119,6 +119,61 @@ async fn wrong_flags_refuse_by_name_from_the_binary() {
     );
 }
 
+/// The binary resolves its configuration in layers (ADR-0016): the state
+/// dir's config file over the defaults, a flag over the file, each printed
+/// with its origin by `--show-config --origin`; a file breaking a rule is a
+/// refusal naming the file and key. Bounded: a binary that ignored
+/// `--show-config` would run instead of exiting.
+#[tokio::test]
+async fn the_binary_layers_defaults_file_and_flags_and_refuses_a_bad_file() {
+    let state = tempfile::tempdir().expect("a temp dir");
+    let file = state.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[worker.workspace]\npin_scan_interval = \"2h\"\nreport_interval = \"10m\"\n",
+    )
+    .expect("writes");
+    let dir = state.path().to_string_lossy().into_owned();
+    let output = support::within(
+        "--show-config must print and exit",
+        tokio::process::Command::new(harness::admitted_daemon())
+            .args(["--state-dir", &dir, "--workspace-report-interval", "30s"])
+            .args(["--show-config", "--origin"])
+            .output(),
+    )
+    .await
+    .expect("the binary runs");
+    assert!(output.status.success(), "{output:?}");
+    let shown = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        "worker.workspace.scan_interval = 1m  # default".to_owned(),
+        format!(
+            "worker.workspace.pin_scan_interval = 2h  # file {}",
+            file.display()
+        ),
+        "worker.workspace.report_interval = 30s  # flag --workspace-report-interval".to_owned(),
+    ] {
+        assert!(shown.contains(&line), "{line} in:\n{shown}");
+    }
+
+    std::fs::write(&file, "[worker.workspace]\nreport_interval = 10\n").expect("writes");
+    let output = support::within(
+        "a bad config file must refuse, not run",
+        tokio::process::Command::new(harness::admitted_daemon())
+            .args(["--state-dir", &dir])
+            .output(),
+    )
+    .await
+    .expect("the binary runs");
+    assert!(!output.status.success());
+    let refusal = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        refusal.contains(&format!("worker config {}", file.display()))
+            && refusal.contains("worker.workspace.report_interval: expected a duration"),
+        "{refusal}"
+    );
+}
+
 /// A missing identity is a startup refusal that says how to enroll, not a
 /// silent plaintext fallback and not a retry loop. Bounded for the same
 /// reason as the flag refusal above: a daemon that wrongly resolved "no
