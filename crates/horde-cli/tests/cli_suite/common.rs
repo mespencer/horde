@@ -65,3 +65,46 @@ pub async fn send_notes(client: &mut Client, agent_id: &str, count: usize) -> Se
     }
     Ok(())
 }
+
+/// What a worker would journal when an agent's tool call escalates to a
+/// human: a permission when `questions` is empty, a question request
+/// otherwise. The control plane cannot author this — observed facts enter
+/// through the worker spine — so tests journal it the way a worker does.
+pub fn escalation(
+    agent_id: &str,
+    request_id: &str,
+    rendered: &str,
+    questions: Vec<horde_proto::v1::Question>,
+) -> horde_proto::v1::Event {
+    use horde_proto::v1::{
+        AgentId, Event, PermissionRequest, PermissionRequestId, PermissionRequested,
+        ProposedToolCall, event::Kind,
+    };
+    let tool_name = if questions.is_empty() {
+        "Bash"
+    } else {
+        "AskUserQuestion"
+    };
+    Event {
+        agent_id: Some(AgentId::new(agent_id)),
+        occurred_at: None,
+        idempotency_key: format!("perm-{request_id}"),
+        kind: Some(Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                agent_id: Some(AgentId::new(agent_id)),
+                tool_call: Some(ProposedToolCall {
+                    tool_name: tool_name.to_owned(),
+                    input: None,
+                    rendered: rendered.to_owned(),
+                    questions,
+                }),
+                tree_path: vec!["tui".to_owned(), "runner".to_owned()],
+                permission_mode: "manual".to_owned(),
+                escalated_from: 0,
+                expires_at: None,
+                forward: None,
+            }),
+        })),
+    }
+}

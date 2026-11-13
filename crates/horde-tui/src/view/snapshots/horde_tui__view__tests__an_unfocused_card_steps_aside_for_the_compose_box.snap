@@ -1,0 +1,28 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: drawn(&app)
+---
+"  ⎿ running 12 tests                                                            "
+"    test a ... ok                                                               "
+"    test b ... FAILED                                                           "
+"    … +2 lines (ctrl-o to expand)                                               "
+"                                                                                "
+"● One test fails: `b` expects a trailing newline. I'll ask a reviewer to check  "
+"  the fix.                                                                      "
+"                                                                                "
+"↳ spawned reviewer                                                              "
+"                                                                                "
+"◆ needs you: rm x                                                               "
+"╭─ Permission · ci-fix > reviewer ─────────────────────────────────────────────╮"
+"│ The agent wants to run:                                                      │"
+"│   rm x                                                                       │"
+"│ mode manual                                                                  │"
+"│ ❯ 1. Yes                                                                     │"
+"│   2. Yes, and don't ask again this session                                   │"
+"│   3. No                                                                      │"
+"╰─ tab to answer ──────────────────────────────────────────────────────────────╯"
+"╭──────────────────────────────────────────────────────────────────────────────╮"
+"│› wait, why?                                                                  │"
+"╰──────────────────────────────────────────────────────────────────────────────╯"
+" enter send · alt-enter newline · / commands · ctrl-t agents · ? help           "
+" ci-fix · ci-fix · claude · opus · on gpu-box · unspecified · ● live            "

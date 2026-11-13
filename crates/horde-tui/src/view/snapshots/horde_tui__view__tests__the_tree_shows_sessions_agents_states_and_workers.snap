@@ -1,0 +1,28 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: drawn(&app)
+---
+" horde  1:session  2:agents  3:inbox 1  4:workspaces  5:usage  6:logs  7:forward"
+"                                                                                "
+"  ci-fix  s1  active  1 waiting                                                 "
+"❯   ci-fix                 unspecified      gpu-box        opus                 "
+"      reviewer             unspecified      gpu-box          1 waiting          "
+"  docs  s2  active                                                              "
+"    docs                   LOST             worker-9                            "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" enter attach · n new session · x archive · r refresh · esc back · q quit       "
+" not attached · ● live                                                          "

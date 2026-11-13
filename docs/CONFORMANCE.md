@@ -28,7 +28,7 @@ citations are for `9218ac2`.
 | §8 Git backbone, relay, blob store | CONFORMS (as built) | Relay mounted by `--relay-bind`; dirty trees refused on the stamp path (`horde-worker/src/share.rs:139-144`); blob GC absent by design. |
 | §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. MCP-spawned children carry their parent's agent type, so allowlists resolve for them (`horde-server/src/lineage.rs:28`; `hub.rs:152,194`) — checked at `9218ac2`. |
 | §10 Permissions | PARTIAL | Chain driver runs in `serve()` with `PermissionModes::shipped()` (`horde-server/src/startup.rs:443-451`); the judge is still a seam with no production implementation. |
-| §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. Archive and workspace/MCP edits stay unattributed. |
+| §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. The TUI was rebuilt in W12f (see "§11 TUI after W12f" below). Archive and workspace/MCP edits stay unattributed. |
 | §12 Usage and observability | PARTIAL | Usage folds conform; threshold alerts absent; OTLP plaintext only; hard budgets shape-only. |
 | §13 Configuration layering | ABSENT | No config file is loaded anywhere; tiers are `TierCatalog::shipped_defaults()` (`service/commands.rs:646`). |
 | §14–§15 | CONFORMS | Unchanged. |
@@ -52,6 +52,25 @@ citations are for `9218ac2`.
 | Trust boundary (ADR-0009) — per-method role table, unknown methods refused; worker from its certificate; dead letters to `horde-dead-letters`; worker sync scoped to its sessions | `crates/horde-server/src/trust.rs:129-205,270`; `service/ingest.rs:52,536,600`; `control_plane.rs:634-671,1840` | `trust.rs:344,496`; `ingest.rs:807,1300`; `server_suite/trust.rs:390` |
 | Harness isolation (ADR-0010) — `CLAUDE_CONFIG_DIR`/`CODEX_HOME` under `<state>/harness/<provider>`; MCP tokens in env or 0600 files; one process group per harness, leftovers swept at start | `crates/horde-worker/src/harness.rs:42`; `claude.rs:19`; `codex.rs:45,324`; `process.rs:223,519` | `claude.rs:542,637`; `worker_suite/supervision.rs:897,940,1037` |
 | Wire limits — 16 MiB messages and 1 MiB push batches on the worker spine; 64 KiB output chunks | `crates/horde-proto/src/limits.rs:14,19`; `horde-server/src/transport.rs:133`; `horde-worker/src/client.rs:54`; `runtime/shape.rs:25` | `limits.rs:26`; `shape.rs:319` |
+
+### §11 TUI after W12f
+
+The TUI is a pure state machine in `horde-tui`: server updates and keys go in, directives come out (`crates/horde-tui/src/app.rs`). Keys become intents through lookup tables (`keys.rs:88-215`), events fold into per-agent transcripts (`transcript.rs:196`), and rendering is a function of the state (`view/mod.rs:24`). The runtime in `horde-cli` maps each directive to one client verb (`crates/horde-cli/src/tui.rs:314,329,350,377`), so CLI parity holds by construction.
+
+| §11 claim | Verdict | Implementation | Proving test |
+|---|---|---|---|
+| Two zoom levels; detach to the overview and back without restarting | CONFORMS | ctrl-t, alt-1…7 and `/agents` switch views (`keys.rs:88`); the tree attaches any session or agent (`app.rs:579`). Opening the tree or inbox after an attach widens the replay, and the runtime reopens its one stream with cursors just past what it has folded (`app.rs:450,746`; `tui.rs:206`) | `cli_suite/tui_pty.rs:322`; `cli_suite/tui_drive.rs:510` |
+| Attached to a session: the top-level agent, prompts from the whole tree, stamped with the tree path | CONFORMS | The view shows the steer target's transcript (`app.rs:475`); the front prompt is the oldest in scope, as an inline card (`app.rs:553`) | `view/tests.rs:146,179`; `cli_suite/tui_pty.rs:502` |
+| Attached to a subagent: that subtree's prompts plus a passive badge | CONFORMS | `app.rs:530,547`; the stream is scoped server-side (`tui.rs:286`) | `view/tests.rs:249` |
+| Global inbox, answerable in place | CONFORMS | `app.rs:501`; y, n and digits answer the selected entry, enter opens its card (`keys.rs:154`) | `view/tests.rs:344`; `cli_suite/tui_drive.rs:173` |
+| Steering vs interrupt: two verbs | CONFORMS | enter queues for the turn boundary, ctrl-s and `/now` send with interrupt delivery, esc on a working agent and ctrl-x interrupt (`keys.rs:105-134`; `tui.rs:377`) | `cli_suite/tui_pty.rs:420,449`; `cli_suite/tui_drive.rs:258` |
+| Questions answerable from the TUI (W12c) | CONFORMS | One card steps through several questions; multi-select toggles, free text is typed, secrets are masked (`prompt.rs:92`) | `view/tests.rs:192,559,572`; `cli_suite/tui_pty.rs:535` |
+| Stale-stream announcement | CONFORMS | 45 s of silence, heartbeats included, reads `stale` in the status line (`app.rs:87,691`) | `view/tests.rs:283` |
+| Status line: session, agent, worker, model, harness, connection | CONFORMS | `view/mod.rs:118` | `view/tests.rs:146` |
+| Workspaces view, tolerant of missing data | CONFORMS | Definitions with whatever instances the server reports; a definition whose instances cannot be fetched still shows (`tui.rs:421`) | `view/tests.rs:366,415`; `cli_suite/tui_drive.rs:532` |
+| Usage view (§12 reporting), display only | CONFORMS | Per agent and per tree path, scoped to the attached session, with account headroom (`tui.rs:444`) | `view/tests.rs:424,468`; `cli_suite/tui_drive.rs:532` |
+| Logs view | PLACEHOLDER | A labelled pane with no RPC behind it: `horde logs` lands with W12h (ADR-0015) | `view/tests.rs:480` |
+| Slash commands | CONFORMS | One table drives the parser, the completion menu and `/help` (`slash.rs:53`) | `view/tests.rs:224,487`; `cli_suite/tui_drive.rs:470` |
 
 ### Status of the W7d fix list (Part 2, (a))
 

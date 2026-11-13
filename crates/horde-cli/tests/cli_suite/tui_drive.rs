@@ -14,13 +14,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::common::{Setup, journal_event, seeded, serve};
+use crate::common::{Setup, escalation, journal_event, seeded, serve};
 use horde_cli::tui::drive;
 use horde_cli::{Client, ClientError};
-use horde_proto::v1::{
-    AgentId, Event, PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall,
-    event::Kind,
-};
 use horde_tui::{App, Screen};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -110,34 +106,6 @@ impl Harness {
     }
 }
 
-/// What a worker would journal when an agent's tool call escalates to a
-/// human. The control plane cannot author this — observed facts enter through
-/// the worker spine — so the test journals it the way a worker does.
-fn escalation(agent_id: &str, request_id: &str, rendered: &str) -> Event {
-    Event {
-        agent_id: Some(AgentId::new(agent_id)),
-        occurred_at: None,
-        idempotency_key: format!("perm-{request_id}"),
-        kind: Some(Kind::PermissionRequested(PermissionRequested {
-            request: Some(PermissionRequest {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                agent_id: Some(AgentId::new(agent_id)),
-                tool_call: Some(ProposedToolCall {
-                    tool_name: "Bash".to_owned(),
-                    input: None,
-                    rendered: rendered.to_owned(),
-                    questions: Vec::new(),
-                }),
-                tree_path: vec!["tui".to_owned(), "runner".to_owned()],
-                permission_mode: "manual".to_owned(),
-                escalated_from: 0,
-                expires_at: None,
-                forward: None,
-            }),
-        })),
-    }
-}
-
 /// Whether this session's feed carries a line with this label whose text
 /// contains the needle — the shape every round-trip assertion here takes.
 fn feed_has(app: &App, session_id: &str, label: &str, needle: &str) -> bool {
@@ -189,7 +157,7 @@ async fn inbox_with_one_escalation(title: &str, request_id: &str) -> Setup<(Stri
     journal_event(
         &endpoint,
         &session_id,
-        escalation(&root, request_id, "docker rm x"),
+        escalation(&root, request_id, "docker rm x", Vec::new()),
     )
     .await?;
 
@@ -245,22 +213,26 @@ async fn n_denies_with_the_tui_reason() {
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
-#[tokio::test]
-async fn composing_in_an_attached_session_sends_a_real_assignment() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-send")
-        .await
-        .expect("a seeded session");
-
-    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
-        .await
-        .expect("a running loop");
+/// Seeds a session and hands back a loop attached to it, once the replay has
+/// taught the app its root agent — the shared preamble of the compose, note,
+/// send-now and interrupt round trips.
+async fn attached_to_seeded(title: &str) -> Setup<(String, Harness)> {
+    let endpoint = serve().await?;
+    let (_, session_id, _) = seeded(&endpoint, title).await?;
+    let mut harness = start(&endpoint, App::attached(session_id.clone(), None)).await?;
     harness
         .state("the replay to teach the app its root agent", |app| {
             app.steer_target().is_some()
         })
+        .await?;
+    Ok((session_id, harness))
+}
+
+#[tokio::test]
+async fn composing_in_an_attached_session_sends_a_real_assignment() {
+    let (session_id, mut harness) = attached_to_seeded("tui-send")
         .await
-        .expect("the root agent arrives via the session's own AgentSpawned event");
+        .expect("a loop attached to a seeded session whose root agent is known");
 
     harness
         .type_line("fix the flaky test")
@@ -275,33 +247,22 @@ async fn composing_in_an_attached_session_sends_a_real_assignment() {
         .await
         .expect("the send must come back as an AssignmentSent event");
 
-    // Esc detaches (the compose line is empty again after the send), then q.
-    harness.press(KeyCode::Esc).await.expect("detach");
+    // Ctrl-T leaves the transcript for the session/agent tree, then q.
+    harness.press_ctrl('t').await.expect("to the tree");
     harness
         .state("the overview to return", |app| {
             app.screen() == Screen::Overview
         })
         .await
-        .expect("esc with an empty compose line detaches");
+        .expect("ctrl-t opens the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
 #[tokio::test]
 async fn ctrl_x_interrupts_the_attached_agent_for_real() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-interrupt")
+    let (session_id, mut harness) = attached_to_seeded("tui-interrupt")
         .await
-        .expect("a seeded session");
-
-    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the root agent to be known", |app| {
-            app.steer_target().is_some()
-        })
-        .await
-        .expect("the root arrives via replay");
+        .expect("a loop attached to a seeded session whose root agent is known");
 
     harness.press_ctrl('x').await.expect("interrupt");
     harness
@@ -311,7 +272,7 @@ async fn ctrl_x_interrupts_the_attached_agent_for_real() {
         .await
         .expect("the interrupt must come back as a TurnInterrupted event");
 
-    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
@@ -359,9 +320,33 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
         "a refusal must not end the session view"
     );
 
-    harness.press(KeyCode::Esc).await.expect("clear nothing");
-    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// Two sessions, "the-target" and "the-other": a client, both session ids,
+/// and the neighbour's root agent.
+async fn target_and_neighbour(endpoint: &str) -> Setup<(Client, String, String, String)> {
+    let (mut client, target, _) = seeded(endpoint, "the-target").await?;
+    let (neighbour, other_root) = client.create_session("the-other", "key-2").await?;
+    let other = neighbour
+        .session_id
+        .map(|id| id.to_string())
+        .ok_or("a created session has an id")?;
+    Ok((client, target, other, other_root.to_string()))
+}
+
+/// A loop attached to `target` whose replay has caught up and carried
+/// something.
+async fn attached_and_replayed(endpoint: &str, target: &str) -> Setup<Harness> {
+    let mut harness = start(endpoint, App::attached(target.to_owned(), None)).await?;
+    harness
+        .state("the target's replay to catch up", |app| {
+            app.session(target)
+                .is_some_and(|session| session.caught_up && !session.feed.is_empty())
+        })
+        .await?;
+    Ok(harness)
 }
 
 /// Attaching replays the target session alone: another session's history
@@ -373,32 +358,16 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
 #[tokio::test]
 async fn attaching_replays_only_the_target_while_the_rest_stays_live() {
     let endpoint = serve().await.expect("a listening server");
-    let (mut client, target, _) = seeded(&endpoint, "the-target")
-        .await
-        .expect("a seeded target");
-    let (neighbour, other_root) = client
-        .create_session("the-other", "key-2")
-        .await
-        .expect("a neighbour session");
-    let other = neighbour
-        .session_id
-        .map(|id| id.to_string())
-        .expect("a created session has an id");
+    let (mut client, target, other, other_root) =
+        target_and_neighbour(&endpoint).await.expect("two sessions");
 
-    let mut harness = start(&endpoint, App::attached(target.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the target's replay to catch up", |app| {
-            app.session(&target)
-                .is_some_and(|session| session.caught_up && !session.feed.is_empty())
-        })
+    let mut harness = attached_and_replayed(&endpoint, &target)
         .await
         .expect("the target replays");
 
     client
         .send_assignment(
-            &other_root.to_string(),
+            &other_root,
             "live next door",
             horde_proto::v1::DeliveryMode::TurnBoundary,
             "",
@@ -418,7 +387,7 @@ async fn attaching_replays_only_the_target_while_the_rest_stays_live() {
         neighbour.feed
     );
 
-    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
@@ -486,4 +455,210 @@ async fn the_picker_paints_the_shared_rows_and_enter_chooses_the_pointed_session
             "the picker must paint the same row `session list` prints:\n{row}\n--- screen:\n{screen}"
         );
     }
+}
+
+/// `/new <title>` from the compose box creates a session on the server and
+/// attaches the view to it.
+#[tokio::test]
+async fn slash_new_creates_a_session_and_attaches_to_it() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, first, _) = seeded(&endpoint, "tui-before-new")
+        .await
+        .expect("a seeded session");
+
+    let mut harness = start(&endpoint, App::attached(first.clone(), None))
+        .await
+        .expect("a running loop");
+    harness
+        .type_line("/new fresh-start")
+        .await
+        .expect("compose");
+    harness.press(KeyCode::Enter).await.expect("run it");
+
+    let app = harness
+        .state("the view to attach to the new session", |app| {
+            app.attachment()
+                .is_some_and(|attachment| attachment.session_id != first)
+        })
+        .await
+        .expect("the created session becomes the attachment");
+    let created = app
+        .attachment()
+        .map(|attachment| attachment.session_id.clone())
+        .expect("attached");
+    let sessions = client.list_sessions(false).await.expect("the list");
+    assert!(
+        sessions.iter().any(|summary| summary.title == "fresh-start"
+            && summary.session_id.as_ref().map(ToString::to_string) == Some(created.clone())),
+        "the server holds the session the view attached to: {sessions:?}"
+    );
+
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// An attach replays only its target, but opening the tree widens the
+/// replay: the loop resubscribes and the neighbour's history arrives.
+#[tokio::test]
+async fn opening_the_tree_after_an_attach_replays_every_session() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, target, other, _) = target_and_neighbour(&endpoint).await.expect("two sessions");
+
+    let mut harness = attached_and_replayed(&endpoint, &target)
+        .await
+        .expect("the target replays");
+
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness
+        .state("the neighbour's history", |app| {
+            app.session(&other)
+                .is_some_and(|session| session.feed.iter().any(|line| line.label == "spawned"))
+        })
+        .await
+        .expect("the tree must replay the sessions it lists");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// The workspaces and usage views ask the real server and show its answer:
+/// the one definition it holds, and usage it has none of.
+#[tokio::test]
+async fn the_workspaces_and_usage_views_fill_from_the_server() {
+    let endpoint = serve().await.expect("a listening server");
+    seeded(&endpoint, "tui-views")
+        .await
+        .expect("a seeded session");
+
+    let mut client = Client::connect(&endpoint).await.expect("a client");
+    client
+        .create_workspace_definition(
+            "tui-ws",
+            vec![horde_proto::v1::WorkspaceRepo {
+                name: "horde".to_owned(),
+                remote_url: "https://example.invalid/horde.git".to_owned(),
+                default_branch: "main".to_owned(),
+                layout_path: "horde".to_owned(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("a workspace definition");
+
+    let mut harness = start(&endpoint, App::overview())
+        .await
+        .expect("a running loop");
+    harness.press(KeyCode::Char('w')).await.expect("workspaces");
+    let app = harness
+        .state("the workspaces answer", |app| app.workspaces().is_some())
+        .await
+        .expect("the workspaces view lists definitions from the server");
+    assert_eq!(app.screen(), Screen::Workspaces);
+    let names: Vec<&str> = app
+        .workspaces()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry.definition.name.as_str())
+        .collect();
+    assert_eq!(names, ["tui-ws"], "the server's definition is listed");
+
+    harness.press(KeyCode::Char('u')).await.expect("usage");
+    let app = harness
+        .state("the usage answer", |app| app.usage().is_some())
+        .await
+        .expect("the usage view queries the server");
+    assert_eq!(app.screen(), Screen::Usage);
+    assert_eq!(
+        app.usage().map(|usage| usage.scope.as_str()),
+        Some("every session"),
+        "with nothing attached, usage covers every session"
+    );
+
+    harness.press(KeyCode::Char('l')).await.expect("logs");
+    harness
+        .state("the logs placeholder", |app| app.screen() == Screen::Logs)
+        .await
+        .expect("the logs view opens");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// `x` on a tree row asks first; `y` archives the session on the server.
+#[tokio::test]
+async fn x_then_y_archives_the_selected_session() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, session_id, _) = seeded(&endpoint, "tui-archive")
+        .await
+        .expect("a seeded session");
+
+    let mut harness = start(&endpoint, App::overview())
+        .await
+        .expect("a running loop");
+    harness
+        .state("the session to be listed", |app| {
+            app.session(&session_id).is_some()
+        })
+        .await
+        .expect("listed");
+    harness.press(KeyCode::Char('x')).await.expect("ask");
+    harness
+        .state("the confirmation", |app| app.confirm().is_some())
+        .await
+        .expect("archive asks first");
+    harness.press(KeyCode::Char('y')).await.expect("confirm");
+    // The loop performs a key's directives before its next redraw, so the
+    // first frame without the question is drawn after the archive returned.
+    harness
+        .state("the confirmation to close", |app| app.confirm().is_none())
+        .await
+        .expect("answered");
+    let listed = client.list_sessions(false).await.expect("the list");
+    assert!(
+        listed.is_empty(),
+        "the session must leave the live list: {listed:?}"
+    );
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// `/note <text>` sends a note, not an assignment, to the attached agent.
+#[tokio::test]
+async fn slash_note_sends_a_real_note() {
+    let (session_id, mut harness) = attached_to_seeded("tui-note")
+        .await
+        .expect("a loop attached to a seeded session whose root agent is known");
+
+    harness.type_line("/note heads up").await.expect("compose");
+    harness.press(KeyCode::Enter).await.expect("run it");
+    let app = harness
+        .state("the note to round-trip", |app| {
+            feed_has(app, &session_id, "note", "heads up")
+        })
+        .await
+        .expect("the note must come back as a NoteSent event");
+    assert!(
+        !feed_has(&app, &session_id, "assign", "heads up"),
+        "a note is not an assignment"
+    );
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// Ctrl-S sends the compose text with interrupt delivery: it reaches the
+/// agent as an assignment at once rather than queueing.
+#[tokio::test]
+async fn ctrl_s_sends_now() {
+    let (session_id, mut harness) = attached_to_seeded("tui-now")
+        .await
+        .expect("a loop attached to a seeded session whose root agent is known");
+
+    harness
+        .type_line("stop and do this")
+        .await
+        .expect("compose");
+    harness.press_ctrl('s').await.expect("send now");
+    harness
+        .state("the urgent assignment to round-trip", |app| {
+            feed_has(app, &session_id, "assign", "stop and do this")
+        })
+        .await
+        .expect("ctrl-s must send for real");
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness.quit_from_list_screen().await.expect("q exits");
 }

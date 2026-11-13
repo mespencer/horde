@@ -9,25 +9,22 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use horde_proto::v1::{
-    AgentLifecycleState, AgentOutputChannel, Event, EventEnvelope, PermissionOutcome,
-    PlacementState, ResultStatus, SessionLifecycleState, SessionSummary, event::Kind,
+use horde_proto::v1::{AgentOutputChannel, Event, EventEnvelope, SessionSummary, event::Kind};
+
+pub use crate::tree::AgentNode;
+use crate::tree::{note_facts, requested_model};
+pub use crate::words::{SHORT_ID_LEN, agent_lifecycle_name, placement_state_name, short_id};
+use crate::words::{
+    channel_name, permission_outcome_name, result_status_name, session_lifecycle_name,
 };
 
-/// One agent's place in the tree, learned from its `AgentSpawned` event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentNode {
-    /// Unset for the session's top-level agent.
-    pub parent: Option<String>,
-    /// Ancestry display names, root first, as the spawn event carried them.
-    pub tree_path: Vec<String>,
-}
-
 /// An escalation still awaiting a human. The inbox is a list of these.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingPermission {
     pub request_id: String,
     pub agent_id: String,
+    /// The tool the harness wants to run (`Bash`, `AskUserQuestion`).
+    pub tool_name: String,
     /// Ancestry for the approver: `["ci-fix", "reviewer", "test-runner"]`.
     pub tree_path: Vec<String>,
     /// Human-readable rendering of the proposed call, e.g. `docker rm x`.
@@ -42,13 +39,28 @@ pub struct PendingPermission {
 }
 
 /// One question a pending request asks, as the inbox shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingQuestion {
     /// The key its answer is filed under.
     pub id: String,
+    /// A short label for the question, e.g. "Colour"; may be empty.
+    pub header: String,
     pub question: String,
-    /// The option labels, in the order offered; answered by 1-based number.
-    pub options: Vec<String>,
+    /// The options, in the order offered; answered by 1-based number.
+    pub options: Vec<QuestionChoice>,
+    /// More than one option may be chosen.
+    pub multi_select: bool,
+    /// An answer outside the options is acceptable.
+    pub allows_free_text: bool,
+    /// The answer is a secret: typed text is never echoed.
+    pub secret: bool,
+}
+
+/// One option a question offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuestionChoice {
+    pub label: String,
+    pub description: String,
 }
 
 impl PendingPermission {
@@ -91,20 +103,17 @@ pub struct SessionState {
     /// session attached for a day must not grow the client without limit,
     /// and the log — not the feed — is the record.
     pub feed: VecDeque<FeedLine>,
+    /// Each agent's transcript, by agent id — the main view's content.
+    pub transcripts: BTreeMap<String, crate::transcript::Transcript>,
+    /// The highest sequence the *stream* delivered. Separate from `head`,
+    /// which summaries also raise: an event at or below this has been folded
+    /// already (a resubscription overlaps its predecessor) and is skipped.
+    pub stream_head: u64,
 }
 
 /// How many feed lines a session keeps. Far more than any terminal shows or
 /// a human scrolls back through; older lines fall off the front.
 pub const FEED_CAPACITY: usize = 2_000;
-
-/// How many characters of an id stand in for it when there is no name, once
-/// its kind stem is gone: the short-prefix convention git uses.
-pub const SHORT_ID_LEN: usize = 8;
-
-/// The kind stems server-minted ids open with (`session-…`, `agent-…`).
-/// Every id of a kind shares its stem, so a prefix that keeps it spends
-/// most of its characters saying nothing.
-const ID_STEMS: [&str; 2] = ["session-", "agent-"];
 
 impl SessionState {
     #[must_use]
@@ -136,6 +145,10 @@ impl SessionState {
 
     /// Folds one event from the stream into the view.
     pub fn apply(&mut self, envelope: &EventEnvelope) {
+        if self.already_folded(envelope.sequence) {
+            return;
+        }
+        self.stream_head = self.stream_head.max(envelope.sequence);
         self.head = self.head.max(envelope.sequence);
         let Some(event) = envelope.event.as_ref() else {
             // An event with no body is still a position in the log; dropping
@@ -150,9 +163,18 @@ impl SessionState {
         };
 
         self.fold(envelope.sequence, event);
+        note_facts(&mut self.agents, event);
+        crate::transcript::transcribe(&mut self.transcripts, &self.agents, event);
         if !is_internal(event) {
             self.push_feed(feed_line(envelope.sequence, event));
         }
+    }
+
+    /// Whether the stream already delivered this position. Position zero is
+    /// never a real sequence (the log counts from one), so it is never a
+    /// duplicate either.
+    fn already_folded(&self, sequence: u64) -> bool {
+        sequence != 0 && sequence <= self.stream_head
     }
 
     /// Appends one line, dropping the oldest once the feed is full.
@@ -179,12 +201,7 @@ impl SessionState {
     /// never saw spawn. Empty for session-scoped events, which have no agent.
     #[must_use]
     pub fn agent_name(&self, agent_id: &str) -> String {
-        self.agents
-            .get(agent_id)
-            .and_then(|node| node.tree_path.last())
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .unwrap_or_else(|| short_id(agent_id))
+        crate::tree::agent_name(&self.agents, agent_id)
     }
 
     /// The state-changing half of [`Self::apply`]: tree, inbox, lifecycle.
@@ -207,11 +224,15 @@ impl SessionState {
                 {
                     self.title = name.clone();
                 }
+                let requested = requested_model(spawned.spec.as_ref());
                 self.agents.insert(
                     agent_id,
                     AgentNode {
                         parent,
                         tree_path: spawned.tree_path.clone(),
+                        harness: requested.0,
+                        model: requested.1,
+                        ..AgentNode::default()
                     },
                 );
             }
@@ -226,6 +247,10 @@ impl SessionState {
                         PendingPermission {
                             request_id,
                             agent_id,
+                            tool_name: request
+                                .tool_call
+                                .as_ref()
+                                .map_or_else(String::new, |call| call.tool_name.clone()),
                             tree_path: request.tree_path.clone(),
                             rendered: request
                                 .tool_call
@@ -236,20 +261,7 @@ impl SessionState {
                             questions: request
                                 .tool_call
                                 .as_ref()
-                                .map(|call| {
-                                    call.questions
-                                        .iter()
-                                        .map(|question| PendingQuestion {
-                                            id: question.id.clone(),
-                                            question: question.question.clone(),
-                                            options: question
-                                                .options
-                                                .iter()
-                                                .map(|option| option.label.clone())
-                                                .collect(),
-                                        })
-                                        .collect()
-                                })
+                                .map(|call| call.questions.iter().map(pending_question).collect())
                                 .unwrap_or_default(),
                         },
                     );
@@ -317,6 +329,26 @@ impl SessionState {
     }
 }
 
+/// A wire question as the inbox holds it.
+fn pending_question(question: &horde_proto::v1::Question) -> PendingQuestion {
+    PendingQuestion {
+        id: question.id.clone(),
+        header: question.header.clone(),
+        question: question.question.clone(),
+        options: question
+            .options
+            .iter()
+            .map(|option| QuestionChoice {
+                label: option.label.clone(),
+                description: option.description.clone(),
+            })
+            .collect(),
+        multi_select: question.multi_select,
+        allows_free_text: question.allows_free_text,
+        secret: question.secret,
+    }
+}
+
 /// Whether an event is the harness talking to itself — warnings, retries,
 /// rate-limit notices (`HARNESS_DIAGNOSTIC`). Still folded, never fed: a
 /// human steering an agent reads what the agent said and what happened to
@@ -327,18 +359,6 @@ fn is_internal(event: &Event) -> bool {
         Some(Kind::AgentOutputChunk(chunk))
             if chunk.channel == AgentOutputChannel::HarnessDiagnostic as i32
     )
-}
-
-/// The first [`SHORT_ID_LEN`] characters of an id after its kind stem —
-/// `session-18f3a2b4c5d6-0` shows as `18f3a2b4`. Display only: unlike the
-/// CLI's resolvable short ids, nothing parses this back.
-#[must_use]
-pub fn short_id(id: &str) -> String {
-    let unstemmed = ID_STEMS
-        .iter()
-        .find_map(|stem| id.strip_prefix(stem))
-        .unwrap_or(id);
-    unstemmed.chars().take(SHORT_ID_LEN).collect()
 }
 
 /// Renders one event into its feed line. Total: an event kind this build does
@@ -550,90 +570,19 @@ fn joined(state: &str, reason: &str) -> String {
     }
 }
 
-fn channel_name(channel: i32) -> &'static str {
-    match AgentOutputChannel::try_from(channel) {
-        Ok(AgentOutputChannel::Assistant) => "assistant",
-        Ok(AgentOutputChannel::Reasoning) => "reasoning",
-        Ok(AgentOutputChannel::ToolCall) => "tool call",
-        Ok(AgentOutputChannel::ToolResult) => "tool result",
-        Ok(AgentOutputChannel::HarnessDiagnostic) => "harness",
-        _ => "output",
-    }
-}
-
-fn result_status_name(status: i32) -> &'static str {
-    match ResultStatus::try_from(status) {
-        Ok(ResultStatus::Success) => "success",
-        Ok(ResultStatus::Partial) => "partial",
-        Ok(ResultStatus::Blocked) => "blocked",
-        _ => "unspecified",
-    }
-}
-
-fn permission_outcome_name(outcome: i32) -> &'static str {
-    match PermissionOutcome::try_from(outcome) {
-        Ok(PermissionOutcome::Allow) => "allowed",
-        Ok(PermissionOutcome::Deny) => "denied",
-        _ => "unspecified",
-    }
-}
-
-/// The word an agent lifecycle state renders as — public for the same
-/// one-vocabulary reason as [`placement_state_name`]: the CLI's `sync` and
-/// `agent status` say these words too.
-#[must_use]
-pub fn agent_lifecycle_name(state: i32) -> &'static str {
-    match AgentLifecycleState::try_from(state) {
-        Ok(AgentLifecycleState::Queued) => "queued",
-        Ok(AgentLifecycleState::Starting) => "starting",
-        Ok(AgentLifecycleState::Running) => "running",
-        Ok(AgentLifecycleState::WaitingOnChild) => "waiting on child",
-        Ok(AgentLifecycleState::WaitingOnHuman) => "waiting on human",
-        Ok(AgentLifecycleState::Idle) => "idle",
-        Ok(AgentLifecycleState::Archived) => "archived",
-        Ok(AgentLifecycleState::Failed) => "failed",
-        _ => "unspecified",
-    }
-}
-
-fn session_lifecycle_name(state: i32) -> &'static str {
-    match SessionLifecycleState::try_from(state) {
-        Ok(SessionLifecycleState::Active) => "active",
-        Ok(SessionLifecycleState::Archived) => "archived",
-        _ => "unspecified",
-    }
-}
-
-/// The word a placement state renders as.
-///
-/// Public because the CLI's renderer says the same words for the same wire
-/// values — two frontends, one vocabulary (DESIGN.md §11) — and a private
-/// copy over there was a duplicate block the gate rightly counted.
-#[must_use]
-pub fn placement_state_name(state: i32) -> &'static str {
-    match PlacementState::try_from(state) {
-        Ok(PlacementState::Placed) => "placed",
-        Ok(PlacementState::Queued) => "queued",
-        Ok(PlacementState::Expired) => "expired",
-        Ok(PlacementState::Cancelled) => "cancelled",
-        Ok(PlacementState::Lost) => "lost",
-        _ => "unspecified",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use horde_proto::v1::{
         AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
-        AgentResult, AgentSpawned, Assignment, AssignmentSent, Event, EventEnvelope, Note,
-        NoteSent, PermissionDecided, PermissionDecision, PermissionOutcome, PermissionRequest,
-        PermissionRequestId, PermissionRequested, Placement, PlacementChanged, PlacementState,
-        ProposedToolCall, ResultReported, ResultStatus, SessionId, SessionLifecycleChanged,
-        SessionLifecycleState, SessionSummary, TurnInterrupted, UsageRecorded,
-        WorkspaceInstanceChanged, WorkspaceInstanceReport, event::Kind,
+        AgentResult, Assignment, AssignmentSent, EventEnvelope, Note, NoteSent, PermissionDecided,
+        PermissionOutcome, PermissionRequested, Placement, PlacementChanged, PlacementState,
+        ResultReported, ResultStatus, SessionId, SessionLifecycleChanged, SessionLifecycleState,
+        SessionSummary, TurnInterrupted, UsageRecorded, WorkspaceInstanceChanged,
+        WorkspaceInstanceReport, event::Kind,
     };
 
     use super::{AgentNode, FEED_CAPACITY, SessionState, short_id};
+    use crate::fixtures::{assignment, decided, envelope, requested, spawned};
 
     fn chunk(channel: AgentOutputChannel, text: &str) -> Kind {
         Kind::AgentOutputChunk(AgentOutputChunk {
@@ -645,6 +594,23 @@ mod tests {
 
     /// The feed keeps the newest [`FEED_CAPACITY`] lines and no more: the
     /// oldest falls off the front, exactly one per line past the cap.
+    /// A reopened stream re-delivers what was already folded; each position
+    /// folds once. Position zero is no position, so it always folds.
+    #[test]
+    fn a_redelivered_position_folds_once() {
+        let mut state = SessionState::new("s1");
+        let first = envelope(1, "a", assignment("do the thing"));
+        state.apply(&first);
+        state.apply(&first);
+        assert_eq!(state.feed.len(), 1, "the repeat is absorbed");
+        state.apply(&envelope(2, "a", assignment("and the next")));
+        assert_eq!(state.feed.len(), 2, "a new position still folds");
+        let unpositioned = envelope(0, "a", assignment("no position"));
+        state.apply(&unpositioned);
+        state.apply(&unpositioned);
+        assert_eq!(state.feed.len(), 4, "position zero is never a duplicate");
+    }
+
     #[test]
     fn the_feed_is_bounded_and_drops_its_oldest_lines() {
         let mut state = SessionState::new("s1");
@@ -712,56 +678,6 @@ mod tests {
         assert_eq!(short_id("abc"), "abc", "a short id never pads");
         assert_eq!(short_id("session-18f3a2b4c5d6-0"), "18f3a2b4");
         assert_eq!(short_id("session-key-1-root"), "key-1-ro");
-    }
-
-    /// One event at a log position, about one agent.
-    fn envelope(sequence: u64, agent: &str, kind: Kind) -> EventEnvelope {
-        let event = Event {
-            kind: Some(kind),
-            agent_id: (!agent.is_empty()).then(|| AgentId::new(agent)),
-            ..Event::default()
-        };
-        EventEnvelope {
-            sequence,
-            event: Some(event),
-            session_id: Some(SessionId::new("s1")),
-            ..EventEnvelope::default()
-        }
-    }
-
-    fn spawned(parent: Option<&str>, tree_path: &[&str]) -> Kind {
-        Kind::AgentSpawned(AgentSpawned {
-            tree_path: tree_path.iter().map(ToString::to_string).collect(),
-            parent_agent_id: parent.map(AgentId::new),
-            ..AgentSpawned::default()
-        })
-    }
-
-    fn requested(request_id: &str, rendered: &str) -> Kind {
-        let tool_call = ProposedToolCall {
-            rendered: rendered.to_owned(),
-            ..ProposedToolCall::default()
-        };
-        Kind::PermissionRequested(PermissionRequested {
-            request: Some(PermissionRequest {
-                permission_mode: "manual".to_owned(),
-                tree_path: vec!["ci-fix".to_owned(), "reviewer".to_owned()],
-                tool_call: Some(tool_call),
-                request_id: Some(PermissionRequestId::new(request_id)),
-                ..PermissionRequest::default()
-            }),
-        })
-    }
-
-    fn decided(request_id: &str, outcome: PermissionOutcome, reason: &str) -> Kind {
-        Kind::PermissionDecided(PermissionDecided {
-            decision: Some(PermissionDecision {
-                reason: reason.to_owned(),
-                outcome: outcome as i32,
-                request_id: Some(PermissionRequestId::new(request_id)),
-                ..PermissionDecision::default()
-            }),
-        })
     }
 
     #[test]
@@ -1170,6 +1086,7 @@ mod tests {
             AgentNode {
                 parent: Some("b".to_owned()),
                 tree_path: Vec::new(),
+                ..AgentNode::default()
             },
         );
         state.agents.insert(
@@ -1177,6 +1094,7 @@ mod tests {
             AgentNode {
                 parent: Some("a".to_owned()),
                 tree_path: Vec::new(),
+                ..AgentNode::default()
             },
         );
         assert!(!state.in_subtree("root-1", "a"));
@@ -1194,6 +1112,7 @@ mod tests {
                 AgentNode {
                     parent: Some(parent.to_owned()),
                     tree_path: Vec::new(),
+                    ..AgentNode::default()
                 },
             );
         }

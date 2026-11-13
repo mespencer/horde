@@ -62,6 +62,11 @@ const HELLO_CEILING: std::time::Duration = std::time::Duration::from_secs(20);
 /// killed outright.
 const TEARDOWN_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a child's exit report waits for the pump to read what the child
+/// printed last. The pipe outlives the process, so an exit is seen before its
+/// final lines are read; bounded because a grandchild can keep the pipe open.
+const DRAIN_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How much of a daemon's stdout is kept for the waits to read (64 KiB). The lines
 /// they wait on come first; a chatty daemon must not grow `up` without
 /// bound.
@@ -673,8 +678,10 @@ async fn await_hello(
                 error.report()
             )));
         }
-        if let Some(died) = owned.iter_mut().find_map(WatchedChild::exit_report) {
-            return Err(died);
+        for child in owned.iter_mut() {
+            if let Some(died) = child.exit_report().await {
+                return Err(died);
+            }
         }
         tokio::time::sleep(POLL).await;
     }
@@ -961,6 +968,8 @@ struct WatchedChild {
     name: String,
     child: tokio::process::Child,
     stdout: Arc<Mutex<String>>,
+    /// The task reading stdout, until an exit report has waited for it.
+    pump: Option<tokio::task::JoinHandle<()>>,
     /// Off during bring-up (the server's first lines carry the bootstrap
     /// token, which must not reach a screen), on once the machine is up.
     forwarding: Arc<AtomicBool>,
@@ -994,7 +1003,7 @@ impl WatchedChild {
             .ok_or_else(|| spawn_failure(&"no stdout pipe"))?;
         let stdout = Arc::new(Mutex::new(String::new()));
         let forwarding = Arc::new(AtomicBool::new(false));
-        tokio::spawn(pump(
+        let pump = tokio::spawn(pump(
             out,
             name.to_owned(),
             Arc::clone(&stdout),
@@ -1005,6 +1014,7 @@ impl WatchedChild {
             name: name.to_owned(),
             child,
             stdout,
+            pump: Some(pump),
             forwarding,
         })
     }
@@ -1015,8 +1025,11 @@ impl WatchedChild {
 
     /// The refusal for a child that has exited, carrying what it printed —
     /// `None` while it runs.
-    fn exit_report(&mut self) -> Option<ClientError> {
+    async fn exit_report(&mut self) -> Option<ClientError> {
         let status = self.child.try_wait().ok().flatten()?;
+        if let Some(pump) = self.pump.take() {
+            let _drained_or_ceiling = tokio::time::timeout(DRAIN_CEILING, pump).await;
+        }
         Some(ClientError::Up(format!(
             "{} exited ({status}) during bring-up; its output:\n{}",
             self.name,
@@ -1038,7 +1051,7 @@ impl WatchedChild {
             if holds(&snapshot) {
                 return Ok(snapshot);
             }
-            if let Some(died) = self.exit_report() {
+            if let Some(died) = self.exit_report().await {
                 return Err(died);
             }
             if tokio::time::Instant::now() >= deadline {

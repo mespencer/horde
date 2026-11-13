@@ -26,6 +26,10 @@ fn spawn_horde(endpoint: &str, args: &[&str]) -> Setup<PtyProcess> {
     PtyProcess::spawn(command)
 }
 
+/// A word only the attached session view paints: its hint line and compose
+/// placeholder offer "/ commands"; the picker never says it.
+const ATTACHED: &str = "commands";
+
 const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const HIDE_CURSOR: &str = "\x1b[?25l";
@@ -63,7 +67,7 @@ async fn bare_horde_with_one_session_attaches_it_directly() {
     // Needles are single words: the terminal skips blank cells with cursor
     // moves, so a phrase never paints as one contiguous byte run.
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("one live session means the session view, no picker");
     horde
@@ -92,7 +96,7 @@ async fn bare_horde_with_no_sessions_creates_an_auto_named_session_and_attaches(
 
     let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("an empty server still puts the human in front of a session");
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
@@ -147,7 +151,7 @@ async fn bare_horde_with_several_sessions_opens_the_picker_and_enter_attaches() 
     horde.type_bytes(b"j").expect("j reaches the pty");
     horde.type_bytes(b"\r").expect("enter reaches the pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("enter on a session row attaches it");
 
@@ -177,7 +181,7 @@ async fn the_pickers_top_row_creates_and_attaches_a_new_session() {
     // Enter with the cursor still on the top row: the "new session" create.
     horde.type_bytes(b"\r").expect("enter reaches the pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("the top row creates and attaches");
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
@@ -208,7 +212,7 @@ async fn horde_new_with_a_terminal_creates_and_attaches() {
     let mut horde =
         spawn_horde(&endpoint, &["new", "fresh-start"]).expect("the binary spawns in a pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("new is create-then-attach");
     horde
@@ -257,7 +261,7 @@ async fn leave_the_picker_with(key: &[u8]) -> Setup<()> {
         "a dismissal exits cleanly, got {status:?}"
     );
     assert!(
-        !seen.contains("attached:"),
+        !seen.contains(ATTACHED),
         "nothing may have been attached: {seen:?}"
     );
     Ok(())
@@ -276,7 +280,7 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
     let mut horde =
         spawn_horde(&endpoint, &["attach", "tui-pty-attach"]).expect("the binary spawns in a pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("the session view must reach the real terminal");
     horde
@@ -284,9 +288,9 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
         .await
         .expect("the name resolved to the seeded session's id");
     horde
-        .await_painted("spawned")
+        .await_painted("Queued")
         .await
-        .expect("the replayed root spawn must be painted into the feed");
+        .expect("the replayed root's placement must be painted into its transcript");
 
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
     await_restored(&mut horde)
@@ -304,16 +308,20 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
 /// drops its sender at birth; `drive` sees the closed channel, requests quit,
 /// and exits cleanly — indistinguishable, from outside, from ctrl-c working.
 /// The tests above type ctrl-c and assert a clean exit, so they pass either
-/// way. Here Esc must swap the attach view for the overview (which paints
-/// "sessions", a word the session view never shows), and `i` must swap that
-/// for the inbox, whose footer paints "allow". The route also pins that the
-/// overview is still reachable behind the front door: attach first, Esc out.
-/// Under a severed input path the process is gone before Esc lands and the
-/// wait fails on the closed pty, without spending its ceiling.
+/// way. Here ctrl-t must swap the attach view for the session/agent tree
+/// (which marks the "(attached)" session, a word the session view never
+/// shows), and `i` must swap that for the inbox, which says nothing "needs"
+/// the human. The session's title shares no cell with that sentence: the
+/// terminal skips unchanged cells, and a shared letter would split the
+/// needle.
+/// The route also pins that the tree is still reachable behind the front
+/// door: attach first, ctrl-t out. Under a severed input path the process is
+/// gone before the key lands and the wait fails on the closed pty, without
+/// spending its ceiling.
 #[tokio::test]
 async fn a_typed_key_reaches_the_loop_and_repaints_the_screen() {
     let endpoint = serve().await.expect("a listening server");
-    seeded(&endpoint, "tui-pty-keys")
+    seeded(&endpoint, "quiet-quorum-quill")
         .await
         .expect("a seeded session");
 
@@ -321,24 +329,21 @@ async fn a_typed_key_reaches_the_loop_and_repaints_the_screen() {
     // Raw mode is on once the attach view has painted, so the keystrokes
     // below arrive at the running loop, not a half-initialised terminal.
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("one session, so the front door attaches before anything is typed");
 
-    // The needle is the overview footer's "inbox": the header repaints only
-    // the cells that changed under the attach header, so no header word is
-    // guaranteed a contiguous byte run — the footer's new words are.
-    horde.type_bytes(&[0x1b]).expect("esc reaches the pty");
+    horde.type_bytes(&[0x14]).expect("ctrl-t reaches the pty");
     horde
-        .await_painted("inbox")
+        .await_painted("(attached)")
         .await
-        .expect("esc must detach into the overview — typed bytes must reach the loop");
+        .expect("ctrl-t must open the tree — typed bytes must reach the loop");
 
     horde.type_bytes(b"i").expect("i reaches the pty");
     horde
-        .await_painted("allow")
+        .await_painted("needs")
         .await
-        .expect("i must swap the overview for the inbox");
+        .expect("i must swap the tree for the inbox");
 
     horde.type_bytes(b"q").expect("q reaches the pty");
     let status = horde.exit_status().await.expect("the TUI exits");
@@ -364,4 +369,232 @@ async fn attaching_to_a_missing_session_fails_before_the_terminal_is_touched() {
         !seen.contains("\u{1b}[?1049h"),
         "the alternate screen must never have been entered: {seen:?}"
     );
+}
+
+/// What the server's log says next in this session that `matches` picks out
+/// — how a pty test checks that a keystroke crossed the wire, not merely
+/// repainted the screen. The follow replays from the start, so an event
+/// written before the subscription opened is still found; the ceiling turns
+/// a keystroke that wrote nothing into a fast failure.
+async fn logged<T>(
+    endpoint: &str,
+    session_id: &str,
+    matches: impl FnMut(&horde_proto::v1::EventEnvelope) -> Option<T>,
+) -> Setup<T> {
+    let mut watcher = horde_cli::Client::connect(endpoint).await?;
+    let mut stream = watcher
+        .follow(&horde_cli::client::SyncOptions::new(session_id.to_owned()))
+        .await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.next_matching(matches),
+    )
+    .await
+    .map_err(|_| "the expected event never reached the log")??
+    .ok_or_else(|| "the stream ended before the expected event".into())
+}
+
+/// Attaches a pty to `title`'s session and waits for the view.
+async fn attached_pty(endpoint: &str, title: &str) -> Setup<PtyProcess> {
+    let mut horde = spawn_horde(endpoint, &["attach", title])?;
+    horde.await_painted(ATTACHED).await?;
+    Ok(horde)
+}
+
+/// Ctrl-C twice: the first may only clear a half-typed compose box.
+async fn quit(mut horde: PtyProcess) -> Setup<()> {
+    horde.type_bytes(&[0x03])?;
+    horde.type_bytes(&[0x03])?;
+    await_restored(&mut horde).await?;
+    let status = horde.exit_status().await?;
+    assert!(
+        status.success(),
+        "the TUI must exit cleanly, got {status:?}"
+    );
+    Ok(())
+}
+
+/// Typing into the compose box and pressing Enter queues a real assignment
+/// for the attached session's root agent.
+#[tokio::test]
+async fn enter_in_the_compose_box_sends_an_assignment() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, _) = seeded(&endpoint, "pty-send")
+        .await
+        .expect("a seeded session");
+    let mut horde = attached_pty(&endpoint, "pty-send").await.expect("attached");
+    // The root must be known before Enter can address it.
+    horde
+        .await_painted("Queued")
+        .await
+        .expect("the replay landed");
+
+    horde.type_bytes(b"fix the flaky test\r").expect("typed");
+    let sent = logged(&endpoint, &session_id, |envelope| {
+        match envelope.event.as_ref()?.kind.as_ref()? {
+            horde_proto::v1::event::Kind::AssignmentSent(sent) => {
+                sent.assignment.as_ref().map(|a| a.text.clone())
+            }
+            _ => None,
+        }
+    })
+    .await
+    .expect("the assignment reaches the log");
+    assert_eq!(sent, "fix the flaky test");
+    quit(horde).await.expect("a clean exit");
+}
+
+/// Ctrl-X interrupts the attached agent's turn on the server.
+#[tokio::test]
+async fn ctrl_x_interrupts_on_the_server() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, _) = seeded(&endpoint, "pty-interrupt")
+        .await
+        .expect("a seeded session");
+    let mut horde = attached_pty(&endpoint, "pty-interrupt")
+        .await
+        .expect("attached");
+    horde
+        .await_painted("Queued")
+        .await
+        .expect("the replay landed");
+
+    horde.type_bytes(&[0x18]).expect("ctrl-x");
+    let reason = logged(&endpoint, &session_id, |envelope| {
+        match envelope.event.as_ref()?.kind.as_ref()? {
+            horde_proto::v1::event::Kind::TurnInterrupted(interrupted) => {
+                Some(interrupted.reason.clone())
+            }
+            _ => None,
+        }
+    })
+    .await
+    .expect("the interrupt reaches the log");
+    assert_eq!(reason, "interrupted from the TUI");
+    quit(horde).await.expect("a clean exit");
+}
+
+/// The decision the log recorded for a request: its outcome and answers.
+async fn decision_for(
+    endpoint: &str,
+    session_id: &str,
+) -> Setup<(i32, std::collections::BTreeMap<String, Vec<String>>)> {
+    logged(endpoint, session_id, |envelope| {
+        match envelope.event.as_ref()?.kind.as_ref()? {
+            horde_proto::v1::event::Kind::PermissionDecided(decided) => {
+                let decision = decided.decision.as_ref()?;
+                let answers = decision
+                    .answers
+                    .iter()
+                    .map(|(id, answer)| (id.clone(), answer.values.clone()))
+                    .collect();
+                Some((decision.outcome, answers))
+            }
+            _ => None,
+        }
+    })
+    .await
+}
+
+/// A permission prompt waits inline in the session view, and `y` approves
+/// it there — the decision lands on the server's log.
+#[tokio::test]
+async fn y_approves_a_permission_inline() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, root) = seeded(&endpoint, "pty-approve")
+        .await
+        .expect("a seeded session");
+    crate::common::journal_event(
+        &endpoint,
+        &session_id,
+        crate::common::escalation(&root, "req-pty-1", "docker rm x", Vec::new()),
+    )
+    .await
+    .expect("an escalation");
+
+    let mut horde = attached_pty(&endpoint, "pty-approve")
+        .await
+        .expect("attached");
+    horde
+        .await_painted("Permission")
+        .await
+        .expect("the inline card paints");
+    horde.type_bytes(b"y").expect("approve");
+    let (outcome, answers) = decision_for(&endpoint, &session_id)
+        .await
+        .expect("the approval reaches the log");
+    assert_eq!(outcome, horde_proto::v1::PermissionOutcome::Allow as i32);
+    assert!(answers.is_empty(), "a permission carries no answers");
+    quit(horde).await.expect("a clean exit");
+}
+
+/// A request asking two questions is answered in place: a digit picks the
+/// first question's second option and moves on, Enter takes the second
+/// question's highlighted first option and submits both.
+#[tokio::test]
+async fn a_multi_question_request_is_answered_in_place() {
+    use horde_proto::v1::{Question, QuestionOption};
+    let option = |label: &str| QuestionOption {
+        label: label.to_owned(),
+        description: String::new(),
+    };
+    let question = |id: &str, text: &str, labels: [&str; 2]| Question {
+        id: id.to_owned(),
+        header: String::new(),
+        question: text.to_owned(),
+        options: labels.into_iter().map(option).collect(),
+        multi_select: false,
+        allows_free_text: false,
+        secret: false,
+    };
+
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, root) = seeded(&endpoint, "pty-answer")
+        .await
+        .expect("a seeded session");
+    crate::common::journal_event(
+        &endpoint,
+        &session_id,
+        crate::common::escalation(
+            &root,
+            "req-pty-2",
+            "AskUserQuestion",
+            vec![
+                question("when", "Publish when?", ["now", "later"]),
+                question("where", "Publish where?", ["main", "docs"]),
+            ],
+        ),
+    )
+    .await
+    .expect("a question escalation");
+
+    let mut horde = attached_pty(&endpoint, "pty-answer")
+        .await
+        .expect("attached");
+    horde
+        .await_painted("Question")
+        .await
+        .expect("the inline card paints");
+    horde.type_bytes(b"2").expect("pick later");
+    // The terminal repaints only changed cells, so the needle is the second
+    // question's own option, which shares no cell with the first's.
+    horde
+        .await_painted("docs")
+        .await
+        .expect("the card moves to question two");
+    horde.type_bytes(b"\r").expect("take main");
+    let (outcome, answers) = decision_for(&endpoint, &session_id)
+        .await
+        .expect("the answers reach the log");
+    assert_eq!(outcome, horde_proto::v1::PermissionOutcome::Allow as i32);
+    assert_eq!(
+        answers,
+        [
+            ("when".to_owned(), vec!["later".to_owned()]),
+            ("where".to_owned(), vec!["main".to_owned()]),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    quit(horde).await.expect("a clean exit");
 }
