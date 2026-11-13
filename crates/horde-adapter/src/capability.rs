@@ -241,6 +241,7 @@ pub struct Capabilities {
 impl Capabilities {
     /// A harness that supports nothing beyond running a turn.
     #[must_use]
+    // #[gamma::skip(fn_value.default, reason = "the body is `Self::default()` over a `Capabilities` that derives `Default`, so the mutant `Default::default()` is the same expression")]
     pub fn none() -> Self {
         Self::default()
     }
