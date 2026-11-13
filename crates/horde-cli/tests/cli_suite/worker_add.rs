@@ -124,7 +124,8 @@ struct Run {
     success: bool,
 }
 
-/// Runs the real `horde worker add <name> me@remote` as the operator.
+/// Runs the real `horde worker add <name> me@remote` as the operator,
+/// `--json` only when `extra` asks for it.
 /// Async: the server runs on this test's runtime.
 async fn worker_add(
     operator: &Operator,
@@ -138,7 +139,7 @@ async fn worker_add(
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_horde"))
         .args(["--endpoint", &operator.harness.main_endpoint()])
         .args(["--identity", &operator.identity.path().to_string_lossy()])
-        .args(["--json", "worker", "add", name, "me@remote"])
+        .args(["worker", "add", name, "me@remote"])
         .args(["--ssh", &remote.program("ssh")])
         .args(["--scp", &remote.program("scp")])
         .args(["--binary-dir", &worker_dir.to_string_lossy()])
@@ -161,7 +162,7 @@ async fn worker_add(
 async fn worker_add_bootstraps_a_machine_and_refuses_a_second_time() -> Setup<()> {
     let operator = operator().await?;
     let remote = Remote::new()?;
-    let run = worker_add(&operator, &remote, "box-ssh", &[]).await?;
+    let run = worker_add(&operator, &remote, "box-ssh", &["--json"]).await?;
     assert!(
         run.success,
         "worker add failed: {}\n{}",
@@ -218,7 +219,7 @@ async fn worker_add_bootstraps_a_machine_and_refuses_a_second_time() -> Setup<()
         "the token file is gone"
     );
 
-    let again = worker_add(&operator, &remote, "box-ssh", &[]).await?;
+    let again = worker_add(&operator, &remote, "box-ssh", &["--json"]).await?;
     assert!(!again.success);
     let refusal: serde_json::Value = serde_json::from_str(again.stderr.trim())?;
     assert_eq!(refusal["error"]["kind"], "worker_add");
@@ -242,12 +243,24 @@ async fn a_worker_that_cannot_join_is_refused_with_its_log() -> Setup<()> {
     std::fs::write(remote.home().join(".horde/worker"), "not a directory")?;
     let run = worker_add(&operator, &remote, "box-broken", &[]).await?;
     assert!(!run.success, "{}", run.stdout);
-    let refusal: serde_json::Value = serde_json::from_str(run.stderr.trim())?;
-    assert_eq!(refusal["error"]["kind"], "worker_add");
-    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    // A terminal run narrates its steps on stderr, then the refusal.
+    let progress: Vec<&str> = run.stderr.lines().take(3).collect();
+    assert_eq!(
+        progress,
+        [
+            "probing me@remote",
+            "installing into .horde/bin",
+            "starting the worker"
+        ],
+        "{}",
+        run.stderr
+    );
     assert!(
-        message.contains("the worker exited before its join was redeemed; its log ends:"),
-        "{message}"
+        run.stderr.contains(
+            "error: worker add: the worker exited before its join was redeemed; its log ends:"
+        ),
+        "{}",
+        run.stderr
     );
     assert!(!remote.home().join(".horde/join-token").exists());
     let identity = horde_identity::StoredIdentity::load(operator.identity.path())?;
@@ -309,10 +322,34 @@ async fn a_dry_run_prints_the_plan_and_touches_nothing() -> Setup<()> {
     assert_eq!(plan["dry_run"], true);
     assert_eq!(plan["steps"][0]["argv"][0], remote.program("ssh"));
     assert_eq!(plan["steps"][0]["step"], "probe");
+    let horde_dir = std::path::Path::new(env!("CARGO_BIN_EXE_horde"))
+        .parent()
+        .ok_or("the horde binary has a directory")?;
+    assert_eq!(plan["steps"][2]["step"], "copy");
+    assert_eq!(
+        plan["steps"][2]["argv"][2],
+        horde_dir.join("horde-worker").display().to_string(),
+        "by default the worker binary beside this horde is copied"
+    );
     assert_eq!(
         std::fs::read_dir(remote.home())?.count(),
         0,
         "nothing ran remotely"
     );
+
+    // --build-locally builds into CARGO_TARGET_DIR, when it is set.
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args(["--json", "worker", "add", "box", "me@remote", "--dry-run"])
+        .arg("--build-locally")
+        .env("CARGO_TARGET_DIR", "/elsewhere")
+        .output()
+        .await?;
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let copied = plan["steps"][2]["argv"][2].as_str().unwrap_or_default();
+    assert!(
+        copied.starts_with("/elsewhere/") && copied.ends_with("/release/horde-worker"),
+        "{plan}"
+    );
+    assert_eq!(plan["build"][0], "cargo");
     Ok(())
 }
