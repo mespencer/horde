@@ -127,19 +127,21 @@ pub fn observability(
     Ok((telemetry, file))
 }
 
-/// The binary's last act: what the file still holds queued is written, and
-/// export is flushed. Blocks; run it off the async runtime. Verdicts are
-/// discarded on purpose — a dead collector must not change an exit code.
+/// The binary's last act: what the file still holds queued is written
+/// (waiting at most `deadline`), and export is flushed. Blocks; run it off
+/// the async runtime. Returns whether the file took everything; the export
+/// verdict is discarded on purpose — a dead collector must not change an
+/// exit code.
 pub fn finish_observability(
     telemetry: Option<horde_observe::Telemetry>,
-    file: Option<horde_observe::FileLogging>,
-) {
-    if let Some(file) = file {
-        file.flush(Duration::from_secs(2));
-    }
+    file: Option<&horde_observe::FileLogging>,
+    deadline: Duration,
+) -> bool {
+    let flushed = file.is_none_or(|file| file.flush(deadline));
     if let Some(telemetry) = telemetry {
         let _ = telemetry.shutdown();
     }
+    flushed
 }
 
 /// What a remote read targets.
@@ -550,7 +552,10 @@ mod tests {
         let (telemetry, file) =
             observability(false, None, |_| None, Some(home.path().to_path_buf())).expect("off");
         assert!(telemetry.is_none() && file.is_none());
-        finish_observability(None, None);
+        assert!(
+            finish_observability(None, None, Duration::ZERO),
+            "nothing to flush"
+        );
         let (_, file) = observability(
             false,
             None,
@@ -559,9 +564,28 @@ mod tests {
         )
         .expect("on");
         let file = file.expect("the environment asked for a file");
-        file.with_default(|| tracing::info!(target: "horde_cli", "noted"));
-        finish_observability(None, Some(file));
-        assert!(home.path().join(".horde/client/logs").is_dir());
+        // A burst queued without waiting: a zero deadline cannot see it all
+        // written, a real one can.
+        let queued = 4000;
+        tracing::dispatcher::with_default(&file.dispatch(), || {
+            for n in 0..queued {
+                tracing::info!(target: "horde_cli", padding = %"p".repeat(512), "burst {n}");
+            }
+        });
+        assert!(
+            !finish_observability(None, Some(&file), Duration::ZERO),
+            "a backlog is not written in no time"
+        );
+        assert!(finish_observability(
+            None,
+            Some(&file),
+            Duration::from_secs(10)
+        ));
+        let written = horde_observe::reader::read_dir(file.dir(), Some("horde"))
+            .iter()
+            .filter(|record| record.message().starts_with("burst "))
+            .count();
+        assert_eq!(written, queued, "the last act flushed everything queued");
         let refused = observability(
             true,
             None,
@@ -812,6 +836,29 @@ mod tests {
             String::from_utf8(human).expect("utf8"),
             "--- redialing ---\n"
         );
+    }
+
+    /// Harness stderr carries the worker's boot too, but only a process's
+    /// own records can show it restarted.
+    #[test]
+    fn a_stderr_record_never_moves_the_boot_a_restart_is_judged_by() {
+        let mut out = Vec::new();
+        {
+            let mut printer = Printer {
+                out: &mut out,
+                format: Format::Human,
+                boot: None,
+            };
+            for line in [
+                r#"{"ts":"t1","msg":"a","boot":"b1","seq":1}"#,
+                r#"{"ts":"t2","stream":"stderr","line":"s","boot":"b2","seq":1}"#,
+                r#"{"ts":"t3","msg":"c","boot":"b1","seq":2}"#,
+            ] {
+                printer.record(&record(line)).expect("print");
+            }
+        }
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("restarted"), "{text}");
     }
 
     #[test]
