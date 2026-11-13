@@ -486,3 +486,152 @@ async fn the_picker_paints_the_shared_rows_and_enter_chooses_the_pointed_session
         );
     }
 }
+
+/// `/new <title>` from the compose box creates a session on the server and
+/// attaches the view to it.
+#[tokio::test]
+async fn slash_new_creates_a_session_and_attaches_to_it() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, first, _) = seeded(&endpoint, "tui-before-new")
+        .await
+        .expect("a seeded session");
+
+    let mut harness = start(&endpoint, App::attached(first.clone(), None))
+        .await
+        .expect("a running loop");
+    harness.type_line("/new fresh-start").await.expect("compose");
+    harness.press(KeyCode::Enter).await.expect("run it");
+
+    let app = harness
+        .state("the view to attach to the new session", |app| {
+            app.attachment()
+                .is_some_and(|attachment| attachment.session_id != first)
+        })
+        .await
+        .expect("the created session becomes the attachment");
+    let created = app
+        .attachment()
+        .map(|attachment| attachment.session_id.clone())
+        .expect("attached");
+    let sessions = client.list_sessions(false).await.expect("the list");
+    assert!(
+        sessions.iter().any(|summary| summary.title == "fresh-start"
+            && summary.session_id.as_ref().map(ToString::to_string) == Some(created.clone())),
+        "the server holds the session the view attached to: {sessions:?}"
+    );
+
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// An attach replays only its target, but opening the tree widens the
+/// replay: the loop resubscribes and the neighbour's history arrives.
+#[tokio::test]
+async fn opening_the_tree_after_an_attach_replays_every_session() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, target, _) = seeded(&endpoint, "the-target")
+        .await
+        .expect("a seeded target");
+    let (neighbour, _) = client
+        .create_session("the-other", "key-2")
+        .await
+        .expect("a neighbour session");
+    let other = neighbour
+        .session_id
+        .map(|id| id.to_string())
+        .expect("a created session has an id");
+
+    let mut harness = start(&endpoint, App::attached(target.clone(), None))
+        .await
+        .expect("a running loop");
+    harness
+        .state("the target's replay to catch up", |app| {
+            app.session(&target).is_some_and(|session| session.caught_up)
+        })
+        .await
+        .expect("the target replays");
+
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness
+        .state("the neighbour's history", |app| {
+            app.session(&other).is_some_and(|session| {
+                session.feed.iter().any(|line| line.label == "spawned")
+            })
+        })
+        .await
+        .expect("the tree must replay the sessions it lists");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// The workspaces and usage views ask the real server and show its answer —
+/// empty here, which they must say rather than wait forever.
+#[tokio::test]
+async fn the_workspaces_and_usage_views_fill_from_the_server() {
+    let endpoint = serve().await.expect("a listening server");
+    seeded(&endpoint, "tui-views").await.expect("a seeded session");
+
+    let mut harness = start(&endpoint, App::overview())
+        .await
+        .expect("a running loop");
+    harness.press(KeyCode::Char('w')).await.expect("workspaces");
+    let app = harness
+        .state("the workspaces answer", |app| app.workspaces().is_some())
+        .await
+        .expect("the workspaces view lists definitions from the server");
+    assert_eq!(app.screen(), Screen::Workspaces);
+    assert_eq!(app.workspaces().map(<[_]>::len), Some(0));
+
+    harness.press(KeyCode::Char('u')).await.expect("usage");
+    let app = harness
+        .state("the usage answer", |app| app.usage().is_some())
+        .await
+        .expect("the usage view queries the server");
+    assert_eq!(app.screen(), Screen::Usage);
+    assert_eq!(
+        app.usage().map(|usage| usage.scope.as_str()),
+        Some("every session"),
+        "with nothing attached, usage covers every session"
+    );
+
+    harness.press(KeyCode::Char('l')).await.expect("logs");
+    harness
+        .state("the logs placeholder", |app| app.screen() == Screen::Logs)
+        .await
+        .expect("the logs view opens");
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// `x` on a tree row asks first; `y` archives the session on the server.
+#[tokio::test]
+async fn x_then_y_archives_the_selected_session() {
+    let endpoint = serve().await.expect("a listening server");
+    let (mut client, session_id, _) = seeded(&endpoint, "tui-archive")
+        .await
+        .expect("a seeded session");
+
+    let mut harness = start(&endpoint, App::overview())
+        .await
+        .expect("a running loop");
+    harness
+        .state("the session to be listed", |app| app.session(&session_id).is_some())
+        .await
+        .expect("listed");
+    harness.press(KeyCode::Char('x')).await.expect("ask");
+    harness
+        .state("the confirmation", |app| app.confirm().is_some())
+        .await
+        .expect("archive asks first");
+    harness.press(KeyCode::Char('y')).await.expect("confirm");
+    // The loop performs a key's directives before its next redraw, so the
+    // first frame without the question is drawn after the archive returned.
+    harness
+        .state("the confirmation to close", |app| app.confirm().is_none())
+        .await
+        .expect("answered");
+    let listed = client.list_sessions(false).await.expect("the list");
+    assert!(
+        listed.is_empty(),
+        "the session must leave the live list: {listed:?}"
+    );
+    harness.quit_from_list_screen().await.expect("q exits");
+}
