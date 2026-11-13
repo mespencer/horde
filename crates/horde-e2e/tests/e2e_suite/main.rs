@@ -7,6 +7,11 @@
 //! Every test here follows the same discipline: real processes, bounded
 //! waits (a hang is a worse finding than any assertion), and assertions on
 //! what crossed the wire — never on a process's internal state.
+//!
+//! Unix-only (ADR-0017): the end-to-end tier stops daemons with SIGTERM,
+//! injects crashes as SIGKILL to a process group, and sweeps orphans by
+//! signal — none of which Windows has. On Windows this binary is empty.
+#![cfg(unix)]
 
 #[cfg(test)]
 mod support;

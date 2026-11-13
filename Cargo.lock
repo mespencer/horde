@@ -764,6 +764,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,6 +900,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1194,6 +1210,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cucumber",
+ "fs4",
  "horde-adapter",
  "horde-adapter-fake",
  "horde-config",
@@ -1341,6 +1358,7 @@ dependencies = [
 name = "horde-proto"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "prost",
  "prost-build",
  "prost-types",
@@ -1454,6 +1472,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "fs4",
  "getrandom 0.3.4",
  "hex",
  "horde-adapter",
@@ -1471,8 +1490,10 @@ dependencies = [
  "horde-server-testkit",
  "horde-testkit",
  "horde-wire",
+ "junction",
  "nix 0.31.3",
  "portable-pty",
+ "process-wrap 10.0.1",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1903,6 +1924,16 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "junction"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2636,6 +2667,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-wrap"
+version = "10.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
+dependencies = [
+ "futures",
+ "indexmap",
+ "nix 0.31.3",
+ "tokio",
+ "windows",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3130,7 +3174,7 @@ dependencies = [
  "http-body-util",
  "pastey",
  "pin-project-lite",
- "process-wrap",
+ "process-wrap 9.1.0",
  "rand 0.10.2",
  "reqwest",
  "rmcp-macros",
@@ -4766,6 +4810,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

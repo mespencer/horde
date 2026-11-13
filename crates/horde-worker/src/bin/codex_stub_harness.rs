@@ -75,7 +75,7 @@ fn die_mid_handshake(hang_up: bool) -> std::process::ExitCode {
     let stdin = std::io::stdin();
     let message = next_message(&mut stdin.lock());
     if hang_up {
-        let _ = nix::unistd::close(0);
+        close_descriptor(0);
         if let Some(reply) = message.and_then(|m| reply_for(&m, &StubConfig::default())) {
             emit(&reply.line);
         }
@@ -275,7 +275,7 @@ fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u
             // The client's read meets EOF while its writes still land: the
             // only state in which a session can tell "ended" from "unwritable".
             let _ = std::io::stdout().flush();
-            let _ = nix::unistd::close(1);
+            close_descriptor(1);
             continue;
         }
         match server_request_marker(line) {
@@ -367,6 +367,16 @@ fn run(blocks: &[Vec<String>], config: &StubConfig) -> std::process::ExitCode {
         );
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// Closes descriptor 0 or 1 — the mid-handshake hang-up and `!CLOSE_STDOUT`.
+/// On Windows nothing closes (there is no safe close of a std handle), and
+/// the codex supervision suite that scripts these is Unix-only (ADR-0017).
+fn close_descriptor(descriptor: i32) {
+    #[cfg(unix)]
+    let _ = nix::unistd::close(descriptor);
+    #[cfg(not(unix))]
+    let _ = descriptor;
 }
 
 #[cfg(test)]

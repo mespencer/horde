@@ -230,11 +230,9 @@ fn subject_name(value: &str) -> Result<String, String> {
 ///
 /// A human-readable refusal naming the flag that was wrong.
 pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
-    invocation_in(
-        arguments,
-        std::env::var_os("HOME").map(PathBuf::from),
-        |name| std::env::var(name).ok(),
-    )
+    invocation_in(arguments, horde_identity::home_dir(), |name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// [`invocation`] with `$HOME` and the environment passed in, so the
@@ -448,22 +446,29 @@ impl Drop for ChainTask {
 /// Brings the networked server up (DESIGN §3, activated in wave 5).
 ///
 /// SIGHUP, as a channel [`hold_until`] can own. Installing it also replaces
-/// SIGHUP's default action (ending the process) for good.
+/// SIGHUP's default action (ending the process) for good. Windows has no
+/// SIGHUP (ADR-0017): there the channel is born closed
+/// ([`crate::windows::forwarded_hangups`]).
 ///
 /// # Errors
 ///
 /// The signal handler failing to install.
 pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
-    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let (sender, receiver) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-        while signal.recv().await.is_some() {
-            if sender.send(()).await.is_err() {
-                return;
+    #[cfg(windows)]
+    return crate::windows::forwarded_hangups();
+    #[cfg(unix)]
+    {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            while signal.recv().await.is_some() {
+                if sender.send(()).await.is_err() {
+                    return;
+                }
             }
-        }
-    });
-    Ok(receiver)
+        });
+        Ok(receiver)
+    }
 }
 
 /// `--serve`'s start: SIGHUP caught *before* the state lock exists —
@@ -858,6 +863,17 @@ mod tests {
         )
     }
 
+    /// `base` joined with `parts` as this platform joins paths, as text:
+    /// what a defaulted database path reads as here (`/` on Unix, the
+    /// joins `\` on Windows).
+    fn joined(base: &str, parts: &[&str]) -> String {
+        parts
+            .iter()
+            .fold(std::path::PathBuf::from(base), |path, part| path.join(part))
+            .display()
+            .to_string()
+    }
+
     /// A mode is asked for by name: a bare invocation (or a bare database
     /// path, the old health check) is a refusal naming both modes, and
     /// `--check` is the health check — defaulting under `$HOME`, never the
@@ -880,7 +896,7 @@ mod tests {
         assert_eq!(
             parsed(&["--check"]),
             Ok(super::Invocation::CheckOnly {
-                database: "/home/me/.horde/server/horde.db".to_owned()
+                database: joined("/home/me", &[".horde/server", "horde.db"])
             })
         );
         assert!(
@@ -917,7 +933,7 @@ mod tests {
         else {
             panic!("a named state dir needs no HOME");
         };
-        assert_eq!(named.database, "/srv/horde/horde.db");
+        assert_eq!(named.database, joined("/srv/horde", &["horde.db"]));
     }
 
     #[test]
@@ -962,7 +978,10 @@ mod tests {
         let Ok(super::Invocation::Serve(defaulted)) = parsed(&["--serve"]) else {
             panic!("--serve alone must parse");
         };
-        assert_eq!(defaulted.database, "/home/me/.horde/server/horde.db");
+        assert_eq!(
+            defaulted.database,
+            joined("/home/me", &[".horde/server", "horde.db"])
+        );
         assert_eq!(
             defaulted.bind.to_string(),
             "127.0.0.1:7777",
@@ -1472,7 +1491,10 @@ mod tests {
     /// finds this server by its state lock and asks through the channel the
     /// binary feeds from SIGHUP; the held server mints, files, and
     /// announces a fresh token, which redeems — and once a client exists,
-    /// the next ask is refused naming the closed door.
+    /// the next ask is refused naming the closed door. Unix only: Windows
+    /// has no SIGHUP to re-mint by (ADR-0017; see
+    /// `windows_refuses_to_remint_a_running_server`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_running_server_remints_its_bootstrap_token_on_request() {
         let directory = tempfile::tempdir().expect("a temp dir");
@@ -1572,6 +1594,9 @@ mod tests {
         );
     }
 
+    /// Unix only: the bounded wait and the failed signal need a server
+    /// that can be signalled at all.
+    #[cfg(unix)]
     #[tokio::test]
     async fn remint_refuses_without_a_server_and_bounds_its_wait() {
         let directory = tempfile::tempdir().expect("a temp dir");
@@ -1606,9 +1631,51 @@ mod tests {
         assert!(unsignalled.contains("could not signal"), "{unsignalled}");
     }
 
+    /// `--remint` on Windows: with no server it says none is running; with
+    /// one running it says so and names the restart — never "no server",
+    /// though the held lock hides the pid — and asks nothing of the hang-up.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_to_remint_a_running_server() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(&directory, None);
+        let idle = crate::remint::remint_running(
+            &config.state_dir,
+            |_| panic!("nobody to signal"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("no server");
+        assert!(idle.contains("no server is running"), "{idle}");
+
+        let _running = super::serve(&config).await.expect("the server comes up");
+        let refused = crate::remint::remint_running(
+            &config.state_dir,
+            |_| panic!("Windows has no SIGHUP to send"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("no re-mint on Windows");
+        assert!(
+            refused.contains("is running") && refused.contains("restart"),
+            "{refused}"
+        );
+        assert!(!refused.contains("no server is running"), "{refused}");
+    }
+
+    /// Windows has no SIGHUP: the hang-up channel is born closed, which
+    /// `hold_until` reads as "no re-mints" while the server stays up.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn without_sighup_the_hangup_channel_is_born_closed() {
+        let mut hangups = super::forwarded_hangups().expect("no handler to fail");
+        assert_eq!(hangups.recv().await, None);
+    }
+
     /// `--serve`'s start catches SIGHUP before serving — a hang-up to this
     /// very process arrives on the channel instead of ending it — and a
     /// server that cannot start is refused in words.
+    #[cfg(unix)]
     #[tokio::test]
     async fn serving_catches_hangups_first_and_refuses_a_held_state() {
         let directory = tempfile::tempdir().expect("a temp dir");
@@ -1630,6 +1697,7 @@ mod tests {
         drop(running);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_hangup_reaches_a_real_process_and_a_dead_pid_is_refused() {
         let mut sleeper = tokio::process::Command::new("sleep")

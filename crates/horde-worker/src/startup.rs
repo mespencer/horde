@@ -142,7 +142,7 @@ pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<WorkerC
     match crate::flags::parse(
         arguments,
         |name| std::env::var(name).ok(),
-        std::env::var_os("HOME").map(PathBuf::from),
+        horde_identity::home_dir(),
     )? {
         crate::flags::Parsed::Run(config) => Ok(*config),
         crate::flags::Parsed::Print(text) => Err(text),
@@ -1303,8 +1303,10 @@ mod tests {
             }
         );
         let refused = identity_plan(&join, true).expect_err("join over existing must refuse");
+        // Joined as this platform joins paths (`/tmp/w\identity` on Windows).
+        let identity = std::path::Path::new("/tmp/w").join("identity");
         assert!(
-            refused.contains("/tmp/w/identity"),
+            refused.contains(&identity.display().to_string()),
             "the refusal names the directory to clear: {refused}"
         );
 
@@ -1337,9 +1339,14 @@ mod tests {
             ..bare.clone()
         };
         let ambient = with(Some(JoinRequest::ambient("t".to_owned())));
+        // Joined as this platform joins paths (`/tmp/w\identity` on Windows).
+        let identity = std::path::Path::new("/tmp/w").join("identity");
         assert_eq!(
             super::ignored_ambient_join(&ambient, true),
-            Some("ignoring HORDE_JOIN_TOKEN: /tmp/w/identity already holds an identity".to_owned())
+            Some(format!(
+                "ignoring HORDE_JOIN_TOKEN: {} already holds an identity",
+                identity.display()
+            ))
         );
         assert_eq!(super::ignored_ambient_join(&ambient, false), None);
         let explicit = with(Some(JoinRequest::explicit("t".to_owned())));

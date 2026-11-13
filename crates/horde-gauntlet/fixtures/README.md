@@ -15,6 +15,9 @@ Two files are lightly edited, and only in ways that do not touch what is parsed:
 
 - `cargo-fmt-check.txt`, `cargo-clippy-denied.txt`, `cargo-*test*.txt` — the
   capture machine's absolute paths were rewritten to `/repo`.
+- `cargo-xwin-clippy-denied.txt` — a Unix-only API reached from a crate
+  cross-checked for Windows; cargo's `Compiling`/`Checking` progress lines
+  were dropped and paths made workspace-relative.
 - `jscpd-report-duplicated.json` — the `fragment` field (the full duplicated
   source text) was replaced with a placeholder to keep the file small, and the
   two file paths were shortened. Every counted field is as jscpd produced it.

@@ -892,7 +892,7 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
 
     let settings = crate::config::ClientSettings::load(
         cli.config.as_deref(),
-        std::env::var_os("HOME").map(Into::into),
+        horde_identity::home_dir(),
         |name| std::env::var(name).ok(),
     )
     .map_err(ClientError::Config)?;
@@ -908,7 +908,7 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     let resolved = resolve_connection(
         cli.endpoint.as_deref(),
         cli.identity.as_deref(),
-        std::env::var_os("HOME").map(Into::into),
+        horde_identity::home_dir(),
     )?;
     let mut client = connect(&resolved)
         .await?
@@ -1207,7 +1207,7 @@ async fn run_join(cli: &Cli, token: &str, force: bool, format: Format) -> Result
     let directory = cli
         .identity
         .clone()
-        .unwrap_or_else(|| default_identity_dir(std::env::var_os("HOME").map(Into::into)));
+        .unwrap_or_else(|| default_identity_dir(horde_identity::home_dir()));
     join_preflight(&token, &directory, force)?;
 
     let enrolled = redeem_client_token(&token, "horde").await?;

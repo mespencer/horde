@@ -203,7 +203,8 @@ fn hostname() -> Option<String> {
 /// The sibling not existing — named, with where it was looked for.
 pub fn sibling_binary(own_binary: &Path, name: &str) -> Result<PathBuf, ClientError> {
     let dir = own_binary.parent().unwrap_or(Path::new("."));
-    let candidate = dir.join(name);
+    // `horde-server.exe` on Windows; the bare name everywhere else.
+    let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if candidate.is_file() {
         return Ok(candidate);
     }
@@ -250,7 +251,7 @@ pub async fn run(args: &UpArgs, identity: Option<&Path>) -> Result<(), ClientErr
     // First of all: a ctrl-c that lands during bring-up must reach the
     // teardown, not the default disposition that would orphan the daemons.
     let stop = stop_signals()?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = horde_identity::home_dir();
     let root = resolve_root(args.state_dir.clone(), home.clone())?;
     let paths = paths_under(&root, identity);
     let export_identity = needs_export(&paths.client_identity, home);
@@ -285,6 +286,7 @@ fn needs_export(client_identity: &Path, home: Option<PathBuf>) -> bool {
 
 /// The stop signals, registered now (registration happens at creation for
 /// unix signal streams), resolving on SIGINT or SIGTERM.
+#[cfg(unix)]
 fn stop_signals() -> Result<impl Future<Output = ()>, ClientError> {
     use tokio::signal::unix::{SignalKind, signal};
     let install = |kind| {
@@ -299,6 +301,9 @@ fn stop_signals() -> Result<impl Future<Output = ()>, ClientError> {
         }
     })
 }
+
+#[cfg(windows)]
+use crate::windows::stop_signals;
 
 /// Stands the machine up, announces the ready line, holds until `shutdown`
 /// or a started daemon's death, and tears down only what it started.
@@ -1052,8 +1057,11 @@ impl WatchedChild {
     }
 
     /// SIGTERM, a wait bounded by `ceiling`, then SIGKILL — a clean
-    /// shutdown offered, never depended on.
+    /// shutdown offered, never depended on. Windows has no SIGTERM to send:
+    /// the console's own ctrl-c is the offer there, and the bounded wait
+    /// the same.
     async fn stop(mut self, ceiling: std::time::Duration) {
+        #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             let _best_effort_term = tokio::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
@@ -1115,5 +1123,9 @@ fn complete_lines(pending: &mut String) -> Vec<String> {
     lines
 }
 
+// The stand-up tests run `/bin/sh` daemons that trap SIGTERM: Unix-only
+// (ADR-0017). The Windows `horde up` path is exercised on a Windows machine
+// by hand (docs/adr/0017).
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

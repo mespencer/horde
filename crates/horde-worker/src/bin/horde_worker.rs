@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     let parsed = horde_worker::flags::parse(
         std::env::args().skip(1),
         |name| std::env::var(name).ok(),
-        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        horde_identity::home_dir(),
     );
     let outcome = parsed.and_then(|parsed| match parsed {
         horde_worker::flags::Parsed::Print(text) => {
@@ -35,7 +35,8 @@ fn main() -> ExitCode {
     })
 }
 
-/// Prepares the daemon and serves until SIGTERM/ctrl-c ends it, or a fatal
+/// Prepares the daemon and serves until SIGTERM/ctrl-c (on Windows, a
+/// console stop event) ends it, or a fatal
 /// refusal does. All the decisions are in `startup`; this is plumbing an
 /// exit code, like `main`.
 async fn serve_until_terminated(config: &startup::WorkerConfig) -> ExitCode {
@@ -60,8 +61,12 @@ async fn serve_until_terminated(config: &startup::WorkerConfig) -> ExitCode {
 /// stops a daemon) or ctrl-c (how an operator does). The racing itself is
 /// [`startup::first_of`], where it is tested; failing to even listen for
 /// SIGTERM degrades to ctrl-c alone — the default disposition would kill the
-/// process on SIGTERM anyway.
+/// process on SIGTERM anyway. On Windows the console's stop events stand in
+/// for SIGTERM ([`horde_worker::windows::console_stop`], ADR-0017).
 async fn termination() {
+    #[cfg(windows)]
+    return horde_worker::windows::console_stop().await;
+    #[cfg(unix)]
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut sigterm) => {
             startup::first_of(wait_for_ctrl_c(), async move {
@@ -79,6 +84,7 @@ async fn termination() {
 /// Parks on ctrl-c. A registration failure parks forever instead: with no
 /// signal to hear, returning would stop a healthy daemon, and the operator
 /// still holds SIGKILL.
+#[cfg(unix)]
 async fn wait_for_ctrl_c() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "could not listen for shutdown");

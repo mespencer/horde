@@ -14,6 +14,11 @@
 //! itself to QUALITY_GATES.md harder than anywhere else: every wait is
 //! ceilinged, every poll is count-bounded, and progress is bounded by count
 //! or structure, never by clock alone.
+//!
+//! Unix-only (ADR-0017): the fault tier stops daemons with SIGTERM,
+//! injects crashes as SIGKILL to a process group, and sweeps orphans by
+//! signal — none of which Windows has. On Windows this binary is empty.
+#![cfg(unix)]
 
 // Every module is `#[cfg(test)]` so the workspace's expect-in-tests
 // exemption covers the suites' free helper functions, not only `#[test]`

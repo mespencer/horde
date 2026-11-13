@@ -18,16 +18,22 @@
 //! written to a [`GroupLedger`] (the journal, in production) when it starts
 //! and erased when it is reaped; [`reap_leftover_groups`] sweeps whatever a
 //! previous run left behind.
+//!
+//! On Windows the tree is a kill-on-close Job Object instead (ADR-0017, via
+//! [`crate::process_tree`]): stopping it closes the harness's stdin — the
+//! only graceful signal a console-less child has — then terminates the job
+//! after the same grace. A job dies with the last handle to it, so a crashed
+//! Worker leaves nothing running and nothing is written to the ledger there.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+
+use crate::process_tree::{ProcessTree, Stop};
 
 /// How many stderr lines a harness keeps. The newest win: the lines that
 /// explain a death are the last ones, and an unbounded buffer is a memory
@@ -43,6 +49,7 @@ pub const STDERR_LINE_BYTES: usize = 4096;
 pub const DEFAULT_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long the one-shot `ps` that fingerprints a group leader may take.
+#[cfg(unix)]
 const FINGERPRINT_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why supervision failed, as distinct from the harness protocol failing.
@@ -178,8 +185,10 @@ type StderrTail = Arc<tokio::sync::Mutex<VecDeque<String>>>;
 
 /// A running harness, owned by its handle.
 pub struct SupervisedHarness {
-    child: Child,
-    stdin: ChildStdin,
+    child: ProcessTree,
+    /// `None` once a Windows stop has closed it — the graceful half of a
+    /// stop there; always present on Unix.
+    stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
     /// The harness's own diagnostics, drained in the background.
     ///
@@ -187,7 +196,8 @@ pub struct SupervisedHarness {
     /// the child — a harness that logs enough would deadlock against a
     /// supervisor that never reads it. Bounded to the last [`STDERR_LINES`].
     stderr: StderrTail,
-    /// The process group the harness leads — its pid at spawn.
+    /// The process group the harness leads — its pid at spawn — on Unix;
+    /// `None` on Windows, where the tree is a job reached by handle.
     pgid: Option<u32>,
     /// Set once the leader has been reaped: from then on its pid is the
     /// kernel's to reissue, and only a sweep straight after the reap may
@@ -218,12 +228,11 @@ impl SupervisedHarness {
             // must never be parsed as such, but they are the only explanation a
             // dead harness leaves behind. Discarding them turns every startup
             // failure into "it exited" with no reason attached.
-            .stderr(Stdio::piped())
-            // Its own group, so stopping it reaches everything it started.
-            .process_group(0)
-            // The last resort, for a handle dropped without a stop: the
-            // leader dies here, and `Drop` sweeps the group.
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        // Its own tree (a process group, or a job), so stopping it reaches
+        // everything it started; and the last resort, for a handle dropped
+        // without a stop: the leader dies with it, and `Drop` sweeps the
+        // group.
 
         for (key, value) in &spec.env {
             command.env(key, value);
@@ -235,24 +244,16 @@ impl SupervisedHarness {
             command.current_dir(cwd);
         }
 
-        let mut child = command.spawn().map_err(|source| SupervisorError::Spawn {
+        let mut child = ProcessTree::spawn(command).map_err(|source| SupervisorError::Spawn {
             program: spec.program.clone(),
             source,
         })?;
-        let pgid = child.id();
+        let pgid = child.group();
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(SupervisorError::MissingPipe("stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(SupervisorError::MissingPipe("stdout"))?;
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .ok_or(SupervisorError::MissingPipe("stderr"))?;
+        let pipes = child.take_pipes();
+        let stdin = pipes.stdin.ok_or(SupervisorError::MissingPipe("stdin"))?;
+        let stdout = pipes.stdout.ok_or(SupervisorError::MissingPipe("stdout"))?;
+        let stderr_pipe = pipes.stderr.ok_or(SupervisorError::MissingPipe("stderr"))?;
 
         let stderr: StderrTail = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
         let sink = Arc::clone(&stderr);
@@ -265,7 +266,7 @@ impl SupervisedHarness {
 
         let harness = Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
             stderr,
             pgid,
@@ -281,6 +282,7 @@ impl SupervisedHarness {
     /// Writes this harness's group to the ledger. Best-effort: a ledger that
     /// cannot write costs the crash sweep one group, which is no reason to
     /// refuse an agent that is already running.
+    #[cfg(unix)]
     async fn remember_group(&self) {
         let (Some(ledger), Some(pgid)) = (&self.ledger, self.pgid) else {
             return;
@@ -294,6 +296,15 @@ impl SupervisedHarness {
         }
     }
 
+    /// Nothing to remember on Windows: the job dies with the Worker, so no
+    /// later run has anything to sweep.
+    #[cfg(not(unix))]
+    #[expect(
+        clippy::unused_async,
+        reason = "the Unix ledger write is async; the call site is shared"
+    )]
+    async fn remember_group(&self) {}
+
     /// Writes one protocol line to the harness.
     ///
     /// # Errors
@@ -306,9 +317,13 @@ impl SupervisedHarness {
     }
 
     async fn write_raw(&mut self, line: &str) -> std::io::Result<()> {
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
     }
 
     /// Reads one protocol line, or `None` at EOF.
@@ -339,19 +354,24 @@ impl SupervisedHarness {
             // Already reaped, so already swept: nothing of ours is left.
             return Ok(());
         }
-        self.signal_group(Signal::SIGKILL);
-        self.child.kill().await?;
+        self.signal_group(Stop::Kill);
+        self.child.kill_root().await?;
         self.after_reap().await;
         Ok(())
     }
 
     /// Stops the harness group gracefully: SIGTERM to the group, the stop
-    /// grace for the leader to exit, then SIGKILL to whatever is left.
+    /// grace for the leader to exit, then SIGKILL to whatever is left. On
+    /// Windows the ask is the harness's stdin closing (EOF ends a
+    /// stream-json or app-server session), and the insistence is the job
+    /// terminated.
     ///
     /// Bounded by the grace plus one SIGKILL-and-reap; never a wait on a
     /// process that chose not to exit.
     pub async fn stop(&mut self) -> Result<(), SupervisorError> {
-        self.signal_group(Signal::SIGTERM);
+        self.signal_group(Stop::Terminate);
+        #[cfg(not(unix))]
+        drop(self.stdin.take());
         match tokio::time::timeout(self.stop_grace, self.child.wait()).await {
             Ok(exited) => {
                 exited?;
@@ -371,7 +391,7 @@ impl SupervisedHarness {
         if self.reaped {
             return;
         }
-        self.signal_group(Signal::SIGKILL);
+        self.signal_group(Stop::Kill);
         self.reaped = true;
         if let (Some(ledger), Some(pgid)) = (&self.ledger, self.pgid) {
             ledger.closed(pgid).await;
@@ -379,14 +399,12 @@ impl SupervisedHarness {
     }
 
     /// Signals the group, while it can still be this harness's.
-    fn signal_group(&self, signal: Signal) {
+    fn signal_group(&mut self, stop: Stop) {
         if self.reaped {
             return;
         }
-        if let Some(pgid) = self.pgid.and_then(group_pid) {
-            // ESRCH just means everyone already left.
-            let _ = killpg(pgid, signal);
-        }
+        // ESRCH just means everyone already left.
+        let _ = self.child.signal(stop);
     }
 
     /// What the harness wrote to stderr — its last [`STDERR_LINES`] lines.
@@ -412,7 +430,8 @@ impl SupervisedHarness {
         self.child.id()
     }
 
-    /// The process group the harness leads, while it is unreaped.
+    /// The process group the harness leads, while it is unreaped; always
+    /// `None` on Windows, where the harness's tree is a job, not a group.
     #[must_use]
     pub fn process_group(&self) -> Option<u32> {
         if self.reaped { None } else { self.pgid }
@@ -427,7 +446,7 @@ impl Drop for SupervisedHarness {
         if self.reaped {
             return;
         }
-        self.signal_group(Signal::SIGKILL);
+        self.signal_group(Stop::Kill);
         if let (Some(ledger), Some(pgid)) = (self.ledger.clone(), self.pgid)
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
@@ -461,32 +480,10 @@ fn keep_tail(tail: &mut VecDeque<String>, mut line: String) {
     tail.push_back(line);
 }
 
-/// Signals the process group led by a child this Worker spawned with
-/// `process_group(0)` — a soft-reclaim command (ADR-0014) — returning whether
-/// the signal was sent. Refuses what [`group_pid`] refuses, and this
-/// process's own group: a reclaim command never shares the Worker's group,
-/// so a leader id naming it is a bug, and signalling it would stop the
-/// Worker itself.
-pub(crate) fn signal_spawned_group(leader: u32, signal: Signal) -> bool {
-    let Some(pgid) = group_pid(leader) else {
-        return false;
-    };
-    if pgid == nix::unistd::getpgrp() || pgid == nix::unistd::getpid() {
-        return false;
-    }
-    killpg(pgid, signal).is_ok()
-}
-
-/// A pid as nix wants it, refusing the ids that would broadcast: 0 is the
-/// caller's own group and 1 is init, and neither is ever a harness.
-fn group_pid(pgid: u32) -> Option<Pid> {
-    let raw = i32::try_from(pgid).ok()?;
-    (raw > 1).then(|| Pid::from_raw(raw))
-}
-
 /// The leader's start time, as `ps` prints it — empty when `ps` cannot say
 /// (an absent pid prints nothing on stdout; with `lstart=` there is no
 /// header either).
+#[cfg(unix)]
 async fn leader_fingerprint(pid: u32) -> String {
     let probe = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
@@ -501,6 +498,7 @@ async fn leader_fingerprint(pid: u32) -> String {
 }
 
 /// What a remembered group turned out to be at startup.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leftover {
     /// Nothing in the group survives: forget it.
@@ -517,6 +515,7 @@ enum Leftover {
 /// Classifies one remembered group from what the OS says now.
 ///
 /// Pure, so every row is pinned by a test without a process in sight.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn classify(group_alive: bool, current_leader: Option<&str>, remembered: &str) -> Leftover {
     match (group_alive, current_leader) {
         (false, _) => Leftover::Gone,
@@ -531,7 +530,9 @@ fn classify(group_alive: bool, current_leader: Option<&str>, remembered: &str) -
 ///
 /// Called once at startup, before any agent is spawned, so every group the
 /// ledger names is a previous run's. Each is classified first and only this
-/// Worker's own are SIGKILLed; every row is forgotten either way.
+/// Worker's own are SIGKILLed; every row is forgotten either way. On Windows
+/// nothing is ever left to kill — a job dies with the Worker that held it —
+/// so every row (written by no Windows run) is only forgotten.
 pub async fn reap_leftover_groups(ledger: &dyn GroupLedger) -> usize {
     let groups = match ledger.open_groups().await {
         Ok(groups) => groups,
@@ -540,31 +541,43 @@ pub async fn reap_leftover_groups(ledger: &dyn GroupLedger) -> usize {
             return 0;
         }
     };
+    #[cfg_attr(windows, expect(unused_mut, reason = "nothing is swept on Windows"))]
     let mut reaped = 0;
     for group in groups {
-        if let Some(pgid) = group_pid(group.pgid) {
-            let group_alive = killpg(pgid, None).is_ok();
-            let current = if kill(pgid, None).is_ok() {
-                Some(leader_fingerprint(group.pgid).await)
-            } else {
-                None
-            };
-            match classify(group_alive, current.as_deref(), &group.fingerprint) {
-                Leftover::Ours => {
-                    if killpg(pgid, Signal::SIGKILL).is_ok() {
-                        reaped += 1;
-                    }
-                }
-                Leftover::Stranger => tracing::warn!(
-                    pgid = group.pgid,
-                    "a remembered harness group id now names another process; left alone"
-                ),
-                Leftover::Gone => {}
-            }
+        #[cfg(unix)]
+        {
+            reaped += usize::from(sweep_leftover(&group).await);
         }
         ledger.closed(group.pgid).await;
     }
     reaped
+}
+
+/// Classifies one remembered group and SIGKILLs it when it is provably
+/// this Worker's, returning whether it was killed.
+#[cfg(unix)]
+async fn sweep_leftover(group: &HarnessGroup) -> bool {
+    use nix::sys::signal::{Signal, kill, killpg};
+    let Some(pgid) = crate::process_tree::group_pid(group.pgid) else {
+        return false;
+    };
+    let group_alive = killpg(pgid, None).is_ok();
+    let current = if kill(pgid, None).is_ok() {
+        Some(leader_fingerprint(group.pgid).await)
+    } else {
+        None
+    };
+    match classify(group_alive, current.as_deref(), &group.fingerprint) {
+        Leftover::Ours => killpg(pgid, Signal::SIGKILL).is_ok(),
+        Leftover::Stranger => {
+            tracing::warn!(
+                pgid = group.pgid,
+                "a remembered harness group id now names another process; left alone"
+            );
+            false
+        }
+        Leftover::Gone => false,
+    }
 }
 
 #[cfg(test)]
@@ -572,7 +585,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{
-        Leftover, STDERR_LINE_BYTES, STDERR_LINES, SupervisorError, classify, group_pid, keep_tail,
+        Leftover, STDERR_LINE_BYTES, STDERR_LINES, SupervisorError, classify, keep_tail,
         write_failure,
     };
 
@@ -671,6 +684,7 @@ mod tests {
     /// The fingerprint is `ps`'s start-time string for a live process — the
     /// shape a reboot-reused pid will not match — and empty for a pid that
     /// does not exist.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_fingerprint_is_the_start_time_of_a_live_process_only() {
         let own = super::leader_fingerprint(std::process::id()).await;
@@ -683,31 +697,6 @@ mod tests {
             "",
             "no process, no fingerprint"
         );
-    }
-
-    /// 0 and 1 would broadcast (the caller's own group, init); neither is a
-    /// harness, and both are refused rather than signalled.
-    #[test]
-    fn broadcast_ids_are_never_a_group_to_signal() {
-        assert_eq!(group_pid(0), None);
-        assert_eq!(group_pid(1), None);
-        assert_eq!(group_pid(u32::MAX), None, "out of pid_t range");
-        assert_eq!(group_pid(4242).map(nix::unistd::Pid::as_raw), Some(4242));
-    }
-
-    /// The Worker's own group and pid are never a reclaim command's group:
-    /// asking to signal them is refused before any signal is sent. (Signal 0
-    /// would only probe, but the refusal must come first either way.)
-    #[test]
-    fn a_reclaim_signal_never_reaches_the_workers_own_group() {
-        let own_group = u32::try_from(nix::unistd::getpgrp().as_raw()).expect("a pid fits");
-        let own_pid = std::process::id();
-        for refused in [0, 1, own_group, own_pid] {
-            assert!(
-                !super::signal_spawned_group(refused, nix::sys::signal::Signal::SIGCONT),
-                "{refused} must be refused"
-            );
-        }
     }
 
     /// Every row of the startup classification: a dead group is forgotten,

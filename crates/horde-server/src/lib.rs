@@ -34,6 +34,7 @@ pub mod tiers;
 pub mod transport;
 pub mod trust;
 pub mod usage;
+mod windows;
 pub mod workspace;
 pub mod workspace_policy;
 

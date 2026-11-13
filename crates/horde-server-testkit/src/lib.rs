@@ -29,11 +29,19 @@
 //! server — a session fetched back, an event replayed — rather than trusting a
 //! returned value.
 
+// The orphan sweep sends real signals to real process groups and reads
+// `ps`, and the pty driver runs `/bin/sh`: Unix-only, like the end-to-end
+// and fault tiers built on them (ADR-0017). The process driver builds on
+// Windows too, without groups or a sweep (see its `spawn`).
 pub mod process;
+#[cfg(unix)]
 pub mod ps;
+#[cfg(unix)]
 pub mod pty;
+#[cfg(unix)]
 pub mod reap;
 pub mod secure;
+pub mod windows;
 
 use horde_cli::Client;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;

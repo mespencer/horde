@@ -73,7 +73,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn ok(name: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn ok(name: &str, detail: impl Into<String>) -> Self {
         Self {
             name: name.to_owned(),
             verdict: Verdict::Ok,
@@ -120,7 +120,7 @@ pub async fn run(
     args: &DoctorArgs,
     format: Format,
 ) -> Result<(), ClientError> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = horde_identity::home_dir();
     let state_dirs = if args.state_dirs.is_empty() {
         home.iter()
             .flat_map(|home| ["server", "worker"].map(|dir| home.join(".horde").join(dir)))
@@ -361,15 +361,33 @@ pub fn harness_checks(harnesses: &[String], path: Option<&std::ffi::OsStr>) -> V
         .collect()
 }
 
-/// The first executable file named `name` in `path`'s directories.
+/// The first executable file named `name` in `path`'s directories. On
+/// Windows, `name.exe` — the only form the Worker can launch
+/// ([`crate::windows::on_path`]).
 pub(crate) fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::split_paths(path?)
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
+    #[cfg(windows)]
+    return crate::windows::on_path(name, path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(path?)
+            .map(|dir| dir.join(name))
+            .find(|candidate| {
+                std::fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+    }
+}
+
+/// The file Windows launches for a bare program name: `name.exe`, unless the
+/// name already ends in `.exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_program(name: &str) -> String {
+    if name.to_ascii_lowercase().ends_with(".exe") {
+        name.to_owned()
+    } else {
+        format!("{name}.exe")
+    }
 }
 
 /// One state directory's permissions and free disk.
@@ -377,36 +395,53 @@ pub(crate) fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<Path
 pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
     let label = format!("dir {}", dir.display());
     let Ok(meta) = std::fs::metadata(dir) else {
+        #[cfg(windows)]
+        return vec![Check::ok(&label, crate::windows::ABSENT_STATE_DIR)];
+        #[cfg(unix)]
         return vec![Check::ok(&label, "absent; created owner-only on first use")];
     };
     vec![permission_check(&label, dir, &meta), disk_check(dir)]
 }
 
+/// Whether a state directory is owner-only. Windows has no mode bits; its
+/// answer is the inherited ACL ([`crate::windows::permission_check`]).
 fn permission_check(label: &str, dir: &Path, meta: &std::fs::Metadata) -> Check {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 == 0 {
-        Check::ok(label, format!("owner-only ({mode:o})"))
-    } else {
-        Check::not_ok(
-            label,
-            Verdict::Warn,
-            format!("mode {mode:o} lets other users look inside"),
-            &format!("chmod 700 {}", dir.display()),
-        )
+    #[cfg(windows)]
+    return crate::windows::permission_check(label, dir, meta);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            Check::ok(label, format!("owner-only ({mode:o})"))
+        } else {
+            Check::not_ok(
+                label,
+                Verdict::Warn,
+                format!("mode {mode:o} lets other users look inside"),
+                &format!("chmod 700 {}", dir.display()),
+            )
+        }
     }
 }
 
+/// Free space on `dir`'s filesystem, by `df`; Windows has none
+/// ([`crate::windows::disk_check`]).
 fn disk_check(dir: &Path) -> Check {
-    let label = format!("disk {}", dir.display());
-    let output = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(dir)
-        .output();
-    let available = output
-        .ok()
-        .and_then(|out| available_kib(&String::from_utf8_lossy(&out.stdout)));
-    disk_verdict(&label, available)
+    #[cfg(windows)]
+    return crate::windows::disk_check(dir);
+    #[cfg(unix)]
+    {
+        let label = format!("disk {}", dir.display());
+        let output = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(dir)
+            .output();
+        let available = output
+            .ok()
+            .and_then(|out| available_kib(&String::from_utf8_lossy(&out.stdout)));
+        disk_verdict(&label, available)
+    }
 }
 
 /// The verdict on `available` KiB free (`None`: `df` gave no answer).

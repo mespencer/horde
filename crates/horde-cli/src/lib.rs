@@ -26,6 +26,7 @@ pub mod render;
 pub mod resolve;
 pub mod tui;
 pub mod up;
+mod windows;
 pub mod workspace_flags;
 pub mod workspace_gc;
 pub mod workspace_update;

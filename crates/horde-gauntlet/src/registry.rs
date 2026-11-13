@@ -32,6 +32,16 @@ pub fn registry() -> Vec<RegisteredGate> {
         },
         RegisteredGate {
             spec: GateSpec {
+                name: "clippy-windows",
+                enforcement: Enforcement::Blocking,
+                depends_on: &[],
+                summary: "cargo xwin clippy for x86_64-pc-windows-msvc: every target builds and \
+                          lints for Windows",
+            },
+            gate: Box::new(gates::clippy_windows::gate()),
+        },
+        RegisteredGate {
+            spec: GateSpec {
                 name: "test",
                 enforcement: Enforcement::Blocking,
                 depends_on: &[],
@@ -135,9 +145,10 @@ mod tests {
     use super::*;
 
     /// The gate list, verbatim. Changing this line is the point.
-    const EXPECTED: [&str; 10] = [
+    const EXPECTED: [&str; 11] = [
         "fmt",
         "clippy",
+        "clippy-windows",
         "test",
         "coverage",
         "crap",

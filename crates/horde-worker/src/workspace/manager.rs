@@ -41,7 +41,9 @@ pub trait FsStats: Send + Sync + std::fmt::Debug {
     fn stats(&self, path: &Path) -> Option<(u64, u64)>;
 }
 
-/// The production source: `statvfs` on the path.
+/// The production source: `statvfs` on the path (on Windows,
+/// `GetDiskFreeSpaceExW` through `fs4`: the bytes available to this user,
+/// and the volume's total).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatvfsStats;
 
@@ -50,11 +52,16 @@ impl FsStats for StatvfsStats {
     // c_ulong on macOS), so the conversions are useless only here.
     #[allow(clippy::useless_conversion)]
     fn stats(&self, path: &Path) -> Option<(u64, u64)> {
-        let stats = nix::sys::statvfs::statvfs(path).ok()?;
-        let fragment = u64::from(stats.fragment_size());
-        let free = u64::from(stats.blocks_available()).saturating_mul(fragment);
-        let total = u64::from(stats.blocks()).saturating_mul(fragment);
-        Some((free, total))
+        #[cfg(windows)]
+        return crate::windows::disk_stats(path);
+        #[cfg(unix)]
+        {
+            let stats = nix::sys::statvfs::statvfs(path).ok()?;
+            let fragment = u64::from(stats.fragment_size());
+            let free = u64::from(stats.blocks_available()).saturating_mul(fragment);
+            let total = u64::from(stats.blocks()).saturating_mul(fragment);
+            Some((free, total))
+        }
     }
 }
 
@@ -1248,11 +1255,21 @@ async fn link_unmanaged(
             })?;
         }
         let target = instance_root.join(path);
-        tokio::fs::symlink(&target, &link).await.map_err(|error| {
+        link_dir(&target, &link).await.map_err(|error| {
             workspace_error(format!("could not link unmanaged path {path}: {error}"))
         })?;
     }
     Ok(())
+}
+
+/// A directory link at `link` naming `target`: a symlink. On Windows, a
+/// directory symlink or else an NTFS junction
+/// ([`crate::windows::link_dir`]).
+async fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    return crate::windows::link_dir(target, link).await;
+    #[cfg(unix)]
+    return tokio::fs::symlink(target, link).await;
 }
 
 /// An unmanaged path is relative, every component normal, and not under

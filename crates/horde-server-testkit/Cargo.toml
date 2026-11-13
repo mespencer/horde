@@ -17,15 +17,17 @@ horde-identity = { workspace = true }
 horde-observe = { workspace = true }
 horde-proto = { workspace = true }
 horde-server = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
+tokio-stream = "0.1.19"
+tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ring"] }
+
+[target.'cfg(unix)'.dependencies]
 # The one guarded signal path (src/reap.rs): kill/killpg straight from the
 # syscall, never through `/bin/kill` and a formatted pid.
 nix = { version = "0.31.3", features = ["process", "signal"] }
 # The pty driver two suites share: the TUI's raw-terminal shell and the
 # interactive-login e2e both spawn product binaries on a real terminal.
 portable-pty = "0.9.0"
-tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
-tokio-stream = "0.1.19"
-tonic = { version = "0.14.6", features = ["channel", "router", "server", "tls-ring"] }
 
 [dev-dependencies]
 # The blob-store harness tests root their stores in throwaway directories.

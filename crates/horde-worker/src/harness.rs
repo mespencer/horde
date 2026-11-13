@@ -19,6 +19,11 @@
 //! * **Process groups** — the spec it builds carries the ledger and stop grace
 //!   [`crate::process`] needs to stop a harness and everything it started.
 //!
+//! On Windows (ADR-0017) "owner-only" is the inherited ACL of the Worker's
+//! state directory — under the user's profile by default, which grants the
+//! user, SYSTEM and Administrators alone — not a mode: there are no mode
+//! bits to set, so files and directories are created plainly and inherit it.
+//!
 //! The provider-specific flags (Claude's `--setting-sources ''` and
 //! `--strict-mcp-config`; Codex's `env_http_headers`) live with each adapter,
 //! built on this profile.
@@ -29,7 +34,6 @@
 //! recipe each adapter publishes carries [`HarnessProfile::login_env`].
 
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -158,17 +162,19 @@ impl HarnessProfile {
     pub fn secret_file(&self, prefix: &str, contents: &[u8]) -> Result<SecretFile, String> {
         let run = self.root.join(RUN_DIR);
         owner_only_dir(&run)?;
-        let mut file = tempfile::Builder::new()
-            .prefix(prefix)
-            .suffix(".json")
-            .permissions(std::fs::Permissions::from_mode(0o600))
-            .tempfile_in(&run)
-            .map_err(|error| {
-                format!(
-                    "could not create a secret file in {}: {error}",
-                    run.display()
-                )
-            })?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix).suffix(".json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        let mut file = builder.tempfile_in(&run).map_err(|error| {
+            format!(
+                "could not create a secret file in {}: {error}",
+                run.display()
+            )
+        })?;
         file.write_all(contents)
             .and_then(|()| file.flush())
             .map_err(|error| format!("could not write a secret file: {error}"))?;
@@ -227,14 +233,21 @@ impl HarnessProfile {
     }
 }
 
-/// Creates `dir` (and its parents) and makes the leaf owner-only.
+/// Creates `dir` (and its parents) and makes the leaf owner-only — on
+/// Windows, created plainly under the state directory's inherited ACL.
 fn owner_only_dir(dir: &Path) -> Result<(), String> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
-        .map_err(|error| format!("could not prepare {}: {error}", dir.display()))
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::create_dir_all(dir);
+    created.map_err(|error| format!("could not prepare {}: {error}", dir.display()))
 }
 
 /// An owner-only file a harness launch references, deleted when the last
@@ -280,14 +293,14 @@ impl GroupLedger for Journal {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use horde_adapter::ProviderAccount;
 
     use super::HarnessProfile;
     use crate::process::{GroupLedger, HarnessGroup};
 
+    #[cfg(unix)]
     fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path)
             .expect("the path exists")
             .permissions()
@@ -314,7 +327,9 @@ mod tests {
             work,
             scratch.path().join("claude").join("accounts").join("work")
         );
+        #[cfg(unix)]
         assert_eq!(mode(&default), 0o700, "config dirs hold credentials");
+        #[cfg(unix)]
         assert_eq!(mode(&work), 0o700);
     }
 
@@ -387,7 +402,10 @@ mod tests {
             .expect("written");
         let path = secret.path().to_path_buf();
 
+        #[cfg(unix)]
+
         assert_eq!(mode(&path), 0o600, "a bearer token is owner-only");
+        #[cfg(unix)]
         assert_eq!(mode(path.parent().expect("a run dir")), 0o700);
         assert_eq!(
             std::fs::read_to_string(&path).expect("readable"),

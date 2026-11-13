@@ -6,6 +6,7 @@
 //! so both halves are testable against captured tool output.
 
 pub mod clippy;
+pub mod clippy_windows;
 pub mod coverage;
 pub mod crap;
 pub mod duplication;
@@ -35,8 +36,8 @@ pub enum Reader {
 
 /// A gate that checks a tool's version, runs one command, and reads the result.
 ///
-/// Six of the ten gates have exactly this shape, so they are values of this
-/// type rather than six near-identical `impl Gate` blocks. Only the multi-step
+/// Seven of the eleven gates have exactly this shape, so they are values of this
+/// type rather than seven near-identical `impl Gate` blocks. Only the multi-step
 /// gates — the ones that enumerate targets or compute a diff first — implement
 /// [`Gate`] themselves.
 #[derive(Debug, Clone, Copy)]

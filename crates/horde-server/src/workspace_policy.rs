@@ -469,9 +469,15 @@ mod tests {
     #[test]
     fn a_reclaim_argv_is_bounded_and_runs_no_relative_program() {
         let argv = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // An absolute program as this platform spells one: `/usr/bin/make`
+        // is only rooted on Windows, where absolute needs a drive.
+        #[cfg(unix)]
+        const ABSOLUTE_MAKE: &str = "/usr/bin/make";
+        #[cfg(windows)]
+        const ABSOLUTE_MAKE: &str = r"C:\tools\make.exe";
         assert_eq!(reclaim_argv_shortfall(&argv(&["make", "clean"]), &[]), None);
         assert_eq!(
-            reclaim_argv_shortfall(&argv(&["/usr/bin/make"]), &argv(&["build"])),
+            reclaim_argv_shortfall(&argv(&[ABSOLUTE_MAKE]), &argv(&["build"])),
             None
         );
         assert!(reclaim_argv_shortfall(&[], &[]).is_some());

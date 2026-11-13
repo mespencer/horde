@@ -44,9 +44,19 @@ fn main() -> std::process::ExitCode {
 /// Starts a SIGTERM-ignoring sleeper in this harness's process group and
 /// records its pid — written after the spawn, so a test that reads the file
 /// knows the child exists.
+///
+/// On Windows the sleeper is `ping -n 600` — there is no SIGTERM to ignore
+/// there, and a job's members die however they feel about it.
 fn start_grandchild(pidfile: &str) {
-    let spawned = std::process::Command::new("/bin/sh")
-        .args(["-c", "trap '' TERM; exec sleep 600"])
+    #[cfg(unix)]
+    let mut command = std::process::Command::new("/bin/sh");
+    #[cfg(unix)]
+    command.args(["-c", "trap '' TERM; exec sleep 600"]);
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new("ping.exe");
+    #[cfg(not(unix))]
+    command.args(["-n", "600", "127.0.0.1"]);
+    let spawned = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn();
@@ -174,7 +184,7 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
         // the turn knows its next write meets EPIPE. The next read here
         // fails on the closed descriptor, which ends the loop.
         if behaviour.hang_up {
-            let _ = nix::unistd::close(0);
+            close_descriptor(0);
         }
 
         if !serve(&mut stdout, turn) || behaviour.done_after(served) {
@@ -194,3 +204,15 @@ fn serve(stdout: &mut std::io::Stdout, turn: &[&str]) -> bool {
     }
     stdout.flush().is_ok()
 }
+
+/// Closes stdin — the hang-up `HORDE_STUB_HANG_UP` stages. Unix only: no
+/// safe close of a standard handle exists on Windows, and the supervision
+/// tests that stage a hang-up run on Unix alone (ADR-0017).
+#[cfg(unix)]
+fn close_descriptor(descriptor: i32) {
+    let _ = nix::unistd::close(descriptor);
+}
+
+/// See the Unix twin: on Windows a staged hang-up closes nothing.
+#[cfg(not(unix))]
+fn close_descriptor(_descriptor: i32) {}

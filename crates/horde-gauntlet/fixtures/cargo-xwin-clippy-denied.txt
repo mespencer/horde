@@ -1,0 +1,26 @@
+error[E0433]: cannot find `unix` in `os`
+  --> crates/horde-identity/src/home.rs:87:18
+   |
+87 |     use std::os::unix::fs::PermissionsExt;
+   |                  ^^^^ could not find `unix` in `os`
+   |
+note: found an item that was configured out
+  --> /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library\std\src\os\mod.rs:29:4
+   |
+   = note: the item is gated here
+note: found an item that was configured out
+  --> /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library\std\src\os\mod.rs:84:40
+   |
+   = note: the item is gated here
+
+error[E0599]: no method named `mode` found for struct `std::fs::Permissions` in the current scope
+  --> crates/horde-identity/src/home.rs:88:24
+   |
+88 |     meta.permissions().mode() & 0o111 != 0
+   |                        ^^^^ method not found in `std::fs::Permissions`
+
+Some errors have detailed explanations: E0433, E0599.
+For more information about an error, try `rustc --explain E0433`.
+error: could not compile `horde-identity` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `horde-identity` (lib test) due to 2 previous errors
