@@ -1603,7 +1603,6 @@ fn materialize_command(sequence: u64, origin: &std::path::Path) -> StreamCommand
                     name: "atlas".to_owned(),
                     remote_url: origin.display().to_string(),
                     default_branch: "main".to_owned(),
-                    layout_path: String::new(),
                     ..horde_proto::v1::WorkspaceRepo::default()
                 }],
                 unmanaged_paths: Vec::new(),

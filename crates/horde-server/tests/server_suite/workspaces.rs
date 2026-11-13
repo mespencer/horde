@@ -92,6 +92,15 @@ async fn report_instance(harness: &mut Harness, worker: &str, definition: &str) 
     Ok(())
 }
 
+/// A harness whose workspace a protocol-2 worker reports holding.
+async fn held_workspace() -> Setup<(Harness, String)> {
+    let mut harness = connect().await?;
+    let workspace = plain_workspace(&mut harness).await?;
+    register(&mut harness, "new-worker", 2).await?;
+    report_instance(&mut harness, "new-worker", &workspace).await?;
+    Ok((harness, workspace))
+}
+
 /// Every new Definition rule is enforced at create: unmanaged paths, nested
 /// layouts under lazy, a layout under `.horde`, and a reclaim argv that
 /// would run a relative program.
@@ -283,14 +292,7 @@ async fn new_checkout_fields_wait_for_a_protocol_two_worker() {
 /// carries the matching command; the listing serves the reported checkouts.
 #[tokio::test]
 async fn gc_targets_holders_and_commands_them() {
-    let mut harness = connect().await.expect("a harness");
-    let workspace = plain_workspace(&mut harness).await.expect("a workspace");
-    register(&mut harness, "new-worker", 2)
-        .await
-        .expect("registers");
-    report_instance(&mut harness, "new-worker", &workspace)
-        .await
-        .expect("reports");
+    let (mut harness, workspace) = held_workspace().await.expect("a held workspace");
     register(&mut harness, "old-worker", 0)
         .await
         .expect("registers");
@@ -372,14 +374,7 @@ async fn gc_targets_holders_and_commands_them() {
 /// without `--purge` is refused.
 #[tokio::test]
 async fn delete_purge_requests_instance_removal_and_a_dry_run_keeps_the_definition() {
-    let mut harness = connect().await.expect("a harness");
-    let workspace = plain_workspace(&mut harness).await.expect("a workspace");
-    register(&mut harness, "new-worker", 2)
-        .await
-        .expect("registers");
-    report_instance(&mut harness, "new-worker", &workspace)
-        .await
-        .expect("reports");
+    let (mut harness, workspace) = held_workspace().await.expect("a held workspace");
     let current = |harness: &mut Harness| {
         let mut control = harness.control.clone();
         let workspace = workspace.clone();

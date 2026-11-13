@@ -164,19 +164,30 @@ mod tests {
         assert!(answer.is_err(), "{answer:?}");
     }
 
+    /// A remote that accepts the connection and never answers: the ceiling
+    /// fires, and it reads as a failure naming itself, never as success with
+    /// empty output.
     #[tokio::test]
     async fn a_remote_run_times_out_with_a_sentence() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let silent = tokio::spawn(async move {
+            let held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+        let url = format!("git://127.0.0.1:{port}/silent.git");
         let failed = git_with(
             dir.path(),
-            &["version"],
-            GitRun::remote(Duration::from_nanos(1)),
+            &["ls-remote", "--", &url],
+            GitRun::remote(Duration::from_millis(500)),
         )
         .await;
-        // No process starts and exits within a nanosecond: the ceiling
-        // fires, and it must read as a failure naming itself, never as
-        // success with empty output.
-        let error = failed.expect_err("a nanosecond is not long enough to run git");
+        silent.abort();
+        let error = failed.expect_err("a silent remote never answers");
         assert!(error.contains("did not finish"), "{error}");
     }
 }

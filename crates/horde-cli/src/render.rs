@@ -927,7 +927,7 @@ fn harnesses_of(worker: &horde_proto::v1::WorkerSummary) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn instance_state(state: i32) -> &'static str {
+pub(crate) fn instance_state(state: i32) -> &'static str {
     match horde_proto::v1::WorkspaceInstanceState::try_from(state) {
         Ok(horde_proto::v1::WorkspaceInstanceState::Materializing) => "materializing",
         Ok(horde_proto::v1::WorkspaceInstanceState::Ready) => "ready",

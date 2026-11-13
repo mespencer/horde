@@ -496,14 +496,60 @@ fn explicit_pass(
     }
 }
 
+/// An explicit hard removal of `record`'s checkout in `ws-1`.
+#[cfg(test)]
+async fn remove(
+    manager: &WorkspaceManager,
+    record: &horde_worker::workspace::ledger::LedgerRecord,
+    policy: &horde_worker::workspace::policy::WorkspacePolicy,
+    force: bool,
+) -> (horde_proto::v1::WorkspaceCleanup, bool) {
+    horde_worker::workspace::cleanup::hard_remove(
+        manager,
+        "ws-1",
+        record,
+        explicit_pass(policy),
+        force,
+    )
+    .await
+}
+
+/// Archives `agent` and runs the lossless (unforced) hard removal of its
+/// checkout under the default policy.
+#[cfg(test)]
+async fn remove_archived(
+    manager: &WorkspaceManager,
+    agent: &str,
+) -> (horde_proto::v1::WorkspaceCleanup, bool) {
+    let record = archived(manager, agent).await;
+    remove(
+        manager,
+        &record,
+        &horde_worker::workspace::policy::WorkspacePolicy::default(),
+        false,
+    )
+    .await
+}
+
+/// The commit an agent's archive pin holds in the Instance's `atlas`.
+#[cfg(test)]
+fn pinned(instance: &horde_proto::v1::WorkspaceInstanceReport, agent: &str) -> String {
+    let repo = std::path::Path::new(&instance.root_path).join("atlas");
+    harness::git(
+        &repo,
+        &["rev-parse", &format!("refs/horde/archived/{agent}")],
+    )
+    .trim()
+    .to_owned()
+}
+
 /// One agent's ledger record, archived.
 #[cfg(test)]
 async fn archived(
     manager: &WorkspaceManager,
     agent: &str,
 ) -> horde_worker::workspace::ledger::LedgerRecord {
-    manager
-        .mark_archived("ws-1", agent)
+    horde_worker::workspace::cleanup::mark_archived(&manager, "ws-1", agent)
         .await
         .expect("the agent has a ledgered checkout")
 }
@@ -524,12 +570,7 @@ async fn a_lossless_hard_removal_removes_the_worktree_and_pins_its_head() {
         .expect("a sibling checkout");
     let work = harness::parents_commit(&checkout.join("atlas"));
     let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
-    let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
-
-    let record = archived(&manager, "agent-1").await;
-    let (event, removed) = manager
-        .hard_remove("ws-1", &record, explicit_pass(&policy), false)
-        .await;
+    let (event, removed) = remove_archived(&manager, "agent-1").await;
     assert!(removed, "{event:?}");
     assert_eq!(event.repos[0].pinned_commit_sha, work);
 
@@ -545,11 +586,7 @@ async fn a_lossless_hard_removal_removes_the_worktree_and_pins_its_head() {
         "only the archived agent's branch is deleted: {branches}"
     );
     assert_eq!(
-        harness::git(
-            &instance_repo,
-            &["rev-parse", "refs/horde/archived/agent-1"]
-        )
-        .trim(),
+        pinned(&instance, "agent-1"),
         work,
         "the agent's last commit stays reachable"
     );
@@ -578,29 +615,18 @@ async fn a_fresh_clone_is_pinned_then_removed_and_shared_roots_are_left_alone() 
         .await
         .expect("a fresh clone");
     let work = harness::parents_commit(&clone.join("atlas"));
-    let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
-
-    let record = archived(&manager, "agent-1").await;
-    let (event, removed) = manager
-        .hard_remove("ws-1", &record, explicit_pass(&policy), false)
-        .await;
+    let (event, removed) = remove_archived(&manager, "agent-1").await;
     assert!(removed, "{event:?}");
     assert!(!clone.exists());
-    let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
-    assert_eq!(
-        harness::git(
-            &instance_repo,
-            &["rev-parse", "refs/horde/archived/agent-1"]
-        )
-        .trim(),
-        work
-    );
+    assert_eq!(pinned(&instance, "agent-1"), work);
 
     let shared = harness::checkout(&manager, "ws-1", "agent-2", CheckoutPolicy::Shared)
         .await
         .expect("the shared checkout");
     assert!(
-        manager.mark_archived("ws-1", "agent-2").await.is_none(),
+        horde_worker::workspace::cleanup::mark_archived(&manager, "ws-1", "agent-2")
+            .await
+            .is_none(),
         "no ledger, nothing to remove"
     );
     assert!(
@@ -615,16 +641,14 @@ async fn a_fresh_clone_is_pinned_then_removed_and_shared_roots_are_left_alone() 
 async fn a_dirty_checkout_is_retained_unless_forced() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
-    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Worktree)
-        .await
-        .expect("a worktree checkout");
+    let checkout = harness::checkout_request(
+        &manager,
+        &harness::request("ws-1", "agent-1", CheckoutPolicy::Worktree),
+    )
+    .await
+    .expect("a checkout to leave dirty");
     std::fs::write(checkout.join("atlas").join("scratch.txt"), "wip").expect("writes");
-    let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
-
-    let record = archived(&manager, "agent-1").await;
-    let (event, removed) = manager
-        .hard_remove("ws-1", &record, explicit_pass(&policy), false)
-        .await;
+    let (event, removed) = remove_archived(&manager, "agent-1").await;
     assert!(!removed);
     assert_eq!(
         event.repos[0].outcome,
@@ -641,20 +665,16 @@ async fn a_dirty_checkout_is_retained_unless_forced() {
     let head = harness::git(&checkout.join("atlas"), &["rev-parse", "HEAD"])
         .trim()
         .to_owned();
-    let (event, removed) = manager
-        .hard_remove("ws-1", &retained[0], explicit_pass(&policy), true)
-        .await;
+    let (event, removed) = remove(
+        &manager,
+        &retained[0],
+        &horde_worker::workspace::policy::WorkspacePolicy::default(),
+        true,
+    )
+    .await;
     assert!(removed, "{event:?}");
     assert!(event.repos[0].reason.starts_with("forced:"), "{event:?}");
-    let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
-    assert_eq!(
-        harness::git(
-            &instance_repo,
-            &["rev-parse", "refs/horde/archived/agent-1"]
-        )
-        .trim(),
-        head
-    );
+    assert_eq!(pinned(&instance, "agent-1"), head);
 }
 
 /// A remote URL or branch shaped like an option is refused before git ever

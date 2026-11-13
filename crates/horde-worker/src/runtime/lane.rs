@@ -400,7 +400,7 @@ impl Lane {
     /// with no workspace support completes the request with the error
     /// rather than leaving the Client waiting.
     async fn workspace_gc(&self, gc: &horde_proto::v1::WorkspaceGcCommand) -> Applied {
-        let effects = match self.shared.housekeeper() {
+        let effects = match super::housekeeping::of(&self.shared) {
             Some(housekeeper) => {
                 if let Some(definition) = gc.workspace_definition_id.as_ref() {
                     self.shared
@@ -544,9 +544,12 @@ impl Lane {
             Err(error) => {
                 // The abandon takes the checkout lock itself.
                 drop(held);
-                self.shared
-                    .abandon_spawn(&agent_id, checkout.as_ref())
-                    .await;
+                super::housekeeping::abandon_spawn(
+                    &self.shared,
+                    &agent_id,
+                    checkout.as_ref().map(|checkout| checkout.root.as_path()),
+                )
+                .await;
                 return Ok(spawn_failed(&context, &agent_id, &error));
             }
         };
@@ -981,7 +984,7 @@ impl Lane {
             }
             AfterCommit::Retire { agent_id } => self.retire(&agent_id).await,
             AfterCommit::Report => {
-                if let Some(housekeeper) = self.shared.housekeeper() {
+                if let Some(housekeeper) = super::housekeeping::of(&self.shared) {
                     housekeeper.report().await;
                 }
             }
@@ -989,7 +992,7 @@ impl Lane {
                 self.shared.forget_endpoint(&agent_id).await;
                 self.shared.broker.forget(&agent_id);
                 if let Some(checkout) = checkout {
-                    self.shared.release_checkout(&agent_id, &checkout).await;
+                    super::housekeeping::release_checkout(&self.shared, &agent_id, &checkout).await;
                 }
             }
         }
@@ -1063,7 +1066,7 @@ impl Lane {
                     let _ = pump.await;
                 }
                 if let Some(checkout) = checkout {
-                    shared.release_checkout(&agent_id, &checkout.root).await;
+                    super::housekeeping::release_checkout(&shared, &agent_id, &checkout.root).await;
                 }
             }),
         );

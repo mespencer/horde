@@ -34,6 +34,7 @@
 //! would double every one of them in every client.
 
 mod access;
+mod activity;
 mod housekeeping;
 mod lane;
 mod pump;
@@ -55,7 +56,8 @@ use crate::client::ApplyCommand;
 use crate::error::WorkerError;
 use crate::journal::{CommandApplication, Journal};
 use crate::share::{ShareBroker, StampingSink};
-pub use housekeeping::{Activity, HousekeepingConfig, InstanceReporter, Watermark};
+pub use activity::{Activity, InstanceReporter};
+pub use housekeeping::{HousekeepingConfig, Watermark};
 use lane::{LaneHandle, LaneMessage, Ledger, lane_key, spawn_lane, workspace_lane};
 use shared::{Shared, workspace_of};
 
@@ -124,7 +126,7 @@ impl Runtime {
         if self.scan.is_some() {
             return;
         }
-        let Some(housekeeper) = self.shared.housekeeper() else {
+        let Some(housekeeper) = housekeeping::of(&self.shared) else {
             return;
         };
         if let Some(endpoints) = &self.shared.endpoints {
@@ -143,7 +145,7 @@ impl Runtime {
     /// interval — returning whether it changed anything. For tests and
     /// operators who will not wait a minute.
     pub async fn scan_workspaces(&self) -> bool {
-        let Some(housekeeper) = self.shared.housekeeper() else {
+        let Some(housekeeper) = housekeeping::of(&self.shared) else {
             return false;
         };
         let mut episode = self.episode.lock().await;

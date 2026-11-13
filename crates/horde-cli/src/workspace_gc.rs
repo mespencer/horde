@@ -844,7 +844,7 @@ pub fn instance_json(report: &WorkspaceInstanceReport) -> serde_json::Value {
     json!({
         "workspace_definition_id": report.workspace_definition_id.as_ref().map(ToString::to_string),
         "worker_id": report.worker_id.as_ref().map(ToString::to_string),
-        "state": instance_state_name(report.state),
+        "state": crate::render::instance_state(report.state),
         "root_path": report.root_path,
         "detail": report.detail,
         "instance_bytes": report.instance_bytes,
@@ -877,7 +877,7 @@ pub fn instance_lines(report: &WorkspaceInstanceReport) -> String {
             .worker_id
             .as_ref()
             .map_or_else(|| "-".to_owned(), ToString::to_string),
-        instance_state_name(report.state),
+        crate::render::instance_state(report.state),
         human_bytes(report.instance_bytes),
         human_bytes(report.filesystem_free_bytes),
         human_bytes(report.filesystem_total_bytes),
@@ -971,16 +971,6 @@ pub fn checkout_state_name(state: i32) -> &'static str {
         Ok(horde_proto::v1::CheckoutState::ArchivedRetained) => "archived-retained",
         Ok(horde_proto::v1::CheckoutState::Orphan) => "orphan",
         Ok(horde_proto::v1::CheckoutState::Unspecified) | Err(_) => "unknown",
-    }
-}
-
-fn instance_state_name(state: i32) -> &'static str {
-    match horde_proto::v1::WorkspaceInstanceState::try_from(state) {
-        Ok(horde_proto::v1::WorkspaceInstanceState::Materializing) => "materializing",
-        Ok(horde_proto::v1::WorkspaceInstanceState::Ready) => "ready",
-        Ok(horde_proto::v1::WorkspaceInstanceState::Degraded) => "degraded",
-        Ok(horde_proto::v1::WorkspaceInstanceState::Missing) => "missing",
-        Ok(horde_proto::v1::WorkspaceInstanceState::Unspecified) | Err(_) => "unknown",
     }
 }
 

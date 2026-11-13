@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use horde_proto::v1::WorkspaceDefinition;
 use serde::{Deserialize, Serialize};
 
-use super::layout_of;
 use super::ledger::{LedgerRecord, write_atomically};
+use super::paths::layout_of;
 
 /// The manifest's path inside an agent root.
 pub const MANIFEST_PATH: &str = ".horde/workspace.json";

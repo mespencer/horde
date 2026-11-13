@@ -13,12 +13,7 @@ use std::time::Duration;
 /// Anything else, in words naming the accepted forms.
 pub fn parse_duration(value: &str) -> Result<Duration, String> {
     let refuse = || format!("{value:?} is not a duration such as 90s, 10m, 4h or 1d");
-    let value = value.trim();
-    let split = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (digits, unit) = value.split_at(split);
-    let amount: u64 = digits.parse().map_err(|_| refuse())?;
+    let (amount, unit) = amount_and_unit(value).ok_or_else(refuse)?;
     let scale = match unit {
         "" | "s" => 1,
         "m" => 60,
@@ -39,12 +34,7 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
 /// Anything else, in words naming the accepted forms.
 pub fn parse_size(value: &str) -> Result<u64, String> {
     let refuse = || format!("{value:?} is not a size such as 512MiB or 20GiB");
-    let value = value.trim();
-    let split = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (digits, unit) = value.split_at(split);
-    let amount: u64 = digits.parse().map_err(|_| refuse())?;
+    let (amount, unit) = amount_and_unit(value).ok_or_else(refuse)?;
     let scale: u64 = match unit {
         "" | "B" => 1,
         "KiB" => 1 << 10,
@@ -54,6 +44,16 @@ pub fn parse_size(value: &str) -> Result<u64, String> {
         _ => return Err(refuse()),
     };
     amount.checked_mul(scale).ok_or_else(refuse)
+}
+
+/// The leading digits as a number, and whatever unit follows them.
+fn amount_and_unit(value: &str) -> Option<(u64, &str)> {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split);
+    Some((digits.parse().ok()?, unit))
 }
 
 /// A free-space threshold as `10%`, `20GiB`, or both comma-separated (the

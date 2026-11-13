@@ -1347,15 +1347,7 @@ impl ControlPlaneService for ControlPlane {
         let targets = super::workspace_gc::targets(&self.core, workers);
         let (purge_request_id, purge_sequence) = super::workspace_gc::request_gc(
             &self.core,
-            super::workspace_gc::GcAsk {
-                definition_id: Some(id),
-                level: horde_proto::v1::GcLevel::Hard,
-                force: request.force,
-                dry_run: request.dry_run,
-                remove_instance: true,
-                requested_by,
-                ..super::workspace_gc::GcAsk::default()
-            },
+            super::workspace_gc::GcAsk::removal(id, request.force, request.dry_run, requested_by),
             &targets,
         )
         .await
@@ -1444,15 +1436,12 @@ impl ControlPlaneService for ControlPlane {
         }
         let (request_id, sequence) = super::workspace_gc::request_gc(
             &self.core,
-            super::workspace_gc::GcAsk {
-                definition_id: Some(definition_id),
-                level: horde_proto::v1::GcLevel::Hard,
-                force: request.force,
-                dry_run: request.dry_run,
-                remove_instance: true,
+            super::workspace_gc::GcAsk::removal(
+                definition_id,
+                request.force,
+                request.dry_run,
                 requested_by,
-                ..super::workspace_gc::GcAsk::default()
-            },
+            ),
             &targets,
         )
         .await

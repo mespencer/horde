@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::is_path_safe;
+use super::paths::is_path_safe;
 
 /// Where ledger records live, under an Instance's agents directory. The
 /// leading dot keeps it from ever reading as an agent.

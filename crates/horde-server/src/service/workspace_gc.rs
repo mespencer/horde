@@ -96,6 +96,28 @@ pub struct GcAsk {
     pub requested_by: String,
 }
 
+impl GcAsk {
+    /// An Instance removal of one Definition — `instance remove` and
+    /// `delete --purge` alike: a hard level that also removes the Instance.
+    #[must_use]
+    pub fn removal(
+        definition_id: String,
+        force: bool,
+        dry_run: bool,
+        requested_by: String,
+    ) -> Self {
+        Self {
+            definition_id: Some(definition_id),
+            level: GcLevel::Hard,
+            force,
+            dry_run,
+            remove_instance: true,
+            requested_by,
+            ..Self::default()
+        }
+    }
+}
+
 /// Appends one `WorkspaceGcRequested` naming every commanded Worker,
 /// returning the request id and its log position.
 ///

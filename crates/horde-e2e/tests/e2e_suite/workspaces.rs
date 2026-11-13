@@ -197,14 +197,16 @@ async fn human(system: &System, args: &[&str]) -> (i32, String) {
 /// A Rust origin: what the built-in reclaim rule runs `cargo clean` in.
 async fn crate_origin(system: &System) -> PathBuf {
     let origin = origin(system, "crate").await;
-    std::fs::write(
-        origin.join("Cargo.toml"),
-        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
-    )
-    .expect("Cargo.toml");
+    let manifest =
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n";
     std::fs::create_dir_all(origin.join("src")).expect("src");
-    std::fs::write(origin.join("src/lib.rs"), "").expect("lib.rs");
-    std::fs::write(origin.join(".gitignore"), "/target\n").expect(".gitignore");
+    for (file, contents) in [
+        ("Cargo.toml", manifest),
+        ("src/lib.rs", ""),
+        (".gitignore", "/target\n"),
+    ] {
+        std::fs::write(origin.join(file), contents).expect("a crate file");
+    }
     git(&origin, &["add", "-A"]).await;
     git(&origin, &["commit", "-m", "a crate"]).await;
     origin
