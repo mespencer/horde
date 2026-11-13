@@ -45,7 +45,19 @@ On the second machine, redeem it. The token file (or `HORDE_JOIN_TOKEN`) keeps t
 horde-worker --join-file token.txt --adapter claude
 ```
 
-The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`. To add another client machine instead, mint with `horde enroll client <name>` and redeem with `horde enroll join --token-file token.txt`.
+The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`.
+
+If you can ssh to the second machine (Linux or macOS), one command does all of this from here:
+
+```sh
+horde worker add gpu-box me@gpu-box --adapter claude --endpoint https://box.lan:7777
+```
+
+`horde worker add` probes the machine with `uname -sm` and copies a matching `horde-worker` into `~/.horde/bin` there, without sudo. It mints the token and hands it over ssh stdin to an owner-only file, so the token never appears on a command line. It starts the worker and waits for it to register. Last, it reports which harnesses (`claude`, `codex`) the worker can see. It uses your own `ssh` and `scp`, with your config, agent and `known_hosts`.
+
+- `--service` installs a systemd user unit or a launchd agent, so the worker survives reboots.
+- `--dry-run` prints every command without running anything.
+- The copied binary must match the remote platform. Pass `--binary-dir` to name a directory holding one built for it, or `--build-locally` to build it here for the remote target. To add another client machine instead, mint with `horde enroll client <name>` and redeem with `horde enroll join --token-file token.txt`.
 
 ## Diagnosing a setup
 
