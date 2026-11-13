@@ -1159,6 +1159,7 @@ dependencies = [
  "horde-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
