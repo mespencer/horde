@@ -713,6 +713,107 @@ mod tests {
         assert_eq!(text.lines().count(), 2, "only records in JSON: {text}");
     }
 
+    /// A buffer a spawned follow writes into while the test reads it.
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut held) = self.0.lock() {
+                held.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            self.0
+                .lock()
+                .map(|held| String::from_utf8_lossy(&held).into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dir_returns_at_once_without_follow_and_keeps_reading_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("horde.b.1.jsonl"),
+            r#"{"ts":"2026-01-01T00:00:01.000000Z","level":"INFO","msg":"first"}"#,
+        )
+        .expect("write");
+        let once = LogsArgs {
+            n: 5,
+            ..LogsArgs::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_dir(dir.path(), &once, Format::Json, &mut Vec::new()),
+        )
+        .await
+        .expect("a plain --dir read returns")
+        .expect("read");
+
+        let out = Shared::default();
+        let mut writer = out.clone();
+        let args = LogsArgs {
+            n: 5,
+            follow: true,
+            ..LogsArgs::default()
+        };
+        let driver = async {
+            let mut polls = 0;
+            while !out.text().contains("first") {
+                polls += 1;
+                assert!(polls < 100, "the existing record prints first");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            std::fs::write(
+                dir.path().join("horde.b.2.jsonl"),
+                r#"{"ts":"2026-01-01T00:00:02.000000Z","level":"INFO","msg":"second"}"#,
+            )
+            .expect("write");
+            while !out.text().contains("second") {
+                polls += 1;
+                assert!(
+                    polls < 200,
+                    "a record written later is followed: {}",
+                    out.text()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::select! {
+            ended = run_dir(dir.path(), &args, Format::Human, &mut writer) => {
+                panic!("a follow keeps reading, but it ended: {ended:?}");
+            }
+            () = driver => {}
+        }
+        assert_eq!(out.text().matches("first").count(), 1, "nothing twice");
+    }
+
+    #[test]
+    fn a_notice_prints_in_human_output() {
+        let mut human = Vec::new();
+        {
+            let mut printer = Printer {
+                out: &mut human,
+                format: Format::Human,
+                boot: None,
+            };
+            printer.notice("redialing").expect("print");
+        }
+        assert_eq!(
+            String::from_utf8(human).expect("utf8"),
+            "--- redialing ---\n"
+        );
+    }
+
     #[test]
     fn only_a_vanished_worker_is_worth_redialing() {
         assert_eq!(ended_by(LogEndReason::Done as i32, ""), Ended::Finished);
