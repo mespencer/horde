@@ -50,20 +50,18 @@ pub struct StatvfsStats;
 impl FsStats for StatvfsStats {
     // The `statvfs` field types are platform-sized (u64 on Linux, u32 and
     // c_ulong on macOS), so the conversions are useless only here.
-    #[cfg(unix)]
     #[allow(clippy::useless_conversion)]
     fn stats(&self, path: &Path) -> Option<(u64, u64)> {
-        let stats = nix::sys::statvfs::statvfs(path).ok()?;
-        let fragment = u64::from(stats.fragment_size());
-        let free = u64::from(stats.blocks_available()).saturating_mul(fragment);
-        let total = u64::from(stats.blocks()).saturating_mul(fragment);
-        Some((free, total))
-    }
-
-    #[cfg(windows)]
-    fn stats(&self, path: &Path) -> Option<(u64, u64)> {
-        let stats = fs4::statvfs(path).ok()?;
-        Some((stats.available_space(), stats.total_space()))
+        #[cfg(windows)]
+        return crate::windows::disk_stats(path);
+        #[cfg(unix)]
+        {
+            let stats = nix::sys::statvfs::statvfs(path).ok()?;
+            let fragment = u64::from(stats.fragment_size());
+            let free = u64::from(stats.blocks_available()).saturating_mul(fragment);
+            let total = u64::from(stats.blocks()).saturating_mul(fragment);
+            Some((free, total))
+        }
     }
 }
 
@@ -1264,27 +1262,14 @@ async fn link_unmanaged(
     Ok(())
 }
 
-/// A directory link at `link` naming `target`: a symlink.
-#[cfg(unix)]
+/// A directory link at `link` naming `target`: a symlink. On Windows, a
+/// directory symlink or else an NTFS junction
+/// ([`crate::windows::link_dir`]).
 async fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
-    tokio::fs::symlink(target, link).await
-}
-
-/// A directory link at `link` naming `target`, on Windows: a directory
-/// symlink where the account may make one (Developer Mode, or an elevated
-/// Worker), and otherwise an NTFS junction, which needs no privilege and
-/// reads the same to every program that opens a path through it
-/// (ADR-0017). `target` is absolute — an Instance root joined to a path —
-/// which a junction requires.
-#[cfg(windows)]
-async fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
-    if tokio::fs::symlink_dir(target, link).await.is_ok() {
-        return Ok(());
-    }
-    let (target, link) = (target.to_owned(), link.to_owned());
-    tokio::task::spawn_blocking(move || junction::create(target, link))
-        .await
-        .map_err(std::io::Error::other)?
+    #[cfg(windows)]
+    return crate::windows::link_dir(target, link).await;
+    #[cfg(unix)]
+    return tokio::fs::symlink(target, link).await;
 }
 
 /// An unmanaged path is relative, every component normal, and not under

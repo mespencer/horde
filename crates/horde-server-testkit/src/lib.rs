@@ -41,6 +41,7 @@ pub mod pty;
 #[cfg(unix)]
 pub mod reap;
 pub mod secure;
+pub mod windows;
 
 use horde_cli::Client;
 use horde_proto::v1::worker_service_client::WorkerServiceClient;

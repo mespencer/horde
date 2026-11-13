@@ -6,7 +6,7 @@
 //! watches whether stopping the harness reaches it. On Unix the same
 //! questions are asked of process groups in `supervision.rs`.
 
-use horde_server_testkit::process::windows::{gone_soon, running};
+use horde_server_testkit::windows::{gone_soon, running};
 
 use rig::{CEILING, Spawned, spawned};
 

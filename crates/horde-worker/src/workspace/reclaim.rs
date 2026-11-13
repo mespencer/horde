@@ -515,7 +515,7 @@ mod tests {
             .parse()
             .expect("a pid");
         assert!(
-            horde_server_testkit::process::windows::gone_soon(pid).await,
+            horde_server_testkit::windows::gone_soon(pid).await,
             "the grandchild {pid} survived its job's termination"
         );
     }

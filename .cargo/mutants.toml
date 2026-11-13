@@ -48,6 +48,19 @@ exclude_re = [
     # only the signal guard, the orphan sweep's selection and the sending;
     # the harmless table reading it needs lives in `ps.rs` and is mutated.
     'crates/horde-server-testkit/src/reap\.rs',
+    # A third criterion: code this host never compiles. Each crate's Windows
+    # bodies (ADR-0017) live in one `windows.rs` whose every item is
+    # `cfg(windows)`, behind a function that every platform calls. A mutant
+    # there changes no byte of the Linux build, so it can only "survive" —
+    # it is not a finding and no Linux test could catch it. Those files are
+    # pinned by `cfg(windows)` tests run on a Windows machine instead, and
+    # `clippy-windows` keeps them compiling. Only `cfg(windows)` items
+    # belong in these files; anything that compiles here belongs elsewhere,
+    # where it is mutated.
+    'crates/horde-cli/src/windows\.rs',
+    'crates/horde-server/src/windows\.rs',
+    'crates/horde-server-testkit/src/windows\.rs',
+    'crates/horde-worker/src/windows\.rs',
 ]
 
 # Parallelism is not settable here — cargo-mutants takes `--jobs` on the command

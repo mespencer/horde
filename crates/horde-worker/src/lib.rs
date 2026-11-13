@@ -43,6 +43,7 @@ pub mod runtime;
 pub mod share;
 pub mod startup;
 pub mod translate;
+pub mod windows;
 pub mod workspace;
 
 pub use blob::AttachmentBroker;

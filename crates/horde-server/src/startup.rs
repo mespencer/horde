@@ -446,36 +446,29 @@ impl Drop for ChainTask {
 /// Brings the networked server up (DESIGN §3, activated in wave 5).
 ///
 /// SIGHUP, as a channel [`hold_until`] can own. Installing it also replaces
-/// SIGHUP's default action (ending the process) for good.
+/// SIGHUP's default action (ending the process) for good. Windows has no
+/// SIGHUP (ADR-0017): there the channel is born closed
+/// ([`crate::windows::forwarded_hangups`]).
 ///
 /// # Errors
 ///
 /// The signal handler failing to install.
-#[cfg(unix)]
 pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
-    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let (sender, receiver) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-        while signal.recv().await.is_some() {
-            if sender.send(()).await.is_err() {
-                return;
+    #[cfg(windows)]
+    return crate::windows::forwarded_hangups();
+    #[cfg(unix)]
+    {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            while signal.recv().await.is_some() {
+                if sender.send(()).await.is_err() {
+                    return;
+                }
             }
-        }
-    });
-    Ok(receiver)
-}
-
-/// Windows has no SIGHUP (ADR-0017): the channel is born closed, which
-/// [`hold_until`] reads as "no re-mints", and the server stays up. A fresh
-/// bootstrap token there comes from a restart, as it did before `--remint`.
-///
-/// # Errors
-///
-/// None; the signature matches the Unix one.
-#[cfg(not(unix))]
-pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
-    let (_closed, receiver) = tokio::sync::mpsc::channel(1);
-    Ok(receiver)
+        });
+        Ok(receiver)
+    }
 }
 
 /// `--serve`'s start: SIGHUP caught *before* the state lock exists —
@@ -1620,7 +1613,7 @@ mod tests {
 
     /// Windows has no SIGHUP: the hang-up channel is born closed, which
     /// `hold_until` reads as "no re-mints" while the server stays up.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     #[tokio::test]
     async fn without_sighup_the_hangup_channel_is_born_closed() {
         let mut hangups = super::forwarded_hangups().expect("no handler to fail");
