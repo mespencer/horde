@@ -1189,6 +1189,97 @@ mod tests {
     /// An instance change answers a prewarm naming this worker in this
     /// stream — the catalog stream included — or a placed agent; its report
     /// may not name another worker.
+    /// ADR-0014's kinds: a checkout's provenance is an agent event; cleanup
+    /// and disk pressure land only in the housekeeping stream and only about
+    /// the journaling worker; a gc answer must answer a request that named
+    /// that worker; and the request itself is the server's to write.
+    #[tokio::test]
+    async fn workspace_housekeeping_is_admitted_only_from_its_own_worker() {
+        let core = core();
+        placed_for_test(&core, "s1", "agent-1", "worker-a").await;
+        let housekeeping = horde_proto::WORKSPACE_HOUSEKEEPING_STREAM;
+        crate::service::shared::append_server_event(
+            &core.log,
+            housekeeping,
+            "",
+            event(
+                None,
+                Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested {
+                    request_id: "gc-1".to_owned(),
+                    worker_ids: vec![WorkerId::new("worker-a")],
+                    ..horde_proto::v1::WorkspaceGcRequested::default()
+                }),
+            ),
+        )
+        .await
+        .expect("the request appends");
+        let view = view_of(&core).await;
+
+        let prepared = event(
+            Some("agent-1"),
+            Kind::CheckoutPrepared(horde_proto::v1::CheckoutPrepared::default()),
+        );
+        assert!(view.judge("worker-a", "s1", &prepared).is_ok());
+        assert!(view.judge("worker-b", "s1", &prepared).is_err(), "not its agent");
+
+        let cleanup = |worker: &str| {
+            event(
+                None,
+                Kind::WorkspaceCleanup(horde_proto::v1::WorkspaceCleanup {
+                    worker_id: Some(WorkerId::new(worker)),
+                    ..horde_proto::v1::WorkspaceCleanup::default()
+                }),
+            )
+        };
+        assert!(view.judge("worker-a", housekeeping, &cleanup("worker-a")).is_ok());
+        assert!(view.judge("worker-a", housekeeping, &cleanup("worker-b")).is_err(), "another worker's");
+        assert!(view.judge("worker-a", "s1", &cleanup("worker-a")).is_err(), "not into a session");
+        let pressure = event(
+            None,
+            Kind::WorkspaceDiskPressure(horde_proto::v1::WorkspaceDiskPressure {
+                worker_id: Some(WorkerId::new("worker-a")),
+                ..horde_proto::v1::WorkspaceDiskPressure::default()
+            }),
+        );
+        assert!(view.judge("worker-a", housekeeping, &pressure).is_ok());
+        assert!(view.judge("worker-b", housekeeping, &pressure).is_err());
+
+        let completed = |request: &str| {
+            event(
+                None,
+                Kind::WorkspaceGcCompleted(horde_proto::v1::WorkspaceGcCompleted {
+                    request_id: request.to_owned(),
+                    worker_id: Some(WorkerId::new("worker-a")),
+                    ..horde_proto::v1::WorkspaceGcCompleted::default()
+                }),
+            )
+        };
+        assert!(view.judge("worker-a", housekeeping, &completed("gc-1")).is_ok());
+        assert!(
+            view.judge("worker-a", housekeeping, &completed("gc-ghost")).is_err(),
+            "no request asked"
+        );
+        let missing = event(
+            None,
+            Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged {
+                report: Some(WorkspaceInstanceReport {
+                    worker_id: Some(WorkerId::new("worker-a")),
+                    ..WorkspaceInstanceReport::default()
+                }),
+                progress: None,
+            }),
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &missing).is_ok(),
+            "a removal's MISSING report answers the request that targeted it"
+        );
+        let forged = event(
+            None,
+            Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested::default()),
+        );
+        assert!(view.judge("worker-a", housekeeping, &forged).is_err(), "server-written only");
+    }
+
     #[tokio::test]
     async fn an_instance_change_must_answer_a_prewarm_or_a_placed_agent() {
         let core = core();
