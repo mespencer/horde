@@ -399,8 +399,6 @@ impl AgentSession for LiveClaudeSession {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use horde_adapter::{Adapter, AgentSpec, Capability, ProviderAccount};
 
     use super::ClaudeAdapter;
@@ -629,12 +627,16 @@ mod tests {
             Some(path.clone()),
             "the harness holds the file it was pointed at, so it lives as long"
         );
-        let mode = std::fs::metadata(&path)
-            .expect("the config file exists")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "a file carrying a bearer token is owner-only");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("the config file exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "a file carrying a bearer token is owner-only");
+        }
 
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("readable"))

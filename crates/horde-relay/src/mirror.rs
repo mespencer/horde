@@ -330,6 +330,7 @@ mod tests {
     /// A dangling `maintenance.lock` symlink stands in for the lock that
     /// vanishes mid-copy, deterministically: a local clone walking `objects/`
     /// refuses it, a clone through the transport never sees it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_path_upstream_under_maintenance_still_mirrors() {
         let dir = tempfile::tempdir().expect("a scratch dir");

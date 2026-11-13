@@ -171,6 +171,14 @@ mod tests {
         assert!(text.contains("4242") && text.contains("SIGHUP") && text.contains("restart"));
     }
 
+    /// On Windows the binary's hang-up refuses with that same refusal.
+    #[cfg(not(unix))]
+    #[test]
+    fn send_hangup_refuses_without_sighup() {
+        let error = super::send_hangup(4242).expect_err("no SIGHUP here");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
     /// The guard alone answers: no signal is sent to learn any of this.
     #[cfg(unix)]
     #[test]

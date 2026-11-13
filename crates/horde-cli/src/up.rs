@@ -1141,5 +1141,9 @@ fn complete_lines(pending: &mut String) -> Vec<String> {
     lines
 }
 
+// The stand-up tests run `/bin/sh` daemons that trap SIGTERM: Unix-only
+// (ADR-0017). The Windows `horde up` path is exercised on a Windows machine
+// by hand (docs/adr/0017).
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

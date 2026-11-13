@@ -1618,9 +1618,19 @@ mod tests {
         assert!(unsignalled.contains("could not signal"), "{unsignalled}");
     }
 
+    /// Windows has no SIGHUP: the hang-up channel is born closed, which
+    /// `hold_until` reads as "no re-mints" while the server stays up.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn without_sighup_the_hangup_channel_is_born_closed() {
+        let mut hangups = super::forwarded_hangups().expect("no handler to fail");
+        assert_eq!(hangups.recv().await, None);
+    }
+
     /// `--serve`'s start catches SIGHUP before serving — a hang-up to this
     /// very process arrives on the channel instead of ending it — and a
     /// server that cannot start is refused in words.
+    #[cfg(unix)]
     #[tokio::test]
     async fn serving_catches_hangups_first_and_refuses_a_held_state() {
         let directory = tempfile::tempdir().expect("a temp dir");
@@ -1642,6 +1652,7 @@ mod tests {
         drop(running);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_hangup_reaches_a_real_process_and_a_dead_pid_is_refused() {
         let mut sleeper = tokio::process::Command::new("sleep")

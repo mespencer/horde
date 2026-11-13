@@ -2,6 +2,7 @@
 //! a real secured server — every input passed explicitly, nothing read from
 //! the process environment.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use super::{
@@ -67,6 +68,7 @@ fn certificates_are_judged_against_their_window() {
 
 /// Harnesses are found as executables on the given PATH; a missing one is
 /// a warning naming the fix; no list means the default pair.
+#[cfg(unix)]
 #[test]
 fn harness_binaries_are_looked_for_on_the_given_path() {
     let bin = tempfile::tempdir().expect("a dir");
@@ -103,6 +105,7 @@ fn harness_binaries_are_looked_for_on_the_given_path() {
 
 /// An owner-only dir passes; a group-readable one warns with the chmod; an
 /// absent one is fine (created owner-only on first use).
+#[cfg(unix)]
 #[test]
 fn state_dirs_are_checked_for_permissions_and_disk() {
     let root = tempfile::tempdir().expect("a dir");
@@ -367,5 +370,52 @@ async fn the_verb_fails_when_a_check_fails() {
     assert!(
         matches!(refused, crate::ClientError::Unhealthy { failures: 2 }),
         "{refused:?}"
+    );
+}
+
+/// The file Windows launches for a bare name is `name.exe`, and a name
+/// already ending in `.exe` (any case) is left alone.
+#[test]
+fn a_windows_program_is_its_exe() {
+    assert_eq!(super::windows_program("claude"), "claude.exe");
+    assert_eq!(super::windows_program("codex.exe"), "codex.exe");
+    assert_eq!(super::windows_program("Codex.EXE"), "Codex.EXE");
+}
+
+/// On Windows a harness is `name.exe` on the PATH; npm's `name.cmd` shim is
+/// not a program the Worker can launch, so it is not found.
+#[cfg(windows)]
+#[test]
+fn windows_harnesses_are_exes_on_the_given_path() {
+    let bin = tempfile::tempdir().expect("a dir");
+    let claude = bin.path().join("claude.exe");
+    std::fs::write(&claude, "MZ").expect("writes");
+    std::fs::write(bin.path().join("codex.cmd"), "@echo off\r\n").expect("writes");
+    let path = std::env::join_paths([bin.path()]).expect("a path");
+
+    let checks = harness_checks(&[], Some(&path));
+    let found = verdict_named(&checks, "harness claude");
+    assert_eq!(found.verdict, Verdict::Ok);
+    assert_eq!(found.detail, claude.display().to_string());
+    assert_eq!(
+        verdict_named(&checks, "harness codex").verdict,
+        Verdict::Warn,
+        "a .cmd shim is no harness"
+    );
+}
+
+/// On Windows a state directory's privacy is its inherited ACL, reported as
+/// such with the command that shows it, and free space is measured without
+/// `df`.
+#[cfg(windows)]
+#[test]
+fn windows_state_dirs_report_their_acl_and_disk() {
+    let root = tempfile::tempdir().expect("a dir");
+    let checks = state_dir_checks(root.path());
+    assert_eq!(checks[0].verdict, Verdict::Ok, "{checks:?}");
+    assert!(checks[0].detail.contains("icacls"), "{checks:?}");
+    assert_ne!(
+        checks[1].detail, "could not measure free space",
+        "{checks:?}"
     );
 }

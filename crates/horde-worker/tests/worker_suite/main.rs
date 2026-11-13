@@ -17,31 +17,51 @@
 //! module-path hygiene; `support` is the process-test toolbox they share.
 
 #[cfg(test)]
+#[cfg(unix)]
 mod support;
 
+#[cfg(unix)]
 mod attachments;
+#[cfg(unix)]
 mod codex_supervision;
+#[cfg(unix)]
 mod connection;
+#[cfg(unix)]
 mod daemon;
 // Gated like `support`: this suite keeps its helpers as free functions, and
 // the lint policy exempts them under `cfg(test)` — which an integration test
 // binary always compiles with (docs/QUALITY_GATES.md, the clippy section).
 #[cfg(test)]
+#[cfg(unix)]
 mod forwards;
 // Gated like `forwards`, for the same free-helper reason.
 #[cfg(test)]
+#[cfg(unix)]
 mod hub_link;
 // Gated like `forwards`, for the same free-helper reason.
 #[cfg(test)]
+#[cfg(unix)]
 mod logins;
+#[cfg(unix)]
 mod payload_share;
+#[cfg(unix)]
 mod supervision;
 // Gated like `forwards`, for the same free-helper reason.
 #[cfg(test)]
+#[cfg(unix)]
 mod workspace_housekeeping;
 #[cfg(test)]
+#[cfg(unix)]
 mod workspace_lifecycle;
 // Gated like `forwards`: the rig both workspace suites drive.
 #[cfg(test)]
+#[cfg(unix)]
 mod workspace_rig;
+#[cfg(unix)]
 mod workspaces;
+// The Windows face of supervision (ADR-0017): the same stub harness, its
+// tree a Job Object. The modules above drive `/bin/sh`, signals and process
+// groups, and run on Unix alone.
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_supervision;
