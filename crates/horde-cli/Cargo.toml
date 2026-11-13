@@ -38,6 +38,8 @@ tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+# The logs suite writes a real server log through the file layer.
+tracing-subscriber = { version = "0.3.20", features = ["registry"] }
 # The Gherkin runner (docs/TESTING.md §2, "Behavioral"). Pinned exactly, like
 # every calibration-sensitive tool: a runner upgrade silently changes which
 # scenarios parse and how failures are judged.

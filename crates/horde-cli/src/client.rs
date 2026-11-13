@@ -240,6 +240,11 @@ pub enum ClientError {
     /// `horde doctor` found something to fix; the report above says what.
     #[error("doctor found {failures} problem(s); each FAIL line above names its fix")]
     Unhealthy { failures: usize },
+
+    /// `horde logs` was asked for something it cannot read: no target, an
+    /// unknown one, or a filter that does not parse.
+    #[error("{0}")]
+    Logs(String),
 }
 
 impl ClientError {

@@ -80,6 +80,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Also write this invocation's own diagnostic log under
+    /// `~/.horde/client/logs` (ADR-0015); `HORDE_LOG_FILE=1` does the same.
+    #[arg(long, global = true)]
+    pub log_file: bool,
+
     /// No verb is the front door (ADR-0008): no live sessions creates one,
     /// auto-named, and attaches; exactly one attaches it; several open the
     /// picker. Headless or `--json`, it fails fast with the candidates.
@@ -91,6 +96,10 @@ pub struct Cli {
 pub enum Command {
     /// Handshake with the server and print what it is.
     Hello,
+    /// Read diagnostic logs: `logs server`, `logs worker <NAME>`,
+    /// `logs agent <AGENT>`, or `logs --dir <PATH>` for local files
+    /// (ADR-0015). Records are redacted before they leave their machine.
+    Logs(crate::logs::LogsArgs),
     /// Create a session and attach to it — the explicit spelling of the
     /// front door. `session new` remains the headless create.
     New(NewArgs),
@@ -827,6 +836,17 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     if let Some(Command::Up(args)) = &cli.command {
         return crate::up::run(args, cli.identity.as_deref()).await;
     }
+    // `logs --dir` reads local files, for exactly the machine that cannot
+    // reach a server.
+    if let Some(Command::Logs(args)) = &cli.command {
+        if let Some(dir) = &args.dir {
+            return crate::logs::run_dir(dir, args, format, &mut std::io::stdout()).await;
+        }
+        // A target mistake is refused before any dial: it is the user's to
+        // fix whether or not a server is up.
+        crate::logs::remote_target(args.target.as_deref(), args.name.as_deref())
+            .map_err(ClientError::Logs)?;
+    }
     // `doctor` diagnoses the very connection the other verbs need, so it
     // must run whether or not one can be made.
     if let Some(Command::Doctor(args)) = &cli.command {
@@ -913,6 +933,7 @@ async fn dispatch_admin(
         Command::Mcp(command) => run_mcp(client, command, format).await,
         Command::Usage(args) => run_usage(client, args, format).await,
         Command::Agent(command) => crate::agent::run(client, command, format).await,
+        Command::Logs(args) => crate::logs::run(client, args, format).await,
         Command::Workspace(command) => run_workspace(client, command, format).await,
         Command::Prewarm(args) => run_prewarm(client, args, format).await,
         Command::Worker(command) => run_worker(client, command, &resolved.endpoint, format).await,
