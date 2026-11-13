@@ -1,0 +1,75 @@
+# cargo-gamma configuration. Read by the `mutants` gate, which supplies scope,
+# parallelism, the cache, memory limits and lint capping on the command line;
+# see docs/QUALITY_GATES.md (mutants).
+#
+# Skipping code because its mutants survive is how a mutation gate becomes
+# decorative, so the bar for an entry below is not "hard to test". A file is
+# excluded for one of two reasons only, each argued in the comment above it:
+# it is a test fixture the suite spawns rather than tests, or a mutant of it is
+# dangerous to run. A mutant that is provably equivalent to the original is not
+# excluded here at all: it is suppressed in the source, at the expression, with
+# `// #[gamma::skip(<mutator>, reason = "...")]`.
+#
+# The gate enforces this rather than trusting it. Before every run it lists
+# the mutants with this file and without it (`--no-config`), and refuses an
+# entry that is not one literal path in the tree, that has no reason beside it,
+# that removed no mutant, or that left any of its file's mutants listed; and it
+# refuses any difference between the listings that no entry accounts for. Gamma
+# itself already refuses an entry that matches no file.
+exclude-files = [
+    # Test fixture: the process suite spawns this binary, so mutating it
+    # measures the fixture rather than the code under test.
+    "crates/horde-worker/src/bin/stub_harness.rs",
+    # Same criterion, codex's half: a scripted app-server the codex
+    # supervision tests spawn. The suite runs it; it never tests it.
+    "crates/horde-worker/src/bin/codex_stub_harness.rs",
+    # Same criterion, the fault suite's half: the worker-runner and the
+    # fault-server are production libraries composed into killable processes.
+    # The fault scenarios spawn them and SIGKILL them; they test nothing, and
+    # the library code they compose is mutated in its own crates.
+    "crates/horde-fault/src/bin/worker_runner.rs",
+    "crates/horde-fault/src/bin/fault_server.rs",
+    # Same criterion, the hub's half: a stub MCP server the hub upstream tests
+    # spawn as a child process (main.rs), whose toolset (tools.rs) the duplex
+    # tests also include by #[path]. The suite runs both; it tests neither.
+    "crates/horde-mcp/src/bin/mcp_stub_server/main.rs",
+    "crates/horde-mcp/src/bin/mcp_stub_server/tools.rs",
+    # Same criterion, the e2e tier's half: the scripted provider login command
+    # the login scenarios relay to. The scenarios test the relay, the PTY and
+    # the callback expose; the script is what they drive, not what they judge.
+    "crates/horde-e2e/src/bin/fake_login.rs",
+    # A different criterion, and the only entry under it: code that sends real
+    # signals to targets chosen at runtime must never be mutated, because a
+    # mutant runs for real. Its mutants are not equivalent; they are
+    # dangerous. Flipping `ppid == parent` in an earlier version of this file
+    # made a test SIGKILL every process on the machine. Gamma compiles every
+    # mutant of a selected file into the test binary as a runtime switch, so
+    # the file must be out of discovery entirely, not merely unselected: an
+    # excluded file is dropped before it is parsed and is never instrumented.
+    # The gate also refuses to run if any listing it takes still names this
+    # file. The file holds only the signal guard, the orphan sweep's selection
+    # and the sending; the harmless table reading it needs lives in `ps.rs`
+    # and is mutated.
+    "crates/horde-server-testkit/src/reap.rs",
+]
+
+# The debuginfo-free profile defined in the workspace manifest.
+profile = "mutants"
+
+# Gamma derives each test binary's budget from that binary's own measured
+# baseline, so a timeout is judged against the mutant's own suite rather than
+# one clock started once for the whole run. Five times the baseline is
+# generous; the floor exists so a binary whose baseline is a fraction of a
+# second is not timed out by a loaded machine. The gate counts a timeout as
+# missed, so a false one costs a red run, not a false green.
+minimum-test-timeout = 60.0
+test-timeout-multiplier = 5.0
+
+# The instrumented build happens once per run, so a build that never finishes
+# costs everything. A cold whole-workspace build of every schema is long.
+build-timeout = 3600.0
+build-timeout-multiplier = 3.0
+
+# The gate enforces zero missed mutants itself, from gamma-report.json, so it
+# can say which mutants and why; gamma's own score threshold stays out of it.
+min-score = 0.0
