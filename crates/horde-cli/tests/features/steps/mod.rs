@@ -7,3 +7,4 @@ pub(crate) mod messaging;
 pub(crate) mod permission;
 pub(crate) mod tui;
 pub(crate) mod worker;
+pub(crate) mod workspace;
