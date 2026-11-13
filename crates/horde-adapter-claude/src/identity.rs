@@ -1,7 +1,7 @@
 //! What it takes to find a Claude conversation again.
 //!
-//! The type is [`horde_adapter::RevivalIdentity`], because the rule is the same
-//! for every provider. What is Claude-specific is which directory it names:
+//! The rule is the same for every provider (see [`horde_adapter::identity`]).
+//! What is Claude-specific is which directory it names:
 //! spike W1c established that `CLAUDE_CONFIG_DIR` fully isolates an account,
 //! and that the CLI stores its `sessions/` and `projects/` *inside* that
 //! directory. A session recorded under one config directory does not exist
@@ -9,7 +9,6 @@
 //! rather than falling back, the failure mode is a hard error rather than a
 //! silently fresh conversation.
 
-pub use horde_adapter::RevivalIdentity;
 /// Resolves an account name to the `CLAUDE_CONFIG_DIR` it runs under.
 ///
 /// The resolution is provider-independent — see [`horde_adapter::account_dir`];

@@ -72,7 +72,6 @@ pub mod version;
 pub use capability::{Capabilities, Capability, PermissionEnforcement, ToolCallKind};
 pub use error::AdapterError;
 pub use event::{AgentEvent, ChunkCounters, OutputChannel, TurnOutcome, TurnStatus};
-pub use identity::RevivalIdentity;
 pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId, account_dir};
 pub use login::LoginRecipe;
 pub use permission::{

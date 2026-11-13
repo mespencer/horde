@@ -12,7 +12,7 @@
 //! * **`SessionEstablished` journals a lifecycle transition, not the provider
 //!   session id as data.** The wire vocabulary has no session-established
 //!   kind, and the revival identity is Worker-local by design — the Worker,
-//!   not the Server, revives agents (`RevivalIdentity`). The Session log gets
+//!   not the Server, revives agents (`horde_adapter::identity`). The Session log gets
 //!   the honest observable fact: the agent went from starting to running, on
 //!   which model.
 //! * **`ToolCompleted` journals nothing.** The tool's output already rode
