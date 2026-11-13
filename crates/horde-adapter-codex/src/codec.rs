@@ -129,6 +129,10 @@ impl ThreadConfig {
                     // anything that does arrive is declined by the session.
                     "rules": true,
                     "sandbox_approval": true,
+                    // Routes sandbox-widening requests to Horde instead of
+                    // codex's default refusal (W12c, transcript 39). Inert
+                    // until codex offers the agent `request_permissions`.
+                    "request_permissions": true,
                 }
             },
             "approvalsReviewer": APPROVALS_REVIEWER,

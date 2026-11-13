@@ -1,0 +1,205 @@
+{
+  "codex_version": "codex-cli 0.167.0",
+  "surface": {
+    "ClientRequest.json initialize": {
+      "capabilities.experimentalApi": "boolean",
+      "clientInfo.name": "string",
+      "clientInfo.title": "null|string",
+      "clientInfo.version": "string"
+    },
+    "ClientRequest.json thread/resume": {
+      "approvalPolicy": "enum:never,on-request,untrusted|null|object|string",
+      "approvalPolicy.granular.mcp_elicitations": "boolean",
+      "approvalPolicy.granular.request_permissions": "boolean",
+      "approvalPolicy.granular.rules": "boolean",
+      "approvalPolicy.granular.sandbox_approval": "boolean",
+      "approvalsReviewer": "enum:auto_review,guardian_subagent,user|null|string",
+      "cwd": "null|string",
+      "developerInstructions": "null|string",
+      "model": "null|string",
+      "sandbox": "enum:danger-full-access,read-only,workspace-write|null|string"
+    },
+    "ClientRequest.json thread/start": {
+      "approvalPolicy": "enum:never,on-request,untrusted|null|object|string",
+      "approvalPolicy.granular.mcp_elicitations": "boolean",
+      "approvalPolicy.granular.request_permissions": "boolean",
+      "approvalPolicy.granular.rules": "boolean",
+      "approvalPolicy.granular.sandbox_approval": "boolean",
+      "approvalsReviewer": "enum:auto_review,guardian_subagent,user|null|string",
+      "cwd": "null|string",
+      "developerInstructions": "null|string",
+      "model": "null|string",
+      "sandbox": "enum:danger-full-access,read-only,workspace-write|null|string"
+    },
+    "ClientRequest.json turn/interrupt": {
+      "threadId": "string"
+    },
+    "ClientRequest.json turn/start": {
+      "input": "array|object",
+      "threadId": "string"
+    },
+    "ClientRequest.json turn/steer": {
+      "expectedTurnId": "string",
+      "input": "array|object",
+      "threadId": "string"
+    },
+    "CommandExecutionRequestApprovalResponse.json": {
+      "decision": "enum:accept,acceptForSession,cancel,decline|object|string"
+    },
+    "FileChangeRequestApprovalResponse.json": {
+      "decision": "enum:accept,acceptForSession,cancel,decline|string"
+    },
+    "McpServerElicitationRequestResponse.json": {
+      "action": "enum:accept,cancel,decline|string",
+      "content": "any"
+    },
+    "PermissionsRequestApprovalResponse.json": {
+      "permissions": "object",
+      "scope": "enum:session,turn|string"
+    },
+    "ServerNotification.json account/rateLimits/updated": {
+      "rateLimits.limitId": "null|string",
+      "rateLimits.primary.resetsAt": "integer|null",
+      "rateLimits.primary.usedPercent": "integer",
+      "rateLimits.primary.windowDurationMins": "integer|null"
+    },
+    "ServerNotification.json error": {
+      "error.codexErrorInfo": "enum:badRequest,contextWindowExceeded,cyberPolicy,flexUnavailable,internalServerError,misalignmentPolicyViolation,modelNotFound,other,policyCapacityUnavailable,rateLimitExceeded,sandboxError,serverOverloaded,sessionBudgetExceeded,threadRollbackFailed,tooManyDenials,unauthorized,usageLimitExceeded|null|object|string",
+      "error.message": "string",
+      "threadId": "string",
+      "turnId": "string",
+      "willRetry": "boolean"
+    },
+    "ServerNotification.json item/agentMessage/delta": {
+      "delta": "string",
+      "itemId": "string",
+      "turnId": "string"
+    },
+    "ServerNotification.json item/completed": {
+      "item.arguments": "any",
+      "item.changes.diff": "string",
+      "item.changes.kind": "object",
+      "item.changes.path": "string",
+      "item.command": "string",
+      "item.error.message": "string",
+      "item.exitCode": "integer|null",
+      "item.id": "string",
+      "item.phase": "enum:commentary,final_answer,partial_answer|null|string",
+      "item.server": "string",
+      "item.status": "enum:completed,declined,failed,inProgress,interrupted|string",
+      "item.text": "string",
+      "item.tool": "enum:closeAgent,followupTask,interruptAgent,listAgents,resumeAgent,sendInput,sendMessage,spawnAgent,wait|string",
+      "item.type": "enum:agentMessage,collabAgentToolCall,commandExecution,contextCompaction,dynamicToolCall,enteredReviewMode,exitedReviewMode,fileChange,functionCallOutput,hookPrompt,imageGeneration,imageView,mcpToolCall,plan,reasoning,sleep,subAgentActivity,userMessage,webSearch|string",
+      "turnId": "string"
+    },
+    "ServerNotification.json item/started": {
+      "item.arguments": "any",
+      "item.changes.diff": "string",
+      "item.changes.kind": "object",
+      "item.changes.path": "string",
+      "item.command": "string",
+      "item.error.message": "string",
+      "item.exitCode": "integer|null",
+      "item.id": "string",
+      "item.phase": "enum:commentary,final_answer,partial_answer|null|string",
+      "item.server": "string",
+      "item.status": "enum:completed,declined,failed,inProgress,interrupted|string",
+      "item.text": "string",
+      "item.tool": "enum:closeAgent,followupTask,interruptAgent,listAgents,resumeAgent,sendInput,sendMessage,spawnAgent,wait|string",
+      "item.type": "enum:agentMessage,collabAgentToolCall,commandExecution,contextCompaction,dynamicToolCall,enteredReviewMode,exitedReviewMode,fileChange,functionCallOutput,hookPrompt,imageGeneration,imageView,mcpToolCall,plan,reasoning,sleep,subAgentActivity,userMessage,webSearch|string",
+      "turnId": "string"
+    },
+    "ServerNotification.json serverRequest/resolved": {
+      "requestId": "integer|string",
+      "threadId": "string"
+    },
+    "ServerNotification.json thread/started": {
+      "thread.id": "string"
+    },
+    "ServerNotification.json thread/status/changed": {
+      "status.type": "enum:active,idle,notLoaded,systemError|string",
+      "threadId": "string"
+    },
+    "ServerNotification.json thread/tokenUsage/updated": {
+      "threadId": "string",
+      "tokenUsage.last.cacheWriteInputTokens": "integer",
+      "tokenUsage.last.cachedInputTokens": "integer",
+      "tokenUsage.last.inputTokens": "integer",
+      "tokenUsage.last.outputTokens": "integer",
+      "tokenUsage.last.reasoningOutputTokens": "integer",
+      "tokenUsage.total.cacheWriteInputTokens": "integer",
+      "tokenUsage.total.cachedInputTokens": "integer",
+      "tokenUsage.total.inputTokens": "integer",
+      "tokenUsage.total.outputTokens": "integer",
+      "tokenUsage.total.reasoningOutputTokens": "integer",
+      "turnId": "string"
+    },
+    "ServerNotification.json turn/completed": {
+      "threadId": "string",
+      "turn.durationMs": "integer|null",
+      "turn.error.codexErrorInfo": "enum:badRequest,contextWindowExceeded,cyberPolicy,flexUnavailable,internalServerError,misalignmentPolicyViolation,modelNotFound,other,policyCapacityUnavailable,rateLimitExceeded,sandboxError,serverOverloaded,sessionBudgetExceeded,threadRollbackFailed,tooManyDenials,unauthorized,usageLimitExceeded|null|object|string",
+      "turn.error.message": "string",
+      "turn.id": "string",
+      "turn.status": "enum:completed,failed,inProgress,interrupted|string"
+    },
+    "ServerNotification.json turn/started": {
+      "threadId": "string",
+      "turn.id": "string"
+    },
+    "ServerRequest.json item/commandExecution/requestApproval": {
+      "command": "null|string",
+      "commandActions.command": "string",
+      "cwd": "null|string",
+      "itemId": "string",
+      "proposedExecpolicyAmendment": "array|null|string",
+      "reason": "null|string",
+      "threadId": "string",
+      "turnId": "string"
+    },
+    "ServerRequest.json item/fileChange/requestApproval": {
+      "grantRoot": "null|string",
+      "itemId": "string",
+      "reason": "null|string",
+      "threadId": "string",
+      "turnId": "string"
+    },
+    "ServerRequest.json item/permissions/requestApproval": {
+      "cwd": "string",
+      "itemId": "string",
+      "permissions": "object",
+      "reason": "null|string",
+      "threadId": "string",
+      "turnId": "string"
+    },
+    "ServerRequest.json item/tool/requestUserInput": {
+      "itemId": "string",
+      "questions.header": "string",
+      "questions.id": "string",
+      "questions.isOther": "boolean",
+      "questions.isSecret": "boolean",
+      "questions.options.description": "string",
+      "questions.options.label": "string",
+      "questions.question": "string",
+      "threadId": "string",
+      "turnId": "string"
+    },
+    "ServerRequest.json mcpServer/elicitation/request": {
+      "_meta": "any",
+      "message": "string",
+      "serverName": "string",
+      "threadId": "string",
+      "turnId": "null|string"
+    },
+    "ToolRequestUserInputResponse.json": {
+      "answers.*.answers": "array|string"
+    },
+    "v2/ThreadResumeResponse.json": {
+      "model": "string",
+      "thread.id": "string"
+    },
+    "v2/ThreadStartResponse.json": {
+      "model": "string",
+      "thread.id": "string"
+    }
+  }
+}
