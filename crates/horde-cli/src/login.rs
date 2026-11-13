@@ -355,19 +355,42 @@ fn terminal_feeds() -> TerminalFeeds {
     });
 
     let (resize_tx, resizes) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
-    let winch = tokio::spawn(async move {
-        let Ok(mut signals) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-        else {
+    let winch = tokio::spawn(watch_resizes(resize_tx));
+    (typed, resizes, winch)
+}
+
+/// Sends the terminal's size on every SIGWINCH.
+#[cfg(unix)]
+async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>) {
+    let Ok(mut signals) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+    else {
+        return;
+    };
+    while signals.recv().await.is_some() {
+        if resize_tx.send(terminal_size()).await.is_err() {
             return;
-        };
-        while signals.recv().await.is_some() {
-            if resize_tx.send(terminal_size()).await.is_err() {
+        }
+    }
+}
+
+/// Windows has no SIGWINCH, and a console resize arrives only as an input
+/// record the raw stdin reader would have to decode: the size polled
+/// instead, twice a second, sending each change (ADR-0017).
+#[cfg(windows)]
+async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>) {
+    let mut last = terminal_size();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    loop {
+        tick.tick().await;
+        let now = terminal_size();
+        if now != last {
+            last = now;
+            if resize_tx.send(now).await.is_err() {
                 return;
             }
         }
-    });
-    (typed, resizes, winch)
+    }
 }
 
 /// The verb's verdict on how the pump ended: the clean exit code to print,

@@ -106,10 +106,34 @@ async fn fresh_token(file: &Path, before: &str, deadline: Duration) -> Option<St
 /// # Errors
 ///
 /// The pid refused, or the signal failing (the pid gone, or not ours).
+#[cfg(unix)]
 pub fn send_hangup(pid: u32) -> std::io::Result<()> {
     let target = hangup_target(pid)?;
     nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGHUP)
         .map_err(|errno| std::io::Error::other(format!("SIGHUP to {pid} failed: {errno}")))
+}
+
+/// Windows has no SIGHUP, so a running server there cannot be asked to
+/// re-mint (ADR-0017): refused in words that name the way that works.
+///
+/// # Errors
+///
+/// Always [`std::io::ErrorKind::Unsupported`].
+#[cfg(not(unix))]
+pub fn send_hangup(pid: u32) -> std::io::Result<()> {
+    Err(unsupported_remint(pid))
+}
+
+/// The refusal `--remint` gives on a platform without SIGHUP.
+#[cfg_attr(unix, allow(dead_code))]
+fn unsupported_remint(pid: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "this platform has no SIGHUP to ask the server (pid {pid}) for a fresh token; \
+             restart it, and starting mints one"
+        ),
+    )
 }
 
 /// `pid` as a single process this verb may hang up: never 0 (our own group,
@@ -119,6 +143,7 @@ pub fn send_hangup(pid: u32) -> std::io::Result<()> {
 /// # Errors
 ///
 /// A refusal naming the pid.
+#[cfg(unix)]
 fn hangup_target(pid: u32) -> std::io::Result<nix::unistd::Pid> {
     let refused = || {
         std::io::Error::new(
@@ -136,7 +161,18 @@ fn hangup_target(pid: u32) -> std::io::Result<nix::unistd::Pid> {
 
 #[cfg(test)]
 mod tests {
+    /// The refusal a platform without SIGHUP gives names the pid, the
+    /// missing signal, and the restart that works instead.
+    #[test]
+    fn a_remint_without_sighup_says_to_restart() {
+        let error = super::unsupported_remint(4242);
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        let text = error.to_string();
+        assert!(text.contains("4242") && text.contains("SIGHUP") && text.contains("restart"));
+    }
+
     /// The guard alone answers: no signal is sent to learn any of this.
+    #[cfg(unix)]
     #[test]
     fn a_hangup_never_targets_reserved_or_own_pids() {
         let own_pid = std::process::id();

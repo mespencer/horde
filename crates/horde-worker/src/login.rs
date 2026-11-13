@@ -394,9 +394,21 @@ fn size_of(request: &LoginSessionRequest) -> PtySize {
     }
 }
 
+/// The PTY's controlling side, kept for resizes.
+#[cfg(not(windows))]
+type Master = Box<dyn portable_pty::MasterPty + Send>;
+
+/// The PTY's controlling side on Windows: a ConPTY, shared with the reaping
+/// wait, which closes it the moment the command exits. A ConPTY's output
+/// pipe reports EOF only when the pseudoconsole itself closes — never when
+/// its child exits — so without this the pump would wait for an EOF that
+/// cannot come (ADR-0017).
+#[cfg(windows)]
+type Master = Arc<std::sync::Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
+
 /// A spawned login command and every handle its supervision needs.
 struct PtySession {
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Master,
     /// PTY output chunks, read by a dedicated thread; the channel closing is
     /// the EOF that follows the command's exit.
     output: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -439,8 +451,6 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     drop(pair.slave);
 
     let killer = child.clone_killer();
-    let reaped =
-        tokio::task::spawn_blocking(move || child.wait().ok().map(|status| status.exit_code()));
 
     let mut reader = pair
         .master
@@ -468,6 +478,29 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
         .master
         .take_writer()
         .map_err(|error| error.to_string())?;
+
+    #[cfg(not(windows))]
+    let master = pair.master;
+    #[cfg(not(windows))]
+    let reaped =
+        tokio::task::spawn_blocking(move || child.wait().ok().map(|status| status.exit_code()));
+    #[cfg(windows)]
+    let master: Master = Arc::new(std::sync::Mutex::new(Some(pair.master)));
+    #[cfg(windows)]
+    let reaped = {
+        let closing = Arc::clone(&master);
+        tokio::task::spawn_blocking(move || {
+            let code = child.wait().ok().map(|status| status.exit_code());
+            // Close the pseudoconsole so the output pipe reports EOF.
+            drop(
+                closing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+            code
+        })
+    };
     let (input, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         while let Ok(bytes) = input_rx.recv() {
@@ -484,7 +517,7 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     });
 
     Ok(PtySession {
-        master: pair.master,
+        master,
         output,
         input,
         killer,
@@ -513,7 +546,7 @@ async fn pump_login(
                         }
                     }
                     Some(Ok(LoginFrame { frame: Some(Frame::Resize(resize)) })) => {
-                        let _ = session.master.resize(PtySize {
+                        resize_pty(&session.master, PtySize {
                             rows: u16::try_from(resize.rows).unwrap_or(DEFAULT_ROWS),
                             cols: u16::try_from(resize.cols).unwrap_or(DEFAULT_COLS),
                             pixel_width: 0,
@@ -564,6 +597,25 @@ async fn pump_login(
                 }
             }
         }
+    }
+}
+
+/// Resizes the PTY, best effort: a PTY already gone has nothing to resize.
+#[cfg(not(windows))]
+fn resize_pty(master: &Master, size: PtySize) {
+    let _ = master.resize(size);
+}
+
+/// Resizes the ConPTY while it is open; once the command has exited and the
+/// pseudoconsole is closed, there is nothing to resize.
+#[cfg(windows)]
+fn resize_pty(master: &Master, size: PtySize) {
+    if let Some(master) = master
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        let _ = master.resize(size);
     }
 }
 

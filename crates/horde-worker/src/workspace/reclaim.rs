@@ -13,8 +13,9 @@ use std::time::Duration;
 use horde_proto::v1::ReclaimPolicy;
 use horde_proto::v1::workspace_cleanup::RepoAction;
 use horde_proto::v1::workspace_cleanup::repo_action::Outcome;
-use nix::sys::signal::Signal;
 use tokio::io::AsyncReadExt;
+
+use crate::process_tree::{ProcessTree, Stop};
 
 use super::policy::{CommandSpec, WorkspacePolicy};
 
@@ -22,6 +23,7 @@ use super::policy::{CommandSpec, WorkspacePolicy};
 pub const OUTPUT_TAIL_BYTES: usize = 4096;
 
 /// How long a timed-out command's group has between SIGTERM and SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a finished command's output pipes may stay open: a process it
@@ -33,7 +35,31 @@ pub const SIZE_WALK_CAP: Duration = Duration::from_secs(30);
 
 /// The environment a reclaim command — and the cargo guard ahead of it —
 /// keeps; `CARGO_TARGET_DIR` is deliberately absent.
+#[cfg(unix)]
 const KEPT_ENVIRONMENT: &[&str] = &["PATH", "HOME", "LANG", "CARGO_HOME", "RUSTUP_HOME"];
+
+/// The environment a reclaim command keeps on Windows: the Unix set, plus
+/// what a Windows program cannot start without (`SystemRoot` above all —
+/// sockets and the CRT fail without it) and where a user's profile and
+/// temporary files are. `CARGO_TARGET_DIR` is deliberately absent.
+#[cfg(windows)]
+const KEPT_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+];
 
 /// What a repo's reclaim resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,7 +242,8 @@ pub struct Ran {
 }
 
 /// Runs `argv` in `cwd` without a shell, bounded by `timeout`; on timeout
-/// the whole process group gets SIGTERM, then SIGKILL after a grace.
+/// the whole process group gets SIGTERM, then SIGKILL after a grace (on
+/// Windows its job is terminated at once — there is no SIGTERM to offer).
 pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
     let Some(program) = argv.first() else {
         return refused("an empty reclaim command");
@@ -230,21 +257,19 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
     command
         .args(&argv[1..])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0);
-    let mut child = match command.spawn() {
+        .stderr(std::process::Stdio::piped());
+    // Its own tree (a process group, or a job), killed on drop.
+    let mut child = match ProcessTree::spawn(command) {
         Ok(child) => child,
         Err(error) => return refused(&format!("could not run {program}: {error}")),
     };
     let tail = Arc::new(Mutex::new(Vec::new()));
     let readers = [
         child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|out| collect(out, Arc::clone(&tail))),
         child
-            .stderr
-            .take()
+            .take_stderr()
             .map(|err| collect(err, Arc::clone(&tail))),
     ];
     let leader = child.id();
@@ -263,7 +288,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
             };
         }
     };
-    let output_tail = drain(readers, leader, &tail).await;
+    let output_tail = drain(readers, leader, &mut child, &tail).await;
     let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
     let succeeded = status.is_some_and(|status| status.success());
     Ran {
@@ -284,6 +309,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
 async fn drain(
     readers: [Option<tokio::task::JoinHandle<()>>; 2],
     leader: Option<u32>,
+    tree: &mut ProcessTree,
     tail: &Arc<Mutex<Vec<u8>>>,
 ) -> String {
     let mut readers: Vec<_> = readers.into_iter().flatten().collect();
@@ -294,8 +320,8 @@ async fn drain(
     })
     .await;
     if drained.is_err() {
-        if let Some(leader) = leader {
-            crate::process::signal_spawned_group(leader, Signal::SIGKILL);
+        if leader.is_some() {
+            tree.signal(Stop::Kill);
         }
         for reader in &readers {
             reader.abort();
@@ -306,14 +332,18 @@ async fn drain(
 
 /// SIGTERM to the group, a grace for the leader, then SIGKILL to whatever
 /// of the group is left — a member that ignores SIGTERM does not outlive
-/// its leader — then the reap.
-async fn terminate(leader: Option<u32>, child: &mut tokio::process::Child) {
-    if let Some(leader) = leader {
-        crate::process::signal_spawned_group(leader, Signal::SIGTERM);
-        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
-        crate::process::signal_spawned_group(leader, Signal::SIGKILL);
+/// its leader — then the reap. On Windows the job is terminated at once: a
+/// console-less command has no SIGTERM.
+async fn terminate(leader: Option<u32>, tree: &mut ProcessTree) {
+    if leader.is_some() {
+        #[cfg(unix)]
+        {
+            tree.signal(Stop::Terminate);
+            let _ = tokio::time::timeout(KILL_GRACE, tree.wait()).await;
+        }
+        tree.signal(Stop::Kill);
     }
-    let _ = child.kill().await;
+    let _ = tree.kill_root().await;
 }
 
 fn refused(reason: &str) -> Ran {

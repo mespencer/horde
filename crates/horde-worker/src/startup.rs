@@ -142,7 +142,7 @@ pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<WorkerC
     match crate::flags::parse(
         arguments,
         |name| std::env::var(name).ok(),
-        std::env::var_os("HOME").map(PathBuf::from),
+        horde_identity::home_dir(),
     )? {
         crate::flags::Parsed::Run(config) => Ok(*config),
         crate::flags::Parsed::Print(text) => Err(text),

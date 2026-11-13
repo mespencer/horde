@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     let parsed = horde_worker::flags::parse(
         std::env::args().skip(1),
         |name| std::env::var(name).ok(),
-        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        horde_identity::home_dir(),
     );
     let outcome = parsed.and_then(|parsed| match parsed {
         horde_worker::flags::Parsed::Print(text) => {
@@ -35,7 +35,8 @@ fn main() -> ExitCode {
     })
 }
 
-/// Prepares the daemon and serves until SIGTERM/ctrl-c ends it, or a fatal
+/// Prepares the daemon and serves until SIGTERM/ctrl-c (on Windows, a
+/// console stop event) ends it, or a fatal
 /// refusal does. All the decisions are in `startup`; this is plumbing an
 /// exit code, like `main`.
 async fn serve_until_terminated(config: &startup::WorkerConfig) -> ExitCode {
@@ -61,6 +62,7 @@ async fn serve_until_terminated(config: &startup::WorkerConfig) -> ExitCode {
 /// [`startup::first_of`], where it is tested; failing to even listen for
 /// SIGTERM degrades to ctrl-c alone — the default disposition would kill the
 /// process on SIGTERM anyway.
+#[cfg(unix)]
 async fn termination() {
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut sigterm) => {
@@ -74,6 +76,39 @@ async fn termination() {
             wait_for_ctrl_c().await;
         }
     }
+}
+
+/// Resolves when the process is asked to stop on Windows: ctrl-c or
+/// ctrl-break (how an operator, or a console-sharing parent, stops it), the
+/// console closing, or the system shutting down — Windows' SIGTERMs
+/// (ADR-0017). Failing to listen for the console events degrades to ctrl-c
+/// alone.
+#[cfg(windows)]
+async fn termination() {
+    use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+    let console = async {
+        let (Ok(mut broke), Ok(mut closed), Ok(mut shut_down)) =
+            (ctrl_break(), ctrl_close(), ctrl_shutdown())
+        else {
+            tracing::warn!("could not listen for ctrl-break, close or shutdown; ctrl-c only");
+            return std::future::pending::<()>().await;
+        };
+        startup::first_of(
+            async move {
+                let _ = broke.recv().await;
+            },
+            startup::first_of(
+                async move {
+                    let _ = closed.recv().await;
+                },
+                async move {
+                    let _ = shut_down.recv().await;
+                },
+            ),
+        )
+        .await;
+    };
+    startup::first_of(wait_for_ctrl_c(), console).await;
 }
 
 /// Parks on ctrl-c. A registration failure parks forever instead: with no

@@ -40,6 +40,10 @@ tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 
+[target.'cfg(windows)'.dependencies]
+# `horde doctor`'s free-space check where there is no `df` (ADR-0017).
+fs4 = { version = "0.13.1", default-features = false }
+
 [dev-dependencies]
 # The Gherkin runner (docs/TESTING.md §2, "Behavioral"). Pinned exactly, like
 # every calibration-sensitive tool: a runner upgrade silently changes which

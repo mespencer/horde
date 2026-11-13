@@ -174,7 +174,7 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
         // the turn knows its next write meets EPIPE. The next read here
         // fails on the closed descriptor, which ends the loop.
         if behaviour.hang_up {
-            let _ = nix::unistd::close(0);
+            close_descriptor(0);
         }
 
         if !serve(&mut stdout, turn) || behaviour.done_after(served) {
@@ -193,4 +193,18 @@ fn serve(stdout: &mut std::io::Stdout, turn: &[&str]) -> bool {
         }
     }
     stdout.flush().is_ok()
+}
+
+/// Closes a standard descriptor — the hang-ups the supervision suites stage.
+/// Unix only: Windows has no safe way to close a standard handle, and the
+/// suites that stage hang-ups run on Unix alone (ADR-0017).
+fn close_descriptor(descriptor: i32) {
+    #[cfg(unix)]
+    {
+        let _ = nix::unistd::close(descriptor);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = descriptor;
+    }
 }
