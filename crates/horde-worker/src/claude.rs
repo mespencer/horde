@@ -338,6 +338,23 @@ impl LiveClaudeSession {
         AdapterError::HarnessExited { exit_code }
     }
 
+    /// Decodes one stdout line into pending events. Every control request is
+    /// waited on: one the assembler did not turn into a permission event — a
+    /// subtype Horde does not answer, or a prompt with no open turn — is
+    /// refused here, now.
+    async fn absorb(&mut self, line: &str) -> Result<()> {
+        let envelope = decode_line(line)?;
+        let events = self.assembler.feed(&envelope);
+        if let Event::ControlRequest(request) = &envelope.event
+            && events.is_empty()
+        {
+            self.write(&refusal_for(request)).await?;
+        }
+        self.pending.extend(events);
+        self.session_id = self.assembler.provider_session_id();
+        Ok(())
+    }
+
     /// Writes one line, or reports the harness dead.
     ///
     /// A hang-up is the write-side face of the death EOF announces on the
@@ -462,18 +479,7 @@ impl AgentSession for LiveClaudeSession {
                 return Err(self.report_death().await);
             };
 
-            let envelope = decode_line(&line)?;
-            let events = self.assembler.feed(&envelope);
-            // Every control request is waited on. One the assembler did not
-            // turn into a permission event — a subtype Horde does not answer,
-            // or a prompt with no open turn — is refused here, now.
-            if let Event::ControlRequest(request) = &envelope.event
-                && events.is_empty()
-            {
-                self.write(&refusal_for(request)).await?;
-            }
-            self.pending.extend(events);
-            self.session_id = self.assembler.provider_session_id();
+            self.absorb(&line).await?;
         }
     }
 

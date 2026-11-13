@@ -146,7 +146,7 @@ impl Behaviour {
     /// Answers a control request unless told to swallow it.
     ///
     /// `false` means the pipe is gone, which ends the session.
-    fn acknowledge(&self, stdout: &mut std::io::Stdout) -> bool {
+    fn acknowledge(&self, stdout: &mut impl Write) -> bool {
         if self.ignore_interrupt {
             return true;
         }
@@ -233,7 +233,7 @@ fn serve(
 /// they would be between turns. `false` means stdin closed first.
 fn await_response(
     stdin: &mut impl Iterator<Item = std::io::Result<String>>,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut impl Write,
     behaviour: &Behaviour,
 ) -> bool {
     for line in stdin.by_ref() {
@@ -247,4 +247,63 @@ fn await_response(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Behaviour, await_response};
+
+    fn quiet() -> Behaviour {
+        Behaviour {
+            exit_after: None,
+            exit_code: 0,
+            ignore_interrupt: false,
+            control_log: None,
+            hang_up: false,
+        }
+    }
+
+    fn lines(input: &[&str]) -> impl Iterator<Item = std::io::Result<String>> {
+        input
+            .iter()
+            .map(|line| Ok((*line).to_owned()))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// The await ends on the answer, acknowledging a control request met on
+    /// the way and leaving later input unread.
+    #[test]
+    fn an_await_ends_on_the_response_and_acknowledges_requests_on_the_way() {
+        let mut stdin = lines(&[
+            r#"{"type":"control_request","request":{"subtype":"interrupt"}}"#,
+            r#"{"type":"control_response","response":{}}"#,
+            "next turn",
+        ]);
+        let mut stdout = Vec::new();
+        assert!(await_response(&mut stdin, &mut stdout, &quiet()));
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf-8").lines().count(),
+            1,
+            "one acknowledgement for the one request"
+        );
+        assert_eq!(
+            stdin.next().map(Result::ok),
+            Some(Some("next turn".to_owned()))
+        );
+    }
+
+    /// Stdin closing, or failing, before the answer ends the await as lost.
+    #[test]
+    fn an_await_without_a_response_reports_the_pipe_lost() {
+        let mut stdout = Vec::new();
+        assert!(!await_response(
+            &mut lines(&["noise"]),
+            &mut stdout,
+            &quiet()
+        ));
+        let mut failing = std::iter::once(Err(std::io::Error::other("closed")));
+        assert!(!await_response(&mut failing, &mut stdout, &quiet()));
+        assert!(stdout.is_empty(), "noise is not acknowledged");
+    }
 }

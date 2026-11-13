@@ -60,18 +60,23 @@ pub fn decode_line(line: &str) -> Result<Envelope, AdapterError> {
 /// is about the protocol.
 fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, AdapterError> {
     Ok(match event_type.as_str() {
-        "assistant" => Event::Assistant(typed(raw, &event_type, line)?),
-        "user" => Event::User(typed(raw, &event_type, line)?),
-        "result" => Event::Result(Box::new(typed(raw, &event_type, line)?)),
+        "assistant" | "user" | "result" => message_event(raw, &event_type, line)?,
         "control_response" => Event::ControlResponse(typed(raw, &event_type, line)?),
-        "control_request" => Event::ControlRequest(control_request(raw, line)?),
-        "control_cancel_request" => Event::ControlCancel {
-            request_id: string_at(raw, "request_id"),
-        },
+        "control_request" | "control_cancel_request" => control_event(raw, &event_type, line)?,
         "rate_limit_event" => Event::RateLimit(typed(raw, &event_type, line)?),
         "stream_event" => Event::StreamEvent,
         "system" => system_event(raw, &event_type, line)?,
         _ => Event::Unknown { event_type },
+    })
+}
+
+/// The conversation itself: the model's messages, the tool results echoed
+/// back through the user role, and the result that closes a turn.
+fn message_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, AdapterError> {
+    Ok(match event_type {
+        "assistant" => Event::Assistant(typed(raw, event_type, line)?),
+        "user" => Event::User(typed(raw, event_type, line)?),
+        _ => Event::Result(Box::new(typed(raw, event_type, line)?)),
     })
 }
 
@@ -86,6 +91,18 @@ fn system_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, Adap
         other => Event::System {
             subtype: other.unwrap_or_default().to_owned(),
         },
+    })
+}
+
+/// The harness's own control traffic: a request it waits on, or the
+/// withdrawal of one.
+fn control_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, AdapterError> {
+    Ok(if event_type == "control_cancel_request" {
+        Event::ControlCancel {
+            request_id: string_at(raw, "request_id"),
+        }
+    } else {
+        Event::ControlRequest(control_request(raw, line)?)
     })
 }
 
