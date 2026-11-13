@@ -631,6 +631,24 @@ impl Client {
         root_agent: AgentSpec,
         idempotency_key: &str,
     ) -> Result<(SessionSummary, AgentId), ClientError> {
+        self.create_session_in(
+            title,
+            root_agent,
+            horde_proto::v1::SessionSettings::default(),
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// [`Self::create_session_with`] with the session's own settings
+    /// (ADR-0016's session layer) — `horde new --permission-mode`.
+    pub async fn create_session_in(
+        &mut self,
+        title: &str,
+        root_agent: AgentSpec,
+        settings: horde_proto::v1::SessionSettings,
+        idempotency_key: &str,
+    ) -> Result<(SessionSummary, AgentId), ClientError> {
         let response = self
             .inner
             .create_session(CreateSessionRequest {
@@ -640,6 +658,7 @@ impl Client {
                 workspace_definition_id: root_agent.workspace_definition_id.clone(),
                 root_agent: Some(root_agent),
                 idempotency_key: idempotency_key.to_owned(),
+                settings: Some(settings),
             })
             .await?
             .into_inner();

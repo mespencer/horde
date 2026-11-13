@@ -136,6 +136,10 @@ pub struct CommandProjection {
     /// The Server's workspace defaults, resolved with each Definition into
     /// the policy every spawn, materialize and gc command carries.
     workspace_policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
+    /// The tier catalog spawn bindings resolve through (ADR-0016); `None`
+    /// is the shipped one. Like the workspace policy, a change takes effect
+    /// on the next command folded after a restart.
+    tiers: Option<Arc<crate::tiers::TierCatalog>>,
     /// The MCP Hub catalog as this fold has seen it, for the same reason:
     /// a `SpawnAgentCommand` carries the agent's `local` server configs and
     /// its visible hub server names in full, and the only place a fold can
@@ -169,6 +173,13 @@ impl CommandProjection {
         policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
     ) -> Self {
         self.workspace_policy = policy;
+        self
+    }
+
+    /// Resolves spawn tiers through this catalog.
+    #[must_use]
+    pub fn with_tiers(mut self, tiers: Arc<crate::tiers::TierCatalog>) -> Self {
+        self.tiers = Some(tiers);
         self
     }
 
@@ -542,7 +553,13 @@ impl CommandProjection {
                         agent_id: Some(AgentId::new(agent_id)),
                         parent_agent_id: details.parent_agent_id.clone().map(AgentId::new),
                         spec: details.spec.clone(),
-                        binding: binding_for(details.spec.as_ref()),
+                        binding: match &self.tiers {
+                            Some(tiers) => binding_for(details.spec.as_ref(), tiers),
+                            None => binding_for(
+                                details.spec.as_ref(),
+                                &crate::tiers::TierCatalog::shipped_defaults(),
+                            ),
+                        },
                         tree_path: details.tree_path.clone(),
                         prompt_overlay: String::new(),
                         local_mcp_servers: self.mcp_servers.local_servers_for(agent_type),
@@ -707,6 +724,7 @@ fn buffers_for(spawned: bool, started: bool) -> bool {
 /// fallback.
 pub(crate) fn binding_for(
     spec: Option<&horde_proto::v1::AgentSpec>,
+    catalog: &crate::tiers::TierCatalog,
 ) -> Option<horde_proto::v1::ModelBinding> {
     use horde_proto::v1::model_selection::Selection;
     match spec?.model.as_ref()?.selection.as_ref()? {
@@ -717,7 +735,6 @@ pub(crate) fn binding_for(
             provider_account: String::new(),
         }),
         Selection::Tier(tier_name) => {
-            let catalog = crate::tiers::TierCatalog::shipped_defaults();
             let candidate = catalog.get(tier_name)?.candidates.first()?.clone();
             Some(horde_proto::v1::ModelBinding {
                 tier: tier_name.clone(),
@@ -857,6 +874,13 @@ impl CommandStream {
         policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
     ) -> Self {
         self.projection = std::mem::take(&mut self.projection).with_workspace_policy(policy);
+        self
+    }
+
+    /// Binds spawn tiers through this catalog (ADR-0016).
+    #[must_use]
+    pub fn with_tiers(mut self, tiers: Arc<crate::tiers::TierCatalog>) -> Self {
+        self.projection = std::mem::take(&mut self.projection).with_tiers(tiers);
         self
     }
 
@@ -1036,21 +1060,28 @@ mod tests {
             }),
             ..AgentSpec::default()
         };
+        let shipped = crate::tiers::TierCatalog::shipped_defaults();
 
-        let concrete = super::binding_for(Some(&with_selection(Selection::Concrete(
-            horde_proto::v1::ConcreteModel {
-                provider: "claude".to_owned(),
-                model: "opus".to_owned(),
-                provider_account: String::new(),
-            },
-        ))))
+        let concrete = super::binding_for(
+            Some(&with_selection(Selection::Concrete(
+                horde_proto::v1::ConcreteModel {
+                    provider: "claude".to_owned(),
+                    model: "opus".to_owned(),
+                    provider_account: String::new(),
+                },
+            ))),
+            &shipped,
+        )
         .expect("a concrete request binds");
         assert_eq!(concrete.provider, "claude");
         assert_eq!(concrete.model, "opus");
         assert_eq!(concrete.tier, "", "a concrete bind names no tier");
 
-        let tiered = super::binding_for(Some(&with_selection(Selection::Tier("deep".to_owned()))))
-            .expect("a shipped tier binds");
+        let tiered = super::binding_for(
+            Some(&with_selection(Selection::Tier("deep".to_owned()))),
+            &shipped,
+        )
+        .expect("a shipped tier binds");
         assert_eq!(tiered.tier, "deep");
         assert_eq!(
             (tiered.provider.as_str(), tiered.model.as_str()),
@@ -1059,14 +1090,40 @@ mod tests {
         );
 
         assert_eq!(
-            super::binding_for(Some(&with_selection(Selection::Tier(
-                "imaginary".to_owned()
-            )))),
+            super::binding_for(
+                Some(&with_selection(Selection::Tier("imaginary".to_owned()))),
+                &shipped
+            ),
             None,
             "an unknown tier in an older log falls back to the worker default"
         );
-        assert_eq!(super::binding_for(Some(&AgentSpec::default())), None);
-        assert_eq!(super::binding_for(None), None);
+        assert_eq!(
+            super::binding_for(Some(&AgentSpec::default()), &shipped),
+            None
+        );
+        assert_eq!(super::binding_for(None, &shipped), None);
+
+        let configured = crate::tiers::TierCatalog::default().with_tier(crate::tiers::Tier::new(
+            "imaginary",
+            vec![crate::tiers::TierCandidate::new("codex", "gpt")],
+        ));
+        let bound = super::binding_for(
+            Some(&with_selection(Selection::Tier("imaginary".to_owned()))),
+            &configured,
+        )
+        .expect("a configured tier binds");
+        assert_eq!(
+            (bound.provider.as_str(), bound.model.as_str()),
+            ("codex", "gpt")
+        );
+        assert_eq!(
+            super::binding_for(
+                Some(&with_selection(Selection::Tier("deep".to_owned()))),
+                &configured
+            ),
+            None,
+            "a configured catalog replaces the shipped one"
+        );
     }
 
     fn placement_event(agent: &str, worker: Option<&str>, state: PlacementState) -> Event {

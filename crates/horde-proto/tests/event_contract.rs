@@ -129,6 +129,7 @@ fn every_kind() -> Vec<event::Kind> {
             chunk_index: 7,
         }),
         event::Kind::AgentSpawned(AgentSpawned {
+            session: None,
             parent_agent_id: Some(AgentId::new("agent-root")),
             spawned_by: None,
             spec: None,

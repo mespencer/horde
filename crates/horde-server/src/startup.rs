@@ -54,7 +54,7 @@ pub fn open_log(path: &str) -> Result<EventLog, ServerError> {
 }
 
 /// How to serve: addresses, identity directory, and extra names.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServeConfig {
     pub database: String,
     /// Where the CA persists. Losing it orphans every issued certificate.
@@ -76,61 +76,14 @@ pub struct ServeConfig {
     /// The worker-lost lease (ADR-0011); `None` takes
     /// [`crate::liveness::DEFAULT_WORKER_LEASE`].
     pub worker_lease: Option<std::time::Duration>,
-    /// The workspace defaults and disk-aware placement (ADR-0014).
-    pub workspace: WorkspaceFlags,
-}
-
-/// ADR-0014's server-side `workspace.*` keys, as flags until W12e's config
-/// file. Each `None` takes the built-in default.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorkspaceFlags {
-    pub fetch_throttle: Option<std::time::Duration>,
-    pub fetch_timeout: Option<std::time::Duration>,
-    pub idle_reclaim_after: Option<std::time::Duration>,
-    pub archived_grace: Option<std::time::Duration>,
-    pub reclaim_timeout: Option<std::time::Duration>,
-    pub archived_pin_ttl: Option<std::time::Duration>,
-    /// `(basis points, bytes)`: below it a Worker is placed last.
-    pub disk_pressure: Option<(u64, u64)>,
-    /// Below it a Worker takes no workspace spawns.
-    pub disk_floor: Option<u64>,
-}
-
-impl WorkspaceFlags {
-    /// The workspace policy these flags configure.
-    #[must_use]
-    pub fn policy(&self) -> crate::workspace_policy::WorkspacePolicyConfig {
-        let defaults = crate::workspace_policy::WorkspacePolicyConfig::default();
-        crate::workspace_policy::WorkspacePolicyConfig {
-            fetch_throttle: self.fetch_throttle.unwrap_or(defaults.fetch_throttle),
-            fetch_timeout: self.fetch_timeout.unwrap_or(defaults.fetch_timeout),
-            idle_reclaim_after: self
-                .idle_reclaim_after
-                .unwrap_or(defaults.idle_reclaim_after),
-            archived_grace: self.archived_grace.unwrap_or(defaults.archived_grace),
-            reclaim_timeout: self.reclaim_timeout.unwrap_or(defaults.reclaim_timeout),
-            archived_pin_ttl: self.archived_pin_ttl.or(defaults.archived_pin_ttl),
-            auto_rules: defaults.auto_rules,
-        }
-    }
-
-    /// The disk-aware placement these flags configure.
-    #[must_use]
-    pub fn disk_placement(&self) -> crate::scheduler::DiskPlacement {
-        let defaults = crate::scheduler::DiskPlacement::default();
-        let (pressure_basis_points, pressure_bytes) = self
-            .disk_pressure
-            .unwrap_or((defaults.pressure_basis_points, defaults.pressure_bytes));
-        crate::scheduler::DiskPlacement {
-            pressure_basis_points,
-            pressure_bytes,
-            floor_bytes: self.disk_floor.unwrap_or(defaults.floor_bytes),
-        }
-    }
+    /// Everything configuration decides (ADR-0016): permission modes,
+    /// tiers, the workspace defaults and disk-aware placement (ADR-0014),
+    /// and the `logs.*` keys — defaults, then the config file, then flags.
+    pub settings: crate::config::ServerSettings,
 }
 
 /// What one command line asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Invocation {
     /// `--check`: open the log, report, exit — the health check.
     CheckOnly { database: String },
@@ -153,8 +106,9 @@ pub enum Invocation {
     name = "horde-server",
     version,
     about = "The Horde control plane: the event log, the mTLS listeners, and the enrollment CA.",
-    group = clap::ArgGroup::new("mode").required(true).args(["serve", "check", "remint"]),
-    group = clap::ArgGroup::new("stateful").multiple(false).args(["serve", "remint"])
+    group = clap::ArgGroup::new("mode").required(true).args(["serve", "check", "remint", "show_config"]),
+    group = clap::ArgGroup::new("stateful").multiple(false).args(["serve", "remint", "show_config"]),
+    group = clap::ArgGroup::new("configured").multiple(false).args(["serve", "show_config"])
 )]
 struct ServerArgs {
     /// The event log's SQLite file. Defaults to `~/.horde/server/horde.db`
@@ -176,6 +130,25 @@ struct ServerArgs {
     /// directory is the trust.
     #[arg(long)]
     remint: bool,
+
+    /// Print the settings this command line would serve with — defaults,
+    /// the config file, then these flags — and exit (ADR-0016).
+    #[arg(long, conflicts_with = "database")]
+    show_config: bool,
+
+    /// With --show-config, name the layer each value came from.
+    #[arg(long, requires = "show_config")]
+    origin: bool,
+
+    /// The config file. Defaults to `<state-dir>/config.toml`, which may be
+    /// absent; a file named here must exist.
+    #[arg(long, requires = "configured")]
+    config: Option<PathBuf>,
+
+    /// The permission mode agents run under when nothing more specific
+    /// names one; overrides `permissions.default_mode` (default `bypass`).
+    #[arg(long, requires = "configured", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    permission_mode: Option<String>,
 
     /// Where the CA, blobs, and bootstrap token live. Defaults to
     /// `~/.horde/server`, created owner-only.
@@ -212,37 +185,37 @@ struct ServerArgs {
     worker_lease: Option<u64>,
 
     /// How long a successful fetch of an Instance repo stays fresh (60s).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_duration)]
     workspace_fetch_throttle: Option<std::time::Duration>,
 
     /// The ceiling on one fetch before a spawn falls back to the cached base (30s).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_duration)]
     workspace_fetch_timeout: Option<std::time::Duration>,
 
     /// Soft-reclaim a live agent idle this long; 0 is never (4h).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_duration)]
     workspace_idle_reclaim_after: Option<std::time::Duration>,
 
     /// How long an archived agent's clean checkout is kept; 0 removes it at
     /// archive (24h).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_duration)]
     workspace_archived_grace: Option<std::time::Duration>,
 
     /// The ceiling on one reclaim command (10m).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_duration)]
     workspace_reclaim_timeout: Option<std::time::Duration>,
 
     /// Let `gc --hard --include-pins --force` drop archive pins older than
     /// this; unset, pins never expire.
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_duration)]
     workspace_archived_pin_ttl: Option<std::time::Duration>,
 
     /// Free disk below which a Worker is placed last: "10%,20GiB" (the default).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_threshold)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_threshold)]
     placement_disk_pressure: Option<(u64, u64)>,
 
     /// Free disk below which a Worker takes no workspace spawns (2GiB).
-    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_size)]
+    #[arg(long, requires = "configured", value_parser = horde_proto::units::parse_size)]
     placement_disk_floor: Option<u64>,
 }
 
@@ -257,10 +230,15 @@ fn subject_name(value: &str) -> Result<String, String> {
 ///
 /// A human-readable refusal naming the flag that was wrong.
 pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
-    invocation_in(arguments, std::env::var_os("HOME").map(PathBuf::from))
+    invocation_in(
+        arguments,
+        std::env::var_os("HOME").map(PathBuf::from),
+        |name| std::env::var(name).ok(),
+    )
 }
 
-/// [`invocation`] with `$HOME` passed in, so the defaults are testable.
+/// [`invocation`] with `$HOME` and the environment passed in, so the
+/// defaults are testable.
 ///
 /// Pure so every flag combination is testable without a process. Unknown
 /// flags are errors rather than ignored: a mistyped `--bnid` silently
@@ -273,6 +251,7 @@ pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocat
 pub fn invocation_in(
     arguments: impl IntoIterator<Item = String>,
     home: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<String>,
 ) -> Result<Invocation, String> {
     use clap::Parser;
     let program = std::iter::once("horde-server".to_owned());
@@ -300,6 +279,28 @@ pub fn invocation_in(
     if args.check {
         return Ok(Invocation::CheckOnly { database });
     }
+    let document = horde_config::load(
+        horde_config::Role::Server,
+        args.config.as_deref(),
+        &state_dir.join(horde_config::Role::FILE_NAME),
+    )?;
+    let flags = crate::config::ServerFlags {
+        permission_mode: args.permission_mode,
+        workspace: crate::config::WorkspaceFlags {
+            fetch_throttle: args.workspace_fetch_throttle,
+            fetch_timeout: args.workspace_fetch_timeout,
+            idle_reclaim_after: args.workspace_idle_reclaim_after,
+            archived_grace: args.workspace_archived_grace,
+            reclaim_timeout: args.workspace_reclaim_timeout,
+            archived_pin_ttl: args.workspace_archived_pin_ttl,
+            disk_pressure: args.placement_disk_pressure,
+            disk_floor: args.placement_disk_floor,
+        },
+    };
+    let settings = crate::config::ServerSettings::resolve(document.as_ref(), &flags, env)?;
+    if args.show_config {
+        return Ok(Invocation::Print(settings.provenance.render(args.origin)));
+    }
     Ok(Invocation::Serve(Box::new(ServeConfig {
         database,
         state_dir,
@@ -311,16 +312,7 @@ pub fn invocation_in(
         blob_max_bytes: args.blob_max_bytes,
         relay_bind: args.relay_bind,
         worker_lease: args.worker_lease.map(std::time::Duration::from_secs),
-        workspace: WorkspaceFlags {
-            fetch_throttle: args.workspace_fetch_throttle,
-            fetch_timeout: args.workspace_fetch_timeout,
-            idle_reclaim_after: args.workspace_idle_reclaim_after,
-            archived_grace: args.workspace_archived_grace,
-            reclaim_timeout: args.workspace_reclaim_timeout,
-            archived_pin_ttl: args.workspace_archived_pin_ttl,
-            disk_pressure: args.placement_disk_pressure,
-            disk_floor: args.placement_disk_floor,
-        },
+        settings,
     })))
 }
 
@@ -536,16 +528,11 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
     let core = reconciled_core(config, log).await?;
 
     // The permission chain driver (fix a5): the deterministic layers run in
-    // the deployed server, over the shipped registry (ADR-0009) — an agent's
-    // own orchestrator verbs allowed, everything else escalated — until §13's
-    // authoring layer exists. The judge stays a seam; a missing judge
-    // already escalates.
+    // the deployed server, over the configured registry (ADR-0016) — bypass
+    // by default, questions always to a human. There is no judge; a mode
+    // that wants one escalates.
     let permission_chain = ChainTask {
-        task: crate::permission::spawn(
-            &core.log,
-            Arc::new(crate::permission::PermissionModes::shipped()),
-            None,
-        ),
+        task: crate::permission::spawn(&core.log, Arc::clone(&core.permission_modes), None),
     };
 
     let relay = mounted_relay(config, &core).await?;
@@ -619,10 +606,10 @@ async fn reconciled_core(config: &ServeConfig, log: EventLog) -> Result<ServerCo
                 .worker_lease
                 .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
         )
-        .with_workspace_policy(config.workspace.policy());
+        .with_settings(&config.settings);
     let core = core.clone().with_scheduler(Arc::new(
         crate::scheduler::CapabilityScheduler::new(core.workers.clone(), core.instances.clone())
-            .with_disk_placement(config.workspace.disk_placement()),
+            .with_disk_placement(config.settings.placement),
     ));
     // The one cold fold of the whole log (ADR-0013); every read after it
     // folds only what was appended since.
@@ -907,6 +894,7 @@ mod tests {
         super::invocation_in(
             arguments.iter().map(|s| (*s).to_owned()),
             Some("/home/me".into()),
+            |_| None,
         )
     }
 
@@ -953,7 +941,7 @@ mod tests {
             assert!(text.contains("horde-server"), "{flag}: {text}");
         }
         let homeless = |arguments: &[&str]| {
-            super::invocation_in(arguments.iter().map(|s| (*s).to_owned()), None)
+            super::invocation_in(arguments.iter().map(|s| (*s).to_owned()), None, |_| None)
         };
         let refused = homeless(&["--serve"]).expect_err("nowhere to default to");
         assert!(refused.contains("--state-dir"), "{refused}");
@@ -1146,7 +1134,12 @@ mod tests {
             blob_max_bytes: None,
             relay_bind,
             worker_lease: None,
-            workspace: super::WorkspaceFlags::default(),
+            settings: crate::config::ServerSettings::resolve(
+                None,
+                &crate::config::ServerFlags::default(),
+                |_| None,
+            )
+            .expect("the built-in settings resolve"),
         }
     }
 

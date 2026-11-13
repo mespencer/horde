@@ -460,6 +460,7 @@ pub async fn seed_agent(
         occurred_at: None,
         idempotency_key: format!("{agent}:spawned"),
         kind: Some(Kind::AgentSpawned(AgentSpawned {
+            session: None,
             parent_agent_id: None,
             spawned_by: None,
             spec: Some(AgentSpec {
