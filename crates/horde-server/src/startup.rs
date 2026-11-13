@@ -230,11 +230,9 @@ fn subject_name(value: &str) -> Result<String, String> {
 ///
 /// A human-readable refusal naming the flag that was wrong.
 pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
-    invocation_in(
-        arguments,
-        std::env::var_os("HOME").map(PathBuf::from),
-        |name| std::env::var(name).ok(),
-    )
+    invocation_in(arguments, horde_identity::home_dir(), |name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// [`invocation`] with `$HOME` and the environment passed in, so the
@@ -453,6 +451,7 @@ impl Drop for ChainTask {
 /// # Errors
 ///
 /// The signal handler failing to install.
+#[cfg(unix)]
 pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
     let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
@@ -463,6 +462,19 @@ pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
             }
         }
     });
+    Ok(receiver)
+}
+
+/// Windows has no SIGHUP (ADR-0017): the channel is born closed, which
+/// [`hold_until`] reads as "no re-mints", and the server stays up. A fresh
+/// bootstrap token there comes from a restart, as it did before `--remint`.
+///
+/// # Errors
+///
+/// None; the signature matches the Unix one.
+#[cfg(not(unix))]
+pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
+    let (_closed, receiver) = tokio::sync::mpsc::channel(1);
     Ok(receiver)
 }
 

@@ -29,9 +29,18 @@
 //! server — a session fetched back, an event replayed — rather than trusting a
 //! returned value.
 
+// The multi-process drivers send real signals to real process groups, and
+// the orphan sweep reads `ps`: Unix-only, like the end-to-end and fault
+// tiers built on them (ADR-0017). Windows suites have no orphan sweep — a
+// spawned product there would need a job of its own, which no Windows suite
+// spawns yet.
+#[cfg(unix)]
 pub mod process;
+#[cfg(unix)]
 pub mod ps;
+#[cfg(unix)]
 pub mod pty;
+#[cfg(unix)]
 pub mod reap;
 pub mod secure;
 

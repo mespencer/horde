@@ -897,6 +897,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1194,6 +1204,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cucumber",
+ "fs4",
  "horde-adapter",
  "horde-adapter-fake",
  "horde-config",
@@ -1454,6 +1465,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "fs4",
  "getrandom 0.3.4",
  "hex",
  "horde-adapter",
@@ -1471,8 +1483,10 @@ dependencies = [
  "horde-server-testkit",
  "horde-testkit",
  "horde-wire",
+ "junction",
  "nix 0.31.3",
  "portable-pty",
+ "process-wrap",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1903,6 +1917,16 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "junction"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4766,6 +4790,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

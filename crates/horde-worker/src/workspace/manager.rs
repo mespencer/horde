@@ -41,13 +41,16 @@ pub trait FsStats: Send + Sync + std::fmt::Debug {
     fn stats(&self, path: &Path) -> Option<(u64, u64)>;
 }
 
-/// The production source: `statvfs` on the path.
+/// The production source: `statvfs` on the path (on Windows,
+/// `GetDiskFreeSpaceExW` through `fs4`: the bytes available to this user,
+/// and the volume's total).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatvfsStats;
 
 impl FsStats for StatvfsStats {
     // The `statvfs` field types are platform-sized (u64 on Linux, u32 and
     // c_ulong on macOS), so the conversions are useless only here.
+    #[cfg(unix)]
     #[allow(clippy::useless_conversion)]
     fn stats(&self, path: &Path) -> Option<(u64, u64)> {
         let stats = nix::sys::statvfs::statvfs(path).ok()?;
@@ -55,6 +58,12 @@ impl FsStats for StatvfsStats {
         let free = u64::from(stats.blocks_available()).saturating_mul(fragment);
         let total = u64::from(stats.blocks()).saturating_mul(fragment);
         Some((free, total))
+    }
+
+    #[cfg(windows)]
+    fn stats(&self, path: &Path) -> Option<(u64, u64)> {
+        let stats = fs4::statvfs(path).ok()?;
+        Some((stats.available_space(), stats.total_space()))
     }
 }
 
@@ -1248,11 +1257,34 @@ async fn link_unmanaged(
             })?;
         }
         let target = instance_root.join(path);
-        tokio::fs::symlink(&target, &link).await.map_err(|error| {
+        link_dir(&target, &link).await.map_err(|error| {
             workspace_error(format!("could not link unmanaged path {path}: {error}"))
         })?;
     }
     Ok(())
+}
+
+/// A directory link at `link` naming `target`: a symlink.
+#[cfg(unix)]
+async fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    tokio::fs::symlink(target, link).await
+}
+
+/// A directory link at `link` naming `target`, on Windows: a directory
+/// symlink where the account may make one (Developer Mode, or an elevated
+/// Worker), and otherwise an NTFS junction, which needs no privilege and
+/// reads the same to every program that opens a path through it
+/// (ADR-0017). `target` is absolute — an Instance root joined to a path —
+/// which a junction requires.
+#[cfg(windows)]
+async fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    if tokio::fs::symlink_dir(target, link).await.is_ok() {
+        return Ok(());
+    }
+    let (target, link) = (target.to_owned(), link.to_owned());
+    tokio::task::spawn_blocking(move || junction::create(target, link))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// An unmanaged path is relative, every component normal, and not under
