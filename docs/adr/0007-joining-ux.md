@@ -173,3 +173,79 @@ prints with a note that only this machine can redeem it.
   while no client is enrolled (`crates/horde-server/src/remint.rs`,
   `startup.rs`). Validating `--san` against DNS is still not done. `--san`
   is now checked at parse time as an IP literal or a well-formed host name.
+
+## Amendment (2026-11-13): `horde worker add` joins a machine over ssh
+
+DESIGN §3 sketched an ssh bootstrap and deferred it. Wave 12 builds it as
+`horde worker add <name> <user@host>`. It is client-side orchestration of
+pieces this ADR already owns: the worker token, `--join-file`, and the
+stored endpoint. It adds no protocol and no server code.
+
+**What it runs.** Every remote command is a value, built in
+`crates/horde-cli/src/worker_add/plan.rs` and printed verbatim by
+`--dry-run`, which connects to nothing, not even the server. In order:
+
+1. **probe**: `uname -sm`, `$HOME`, `$PATH`, and whether
+   `~/.horde/worker/identity` already exists. An enrolled machine is
+   refused. A second identity would fail the worker's guarded re-join
+   anyway, and moving the old one aside is the operator's call.
+2. **binary**: the local `horde-worker` (beside this `horde`, or
+   `--binary-dir`, or built by `--build-locally` with
+   `cargo build --release --target <triple>`) is checked against the
+   remote platform by its ELF or Mach-O header. A mismatch is refused,
+   naming the triple to build. Cross builds are not set up for you.
+   `--from-release` refuses, because no release is published yet.
+3. **install**: `scp` to `<dir>/horde-worker.new` under a user-owned dir
+   (default `~/.horde/bin`, created owner-only, never sudo), then a rename
+   and one `--version` run. A binary that cannot run there (an older C
+   library) fails here, before a token is spent.
+4. **mint**: the ordinary `worker enroll` mint, through the endpoint this
+   invocation dialed. A token naming the unspecified address is refused. A
+   loopback token is a warning, because only a server on the remote machine
+   itself would answer it.
+5. **start**: the token travels on ssh **stdin** into
+   `~/.horde/join-token`, written under umask 077. It is never on any argv
+   or in any process list. A launcher script, `<dir>/horde-worker-start`,
+   runs `horde-worker --join-file … --adapter …` while no identity exists
+   and plain `horde-worker --adapter …` after that. The start script waits,
+   at most `--timeout-secs`, for the identity file the join writes, and
+   removes the token file on every exit path.
+   - **Default mode**: the launcher runs detached (`nohup`, plus `setsid`
+     where it exists), logging to `~/.horde/worker.log`.
+   - **`--service`**: the launcher becomes a systemd user unit
+     (`horde-worker.service`) on Linux or a launchd agent
+     (`dev.horde.worker`) on macOS. The unit pins the `PATH` the probe saw
+     over ssh, because a service manager's PATH would hide harnesses
+     installed under the user's home. On Linux the verb warns when
+     lingering is off, since systemd then stops user services at logout.
+6. **verify**: poll `ListWorkers` until the name registers, bounded by
+   `--timeout-secs`. Then report each harness's path and first
+   `--version` line on the PATH the worker inherited, as
+   `horde doctor --harness` does, and warn for an `--adapter` whose binary
+   is missing.
+
+**Trust.** The verb uses the system `ssh` and `scp`, so `~/.ssh/config`,
+the agent, `known_hosts` and password prompts behave as they always do.
+`--ssh-config` passes `-F` to both. The verb never disables host-key
+checking and never touches a private key. The target must look like
+`[user@]host` and may not begin with `-`, so it cannot smuggle in an ssh
+option. Every remote script is sent as `sh -c '<script>'` with POSIX
+quoting, so a non-POSIX login shell (fish, zsh) runs it unchanged.
+
+**Consequences.**
+
+- Re-running against a machine that is already a worker is a refusal, not
+  an upgrade. Replacing the binary on an enrolled machine stays manual for
+  now.
+- A worker started without `--service` does not survive a reboot. On a
+  systemd machine without lingering, it may not survive the ssh session's
+  logout either.
+- Harness install recipes (DESIGN §3) remain deferred. The verb reports
+  missing harnesses and does not install them.
+- Tests: the plan's scripts run for real under `sh` in unit tests. The CLI
+  suite drives the real `horde` binary against a secured server, joining
+  the real `horde-worker` through ssh/scp stand-ins. An `#[ignore]`d e2e
+  scenario, gated on `HORDE_SSH_DOCKER_TEST=1`, runs it over real ssh into
+  an sshd container.
+  The service paths are covered by unit-content tests only, because neither
+  systemd nor launchd runs in a container here.

@@ -111,7 +111,8 @@ citations are for `9218ac2`.
 
 | Item | Where deferred | Status at `22f2599` |
 |---|---|---|
-| ssh worker bootstrap + harness install recipes | §3/§14 | Absent: no ssh code anywhere. |
+| ssh worker bootstrap | §3/§14 | Built in wave 12 (W12i): `horde worker add` (`crates/horde-cli/src/worker_add.rs`, `worker_add/plan.rs`; ADR-0007 2026-11-13 amendment); tests `worker_add/tests.rs`, `worker_add/plan/tests.rs`, `crates/horde-cli/tests/cli_suite/worker_add.rs`, `crates/horde-e2e/tests/e2e_suite/worker_add.rs` (Docker, env-gated). |
+| Harness install recipes | §3/§14 | Absent: `worker add` reports missing harnesses and installs none. |
 | Raw/self-hosted model harness | §4/§14 | Absent: `--adapter` takes only `fake`, `claude`, `codex` (`horde-worker/src/flags.rs:43-47`). |
 | Hard budgets | §12/§14 | Proto shape only (`agent.proto:155`); the CLI sends `budget: None` and nothing reads it. Budget unit (§15) undecided. |
 | Threshold usage alerts | §12 | Absent. |

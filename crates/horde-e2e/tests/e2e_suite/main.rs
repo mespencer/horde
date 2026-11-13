@@ -27,3 +27,5 @@ mod logins;
 mod relay_payload;
 #[cfg(test)]
 mod resilience;
+#[cfg(test)]
+mod worker_add;

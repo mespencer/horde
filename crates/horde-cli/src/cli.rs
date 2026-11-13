@@ -333,6 +333,11 @@ pub struct PrewarmArgs {
 pub enum WorkerCommand {
     /// List the connected workers.
     List,
+    /// Bootstrap a remote Linux or macOS machine as a worker over the
+    /// system ssh: install `horde-worker` in a user-owned directory, join
+    /// it with a token delivered over ssh stdin, start it, and wait for it
+    /// to register.
+    Add(crate::worker_add::AddArgs),
     /// Mint a one-time enrollment code for a new worker. Run
     /// `horde-worker`'s join (or `horde enroll join`) with it on the new
     /// machine before it expires.
@@ -826,6 +831,13 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     // a machine that may hold nothing yet.
     if let Some(Command::Up(args)) = &cli.command {
         return crate::up::run(args, cli.identity.as_deref()).await;
+    }
+    // A dry run of `worker add` prints its plan and connects to nothing —
+    // not even the server it would mint through.
+    if let Some(Command::Worker(WorkerCommand::Add(args))) = &cli.command
+        && args.dry_run
+    {
+        return crate::worker_add::dry_run(args, format);
     }
     // `doctor` diagnoses the very connection the other verbs need, so it
     // must run whether or not one can be made.
@@ -1417,6 +1429,9 @@ async fn run_worker(
         WorkerCommand::List => {
             let workers = client.list_workers().await?;
             println!("{}", render::workers(&workers, format));
+        }
+        WorkerCommand::Add(args) => {
+            crate::worker_add::run(client, args, endpoint, format).await?;
         }
         WorkerCommand::Enroll { name, ttl_minutes } => {
             let minted = client

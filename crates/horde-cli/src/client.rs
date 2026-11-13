@@ -237,6 +237,12 @@ pub enum ClientError {
     )]
     AgentEnded { agent_id: String, detail: String },
 
+    /// `horde worker add` could not bootstrap the remote machine: a step
+    /// failed, or the machine (or the local binary) is not one it serves —
+    /// always naming the step and what to do.
+    #[error("worker add: {0}")]
+    WorkerAdd(String),
+
     /// `horde doctor` found something to fix; the report above says what.
     #[error("doctor found {failures} problem(s); each FAIL line above names its fix")]
     Unhealthy { failures: usize },
