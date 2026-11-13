@@ -294,6 +294,24 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The bound is 16 KiB: a record just under it is kept whole.
+    #[test]
+    fn a_record_just_under_sixteen_kib_is_kept_whole() {
+        let line = serialize_bounded(record(&"m".repeat(16 * 1024 - 100)));
+        assert!(!line.contains("truncated"), "{} bytes", line.len());
+        assert_eq!(MAX_RECORD_BYTES, 16 * 1024);
+    }
+
+    #[test]
+    fn a_cut_backs_off_to_a_char_boundary() {
+        let mut text = "éé".to_owned();
+        super::cut_on_char_boundary(&mut text, 3);
+        assert_eq!(text, "é");
+        let mut short = "ab".to_owned();
+        super::cut_on_char_boundary(&mut short, 5);
+        assert_eq!(short, "ab");
+    }
+
     #[test]
     fn a_short_record_is_serialized_whole() {
         let line = serialize_bounded(record("hello"));

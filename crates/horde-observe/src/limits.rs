@@ -146,6 +146,17 @@ mod tests {
     }
 
     #[test]
+    fn the_buckets_report_the_limits_they_enforce() {
+        let limits = AgentReadLimits {
+            default_bytes: 1,
+            max_bytes: 2,
+            calls_per_minute: 3,
+            burst: 4,
+        };
+        assert_eq!(*RateBuckets::new(limits).limits(), limits);
+    }
+
+    #[test]
     fn a_zero_rate_waits_a_minute() {
         let limits = AgentReadLimits {
             calls_per_minute: 0,

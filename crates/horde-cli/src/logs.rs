@@ -900,6 +900,20 @@ mod tests {
         }
     }
 
+    /// A non-following `--dir` read, which must return on its own: a read
+    /// that would never end fails here in seconds rather than hanging.
+    async fn bounded_dir(
+        dir: &std::path::Path,
+        args: &LogsArgs,
+        format: Format,
+    ) -> Result<String, crate::ClientError> {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), run_dir(dir, args, format, &mut out))
+            .await
+            .expect("a --dir read without --follow returns")?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
     #[tokio::test]
     async fn dir_reads_local_files_unredacted_with_the_same_filters() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -918,37 +932,32 @@ mod tests {
             n: 5,
             ..LogsArgs::default()
         };
-        let mut out = Vec::new();
-        run_dir(dir.path(), &args, Format::Json, &mut out)
+        let text = bounded_dir(dir.path(), &args, Format::Json)
             .await
             .expect("read");
-        let text = String::from_utf8(out).expect("utf8");
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(
             text.contains("horde://join/h:1/a.b"),
             "the operator's own files are unredacted"
         );
-        let mut tail = Vec::new();
-        run_dir(
+        let tail = bounded_dir(
             dir.path(),
             &LogsArgs {
                 n: 1,
                 ..LogsArgs::default()
             },
             Format::Human,
-            &mut tail,
         )
         .await
         .expect("read");
-        assert!(String::from_utf8(tail).expect("utf8").contains("last"));
-        let bad = run_dir(
+        assert!(tail.contains("last"));
+        let bad = bounded_dir(
             dir.path(),
             &LogsArgs {
                 level: Some("loud".to_owned()),
                 ..LogsArgs::default()
             },
             Format::Human,
-            &mut Vec::new(),
         )
         .await;
         assert!(bad.is_err());
