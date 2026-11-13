@@ -391,18 +391,23 @@ mod tests {
         LocalLogs::new(dir, "horde-worker", None)
     }
 
-    #[tokio::test]
-    async fn a_local_read_pages_redacts_and_stays_in_its_session() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let access = LogAccess::new(
-            Some(files(dir.path())),
+    /// Access over [`files`] with limits no test here reaches.
+    fn generous(dir: &std::path::Path) -> LogAccess {
+        LogAccess::new(
+            Some(files(dir)),
             "w1",
             AgentReadLimits {
                 calls_per_minute: 600,
                 burst: 100,
                 ..AgentReadLimits::default()
             },
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn a_local_read_pages_redacts_and_stays_in_its_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let access = generous(dir.path());
         let mut client = client();
         let all = access
             .call(&mut client, "a1", "s1", &LogsParams::default())
@@ -497,15 +502,7 @@ mod tests {
     #[tokio::test]
     async fn since_level_and_grep_each_narrow_the_read() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let access = LogAccess::new(
-            Some(files(dir.path())),
-            "w1",
-            AgentReadLimits {
-                calls_per_minute: 600,
-                burst: 100,
-                ..AgentReadLimits::default()
-            },
-        );
+        let access = generous(dir.path());
         let client = client();
         let count = |params: LogsParams| {
             let (access, mut client) = (&access, client.clone());

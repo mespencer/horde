@@ -572,8 +572,11 @@ mod tests {
                 tracing::info!(target: "horde_cli", padding = %"p".repeat(512), "burst {n}");
             }
         });
+        // A zero deadline only sees the writer's answer if this thread is
+        // preempted between asking and looking, so one attempt can win the
+        // race on a loaded machine; a hundred cannot all win it.
         assert!(
-            !finish_observability(None, Some(&file), Duration::ZERO),
+            (0..100).any(|_| !finish_observability(None, Some(&file), Duration::ZERO)),
             "a backlog is not written in no time"
         );
         assert!(finish_observability(
