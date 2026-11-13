@@ -325,49 +325,15 @@ impl Housekeeper {
         command: &WorkspaceGcCommand,
         pass: Pass<'_>,
     ) -> Vec<WorkspaceCleanup> {
-        let level = match GcLevel::try_from(command.level) {
-            Ok(GcLevel::Soft) => GcLevel::Soft,
-            Ok(GcLevel::Hard) => GcLevel::Hard,
-            _ => GcLevel::Automatic,
-        };
+        let level = gc_level(command.level);
         let agents: Vec<String> = command.agent_ids.iter().map(ToString::to_string).collect();
         let mut events = Vec::new();
         for record in self.workspaces.records(definition_id).await {
-            if !agents.is_empty() && !agents.contains(&record.agent_id) {
-                continue;
-            }
-            let standing = self.standing(&record).await;
-            let lock = self.shared.checkout_locks.of(&record.agent_id);
-            let _held = lock.lock().await;
-            let busy = self.shared.activity.is_busy(&record.agent_id);
-            if !busy && record.soft_reclaimed_at_ms.is_none() {
-                events.push(
-                    crate::workspace::cleanup::soft_reclaim(
-                        &self.workspaces,
-                        definition_id,
-                        &record,
-                        pass,
-                    )
-                    .await,
+            if agents.is_empty() || agents.contains(&record.agent_id) {
+                events.extend(
+                    self.gc_checkout(definition_id, &record, level, command.force, pass)
+                        .await,
                 );
-            }
-            let removable = match (level, standing) {
-                (GcLevel::Soft, _) | (_, Standing::Live | Standing::Remembered) => false,
-                (GcLevel::Automatic, Standing::Archived) | (GcLevel::Hard, _) => true,
-                (GcLevel::Automatic, Standing::Orphan) => false,
-                _ => false,
-            };
-            if removable {
-                let force = level == GcLevel::Hard && command.force;
-                let (event, _) = crate::workspace::cleanup::hard_remove(
-                    &self.workspaces,
-                    definition_id,
-                    &record,
-                    pass,
-                    force,
-                )
-                .await;
-                events.push(event);
             }
         }
         if level == GcLevel::Hard && command.include_pins {
@@ -382,6 +348,47 @@ impl Housekeeper {
                 )
                 .await,
             );
+        }
+        events
+    }
+
+    /// The gc levels on one checkout: a soft reclaim unless it is busy or
+    /// already reclaimed, then a hard removal when the level and standing
+    /// allow — never of a live or remembered agent's checkout.
+    async fn gc_checkout(
+        &self,
+        definition_id: &str,
+        record: &LedgerRecord,
+        level: GcLevel,
+        force: bool,
+        pass: Pass<'_>,
+    ) -> Vec<WorkspaceCleanup> {
+        let standing = self.standing(record).await;
+        let lock = self.shared.checkout_locks.of(&record.agent_id);
+        let _held = lock.lock().await;
+        let mut events = Vec::new();
+        if !self.shared.activity.is_busy(&record.agent_id) && record.soft_reclaimed_at_ms.is_none()
+        {
+            events.push(
+                crate::workspace::cleanup::soft_reclaim(
+                    &self.workspaces,
+                    definition_id,
+                    record,
+                    pass,
+                )
+                .await,
+            );
+        }
+        if removable_at(level, standing) {
+            let (event, _) = crate::workspace::cleanup::hard_remove(
+                &self.workspaces,
+                definition_id,
+                record,
+                pass,
+                level == GcLevel::Hard && force,
+            )
+            .await;
+            events.push(event);
         }
         events
     }
@@ -768,6 +775,26 @@ impl Housekeeper {
     }
 }
 
+/// A gc command's level; unspecified reads as AUTOMATIC.
+fn gc_level(level: i32) -> GcLevel {
+    match GcLevel::try_from(level) {
+        Ok(GcLevel::Soft) => GcLevel::Soft,
+        Ok(GcLevel::Hard) => GcLevel::Hard,
+        _ => GcLevel::Automatic,
+    }
+}
+
+/// Whether a gc at `level` may hard-remove a checkout standing so: never a
+/// live or remembered agent's, never under SOFT; archived ones under
+/// AUTOMATIC; orphans too under HARD.
+fn removable_at(level: GcLevel, standing: Standing) -> bool {
+    match (level, standing) {
+        (GcLevel::Soft, _) | (_, Standing::Live | Standing::Remembered) => false,
+        (GcLevel::Hard, _) => true,
+        (_, standing) => standing == Standing::Archived,
+    }
+}
+
 /// One disk-pressure episode's state across scans.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Episode {
@@ -856,6 +883,27 @@ mod tests {
         assert_eq!(config.disk_low_watermark.basis_points, 1_000);
         assert_eq!(config.disk_low_watermark.bytes, 20 << 30);
         assert_eq!(config.disk_high_watermark.basis_points, 1_500);
+    }
+
+    /// The gc removal table (ADR-0014): never a live or remembered agent's
+    /// checkout, nothing under SOFT, archived under AUTOMATIC, orphans too
+    /// under HARD.
+    #[test]
+    fn gc_removes_by_level_and_standing() {
+        use Standing::{Archived, Live, Orphan, Remembered};
+        for standing in [Live, Remembered, Archived, Orphan] {
+            assert!(!removable_at(GcLevel::Soft, standing), "{standing:?}");
+        }
+        for level in [GcLevel::Automatic, GcLevel::Hard] {
+            assert!(!removable_at(level, Live) && !removable_at(level, Remembered));
+            assert!(removable_at(level, Archived));
+        }
+        assert!(!removable_at(GcLevel::Automatic, Orphan));
+        assert!(removable_at(GcLevel::Hard, Orphan));
+        assert_eq!(gc_level(GcLevel::Soft.into()), GcLevel::Soft);
+        assert_eq!(gc_level(GcLevel::Hard.into()), GcLevel::Hard);
+        assert_eq!(gc_level(0), GcLevel::Automatic);
+        assert_eq!(gc_level(99), GcLevel::Automatic);
     }
 
     #[test]

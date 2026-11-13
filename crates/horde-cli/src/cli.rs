@@ -1422,6 +1422,22 @@ async fn run_workspace(
         WorkspaceCommand::Update(args) => {
             crate::workspace_update::run(client, args, format).await?;
         }
+        WorkspaceCommand::Delete { .. }
+        | WorkspaceCommand::Gc(_)
+        | WorkspaceCommand::Instance(_)
+        | WorkspaceCommand::Log(_) => run_workspace_cleanup(client, command, format).await?,
+    }
+    Ok(())
+}
+
+/// The cleanup half of `workspace` (ADR-0014): delete (with `--purge`),
+/// gc, instance list/remove, and the housekeeping log.
+async fn run_workspace_cleanup(
+    client: &mut Client,
+    command: &WorkspaceCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
         WorkspaceCommand::Delete {
             workspace_definition_id,
             etag,
@@ -1442,15 +1458,16 @@ async fn run_workspace(
                 },
                 format,
             )
-            .await?;
+            .await
         }
-        WorkspaceCommand::Gc(args) => crate::workspace_gc::run_gc(client, args, format).await?,
+        WorkspaceCommand::Gc(args) => crate::workspace_gc::run_gc(client, args, format).await,
         WorkspaceCommand::Instance(command) => {
-            crate::workspace_gc::run_instance(client, command, format).await?;
+            crate::workspace_gc::run_instance(client, command, format).await
         }
-        WorkspaceCommand::Log(args) => crate::workspace_gc::run_log(client, args, format).await?,
+        WorkspaceCommand::Log(args) => crate::workspace_gc::run_log(client, args, format).await,
+        // The definition verbs are `run_workspace`'s own.
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 async fn run_prewarm(

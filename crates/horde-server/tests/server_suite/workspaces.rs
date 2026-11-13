@@ -434,3 +434,52 @@ async fn delete_purge_requests_instance_removal_and_a_dry_run_keeps_the_definiti
         tonic::Code::NotFound
     );
 }
+
+/// Instance removal names its workspace and worker; an older worker is
+/// refused outright, an online one is targeted, and an offline one gets the
+/// command waiting in its stream.
+#[tokio::test]
+async fn instance_removal_targets_one_worker_or_says_why_not() {
+    let (mut harness, workspace) = held_workspace().await.expect("a held workspace");
+    register(&mut harness, "old-worker", 0)
+        .await
+        .expect("registers");
+    let remove = |worker: Option<&str>, workspace: Option<&str>| {
+        horde_proto::v1::RemoveWorkspaceInstanceRequest {
+            workspace_definition_id: workspace.map(WorkspaceDefinitionId::new),
+            worker_id: worker.map(WorkerId::new),
+            force: false,
+            dry_run: true,
+        }
+    };
+    let online = harness
+        .control
+        .remove_workspace_instance(remove(Some("new-worker"), Some(&workspace)))
+        .await
+        .expect("accepted")
+        .into_inner();
+    assert!(online.targeted && online.sequence > 0 && online.request_id.starts_with("gc-"));
+
+    let offline = harness
+        .control
+        .remove_workspace_instance(remove(Some("away"), Some(&workspace)))
+        .await
+        .expect("accepted")
+        .into_inner();
+    assert!(!offline.targeted, "the command waits for it");
+
+    let old = harness
+        .control
+        .remove_workspace_instance(remove(Some("old-worker"), Some(&workspace)))
+        .await
+        .expect_err("too old");
+    assert_eq!(old.code(), tonic::Code::FailedPrecondition);
+    for (worker, workspace) in [(None, Some(workspace.as_str())), (Some("new-worker"), None)] {
+        let refused = harness
+            .control
+            .remove_workspace_instance(remove(worker, workspace))
+            .await
+            .expect_err("both are required");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    }
+}
