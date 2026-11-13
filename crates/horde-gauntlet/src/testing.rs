@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::command::{CommandOutput, CommandRunner, CommandSpec};
 use crate::gate::{Gate, GateContext, GateOutcome};
@@ -50,6 +50,7 @@ pub(crate) struct ScriptedRunner {
     responses: RefCell<VecDeque<Result<CommandOutput, String>>>,
     repeat_last: bool,
     calls: RefCell<Vec<CommandSpec>>,
+    writes: Vec<(usize, PathBuf, String)>,
 }
 
 impl ScriptedRunner {
@@ -64,7 +65,16 @@ impl ScriptedRunner {
             responses: RefCell::new(responses.into()),
             repeat_last: false,
             calls: RefCell::new(Vec::new()),
+            writes: Vec::new(),
         }
+    }
+
+    /// Writes `contents` to `path` when the `call`th command (from 0) runs,
+    /// the way a tool leaves an artifact behind for its gate to read.
+    pub(crate) fn writing(mut self, call: usize, path: &Path, contents: &str) -> Self {
+        self.writes
+            .push((call, path.to_path_buf(), contents.to_owned()));
+        self
     }
 
     /// Fails every launch with `message`, however many times it is asked.
@@ -73,6 +83,7 @@ impl ScriptedRunner {
             responses: RefCell::new(VecDeque::from(vec![Err(message.to_owned())])),
             repeat_last: true,
             calls: RefCell::new(Vec::new()),
+            writes: Vec::new(),
         }
     }
 
@@ -82,6 +93,7 @@ impl ScriptedRunner {
             responses: RefCell::new(VecDeque::from(vec![Ok(output)])),
             repeat_last: true,
             calls: RefCell::new(Vec::new()),
+            writes: Vec::new(),
         }
     }
 
@@ -102,7 +114,16 @@ impl ScriptedRunner {
 
 impl CommandRunner for ScriptedRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, String> {
+        let call = self.calls.borrow().len();
         self.calls.borrow_mut().push(spec.clone());
+        for (at, path, contents) in &self.writes {
+            if *at == call {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("scripted artifact directory");
+                }
+                std::fs::write(path, contents).expect("scripted artifact");
+            }
+        }
         let mut responses = self.responses.borrow_mut();
         if self.repeat_last && responses.len() == 1 {
             let response = responses.front().expect("length checked").clone();

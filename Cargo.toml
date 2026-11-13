@@ -78,11 +78,11 @@ dbg_macro = "deny"
 [profile.release]
 debug = "line-tables-only"
 
-# What cargo-mutants builds with (the mutants gate passes `--profile=mutants`).
-# Every mutant pays an incremental rebuild and relink of the mutated package's
-# test binaries; debuginfo is the bulk of the link cost and nothing in a
-# mutation run ever reads it — no debugger attaches, and a mutant's failure is
-# read from the test harness's output, not a backtrace.
+# What cargo-gamma builds with (`gamma.toml` selects `profile = "mutants"`).
+# Gamma builds the whole instrumented workspace once per run and then runs
+# thousands of mutants against it; debuginfo is the bulk of that build's link
+# cost and nothing in a mutation run ever reads it — no debugger attaches, and
+# a mutant's verdict is read from gamma's report, not a backtrace.
 [profile.mutants]
 inherits = "test"
 debug = false

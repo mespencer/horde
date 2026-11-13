@@ -142,6 +142,10 @@ pub struct GateContext {
     /// Whether the caller asked to measure the whole tree rather than the
     /// change under test. Only the `mutants` gate scopes by change today.
     pub full: bool,
+    /// Whether the caller asked to measure what changed since the last green
+    /// whole-tree sweep, rather than since the branch point. Only `mutants`
+    /// reads it.
+    pub incremental: bool,
 }
 
 impl GateContext {
@@ -152,6 +156,7 @@ impl GateContext {
             log_dir: workspace_root.join("target").join("quality"),
             packages,
             full: false,
+            incremental: false,
         }
     }
 
@@ -159,6 +164,13 @@ impl GateContext {
     #[must_use]
     pub fn measuring_everything(mut self, full: bool) -> Self {
         self.full = full;
+        self
+    }
+
+    /// Asks for what changed since the last green whole-tree sweep.
+    #[must_use]
+    pub fn since_last_full_sweep(mut self, incremental: bool) -> Self {
+        self.incremental = incremental;
         self
     }
 
@@ -416,6 +428,16 @@ mod tests {
             GateContext::new(Path::new("/repo"), Vec::new())
                 .measuring_everything(true)
                 .full
+        );
+    }
+
+    #[test]
+    fn a_context_measures_since_the_branch_point_unless_asked_otherwise() {
+        assert!(!GateContext::new(Path::new("/repo"), Vec::new()).incremental);
+        assert!(
+            GateContext::new(Path::new("/repo"), Vec::new())
+                .since_last_full_sweep(true)
+                .incremental
         );
     }
 
