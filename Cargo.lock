@@ -1212,6 +1212,8 @@ dependencies = [
  "cucumber",
  "fs4",
  "horde-adapter",
+ "horde-adapter-claude",
+ "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-config",
  "horde-identity",
