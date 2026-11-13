@@ -1,9 +1,15 @@
 ---
-source: crates/horde-tui/tests/render.rs
+source: crates/horde-tui/src/view/tests.rs
 expression: drawn(&app)
 ---
-" horde — sessions  — 1 waiting  ⚠ stream ended                                  "
-"> ci-fix  s1  active  head=7  [1 waiting]                                       "
+" horde  1:session  2:agents  3:inbox  4:workspaces  5:usage  6:logs  7:forwards "
+"                                                                                "
+"❯ horde  horde@main, atlas                                                      "
+"    gpu-box          ready          /srv/horde/ws/horde                         "
+"        horde          2df0ef01  dirty  /srv/horde/ws/horde/horde               "
+"    unknown worker   degraded         atlas failed to fetch                     "
+"  scratch                                                                       "
+"      no instances on any worker yet                                            "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -18,11 +24,5 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"[enter] attach  [i] inbox  [f] forwards  [r] refresh  [q] quit                  "
+" r refresh · esc back · q quit                                                  "
+" not attached · ○ connecting                                                    "

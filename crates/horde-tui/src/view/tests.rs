@@ -1,0 +1,487 @@
+//! Every screen rendered against fixed fixtures (docs/TESTING.md §2).
+//!
+//! The snapshots under `snapshots/` are the UI diff: a rendering change
+//! shows up as a reviewable text diff of the actual 80×24 buffer, exactly
+//! what an attached terminal would show. The fixtures walk the production
+//! fold — `App::apply` over real envelopes — and the keys go through
+//! `App::on_input`, never hand-built view state, so a snapshot can only be
+//! green if the fold, the keys and the renderer agree.
+
+use horde_proto::v1::{
+    AgentId, AgentOutputChannel, ForwardDirection, ForwardId, ForwardIntent, ForwardSpec,
+    ForwardStatus, PlacementState, RepoInstanceReport, SessionId, SessionSummary,
+    TokenUsage, UsageAggregate, UsageGroupKey, WorkerId, WorkerSummary, WorkspaceDefinition,
+    WorkspaceInstanceReport, WorkspaceInstanceState, WorkspaceRepo, event::Kind,
+};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+
+use super::render;
+use crate::app::{App, Update, UsageReport, WorkspaceEntry};
+use crate::fixtures::{asked, assignment, bound, chunk, envelope_in, placement, requested, spawned};
+
+/// Draws the app once at 80×24 and hands back the buffer as text.
+fn drawn(app: &App) -> String {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("a test terminal always constructs");
+    terminal
+        .draw(|frame| render(app, frame))
+        .expect("drawing on a TestBackend cannot fail");
+    terminal.backend().to_string()
+}
+
+fn press(app: &mut App, code: KeyCode) {
+    app.on_input(&TermEvent::Key(KeyEvent::from(code)));
+}
+
+fn ctrl(app: &mut App, c: char) {
+    app.on_input(&TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
+}
+
+fn typed(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
+fn summary(session_id: &str, title: &str, root: &str) -> SessionSummary {
+    SessionSummary {
+        session_id: Some(SessionId::new(session_id)),
+        title: title.to_owned(),
+        root_agent_id: Some(AgentId::new(root)),
+        state: horde_proto::v1::SessionLifecycleState::Active as i32,
+        ..SessionSummary::default()
+    }
+}
+
+/// Folds `kinds` into a session, each about `agent`, at the next positions.
+fn fold(app: &mut App, session: &str, agent: &str, kinds: Vec<Kind>) {
+    for kind in kinds {
+        let next = app.session(session).map_or(0, |state| state.stream_head) + 1;
+        app.apply(Update::Event(Box::new(envelope_in(session, next, agent, kind))));
+    }
+}
+
+fn caught_up(app: &mut App, session_id: &str) {
+    app.apply(Update::CaughtUp {
+        session_id: session_id.to_owned(),
+        head: 0,
+    });
+}
+
+fn workers(app: &mut App) {
+    app.apply(Update::Workers(vec![WorkerSummary {
+        worker_id: Some(WorkerId::new("worker-1")),
+        name: "gpu-box".to_owned(),
+        ..WorkerSummary::default()
+    }]));
+}
+
+/// `ci-fix`: a root on gpu-box running claude/opus that took an assignment,
+/// read a file, thought, and replied; a reviewer child it spawned.
+fn conversation(app: &mut App) {
+    app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+    workers(app);
+    fold(app, "s1", "root-1", vec![
+        spawned(None, &["ci-fix"]),
+        placement(PlacementState::Placed, Some("worker-1")),
+        assignment("make the tests green"),
+        chunk(AgentOutputChannel::Reasoning, "t1", "The failure is probably in the parser."),
+        chunk(AgentOutputChannel::ToolCall, "t1", r#"Bash {"command":"cargo test -p parser"}"#),
+        chunk(AgentOutputChannel::ToolResult, "t1", "running 12 tests\ntest a ... ok\ntest b ... FAILED\ntest c ... ok\nfailures: b"),
+        chunk(AgentOutputChannel::Assistant, "t1", "One test fails: `b` expects a trailing "),
+        chunk(AgentOutputChannel::Assistant, "t1", "newline. I'll ask a reviewer to check the fix."),
+    ]);
+    fold(app, "s1", "kid", vec![spawned(Some("root-1"), &["ci-fix", "reviewer"])]);
+    fold(app, "s1", "root-1", vec![bound("t1", "claude", "opus")]);
+    caught_up(app, "s1");
+}
+
+fn attached_conversation() -> App {
+    let mut app = App::attached("s1", None);
+    conversation(&mut app);
+    app.apply(Update::Heartbeat);
+    app
+}
+
+#[test]
+fn the_session_shows_the_transcript_compose_box_and_status() {
+    let mut app = attached_conversation();
+    typed(&mut app, "looks good, go ahead");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn ctrl_o_expands_tool_input_and_output() {
+    let mut app = attached_conversation();
+    ctrl(&mut app, 'o');
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_working_agent_shows_the_spinner_line_and_queue_hints() {
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![
+        assignment("also fix the lint"),
+        chunk(AgentOutputChannel::ToolCall, "t2", r#"Read {"file_path":"src/lib.rs"}"#),
+    ]);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_permission_waits_inline_with_its_choices() {
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "kid", vec![requested("req-1", "git push --force origin main")]);
+    press(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_multi_question_request_is_answered_in_place() {
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![asked("q-1", &[
+        ("Which branch?", &["main", "release"]),
+        ("Run the slow tests?", &["yes", "no"]),
+    ])]);
+    typed(&mut app, "2");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn an_answered_prompt_says_it_is_waiting_for_the_server() {
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![requested("req-1", "rm -rf target")]);
+    typed(&mut app, "y");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn slash_opens_the_command_menu() {
+    let mut app = attached_conversation();
+    typed(&mut app, "/a");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_session_still_replaying_says_syncing() {
+    let mut app = App::attached("s1", None);
+    app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_new_session_invites_the_first_message() {
+    let mut app = App::attached("s1", None);
+    app.apply(Update::Sessions(vec![SessionSummary {
+        root_agent_id: None,
+        ..summary("s1", "brisk-warband", "")
+    }]));
+    caught_up(&mut app, "s1");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_subagent_attach_scopes_prompts_and_badges_the_rest() {
+    let mut app = App::attached("s1", Some("kid".to_owned()));
+    conversation(&mut app);
+    fold(&mut app, "s1", "kid", vec![chunk(AgentOutputChannel::Assistant, "k1", "Reviewing the diff.")]);
+    fold(&mut app, "s1", "root-1", vec![requested("req-root", "ls")]);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn scrolling_back_shows_older_rows() {
+    let mut app = attached_conversation();
+    press(&mut app, KeyCode::PageUp);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_closed_stream_says_it_ended_and_why() {
+    let mut app = attached_conversation();
+    app.apply(Update::StreamEnded {
+        reason: "server unavailable".to_owned(),
+    });
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_stale_stream_is_badged() {
+    let mut app = attached_conversation();
+    app.apply(Update::Tick {
+        now: std::time::Instant::now() + crate::app::STALE_AFTER * 2,
+    });
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_refusal_shows_in_the_hint_line() {
+    let mut app = attached_conversation();
+    app.report_error("permission denied: you are not the session owner");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+/// Two sessions, one with a lost agent and one waiting prompt.
+fn tree() -> App {
+    let mut app = App::overview();
+    conversation(&mut app);
+    app.apply(Update::Sessions(vec![summary("s2", "docs", "root-2")]));
+    fold(&mut app, "s2", "root-2", vec![
+        spawned(None, &["docs"]),
+        placement(PlacementState::Lost, Some("worker-9")),
+    ]);
+    fold(&mut app, "s1", "kid", vec![
+        placement(PlacementState::Placed, Some("worker-1")),
+        requested("req-1", "git push"),
+    ]);
+    app
+}
+
+#[test]
+fn the_tree_shows_sessions_agents_states_and_workers() {
+    let mut app = tree();
+    press(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn an_empty_tree_says_how_to_start() {
+    insta::assert_snapshot!(drawn(&App::overview()));
+}
+
+#[test]
+fn archive_asks_in_the_hint_line() {
+    let mut app = tree();
+    press(&mut app, KeyCode::Char('x'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn the_inbox_lists_prompts_with_the_selected_card() {
+    let mut app = tree();
+    fold(&mut app, "s2", "root-2", vec![asked("q-9", &[("Publish the docs?", &["now", "later"])])]);
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn an_empty_inbox_says_nothing_needs_you() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('i'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn workspaces_show_definitions_instances_and_checkouts() {
+    let mut app = App::overview();
+    workers(&mut app);
+    let repo = |name: &str, branch: &str| WorkspaceRepo {
+        name: name.to_owned(),
+        default_branch: branch.to_owned(),
+        ..WorkspaceRepo::default()
+    };
+    app.apply(Update::Workspaces(vec![
+        WorkspaceEntry {
+            definition: WorkspaceDefinition {
+                name: "horde".to_owned(),
+                repos: vec![repo("horde", "main"), repo("atlas", "")],
+                ..WorkspaceDefinition::default()
+            },
+            instances: vec![WorkspaceInstanceReport {
+                worker_id: Some(WorkerId::new("worker-1")),
+                state: WorkspaceInstanceState::Ready as i32,
+                root_path: "/srv/horde/ws/horde".to_owned(),
+                repos: vec![RepoInstanceReport {
+                    repo_name: "horde".to_owned(),
+                    path: "/srv/horde/ws/horde/horde".to_owned(),
+                    head_commit_sha: "2df0ef0123456789".to_owned(),
+                    dirty: true,
+                }],
+                ..WorkspaceInstanceReport::default()
+            }, WorkspaceInstanceReport {
+                worker_id: None,
+                state: WorkspaceInstanceState::Degraded as i32,
+                detail: "atlas failed to fetch".to_owned(),
+                ..WorkspaceInstanceReport::default()
+            }],
+        },
+        WorkspaceEntry {
+            definition: WorkspaceDefinition {
+                name: "scratch".to_owned(),
+                ..WorkspaceDefinition::default()
+            },
+            instances: Vec::new(),
+        },
+    ]));
+    press(&mut app, KeyCode::Char('w'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn workspaces_loading_and_empty_say_which() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('w'));
+    let loading = drawn(&app);
+    app.apply(Update::Workspaces(Vec::new()));
+    insta::assert_snapshot!(format!("{loading}\n{}", drawn(&app)));
+}
+
+#[test]
+fn usage_shows_agents_trees_and_accounts() {
+    let mut app = App::attached("s1", None);
+    conversation(&mut app);
+    let tokens = |input, output| Some(TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: 1_000,
+        ..TokenUsage::default()
+    });
+    app.apply(Update::Usage(UsageReport {
+        scope: "session ci-fix".to_owned(),
+        by_agent: vec![UsageAggregate {
+            key: Some(UsageGroupKey {
+                agent_id: Some(AgentId::new("agent-root-1")),
+                ..UsageGroupKey::default()
+            }),
+            tokens: tokens(12_345, 678),
+            agent_count: 1,
+        }],
+        by_tree: vec![UsageAggregate {
+            key: Some(UsageGroupKey {
+                tree_path: vec!["ci-fix".to_owned(), "reviewer".to_owned()],
+                ..UsageGroupKey::default()
+            }),
+            tokens: tokens(5, 6),
+            agent_count: 1,
+        }],
+        accounts: vec![horde_proto::v1::AccountHeadroom {
+            provider: "claude".to_owned(),
+            account: "work".to_owned(),
+            tokens: tokens(12_350, 684),
+            remaining_fraction: Some(0.42),
+            exhausted: true,
+            ..horde_proto::v1::AccountHeadroom::default()
+        }],
+    }));
+    ctrl(&mut app, 't');
+    press(&mut app, KeyCode::Char('u'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn usage_loading_and_empty_say_which() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('u'));
+    let loading = drawn(&app);
+    app.apply(Update::Usage(UsageReport {
+        scope: "every session".to_owned(),
+        ..UsageReport::default()
+    }));
+    insta::assert_snapshot!(format!("{loading}\n{}", drawn(&app)));
+}
+
+#[test]
+fn the_logs_pane_is_a_labelled_placeholder() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('l'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn help_lists_keys_from_the_binding_tables() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('?'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn the_forward_panel_shows_names_reachability_and_backing() {
+    let mut app = App::overview();
+    conversation(&mut app);
+    let forward = |name: &str, direction: ForwardDirection, port, backer: Option<&str>, backed, reachable| ForwardStatus {
+        intent: Some(ForwardIntent {
+            forward_id: Some(ForwardId::new(format!("fwd-{name}"))),
+            session_id: Some(SessionId::new("s1")),
+            spec: Some(ForwardSpec {
+                name: name.to_owned(),
+                direction: direction as i32,
+                worker_port: port,
+                ..ForwardSpec::default()
+            }),
+            backer_client_id: backer.map(horde_proto::v1::ClientId::new),
+            ..ForwardIntent::default()
+        }),
+        worker_reachable: reachable,
+        backed,
+    };
+    app.apply(Update::Forwards(vec![
+        forward("vite", ForwardDirection::Expose, 5173, None, false, true),
+        forward("db", ForwardDirection::Inject, 5432, Some("laptop"), true, true),
+        forward("redis", ForwardDirection::Inject, 6379, Some("laptop"), false, false),
+    ]));
+    press(&mut app, KeyCode::Char('f'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn an_empty_forward_panel_says_so() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('f'));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_secret_free_text_answer_is_masked() {
+    let mut app = attached_conversation();
+    let mut request = asked("q-s", &[("Token?", &[])]);
+    if let Kind::PermissionRequested(requested) = &mut request
+        && let Some(question) = requested
+            .request
+            .as_mut()
+            .and_then(|request| request.tool_call.as_mut())
+            .and_then(|call| call.questions.first_mut())
+    {
+        question.secret = true;
+        question.header = "Credentials".to_owned();
+    }
+    fold(&mut app, "s1", "root-1", vec![request]);
+    typed(&mut app, "hunter2");
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn a_multi_select_question_shows_checkboxes() {
+    let mut app = attached_conversation();
+    let mut request = asked("q-m", &[("Which checks?", &["fmt", "clippy", "tests"])]);
+    if let Kind::PermissionRequested(requested) = &mut request
+        && let Some(question) = requested
+            .request
+            .as_mut()
+            .and_then(|request| request.tool_call.as_mut())
+            .and_then(|call| call.questions.first_mut())
+    {
+        question.multi_select = true;
+        question.allows_free_text = true;
+        if let Some(option) = question.options.first_mut() {
+            option.description = "rustfmt, no config".to_owned();
+        }
+    }
+    fold(&mut app, "s1", "root-1", vec![request]);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char(' '));
+    insta::assert_snapshot!(drawn(&app));
+}
+
+#[test]
+fn an_unfocused_card_steps_aside_for_the_compose_box() {
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![requested("req-1", "rm x")]);
+    press(&mut app, KeyCode::Tab);
+    typed(&mut app, "wait, why?");
+    insta::assert_snapshot!(drawn(&app));
+}

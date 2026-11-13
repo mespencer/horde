@@ -1,9 +1,7 @@
 ---
-source: crates/horde-tui/tests/render.rs
+source: crates/horde-tui/src/view/tests.rs
 expression: drawn(&app)
 ---
-" horde — sessions                                                               "
-"  no sessions — `horde session new <title>` starts one                          "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -21,8 +19,10 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"[enter] attach  [i] inbox  [f] forwards  [r] refresh  [q] quit                  "
+"● Reviewing the diff.                                                           "
+"✻ Working… (esc to interrupt)                                                   "
+"╭──────────────────────────────────────────────────────────────────────────────╮"
+"│› queue a message for the next turn (ctrl-s sends now)                        │"
+"╰──────────────────────────────────────────────────────────────────────────────╯"
+" enter queue · ctrl-s send now · esc interrupt · ctrl-t agents · ? help         "
+" ci-fix · reviewer · working · ● live · 1 waiting elsewhere                     "

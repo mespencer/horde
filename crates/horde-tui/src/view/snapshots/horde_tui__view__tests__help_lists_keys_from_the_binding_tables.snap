@@ -1,0 +1,28 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: drawn(&app)
+---
+" horde  1:session  2:agents  3:inbox  4:workspaces  5:usage  6:logs  7:forwards "
+"                                                                                "
+" Session (compose box)                                                          "
+"   alt-enter      new line                                                      "
+"   shift-enter    new line                                                      "
+"   ctrl-j         new line                                                      "
+"   enter          send, or run a /command                                       "
+"   esc            interrupt a working agent · close · back                      "
+"   tab            complete a command · switch prompt/compose                    "
+"   ctrl-s         send now (interrupts the turn)                                "
+"   ctrl-x         interrupt the agent's turn                                    "
+"   ctrl-d         quit                                                          "
+"   ctrl-a         line start                                                    "
+"   ctrl-e         line end                                                      "
+"   ctrl-w         delete a word                                                 "
+"   ctrl-u         delete to line start                                          "
+"   backspace      edit                                                          "
+"   delete         edit                                                          "
+"   left           edit                                                          "
+"   right          edit                                                          "
+"   up             move up · older message                                       "
+"   down           move down · newer message                                     "
+" j/k scroll · esc back · q quit                                                 "
+" not attached · ○ connecting                                                    "

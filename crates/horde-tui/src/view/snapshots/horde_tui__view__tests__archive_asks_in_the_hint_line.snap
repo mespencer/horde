@@ -1,8 +1,14 @@
 ---
-source: crates/horde-tui/tests/render.rs
+source: crates/horde-tui/src/view/tests.rs
 expression: drawn(&app)
 ---
-" ci-fix  s1  attached: session root  (syncing)                                  "
+" horde  1:session  2:agents  3:inbox 1  4:workspaces  5:usage  6:logs  7:forward"
+"                                                                                "
+"❯ ci-fix  s1  active  1 waiting                                                 "
+"    ci-fix                 unspecified      gpu-box        opus                 "
+"      reviewer             unspecified      gpu-box          1 waiting          "
+"  docs  s2  active                                                              "
+"    docs                   LOST             worker-9                            "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -18,11 +24,5 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-">                                                                               "
-"[enter] send  [ctrl-x] interrupt  [esc] detach  [ctrl-c] quit                   "
+" archive ci-fix? y archives · any other key cancels                             "
+" not attached · ● live                                                          "

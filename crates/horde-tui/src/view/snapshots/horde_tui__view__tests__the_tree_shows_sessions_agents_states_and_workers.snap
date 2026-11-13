@@ -1,10 +1,14 @@
 ---
-source: crates/horde-tui/tests/render.rs
+source: crates/horde-tui/src/view/tests.rs
 expression: drawn(&app)
 ---
-" inbox  — 2 waiting                                                             "
-"  ci-fix  ci-fix > reviewer > test-runner wants `docker rm horde-test`  (mode ca"
-"> write the docs  write the docs wants `rm -rf ./stale-docs`  (mode cautious)   "
+" horde  1:session  2:agents  3:inbox 1  4:workspaces  5:usage  6:logs  7:forward"
+"                                                                                "
+"  ci-fix  s1  active  1 waiting                                                 "
+"❯   ci-fix                 unspecified      gpu-box        opus                 "
+"      reviewer             unspecified      gpu-box          1 waiting          "
+"  docs  s2  active                                                              "
+"    docs                   LOST             worker-9                            "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -20,9 +24,5 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"[y] allow  [1-9] answer  [n] deny  [enter] attach  [o] overview  [q] quit       "
+" enter attach · n new session · x archive · r refresh · esc back · q quit       "
+" not attached · ● live                                                          "
