@@ -22,7 +22,7 @@ global install and config.toml are never modified.
 import json
 import os
 import pathlib
-import select
+import queue
 import subprocess
 import sys
 import tempfile
@@ -59,12 +59,12 @@ def probe_env():
 class AppServer:
     """NDJSON JSON-RPC over stdio, every frame recorded. Same shape as drive.py."""
 
-    def __init__(self, transcript_name):
+    def __init__(self, transcript_name, extra_args=()):
         TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
         self.path = TRANSCRIPTS / f"{transcript_name}.jsonl"
         self.log = self.path.open("w")
         self.proc = subprocess.Popen(
-            [CODEX_BIN, "app-server", "--stdio"],
+            [CODEX_BIN, "app-server", "--stdio", *extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -74,8 +74,21 @@ class AppServer:
         )
         self._next_id = 0
         self._stderr = []
+        # Lines are read on their own thread into a queue. `select()` on the
+        # pipe plus `readline()` (what 20-33 used) loses frames: readline
+        # buffers a whole chunk, select then reports the fd idle, and the
+        # buffered frames wait for the next unrelated write — the W12c re-probe
+        # first misread that as turns hanging for minutes (`emittedAtMs` proved
+        # codex had sent them on time).
+        self._lines = queue.Queue()
+        threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self.meta(codex_bin=CODEX_BIN, codex_version=codex_version())
+
+    def _drain_stdout(self):
+        for line in self.proc.stdout:
+            self._lines.put(line)
+        self._lines.put(None)
 
     def _drain_stderr(self):
         for line in self.proc.stderr:
@@ -112,11 +125,11 @@ class AppServer:
     def read(self, timeout):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            ready, _, _ = select.select([self.proc.stdout], [], [], max(0.1, deadline - time.time()))
-            if not ready:
+            try:
+                line = self._lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
                 return None
-            line = self.proc.stdout.readline()
-            if not line:
+            if line is None:
                 return None
             line = line.strip()
             if not line:
@@ -176,15 +189,29 @@ PROMPTS = {
     # File-change path (apply_patch, not shell): probes item/fileChange/requestApproval.
     "patch": "Use your apply_patch (file edit) tool — NOT a shell command — to create a file "
              "named horde-patch-probe.txt containing the word PATCHED.",
+    # W12c: a plain two-turn baseline at the new version.
+    "ok": "Reply with exactly: OK",
+    # W12c: the request_user_input tool, when the harness offers it.
+    "ask": "Before doing anything else, use your request_user_input tool to ask me which "
+           "colour I prefer, with exactly two options: Red and Blue. Then reply with just "
+           "the colour I chose.",
+    # W12c: the request_permissions tool, when the harness offers it.
+    "perms": "Use your request_permissions tool to ask for network access, then run: "
+             "curl -sS -o /dev/null -w '%{http_code}' https://example.com and report the output.",
 }
 
 
 def run_probe(name, *, reviewer, policy, sandbox, client_name, prompt, decision="decline",
-              second_prompt=None):
+              second_prompt=None, extra_args=()):
     """One configuration, one fresh cwd, one turn, one transcript. Returns findings."""
-    cwd = pathlib.Path(tempfile.mkdtemp(prefix=f"horde-appr-{name}-", dir="/private/tmp"))
+    # /private/tmp on the macOS runs (20-33); the platform temp dir elsewhere.
+    tmp_root = os.environ.get("PROBE_TMP") or (
+        "/private/tmp" if os.path.isdir("/private/tmp") else tempfile.gettempdir())
+    cwd = pathlib.Path(tempfile.mkdtemp(prefix=f"horde-appr-{name}-", dir=tmp_root))
     (cwd / "probe.txt").write_text("horde probe file\n")
-    srv = AppServer(name)
+    srv = AppServer(name, extra_args)
+    if extra_args:
+        srv.meta(extra_args=list(extra_args))
     config = {"reviewer": reviewer, "policy": policy, "sandbox": sandbox,
               "client": client_name, "prompt": prompt, "decision": decision, "cwd": str(cwd)}
     srv.meta(config=config)
@@ -254,6 +281,16 @@ def run_probe(name, *, reviewer, policy, sandbox, client_name, prompt, decision=
                         finding["exec_completed_before_request"] = bool(finding.get(results_key))
                     if method == "mcpServer/elicitation/request":
                         result = {"action": "decline"}
+                    elif method == "item/tool/requestUserInput":
+                        # W12c: answer every question with its first option.
+                        result = {"answers": {
+                            q["id"]: {"answers": [((q.get("options") or [{"label": "yes"}])[0])["label"]]}
+                            for q in p.get("questions", [])}}
+                    elif method == "item/permissions/requestApproval":
+                        # W12c: grant exactly what was asked, for the turn —
+                        # or nothing, which is how a refusal is spelled.
+                        granted = p.get("permissions", {}) if decision == "accept" else {}
+                        result = {"permissions": granted, "scope": "turn"}
                     elif decision == "amend" and p.get("proposedExecpolicyAmendment"):
                         result = {"decision": {"acceptWithExecpolicyAmendment": {
                             "execpolicy_amendment": p["proposedExecpolicyAmendment"]}}}
@@ -355,6 +392,35 @@ RUNS = {
         client_name="horde-worker", prompt="write"),
     "33-0147-exec-user-granular-ro-horde-write": dict(
         reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="write"),
+    # W12c (2026-11-13): the same questions against codex-cli 0.167.0 on Linux,
+    # plus the three server requests Horde had never seen routed.
+    "34-0167-exec-user-granular-ro-horde-write": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="write"),
+    "35-0167-exec-user-granular-ro-horde-write-accept": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="write", decision="accept"),
+    "36-0167-filechange-user-granular-ro-horde-patch": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="patch"),
+    "37-0167-filechange-user-granular-ro-horde-patch-accept": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="patch", decision="accept"),
+    "38-0167-userinput-user-granular-ro-horde-ask": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="ask",
+        extra_args=("--enable", "default_mode_request_user_input")),
+    "39-0167-permissions-user-granular-ro-horde-perms": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="perms", decision="accept",
+        extra_args=("--enable", "request_permissions_tool")),
+    "41-0167-basic-user-granular-ro-horde-two-turns": dict(
+        reviewer="user", policy="granular", sandbox="read-only",
+        client_name="horde-worker", prompt="ok",
+        second_prompt="Reply with exactly: AGAIN"),
+    "40-0167-exec-user-onrequest-ro-horde-write": dict(
+        reviewer="user", policy="on-request", sandbox="read-only",
         client_name="horde-worker", prompt="write"),
 }
 
