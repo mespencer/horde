@@ -631,6 +631,65 @@ pub fn cleanup_rows(cleanup: &WorkspaceCleanup, format: Format) -> String {
     }
 }
 
+/// A `checkout_prepared` event as JSON: per repo, where it started and how
+/// the base was chosen.
+#[must_use]
+pub fn prepared_detail(prepared: &horde_proto::v1::CheckoutPrepared) -> serde_json::Value {
+    json!({
+        "mode": if prepared.mode == i32::from(horde_proto::v1::CheckoutMode::Lazy) { "lazy" } else { "all" },
+        "available_repos": prepared.available_repos,
+        "repos": prepared.repos.iter().map(|repo| json!({
+            "repo": repo.repo_name,
+            "branch": repo.branch,
+            "base": repo.base_commit_sha,
+            "resolution": resolution_name(repo.resolution),
+            "requested_ref": repo.requested_ref,
+            "stale_reason": repo.stale_reason,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A `checkout_prepared` event as one human line:
+/// `atlas@9c1e2f3 fresh on horde/agent-7; docs@41aa… cached (fetch failed…)`.
+#[must_use]
+pub fn prepared_line(prepared: &horde_proto::v1::CheckoutPrepared) -> String {
+    if prepared.repos.is_empty() {
+        return format!("lazy: nothing checked out of {}", prepared.available_repos.join(", "));
+    }
+    prepared
+        .repos
+        .iter()
+        .map(|repo| {
+            let short: String = repo.base_commit_sha.chars().take(7).collect();
+            let mut line = format!(
+                "{}@{short} {} on {}",
+                repo.repo_name,
+                resolution_name(repo.resolution),
+                repo.branch
+            );
+            if !repo.stale_reason.is_empty() {
+                line.push_str(&format!(" ({})", repo.stale_reason));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[must_use]
+pub fn resolution_name(resolution: i32) -> &'static str {
+    use horde_proto::v1::checkout_prepared::BaseResolution;
+    match BaseResolution::try_from(resolution) {
+        Ok(BaseResolution::Fresh) => "fresh",
+        Ok(BaseResolution::Cached) => "cached",
+        Ok(BaseResolution::InstanceHead) => "instance-head",
+        Ok(BaseResolution::Parent) => "parent",
+        Ok(BaseResolution::Requested) => "requested",
+        Ok(BaseResolution::Reused) => "reused",
+        Ok(BaseResolution::Unspecified) | Err(_) => "unknown",
+    }
+}
+
 /// One `workspace log` line, when the event passes the filters.
 #[must_use]
 pub fn log_line(kind: &Kind, workspace: Option<&str>, worker: Option<&str>, format: Format) -> Option<String> {
@@ -1065,6 +1124,55 @@ mod tests {
             serde_json::from_str(&render_instances(&[report], Format::Json)).expect("json");
         assert_eq!(json["instances"][0]["checkouts"][0]["state"], "orphan");
         assert_eq!(render_instances(&[], Format::Human), "no instances reported");
+    }
+
+    #[test]
+    fn a_checkout_prepared_event_renders_each_repos_start() {
+        use horde_proto::v1::checkout_prepared::{BaseResolution, Repo};
+        let prepared = horde_proto::v1::CheckoutPrepared {
+            repos: vec![
+                Repo {
+                    repo_name: "atlas".to_owned(),
+                    branch: "horde/a".to_owned(),
+                    base_commit_sha: "9c1e2f3abcdef".to_owned(),
+                    resolution: BaseResolution::Fresh.into(),
+                    ..Repo::default()
+                },
+                Repo {
+                    repo_name: "docs".to_owned(),
+                    branch: "horde/a".to_owned(),
+                    base_commit_sha: "41aa".to_owned(),
+                    resolution: BaseResolution::Cached.into(),
+                    stale_reason: "fetch failed".to_owned(),
+                    ..Repo::default()
+                },
+            ],
+            mode: horde_proto::v1::CheckoutMode::All.into(),
+            available_repos: vec!["atlas".to_owned(), "docs".to_owned()],
+        };
+        assert_eq!(
+            prepared_line(&prepared),
+            "atlas@9c1e2f3 fresh on horde/a; docs@41aa cached on horde/a (fetch failed)"
+        );
+        let json = prepared_detail(&prepared);
+        assert_eq!(json["repos"][1]["resolution"], "cached");
+        assert_eq!(json["mode"], "all");
+        let lazy = horde_proto::v1::CheckoutPrepared {
+            mode: horde_proto::v1::CheckoutMode::Lazy.into(),
+            available_repos: vec!["atlas".to_owned()],
+            ..horde_proto::v1::CheckoutPrepared::default()
+        };
+        assert_eq!(prepared_line(&lazy), "lazy: nothing checked out of atlas");
+        assert_eq!(prepared_detail(&lazy)["mode"], "lazy");
+        for (resolution, name) in [
+            (BaseResolution::InstanceHead, "instance-head"),
+            (BaseResolution::Parent, "parent"),
+            (BaseResolution::Requested, "requested"),
+            (BaseResolution::Reused, "reused"),
+            (BaseResolution::Unspecified, "unknown"),
+        ] {
+            assert_eq!(resolution_name(resolution.into()), name);
+        }
     }
 
     #[test]

@@ -29,3 +29,5 @@ mod relay_payload;
 mod resilience;
 #[cfg(test)]
 mod worker_add;
+#[cfg(test)]
+mod workspaces;
