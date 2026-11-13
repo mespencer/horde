@@ -381,6 +381,38 @@ mod tests {
         ));
     }
 
+    /// Runs an async test body on its own thread and runtime, failing in
+    /// seconds. Framing is synchronous, so a read whose windowing stopped
+    /// advancing would spin on the runtime's only thread, starve its timers,
+    /// and leave every `tokio::time::timeout` in the body unfired; the wall
+    /// clock here does not depend on the runtime making progress.
+    fn bounded<F, Fut>(body: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(body());
+            let _ = done.send(());
+        });
+        match finished.recv_timeout(Duration::from_secs(20)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Err(panic) = worker.join() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the test body did not finish in 20s")
+            }
+        }
+    }
+
     /// The next frame of a followed read, bounded: a read that never
     /// produces it fails in seconds instead of hanging.
     async fn next_frame(receiver: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
@@ -515,87 +547,98 @@ mod tests {
         .expect("read")
     }
 
-    #[tokio::test]
-    async fn an_initial_read_redacts_and_ends_done() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _logging = written(dir.path(), &["m1", "m2 horde://join/h:1/a.b"]);
-        let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let frames = served(&logs, read(None, 0, false)).await;
-        let [Frame::Records(records), Frame::End(end)] = frames.as_slice() else {
-            panic!("records then end: {frames:?}");
-        };
-        assert_eq!(records.lines.len(), 2);
-        assert_eq!(records.redacted, 1);
-        assert!(records.lines[1].contains("[REDACTED:join-token]"));
-        assert!(records.cursor.is_some());
-        assert_eq!(end.reason, LogEndReason::Done as i32);
+    #[test]
+    fn an_initial_read_redacts_and_ends_done() {
+        bounded(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let _logging = written(dir.path(), &["m1", "m2 horde://join/h:1/a.b"]);
+            let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+            let frames = served(&logs, read(None, 0, false)).await;
+            let [Frame::Records(records), Frame::End(end)] = frames.as_slice() else {
+                panic!("records then end: {frames:?}");
+            };
+            assert_eq!(records.lines.len(), 2);
+            assert_eq!(records.redacted, 1);
+            assert!(records.lines[1].contains("[REDACTED:join-token]"));
+            assert!(records.cursor.is_some());
+            assert_eq!(end.reason, LogEndReason::Done as i32);
+        });
     }
 
-    #[tokio::test]
-    async fn a_forward_read_that_hits_the_cap_ends_byte_cap() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _logging = written(dir.path(), &["m1", "m2", "m3"]);
-        let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let first = LogCursor {
-            ts: "1970-01-01T00:00:00.000000Z".to_owned(),
-            source: "horde".to_owned(),
-            ..LogCursor::default()
-        };
-        assert_empty_truncated(&logs, read(Some(&first), 1, false), LogEndReason::ByteCap).await;
+    #[test]
+    fn a_forward_read_that_hits_the_cap_ends_byte_cap() {
+        bounded(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let _logging = written(dir.path(), &["m1", "m2", "m3"]);
+            let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+            let first = LogCursor {
+                ts: "1970-01-01T00:00:00.000000Z".to_owned(),
+                source: "horde".to_owned(),
+                ..LogCursor::default()
+            };
+            assert_empty_truncated(&logs, read(Some(&first), 1, false), LogEndReason::ByteCap)
+                .await;
+        });
     }
 
     /// A tail read whose newest record is already over the cap still says
     /// it left records out.
-    #[tokio::test]
-    async fn a_tail_read_with_nothing_under_the_cap_reports_truncation() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _logging = written(dir.path(), &["m1"]);
-        let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        assert_empty_truncated(&logs, read(None, 1, false), LogEndReason::Done).await;
+    #[test]
+    fn a_tail_read_with_nothing_under_the_cap_reports_truncation() {
+        bounded(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let _logging = written(dir.path(), &["m1"]);
+            let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+            assert_empty_truncated(&logs, read(None, 1, false), LogEndReason::Done).await;
+        });
     }
 
-    #[tokio::test]
-    async fn a_follow_sees_new_records_and_stops_at_the_cap() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let logging = written(dir.path(), &["m-before"]);
-        let logs = LocalLogs::new(dir.path(), "horde-worker", Some(logging.tap().clone()));
-        let (sender, mut receiver) = mpsc::channel(8);
-        let serving = tokio::spawn(async move {
-            serve_local(&logs, read(None, 600, true), &sender).await;
+    #[test]
+    fn a_follow_sees_new_records_and_stops_at_the_cap() {
+        bounded(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let logging = written(dir.path(), &["m-before"]);
+            let logs = LocalLogs::new(dir.path(), "horde-worker", Some(logging.tap().clone()));
+            let (sender, mut receiver) = mpsc::channel(8);
+            let serving = tokio::spawn(async move {
+                serve_local(&logs, read(None, 600, true), &sender).await;
+            });
+            let Some(Frame::Records(initial)) = next_frame(&mut receiver).await else {
+                panic!("the initial records come first");
+            };
+            assert_eq!(initial.lines.len(), 1);
+            logging.with_default(|| {
+                tracing::info!(target: "horde_worker", "not matched");
+                tracing::info!(target: "horde_worker", "m-after");
+            });
+            let Some(Frame::Records(followed)) = next_frame(&mut receiver).await else {
+                panic!("the followed record");
+            };
+            assert!(followed.lines[0].contains("m-after"));
+            logging.with_default(|| {
+                tracing::info!(target: "horde_worker", "m-{}", "x".repeat(600));
+            });
+            let Some(Frame::End(end)) = next_frame(&mut receiver).await else {
+                panic!("the cap ends the follow");
+            };
+            assert_eq!(end.reason, LogEndReason::ByteCap as i32);
+            tokio::time::timeout(Duration::from_secs(10), serving)
+                .await
+                .expect("the follow returns after its end")
+                .expect("served");
         });
-        let Some(Frame::Records(initial)) = next_frame(&mut receiver).await else {
-            panic!("the initial records come first");
-        };
-        assert_eq!(initial.lines.len(), 1);
-        logging.with_default(|| {
-            tracing::info!(target: "horde_worker", "not matched");
-            tracing::info!(target: "horde_worker", "m-after");
-        });
-        let Some(Frame::Records(followed)) = next_frame(&mut receiver).await else {
-            panic!("the followed record");
-        };
-        assert!(followed.lines[0].contains("m-after"));
-        logging.with_default(|| {
-            tracing::info!(target: "horde_worker", "m-{}", "x".repeat(600));
-        });
-        let Some(Frame::End(end)) = next_frame(&mut receiver).await else {
-            panic!("the cap ends the follow");
-        };
-        assert_eq!(end.reason, LogEndReason::ByteCap as i32);
-        tokio::time::timeout(Duration::from_secs(10), serving)
-            .await
-            .expect("the follow returns after its end")
-            .expect("served");
     }
 
-    #[tokio::test]
-    async fn following_a_process_without_a_tap_says_so() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let frames = served(&logs, read(None, 0, true)).await;
-        assert!(
-            matches!(frames.as_slice(), [Frame::End(end)] if end.detail.contains("cannot be followed")),
-            "{frames:?}"
-        );
+    #[test]
+    fn following_a_process_without_a_tap_says_so() {
+        bounded(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+            let frames = served(&logs, read(None, 0, true)).await;
+            assert!(
+                matches!(frames.as_slice(), [Frame::End(end)] if end.detail.contains("cannot be followed")),
+                "{frames:?}"
+            );
+        });
     }
 }
