@@ -20,6 +20,19 @@ pub(crate) fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver
     Ok(receiver)
 }
 
+/// `--remint`'s refusal on Windows for the server holding `state_dir`: it
+/// is running (its lock is held), but its pid is unreadable behind that
+/// mandatory lock and there is no SIGHUP to send it, so the answer is the
+/// restart that mints a fresh token.
+#[cfg(windows)]
+pub(crate) fn remint_refusal(state_dir: &std::path::Path) -> String {
+    format!(
+        "the server on {} is running, but this platform has no SIGHUP to ask it for a fresh \
+         bootstrap token; restart it, and starting mints one",
+        state_dir.display()
+    )
+}
+
 /// [`crate::remint::send_hangup`] on Windows: no SIGHUP to send, so the
 /// re-mint is refused in words that name the restart that works.
 #[cfg(windows)]

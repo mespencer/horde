@@ -70,10 +70,18 @@ fn holder_pid(state_dir: &Path) -> Result<u32, String> {
     if !horde_identity::StateLock::is_held(state_dir, STATE_LOCK_FILE) {
         return Err(not_running());
     }
-    std::fs::read_to_string(state_dir.join(STATE_LOCK_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .ok_or_else(not_running)
+    // A held lock on Windows is a running server whose pid cannot be read
+    // (the lock is mandatory) and which has no SIGHUP to receive anyway:
+    // refused with the restart that works, never as "no server" (ADR-0017).
+    #[cfg(windows)]
+    return Err(crate::windows::remint_refusal(state_dir));
+    #[cfg(unix)]
+    {
+        std::fs::read_to_string(state_dir.join(STATE_LOCK_FILE))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .ok_or_else(not_running)
+    }
 }
 
 /// The token in `file`, trimmed; `None` when there is no file.

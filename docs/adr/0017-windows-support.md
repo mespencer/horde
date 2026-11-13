@@ -104,7 +104,8 @@ config directories, `horde up`'s root, the client identity — reads it.
   existed. A file-based request is possible later; nothing needs it yet.
   (Windows file locks are mandatory, so another process cannot read the pid
   in a held lock file either; refusals that would name the holder's pid
-  name none.)
+  name none. `--remint` therefore reads a held lock as the running server
+  and refuses with the restart, rather than reporting "no server running".)
 
 ### The interactive login relay: ConPTY
 
@@ -189,7 +190,7 @@ Windows-only (`cfg(windows)`), to run on a Windows machine:
 | `horde-worker` `login::tests::a_conpty_session_reaches_eof_when_its_command_exits`, `killing_a_conpty_login_reaps_it_and_ends_its_output` | the ConPTY close-on-reap fix |
 | `horde-worker` `workspace::reclaim::tests::a_timed_out_command_is_killed_with_its_job`, `a_windows_command_keeps_what_windows_needs` | reclaim's job and its kept environment |
 | `horde-cli` `doctor::tests::windows_harnesses_are_exes_on_the_given_path`, `windows_state_dirs_report_their_acl_and_disk` | harness lookup and state-dir checks |
-| `horde-server` `startup::tests::without_sighup_the_hangup_channel_is_born_closed`, `remint::tests::send_hangup_refuses_without_sighup` | the SIGHUP-less server |
+| `horde-server` `startup::tests::without_sighup_the_hangup_channel_is_born_closed`, `windows_refuses_to_remint_a_running_server`, `remint::tests::send_hangup_refuses_without_sighup` | the SIGHUP-less server |
 
 Run them on Windows (MSVC toolchain, Git for Windows on `PATH`):
 
