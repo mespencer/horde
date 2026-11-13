@@ -863,6 +863,17 @@ mod tests {
         )
     }
 
+    /// `base` joined with `parts` as this platform joins paths, as text:
+    /// what a defaulted database path reads as here (`/` on Unix, the
+    /// joins `\` on Windows).
+    fn joined(base: &str, parts: &[&str]) -> String {
+        parts
+            .iter()
+            .fold(std::path::PathBuf::from(base), |path, part| path.join(part))
+            .display()
+            .to_string()
+    }
+
     /// A mode is asked for by name: a bare invocation (or a bare database
     /// path, the old health check) is a refusal naming both modes, and
     /// `--check` is the health check — defaulting under `$HOME`, never the
@@ -885,7 +896,7 @@ mod tests {
         assert_eq!(
             parsed(&["--check"]),
             Ok(super::Invocation::CheckOnly {
-                database: "/home/me/.horde/server/horde.db".to_owned()
+                database: joined("/home/me", &[".horde/server", "horde.db"])
             })
         );
         assert!(
@@ -922,7 +933,7 @@ mod tests {
         else {
             panic!("a named state dir needs no HOME");
         };
-        assert_eq!(named.database, "/srv/horde/horde.db");
+        assert_eq!(named.database, joined("/srv/horde", &["horde.db"]));
     }
 
     #[test]
@@ -967,7 +978,10 @@ mod tests {
         let Ok(super::Invocation::Serve(defaulted)) = parsed(&["--serve"]) else {
             panic!("--serve alone must parse");
         };
-        assert_eq!(defaulted.database, "/home/me/.horde/server/horde.db");
+        assert_eq!(
+            defaulted.database,
+            joined("/home/me", &[".horde/server", "horde.db"])
+        );
         assert_eq!(
             defaulted.bind.to_string(),
             "127.0.0.1:7777",
@@ -1477,7 +1491,10 @@ mod tests {
     /// finds this server by its state lock and asks through the channel the
     /// binary feeds from SIGHUP; the held server mints, files, and
     /// announces a fresh token, which redeems — and once a client exists,
-    /// the next ask is refused naming the closed door.
+    /// the next ask is refused naming the closed door. Unix only: Windows
+    /// has no SIGHUP to re-mint by (ADR-0017; see
+    /// `windows_refuses_to_remint_a_running_server`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_running_server_remints_its_bootstrap_token_on_request() {
         let directory = tempfile::tempdir().expect("a temp dir");
@@ -1577,6 +1594,9 @@ mod tests {
         );
     }
 
+    /// Unix only: the bounded wait and the failed signal need a server
+    /// that can be signalled at all.
+    #[cfg(unix)]
     #[tokio::test]
     async fn remint_refuses_without_a_server_and_bounds_its_wait() {
         let directory = tempfile::tempdir().expect("a temp dir");
@@ -1609,6 +1629,38 @@ mod tests {
         .await
         .expect_err("the signal failed");
         assert!(unsignalled.contains("could not signal"), "{unsignalled}");
+    }
+
+    /// `--remint` on Windows: with no server it says none is running; with
+    /// one running it says so and names the restart — never "no server",
+    /// though the held lock hides the pid — and asks nothing of the hang-up.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_to_remint_a_running_server() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let config = config_in(&directory, None);
+        let idle = crate::remint::remint_running(
+            &config.state_dir,
+            |_| panic!("nobody to signal"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("no server");
+        assert!(idle.contains("no server is running"), "{idle}");
+
+        let _running = super::serve(&config).await.expect("the server comes up");
+        let refused = crate::remint::remint_running(
+            &config.state_dir,
+            |_| panic!("Windows has no SIGHUP to send"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("no re-mint on Windows");
+        assert!(
+            refused.contains("is running") && refused.contains("restart"),
+            "{refused}"
+        );
+        assert!(!refused.contains("no server is running"), "{refused}");
     }
 
     /// Windows has no SIGHUP: the hang-up channel is born closed, which
