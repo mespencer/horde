@@ -497,7 +497,42 @@ installs `--locked`, and stamps the patch's and binary's digests beside the bina
 and then runs `install.sh --check`, which finds the binary `cargo gamma` would run and
 compares the stamp; a stock build of the same version is an `error` naming the installer.
 
-**The pilot.** {{PILOT}}
+**The pilot.** `gauntlet run mutants --full` at `580a2ee`, `nice -n 19`, `--jobs 16`, on the
+32-core development machine shared with other agents (load average 20–45 throughout),
+cold cache: **60 min 11 s wall** (3,611 s), against 2–10 hours for a cargo-mutants
+sweep. Of that, the one instrumented whole-workspace build was about 5 minutes. Gamma
+generated 15,504 mutants after exclusions; the report scored 14,230:
+
+| caught | missed | survived | timed out | out of memory | uncovered | unviable | flaky |
+|---|---|---|---|---|---|---|---|
+| 11,772 | **2,458** | 2,306 | 21 | 9 | 122 | 1,272 | 0 |
+
+The gate is therefore **red on the whole tree**, and that is the measurement, not a
+fault in it: cargo-mutants never generated most of these. By family, 1,212 are
+`literal` mutations (string literals to `""`/`"xyzzy"`: 751; integer ±1: 331), 300
+`expr` increments/decrements, 228 statement deletions, 226 `Option` swaps, 186
+condition mutations. By crate: horde-server 624 of 3,697 scored, horde-worker 485/2,222,
+horde-cli 466/2,189, horde-gauntlet 169/1,790, horde-identity 130/538, horde-mcp
+121/586, horde-server-testkit 118/304, the rest under 100 each. The list, one per line, is `docs/quality/w12a-full-sweep-missed.txt`. Killing them is a
+backlog to be planned, not something a gate change can do; until it is cleared, a
+diff-scoped run that touches a line with an old survivor on it reds for that survivor.
+
+Of the three mutants known to time out under cargo-mutants, `Folded::fold`'s are all
+killed under gamma (its per-test selection runs the projection's own tests, which fail
+fast), and `split_full`'s three (`cut -= 1` deleted, or its literal changed) were the
+backwards scan for a character boundary; the scan is now the last character start
+under the limit from a finite walk of the text, so no mutation of it can spin. The
+other 27 timeouts and out-of-memory mutants are in the backlog.
+
+*The baseline is the fragile part.* Every verdict compares against an unmutated run of
+each test binary, and a binary that fails it stops the whole run. Two causes are known:
+`reap::tests::a_real_orphaned_leader_is_reaped_by_its_directory` waits for pid 1 to adopt
+an orphan, and inside gamma's systemd scope a subreaper adopts it instead, so the gate
+skips that one test (`SKIPPED_TESTS`; it judges only `reap.rs`, which is never mutated);
+and horde-worker's `worker_suite` has been seen, on a heavily loaded machine, to breach
+the 2 GiB baseline guard (half the default cap) and to fail a hub-link test in narrowed
+runs, while passing in the full sweep. If a run stops on a `worker_suite` baseline,
+rerun on a quieter machine or raise `HORDE_MUTANTS_MEMORY_MIB`.
 
 **Do not edit the tree during a run.** Gamma copies the workspace into its cache at the
 start and re-reads sources while it instruments them. The first pilot sweep died after
@@ -507,7 +542,7 @@ file was edited while it built. Run long sweeps from a worktree nobody is editin
 **The disk pre-flight: 40 GiB free, or the run does not start.** Before listing anything,
 the gate reads `df -P -k` on the workspace's volume and reports `error` below 40 GiB. An
 `error`, not a `fail`: the code was never judged. Gamma's cache holds a workspace copy and
-a whole instrumented build ({{CACHE}} after a full sweep here); a run that dies of a full
+a whole instrumented build (8.0 GiB after a full sweep here); a run that dies of a full
 disk mid-build has spent its most expensive part for nothing.
 
 **Exclusions: two kinds of file, and nothing else.** Skipping code because its mutants
