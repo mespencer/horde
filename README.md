@@ -55,6 +55,19 @@ horde doctor
 
 `horde doctor` checks identity, endpoint, certificates, server reachability, harness binaries (`--harness`, default `claude` and `codex`), and state directories and disk. It says what to fix, and exits non-zero when any check fails. Add `--json` for machine-readable output.
 
+## Reading logs
+
+Each daemon keeps bounded, rotating JSON-lines logs under its state directory: `~/.horde/server/logs/` and `~/.horde/worker/logs/`. A worker also keeps each agent's harness stderr in `logs/agents/`. Read them from anywhere through the server:
+
+```sh
+horde logs server --since 10m --level warn
+horde logs worker gpu-box --grep materialize -f
+horde logs agent <agent-id> --source stderr -n 50
+horde logs --dir ~/.horde/worker/logs        # local files, no server needed
+```
+
+`-f` follows new records. `--json` prints the records as JSON lines. Records are redacted before they leave the machine that wrote them. `--dir` reads the files as written, for a machine that cannot reach the server. `HORDE_LOG` sets the file filter (default `info,horde_server=debug,horde_worker=debug`), and `RUST_LOG` still controls stderr. The CLI writes its own log only on request, with `--log-file` or `HORDE_LOG_FILE=1`. Agents can read the same logs through the `horde/logs` MCP tool, limited to their own session and rate-limited. See [ADR-0015](docs/adr/0015-logs-and-diagnostics.md).
+
 ## Building and the quality gauntlet
 
 ```sh

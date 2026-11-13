@@ -378,7 +378,76 @@ DESIGN §12's OTLP bullet is replaced by a pointer to this ADR.
 - The OTLP stack and its pinned dependencies leave the workspace. DESIGN
   §12's open mTLS inconsistency closes by removing the exporter.
 - `JoinToken`/`JoinCode` stop deriving `Debug`.
-- Not decided here: whether `HORDE_LOG` and the size and retention settings
-  move under W12e's config layering (expected: yes, as `logs.*` keys); a
-  TUI log pane (W12f may add one over the same RPC); and log shipping off
-  the machine (out of scope by the operator's decision).
+- The questions this ADR left open were resolved on 2026-11-13; see
+  Resolutions below. Log shipping off the machine stays out of scope by the
+  operator's decision.
+
+## Resolutions (2026-11-13)
+
+The operator resolved the questions this ADR left open before W12h was
+built. These resolutions replace the open questions, and where one
+contradicts the text above, the resolution holds.
+
+1. **An agent sees only its own session's records.** That is the default
+   described above, and it is the only behavior built. A config option may
+   widen it later (W12e). The server derives the session from the agent in
+   `on_behalf_of`, never from the caller, and the scope runs twice: where
+   the record is read (`horde_wire::logs::serve_local`), and again in the
+   server's relay (`horde_server::diagnostics::relay`).
+2. **No unredacted read goes over the wire.** Every `ReadLogs` response and
+   every `logs` result is redacted. `horde logs --dir` on the machine that
+   wrote the files is the only way to see a record unredacted. No flag or
+   role asks for raw records remotely.
+3. **The limits are the ones proposed, as code defaults.** Each bound is a
+   constant in `horde_observe::settings`, next to the setting name W12e will
+   expose as a `logs.*` config key: `logs.level` (with `HORDE_LOG` as its
+   environment form today), `logs.max_file_bytes`, `logs.max_files`,
+   `logs.max_age`, `logs.agents.max_file_bytes`, `logs.agents.max_files`,
+   `logs.agents.budget_bytes`, `logs.agent_reads.default_bytes`,
+   `logs.agent_reads.max_bytes`, `logs.agent_reads.calls_per_minute` and
+   `logs.agent_reads.burst`. Only `HORDE_LOG` is read from the environment
+   today, so it is the only setting that can refuse startup.
+4. **Removing OTLP is deferred until the operator signs off.** The OTLP
+   exporter stays and works as it did before: `export.rs`, `pipeline.rs`,
+   `config.rs`, the `otlp_smoke` suite, the pinned `opentelemetry*` crates
+   and the testkit's `env_remove` lines are all unchanged. The paragraph
+   "The OTLP exporter is removed, not deprecated", the removal test in the
+   test plan, and the OTLP bullets under Consequences are suspended until
+   then. The file layer is composed beside the exporter, so each binary
+   installs a console, a file layer and an optional exporter. DESIGN §12
+   points here for local logs, and its OTLP bullet is unchanged.
+5. **The TUI log pane belongs to W12f.** W12h ships the CLI and the MCP
+   verb. W12f can build the pane on the same `ReadLogs` RPC.
+
+### As built
+
+A few choices had to be made during the build. They follow the design and
+are recorded here:
+
+- **Harness stderr reaches its file through a task-local sink.** The sink
+  is `horde_adapter::stderr`, a task-local the worker sets around each
+  `spawn` and `resume` call. The supervisor's stderr drain captures it when
+  the harness starts, and so does the fake adapter, whose `Step::Stderr` is
+  the scripted line the test plan asks for. `AgentSpec` and the adapter
+  signatures are unchanged.
+- **Records are ordered by `(ts, source, boot, seq)`.** That key is also
+  the cursor. Every cursor in this order covers both a worker's own records
+  and its agents' stderr, so an agent read can merge the two and still page
+  or resume. The MCP verb passes the key as one opaque string
+  (`ts~source~boot~seq`).
+- **`truncated` means matching records were left out to respect the byte
+  cap.** On a first call, which returns the newest records that fit, the
+  left-out records are the older ones. On a paging call (`cursor` set), they
+  are the newer ones, and the agent calls again with `next_cursor`.
+- **Spans become JSON objects.** The file layer is a small `tracing` layer
+  rather than `tracing-subscriber`'s JSON formatter. It hoists the
+  `agent`/`session` span conventions to top-level keys, writes `boot` and
+  `seq`, and cuts oversized records so they stay valid JSON.
+- **Redaction spares numbers.** Secret-named fields are replaced only when
+  their value is a string, so usage counts such as `output_tokens` stay
+  readable. A secret is text.
+- **`logs` is allowed by the shipped permission mode.** It is listed with
+  the orchestrator verbs (`horde_server::permission::orchestrator`), and
+  deny rules still run first.
+- **Retired agents' files.** For the `agents/` budget, an agent whose
+  harness has no live stderr writer counts as archived.

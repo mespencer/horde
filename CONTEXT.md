@@ -128,6 +128,13 @@ The cheap-model evaluator that applies a plain-text permission mode to a propose
 **Prompt Overlay**:
 The user-global prompt variant applied at spawn, differing for top-level agents vs spawned agents.
 
+**Diagnostic Log**:
+A process's own bounded, rotating JSON-lines files under `<state>/logs`, plus each agent's harness stderr on a worker (ADR-0015). Read by people and agents through `horde logs` and `horde/logs`, redacted at egress. Never a session fact: nothing decides from it, and losing it loses no state.
+_Avoid_: event log (that's the session's), trace
+
+**Redaction**:
+Removing secrets from a diagnostic-log record before it leaves the machine that wrote it: known shapes, secret-named fields, and the exact secrets a process registered. `horde logs --dir` on that machine is the only unredacted read.
+
 ### Process
 
 **Sweep**:

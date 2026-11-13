@@ -29,7 +29,7 @@ citations are for `9218ac2`.
 | §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. MCP-spawned children carry their parent's agent type, so allowlists resolve for them (`horde-server/src/lineage.rs:28`; `hub.rs:152,194`) — checked at `9218ac2`. |
 | §10 Permissions | PARTIAL | Chain driver runs in `serve()` with `PermissionModes::shipped()` (`horde-server/src/startup.rs:443-451`); the judge is still a seam with no production implementation. |
 | §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. Archive and workspace/MCP edits stay unattributed. |
-| §12 Usage and observability | PARTIAL | Usage folds conform; threshold alerts absent; OTLP plaintext only; hard budgets shape-only. |
+| §12 Usage and observability | PARTIAL | Usage folds conform. Diagnostic logs are built (ADR-0015, W12h; see the surfaces table). Threshold alerts are absent, OTLP is plaintext only (removal is deferred until the operator signs off), and hard budgets are shape-only. |
 | §13 Configuration layering | ABSENT | No config file is loaded anywhere; tiers are `TierCatalog::shipped_defaults()` (`service/commands.rs:646`). |
 | §14–§15 | CONFORMS | Unchanged. |
 | §16 Development quality | CONFORMS | Ten blocking gates; coverage has a 95.0 floor (`horde-gauntlet/src/gates/coverage.rs:20`). |
@@ -51,6 +51,7 @@ citations are for `9218ac2`.
 | Session projection and read pool (ADR-0013) — in-memory projection, four `query_only` WAL readers, one-transaction batch ingest, ListSessions name filter | `crates/horde-server/src/projection.rs:52`; `log/mod.rs:83,264`; `log/store.rs:111`; `service/ingest.rs:374`; `control_plane.rs:390` | `projection.rs:396`; `log/mod.rs:792`; `store.rs:710,751`; `ingest.rs:931`; `control_plane.rs:2594` |
 | Trust boundary (ADR-0009) — per-method role table, unknown methods refused; worker from its certificate; dead letters to `horde-dead-letters`; worker sync scoped to its sessions | `crates/horde-server/src/trust.rs:129-205,270`; `service/ingest.rs:52,536,600`; `control_plane.rs:634-671,1840` | `trust.rs:344,496`; `ingest.rs:807,1300`; `server_suite/trust.rs:390` |
 | Harness isolation (ADR-0010) — `CLAUDE_CONFIG_DIR`/`CODEX_HOME` under `<state>/harness/<provider>`; MCP tokens in env or 0600 files; one process group per harness, leftovers swept at start | `crates/horde-worker/src/harness.rs:42`; `claude.rs:19`; `codex.rs:45,324`; `process.rs:223,519` | `claude.rs:542,637`; `worker_suite/supervision.rs:897,940,1037` |
+| Diagnostic logs (ADR-0015, W12h): daemons keep rotating JSON-lines files under `<state>/logs` (16 MiB × 8, 14 days); a worker keeps per-agent harness stderr (4 MiB × 2, 256 MiB budget); `ControlPlane/ReadLogs` and the `StreamLogRequests`/`WorkerLogTunnel` pair serve them; records are redacted at egress; a worker caller is scoped to its agent's session and limited to 16/64 KiB per call, 6 calls a minute (burst 3); `horde logs` and the `horde/logs` MCP verb; `JoinToken`/`JoinCode` no longer print their secret in Debug | `crates/horde-observe/src/{layer,files,agents,reader,redact,limits}.rs`; `crates/horde-wire/src/logs.rs`; `crates/horde-server/src/diagnostics/mod.rs`, `service/diagnostics.rs`, `trust.rs` (rows `ReadLogs`, `StreamLogRequests`, `WorkerLogTunnel`); `crates/horde-worker/src/logs.rs`, `process.rs` (stderr drain); `crates/horde-mcp/src/logs.rs`; `crates/horde-cli/src/logs.rs` | `horde-observe` units (rotation, pruning, permissions, truncation, drop counter, redactor table); `horde-server/src/diagnostics/tests.rs`; `login/relay.rs` and `forward/relay.rs` (bytes never logged); `worker_suite/logs.rs`; `cli_suite/logs.rs`; `horde-mcp/src/logs.rs`; `horde-e2e/tests/e2e_suite/logs.rs` |
 | Wire limits — 16 MiB messages and 1 MiB push batches on the worker spine; 64 KiB output chunks | `crates/horde-proto/src/limits.rs:14,19`; `horde-server/src/transport.rs:133`; `horde-worker/src/client.rs:54`; `runtime/shape.rs:25` | `limits.rs:26`; `shape.rs:319` |
 
 ### Status of the W7d fix list (Part 2, (a))
@@ -106,6 +107,7 @@ citations are for `9218ac2`.
 | 0011 delivery and liveness | CONFORMS | Lease, boot reconcile, reset, position resume. |
 | 0012 worker inbox | CONFORMS | Inbox, lanes, replay. |
 | 0013 read path and ingest | CONFORMS | Projection, read pool, batch ingest, name filter. |
+| 0015 logs and diagnostics | CONFORMS (as resolved) | Built per its 2026-11-13 resolutions (W12h). OTLP removal is deferred until the operator signs off, and the TUI pane belongs to W12f. |
 
 ### Deferred by design (supersedes Part 2 (c))
 
