@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod cli;
 pub mod client;
+pub mod config;
 pub mod connection;
 pub mod doctor;
 pub mod forward;

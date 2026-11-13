@@ -11,6 +11,7 @@
 //! subscriber or decides how logs are formatted.
 
 pub mod blob;
+pub mod config;
 pub mod enrollment;
 pub mod error;
 pub mod forward;

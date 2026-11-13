@@ -118,8 +118,14 @@ pub struct WorkerConfig {
     /// The git Relay payload shares stage to and fetch through.
     pub relay: Option<String>,
     /// The workspace scan's machine-local settings (ADR-0014's
-    /// `worker.workspace.*`; flags until W12e's config file).
+    /// `worker.workspace.*`): defaults, the config file, then flags.
     pub housekeeping: crate::runtime::HousekeepingConfig,
+    /// The codex sandbox tier per permission mode (`codex.sandbox.*`).
+    pub sandbox: horde_adapter_codex::SandboxPolicy,
+    /// ADR-0015's `logs.*` keys, for the logs work (W12h) to consume.
+    pub logs: horde_config::LogKeys,
+    /// Every configured key with the layer that decided it (ADR-0016).
+    pub provenance: horde_config::Provenance,
     /// Placement tags this Worker advertises (`--tag`, repeatable).
     pub tags: Vec<String>,
     /// Remote URLs this machine's credentials can reach
@@ -277,35 +283,50 @@ struct WorkerArgs {
     #[arg(long)]
     fake_login_listen_port: Option<u16>,
 
-    /// Enables workspace support rooted here.
+    /// Enables workspace support rooted here; overrides
+    /// `worker.workspace.root`.
     #[arg(long)]
     workspace_root: Option<PathBuf>,
+
+    /// The config file. Defaults to `<state-dir>/config.toml`, which may be
+    /// absent; a file named here must exist.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Print the settings these flags and the config file resolve to, and
+    /// exit (ADR-0016).
+    #[arg(long)]
+    show_config: bool,
+
+    /// With --show-config, name the layer each value came from.
+    #[arg(long, requires = "show_config")]
+    origin: bool,
 
     /// The git Relay payload shares stage to and fetch through.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     relay: Option<String>,
 
     /// How often the workspace scan runs (idle and orphan reclaim, grace
-    /// expiry, disk pressure), e.g. 60s.
-    #[arg(long, value_parser = seconds, default_value = "60s")]
-    workspace_scan_interval: std::time::Duration,
+    /// expiry, disk pressure), e.g. 60s (default 60s).
+    #[arg(long, value_parser = seconds)]
+    workspace_scan_interval: Option<std::time::Duration>,
 
-    /// How often archive pins are checked against origin and the Relay.
-    #[arg(long, value_parser = seconds, default_value = "6h")]
-    workspace_pin_scan_interval: std::time::Duration,
+    /// How often archive pins are checked against origin and the Relay (6h).
+    #[arg(long, value_parser = seconds)]
+    workspace_pin_scan_interval: Option<std::time::Duration>,
 
-    /// How often the whole Instance set is re-reported to the Server.
-    #[arg(long, value_parser = seconds, default_value = "5m")]
-    workspace_report_interval: std::time::Duration,
+    /// How often the whole Instance set is re-reported to the Server (5m).
+    #[arg(long, value_parser = seconds)]
+    workspace_report_interval: Option<std::time::Duration>,
 
     /// Free space below which disk-pressure reclaim starts: a percentage,
-    /// a size, or both (the larger wins), e.g. "10%,20GiB".
-    #[arg(long, value_parser = watermark, default_value = "10%,20GiB")]
-    workspace_disk_low_watermark: crate::runtime::Watermark,
+    /// a size, or both (the larger wins); default "10%,20GiB".
+    #[arg(long, value_parser = watermark)]
+    workspace_disk_low_watermark: Option<crate::runtime::Watermark>,
 
-    /// Free space disk-pressure reclaim stops at; above the low mark.
-    #[arg(long, value_parser = watermark, default_value = "15%")]
-    workspace_disk_high_watermark: crate::runtime::Watermark,
+    /// Free space disk-pressure reclaim stops at; above the low mark (15%).
+    #[arg(long, value_parser = watermark)]
+    workspace_disk_high_watermark: Option<crate::runtime::Watermark>,
 
     /// A placement tag this worker advertises; repeatable.
     #[arg(long = "tag", value_parser = NonEmptyStringValueParser::new())]
@@ -374,6 +395,26 @@ pub fn parse(
         (None, Some(home)) => home.join(DEFAULT_STATE_SUBDIR),
         (None, None) => return Err("HOME is unset, so pass --state-dir".to_owned()),
     };
+    let document = horde_config::load(
+        horde_config::Role::Worker,
+        args.config.as_deref(),
+        &state_dir.join(horde_config::Role::FILE_NAME),
+    )?;
+    let settings = crate::config::WorkerSettings::resolve(
+        document.as_ref(),
+        &crate::config::WorkerFlags {
+            workspace_root: args.workspace_root,
+            scan_interval: args.workspace_scan_interval,
+            pin_scan_interval: args.workspace_pin_scan_interval,
+            report_interval: args.workspace_report_interval,
+            disk_low_watermark: args.workspace_disk_low_watermark,
+            disk_high_watermark: args.workspace_disk_high_watermark,
+        },
+        &env,
+    )?;
+    if args.show_config {
+        return Ok(Parsed::Print(settings.provenance.render(args.origin)));
+    }
     let config = WorkerConfig {
         server: args.server.or_else(|| env(SERVER_VAR)),
         state_dir,
@@ -384,15 +425,12 @@ pub fn parse(
         fake_login: args.fake_login,
         fake_login_callback_port: args.fake_login_callback_port,
         fake_login_listen_port: args.fake_login_listen_port,
-        workspace_root: args.workspace_root,
+        workspace_root: settings.workspace_root,
         relay: args.relay,
-        housekeeping: crate::runtime::HousekeepingConfig {
-            scan_interval: args.workspace_scan_interval,
-            pin_scan_interval: args.workspace_pin_scan_interval,
-            report_interval: args.workspace_report_interval,
-            disk_low_watermark: args.workspace_disk_low_watermark,
-            disk_high_watermark: args.workspace_disk_high_watermark,
-        },
+        housekeeping: settings.housekeeping,
+        sandbox: settings.sandbox,
+        logs: settings.logs,
+        provenance: settings.provenance,
         tags: args.tags,
         advertised_remotes: args.advertised_remotes,
         insecure: args.insecure,
@@ -592,6 +630,96 @@ mod tests {
         let swallowed =
             parsed_with(&["--state-dir", "--insecure"], &[]).expect_err("no dash-prefixed path");
         assert!(swallowed.contains("--state-dir"), "{swallowed}");
+    }
+
+    /// The config file in the state dir is the layer between the defaults
+    /// and the flags (ADR-0016): it sets what no flag does, a flag beats it,
+    /// and `--show-config --origin` prints each value with its layer.
+    #[test]
+    fn the_state_dirs_config_file_sits_between_the_defaults_and_the_flags() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let dir = state.path().to_string_lossy().into_owned();
+        let file = state.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "[worker.workspace]\nroot = \"/srv/ws\"\nscan_interval = \"2m\"\n\
+             [codex.sandbox]\nbuilder = \"workspace-write\"\n",
+        )
+        .expect("writes");
+
+        let filed = parsed_with(&["--state-dir", &dir], &[]).expect("parses");
+        assert_eq!(filed.workspace_root, Some("/srv/ws".into()));
+        assert_eq!(filed.housekeeping.scan_interval.as_secs(), 120);
+        assert_eq!(
+            filed.sandbox.tier_for("builder").tier,
+            horde_adapter_codex::SandboxTier::WorkspaceWrite
+        );
+
+        let flagged = parsed_with(
+            &[
+                "--state-dir",
+                &dir,
+                "--workspace-scan-interval",
+                "5s",
+                "--workspace-root",
+                "/x",
+            ],
+            &[],
+        )
+        .expect("parses");
+        assert_eq!(flagged.housekeeping.scan_interval.as_secs(), 5);
+        assert_eq!(flagged.workspace_root, Some("/x".into()));
+
+        let shown = parsed_with(
+            &[
+                "--state-dir",
+                &dir,
+                "--workspace-scan-interval",
+                "5s",
+                "--show-config",
+                "--origin",
+            ],
+            &[("HORDE_LOG", "warn")],
+        )
+        .expect_err("prints instead of running");
+        let file_origin = format!("# file {}", file.display());
+        for line in [
+            "worker.workspace.scan_interval = 5s  # flag --workspace-scan-interval".to_owned(),
+            format!("worker.workspace.root = \"/srv/ws\"  {file_origin}"),
+            "worker.workspace.report_interval = 5m  # default".to_owned(),
+            "logs.level = \"warn\"  # env HORDE_LOG".to_owned(),
+        ] {
+            assert!(shown.contains(&line), "{line} in:\n{shown}");
+        }
+        let plain = parsed_with(&["--state-dir", &dir, "--show-config"], &[])
+            .expect_err("prints instead of running");
+        assert!(
+            plain.contains("worker.workspace.scan_interval = 2m\n"),
+            "{plain}"
+        );
+        assert!(!plain.contains('#'), "no origins without --origin: {plain}");
+    }
+
+    /// A broken or missing config file refuses the start by path.
+    #[test]
+    fn a_bad_or_missing_config_file_refuses_the_start() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let dir = state.path().to_string_lossy().into_owned();
+        std::fs::write(
+            state.path().join("config.toml"),
+            "[worker.workspace]\nscan = 1\n",
+        )
+        .expect("writes");
+        let refused = parsed_with(&["--state-dir", &dir], &[]).expect_err("an unknown key");
+        assert!(
+            refused.contains("unknown key worker.workspace.scan"),
+            "{refused}"
+        );
+        let missing = parsed_with(&["--config", "/nonexistent/worker.toml"], &[])
+            .expect_err("a named file must exist");
+        assert!(missing.contains("/nonexistent/worker.toml"), "{missing}");
+        let origin_alone = parsed_with(&["--origin"], &[]).expect_err("needs --show-config");
+        assert!(origin_alone.contains("--show-config"), "{origin_alone}");
     }
 
     /// An empty value is no value: every string flag refuses one by name,

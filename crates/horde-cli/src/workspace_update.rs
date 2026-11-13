@@ -40,6 +40,9 @@ pub struct UpdateArgs {
     /// A `--reclaim` applies to the current repo set (or the re-laid one).
     #[command(flatten)]
     pub policy: crate::workspace_flags::WorkspacePolicyArgs,
+    /// Drop the workspace's permission mode, so the server's applies.
+    #[arg(long, conflicts_with = "permission_mode")]
+    pub clear_permission_mode: bool,
 }
 
 /// The update request these flags make of `current`.
@@ -74,6 +77,8 @@ pub fn request_from(
         name: args.name.clone().unwrap_or_default(),
         unmanaged_paths: unmanaged_paths_for(args, current),
         repos,
+        permission_mode: args.policy.permission_mode.clone().unwrap_or_default(),
+        clear_permission_mode: args.clear_permission_mode,
     })
 }
 

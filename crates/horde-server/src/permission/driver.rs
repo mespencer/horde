@@ -341,6 +341,12 @@ impl ChainDriver {
                 reason: String::new(),
                 updated_input,
             },
+            ChainRuling::Bypass => Settled::Decided {
+                outcome: PermissionOutcome::Allow,
+                decided_by: PermissionLayer::DeterministicAllow,
+                reason: BYPASS_REASON.to_owned(),
+                updated_input: None,
+            },
             ChainRuling::Consult { instructions } => {
                 self.consult(&instructions, call, requester.ancestry).await
             }
@@ -391,6 +397,10 @@ impl ChainDriver {
         }
     }
 }
+
+/// The reason a bypass-mode allow is journaled with, so every client shows
+/// why no human was asked (ADR-0016).
+pub const BYPASS_REASON: &str = "bypass mode";
 
 /// Whether a park's wake-up means there is more log to read (`true`), or the
 /// log is gone (`false`).
@@ -575,6 +585,7 @@ mod tests {
         agent_event(
             agent,
             Kind::AgentSpawned(AgentSpawned {
+                session: None,
                 parent_agent_id: parent.map(AgentId::new),
                 spawned_by: None,
                 spec: Some(AgentSpec {
@@ -713,6 +724,86 @@ mod tests {
     }
 
     // -- the deterministic layers, through the whole driver ------------------
+
+    /// The shipped registry's default — bypass — settles an ordinary call
+    /// with a journaled allow that names bypass, so every client sees the
+    /// prompt and why no human was asked.
+    #[tokio::test]
+    async fn the_bypass_default_allows_a_call_and_journals_why() {
+        let log = EventLog::in_memory().expect("log");
+        append(&log, "s1", "spawn-root", spawned("root", None, "", &["s"])).await;
+        append(
+            &log,
+            "s1",
+            "req-1",
+            requested("root", "req-1", Some(call("Bash", "/w"))),
+        )
+        .await;
+
+        run_chain(&log, PermissionModes::shipped(), None).await;
+
+        let rulings: Vec<(i32, i32, String)> = decisions_in(&log, "s1")
+            .await
+            .into_iter()
+            .map(|decision| (decision.outcome, decision.decided_by, decision.reason))
+            .collect();
+        assert_eq!(
+            rulings,
+            [(
+                PermissionOutcome::Allow as i32,
+                PermissionLayer::DeterministicAllow as i32,
+                super::BYPASS_REASON.to_owned()
+            )]
+        );
+        assert_eq!(
+            requests_in(&log, "s1").await.len(),
+            1,
+            "the prompt is in the log"
+        );
+    }
+
+    /// The bypass default must not swallow a question: `AskUserQuestion`
+    /// is re-raised to a human, undecided, under the shipped registry and
+    /// under an explicitly named bypass mode alike.
+    #[tokio::test]
+    async fn the_bypass_default_still_escalates_a_question_to_a_human() {
+        for mode in ["", crate::permission::modes::BYPASS] {
+            let log = EventLog::in_memory().expect("log");
+            append(
+                &log,
+                "s1",
+                "spawn-root",
+                spawned("root", None, mode, &["s"]),
+            )
+            .await;
+            append(
+                &log,
+                "s1",
+                "req-1",
+                requested("root", "req-1", Some(call("AskUserQuestion", "/w"))),
+            )
+            .await;
+
+            run_chain(&log, PermissionModes::shipped(), None).await;
+
+            assert!(
+                decisions_in(&log, "s1").await.is_empty(),
+                "{mode:?}: nothing but a human may answer a question"
+            );
+            let requests = requests_in(&log, "s1").await;
+            let escalated = requests.last().expect("re-raised");
+            assert_eq!(
+                requests.len(),
+                2,
+                "{mode:?}: the original and the escalation"
+            );
+            assert_eq!(
+                escalated.escalated_from,
+                PermissionLayer::DeterministicDeny as i32
+            );
+            assert_eq!(escalated.permission_mode, mode);
+        }
+    }
 
     #[tokio::test]
     async fn an_allow_rule_settles_the_request_and_names_its_layer() {

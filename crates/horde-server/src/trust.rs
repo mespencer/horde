@@ -167,6 +167,7 @@ fn control_plane(method: &str) -> Option<Admits> {
         | "ListMcpServers"
         | "DeleteMcpServer"
         | "ListWorkers"
+        | "GetEffectiveConfig"
         | "MintEnrollmentCode"
         | "RevokeEnrollment"
         | "ResetWorkerJournal"

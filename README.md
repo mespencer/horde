@@ -47,6 +47,40 @@ horde-worker --join-file token.txt --adapter claude
 
 The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`. To add another client machine instead, mint with `horde enroll client <name>` and redeem with `horde enroll join --token-file token.txt`.
 
+## Configuration
+
+Each binary reads its own TOML file, which may be absent: `~/.horde/server/config.toml`, `~/.horde/worker/config.toml` and `~/.horde/client/config.toml` (`--config PATH` names another). Settings layer from least to most specific: built-in defaults, the file, the workspace, the session, then flags. An unknown key, a value of the wrong type, or a key that belongs to another binary is refused at start, naming the file and the key.
+
+See where every value came from:
+
+```sh
+horde config show --origin                         # this client
+horde config show --server --workspace api --origin  # the server, and what an agent in `api` gets
+horde-server --show-config --origin                # what these flags and the file resolve to
+horde-worker --show-config --origin
+```
+
+Permissions default to `bypass`. The server's permission chain allows each tool call that no deny rule refuses, and records the prompt and the allow in the session so every client sees them. Questions such as Claude's `AskUserQuestion` always wait for a human. To make agents ask before acting, set the `ask` mode. It escalates everything except an agent's own orchestrator verbs. You can also author rule modes:
+
+```toml
+# ~/.horde/server/config.toml
+[permissions]
+default_mode = "careful"
+
+[permissions.modes.careful]
+own_orchestrator_verbs = true
+deny  = [{ tool = "Bash", where = { command = "rm " }, reason = "no rm" }]
+allow = [{ tool = "Read" }, { tool = "Grep" }]
+
+[tiers.standard]          # a [tiers] table replaces the shipped catalog
+candidates = [{ provider = "claude", model = "sonnet" }, { provider = "codex" }]
+
+[workspace]
+idle_reclaim_after = "8h"
+```
+
+A workspace (`horde workspace create|update --permission-mode`), a session (`horde new --permission-mode`, or `session.permission_mode` in the client file) and a spawn (`horde spawn --permission-mode`) each override the server's default, in that order. Codex cannot be gated per call. On each worker, `codex.sandbox.<mode>` therefore picks the codex sandbox for agents under a mode, and the built-in mapping gives `bypass` agents `workspace-write`. [ADR-0016](docs/adr/0016-configuration-layering-and-permission-defaults.md) lists every key per binary.
+
 ## Diagnosing a setup
 
 ```sh

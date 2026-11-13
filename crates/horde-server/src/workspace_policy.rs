@@ -54,7 +54,10 @@ impl Default for WorkspacePolicyConfig {
     }
 }
 
-fn wire(duration: Duration) -> horde_proto::prost_types::Duration {
+/// `duration` as the protobuf `Duration` the policy messages carry,
+/// nanoseconds included.
+#[must_use]
+pub fn wire(duration: Duration) -> horde_proto::prost_types::Duration {
     horde_proto::prost_types::Duration {
         seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         nanos: i32::try_from(duration.subsec_nanos()).unwrap_or(0),

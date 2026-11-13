@@ -14,6 +14,9 @@ async-trait = { workspace = true }
 # The binary's command line (`--help`, and refusals that name the flag),
 # the same parser the `horde` CLI uses.
 clap = { version = "4.5", features = ["derive"] }
+# The server's config file (ADR-0016): the strict reader and provenance
+# every role shares.
+horde-config = { workspace = true }
 horde-identity = { workspace = true }
 # The hub core (ADR-0004): upstream connections and the namespaced routing
 # the worker-forwarded hub calls are answered from.
@@ -32,6 +35,8 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time", "process"] }
 tokio-stream = "0.1.19"
+# The config file's parser (ADR-0016); the walk over it is horde-config's.
+toml = "1.2.1"
 tonic = { version = "0.14.6", features = ["server", "channel", "tls-ring"] }
 # The router layer that stamps each request's gRPC method path where the
 # trust door can read it (ADR-0009) — an interceptor never sees the URI.

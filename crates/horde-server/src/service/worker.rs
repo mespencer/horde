@@ -146,7 +146,8 @@ impl WorkerService for WorkerFacing {
                 log_position: request.resume_after_log_position,
             },
         )
-        .with_workspace_policy(std::sync::Arc::clone(&self.core.workspace_policy));
+        .with_workspace_policy(std::sync::Arc::clone(&self.core.workspace_policy))
+        .with_tiers(std::sync::Arc::clone(&self.core.tiers));
 
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         let core = self.core.clone();

@@ -69,6 +69,10 @@ message AgentSpawned {
 
   // Ancestry display names, root first.
   repeated string tree_path = 4;
+
+  // The Session's own settings (ADR-0016's session layer). Set only on a
+  // Session's top-level Agent, from CreateSessionRequest.settings.
+  SessionSettings session = 5;
 }
 
 // Event.agent_id is the recipient; `from` is the sender.

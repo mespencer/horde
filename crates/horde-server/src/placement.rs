@@ -208,7 +208,7 @@ pub async fn append_placement(
         .as_ref()
         .filter(|_| placement.state == PlacementState::Placed as i32)
         .and_then(|worker_id| core.workers.capabilities_of(&worker_id.to_string()))
-        .map(|capabilities| adapter_capabilities(&capabilities, spec))
+        .map(|capabilities| adapter_capabilities(&capabilities, spec, &core.tiers))
         .unwrap_or_default();
     append_server_event(
         &core.log,
@@ -237,8 +237,9 @@ pub async fn append_placement(
 pub fn adapter_capabilities(
     capabilities: &horde_proto::v1::WorkerCapabilities,
     spec: Option<&AgentSpec>,
+    tiers: &crate::tiers::TierCatalog,
 ) -> Vec<i32> {
-    let harness = match requested_provider(spec) {
+    let harness = match requested_provider(spec, tiers) {
         Some(provider) => capabilities
             .harnesses
             .iter()
@@ -255,8 +256,11 @@ pub fn adapter_capabilities(
 /// Placement demands this harness of the chosen worker: a worker without
 /// it would refuse the spawn command with an unknown provider.
 #[must_use]
-pub fn requested_provider(spec: Option<&AgentSpec>) -> Option<String> {
-    crate::service::commands::binding_for(spec)
+pub fn requested_provider(
+    spec: Option<&AgentSpec>,
+    tiers: &crate::tiers::TierCatalog,
+) -> Option<String> {
+    crate::service::commands::binding_for(spec, tiers)
         .map(|binding| binding.provider)
         .filter(|provider| !provider.is_empty())
 }
@@ -358,7 +362,7 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
             let constraints = spec.placement.clone().unwrap_or_default();
             let workspace = workspace_of(&spec);
             let parent_worker = parent_worker_of(state, agent);
-            let harness = requested_provider(Some(&spec));
+            let harness = requested_provider(Some(&spec), &core.tiers);
 
             let placement = core.scheduler.place(&PlacementRequest {
                 constraints: &constraints,
@@ -888,25 +892,49 @@ mod tests {
         };
 
         assert_eq!(
-            adapter_capabilities(&worker, Some(&naming("codex"))),
+            adapter_capabilities(
+                &worker,
+                Some(&naming("codex")),
+                &crate::tiers::TierCatalog::shipped_defaults()
+            ),
             vec![AdapterCapability::ToolInputRewrite as i32],
             "a named provider picks its own harness, not the first"
         );
         assert_eq!(
-            adapter_capabilities(&worker, None),
+            adapter_capabilities(
+                &worker,
+                None,
+                &crate::tiers::TierCatalog::shipped_defaults()
+            ),
             vec![AdapterCapability::Resumable as i32],
             "no spec runs on the worker's default harness"
         );
         assert_eq!(
-            adapter_capabilities(&worker, Some(&naming(""))),
+            adapter_capabilities(
+                &worker,
+                Some(&naming("")),
+                &crate::tiers::TierCatalog::shipped_defaults()
+            ),
             vec![AdapterCapability::Resumable as i32],
             "an empty provider is no provider"
         );
         assert!(
-            adapter_capabilities(&worker, Some(&naming("ollama"))).is_empty(),
+            adapter_capabilities(
+                &worker,
+                Some(&naming("ollama")),
+                &crate::tiers::TierCatalog::shipped_defaults()
+            )
+            .is_empty(),
             "a provider the worker does not run can do nothing"
         );
-        assert!(adapter_capabilities(&WorkerCapabilities::default(), None).is_empty());
+        assert!(
+            adapter_capabilities(
+                &WorkerCapabilities::default(),
+                None,
+                &crate::tiers::TierCatalog::shipped_defaults()
+            )
+            .is_empty()
+        );
     }
 
     #[test]

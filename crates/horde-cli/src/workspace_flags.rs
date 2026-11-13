@@ -56,6 +56,10 @@ pub struct WorkspacePolicyArgs {
     /// removed automatically (0 = at archive), e.g. 24h.
     #[arg(long, value_name = "DUR")]
     pub archived_grace: Option<String>,
+    /// The permission mode agents in this workspace run under when neither
+    /// their spawn nor their session names one (ADR-0016's workspace layer).
+    #[arg(long, value_name = "MODE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub permission_mode: Option<String>,
 }
 
 fn invalid(message: String) -> ClientError {

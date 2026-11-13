@@ -391,6 +391,7 @@ mod tests {
                 }),
             }),
             Kind::AgentSpawned(AgentSpawned {
+                session: None,
                 parent_agent_id: None,
                 spawned_by: None,
                 spec: Some(AgentSpec {

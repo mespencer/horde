@@ -132,9 +132,13 @@ pub async fn new_session(
 pub async fn create(
     client: &mut Client,
     title: Option<&str>,
-    spec: AgentSpec,
+    mut spec: AgentSpec,
     idempotency_key: &str,
 ) -> Result<(SessionSummary, AgentId), ClientError> {
+    // `--permission-mode` on a create names the session's mode (ADR-0016's
+    // session layer), which the root and every agent a client later spawns
+    // there run under unless they name their own.
+    let settings = crate::config::session_settings(&mut spec, client.session_defaults());
     let title = match title {
         Some(title) => title.to_owned(),
         None => {
@@ -145,7 +149,7 @@ pub async fn create(
         }
     };
     client
-        .create_session_with(&title, spec, idempotency_key)
+        .create_session_in(&title, spec, settings, idempotency_key)
         .await
 }
 

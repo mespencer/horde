@@ -738,6 +738,7 @@ mod tests {
 
     fn spawn_kind(parent: Option<&str>) -> Kind {
         Kind::AgentSpawned(AgentSpawned {
+            session: None,
             parent_agent_id: parent.map(AgentId::new),
             spawned_by: None,
             spec: None,

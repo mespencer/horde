@@ -590,9 +590,13 @@ async fn build_runtime(
                 )?;
                 // Probed, not assumed: the exec-gating capability claim is
                 // version-gated (ADR-0005, 2026-08-19 amendment).
-                let adapter = crate::CodexAdapter::new(harness_profile(config, "codex", &journal))
-                    .probe_exec_interception()
-                    .await;
+                let mut adapter =
+                    crate::CodexAdapter::new(harness_profile(config, "codex", &journal));
+                // The sandbox tier each permission mode gets on this machine
+                // (`codex.sandbox.*`, ADR-0016): codex cannot be gated per
+                // call, so this is the control its agents actually run under.
+                adapter.sandbox_policy = config.sandbox.clone();
+                let adapter = adapter.probe_exec_interception().await;
                 runtime.with_adapter(Arc::new(adapter))
             }
         };

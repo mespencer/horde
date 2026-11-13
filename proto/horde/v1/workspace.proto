@@ -98,6 +98,10 @@ message WorkspaceDefinition {
 
   // Overrides of the Server's cleanup defaults for this Workspace.
   WorkspaceCleanupPolicy cleanup = 8;
+
+  // The permission mode for Agents in this Workspace whose spawn and
+  // Session name none (ADR-0016's workspace layer). Empty: the Server's.
+  string permission_mode = 9;
 }
 
 enum WorkspaceInstanceState {

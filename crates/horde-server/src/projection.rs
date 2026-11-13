@@ -76,7 +76,8 @@ struct Folded {
 
 /// One stream's fold: its state, or the decode failure that stopped it.
 enum Fold {
-    State(SessionState),
+    /// Boxed: a session's state is far larger than a decode failure.
+    State(Box<SessionState>),
     Unfoldable {
         session_id: String,
         error: prost::DecodeError,
@@ -94,7 +95,7 @@ impl Fold {
     /// The state, or the error a cold fold of this stream answers.
     fn outcome(&self) -> Result<&SessionState, ServerError> {
         match self {
-            Self::State(state) => Ok(state),
+            Self::State(state) => Ok(state.as_ref()),
             Self::Unfoldable { error, .. } => Err(ServerError::Decode(error.clone())),
         }
     }
@@ -110,7 +111,7 @@ impl Folded {
         let place = *self.index.entry(session_id.clone()).or_insert(next);
         if place == next {
             self.sessions
-                .push(Fold::State(SessionState::new(session_id)));
+                .push(Fold::State(Box::new(SessionState::new(session_id))));
         }
         // In bounds: `index` only ever holds positions already pushed.
         let fold = &mut self.sessions[place];

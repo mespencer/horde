@@ -1,0 +1,20 @@
+[package]
+name = "horde-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Layered, strictly validated TOML configuration with provenance (ADR-0016)."
+
+[lints]
+workspace = true
+
+[dependencies]
+horde-proto = { workspace = true }
+toml = "1.2.1"
+# `logs.level` is an EnvFilter directive (ADR-0015): a value that does not
+# parse is refused at load, not discovered when the logs layer starts.
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
