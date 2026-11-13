@@ -2,8 +2,6 @@
 //! a real server and a real worker binary lives in the e2e suite
 //! (`horde-e2e`, `worker_add.rs`); these pin the decisions it is built on.
 
-use std::time::Duration;
-
 use clap::Parser;
 
 use super::*;
@@ -318,61 +316,6 @@ fn header_reads_at_most_the_first_bytes() -> Outcome {
         Err(ClientError::File { .. })
     ));
     Ok(())
-}
-
-#[tokio::test]
-async fn execute_returns_stdout_and_feeds_stdin() -> Outcome {
-    let cat = Invocation {
-        program: "sh".to_owned(),
-        args: vec!["-c".to_owned(), "cat; echo done".to_owned()],
-    };
-    let out = execute("echo", &cat, Some("in\n"), Duration::from_secs(10)).await?;
-    assert_eq!(out, "in\ndone\n");
-    let quiet = execute("echo", &cat, None, Duration::from_secs(10)).await?;
-    assert_eq!(quiet, "done\n", "no stdin is an empty stdin");
-    Ok(())
-}
-
-#[tokio::test]
-async fn execute_refuses_a_failing_command_with_what_it_said() {
-    let failing = Invocation {
-        program: "sh".to_owned(),
-        args: vec![
-            "-c".to_owned(),
-            "echo said; echo oops >&2; exit 255".to_owned(),
-        ],
-    };
-    let error = execute("probe", &failing, None, Duration::from_secs(10))
-        .await
-        .expect_err("a failing command is refused");
-    let text = message(&error);
-    assert!(text.contains("probe failed (exit 255)"), "{text}");
-    assert!(text.contains("ssh could not connect"), "{text}");
-    assert!(text.contains("said\noops"), "{text}");
-}
-
-#[tokio::test]
-async fn execute_refuses_a_command_that_outlives_its_limit() {
-    let hanging = Invocation {
-        program: "sleep".to_owned(),
-        args: vec!["30".to_owned()],
-    };
-    let error = execute("start", &hanging, None, Duration::from_millis(200))
-        .await
-        .expect_err("a hang is refused");
-    assert!(message(&error).contains("start: no answer within 200ms"));
-}
-
-#[tokio::test]
-async fn execute_refuses_a_program_that_does_not_exist() {
-    let missing = Invocation {
-        program: "/nonexistent/ssh".to_owned(),
-        args: Vec::new(),
-    };
-    let error = execute("probe", &missing, None, Duration::from_secs(1))
-        .await
-        .expect_err("a missing program is refused");
-    assert!(message(&error).contains("could not run /nonexistent/ssh"));
 }
 
 #[test]

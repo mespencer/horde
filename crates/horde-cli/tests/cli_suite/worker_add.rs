@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use horde_identity::PrincipalRole;
 use horde_server_testkit::secure::{SecureHarness, serve_secured, within};
 
+#[cfg(test)]
+mod scripts;
+
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn executable(path: &Path, content: &str) -> Setup<()> {
