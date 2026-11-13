@@ -921,7 +921,7 @@ duration or size string, and the built-in default is listed.
 | `workspace.fetch_throttle` | server file | `60s` | |
 | `workspace.fetch_timeout` | server file | `30s` | |
 | `workspace.idle_reclaim_after` | server file → Definition `cleanup` | `4h` | `0` = never |
-| `workspace.archived_grace` | server file → Definition `cleanup` | `0s` | |
+| `workspace.archived_grace` | server file → Definition `cleanup` | `24h` | resolution 1 |
 | `workspace.archived_pin_ttl` | server file | unset (never) | only with `gc --hard --include-pins --force` |
 | `workspace.reclaim_timeout` | server file → repo `reclaim.command.timeout` | `10m` | |
 | `workspace.reclaim.auto` | server file | `[{marker = "Cargo.toml", argv = ["cargo","clean"]}]` | replaces the built-in list when set |
@@ -1106,30 +1106,81 @@ ground rules, no test re-implements a predicate to check it.
   cleanup actions, roughly one event per checkout per tier.
 - DESIGN §7 points here.
 
-## Open questions
+## Resolutions (2026-11-13)
 
-1. **`archived_grace` default.** Zero matches today's immediate release. A
-   few hours would let a human inspect a finished agent's tree. The ADR
-   ships `0s`.
-2. **Ignored files and losslessness.** Rule 1 ignores ignored files, so an
-   agent-written `.env` or a local DB under an ignored path is lost on a
-   lossless hard removal. Alternatives are to treat ignored files outside
-   the reclaim command's known outputs as dirty, or to make this a
-   per-repo `lossless_ignores` list.
-3. **Does the Relay count as "pushed"?** This ADR says yes for pin expiry:
-   share refs are never pruned. If the operator intends "pushed" to mean
-   the external origin only, drop the Relay keeper.
-4. **Pin TTL.** Pins never age out by default. Squash-merge workflows will
-   accumulate them; whether `archived_pin_ttl` should default to something
-   like 30 d is left open.
-5. **Adopting an existing origin branch as the base for `--branch`.** This
-   is the natural "continue this branch" reading, but it is a decision the
-   brief did not state.
-6. **Lazy materialization of the Instance itself** (clone a repo on first
-   checkout rather than at materialize). Deferred: it moves minutes-long
-   clones into an agent's tool call.
-7. **Disk facts in placement.** Workers now report free space; whether
-   placement should avoid a Worker in a pressure episode is not designed
-   here.
-8. **Who may gc.** Any enrolled Client may (ADR-0009 roles). There is no
-   per-workspace ACL.
+The operator settled the open questions on 2026-11-13; the implementation
+(W12d) follows these, and they override anything above that says otherwise.
+
+1. **`archived_grace` defaults to 24 h.** A clean archived checkout is
+   soft-reclaimed at archive and hard-removed automatically by the scan once
+   24 h have passed, so a human can still inspect a finished agent's tree the
+   next day. Configurable (`workspace.archived_grace`, today
+   `horde-server --workspace-archived-grace`, and per Definition through
+   `cleanup.archived_grace`); `0` restores removal at archive. The tables
+   above that say `0s` read `24h`.
+2. **Ignored files count as loss unless the repo's reclaim owns them.**
+   Rule 1 of `removable(W)` changes: an ignored path is non-loss only when it
+   lies under an output path of the repo's resolved reclaim command — the
+   cargo target directory that `cargo metadata` names for the built-in rule
+   (normally `target/`), or the `output_paths` a configured command declares
+   (`ReclaimPolicy.Command.output_paths`, a field added for this). After a
+   soft reclaim those directories are empty anyway, so what remains ignored
+   is, by construction, not reclaim output. Any other ignored path (an
+   agent-written `.env`, a local database) makes automatic removal "not
+   provable". `git ls-files --others --ignored --exclude-standard
+   --directory` lists the candidates, so an ignored directory is one entry.
+   An explicit `horde workspace gc --hard` refuses such a checkout unless
+   `--force`, and lists the paths with their sizes in each
+   `RepoAction.unrecoverable_files` (`--dry-run` included, rendered as
+   `would lose <path> <size>`).
+3. **A commit held on the Relay counts as pushed** for pin removal, as
+   `unpinnable(P)` says: share refs are never pruned.
+4. **Archive pins never expire by default.** `archived_pin_ttl` stays unset
+   unless configured, and even then only `gc --hard --include-pins --force`
+   drops an expired, unreachable pin. Its age is the pinned commit's
+   committer date (refs under `refs/horde/` keep no reflog).
+5. **`--branch` naming a branch that exists on origin continues it**: the
+   base is `origin/<branch>` (resolution `REQUESTED`) unless the spawn named
+   a base for that repo.
+6. **Lazy cloning of Instance repos stays deferred.** Materialization still
+   clones every repo of the Definition; an on-demand checkout costs a
+   worktree, not a clone.
+7. **Placement reads disk facts: deprioritize under pressure, exclude only
+   below a hard floor.** A Worker whose freshest report (an Instance report,
+   else its registration's `workspace_free_bytes`/`workspace_total_bytes`)
+   shows free space below the pressure threshold — default the larger of
+   10 % and 20 GiB — is ranked after every other eligible Worker (ahead of
+   warmth, the parent's Worker and load) but still chosen when it is the only
+   one. Below the floor (default 2 GiB) it is refused for workspace spawns,
+   and the queued reason says so. A Worker that reported no disk facts is
+   neither. Configurable: `horde-server --placement-disk-pressure 10%,20GiB
+   --placement-disk-floor 2GiB` until W12e's config file.
+8. **No per-workspace access control for gc**: correct for a single-user
+   server. Any Client may gc; a worker-certified caller is refused, since
+   cleanup is an operator's verb.
+
+### Implementation notes (W12d)
+
+Where the build differs in detail from the sections above:
+
+- **The ledger is JSON** (`.horde-agents/.ledger/<agent>.json`), not
+  protobuf: it is Worker-private and never crosses the wire, so it needs no
+  schema in `horde.v1`.
+- **Ordering with an agent's lane is a per-agent checkout lock**, not a
+  local lane message. Spawn holds it from checkout to registration,
+  `workspace_checkout` holds it while it adds a repo (and re-checks the
+  agent is still registered under it, so a checkout racing an archive loses
+  cleanly), and archive, every cleanup and every scan action take it — the
+  scan with `try_lock`, skipping a checkout someone is working on.
+- **The branch claim table is read off the in-memory session projection**
+  (ADR-0013) under the placement lock, rather than kept as a separate fold:
+  the projection already holds every live agent's spec.
+- **`HORDE_WORKSPACE_MANIFEST` is not set in the harness environment**: the
+  adapters' spec has no environment seam yet. A lazy agent's prompt overlay
+  names the manifest's path instead.
+- **The front door's offer to create a workspace from cwd is not built**;
+  `horde workspace create --from-cwd` is, and the front door's hint can name
+  it. The offer is UI, and lands with W12f's front door.
+- **`MaterializationProgress` events carry a skeletal report** (the
+  Definition id and `MATERIALIZING`), journaled as each step starts, into
+  the materialize command's carrying stream.

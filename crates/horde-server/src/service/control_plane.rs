@@ -1370,7 +1370,6 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<horde_proto::v1::CollectWorkspaceGarbageRequest>,
     ) -> Result<Response<horde_proto::v1::CollectWorkspaceGarbageResponse>, Status> {
-        refuse_worker_caller(&request, "collect workspace garbage")?;
         let requested_by = principal_of(&request);
         let request = request.into_inner();
         let level = horde_proto::v1::GcLevel::try_from(request.level).unwrap_or_default();
@@ -1416,7 +1415,6 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<horde_proto::v1::RemoveWorkspaceInstanceRequest>,
     ) -> Result<Response<horde_proto::v1::RemoveWorkspaceInstanceResponse>, Status> {
-        refuse_worker_caller(&request, "remove a workspace instance")?;
         let requested_by = principal_of(&request);
         let request = request.into_inner();
         let definition_id = request
@@ -2063,19 +2061,6 @@ fn validate_model_selection(spec: Option<&horde_proto::v1::AgentSpec>) -> Result
 /// # Errors
 ///
 /// `PermissionDenied` naming the caller and the verb it may not use.
-/// Refuses a worker-certified caller: cleanup is an operator's verb, and an
-/// agent's worker has no business removing checkouts (ADR-0009 roles). A
-/// plaintext loopback channel carries no role and is admitted, like every
-/// other client verb there.
-fn refuse_worker_caller<T>(request: &Request<T>, verb: &str) -> Result<(), Status> {
-    match crate::trust::conduit_worker(request) {
-        Some(worker) => Err(Status::permission_denied(format!(
-            "worker {worker} may not {verb}; that is a client's verb"
-        ))),
-        None => Ok(()),
-    }
-}
-
 fn require_client_role<T>(request: &Request<T>, verb: &str) -> Result<(), Status> {
     let identity = request
         .extensions()

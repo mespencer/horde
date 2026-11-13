@@ -73,6 +73,9 @@ pub struct Runtime {
     housekeeping: HousekeepingConfig,
     /// The running scan loop, started with the first command.
     scan: Option<tokio::task::JoinHandle<()>>,
+    /// The disk-pressure episode, shared by the loop and manual scans so
+    /// "one exhausted event per episode" holds across both.
+    episode: Arc<tokio::sync::Mutex<housekeeping::Episode>>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -96,6 +99,7 @@ impl Runtime {
             replayed: false,
             housekeeping: HousekeepingConfig::default(),
             scan: None,
+            episode: Arc::new(tokio::sync::Mutex::new(housekeeping::Episode::default())),
         }
     }
 
@@ -131,6 +135,7 @@ impl Runtime {
         self.scan = Some(tokio::spawn(housekeeping::run(
             housekeeper,
             self.housekeeping,
+            Arc::clone(&self.episode),
         )));
     }
 
@@ -141,8 +146,9 @@ impl Runtime {
         let Some(housekeeper) = self.shared.housekeeper() else {
             return false;
         };
-        let mut episode = housekeeping::Episode::default();
+        let mut episode = self.episode.lock().await;
         let changed = housekeeper.scan(&self.housekeeping, &mut episode).await;
+        drop(episode);
         housekeeper.report().await;
         changed
     }

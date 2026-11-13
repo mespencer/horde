@@ -377,6 +377,11 @@ impl WorkspaceManager {
             };
             prepared.push(added);
         }
+        // Written even with no repo checked out: a lazy agent that starts
+        // with none still has a checkout to add to, and an orphan to find.
+        ledger::write(&agents_dir, &record)
+            .await
+            .map_err(WorkerError::Workspace)?;
         link_unmanaged(&instance_root, &agent_root, &definition.unmanaged_paths).await?;
         let manifest = self
             .rewrite_manifest(&agent_root, &definition, &record)
