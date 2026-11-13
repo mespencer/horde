@@ -8,7 +8,6 @@ mod harness {
 
     use horde_observe::reader::LocalLogs;
     use horde_observe::settings::LogSettings;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     /// A served core whose server log holds three records, one carrying a
     /// join token.
@@ -20,8 +19,7 @@ mod harness {
             &horde_observe::ServiceIdentity::new("horde-server"),
         )
         .expect("start");
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             tracing::debug!(target: "horde_server", "placed agent quietly");
             tracing::info!(target: "horde_server", worker = "w1", "placed agent loudly");
             tracing::warn!(target: "horde_server", "minted horde://join/h:7/s3cr3t.fp");

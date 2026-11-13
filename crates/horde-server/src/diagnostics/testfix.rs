@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use horde_observe::reader::read_dir;
 use horde_observe::settings::LogSettings;
-use tracing_subscriber::layer::SubscriberExt as _;
 
 /// Every record this thread emits while held, written by the real file
 /// layer at `trace`. `#[tokio::test]`'s current-thread runtime polls every
@@ -31,8 +30,7 @@ impl Capture {
             &horde_observe::ServiceIdentity::new("capture"),
         )
         .expect("the capture starts");
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        let guard = tracing::dispatcher::set_default(&dispatch);
+        let guard = tracing::dispatcher::set_default(&logging.dispatch());
         Self {
             dir,
             logging,

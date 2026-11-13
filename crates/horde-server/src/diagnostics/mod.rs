@@ -15,24 +15,28 @@
 //! worker, and agents of that agent's own session; and every record naming
 //! another session is dropped before it leaves the machine that wrote it.
 //! A worker caller's reads are clamped and rate-limited per agent.
+//!
+//! This module is the plane's state and its pure halves (the registry, the
+//! relay, the refusals); the decisions that read the session projection —
+//! authorizing and opening a read — live in `crate::service::diagnostics`,
+//! beside the handlers, so this module never reaches back into the service
+//! layer that holds it.
 
 pub mod registry;
 
-use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use horde_observe::limits::{RateBuckets, retry_after_secs};
-use horde_observe::reader::{LocalLogs, Target, egress_lines, scope_admits};
+use horde_observe::reader::{LocalLogs, egress_lines, scope_admits};
 use horde_observe::record::Record;
 use horde_observe::settings::AgentReadLimits;
-use horde_proto::v1::{LogEndReason, LogQuery, ReadLogsRequest, read_logs_request};
-use horde_wire::logs::{Frame, LocalRead, end, filter_from_wire, serve_local};
+use horde_proto::v1::LogEndReason;
+use horde_wire::logs::{Frame, end};
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use crate::service::shared::ServerCore;
-use registry::{LaneState, LogRegistry};
+use registry::LogRegistry;
 
 /// The prefix of the server's own log files.
 pub const BINARY: &str = "horde-server";
@@ -41,7 +45,7 @@ pub const BINARY: &str = "horde-server";
 pub const TUNNEL_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The frames buffered between a read's source and its client.
-const FRAME_DEPTH: usize = 16;
+pub const FRAME_DEPTH: usize = 16;
 
 /// The server's log plane: its own files, the workers' lanes, and the
 /// agent read limits.
@@ -84,119 +88,6 @@ pub struct Authorized {
     pub max_bytes: u32,
 }
 
-/// An agent's session and the worker it is placed on.
-async fn locate(core: &ServerCore, agent_id: &str) -> Result<(String, Option<String>), Status> {
-    core.sessions
-        .walk(crate::enrollment::is_session_stream, |state| {
-            match state.agents.get(agent_id) {
-                Some(agent) => {
-                    ControlFlow::Break((state.session_id.clone(), agent.worker_id.clone()))
-                }
-                None => ControlFlow::Continue(()),
-            }
-        })
-        .await
-        .map_err(Status::from)?
-        .ok_or_else(|| Status::not_found(format!("no agent {agent_id:?}")))
-}
-
-fn agent_of(id: Option<&horde_proto::v1::AgentId>) -> String {
-    id.map(|id| id.value.clone()).unwrap_or_default()
-}
-
-/// Decides whether a read may happen and what it is held to.
-///
-/// `conduit` is the worker a certificate names (`None` for a client, and
-/// for a plaintext test channel). `now` drives the rate limit.
-///
-/// # Errors
-///
-/// `InvalidArgument` without a target; `PermissionDenied` for a worker
-/// reading on nobody's behalf, for an agent placed elsewhere, or for
-/// another session's agent; `NotFound` for an unknown agent;
-/// `ResourceExhausted` (with `retry-after`) past the rate limit;
-/// `FailedPrecondition` for an agent target placed nowhere.
-pub async fn authorize(
-    core: &ServerCore,
-    conduit: Option<&str>,
-    request: &ReadLogsRequest,
-    now: Instant,
-) -> Result<Authorized, Status> {
-    let target = request.target.as_ref().ok_or_else(|| {
-        Status::invalid_argument("name a target: the server, a worker, or an agent")
-    })?;
-    let (session_scope, max_bytes) = match conduit {
-        None => (None, request.max_bytes),
-        Some(worker_id) => {
-            let session = conduit_scope(core, worker_id, request, target).await?;
-            let reader = agent_of(request.on_behalf_of.as_ref());
-            if let Err(wait) = core.logs.buckets.take(&reader, now) {
-                return Err(rate_limited(&reader, wait));
-            }
-            (
-                Some(session),
-                core.logs.buckets.limits().clamp(request.max_bytes),
-            )
-        }
-    };
-    let target = match target {
-        read_logs_request::Target::Server(_) => Resolved::Server,
-        read_logs_request::Target::Worker(worker_id) => Resolved::Worker {
-            worker_id: worker_id.clone(),
-            agent: None,
-        },
-        read_logs_request::Target::Agent(agent) => {
-            let (_, placed) = locate(core, &agent.value).await?;
-            let worker_id = placed.ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "agent {} is not placed on any worker",
-                    agent.value
-                ))
-            })?;
-            Resolved::Worker {
-                worker_id,
-                agent: Some(agent.value.clone()),
-            }
-        }
-    };
-    Ok(Authorized {
-        target,
-        session_scope,
-        max_bytes,
-    })
-}
-
-/// A worker caller's session scope: the session of the agent it reads for,
-/// which must be placed on it, and which an agent target must share.
-async fn conduit_scope(
-    core: &ServerCore,
-    worker_id: &str,
-    request: &ReadLogsRequest,
-    target: &read_logs_request::Target,
-) -> Result<String, Status> {
-    let reader = agent_of(request.on_behalf_of.as_ref());
-    if reader.is_empty() {
-        return Err(Status::permission_denied(
-            "a worker reads logs only on behalf of one of its agents (on_behalf_of)",
-        ));
-    }
-    let (session, placed) = locate(core, &reader).await?;
-    if !crate::trust::holds_agent(placed.as_deref(), worker_id) {
-        return Err(Status::permission_denied(format!(
-            "agent {reader} is not placed on worker {worker_id}, which may not read for it"
-        )));
-    }
-    if let read_logs_request::Target::Agent(agent) = target {
-        let (theirs, _) = locate(core, &agent.value).await?;
-        if theirs != session {
-            return Err(Status::permission_denied(format!(
-                "agent {reader} may read the logs of its own session's agents only"
-            )));
-        }
-    }
-    Ok(session)
-}
-
 /// The refusal past the rate limit: a code the endpoint turns into a tool
 /// error the model can read, with the wait in both the text and the
 /// `retry-after` metadata.
@@ -210,118 +101,6 @@ pub fn rate_limited(agent: &str, wait: Duration) -> Status {
         status.metadata_mut().insert("retry-after", value);
     }
     status
-}
-
-/// Opens an authorized read: the frames it produces, in order, ending with
-/// an end frame.
-///
-/// # Errors
-///
-/// `InvalidArgument` for an unparseable filter or cursor; `Unavailable`
-/// for a server without log files, a worker not connected (with when it
-/// was last seen), or a tunnel that never came; `FailedPrecondition` for a
-/// worker that predates log serving.
-pub async fn open(
-    core: &ServerCore,
-    authorized: Authorized,
-    request: &ReadLogsRequest,
-) -> Result<mpsc::Receiver<Frame>, Status> {
-    let filter = request.filter.clone().unwrap_or_default();
-    // Validated here, so a bad pattern is refused before any worker is asked.
-    filter_from_wire(&filter, authorized.session_scope.clone(), SystemTime::now())
-        .map_err(Status::invalid_argument)?;
-    let (sender, receiver) = mpsc::channel(FRAME_DEPTH);
-    tracing::info!(
-        target: horde_observe::tap::QUIET_TARGET,
-        target_kind = ?authorized.target,
-        follow = request.follow,
-        scoped = authorized.session_scope.is_some(),
-        "log read"
-    );
-    match authorized.target {
-        Resolved::Server => {
-            let local = core
-                .logs
-                .local
-                .clone()
-                .ok_or_else(|| Status::unavailable("this server keeps no log files to read"))?;
-            let read = LocalRead::from_wire(
-                Target::Process,
-                &filter,
-                authorized.session_scope,
-                request.follow,
-                request.after.as_ref(),
-                authorized.max_bytes,
-            )
-            .map_err(Status::invalid_argument)?;
-            tokio::spawn(async move { serve_local(&local, read, &sender).await });
-        }
-        Resolved::Worker { worker_id, agent } => {
-            let query = LogQuery {
-                request_id: String::new(),
-                agent: agent.map(horde_proto::v1::AgentId::new),
-                filter: Some(filter),
-                follow: request.follow,
-                after: request.after.clone(),
-                max_bytes: authorized.max_bytes,
-                session_scope: authorized.session_scope.clone(),
-            };
-            let frames = dispatch(&core.logs.registry, &worker_id, query).await?;
-            let cap = usize::try_from(authorized.max_bytes)
-                .ok()
-                .filter(|cap| *cap != 0);
-            tokio::spawn(relay(frames, sender, authorized.session_scope, cap));
-        }
-    }
-    Ok(receiver)
-}
-
-/// Pushes `query` down `worker_id`'s lane and waits for its tunnel.
-async fn dispatch(
-    registry: &LogRegistry,
-    worker_id: &str,
-    mut query: LogQuery,
-) -> Result<mpsc::Receiver<Frame>, Status> {
-    let lane = match registry.lane(worker_id) {
-        LaneState::Connected(lane) => lane,
-        LaneState::Away(seen) => {
-            let seen = seen
-                .map(|at| format!(" (last seen {})", horde_observe::record::format_ts(at)))
-                .unwrap_or_default();
-            return Err(Status::unavailable(format!(
-                "worker {worker_id} is not connected{seen}; read its files on that machine \
-                 with `horde logs --dir`"
-            )));
-        }
-        LaneState::Unsupported => {
-            return Err(Status::failed_precondition(format!(
-                "worker {worker_id} predates log serving (it does not advertise {})",
-                horde_wire::logs::LOGS_CAPABILITY
-            )));
-        }
-        LaneState::Unknown => {
-            return Err(Status::unavailable(format!(
-                "worker {worker_id} is not connected"
-            )));
-        }
-    };
-    let (request_id, paired) = registry.begin(worker_id);
-    query.request_id.clone_from(&request_id);
-    if lane.try_send(query).is_err() {
-        registry.abandon(&request_id);
-        return Err(Status::unavailable(format!(
-            "worker {worker_id} is not taking log reads right now"
-        )));
-    }
-    match tokio::time::timeout(TUNNEL_DEADLINE, paired).await {
-        Ok(Ok(frames)) => Ok(frames),
-        _ => {
-            registry.abandon(&request_id);
-            Err(Status::unavailable(format!(
-                "worker {worker_id} did not open its log tunnel"
-            )))
-        }
-    }
 }
 
 /// Relays a worker's frames to the client: the session scope and the byte
@@ -371,5 +150,3 @@ pub async fn relay(
 
 #[cfg(test)]
 pub(crate) mod testfix;
-#[cfg(test)]
-mod tests;

@@ -262,7 +262,6 @@ mod tests {
     use horde_observe::settings::LogSettings;
     use horde_proto::v1::{AgentId, LogCursor, LogEndReason, LogFilter};
     use tokio::sync::mpsc;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{
         Frame, LocalRead, cursor_from_wire, cursor_to_wire, filter_from_wire, serve_local,
@@ -340,8 +339,7 @@ mod tests {
             &horde_observe::ServiceIdentity::new("horde-worker"),
         )
         .expect("start");
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             for message in messages {
                 tracing::info!(target: "horde_worker", "{message}");
             }
@@ -356,6 +354,23 @@ mod tests {
             frames.push(frame);
         }
         frames
+    }
+
+    /// Serves `read` and asserts it said "truncated" with nothing in hand,
+    /// then ended for `reason`.
+    async fn assert_empty_truncated(logs: &LocalLogs, read: LocalRead, reason: LogEndReason) {
+        let (sender, receiver) = mpsc::channel(8);
+        serve_local(logs, read, &sender).await;
+        drop(sender);
+        let frames = drain(receiver).await;
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [Frame::Records(none), Frame::End(end)]
+                    if none.lines.is_empty() && none.truncated && end.reason == reason as i32
+            ),
+            "{frames:?}"
+        );
     }
 
     fn read(after: Option<&LogCursor>, max_bytes: u32, follow: bool) -> LocalRead {
@@ -402,19 +417,7 @@ mod tests {
             source: "horde".to_owned(),
             ..LogCursor::default()
         };
-        let (sender, receiver) = mpsc::channel(8);
-        serve_local(&logs, read(Some(&first), 1, false), &sender).await;
-        drop(sender);
-        let frames = drain(receiver).await;
-        assert!(
-            matches!(
-                frames.as_slice(),
-                [Frame::Records(none), Frame::End(end)]
-                    if none.lines.is_empty() && none.truncated
-                        && end.reason == LogEndReason::ByteCap as i32
-            ),
-            "{frames:?}"
-        );
+        assert_empty_truncated(&logs, read(Some(&first), 1, false), LogEndReason::ByteCap).await;
     }
 
     /// A tail read whose newest record is already over the cap still says
@@ -424,19 +427,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _logging = written(dir.path(), &["m1"]);
         let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let (sender, receiver) = mpsc::channel(8);
-        serve_local(&logs, read(None, 1, false), &sender).await;
-        drop(sender);
-        let frames = drain(receiver).await;
-        assert!(
-            matches!(
-                frames.as_slice(),
-                [Frame::Records(none), Frame::End(end)]
-                    if none.lines.is_empty() && none.truncated
-                        && end.reason == LogEndReason::Done as i32
-            ),
-            "{frames:?}"
-        );
+        assert_empty_truncated(&logs, read(None, 1, false), LogEndReason::Done).await;
     }
 
     #[tokio::test]
@@ -452,8 +443,7 @@ mod tests {
             panic!("the initial records come first");
         };
         assert_eq!(initial.lines.len(), 1);
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             tracing::info!(target: "horde_worker", "not matched");
             tracing::info!(target: "horde_worker", "m-after");
         });
@@ -461,7 +451,7 @@ mod tests {
             panic!("the followed record");
         };
         assert!(followed.lines[0].contains("m-after"));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             tracing::info!(target: "horde_worker", "m-{}", "x".repeat(600));
         });
         let Some(Frame::End(end)) = receiver.recv().await else {
