@@ -85,6 +85,9 @@ pub trait FsStats: Send + Sync + std::fmt::Debug {
 pub struct StatvfsStats;
 
 impl FsStats for StatvfsStats {
+    // The `statvfs` field types are platform-sized (u64 on Linux, u32 and
+    // c_ulong on macOS), so the conversions are useless only here.
+    #[allow(clippy::useless_conversion)]
     fn stats(&self, path: &Path) -> Option<(u64, u64)> {
         let stats = nix::sys::statvfs::statvfs(path).ok()?;
         let fragment = u64::from(stats.fragment_size());

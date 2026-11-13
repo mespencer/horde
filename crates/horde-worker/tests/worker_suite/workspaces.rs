@@ -484,6 +484,7 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
 }
 
 /// The cleanup pass an explicit, non-dry-run removal runs under.
+#[cfg(test)]
 fn explicit_pass(
     policy: &horde_worker::workspace::policy::WorkspacePolicy,
 ) -> horde_worker::workspace::cleanup::Pass<'_> {
@@ -496,6 +497,7 @@ fn explicit_pass(
 }
 
 /// One agent's ledger record, archived.
+#[cfg(test)]
 async fn archived(
     manager: &WorkspaceManager,
     agent: &str,
