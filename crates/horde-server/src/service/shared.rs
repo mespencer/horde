@@ -111,6 +111,14 @@ impl ServerCore {
         }
     }
 
+    /// Replaces the permission modes spawns are stamped from — the registry
+    /// a chain driver over this core's log must share.
+    #[must_use]
+    pub fn with_permission_modes(mut self, modes: Arc<crate::permission::PermissionModes>) -> Self {
+        self.permission_modes = modes;
+        self
+    }
+
     /// Takes everything configuration decides from `settings` (ADR-0016):
     /// the workspace defaults, the tier catalog, the permission modes and the
     /// provenance `GetEffectiveConfig` reports. Placement's disk thresholds
