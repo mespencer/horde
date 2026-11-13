@@ -1,0 +1,54 @@
+#!/bin/sh
+# The multi-node harness's entrypoint for roles that need more than one exec.
+#
+#   horde-node worker [horde-worker flags...]
+#       Joins on first start, then runs the worker. A worker with no identity
+#       waits for its one-time join token at /join/token — delivered over
+#       `docker compose exec` stdin by whoever minted it with
+#       `horde worker enroll` — and redeems it with --join-file, so the
+#       secret never rides argv or the environment. A restart over the same
+#       /state finds the identity and the stored endpoint and needs neither;
+#       it also deletes the spent (single-use) token.
+#
+#   horde-node origin
+#       Seeds /srv/git/atlas.git with one commit on main (once) and serves
+#       /srv/git read-only over git://, the "upstream" every workspace
+#       clones from.
+set -eu
+
+role="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$role" in
+worker)
+    state=/state
+    if [ -f "$state/identity/identity.pem" ]; then
+        rm -f /join/token
+        exec horde-worker --state-dir "$state" "$@"
+    fi
+    echo "horde-node: no identity in $state; waiting for /join/token" >&2
+    while [ ! -s /join/token ]; do
+        sleep 0.2
+    done
+    exec horde-worker --state-dir "$state" --join-file /join/token "$@"
+    ;;
+origin)
+    repo=/srv/git/atlas.git
+    if [ ! -d "$repo" ]; then
+        seed="$(mktemp -d)"
+        git init -q --bare "$repo"
+        git -C "$seed" init -q
+        echo "atlas" >"$seed/README.md"
+        git -C "$seed" add README.md
+        git -C "$seed" commit -q -m seed
+        git -C "$seed" push -q "$repo" HEAD:refs/heads/main
+        rm -rf "$seed"
+    fi
+    exec git daemon --base-path=/srv/git --export-all --reuseaddr \
+        --listen=0.0.0.0 --port=9418 /srv/git
+    ;;
+*)
+    echo "usage: horde-node worker [flags...] | horde-node origin" >&2
+    exit 64
+    ;;
+esac

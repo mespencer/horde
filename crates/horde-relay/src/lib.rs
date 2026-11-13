@@ -38,6 +38,6 @@ pub use http::RelayServer;
 pub use mirror::{MirrorError, MirrorStore};
 pub use resolve::{CheckoutView, ShareRoute, resolve_route};
 pub use transport::{
-    ObservedHead, RelayLocation, ShareError, observe_head, obtain_share, require_committed,
-    share_ref, stage_share,
+    ObservedHead, RelayIdentity, RelayLocation, ShareError, observe_head, obtain_share,
+    require_committed, share_ref, stage_share,
 };

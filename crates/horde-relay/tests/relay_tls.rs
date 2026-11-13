@@ -40,7 +40,12 @@ mod suite {
             commit_file(&origin, "src.rs", "fn main() {}", "add src"),
         )
         .await;
+        tls_relay_over(scratch, &origin).await
+    }
 
+    /// [`tls_relay`] with `atlas` registered against an origin the caller
+    /// arranged; `scratch` is kept alive with the relay.
+    async fn tls_relay_over(scratch: tempfile::TempDir, origin: &std::path::Path) -> TlsRelay {
         let mirrors = tempfile::tempdir().expect("a mirror dir");
         let store =
             std::sync::Arc::new(horde_relay::MirrorStore::new(mirrors.path().join("relay")));
@@ -189,6 +194,77 @@ mod suite {
         assert!(
             refused.is_err(),
             "a revoked serial must be refused by the Relay's door: {refused:?}"
+        );
+    }
+
+    /// The location a real worker would dial: the mTLS door by the name its
+    /// certificate answers to, presenting the identity saved where a worker
+    /// keeps it — or presenting nothing, when `identity` is `None`.
+    fn tls_location(
+        relay: &TlsRelay,
+        identity: Option<&std::path::Path>,
+    ) -> horde_relay::RelayLocation {
+        let location = horde_relay::RelayLocation::new(&format!(
+            "https://localhost:{}",
+            relay.server.addr().port()
+        ));
+        match identity {
+            Some(dir) => location.with_identity(horde_relay::RelayIdentity::in_dir(dir)),
+            None => location,
+        }
+    }
+
+    /// The whole share, through real `git` over the mTLS door: the sender's
+    /// push and the receiver's fetch both present the worker identity as
+    /// saved on disk (DESIGN §8, cross-machine). This is the dial a worker on
+    /// another machine makes — the loopback door cannot reach it.
+    #[tokio::test]
+    async fn a_share_crosses_the_mtls_door_with_the_saved_identity() {
+        let workers = within(
+            "the two-worker arrangement",
+            crate::common::harness::two_workers(),
+        )
+        .await;
+        let relay =
+            tls_relay_over(tempfile::tempdir().expect("a scratch dir"), &workers.origin).await;
+        let ids = tempfile::tempdir().expect("an identity dir");
+        relay.identity.save(ids.path()).expect("the identity saves");
+
+        let route = horde_relay::ShareRoute::ViaRelay {
+            repo_name: "atlas".to_owned(),
+        };
+        let shared = workers.senders_commit.clone();
+
+        // Positive control the other way first: the same dial presenting no
+        // certificate is refused, so the success below is the identity's.
+        let bare = tls_location(&relay, None);
+        let refused = within(
+            "the bare push",
+            horde_relay::stage_share(&workers.sender_repo, &route, Some(&bare), &shared),
+        )
+        .await;
+        assert!(refused.is_err(), "no certificate, no push: {refused:?}");
+
+        let location = tls_location(&relay, Some(ids.path()));
+        within(
+            "stage",
+            horde_relay::stage_share(&workers.sender_repo, &route, Some(&location), &shared),
+        )
+        .await
+        .expect("the push presents the identity");
+        within(
+            "obtain",
+            horde_relay::obtain_share(&workers.receiver_repo, &route, Some(&location), &shared),
+        )
+        .await
+        .expect("the fetch presents the identity");
+        assert!(
+            within(
+                "the receiver has it",
+                crate::common::harness::has_commit(&workers.receiver_repo, &shared)
+            )
+            .await,
+            "the commit must arrive through the mTLS door"
         );
     }
 }
