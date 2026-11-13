@@ -51,7 +51,6 @@ pub mod version;
 pub mod wire;
 
 pub use codec::{decode_line, encode_interrupt, encode_user_message};
-pub use identity::RevivalIdentity;
 pub use replay::ReplaySession;
 pub use turn::TurnAssembler;
 

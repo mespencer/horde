@@ -60,7 +60,6 @@ pub use codec::{
     encode_permissions_response, encode_steer, encode_thread_resume, encode_thread_start,
     encode_turn_start, encode_user_input_response, encode_withdrawal,
 };
-pub use identity::RevivalIdentity;
 pub use replay::{ReplaySession, replay};
 pub use sandbox::{SandboxPolicy, SandboxTier, TierChoice};
 pub use turn::{
