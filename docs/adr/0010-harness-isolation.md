@@ -59,6 +59,14 @@ servers, and stdio MCP servers running after archive.
   A leader with a different start time is a stranger who was handed the pid
   (after a reboot) and is never signalled.
 
+**Amendment (2026-11-13), Windows (ADR-0017):** on Windows the process
+group is a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, reached by
+handle (`horde_worker::process_tree`). A stop closes the harness's stdin,
+waits the stop grace, and terminates the job; a dropped handle or a crashed
+Worker closes the job and kills every member, so no ledger is written there.
+"Owner-only" files and directories inherit the user profile's ACL instead of
+a mode. Secrets stay off argv on every platform.
+
 ## Consequences
 
 - **A Worker-owned config directory starts logged out.** An agent run there
