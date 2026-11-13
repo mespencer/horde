@@ -1344,50 +1344,75 @@ async fn run_workspace(
             name,
             repos,
             unmanaged_paths,
-        } => {
-            let repos = repos
-                .iter()
-                .map(|value| repo_from(value))
-                .collect::<Result<Vec<_>, _>>()?;
-            let definition = client
-                .create_workspace_definition(name, repos, unmanaged_paths.clone())
-                .await?;
-            println!("{}", render::workspace(&definition, format));
-        }
+        } => create_workspace(client, name, repos, unmanaged_paths, format).await,
         WorkspaceCommand::List => {
             let definitions = client.list_workspace_definitions().await?;
             println!("{}", render::workspaces(&definitions, format));
+            Ok(())
         }
         WorkspaceCommand::Get { reference } => {
             let response = client.get_workspace_definition(reference).await?;
             println!("{}", render::workspace_with_instances(&response, format));
+            Ok(())
         }
         WorkspaceCommand::AddRepo {
             workspace_definition_id,
             repo,
             etag,
-        } => {
-            let definition = client
-                .add_workspace_repo(workspace_definition_id, repo_from(repo)?, etag)
-                .await?;
-            println!("{}", render::workspace(&definition, format));
-        }
-        WorkspaceCommand::Update(args) => {
-            crate::workspace_update::run(client, args, format).await?;
-        }
+        } => add_workspace_repo(client, workspace_definition_id, repo, etag, format).await,
+        WorkspaceCommand::Update(args) => crate::workspace_update::run(client, args, format).await,
         WorkspaceCommand::Delete {
             workspace_definition_id,
             etag,
-        } => {
-            client
-                .delete_workspace_definition(workspace_definition_id, etag)
-                .await?;
-            println!(
-                "{}",
-                render::workspace_deleted(workspace_definition_id, format)
-            );
-        }
+        } => delete_workspace(client, workspace_definition_id, etag, format).await,
     }
+}
+
+async fn create_workspace(
+    client: &mut Client,
+    name: &str,
+    repos: &[String],
+    unmanaged_paths: &[String],
+    format: Format,
+) -> Result<(), ClientError> {
+    let repos = repos
+        .iter()
+        .map(|value| repo_from(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let definition = client
+        .create_workspace_definition(name, repos, unmanaged_paths.to_vec())
+        .await?;
+    println!("{}", render::workspace(&definition, format));
+    Ok(())
+}
+
+async fn add_workspace_repo(
+    client: &mut Client,
+    workspace_definition_id: &str,
+    repo: &str,
+    etag: &str,
+    format: Format,
+) -> Result<(), ClientError> {
+    let definition = client
+        .add_workspace_repo(workspace_definition_id, repo_from(repo)?, etag)
+        .await?;
+    println!("{}", render::workspace(&definition, format));
+    Ok(())
+}
+
+async fn delete_workspace(
+    client: &mut Client,
+    workspace_definition_id: &str,
+    etag: &str,
+    format: Format,
+) -> Result<(), ClientError> {
+    client
+        .delete_workspace_definition(workspace_definition_id, etag)
+        .await?;
+    println!(
+        "{}",
+        render::workspace_deleted(workspace_definition_id, format)
+    );
     Ok(())
 }
 
