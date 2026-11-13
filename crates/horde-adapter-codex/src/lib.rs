@@ -48,6 +48,7 @@ pub mod codec;
 pub mod identity;
 pub mod replay;
 pub mod sandbox;
+pub mod surface;
 pub mod turn;
 pub mod version;
 pub mod wire;
