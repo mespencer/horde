@@ -191,7 +191,7 @@ Layered, evaluated in order:
 
 As built, the whole chain evaluates **server-side**, in one driver over the event log (deny → remembered allow → allow → judge → escalate) — one authority, not the worker-local fast path originally sketched here. The worker's share of enforcement is the harness-side settings hardening that stops a harness pre-empting the chain (ADR-0003).
 
-Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), and layered under manual-approve / allowlist styles. Escalation requests carry tree path + context ("session ci-fix → reviewer → test-runner wants `docker rm`"). As built (ADR-0009), the production server's unnamed mode allows an agent's own orchestrator verbs within its own subtree and escalates everything else. Rules name Horde's own tools canonically as `horde/<tool>`, and the chain maps Claude's `mcp__horde__<tool>` onto that name, so one rule covers both harnesses (ADR-0004, 2026-10-31 amendment).
+Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), and layered under manual-approve / allowlist styles. As decided for wave 12 (ADR-0016), the default mode is **bypass**: the chain allows every call no deny rule refuses, journaling each prompt and its allow so every client still sees it; the rule chain is the built-in `ask` mode or any mode the server's config file authors; there is no judge. A question (Claude's `AskUserQuestion`, codex's `requestUserInput`) is not a permission and always escalates to a human, whatever the mode. Escalation requests carry tree path + context ("session ci-fix → reviewer → test-runner wants `docker rm`"). As built (ADR-0009), the production server's unnamed mode allows an agent's own orchestrator verbs within its own subtree and escalates everything else. Rules name Horde's own tools canonically as `horde/<tool>`, and the chain maps Claude's `mcp__horde__<tool>` onto that name, so one rule covers both harnesses (ADR-0004, 2026-10-31 amendment).
 
 **Per-provider gating capability varies.** Adapters advertise whether tool calls can be pre-authorized externally: Claude can (permission interception incl. input rewrite, ADR-0003); Codex cannot in current releases — its sandbox tier + project-trust chosen at thread start are the real controls (ADR-0005). Permission modes and placement must consult this flag: a high-trust assignment can refuse placement on an agent whose provider can't be gated. As built (ADR-0009), placement stamps the placed agent's adapter capabilities into the log, and a narrowing (`updated_input`) is refused — or, replayed from memory, escalated — for an agent whose adapter cannot rewrite tool input.
 
@@ -217,15 +217,21 @@ Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), an
 
 ## 13. Configuration layering
 
-Precedence: **spawn args > repo > workspace > user-global.**
+Precedence, least to most specific: **built-in defaults < role config file < workspace < session < flags** (ADR-0016).
 
 | Layer | Lives | Holds |
 |---|---|---|
-| User-global | Server DB (CLI/TUI-authored) | Default provider, personal permission modes, top-level-vs-subagent prompt overlays (about *you*) |
-| Workspace | Workspace definition (server) | Default mode, default agent type, layout, MCP allowlists, collision pins |
-| Repo | `.horde/` in each repo | Repo-scoped agent types & prompt fragments (about *that codebase*), versioned with the code, rides PRs |
+| Built-in defaults | Code, one key table per role | Every key's default, printed by `config show` |
+| Role config file | `~/.horde/server/config.toml`, `~/.horde/worker/config.toml`, `~/.horde/client/config.toml` (TOML, `--config` overrides) | Server: permission modes and the default mode, the tier catalog, ADR-0014's `workspace.*`/`placement.*`, `logs.*`. Worker: `worker.workspace.*`, `codex.sandbox.*`, `logs.*`. Client: `session.permission_mode`, `logs.*` |
+| Workspace | Workspace definition (server) | Default permission mode, checkout mode, cleanup overrides; later: default agent type, MCP allowlists, collision pins |
+| Session | `CreateSessionRequest.settings`, recorded on the root spawn | Default permission mode for agents a client creates in the session |
+| Flags | The process's flags (a process-wide key), or the spawn's (a per-agent key) | Anything the layer below said |
 
-Multi-repo workspaces: each repo's `.horde/` contributes namespaced definitions; cross-repo name collisions are surfaced warnings, pinnable at the workspace layer. Top-level agents and subagents get different prompt overlays (a stated requirement) — user-global config, applied by the worker at spawn.
+Each file is validated strictly: an unknown key is refused with its path and the keys valid there, a type error names what was expected and found, and another role's key names the role it belongs to. Every effective value carries its origin (`horde config show [--server --workspace W --session S] --origin`, `horde-server --show-config`, `horde-worker --show-config`). A file is read at start; there is no hot reload.
+
+An agent's permission mode is resolved when a client creates it — spawn flag, then session, then workspace, then server — and stamped into its spawn, so the log records what it ran under. An agent-originated child still inherits its parent's mode and may not change it (ADR-0009), so the workspace and session layers can never widen a child past its parent.
+
+Not built: the repo layer (`.horde/` in each repo: repo-scoped agent types and prompt fragments) and prompt overlays. A checked-out repo is content agents write, so it may never grant authority; when the repo layer arrives it carries definitions, not permissions. Multi-repo workspaces: each repo's `.horde/` would contribute namespaced definitions; cross-repo name collisions surfaced as warnings, pinnable at the workspace layer. Top-level agents and subagents get different prompt overlays (a stated requirement) — user config, applied by the worker at spawn.
 
 ## 14. Build sequencing
 
