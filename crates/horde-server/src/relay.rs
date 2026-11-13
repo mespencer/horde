@@ -7,16 +7,17 @@
 //! catalog — the definitions are where repo names meet remote URLs, so the
 //! catalog is the one source that cannot drift from what workers check out.
 //!
-//! # Loopback only, deliberately
+//! # Two doors
 //!
-//! The Relay speaks plain git smart-HTTP on this listener, and the workers'
-//! git processes cannot yet present a client certificate (the mTLS door,
-//! `RelayServer::bind_mtls`, exists and is proven — but a door nobody can
-//! walk through secures nothing). Until the worker's git dial carries its
-//! identity, binding beyond loopback would be exactly the unauthenticated
-//! networked listener DESIGN §3 forbids, so it is refused by name rather
-//! than allowed and regretted. Single-machine topologies — every worker on
-//! the server's host — are served fully today.
+//! The loopback door (`--relay-bind`) speaks plain git smart-HTTP with the
+//! ambient principal, so it refuses any non-loopback bind: an unauthenticated
+//! networked listener is exactly what DESIGN §3 forbids. The mTLS door
+//! (`--relay-mtls-bind`) is the one other machines dial: every connection
+//! presents a certificate chaining to the server's CA, revoked serials are
+//! refused at the handshake, and the principal becomes `REMOTE_USER`. A
+//! worker whose `--relay` is an `https://` URL presents its own enrolled
+//! identity on every git dial (`horde_relay::RelayIdentity`). Both doors
+//! serve the same mirrors and the same catalog-fed registry.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -26,10 +27,13 @@ use crate::error::ServerError;
 use crate::log::{EventLog, Notification};
 use crate::workspace::{CATALOG_STREAM, WorkspaceCatalog, is_catalog_stream};
 
-/// The served Relay and the task keeping its registry current.
+/// The served Relay doors and the task keeping their registry current.
 #[derive(Debug)]
 pub struct MountedRelay {
-    pub server: horde_relay::RelayServer,
+    /// The plaintext loopback door, when `--relay-bind` asked for one.
+    pub loopback: Option<horde_relay::RelayServer>,
+    /// The mTLS door, when `--relay-mtls-bind` asked for one.
+    pub mtls: Option<horde_relay::RelayServer>,
     follower: tokio::task::JoinHandle<()>,
 }
 
@@ -39,33 +43,92 @@ impl Drop for MountedRelay {
     }
 }
 
-/// Serves the Relay on `bind`, mirrors under `state_dir/relay`, registry fed
-/// from the workspace catalog now and kept current as definitions change.
+/// The material the mTLS door authenticates with: the listener credential,
+/// the CA every peer chains to, and the live revocation list.
+#[derive(Debug, Clone)]
+pub struct MtlsDoor<'a> {
+    pub bind: SocketAddr,
+    pub credential: &'a horde_identity::ServerCredential,
+    pub ca_pem: &'a str,
+    pub deny: horde_identity::RevocationList,
+}
+
+/// Which doors to open; at least one, or there is nothing to mount.
+#[derive(Debug, Clone, Default)]
+pub struct RelayDoors<'a> {
+    pub loopback: Option<SocketAddr>,
+    pub mtls: Option<MtlsDoor<'a>>,
+}
+
+impl RelayDoors<'_> {
+    /// Only the loopback door.
+    #[must_use]
+    pub fn loopback(bind: SocketAddr) -> Self {
+        Self {
+            loopback: Some(bind),
+            mtls: None,
+        }
+    }
+}
+
+/// Serves the Relay's requested doors, mirrors under `state_dir/relay`,
+/// registry fed from the workspace catalog now and kept current as
+/// definitions change. `None` when no door was asked for.
 ///
 /// # Errors
 ///
-/// A non-loopback bind (see the module docs), the bind itself failing, or
-/// the catalog being unreadable.
+/// A non-loopback loopback-door bind (see the module docs), either bind
+/// failing, unusable TLS material, or the catalog being unreadable.
 pub async fn mount(
-    bind: SocketAddr,
+    doors: RelayDoors<'_>,
     state_dir: &Path,
     log: &EventLog,
-) -> Result<MountedRelay, ServerError> {
-    if !bind.ip().is_loopback() {
+) -> Result<Option<MountedRelay>, ServerError> {
+    if doors.loopback.is_none() && doors.mtls.is_none() {
+        return Ok(None);
+    }
+    if let Some(bind) = doors.loopback
+        && !bind.ip().is_loopback()
+    {
         return Err(ServerError::Invalid(format!(
-            "--relay-bind {bind} is not loopback: the relay listener speaks \
-             plain git smart-HTTP, and workers cannot present a certificate \
-             to its mTLS door yet — bind 127.0.0.1 until the worker git dial \
-             carries an identity"
+            "--relay-bind {bind} is not loopback: that door speaks plain git \
+             smart-HTTP with no identity — bind 127.0.0.1 there, and serve \
+             other machines through --relay-mtls-bind"
         )));
     }
 
     let store = Arc::new(horde_relay::MirrorStore::new(state_dir.join("relay")));
     register_catalog(&store, log).await?;
 
-    let server = horde_relay::RelayServer::bind(bind, Arc::clone(&store))
-        .await
-        .map_err(|error| ServerError::Internal(format!("binding the relay at {bind}: {error}")))?;
+    let loopback = match doors.loopback {
+        Some(bind) => Some(
+            horde_relay::RelayServer::bind(bind, Arc::clone(&store))
+                .await
+                .map_err(|error| {
+                    ServerError::Internal(format!("binding the relay at {bind}: {error}"))
+                })?,
+        ),
+        None => None,
+    };
+    let mtls = match doors.mtls {
+        Some(door) => Some(
+            horde_relay::RelayServer::bind_mtls(
+                door.bind,
+                Arc::clone(&store),
+                door.credential,
+                door.ca_pem,
+                door.deny,
+            )
+            .await
+            .map_err(|error| {
+                ServerError::Internal(format!(
+                    "binding the relay's mTLS door at {}: {error}",
+                    door.bind
+                ))
+            })?,
+        ),
+        None => None,
+    };
 
     // Definitions created after startup register their repos too. The
     // follower re-projects the whole catalog per catalog notification:
@@ -73,7 +136,11 @@ pub async fn mount(
     // that cannot drift beats a delta that can.
     let follower = tokio::spawn(follow_catalog(store, log.clone()));
 
-    Ok(MountedRelay { server, follower })
+    Ok(Some(MountedRelay {
+        loopback,
+        mtls,
+        follower,
+    }))
 }
 
 /// Makes the registry exactly the live catalog's repos: registers every live
@@ -235,9 +302,13 @@ mod tests {
     async fn a_non_loopback_relay_bind_is_refused_by_name() {
         let log = EventLog::in_memory().expect("an in-memory log");
         let state = tempfile::tempdir().expect("a state dir");
-        let refused = mount("0.0.0.0:0".parse().expect("an address"), state.path(), &log)
-            .await
-            .expect_err("a wildcard bind must be refused");
+        let refused = mount(
+            super::RelayDoors::loopback("0.0.0.0:0".parse().expect("an address")),
+            state.path(),
+            &log,
+        )
+        .await
+        .expect_err("a wildcard bind must be refused");
         let message = refused.to_string();
         assert!(message.contains("loopback"), "{message}");
         assert!(message.contains("--relay-bind"), "{message}");
@@ -292,12 +363,14 @@ mod tests {
         journal_definition(&log, "ws-1:1", definition).await;
 
         let mounted = mount(
-            "127.0.0.1:0".parse().expect("an address"),
+            super::RelayDoors::loopback("127.0.0.1:0".parse().expect("an address")),
             state.path(),
             &log,
         )
         .await
-        .expect("the relay mounts");
+        .expect("the relay mounts")
+        .expect("a door was asked for");
+        let served = mounted.loopback.as_ref().expect("the loopback door").addr();
 
         // A real clone through the served relay: the mirror materializes
         // lazily from the registered remote on first request. Async and
@@ -305,7 +378,7 @@ mod tests {
         // test's own runtime, and an unbounded one turns a defect into a
         // hang.
         let clone_dir = state.path().join("clone");
-        let url = format!("http://{}/maps", mounted.server.addr());
+        let url = format!("http://{}/maps", served);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             tokio::process::Command::new("git")
@@ -338,7 +411,7 @@ mod tests {
         };
         journal_definition(&log, "ws-2:1", late).await;
 
-        let late_url = format!("http://{}/charts", mounted.server.addr());
+        let late_url = format!("http://{}/charts", served);
         let late_clone = state.path().join("late-clone");
         let mut cloned = false;
         for _ in 0..100_u32 {

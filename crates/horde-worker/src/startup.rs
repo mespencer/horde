@@ -602,9 +602,26 @@ async fn build_runtime(
         runtime = runtime.with_workspaces(crate::WorkspaceManager::new(name, root.clone()));
     }
     if let Some(relay) = &config.relay {
-        runtime = runtime.with_relay(horde_relay::RelayLocation::new(relay));
+        runtime = runtime.with_relay(relay_location(relay, identity, &config.identity_dir()));
     }
     Ok(runtime)
+}
+
+/// Where this Worker's git reaches the Relay. An `https://` Relay is the
+/// server's mTLS door, so every dial presents this Worker's enrolled identity
+/// (DESIGN §8); a plaintext URL is the loopback door, dialled bare. An
+/// unenrolled Worker (`--insecure`) has nothing to present.
+fn relay_location(
+    relay: &str,
+    identity: Option<&StoredIdentity>,
+    identity_dir: &std::path::Path,
+) -> horde_relay::RelayLocation {
+    let location = horde_relay::RelayLocation::new(relay);
+    if identity.is_some() && relay.starts_with("https://") {
+        location.with_identity(horde_relay::RelayIdentity::in_dir(identity_dir))
+    } else {
+        location
+    }
 }
 
 /// The Worker-owned harness profile one provider's adapter launches under
@@ -1623,6 +1640,35 @@ mod tests {
         assert!(
             reason.contains("could not reach the server"),
             "the reason survives into the operator line: {reason}"
+        );
+    }
+
+    /// The mTLS door gets the Worker's identity; the loopback door and an
+    /// unenrolled Worker dial bare — each half of the choice held.
+    #[test]
+    fn only_an_enrolled_worker_dialling_https_presents_its_identity() {
+        let identity = horde_identity::StoredIdentity {
+            certificate_pem: "cert".to_owned(),
+            key_pem: "key".to_owned(),
+            ca_pem: "ca".to_owned(),
+        };
+        let dir = std::path::Path::new("/state/identity");
+        let tls = "https://horde.lan:7779";
+        assert_eq!(
+            super::relay_location(tls, Some(&identity), dir),
+            horde_relay::RelayLocation::new(tls)
+                .with_identity(horde_relay::RelayIdentity::in_dir(dir))
+        );
+        assert_eq!(
+            super::relay_location(tls, None, dir),
+            horde_relay::RelayLocation::new(tls),
+            "nothing to present without an identity"
+        );
+        let plain = "http://127.0.0.1:7420";
+        assert_eq!(
+            super::relay_location(plain, Some(&identity), dir),
+            horde_relay::RelayLocation::new(plain),
+            "the loopback door takes no certificate"
         );
     }
 }
