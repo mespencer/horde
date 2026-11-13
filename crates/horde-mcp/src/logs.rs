@@ -493,6 +493,59 @@ mod tests {
         assert!(bad.is_err());
     }
 
+    /// Each filter parameter reaches the read.
+    #[tokio::test]
+    async fn since_level_and_grep_each_narrow_the_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let access = LogAccess::new(
+            Some(files(dir.path())),
+            "w1",
+            AgentReadLimits {
+                calls_per_minute: 600,
+                burst: 100,
+                ..AgentReadLimits::default()
+            },
+        );
+        let client = client();
+        let count = |params: LogsParams| {
+            let (access, mut client) = (&access, client.clone());
+            async move {
+                access
+                    .call(&mut client, "a1", "s1", &params)
+                    .await
+                    .expect("read")
+                    .records
+                    .len()
+            }
+        };
+        assert_eq!(
+            count(LogsParams {
+                grep: Some("line 3".to_owned()),
+                ..LogsParams::default()
+            })
+            .await,
+            1
+        );
+        assert_eq!(
+            count(LogsParams {
+                level: Some("warn".to_owned()),
+                ..LogsParams::default()
+            })
+            .await,
+            0,
+            "stderr reads as info"
+        );
+        assert_eq!(
+            count(LogsParams {
+                since: Some("2999-01-01T00:00:00Z".to_owned()),
+                ..LogsParams::default()
+            })
+            .await,
+            0
+        );
+        assert_eq!(count(LogsParams::default()).await, 6);
+    }
+
     #[tokio::test]
     async fn the_rate_and_concurrency_limits_refuse_in_words() {
         let dir = tempfile::tempdir().expect("tempdir");

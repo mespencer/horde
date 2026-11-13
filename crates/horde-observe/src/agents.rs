@@ -312,6 +312,46 @@ mod tests {
         assert!(left.iter().filter(|f| f.prefix == "old").count() < 2);
     }
 
+    /// An archived agent's newer file goes before a live agent's older
+    /// one: liveness, not age, decides who pays first.
+    #[test]
+    fn the_budget_spares_a_live_agents_older_files_before_an_archived_agents_newer_ones() {
+        let probe = tempfile::tempdir().expect("tempdir");
+        let line = "x".repeat(300);
+        let measure = AgentLogs::new(probe.path(), settings(1 << 20), "b", None);
+        measure.writer("l", "s").line(&line);
+        let size = list(probe.path(), None)[0].len;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let three = AgentLogSettings {
+            max_file_bytes: 400,
+            max_files: 3,
+            budget_bytes: size * 4 + size / 2,
+        };
+        let logs = AgentLogs::new(dir.path(), three, "b", None);
+        let live = logs.writer("l", "s");
+        live.line(&line);
+        live.line(&line);
+        let archived = logs.writer("a", "s");
+        archived.line(&line);
+        archived.line(&line);
+        drop(archived);
+        live.line(&line);
+        let left: Vec<String> = list(dir.path(), None)
+            .iter()
+            .map(|file| format!("{}.{}", file.prefix, file.n))
+            .collect();
+        assert!(
+            left.contains(&"l.1".to_owned()),
+            "the live agent's oldest file stays: {left:?}"
+        );
+        assert!(
+            !left.contains(&"a.1".to_owned()),
+            "the archived agent's file went: {left:?}"
+        );
+        assert_eq!(left.len(), 4, "{left:?}");
+    }
+
     fn file(prefix: &str, n: u64, len: u64) -> LogFile {
         LogFile {
             path: PathBuf::from(format!("/a/{prefix}.{n}.jsonl")),
