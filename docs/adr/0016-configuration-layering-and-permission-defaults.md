@@ -12,7 +12,7 @@ code implements (CONFORMANCE: ABSENT).
 Day to day, the permission chain is also too strict. Its shipped default
 escalates everything except an agent's own orchestrator verbs, so every
 `Read` and every `Bash` waits for a human. The operator decided on
-2026-11-13 (docs/WAVE12.md, W12e): permissions default to bypass, the rule
+2026-11-13: permissions default to bypass, the rule
 chain stays available as a mode, there is no judge, and harness prompts and
 questions still reach clients.
 
