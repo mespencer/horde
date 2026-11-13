@@ -4,6 +4,7 @@ syntax = "proto3";
 
 package horde.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "horde/v1/id.proto";
 
@@ -17,6 +18,60 @@ message WorkspaceRepo {
 
   // Path relative to the Instance root where this repo is checked out.
   string layout_path = 4;
+
+  // How this repo's agent checkouts are soft-reclaimed (ADR-0014). Unset
+  // reads as auto.
+  ReclaimPolicy reclaim = 5;
+}
+
+// Whether an agent checks out every repo of its Workspace at spawn, or only
+// the repos it names and the rest on demand (ADR-0014).
+enum CheckoutMode {
+  // Reads as ALL.
+  CHECKOUT_MODE_UNSPECIFIED = 0;
+
+  CHECKOUT_MODE_ALL = 1;
+
+  CHECKOUT_MODE_LAZY = 2;
+}
+
+// How a repo's checkouts are soft-reclaimed. Unset reads as auto.
+message ReclaimPolicy {
+  // Detect by marker file at the repo root (the Server-resolved auto rules;
+  // built in: Cargo.toml runs `cargo clean`).
+  message Auto {}
+
+  // Never reclaim this repo's checkouts.
+  message Disabled {}
+
+  message Command {
+    // argv[0] is a bare program name (resolved on PATH) or an absolute path.
+    // Never run through a shell.
+    repeated string argv = 1;
+
+    // Unset: the resolved default.
+    google.protobuf.Duration timeout = 2;
+
+    // Repo-relative directories this command reclaims. Ignored files under
+    // them are build output, not loss, when hard removal judges a checkout
+    // (ADR-0014 resolution 2). Empty: every ignored file counts as loss.
+    repeated string output_paths = 3;
+  }
+
+  oneof policy {
+    Auto auto = 1;
+    Disabled disabled = 2;
+    Command command = 3;
+  }
+}
+
+// Workspace-layer overrides of the cleanup defaults.
+message WorkspaceCleanupPolicy {
+  // Unset: inherit. Zero: never.
+  google.protobuf.Duration idle_reclaim_after = 1;
+
+  // Unset: inherit.
+  google.protobuf.Duration archived_grace = 2;
 }
 
 // The portable description of a Workspace: repos, layout, Unmanaged Paths.
@@ -37,6 +92,12 @@ message WorkspaceDefinition {
 
   // Optimistic-concurrency token. Send back on Update; mismatch is ABORTED.
   string etag = 6;
+
+  // Unset reads as ALL. Each spawn may override it.
+  CheckoutMode checkout_mode = 7;
+
+  // Overrides of the Server's cleanup defaults for this Workspace.
+  WorkspaceCleanupPolicy cleanup = 8;
 }
 
 enum WorkspaceInstanceState {
@@ -82,11 +143,67 @@ message WorkspaceInstanceReport {
   string detail = 6;
 
   google.protobuf.Timestamp observed_at = 7;
+
+  // The agent checkouts inside this Instance, from the Worker's ledger.
+  repeated CheckoutReport checkouts = 8;
+
+  // The whole Instance root, checkouts included, as of sized_at.
+  uint64 instance_bytes = 9;
+
+  uint64 unmanaged_bytes = 10;
+
+  // The filesystem holding the workspace root.
+  uint64 filesystem_free_bytes = 11;
+
+  uint64 filesystem_total_bytes = 12;
+
+  google.protobuf.Timestamp sized_at = 13;
 }
 
-// Designed to stream while an Instance is being materialized, so `prewarm`
-// is visible rather than a silent wait (DESIGN §6). Not yet produced:
-// Workers currently report once, on completion, with no progress attached.
+enum CheckoutState {
+  CHECKOUT_STATE_UNSPECIFIED = 0;
+
+  // Live agent, turn in flight or recently active.
+  CHECKOUT_STATE_ACTIVE = 1;
+
+  // Live agent, idle past idle_reclaim_after.
+  CHECKOUT_STATE_IDLE = 2;
+
+  // Archived; hard removal is waiting on the grace period or was not
+  // provably lossless (retained_reason says which).
+  CHECKOUT_STATE_ARCHIVED_RETAINED = 3;
+
+  // On disk, no agent this Worker knows: left behind by a worker reset.
+  CHECKOUT_STATE_ORPHAN = 4;
+}
+
+// One agent's private checkout inside an Instance.
+message CheckoutReport {
+  AgentId agent_id = 1;
+
+  SessionId session_id = 2;
+
+  // Checked-out repo names.
+  repeated string repos = 3;
+
+  string branch = 4;
+
+  CheckoutState state = 5;
+
+  google.protobuf.Timestamp last_active_at = 6;
+
+  google.protobuf.Timestamp soft_reclaimed_at = 7;
+
+  // As of the Instance report's sized_at.
+  uint64 bytes = 8;
+
+  // Why hard removal was refused, when it was.
+  string retained_reason = 9;
+}
+
+// Journaled while an Instance is being materialized, so `prewarm` is visible
+// rather than a silent wait (DESIGN §6): one step per repo plus the unmanaged
+// paths, before the final READY or DEGRADED report (ADR-0014).
 message MaterializationProgress {
   // What is happening now, e.g. "cloning atlas".
   string step = 1;

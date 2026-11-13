@@ -13,6 +13,7 @@ syntax = "proto3";
 
 package horde.v1;
 
+import "google/protobuf/duration.proto";
 import "horde/v1/agent.proto";
 import "horde/v1/event.proto";
 import "horde/v1/forward.proto";
@@ -182,6 +183,9 @@ message SpawnAgentCommand {
   // name. Resolved Server-side from the catalog and the Agent's type; the
   // endpoint filters its hub toolset to exactly these prefixes.
   repeated string visible_hub_mcp_servers = 9;
+
+  // The cleanup and freshness policy this agent's Workspace resolves to.
+  ResolvedWorkspacePolicy workspace_policy = 10;
 }
 
 message DeliverMessageCommand {
@@ -217,6 +221,67 @@ message MaterializeWorkspaceCommand {
 
   // Session whose log should carry progress events, when there is one.
   SessionId session_id = 2;
+
+  ResolvedWorkspacePolicy policy = 3;
+}
+
+// Server-resolved workspace policy (ADR-0014): built-in defaults, then the
+// Server's configuration, then the Definition's cleanup overrides. The
+// Worker never reads Server configuration.
+message ResolvedWorkspacePolicy {
+  message MarkerRule {
+    // A file at the repo root that selects this rule, e.g. "Cargo.toml".
+    string marker_file = 1;
+
+    ReclaimPolicy.Command command = 2;
+  }
+
+  // Default 60s.
+  google.protobuf.Duration fetch_throttle = 1;
+
+  // Default 30s.
+  google.protobuf.Duration fetch_timeout = 2;
+
+  // Default 4h; zero is never.
+  google.protobuf.Duration idle_reclaim_after = 3;
+
+  // Default 24h (ADR-0014 resolution 1); zero removes at archive.
+  google.protobuf.Duration archived_grace = 4;
+
+  // Default 10m.
+  google.protobuf.Duration reclaim_timeout = 5;
+
+  // Built in: Cargo.toml runs `cargo clean`.
+  repeated MarkerRule auto_rules = 6;
+
+  // Unset: archive pins never expire.
+  google.protobuf.Duration archived_pin_ttl = 7;
+}
+
+// Plan, and unless dry_run carry out, workspace cleanup on this Worker.
+message WorkspaceGcCommand {
+  string request_id = 1;
+
+  // Empty: every Instance here.
+  WorkspaceDefinitionId workspace_definition_id = 2;
+
+  // Empty: every checkout.
+  repeated AgentId agent_ids = 3;
+
+  GcLevel level = 4;
+
+  bool force = 5;
+
+  bool dry_run = 6;
+
+  bool remove_instance = 7;
+
+  bool include_pins = 8;
+
+  ResolvedWorkspacePolicy policy = 9;
+
+  // Always the workspace-housekeeping stream today.
+  SessionId carrying_stream = 10;
 }
 
 message DeliverPermissionDecisionCommand {
@@ -253,6 +318,7 @@ message StreamCommandsResponse {
     MaterializeWorkspaceCommand materialize_workspace = 14;
     DeliverPermissionDecisionCommand deliver_permission_decision = 15;
     CancelPlacementCommand cancel_placement = 16;
+    WorkspaceGcCommand workspace_gc = 17;
   }
 }
 

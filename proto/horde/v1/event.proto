@@ -292,7 +292,245 @@ message Event {
     // An operator reset a Worker's journal (ADR-0011). Lives in the reserved
     // worker-journal stream.
     WorkerJournalReset worker_journal_reset = 35;
+
+    // Workspaces (ADR-0014). CheckoutPrepared lives in the agent's Session;
+    // the rest live in the reserved workspace-housekeeping stream.
+    CheckoutPrepared checkout_prepared = 36;
+    WorkspaceCleanup workspace_cleanup = 37;
+    WorkspaceGcRequested workspace_gc_requested = 38;
+    WorkspaceGcCompleted workspace_gc_completed = 39;
+    WorkspaceDiskPressure workspace_disk_pressure = 40;
   }
+}
+
+// Per agent, in its Session: exactly what each repo of a checkout started
+// from. Journaled at spawn (all initial repos) and at each
+// workspace_checkout (one repo).
+message CheckoutPrepared {
+  enum BaseResolution {
+    BASE_RESOLUTION_UNSPECIFIED = 0;
+
+    // origin/<default>, fetched within the throttle.
+    BASE_RESOLUTION_FRESH = 1;
+
+    // The fetch failed; the cached origin/<default>.
+    BASE_RESOLUTION_CACHED = 2;
+
+    // No remote-tracking ref at all, or the `shared` policy.
+    BASE_RESOLUTION_INSTANCE_HEAD = 3;
+
+    BASE_RESOLUTION_PARENT = 4;
+
+    BASE_RESOLUTION_REQUESTED = 5;
+
+    // A redelivered spawn or a revival: the checkout was already there.
+    BASE_RESOLUTION_REUSED = 6;
+  }
+
+  message Repo {
+    string repo_name = 1;
+
+    string branch = 2;
+
+    string base_commit_sha = 3;
+
+    BaseResolution resolution = 4;
+
+    // For REQUESTED and PARENT.
+    string requested_ref = 5;
+
+    // The last successful fetch behind the base.
+    google.protobuf.Timestamp fetched_at = 6;
+
+    // Non-empty is the warning: why the base is not fresh.
+    string stale_reason = 7;
+  }
+
+  repeated Repo repos = 1;
+
+  CheckoutMode mode = 2;
+
+  // Every repo the agent could check out (the manifest's set).
+  repeated string available_repos = 3;
+}
+
+enum CleanupTier {
+  CLEANUP_TIER_UNSPECIFIED = 0;
+
+  // Ran the repo's reclaim command; worktree, branch and commits stay.
+  CLEANUP_TIER_SOFT = 1;
+
+  // Removed the worktree and its branch, after pinning HEAD.
+  CLEANUP_TIER_HARD = 2;
+
+  // Dropped an archive pin.
+  CLEANUP_TIER_UNPIN = 3;
+
+  // Removed a whole Instance.
+  CLEANUP_TIER_INSTANCE = 4;
+}
+
+enum CleanupTrigger {
+  CLEANUP_TRIGGER_UNSPECIFIED = 0;
+
+  CLEANUP_TRIGGER_ARCHIVE = 1;
+
+  CLEANUP_TRIGGER_IDLE = 2;
+
+  CLEANUP_TRIGGER_DISK_PRESSURE = 3;
+
+  CLEANUP_TRIGGER_EXPLICIT = 4;
+
+  CLEANUP_TRIGGER_PURGE = 5;
+
+  // The Worker's periodic scan: orphans, an expired archive grace period.
+  CLEANUP_TRIGGER_SCAN = 6;
+}
+
+// One cleanup decision on one checkout (or pin, or Instance).
+message WorkspaceCleanup {
+  message RetainedFile {
+    // Repo-relative.
+    string path = 1;
+
+    uint64 bytes = 2;
+  }
+
+  message RepoAction {
+    enum Outcome {
+      OUTCOME_UNSPECIFIED = 0;
+
+      OUTCOME_DONE = 1;
+
+      // A dry run's answer for an action that would have run.
+      OUTCOME_WOULD_DO = 2;
+
+      OUTCOME_SKIPPED = 3;
+
+      // Not provably lossless, so not done.
+      OUTCOME_REFUSED = 4;
+
+      OUTCOME_FAILED = 5;
+    }
+
+    string repo_name = 1;
+
+    Outcome outcome = 2;
+
+    // "untracked files: 3", "no reclaim command", "timed out after 10m".
+    string reason = 3;
+
+    // The reclaim command run, if any.
+    repeated string argv = 4;
+
+    int32 exit_code = 5;
+
+    // The last 4 KiB of stdout and stderr.
+    string output_tail = 6;
+
+    uint64 bytes_freed = 7;
+
+    // HARD: what refs/horde/archived/<agent> now holds.
+    string pinned_commit_sha = 8;
+
+    // Ignored files outside every reclaim output path: what a forced hard
+    // removal would delete that cannot be recovered (ADR-0014 resolution 2).
+    repeated RetainedFile unrecoverable_files = 9;
+  }
+
+  WorkerId worker_id = 1;
+
+  WorkspaceDefinitionId workspace_definition_id = 2;
+
+  // Empty for an INSTANCE action and a pin with no ledger.
+  AgentId agent_id = 3;
+
+  // From the checkout ledger; may be empty for orphans.
+  SessionId session_id = 4;
+
+  CleanupTier tier = 5;
+
+  CleanupTrigger trigger = 6;
+
+  // EXPLICIT and PURGE.
+  string gc_request_id = 7;
+
+  bool dry_run = 8;
+
+  repeated RepoAction repos = 9;
+}
+
+enum GcLevel {
+  // Reads as AUTOMATIC.
+  GC_LEVEL_UNSPECIFIED = 0;
+
+  // Soft reclaim only.
+  GC_LEVEL_SOFT = 1;
+
+  // Soft plus lossless hard removal of archived checkouts: what the triggers
+  // would do.
+  GC_LEVEL_AUTOMATIC = 2;
+
+  // Plus orphans, pins and retained checkouts: lossless unless forced.
+  GC_LEVEL_HARD = 3;
+}
+
+// Server-appended in the housekeeping stream by the gc, instance-remove and
+// delete --purge RPCs. Targets are resolved at request time, so the command
+// fold stays a pure function of the log.
+message WorkspaceGcRequested {
+  string request_id = 1;
+
+  repeated WorkerId worker_ids = 2;
+
+  // Empty: every Instance on the targets.
+  WorkspaceDefinitionId workspace_definition_id = 3;
+
+  // Empty: every checkout.
+  repeated AgentId agent_ids = 4;
+
+  GcLevel level = 5;
+
+  bool force = 6;
+
+  bool dry_run = 7;
+
+  bool remove_instance = 8;
+
+  bool include_pins = 9;
+
+  // The requesting principal, from its certificate (ADR-0009).
+  string requested_by = 10;
+}
+
+// A Worker's answer to one WorkspaceGcRequested, after its WorkspaceCleanup
+// events.
+message WorkspaceGcCompleted {
+  string request_id = 1;
+
+  WorkerId worker_id = 2;
+
+  uint32 actions_done = 3;
+
+  uint32 actions_refused = 4;
+
+  uint64 bytes_freed = 5;
+
+  // The whole request failed, e.g. the Worker has no workspace support.
+  string error = 6;
+}
+
+// The disk stayed below the low watermark after every permitted reclaim.
+// One per pressure episode.
+message WorkspaceDiskPressure {
+  WorkerId worker_id = 1;
+
+  uint64 free_bytes = 2;
+
+  uint64 low_watermark_bytes = 3;
+
+  // True: nothing reclaimable was left.
+  bool exhausted = 4;
 }
 
 // A late journal entry from an Agent's former placement (ADR-0011): the

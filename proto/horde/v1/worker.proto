@@ -125,6 +125,16 @@ message WorkerCapabilities {
   // would refuse it, so an Agent that names a Workspace can only land where
   // this is set.
   bool supports_workspaces = 8;
+
+  // The workspace protocol this Worker implements: 2 for ADR-0014 (fresh
+  // bases, lazy checkout, branches, two-tier cleanup), absent (0) before.
+  uint32 workspace_protocol = 9;
+
+  // The filesystem holding the workspace root, at registration. Placement
+  // deprioritizes a Worker under disk pressure (ADR-0014 resolution 7).
+  uint64 workspace_free_bytes = 10;
+
+  uint64 workspace_total_bytes = 11;
 }
 
 enum WorkerConnectionState {
