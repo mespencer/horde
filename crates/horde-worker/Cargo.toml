@@ -58,8 +58,6 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.19"
-# The config file's parser (ADR-0016); the walk over it is horde-config's.
-toml = "1.2.1"
 tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
