@@ -98,7 +98,7 @@ pub fn registry() -> Vec<RegisteredGate> {
                 name: "mutants",
                 enforcement: Enforcement::Blocking,
                 depends_on: &[],
-                summary: "cargo-mutants: no mutant survives, diff-scoped against main",
+                summary: "cargo-gamma: no mutant missed (timeouts count), diff-scoped against main",
             },
             gate: Box::new(gates::mutants::gate()),
         },

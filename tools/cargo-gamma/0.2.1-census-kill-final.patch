@@ -1,0 +1,46 @@
+diff -ruN a/cargo-gamma-0.2.1/Cargo.lock b/cargo-gamma-0.2.1/Cargo.lock
+--- a/cargo-gamma-0.2.1/Cargo.lock	2006-07-23 21:21:28
++++ b/cargo-gamma-0.2.1/Cargo.lock	2026-10-29 11:11:04
+@@ -135,8 +135,6 @@
+ [[package]]
+ name = "cargo-gamma-lib"
+ version = "0.2.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9e0f3bc0fe8ea62fda3020a8aa1104bc21d0e0654165fceb6520294c6312a70c"
+ dependencies = [
+  "blake3",
+  "camino",
+diff -ruN a/cargo-gamma-0.2.1/Cargo.toml b/cargo-gamma-0.2.1/Cargo.toml
+--- a/cargo-gamma-0.2.1/Cargo.toml	2006-07-23 21:21:28
++++ b/cargo-gamma-0.2.1/Cargo.toml	2026-10-29 11:10:59
+@@ -55,6 +55,7 @@
+ 
+ [dependencies.cargo-gamma-lib]
+ version = "0.2.1"
++path = "../cargo-gamma-lib-0.2.1"
+ default-features = false
+ 
+ [dependencies.mimalloc]
+@@ -67,6 +68,7 @@
+ 
+ [dev-dependencies.cargo-gamma-lib]
+ version = "0.2.1"
++path = "../cargo-gamma-lib-0.2.1"
+ features = ["internals"]
+ default-features = false
+ 
+diff -ruN a/cargo-gamma-lib-0.2.1/src/exec/sweep.rs b/cargo-gamma-lib-0.2.1/src/exec/sweep.rs
+--- a/cargo-gamma-lib-0.2.1/src/exec/sweep.rs	2006-07-23 21:21:28
++++ b/cargo-gamma-lib-0.2.1/src/exec/sweep.rs	2026-10-29 11:10:52
+@@ -664,7 +664,10 @@
+         // A complete census proves which tests can observe the mutant, but filtering also shrinks
+         // runtime and peak memory and can change failure order. A non-passing filtered run is
+         // therefore provisional: repeat the whole binary and use only its canonical outcome.
+-        if matches!(selection, CensusSelection::Selected(_)) && !matches!(verdict, Verdict::Passed) {
++        //
++        // Atlas patch: a filtered run that failed is final. Kill confirmation, which re-runs the
++        // failing test with no mutant active, still decides whether the kill stands.
++        if matches!(selection, CensusSelection::Selected(_)) && !matches!(verdict, Verdict::Passed | Verdict::Failed(_)) {
+             let _launches = tally.launches.fetch_add(1, Ordering::Relaxed);
+             verdict = run_binary(
+                 work,

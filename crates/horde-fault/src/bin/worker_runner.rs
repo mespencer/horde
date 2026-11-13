@@ -1,6 +1,6 @@
 //! The worker-runner: the production worker library as a killable process.
 //!
-//! Test fixture, not product (`.cargo/mutants.toml` excludes it under the
+//! Test fixture, not product (`gamma.toml` excludes it under the
 //! same criterion as `stub_harness`: the suite runs it, it tests nothing).
 //! It composes exactly the pieces the eventual `horde-worker` binary will —
 //! `Journal::open` over a file that survives `kill -9`, a `Runtime` over a

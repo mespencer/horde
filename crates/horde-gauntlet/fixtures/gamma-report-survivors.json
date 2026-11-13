@@ -1,0 +1,1007 @@
+{
+ "schemaVersion": "2",
+ "thresholds": {
+  "high": 80,
+  "low": 60
+ },
+ "projectRoot": "/repo",
+ "framework": {
+  "name": "cargo-gamma",
+  "version": "0.2.1"
+ },
+ "files": {
+  "crates/horde-observe/src/config.rs": {
+   "source": "(source elided)",
+   "language": "rust",
+   "mutants": [
+    {
+     "id": "5d9e3131bf48",
+     "mutatorName": "fn_value.ok",
+     "location": {
+      "start": {
+       "line": 60,
+       "column": 46
+      },
+      "end": {
+       "line": 84,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "Ok(None)",
+     "description": "replace { let endpoint = l...o: ratio, })) } } } with Ok(None)",
+     "statusReason": "failed `config::tests::a_ratio_with_an_endpoint_is_used`",
+     "duration": 58.0,
+     "killedBy": [
+      "config::tests::a_ratio_with_an_endpoint_is_used"
+     ]
+    },
+    {
+     "id": "9231ee5ee85e",
+     "mutatorName": "unary.remove_not",
+     "location": {
+      "start": {
+       "line": 63,
+       "column": 25
+      },
+      "end": {
+       "line": 63,
+       "column": 42
+      }
+     },
+     "status": "Killed",
+     "replacement": "value.is_empty()",
+     "description": "replace !value.is_empty() with value.is_empty()",
+     "statusReason": "failed `config::tests::an_endpoint_alone_exports_everything`",
+     "duration": 37.0,
+     "killedBy": [
+      "config::tests::an_endpoint_alone_exports_everything"
+     ]
+    },
+    {
+     "id": "2c268a3da170",
+     "mutatorName": "option.none_to_some",
+     "location": {
+      "start": {
+       "line": 65,
+       "column": 28
+      },
+      "end": {
+       "line": 65,
+       "column": 32
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Some(Default::default())",
+     "description": "replace None with Some(Default::default())",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "019e7996c71e",
+     "mutatorName": "result.err_to_ok",
+     "location": {
+      "start": {
+       "line": 66,
+       "column": 28
+      },
+      "end": {
+       "line": 66,
+       "column": 67
+      }
+     },
+     "status": "Killed",
+     "replacement": "Ok(Default::default())",
+     "description": "replace Err(ConfigError::SampleWithoutEndpoint) with Ok(Default::default())",
+     "statusReason": "failed `config::tests::a_ratio_without_an_endpoint_is_refused`",
+     "duration": 8.0,
+     "killedBy": [
+      "config::tests::a_ratio_without_an_endpoint_is_refused"
+     ]
+    },
+    {
+     "id": "bc70849f5acb",
+     "mutatorName": "option.some_to_none",
+     "location": {
+      "start": {
+       "line": 67,
+       "column": 38
+      },
+      "end": {
+       "line": 70,
+       "column": 11
+      }
+     },
+     "status": "Killed",
+     "replacement": "None",
+     "description": "replace Some(OtlpConfig { ...mple_ratio: 1.0, }) with None",
+     "statusReason": "failed `config::tests::the_endpoint_is_trimmed`",
+     "duration": 35.0,
+     "killedBy": [
+      "config::tests::the_endpoint_is_trimmed"
+     ]
+    },
+    {
+     "id": "4f001bbc90b6",
+     "mutatorName": "option.some_to_none",
+     "location": {
+      "start": {
+       "line": 78,
+       "column": 16
+      },
+      "end": {
+       "line": 81,
+       "column": 15
+      }
+     },
+     "status": "Killed",
+     "replacement": "None",
+     "description": "replace Some(OtlpConfig { ...le_ratio: ratio, }) with None",
+     "statusReason": "failed `config::tests::a_ratio_with_an_endpoint_is_used`",
+     "duration": 7.0,
+     "killedBy": [
+      "config::tests::a_ratio_with_an_endpoint_is_used"
+     ]
+    },
+    {
+     "id": "f1098445186e",
+     "mutatorName": "fn_value.bool_false",
+     "location": {
+      "start": {
+       "line": 91,
+       "column": 39
+      },
+      "end": {
+       "line": 93,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "false",
+     "description": "replace { ratio.is_finite(....contains(&ratio) } with false",
+     "statusReason": "failed `config::tests::a_ratio_with_an_endpoint_is_used`",
+     "duration": 37.0,
+     "killedBy": [
+      "config::tests::a_ratio_with_an_endpoint_is_used"
+     ]
+    },
+    {
+     "id": "ce2fef58bff4",
+     "mutatorName": "fn_value.bool_true",
+     "location": {
+      "start": {
+       "line": 91,
+       "column": 39
+      },
+      "end": {
+       "line": 93,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "true",
+     "description": "replace { ratio.is_finite(....contains(&ratio) } with true",
+     "statusReason": "failed `config::tests::the_ratio_truth_table`",
+     "duration": 81.0,
+     "killedBy": [
+      "config::tests::the_ratio_truth_table"
+     ]
+    },
+    {
+     "id": "2f1d4e469f67",
+     "mutatorName": "logical.and_to_or",
+     "location": {
+      "start": {
+       "line": 92,
+       "column": 5
+      },
+      "end": {
+       "line": 92,
+       "column": 54
+      }
+     },
+     "status": "Killed",
+     "replacement": "(ratio.is_finite()) || ((0.0..=1.0).contains(&ratio))",
+     "description": "replace ratio.is_finite() ...0).contains(&ratio) with (ratio.is_fini...ntains(&ratio))",
+     "statusReason": "failed `config::tests::an_unusable_ratio_is_refused_with_what_it_held`",
+     "duration": 22.0,
+     "killedBy": [
+      "config::tests::an_unusable_ratio_is_refused_with_what_it_held"
+     ]
+    },
+    {
+     "id": "582d1f3836fc",
+     "mutatorName": "range.inclusive_to_exclusive",
+     "location": {
+      "start": {
+       "line": 92,
+       "column": 27
+      },
+      "end": {
+       "line": 92,
+       "column": 36
+      }
+     },
+     "status": "CompileError",
+     "replacement": "(0.0)..=((1.0) - 1)",
+     "description": "replace 0.0..=1.0 with (0.0)..=((1.0) - 1)",
+     "statusReason": "the mutant does not compile"
+    }
+   ]
+  },
+  "crates/horde-observe/src/export.rs": {
+   "source": "(source elided)",
+   "language": "rust",
+   "mutants": [
+    {
+     "id": "bbaa6c211b4d",
+     "mutatorName": "fn_value.bool_false",
+     "location": {
+      "start": {
+       "line": 33,
+       "column": 51
+      },
+      "end": {
+       "line": 40,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "false",
+     "description": "replace { !SUPPRESSED_TARG...ts_with(\"::\")) }) } with false",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 39.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "9f9293d1466e",
+     "mutatorName": "fn_value.bool_true",
+     "location": {
+      "start": {
+       "line": 33,
+       "column": 51
+      },
+      "end": {
+       "line": 40,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "true",
+     "description": "replace { !SUPPRESSED_TARG...ts_with(\"::\")) }) } with true",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 36.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "a9ac2973c1cd",
+     "mutatorName": "unary.remove_not",
+     "location": {
+      "start": {
+       "line": 34,
+       "column": 5
+      },
+      "end": {
+       "line": 39,
+       "column": 7
+      }
+     },
+     "status": "Killed",
+     "replacement": "SUPPRESSED_TARGETS.iter().any(|prefix| {\n        target == *prefix\n            || target\n                .strip_prefix(prefix)\n                .is_some_and(|rest| rest.starts_with(\"::\"))\n    })",
+     "description": "replace !SUPPRESSED_TARGET...arts_with(\"::\")) }) with SUPPRESSED_TAR..._with(\"::\")) })",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 36.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "6c35a2f77171",
+     "mutatorName": "iter.any_to_all",
+     "location": {
+      "start": {
+       "line": 34,
+       "column": 6
+      },
+      "end": {
+       "line": 39,
+       "column": 7
+      }
+     },
+     "status": "Killed",
+     "replacement": "SUPPRESSED_TARGETS.iter().all(|prefix| {\n        target == *prefix\n            || target\n                .strip_prefix(prefix)\n                .is_some_and(|rest| rest.starts_with(\"::\"))\n    })",
+     "description": "replace SUPPRESSED_TARGETS...arts_with(\"::\")) }) with SUPPRESSED_TAR..._with(\"::\")) })",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 12.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "91e71e054475",
+     "mutatorName": "logical.or_to_and",
+     "location": {
+      "start": {
+       "line": 35,
+       "column": 9
+      },
+      "end": {
+       "line": 38,
+       "column": 60
+      }
+     },
+     "status": "Killed",
+     "replacement": "(target == *prefix) && (target\n                .strip_prefix(prefix)\n                .is_some_and(|rest| rest.starts_with(\"::\")))",
+     "description": "replace target == *prefix ....starts_with(\"::\")) with (target == *pr...ts_with(\"::\")))",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 7.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "fb0283ee377b",
+     "mutatorName": "relational.eq_to_ne",
+     "location": {
+      "start": {
+       "line": 35,
+       "column": 9
+      },
+      "end": {
+       "line": 35,
+       "column": 26
+      }
+     },
+     "status": "Killed",
+     "replacement": "(target) != (*prefix)",
+     "description": "replace target == *prefix with (target) != (*prefix)",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 8.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "7d4e90286da2",
+     "mutatorName": "string.starts_with_to_ends_with",
+     "location": {
+      "start": {
+       "line": 38,
+       "column": 37
+      },
+      "end": {
+       "line": 38,
+       "column": 59
+      }
+     },
+     "status": "Killed",
+     "replacement": "rest.ends_with(\"::\")",
+     "description": "replace rest.starts_with(\"::\") with rest.ends_with(\"::\")",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 7.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "63d52a6d10e6",
+     "mutatorName": "literal.str_to_empty",
+     "location": {
+      "start": {
+       "line": 38,
+       "column": 54
+      },
+      "end": {
+       "line": 38,
+       "column": 58
+      }
+     },
+     "status": "Killed",
+     "replacement": "\"\"",
+     "description": "replace \"::\" with \"\"",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 7.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "797bf2a29bc1",
+     "mutatorName": "literal.str_to_xyzzy",
+     "location": {
+      "start": {
+       "line": 38,
+       "column": 54
+      },
+      "end": {
+       "line": 38,
+       "column": 58
+      }
+     },
+     "status": "Killed",
+     "replacement": "\"xyzzy\"",
+     "description": "replace \"::\" with \"xyzzy\"",
+     "statusReason": "failed `export::tests::product_targets_export_and_pipeline_targets_do_not`",
+     "duration": 7.0,
+     "killedBy": [
+      "export::tests::product_targets_export_and_pipeline_targets_do_not"
+     ]
+    },
+    {
+     "id": "1bc97a485da0",
+     "mutatorName": "literal.int_decrement",
+     "location": {
+      "start": {
+       "line": 59,
+       "column": 47
+      },
+      "end": {
+       "line": 59,
+       "column": 48
+      }
+     },
+     "status": "CompileError",
+     "replacement": "-1",
+     "description": "replace 0 with -1",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "b699fe54056f",
+     "mutatorName": "literal.int_increment",
+     "location": {
+      "start": {
+       "line": 59,
+       "column": 47
+      },
+      "end": {
+       "line": 59,
+       "column": 48
+      }
+     },
+     "status": "Killed",
+     "replacement": "1",
+     "description": "replace 0 with 1",
+     "statusReason": "failed `export::tests::a_successful_export_counts_nothing_and_a_failure_passes_through`",
+     "duration": 25.0,
+     "killedBy": [
+      "export::tests::a_successful_export_counts_nothing_and_a_failure_passes_through"
+     ]
+    },
+    {
+     "id": "09c6ccf1c1d3",
+     "mutatorName": "stmt.delete_call",
+     "location": {
+      "start": {
+       "line": 81,
+       "column": 17
+      },
+      "end": {
+       "line": 81,
+       "column": 61
+      }
+     },
+     "status": "Killed",
+     "replacement": "",
+     "description": "delete dropped.fetch_add(spans, Ordering::Relaxed);",
+     "statusReason": "failed `shutdown_drains_the_queue_and_accounts_for_what_it_could_not_deliver`",
+     "duration": 34.0,
+     "killedBy": [
+      "shutdown_drains_the_queue_and_accounts_for_what_it_could_not_deliver"
+     ]
+    },
+    {
+     "id": "d103d8770316",
+     "mutatorName": "expr.decrement",
+     "location": {
+      "start": {
+       "line": 81,
+       "column": 35
+      },
+      "end": {
+       "line": 81,
+       "column": 40
+      }
+     },
+     "status": "Killed",
+     "replacement": "(spans) - 1",
+     "description": "replace spans with (spans) - 1",
+     "statusReason": "failed `export::tests::a_successful_export_counts_nothing_and_a_failure_passes_through`",
+     "duration": 6.0,
+     "killedBy": [
+      "export::tests::a_successful_export_counts_nothing_and_a_failure_passes_through"
+     ]
+    },
+    {
+     "id": "4d9aeaadd10e",
+     "mutatorName": "expr.increment",
+     "location": {
+      "start": {
+       "line": 81,
+       "column": 35
+      },
+      "end": {
+       "line": 81,
+       "column": 40
+      }
+     },
+     "status": "Killed",
+     "replacement": "(spans) + 1",
+     "description": "replace spans with (spans) + 1",
+     "statusReason": "failed `an_unreachable_collector_costs_spans_and_never_blocks`",
+     "duration": 32.0,
+     "killedBy": [
+      "an_unreachable_collector_costs_spans_and_never_blocks"
+     ]
+    },
+    {
+     "id": "61bd55a70308",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 93,
+       "column": 73
+      },
+      "end": {
+       "line": 95,
+       "column": 6
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Default::default()",
+     "description": "replace { self.inner.shutd..._timeout(timeout) } with Default::default()",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "d2187d44842a",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 97,
+       "column": 44
+      },
+      "end": {
+       "line": 99,
+       "column": 6
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Default::default()",
+     "description": "replace { self.inner.force_flush() } with Default::default()",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "2eaa0061b47c",
+     "mutatorName": "fn_value.unit",
+     "location": {
+      "start": {
+       "line": 101,
+       "column": 53
+      },
+      "end": {
+       "line": 103,
+       "column": 6
+      }
+     },
+     "status": "Killed",
+     "replacement": "()",
+     "description": "replace { self.inner.set_resource(resource); } with ()",
+     "statusReason": "failed `export::tests::lifecycle_calls_reach_the_inner_exporter`",
+     "duration": 36.0,
+     "killedBy": [
+      "export::tests::lifecycle_calls_reach_the_inner_exporter"
+     ]
+    },
+    {
+     "id": "64f4cc70777c",
+     "mutatorName": "stmt.delete_call",
+     "location": {
+      "start": {
+       "line": 102,
+       "column": 9
+      },
+      "end": {
+       "line": 102,
+       "column": 43
+      }
+     },
+     "status": "Killed",
+     "replacement": "",
+     "description": "delete self.inner.set_resource(resource);",
+     "statusReason": "failed `export::tests::lifecycle_calls_reach_the_inner_exporter`",
+     "duration": 34.0,
+     "killedBy": [
+      "export::tests::lifecycle_calls_reach_the_inner_exporter"
+     ]
+    }
+   ]
+  },
+  "crates/horde-observe/src/pipeline.rs": {
+   "source": "(source elided)",
+   "language": "rust",
+   "mutants": [
+    {
+     "id": "4a849bc7d329",
+     "mutatorName": "option.none_to_some",
+     "location": {
+      "start": {
+       "line": 42,
+       "column": 24
+      },
+      "end": {
+       "line": 42,
+       "column": 28
+      }
+     },
+     "status": "Survived",
+     "replacement": "Some(Default::default())",
+     "description": "replace None with Some(Default::default())",
+     "duration": 88.0
+    },
+    {
+     "id": "ae48bb35d835",
+     "mutatorName": "stmt.delete_assign",
+     "location": {
+      "start": {
+       "line": 53,
+       "column": 9
+      },
+      "end": {
+       "line": 53,
+       "column": 36
+      }
+     },
+     "status": "Killed",
+     "replacement": "",
+     "description": "delete self.principal = principal;",
+     "statusReason": "failed `an_exported_span_carries_the_service_identity_fields_and_events`",
+     "duration": 61.0,
+     "killedBy": [
+      "an_exported_span_carries_the_service_identity_fields_and_events"
+     ]
+    },
+    {
+     "id": "95cda8bde729",
+     "mutatorName": "assign_value.default",
+     "location": {
+      "start": {
+       "line": 53,
+       "column": 26
+      },
+      "end": {
+       "line": 53,
+       "column": 35
+      }
+     },
+     "status": "Killed",
+     "replacement": "Default::default()",
+     "description": "replace principal with Default::default()",
+     "statusReason": "failed `an_exported_span_carries_the_service_identity_fields_and_events`",
+     "duration": 21.0,
+     "killedBy": [
+      "an_exported_span_carries_the_service_identity_fields_and_events"
+     ]
+    },
+    {
+     "id": "0f961ed71ff5",
+     "mutatorName": "fn_value.ok",
+     "location": {
+      "start": {
+       "line": 108,
+       "column": 43
+      },
+      "end": {
+       "line": 113,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "Ok(None)",
+     "description": "replace { match crate::con... &identity)?)), } } with Ok(None)",
+     "statusReason": "failed `pipeline::tests::init_from_env_builds_exactly_when_opted_in`",
+     "duration": 14.0,
+     "killedBy": [
+      "pipeline::tests::init_from_env_builds_exactly_when_opted_in"
+     ]
+    },
+    {
+     "id": "a01efb601e39",
+     "mutatorName": "option.none_to_some",
+     "location": {
+      "start": {
+       "line": 110,
+       "column": 20
+      },
+      "end": {
+       "line": 110,
+       "column": 24
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Some(Default::default())",
+     "description": "replace None with Some(Default::default())",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "46b7aca5a65d",
+     "mutatorName": "option.some_to_none",
+     "location": {
+      "start": {
+       "line": 111,
+       "column": 28
+      },
+      "end": {
+       "line": 111,
+       "column": 63
+      }
+     },
+     "status": "Killed",
+     "replacement": "None",
+     "description": "replace Some(pipeline(&config, &identity)?) with None",
+     "statusReason": "failed `pipeline::tests::init_from_env_builds_exactly_when_opted_in`",
+     "duration": 15.0,
+     "killedBy": [
+      "pipeline::tests::init_from_env_builds_exactly_when_opted_in"
+     ]
+    },
+    {
+     "id": "be42b56965ba",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 153,
+       "column": 53
+      },
+      "end": {
+       "line": 161,
+       "column": 2
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Default::default()",
+     "description": "replace { let builder = Re...uilder.build(), } } with Default::default()",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "baf203556ed7",
+     "mutatorName": "literal.str_to_empty",
+     "location": {
+      "start": {
+       "line": 179,
+       "column": 47
+      },
+      "end": {
+       "line": 179,
+       "column": 62
+      }
+     },
+     "status": "Survived",
+     "replacement": "\"\"",
+     "description": "replace \"horde-observe\" with \"\"",
+     "duration": 84.0
+    },
+    {
+     "id": "92ad781ffbd8",
+     "mutatorName": "literal.str_to_xyzzy",
+     "location": {
+      "start": {
+       "line": 179,
+       "column": 47
+      },
+      "end": {
+       "line": 179,
+       "column": 62
+      }
+     },
+     "status": "Survived",
+     "replacement": "\"xyzzy\"",
+     "description": "replace \"horde-observe\" with \"xyzzy\"",
+     "duration": 124.0
+    },
+    {
+     "id": "2ef872826266",
+     "mutatorName": "fn_value.one",
+     "location": {
+      "start": {
+       "line": 190,
+       "column": 40
+      },
+      "end": {
+       "line": 192,
+       "column": 6
+      }
+     },
+     "status": "Killed",
+     "replacement": "1",
+     "description": "replace { self.dropped.load(Ordering::Relaxed) } with 1",
+     "statusReason": "failed `an_unreachable_collector_costs_spans_and_never_blocks`",
+     "duration": 55.0,
+     "killedBy": [
+      "an_unreachable_collector_costs_spans_and_never_blocks"
+     ]
+    },
+    {
+     "id": "ee60072265f3",
+     "mutatorName": "fn_value.zero",
+     "location": {
+      "start": {
+       "line": 190,
+       "column": 40
+      },
+      "end": {
+       "line": 192,
+       "column": 6
+      }
+     },
+     "status": "Killed",
+     "replacement": "0",
+     "description": "replace { self.dropped.load(Ordering::Relaxed) } with 0",
+     "statusReason": "failed `an_unreachable_collector_costs_spans_and_never_blocks`",
+     "duration": 107.0,
+     "killedBy": [
+      "an_unreachable_collector_costs_spans_and_never_blocks"
+     ]
+    },
+    {
+     "id": "3223be9f450c",
+     "mutatorName": "expr.decrement",
+     "location": {
+      "start": {
+       "line": 191,
+       "column": 9
+      },
+      "end": {
+       "line": 191,
+       "column": 45
+      }
+     },
+     "status": "Killed",
+     "replacement": "(self.dropped.load(Ordering::Relaxed)) - 1",
+     "description": "replace self.dropped.load(Ordering::Relaxed) with (self.dropped....::Relaxed)) - 1",
+     "statusReason": "failed `an_unreachable_collector_costs_spans_and_never_blocks`",
+     "duration": 47.0,
+     "killedBy": [
+      "an_unreachable_collector_costs_spans_and_never_blocks"
+     ]
+    },
+    {
+     "id": "89938fe8c430",
+     "mutatorName": "expr.increment",
+     "location": {
+      "start": {
+       "line": 191,
+       "column": 9
+      },
+      "end": {
+       "line": 191,
+       "column": 45
+      }
+     },
+     "status": "Killed",
+     "replacement": "(self.dropped.load(Ordering::Relaxed)) + 1",
+     "description": "replace self.dropped.load(Ordering::Relaxed) with (self.dropped....::Relaxed)) + 1",
+     "statusReason": "failed `an_unreachable_collector_costs_spans_and_never_blocks`",
+     "duration": 48.0,
+     "killedBy": [
+      "an_unreachable_collector_costs_spans_and_never_blocks"
+     ]
+    },
+    {
+     "id": "89e84b7afd94",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 203,
+       "column": 68
+      },
+      "end": {
+       "line": 205,
+       "column": 6
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Default::default()",
+     "description": "replace { self.provider.force_flush() } with Default::default()",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "608152926009",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 217,
+       "column": 71
+      },
+      "end": {
+       "line": 219,
+       "column": 6
+      }
+     },
+     "status": "CompileError",
+     "replacement": "Default::default()",
+     "description": "replace { self.provider.sh...SHUTDOWN_TIMEOUT) } with Default::default()",
+     "statusReason": "the mutant does not compile"
+    },
+    {
+     "id": "6daa98a709f1",
+     "mutatorName": "fn_value.unit",
+     "location": {
+      "start": {
+       "line": 223,
+       "column": 24
+      },
+      "end": {
+       "line": 229,
+       "column": 6
+      }
+     },
+     "status": "Killed",
+     "replacement": "()",
+     "description": "replace { // The layer's t...HUTDOWN_TIMEOUT); } with ()",
+     "statusReason": "failed `dropping_the_telemetry_drains_the_queue_while_the_subscriber_still_lives`",
+     "duration": 126.0,
+     "killedBy": [
+      "dropping_the_telemetry_drains_the_queue_while_the_subscriber_still_lives"
+     ]
+    }
+   ]
+  },
+  "crates/horde-observe/src/subscriber.rs": {
+   "source": "(source elided)",
+   "language": "rust",
+   "mutants": [
+    {
+     "id": "4fde7e4daee1",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 23,
+       "column": 88
+      },
+      "end": {
+       "line": 35,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "Default::default()",
+     "description": "replace { let fmt = tracin...ry.layer()), ), } } with Default::default()",
+     "statusReason": "failed `subscriber::tests::the_stderr_subscriber_honors_its_filter`",
+     "duration": 14.0,
+     "killedBy": [
+      "subscriber::tests::the_stderr_subscriber_honors_its_filter"
+     ]
+    },
+    {
+     "id": "7dcad31a4ebb",
+     "mutatorName": "fn_value.default",
+     "location": {
+      "start": {
+       "line": 44,
+       "column": 61
+      },
+      "end": {
+       "line": 46,
+       "column": 2
+      }
+     },
+     "status": "Killed",
+     "replacement": "Default::default()",
+     "description": "replace { Dispatch::new(tr...lemetry.layer())) } with Default::default()",
+     "statusReason": "failed `subscriber::tests::the_silent_subscriber_exports_product_targets_and_nothing_of_its_own`",
+     "duration": 15.0,
+     "killedBy": [
+      "subscriber::tests::the_silent_subscriber_exports_product_targets_and_nothing_of_its_own"
+     ]
+    }
+   ]
+  }
+ },
+ "config": {
+  "startedAt": 1794550298,
+  "mutantIdVersion": 5,
+  "tests": 21
+ }
+}

@@ -1,7 +1,7 @@
 //! The fault-server: the production server startup path as a killable
 //! process the fault suite can always find.
 //!
-//! Test fixture, not product (`.cargo/mutants.toml` excludes it under the
+//! Test fixture, not product (`gamma.toml` excludes it under the
 //! same criterion as the worker-runner). The shipped `horde-server` binary
 //! is deliberately thin — argument parsing, a subscriber, an exit code —
 //! with every decision in `horde_server::startup`, and this fixture

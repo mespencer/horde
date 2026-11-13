@@ -22,7 +22,7 @@
 //! a worker *process* today, so the runner composes the production pieces
 //! (`Journal::open`, `Runtime`, `Connection::dial`, the redial loop) exactly
 //! as the eventual binary will. It is fixture in the mutants sense — the
-//! suite runs it, it tests nothing — and is excluded in `.cargo/mutants.toml`
+//! suite runs it, it tests nothing — and is excluded in `gamma.toml`
 //! under the same criterion as `stub_harness`.
 
 use std::net::SocketAddr;

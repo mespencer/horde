@@ -1,0 +1,77 @@
+[
+  {
+    "id": "5d9e3131bf48",
+    "ordinal": 1,
+    "file": "crates/horde-observe/src/config.rs",
+    "package": "horde-observe",
+    "span": {
+      "start": 2378,
+      "end": 3180
+    },
+    "line": 60,
+    "end_line": 84,
+    "column": 46,
+    "mutator": "fn_value.ok",
+    "item_path": "from_env",
+    "occurrence": 0,
+    "replacement_index": 0,
+    "original": "{\n    let endpoint = lookup(ENDPOINT_VAR)\n        .map(|value| value.trim().to_owned())\n        .filter(|value| !value.is_empty());\n    match (endpoint, lookup(SAMPLE_VAR)) {\n        (None, None) => Ok(None),\n        (None, Some(_)) => Err(ConfigError::SampleWithoutEndpoint),\n        (Some(endpoint), None) => Ok(Some(OtlpConfig {\n            endpoint,\n            sample_ratio: 1.0,\n        })),\n        (Some(endpoint), Some(given)) => {\n            let ratio = given\n                .trim()\n                .parse::<f64>()\n                .ok()\n                .filter(|ratio| is_valid_ratio(*ratio))\n                .ok_or(ConfigError::InvalidSampleRatio { given })?;\n            Ok(Some(OtlpConfig {\n                endpoint,\n                sample_ratio: ratio,\n            }))\n        }\n    }\n}",
+    "replacement": "Ok(None)",
+    "shape": "Block",
+    "outcome": "Pending",
+    "suppression": null,
+    "elapsed_ms": 0,
+    "killed_by": null,
+    "note": null
+  },
+  {
+    "id": "9231ee5ee85e",
+    "ordinal": 2,
+    "file": "crates/horde-observe/src/config.rs",
+    "package": "horde-observe",
+    "span": {
+      "start": 2490,
+      "end": 2507
+    },
+    "line": 63,
+    "end_line": 63,
+    "column": 25,
+    "mutator": "unary.remove_not",
+    "item_path": "from_env",
+    "occurrence": 0,
+    "replacement_index": 0,
+    "original": "!value.is_empty()",
+    "replacement": "value.is_empty()",
+    "shape": "Expr",
+    "outcome": "Pending",
+    "suppression": null,
+    "elapsed_ms": 0,
+    "killed_by": null,
+    "note": null
+  },
+  {
+    "id": "2c268a3da170",
+    "ordinal": 3,
+    "file": "crates/horde-observe/src/config.rs",
+    "package": "horde-observe",
+    "span": {
+      "start": 2580,
+      "end": 2584
+    },
+    "line": 65,
+    "end_line": 65,
+    "column": 28,
+    "mutator": "option.none_to_some",
+    "item_path": "from_env",
+    "occurrence": 0,
+    "replacement_index": 0,
+    "original": "None",
+    "replacement": "Some(Default::default())",
+    "shape": "Expr",
+    "outcome": "Pending",
+    "suppression": null,
+    "elapsed_ms": 0,
+    "killed_by": null,
+    "note": null
+  }
+]
