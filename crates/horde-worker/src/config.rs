@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use horde_adapter_codex::{SandboxPolicy, SandboxTier};
-use horde_config::logs::LEVEL_VAR;
 use horde_config::values::{show_duration, show_string, show_threshold};
 use horde_config::{Document, LogKeys, Origin, Provenance, Role, Section};
 
@@ -68,20 +67,9 @@ impl WorkerSettings {
         flags: &WorkerFlags,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let empty = toml::Table::new();
-        let (table, origin) = document.map_or((&empty, Origin::Default), |document| {
-            (&document.table, document.origin())
-        });
-        let file_error = |message: String| match document {
-            Some(document) if !message.starts_with(LEVEL_VAR) => document.refusal(message),
-            _ => message,
-        };
+        let (mut root, origin) = horde_config::open(Role::Worker, document);
+        let file_error = horde_config::refuser(document);
         let mut provenance = Provenance::default();
-        let mut root = Section::root(table);
-        for key in ["permissions", "tiers", "workspace", "placement"] {
-            root.foreign(key, "server");
-        }
-        root.foreign("session", "client");
         let file = read(&mut root).map_err(file_error)?;
         let logs_section = root.section("logs").map_err(file_error)?;
         let logs = LogKeys::resolve(Role::Worker, logs_section, &origin, env, &mut provenance)

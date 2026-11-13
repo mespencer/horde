@@ -21,8 +21,7 @@ fn configured(text: &str, flags: &ServerFlags) -> Setup<(ServerCore, tempfile::T
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("config.toml");
     std::fs::write(&path, text)?;
-    let document = horde_config::load(horde_config::Role::Server, Some(&path), &path)?;
-    let settings = ServerSettings::resolve(document.as_ref(), flags, |_| None)?;
+    let settings = ServerSettings::load(Some(&path), &path, flags, |_| None)?;
     Ok((core()?.with_settings(&settings), dir))
 }
 

@@ -2,7 +2,23 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::logs::LEVEL_VAR;
 use crate::origin::Origin;
+use crate::reader::Section;
+
+/// Which role owns each top-level table; `logs` is every role's.
+const TOP_LEVEL: &[(&str, Role)] = &[
+    ("permissions", Role::Server),
+    ("tiers", Role::Server),
+    ("workspace", Role::Server),
+    ("placement", Role::Server),
+    ("worker", Role::Worker),
+    ("codex", Role::Worker),
+    ("session", Role::Client),
+];
+
+/// The table a role reads when it has no file.
+static EMPTY: std::sync::LazyLock<toml::Table> = std::sync::LazyLock::new(toml::Table::new);
 
 /// Which binary a file configures — named in every refusal, so an operator
 /// with three files open knows which one is wrong.
@@ -51,6 +67,30 @@ impl Document {
             self.role.name(),
             self.path.display()
         )
+    }
+}
+
+/// The file's root section for `role` — empty without a file — with every
+/// other role's top-level table declared foreign, and the origin its values
+/// carry.
+#[must_use]
+pub fn open(role: Role, document: Option<&Document>) -> (Section<'_>, Origin) {
+    let (table, origin) = document.map_or((&*EMPTY, Origin::Default), |document| {
+        (&document.table, document.origin())
+    });
+    let mut root = Section::root(table);
+    for (key, owner) in TOP_LEVEL.iter().filter(|(_, owner)| *owner != role) {
+        root.foreign(key, owner.name());
+    }
+    (root, origin)
+}
+
+/// Prefixes a refusal with the file it is about — unless there is no file,
+/// or the refusal is about `HORDE_LOG`, which the environment set.
+pub fn refuser(document: Option<&Document>) -> impl Fn(String) -> String + Copy + '_ {
+    move |message| match document {
+        Some(document) if !message.starts_with(LEVEL_VAR) => document.refusal(message),
+        _ => message,
     }
 }
 
@@ -132,6 +172,31 @@ mod tests {
             refused.starts_with(&format!("server config {}: not valid TOML", path.display())),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn open_declares_the_other_roles_tables_foreign_and_refuser_names_the_file() {
+        let document = super::Document {
+            role: Role::Worker,
+            path: "/w.toml".into(),
+            table: "[tiers.t]\n".parse().expect("parses"),
+        };
+        let (root, origin) = super::open(Role::Worker, Some(&document));
+        assert_eq!(origin, Origin::File("/w.toml".into()));
+        assert_eq!(
+            root.finish(),
+            Err("tiers belongs in the server's config file, not this one".to_owned())
+        );
+        let (mut own, _) = super::open(Role::Server, Some(&document));
+        assert!(own.named("tiers").is_ok());
+        assert_eq!(own.finish(), Ok(()));
+        let (bare, origin) = super::open(Role::Client, None);
+        assert_eq!((bare.finish(), origin), (Ok(()), Origin::Default));
+
+        let refuse = super::refuser(Some(&document));
+        assert_eq!(refuse("x".to_owned()), "worker config /w.toml: x");
+        assert_eq!(refuse("HORDE_LOG=1".to_owned()), "HORDE_LOG=1");
+        assert_eq!(super::refuser(None)("x".to_owned()), "x");
     }
 
     #[test]

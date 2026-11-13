@@ -1,8 +1,7 @@
 //! The server's effective settings: built-in defaults, then
 //! `~/.horde/server/config.toml`, then `horde-server`'s flags (ADR-0016).
 
-use horde_config::logs::LEVEL_VAR;
-use horde_config::{Document, LogKeys, Origin, Provenance, Role, Section};
+use horde_config::{Document, LogKeys, Origin, Provenance, Role};
 
 use super::workspace::WorkspaceFlags;
 use super::{permissions, tiers, workspace};
@@ -34,6 +33,22 @@ pub struct ServerSettings {
 }
 
 impl ServerSettings {
+    /// Loads the config file — `explicit` when `--config` named one, else
+    /// `default`, which may be absent — and resolves it under `flags`.
+    ///
+    /// # Errors
+    ///
+    /// As [`horde_config::load`] and [`Self::resolve`].
+    pub fn load(
+        explicit: Option<&std::path::Path>,
+        default: &std::path::Path,
+        flags: &ServerFlags,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        let document = horde_config::load(Role::Server, explicit, default)?;
+        Self::resolve(document.as_ref(), flags, env)
+    }
+
     /// Resolves every key: the defaults, then `document` (when the file
     /// exists), then `flags`; `logs.level` also reads `HORDE_LOG` from `env`.
     ///
@@ -47,19 +62,9 @@ impl ServerSettings {
         flags: &ServerFlags,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let empty = toml::Table::new();
-        let (table, origin) = document.map_or((&empty, Origin::Default), |document| {
-            (&document.table, document.origin())
-        });
-        let file_error = |message: String| match document {
-            Some(document) if !message.starts_with(LEVEL_VAR) => document.refusal(message),
-            _ => message,
-        };
+        let (mut root, origin) = horde_config::open(Role::Server, document);
+        let file_error = horde_config::refuser(document);
         let mut provenance = Provenance::default();
-        let mut root = Section::root(table);
-        root.foreign("worker", "worker");
-        root.foreign("codex", "worker");
-        root.foreign("session", "client");
         let permission_file = permissions::read(root.section("permissions").map_err(file_error)?)
             .map_err(file_error)?;
         let configured_tiers = tiers::read(&mut root).map_err(file_error)?;

@@ -18,7 +18,7 @@ pub mod provenance;
 pub mod reader;
 pub mod values;
 
-pub use file::{Document, Role, load};
+pub use file::{Document, Role, load, open, refuser};
 pub use logs::{AgentLogKeys, AgentReadKeys, LogKeys};
 pub use origin::Origin;
 pub use provenance::{Entry, Provenance};

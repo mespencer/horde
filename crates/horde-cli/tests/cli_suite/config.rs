@@ -29,8 +29,7 @@ async fn configured_server(text: &str) -> Setup<(String, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("config.toml");
     std::fs::write(&path, text)?;
-    let document = horde_config::load(horde_config::Role::Server, Some(&path), &path)?;
-    let settings = ServerSettings::resolve(document.as_ref(), &ServerFlags::default(), |_| None)?;
+    let settings = ServerSettings::load(Some(&path), &path, &ServerFlags::default(), |_| None)?;
     let core = ServerCore::new(horde_server::EventLog::in_memory()?).with_settings(&settings);
     Ok((horde_server_testkit::serve_core(core).await?, dir))
 }
