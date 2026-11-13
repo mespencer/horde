@@ -505,4 +505,73 @@ mod tests {
         let broker = ShareBroker::new(None);
         assert_eq!(broker.stamp("agent-1").await.expect("no checkout"), None);
     }
+
+    /// `add_repo` grows only a registered agent's checked-out set, once per
+    /// repo name, and says whether the agent was there to grow.
+    #[test]
+    fn adding_a_repo_needs_a_registered_agent_and_happens_once() {
+        let broker = ShareBroker::new(None);
+        assert!(
+            !broker.add_repo("agent-1", "docs", "docs".into()),
+            "no checkout to add to"
+        );
+        assert!(broker.checkout_of("agent-1").is_none());
+        broker.register(
+            "agent-1",
+            AgentCheckout {
+                root: "/w/agents/agent-1".into(),
+                repos: vec![("atlas".to_owned(), "atlas".into())],
+            },
+        );
+        assert!(broker.add_repo("agent-1", "docs", "docs".into()));
+        assert!(broker.add_repo("agent-1", "docs", "docs".into()));
+        let repos: Vec<String> = broker
+            .checkout_of("agent-1")
+            .expect("registered")
+            .repos
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(repos, vec!["atlas", "docs"]);
+    }
+
+    /// The broker answers with the Relay it was built over, or none.
+    #[test]
+    fn the_broker_names_its_relay() {
+        let relay = super::RelayLocation::new("http://relay.example:7779/");
+        let broker = ShareBroker::new(Some(relay));
+        assert_eq!(
+            broker.relay().map(|relay| relay.repo_url("atlas")),
+            Some("http://relay.example:7779/atlas".to_owned())
+        );
+        assert!(ShareBroker::new(None).relay().is_none());
+    }
+
+    /// A commit that is nowhere on this Worker, with no Relay configured,
+    /// cannot be obtained into an Instance repo: both the inherent call and
+    /// the `CommitSource` face refuse rather than pretend.
+    #[tokio::test]
+    async fn obtaining_an_absent_commit_without_a_relay_is_refused() {
+        let temp = tempfile::tempdir().expect("a tempdir");
+        let repo = temp.path().join("atlas");
+        std::fs::create_dir_all(&repo).expect("the repo dir");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        let broker = ShareBroker::new(None);
+        assert!(
+            broker.obtain_into(&repo, "atlas", absent).await.is_err(),
+            "nowhere to obtain it from"
+        );
+        let source: &dyn crate::workspace::base::CommitSource = &broker;
+        let refused = source
+            .obtain_into(&repo, "atlas", absent)
+            .await
+            .expect_err("the commit source refuses too");
+        assert!(!refused.is_empty(), "with a reason");
+    }
 }

@@ -156,6 +156,28 @@ mod tests {
         assert!(!is_full_sha("main"));
     }
 
+    /// Exit 0 is yes and exit 1 is no.
+    #[tokio::test]
+    async fn a_predicate_answers_yes_and_no() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=h", "-c", "user.email=h@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let ancestor = ["merge-base", "--is-ancestor", "HEAD~1", "HEAD"];
+        assert_eq!(git_check(dir.path(), &ancestor).await, Ok(true));
+        let descendant = ["merge-base", "--is-ancestor", "HEAD", "HEAD~1"];
+        assert_eq!(git_check(dir.path(), &descendant).await, Ok(false));
+    }
+
     #[tokio::test]
     async fn a_predicate_that_cannot_run_is_an_error_not_an_answer() {
         let dir = tempfile::tempdir().expect("tempdir");

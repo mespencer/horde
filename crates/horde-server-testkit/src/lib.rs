@@ -352,17 +352,17 @@ pub async fn journal_event(endpoint: &str, session_id: &str, event: Event) -> Se
     journal_event_at(endpoint, session_id, 1, event).await
 }
 
-/// Registers a worker whose one harness rewrites tool input, so an agent the
-/// scheduler places after it can take a human's narrowing — the server
-/// refuses a narrowing for an adapter that cannot apply one (ADR-0009).
+/// Registers `worker_id` as a connected worker with `capabilities`.
 ///
 /// # Errors
 ///
 /// The dial or the registration failing.
-pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup<()> {
-    use horde_proto::v1::{
-        AdapterCapability, HarnessCapability, Hello, RegisterWorkerRequest, WorkerCapabilities,
-    };
+pub async fn register_worker_with(
+    endpoint: &str,
+    worker_id: &str,
+    capabilities: horde_proto::v1::WorkerCapabilities,
+) -> Setup<()> {
+    use horde_proto::v1::{Hello, RegisterWorkerRequest};
     let mut worker = worker_spine(endpoint).await?;
     worker
         .register_worker(RegisterWorkerRequest {
@@ -371,19 +371,61 @@ pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup
                 ..Hello::default()
             }),
             worker_id: Some(WorkerId::new(worker_id)),
-            capabilities: Some(WorkerCapabilities {
-                // The worker's only harness is its default, so a spawn
-                // naming no provider runs on it.
-                harnesses: vec![HarnessCapability {
-                    capabilities: vec![AdapterCapability::ToolInputRewrite as i32],
-                    ..HarnessCapability::default()
-                }],
-                ..WorkerCapabilities::default()
-            }),
+            capabilities: Some(capabilities),
             last_local_journal_sequence: None,
         })
         .await?;
     Ok(())
+}
+
+/// Registers a worker whose one harness rewrites tool input, so an agent the
+/// scheduler places after it can take a human's narrowing — the server
+/// refuses a narrowing for an adapter that cannot apply one (ADR-0009).
+///
+/// # Errors
+///
+/// The dial or the registration failing.
+pub async fn register_rewriting_worker(endpoint: &str, worker_id: &str) -> Setup<()> {
+    use horde_proto::v1::{AdapterCapability, HarnessCapability, WorkerCapabilities};
+    register_worker_with(
+        endpoint,
+        worker_id,
+        WorkerCapabilities {
+            // The worker's only harness is its default, so a spawn
+            // naming no provider runs on it.
+            harnesses: vec![HarnessCapability {
+                capabilities: vec![AdapterCapability::ToolInputRewrite as i32],
+                ..HarnessCapability::default()
+            }],
+            ..WorkerCapabilities::default()
+        },
+    )
+    .await
+}
+
+/// Defines the workspace `name` over one repo, `atlas`, and returns its
+/// definition.
+///
+/// # Errors
+///
+/// The dial or the definition failing.
+pub async fn define_atlas_workspace(
+    endpoint: &str,
+    name: &str,
+) -> Setup<horde_proto::v1::WorkspaceDefinition> {
+    let mut client = Client::connect(endpoint).await?;
+    Ok(client
+        .create_workspace_definition(horde_proto::v1::CreateWorkspaceDefinitionRequest {
+            name: name.to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
+                name: "atlas".to_owned(),
+                remote_url: "https://example.invalid/atlas.git".to_owned(),
+                default_branch: "main".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
+            }],
+            ..horde_proto::v1::CreateWorkspaceDefinitionRequest::default()
+        })
+        .await?)
 }
 
 /// Appends the `AgentSpawned` + `PlacementChanged` pair the control plane

@@ -138,6 +138,41 @@ mod tests {
         assert!(activity.snapshot("a").is_none());
     }
 
+    /// Only a turn *starting* clears the idle flag: an agent reported idle
+    /// twice, or busy twice within one turn, keeps it.
+    #[test]
+    fn only_a_starting_turn_clears_the_idle_flag() {
+        let activity = Activity::default();
+        activity.set_busy("a", false);
+        activity.mark_idle_reclaimed("a");
+        activity.set_busy("a", false);
+        assert!(activity.snapshot("a").expect("seen").idle_reclaimed);
+    }
+
+    /// An agent never active has nothing to write through, and a write is
+    /// not repeated inside its minute however much activity follows it.
+    #[test]
+    fn activity_is_written_through_only_when_new_and_not_within_a_minute() {
+        let activity = Activity::default();
+        activity.set_busy("idle", false);
+        assert_eq!(
+            activity.due_for_write("idle"),
+            None,
+            "never active: nothing newer than the last write"
+        );
+
+        activity.set_busy("a", true);
+        assert!(activity.due_for_write("a").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        activity.set_busy("a", false);
+        activity.set_busy("a", true);
+        assert_eq!(
+            activity.due_for_write("a"),
+            None,
+            "newer activity, but inside the minute"
+        );
+    }
+
     #[tokio::test]
     async fn one_agent_one_lock() {
         let locks = CheckoutLocks::default();

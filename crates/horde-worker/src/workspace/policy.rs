@@ -167,7 +167,11 @@ mod tests {
     fn an_unset_policy_reads_as_the_built_in_defaults() {
         let policy = WorkspacePolicy::from_wire(None);
         assert_eq!(policy.fetch, FetchPolicy::default());
-        assert_eq!(policy.idle_reclaim_after, Some(DEFAULT_IDLE_RECLAIM_AFTER));
+        assert_eq!(
+            policy.idle_reclaim_after,
+            Some(Duration::from_secs(14_400)),
+            "four hours"
+        );
         assert_eq!(policy.archived_grace, Duration::from_secs(86_400));
         assert_eq!(policy.reclaim_timeout, Duration::from_secs(600));
         assert_eq!(policy.auto_rules, vec![cargo_rule()]);

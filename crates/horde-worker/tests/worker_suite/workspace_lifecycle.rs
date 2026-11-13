@@ -8,8 +8,6 @@
 //! nothing re-derives a predicate to compare against.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use horde_proto::v1::checkout_prepared::BaseResolution;
@@ -18,21 +16,17 @@ use horde_proto::v1::stream_commands_response::Command;
 use horde_proto::v1::workspace_cleanup::repo_action::Outcome;
 use horde_proto::v1::{
     CheckoutMode, CheckoutPolicy, CheckoutState, CleanupTier, CleanupTrigger, GcLevel, RepoBase,
-    RepoBaseSource, ResolvedWorkspacePolicy, StreamCommandsResponse, WorkspaceCleanup,
-    WorkspaceDefinition, WorkspaceInstanceReport,
+    RepoBaseSource, WorkspaceCleanup, WorkspaceDefinition,
 };
 use horde_worker::workspace::base::NoSource;
-use horde_worker::workspace::{CheckoutRequest, FsStats, WorkspaceManager};
-use horde_worker::{ApplyCommand as _, Journal, Runtime};
+use horde_worker::workspace::{CheckoutRequest, WorkspaceManager};
+use horde_worker::{ApplyCommand as _, Journal};
 
+use crate::workspace_rig::{
+    Rig, archive, cleanups, command, fresh_rig, kinds, materialize, policy, rig, settled_within,
+    spawn_in, three_repo_rig,
+};
 use crate::workspaces::harness;
-
-fn wire(seconds: u64) -> horde_proto::prost_types::Duration {
-    horde_proto::prost_types::Duration {
-        seconds: i64::try_from(seconds).unwrap_or(i64::MAX),
-        nanos: 0,
-    }
-}
 
 /// A policy with no fetch throttle, so every checkout fetches.
 fn eager_fetch() -> horde_worker::workspace::base::FetchPolicy {
@@ -496,104 +490,6 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
     assert_eq!(event.repos[0].reason, "no reclaim command");
 }
 
-/// A free-space source the test steers: what the scan reads instead of
-/// `statvfs`.
-#[derive(Debug)]
-struct SteeredDisk {
-    free: AtomicU64,
-    total: u64,
-}
-
-impl FsStats for SteeredDisk {
-    fn stats(&self, _path: &Path) -> Option<(u64, u64)> {
-        Some((self.free.load(Ordering::SeqCst), self.total))
-    }
-}
-
-/// A reporter that records every report it is handed.
-#[derive(Debug, Default)]
-struct RecordingReporter {
-    reports: Mutex<Vec<Vec<WorkspaceInstanceReport>>>,
-}
-
-#[async_trait::async_trait]
-impl horde_worker::runtime::InstanceReporter for RecordingReporter {
-    async fn report(&self, reports: Vec<WorkspaceInstanceReport>) {
-        if let Ok(mut recorded) = self.reports.lock() {
-            recorded.push(reports);
-        }
-    }
-}
-
-impl RecordingReporter {
-    fn count(&self) -> usize {
-        self.reports.lock().map(|r| r.len()).unwrap_or(0)
-    }
-
-    fn last(&self) -> Vec<WorkspaceInstanceReport> {
-        self.reports
-            .lock()
-            .ok()
-            .and_then(|reports| reports.last().cloned())
-            .unwrap_or_default()
-    }
-}
-
-/// A Runtime over a workspace root, a journal it shares, and a reporter.
-struct Rig {
-    runtime: Runtime,
-    journal: Journal,
-    reporter: Arc<RecordingReporter>,
-    disk: Arc<SteeredDisk>,
-    root: PathBuf,
-}
-
-fn rig(root: &Path, journal: Journal) -> Rig {
-    let reporter = Arc::new(RecordingReporter::default());
-    let disk = Arc::new(SteeredDisk {
-        free: AtomicU64::new(1 << 40),
-        total: 1 << 41,
-    });
-    let manager = WorkspaceManager::new("worker-a", root).with_fs_stats(disk.clone());
-    let runtime = Runtime::new(journal.clone())
-        .with_adapter(Arc::new(horde_adapter_fake::FakeAdapter::new(
-            horde_adapter_fake::Script::echoing(),
-        )))
-        .with_workspaces(manager)
-        .with_instance_reporter(reporter.clone())
-        .with_housekeeping(horde_worker::runtime::HousekeepingConfig {
-            // The scan is driven by hand here, never by the clock.
-            scan_interval: Duration::from_secs(3600),
-            ..horde_worker::runtime::HousekeepingConfig::default()
-        });
-    Rig {
-        runtime,
-        journal,
-        reporter,
-        disk,
-        root: root.to_path_buf(),
-    }
-}
-
-/// Waits for workspace work — clones, fetches, worktree adds, reclaim
-/// commands — under a ceiling sized for real git under a parallel suite's
-/// load (plain `cargo test` runs every test in one process at once), while
-/// still turning a hang into a failure rather than a stuck run.
-async fn settled_within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-    match tokio::time::timeout(Duration::from_secs(120), future).await {
-        Ok(value) => value,
-        Err(_) => panic!("{what} must finish rather than hang"),
-    }
-}
-
-/// A rig over `<temp>/workspaces` with a fresh in-memory journal.
-fn fresh_rig(temp: &Path) -> Rig {
-    rig(
-        &temp.join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    )
-}
-
 /// The one-repo `atlas` Definition over a fresh origin under `temp`.
 fn atlas_definition(temp: &Path) -> WorkspaceDefinition {
     let atlas = harness::origin(temp, "atlas");
@@ -609,76 +505,8 @@ async fn soft(
     horde_worker::workspace::cleanup::soft_reclaim(manager, "ws-1", record, explicit(policy)).await
 }
 
-fn command(id: &str, kind: Command) -> StreamCommandsResponse {
-    StreamCommandsResponse {
-        command_sequence: 0,
-        command_id: id.to_owned(),
-        log_position: 0,
-        command: Some(kind),
-    }
-}
-
-fn policy(grace_s: u64, idle_s: u64) -> ResolvedWorkspacePolicy {
-    ResolvedWorkspacePolicy {
-        archived_grace: Some(wire(grace_s)),
-        idle_reclaim_after: Some(wire(idle_s)),
-        ..ResolvedWorkspacePolicy::default()
-    }
-}
-
-async fn materialize(
-    rig: &mut Rig,
-    definition: &WorkspaceDefinition,
-    policy: ResolvedWorkspacePolicy,
-) {
-    rig.runtime
-        .apply(command(
-            "m-1",
-            Command::MaterializeWorkspace(horde_proto::v1::MaterializeWorkspaceCommand {
-                definition: Some(definition.clone()),
-                session_id: Some(horde_proto::v1::SessionId::new("s1")),
-                policy: Some(policy),
-            }),
-        ))
-        .await
-        .expect("the materialize applies");
-    settled_within("the materialize", rig.runtime.settled()).await;
-}
-
 async fn spawn(rig: &mut Rig, agent: &str) {
-    rig.runtime
-        .apply(command(
-            &format!("spawn-{agent}"),
-            Command::SpawnAgent(horde_proto::v1::SpawnAgentCommand {
-                session_id: Some(horde_proto::v1::SessionId::new("s1")),
-                agent_id: Some(horde_proto::v1::AgentId::new(agent)),
-                spec: Some(horde_proto::v1::AgentSpec {
-                    workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
-                        "ws-1",
-                    )),
-                    checkout_policy: CheckoutPolicy::Worktree.into(),
-                    ..horde_proto::v1::AgentSpec::default()
-                }),
-                ..horde_proto::v1::SpawnAgentCommand::default()
-            }),
-        ))
-        .await
-        .expect("the spawn applies");
-    settled_within("the spawn", rig.runtime.settled()).await;
-}
-
-async fn archive(rig: &mut Rig, agent: &str) {
-    rig.runtime
-        .apply(command(
-            &format!("archive-{agent}"),
-            Command::ArchiveAgent(horde_proto::v1::ArchiveAgentCommand {
-                agent_id: Some(horde_proto::v1::AgentId::new(agent)),
-                reason: "done".to_owned(),
-            }),
-        ))
-        .await
-        .expect("the archive applies");
-    settled_within("the archive", rig.runtime.settled()).await;
+    spawn_in(rig, "ws-1", agent).await;
 }
 
 async fn gc(
@@ -704,28 +532,6 @@ async fn gc(
         .await
         .expect("the gc applies");
     settled_within("the gc", rig.runtime.settled()).await;
-}
-
-/// Every journaled event of one kind, in journal order.
-async fn journaled(journal: &Journal) -> Vec<Kind> {
-    journal
-        .read_from(1, 100_000)
-        .await
-        .expect("the journal reads")
-        .into_iter()
-        .filter_map(|journaled| journaled.event.and_then(|event| event.kind))
-        .collect()
-}
-
-async fn cleanups(journal: &Journal) -> Vec<WorkspaceCleanup> {
-    journaled(journal)
-        .await
-        .into_iter()
-        .filter_map(|kind| match kind {
-            Kind::WorkspaceCleanup(cleanup) => Some(cleanup),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Waits for an archive's release to finish: it runs once the pump has
@@ -857,7 +663,7 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
     spawn(&mut rig, "agent-live").await;
     let before = cleanups(&rig.journal).await.len();
 
-    rig.disk.free.store(1, Ordering::SeqCst);
+    rig.disk.set_free(1);
     rig.runtime.scan_workspaces().await;
     let pressure: Vec<WorkspaceCleanup> = cleanups(&rig.journal)
         .await
@@ -885,7 +691,7 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
         vec!["agent-old"],
         "a lossless archived checkout goes, grace or not"
     );
-    let exhausted: Vec<_> = journaled(&rig.journal)
+    let exhausted: Vec<_> = kinds(&rig.journal)
         .await
         .into_iter()
         .filter(|kind| matches!(kind, Kind::WorkspaceDiskPressure(p) if p.exhausted))
@@ -896,9 +702,9 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
         agent_root(&rig, "agent-live").exists(),
         "a live checkout is never removed"
     );
-    let before = journaled(&rig.journal).await.len();
+    let before = kinds(&rig.journal).await.len();
     rig.runtime.scan_workspaces().await;
-    let repeated = journaled(&rig.journal)
+    let repeated = kinds(&rig.journal)
         .await
         .into_iter()
         .skip(before)
@@ -963,7 +769,7 @@ async fn orphans_after_a_reset_are_reported_soft_at_most_and_removed_by_hard_gc(
         !agent_root(&reset, "agent-1").exists(),
         "a hard gc removes a lossless orphan"
     );
-    let completed = journaled(&reset.journal)
+    let completed = kinds(&reset.journal)
         .await
         .into_iter()
         .filter(|kind| matches!(kind, Kind::WorkspaceGcCompleted(c) if c.request_id == "gc-hard"))
@@ -1174,7 +980,7 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
         .expect("applies");
     settled_within("the removal", rig.runtime.settled()).await;
     assert!(!rig.root.join("ws-1").exists(), "forced");
-    let missing = journaled(&rig.journal).await.into_iter().any(|kind| {
+    let missing = kinds(&rig.journal).await.into_iter().any(|kind| {
         matches!(kind, Kind::WorkspaceInstanceChanged(c)
             if c.report.as_ref().is_some_and(|r| r.state == i32::from(horde_proto::v1::WorkspaceInstanceState::Missing)))
     });
@@ -1191,14 +997,8 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
 #[tokio::test]
 async fn materialization_journals_its_progress_and_reports() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let repos: Vec<_> = ["a", "b", "c"]
-        .into_iter()
-        .map(|name| harness::repo(name, &harness::origin(temp.path(), name)))
-        .collect();
-    let definition = harness::definition("ws-1", repos);
-    let mut rig = fresh_rig(temp.path());
-    materialize(&mut rig, &definition, policy(0, 0)).await;
-    let steps: Vec<(String, u32, u32)> = journaled(&rig.journal)
+    let rig = three_repo_rig(temp.path()).await;
+    let steps: Vec<(String, u32, u32)> = kinds(&rig.journal)
         .await
         .into_iter()
         .filter_map(|kind| match kind {

@@ -1189,6 +1189,48 @@ mod tests {
         );
     }
 
+    /// Another request's completion answers nothing of this one.
+    #[test]
+    fn a_completion_counts_only_for_its_own_request() {
+        let mut answers = Answers::default();
+        answers.fold("gc-1", &completed("gc-other", "w1"), Format::Human);
+        assert!(answers.completed.is_empty(), "{answers:?}");
+        assert_eq!(answers.bytes_freed, 0);
+        assert!(
+            answers
+                .verdict(&expected(&["w1"]))
+                .is_err_and(|e| e.exit_status() == 3)
+        );
+    }
+
+    /// The refusal names only what happened: a refusal alone says nothing
+    /// failed, a failure alone says nothing was refused, and both are named
+    /// when both happened.
+    #[test]
+    fn a_refusal_message_names_exactly_the_kinds_that_happened() {
+        let message = |outcomes: &[Outcome]| {
+            let mut answers = Answers::default();
+            for outcome in outcomes {
+                answers.fold("gc-1", &cleanup("gc-1", *outcome), Format::Human);
+            }
+            answers
+                .verdict(&expected(&[]))
+                .expect_err("refused")
+                .to_string()
+        };
+        let refused = message(&[Outcome::Refused]);
+        assert!(refused.contains("1 action(s) refused"), "{refused}");
+        assert!(!refused.contains("failed"), "{refused}");
+        let failed = message(&[Outcome::Failed]);
+        assert!(failed.contains("1 action(s) failed"), "{failed}");
+        assert!(!failed.contains("refused"), "{failed}");
+        let both = message(&[Outcome::Failed, Outcome::Refused, Outcome::Failed]);
+        assert!(
+            both.contains("1 action(s) refused; 2 action(s) failed"),
+            "{both}"
+        );
+    }
+
     #[test]
     fn a_row_names_worker_agent_repo_outcome_and_what_would_be_lost() {
         let Kind::WorkspaceCleanup(event) = cleanup("gc-1", Outcome::Refused) else {

@@ -210,6 +210,23 @@ pub fn claimant(state: &SessionState, definition_id: &str, branch: &str) -> Opti
 mod tests {
     use super::*;
 
+    /// A removal is a hard gc of exactly one Definition that also removes
+    /// the Instance, carrying the caller's force, dry run and identity.
+    #[test]
+    fn a_removal_is_a_hard_instance_gc_of_its_definition() {
+        for (force, dry_run) in [(true, false), (false, true)] {
+            let ask = GcAsk::removal("ws-1".to_owned(), force, dry_run, "alice".to_owned());
+            assert_eq!(ask.definition_id.as_deref(), Some("ws-1"));
+            assert_eq!(ask.level, GcLevel::Hard);
+            assert_eq!(ask.force, force);
+            assert_eq!(ask.dry_run, dry_run);
+            assert!(ask.remove_instance);
+            assert!(!ask.include_pins);
+            assert!(ask.agent_ids.is_empty());
+            assert_eq!(ask.requested_by, "alice");
+        }
+    }
+
     #[test]
     fn targets_split_by_connection_and_protocol() {
         let targets = split_targets(

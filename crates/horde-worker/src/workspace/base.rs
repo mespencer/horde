@@ -10,7 +10,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Tokio's clock rather than std's: identical at run time, and pausable in
+// tests, which is how the throttle's boundary is observed.
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use horde_proto::v1::checkout_prepared::BaseResolution;
@@ -414,6 +418,7 @@ pub(crate) fn holder_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::test_git::{commit, git as run_git};
 
     #[test]
     fn a_holder_is_named_by_its_checkout_path() {
@@ -442,6 +447,190 @@ mod tests {
         let policy = FetchPolicy::default();
         assert_eq!(policy.throttle, Duration::from_secs(60));
         assert_eq!(policy.timeout, Duration::from_secs(30));
+    }
+
+    /// An origin with one commit on `main`, and an Instance repo cloned
+    /// from it: `(origin, instance, the seed commit)`.
+    fn origin_and_instance(dir: &Path) -> (PathBuf, PathBuf, String) {
+        let origin = dir.join("origin");
+        std::fs::create_dir_all(&origin).expect("origin");
+        run_git(&origin, &["init", "-q", "-b", "main"]);
+        let seed = commit(&origin, "seed");
+        let instance = dir.join("instance");
+        run_git(
+            dir,
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                "--",
+                &origin.display().to_string(),
+                &instance.display().to_string(),
+            ],
+        );
+        (origin, instance, seed)
+    }
+
+    fn repo(default_branch: &str) -> WorkspaceRepo {
+        WorkspaceRepo {
+            name: "atlas".to_owned(),
+            default_branch: default_branch.to_owned(),
+            ..WorkspaceRepo::default()
+        }
+    }
+
+    fn requested(reference: &str, source: RepoBaseSource) -> RepoBase {
+        RepoBase {
+            repo_name: "atlas".to_owned(),
+            r#ref: reference.to_owned(),
+            source: source.into(),
+        }
+    }
+
+    /// A throttle counts the fetches it actually runs, and one inside the
+    /// throttle window reuses the last outcome instead of fetching.
+    #[tokio::test]
+    async fn a_fetch_inside_the_throttle_is_reused_and_not_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let throttle = FetchThrottle::new();
+        assert_eq!(throttle.fetches_run(), 0);
+        let policy = FetchPolicy::default();
+        let first = throttle.fetch(dir.path(), policy).await;
+        let second = throttle.fetch(dir.path(), policy).await;
+        assert_eq!(throttle.fetches_run(), 1);
+        assert!(first.error.is_some(), "not a repository");
+        assert_eq!(first, second, "the outcome is reused");
+    }
+
+    /// The window is half-open: a zero throttle never reuses an attempt,
+    /// even one that finished at this very instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_throttle_fetches_again_at_the_same_instant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let throttle = FetchThrottle::new();
+        let policy = FetchPolicy {
+            throttle: Duration::ZERO,
+            timeout: Duration::from_secs(30),
+        };
+        throttle.fetch(dir.path(), policy).await;
+        throttle.fetch(dir.path(), policy).await;
+        throttle.fetch(dir.path(), policy).await;
+        assert_eq!(throttle.fetches_run(), 3);
+    }
+
+    /// A repo with no default branch named starts from `origin/HEAD`, fresh.
+    #[tokio::test]
+    async fn no_default_branch_starts_from_origin_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, _) = origin_and_instance(dir.path());
+        let latest = commit(&origin, "latest");
+        let resolved = prepare_base(
+            &instance,
+            &repo(""),
+            None,
+            "horde/agent-1",
+            &FetchThrottle::new(),
+            FetchPolicy::default(),
+            &NoSource,
+        )
+        .await
+        .expect("the default base never errors");
+        assert_eq!(resolved.resolution, BaseResolution::Fresh);
+        assert_eq!(resolved.sha, latest);
+        assert_eq!(resolved.stale_reason, "");
+    }
+
+    /// An empty or option-shaped base is refused before git sees it.
+    #[tokio::test]
+    async fn an_empty_or_option_shaped_base_is_refused_up_front() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, instance, _) = origin_and_instance(dir.path());
+        let throttle = FetchThrottle::new();
+        for reference in ["", "--upload-pack=touch /tmp/x"] {
+            let error = prepare_base(
+                &instance,
+                &repo("main"),
+                Some(&requested(reference, RepoBaseSource::Requested)),
+                "horde/agent-1",
+                &throttle,
+                FetchPolicy::default(),
+                &NoSource,
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                error.contains("is not a commit, branch or tag"),
+                "{reference:?}: {error}"
+            );
+        }
+        assert_eq!(throttle.fetches_run(), 0, "nothing was fetched");
+    }
+
+    /// Only a parent's commit is sought through the commit source: a human's
+    /// full SHA that names nothing is simply unknown.
+    #[tokio::test]
+    async fn only_a_parents_missing_commit_goes_to_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, instance, _) = origin_and_instance(dir.path());
+        let missing = "0123456789abcdef".repeat(3)[..40].to_owned();
+        let asked = |source: RepoBaseSource| {
+            let instance = instance.clone();
+            let missing = missing.clone();
+            async move {
+                prepare_base(
+                    &instance,
+                    &repo("main"),
+                    Some(&requested(&missing, source)),
+                    "horde/agent-1",
+                    &FetchThrottle::new(),
+                    FetchPolicy::default(),
+                    &NoSource,
+                )
+                .await
+                .expect_err("nothing has that commit")
+            }
+        };
+        let human = asked(RepoBaseSource::Requested).await;
+        assert!(human.contains("names no commit"), "{human}");
+        assert!(!human.contains("parent's commit"), "{human}");
+        let parent = asked(RepoBaseSource::Parent).await;
+        assert!(parent.contains("the parent's commit"), "{parent}");
+        assert!(parent.contains("is not on this worker"), "{parent}");
+    }
+
+    /// A branch at or behind the base is adopted; one holding commits the
+    /// base lacks is refused rather than reset.
+    #[tokio::test]
+    async fn a_branch_behind_its_base_is_adopted_and_one_ahead_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, instance, seed) = origin_and_instance(dir.path());
+        let base = commit(&instance, "base");
+        run_git(&instance, &["branch", "behind", &seed]);
+        run_git(&instance, &["branch", "same", &base]);
+        run_git(&instance, &["checkout", "-q", "-b", "ahead", &seed]);
+        commit(&instance, "diverged");
+        run_git(&instance, &["checkout", "-q", "main"]);
+
+        assert_eq!(
+            plan_branch(&instance, "fresh", &base).await,
+            Ok(BranchPlan::Create)
+        );
+        assert_eq!(
+            plan_branch(&instance, "behind", &base).await,
+            Ok(BranchPlan::Adopt)
+        );
+        assert_eq!(
+            plan_branch(&instance, "same", &base).await,
+            Ok(BranchPlan::Adopt)
+        );
+        let refused = plan_branch(&instance, "ahead", &base)
+            .await
+            .expect_err("its commits would be lost");
+        assert!(refused.contains("commits its base"), "{refused}");
+        let held = plan_branch(&instance, "main", &seed)
+            .await
+            .expect_err("main is checked out");
+        assert!(held.contains("checked out by"), "{held}");
     }
 
     #[tokio::test]

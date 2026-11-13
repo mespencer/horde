@@ -773,7 +773,14 @@ fn commit_older_than(repo: &Path, reference: &str, ttl: std::time::Duration) -> 
     else {
         return false;
     };
-    let age_ms = now_ms().saturating_sub(seconds.saturating_mul(1000));
+    aged_past(seconds, now_ms(), ttl)
+}
+
+/// Whether something committed at `committed_s` (Unix seconds) is, at
+/// `now_ms`, strictly older than `ttl`. A commit dated in the future is
+/// never old.
+fn aged_past(committed_s: i64, now_ms: i64, ttl: std::time::Duration) -> bool {
+    let age_ms = now_ms.saturating_sub(committed_s.saturating_mul(1000));
     u128::try_from(age_ms).is_ok_and(|age| age > ttl.as_millis())
 }
 
@@ -794,6 +801,10 @@ pub fn tally(events: &[WorkspaceCleanup]) -> (u32, u32, u64) {
     }
     (done, refused, freed)
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod scenarios;
 
 #[cfg(test)]
 mod tests {
@@ -830,11 +841,14 @@ mod tests {
     fn a_dry_run_reclaim_names_the_command_or_the_skip() {
         let skip = would_reclaim("atlas", &Resolved::Skip("no reclaim command".to_owned()));
         assert_eq!(skip.outcome, i32::from(Outcome::Skipped));
+        assert_eq!(skip.repo_name, "atlas");
+        assert_eq!(skip.reason, "no reclaim command");
         let run = would_reclaim(
             "atlas",
             &Resolved::Run(super::super::policy::cargo_rule().command),
         );
         assert_eq!(run.outcome, i32::from(Outcome::WouldDo));
+        assert_eq!(run.repo_name, "atlas");
         assert_eq!(run.argv, vec!["cargo", "clean"]);
     }
 
@@ -851,5 +865,16 @@ mod tests {
         assert_eq!(forced_reason(&proof), "forced: untracked files: 1");
         assert_eq!(unrecoverable_of(&proof).len(), 1);
         assert!(unrecoverable_of(&Proof::Lossless).is_empty());
+    }
+
+    /// Age is strict: exactly the TTL old is not past it, a millisecond
+    /// more is, and a commit dated after now never is.
+    #[test]
+    fn a_commit_ages_past_its_ttl_only_strictly() {
+        let ttl = std::time::Duration::from_secs(10);
+        assert!(!aged_past(100, 110_000, ttl), "exactly the ttl");
+        assert!(aged_past(100, 110_001, ttl), "one millisecond past");
+        assert!(!aged_past(100, 109_999, ttl), "younger");
+        assert!(!aged_past(200, 110_000, ttl), "from the future");
     }
 }

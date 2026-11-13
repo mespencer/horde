@@ -557,3 +557,41 @@ pub(super) fn domain_spec(
         provider_options: BTreeMap::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SpawnCheckout, with_overlay};
+    use crate::share::AgentCheckout;
+    use horde_proto::v1::SpawnAgentCommand;
+
+    fn lazy_checkout(overlay: &str) -> SpawnCheckout {
+        SpawnCheckout {
+            checkout: AgentCheckout {
+                root: "/w/agent-1".into(),
+                repos: Vec::new(),
+            },
+            prepared: horde_proto::v1::CheckoutPrepared::default(),
+            overlay: Some(overlay.to_owned()),
+        }
+    }
+
+    /// The lazy paragraph stands alone on a spawn with no overlay of its
+    /// own, and follows an existing one after a blank line.
+    #[test]
+    fn the_lazy_paragraph_joins_the_overlay_with_one_blank_line() {
+        let bare = SpawnAgentCommand::default();
+        assert_eq!(
+            with_overlay(&bare, Some(&lazy_checkout("check out lazily"))).prompt_overlay,
+            "check out lazily"
+        );
+        let own = SpawnAgentCommand {
+            prompt_overlay: "be brief".to_owned(),
+            ..SpawnAgentCommand::default()
+        };
+        assert_eq!(
+            with_overlay(&own, Some(&lazy_checkout("check out lazily"))).prompt_overlay,
+            "be brief\n\ncheck out lazily"
+        );
+        assert_eq!(with_overlay(&own, None).prompt_overlay, "be brief");
+    }
+}
