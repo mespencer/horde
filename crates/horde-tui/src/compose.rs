@@ -145,15 +145,13 @@ impl Compose {
     pub fn delete_word(&mut self) {
         let chars: Vec<char> = self.lines[self.row].chars().collect();
         let before = &chars[..self.col.min(chars.len())];
-        // Past any spaces just behind the cursor, then back over the word.
-        let word_end = before
+        // Past any spaces just behind the cursor to the word's last
+        // character, then back to the space before the word.
+        let start = before
             .iter()
             .rposition(|c| *c != ' ')
-            .map_or(0, |index| index + 1);
-        let start = before[..word_end]
-            .iter()
-            .rposition(|c| *c == ' ')
-            .map_or(0, |index| index + 1);
+            .and_then(|last| before[..last].iter().rposition(|c| *c == ' '))
+            .map_or(0, |space| space + 1);
         let line = &mut self.lines[self.row];
         let (from, to) = (byte_at(line, start), byte_at(line, self.col));
         line.replace_range(from..to, "");
@@ -324,6 +322,10 @@ mod tests {
             "only the word behind the cursor goes"
         );
         assert_eq!(compose.cursor(), (0, 3));
+
+        let mut compose = typed("a b");
+        compose.delete_word();
+        assert_eq!(compose.text(), "a ", "a one-letter word goes alone");
 
         let mut compose = typed("   ");
         compose.delete_word();
