@@ -270,6 +270,11 @@ fn detail(kind: Option<&Kind>) -> Value {
                 .unwrap_or_default(),
         ),
         Some(Kind::TurnInterrupted(interrupted)) => Value::String(interrupted.reason.clone()),
+        Some(Kind::CheckoutPrepared(prepared)) => crate::workspace_gc::prepared_detail(prepared),
+        Some(Kind::WorkspaceCleanup(cleanup)) => {
+            serde_json::from_str(&crate::workspace_gc::cleanup_rows(cleanup, Format::Json))
+                .unwrap_or_default()
+        }
         other => structured_detail(other),
     }
 }
@@ -280,6 +285,8 @@ fn detail(kind: Option<&Kind>) -> Value {
 fn human_detail(kind: Option<&Kind>, detail: &Value) -> String {
     match kind {
         Some(Kind::AgentLifecycleChanged(changed)) => lifecycle_line(changed),
+        Some(Kind::CheckoutPrepared(prepared)) => crate::workspace_gc::prepared_line(prepared),
+        Some(Kind::WorkspaceCleanup(cleanup)) => crate::workspace_gc::cleanup_rows(cleanup, Format::Human),
         _ => detail.as_str().unwrap_or_default().to_owned(),
     }
 }
