@@ -121,39 +121,51 @@ impl WorkerSettings {
 fn read(root: &mut Section<'_>) -> Result<WorkerFile, String> {
     let mut file = WorkerFile::default();
     if let Some(mut worker) = root.section("worker")? {
-        if let Some(mut workspace) = worker.section("workspace")? {
-            let keys = &mut file.keys;
-            keys.workspace_root = workspace.string("root")?.map(PathBuf::from);
-            keys.scan_interval = interval(&mut workspace, "scan_interval")?;
-            keys.pin_scan_interval = interval(&mut workspace, "pin_scan_interval")?;
-            keys.report_interval = interval(&mut workspace, "report_interval")?;
-            keys.disk_low_watermark = watermark(&mut workspace, "disk_low_watermark")?;
-            keys.disk_high_watermark = watermark(&mut workspace, "disk_high_watermark")?;
-            workspace.finish()?;
+        if let Some(workspace) = worker.section("workspace")? {
+            file.keys = read_workspace(workspace)?;
         }
         worker.finish()?;
     }
     if let Some(mut codex) = root.section("codex")? {
-        file.sandbox = codex
-            .string_map("sandbox")?
-            .map(|modes| {
-                modes
-                    .into_iter()
-                    .map(|(mode, tier)| {
-                        let tier = tier_named(&tier).ok_or_else(|| {
-                            codex.refuse(
-                                &format!("sandbox.{mode}"),
-                                format!("{tier:?} is not \"read-only\" or \"workspace-write\""),
-                            )
-                        })?;
-                        Ok((mode, tier))
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            })
-            .transpose()?;
+        file.sandbox = read_sandbox(&mut codex)?;
         codex.finish()?;
     }
     Ok(file)
+}
+
+/// `[worker.workspace]`, finished.
+fn read_workspace(mut workspace: Section<'_>) -> Result<WorkerFlags, String> {
+    let keys = WorkerFlags {
+        workspace_root: workspace.string("root")?.map(PathBuf::from),
+        scan_interval: interval(&mut workspace, "scan_interval")?,
+        pin_scan_interval: interval(&mut workspace, "pin_scan_interval")?,
+        report_interval: interval(&mut workspace, "report_interval")?,
+        disk_low_watermark: watermark(&mut workspace, "disk_low_watermark")?,
+        disk_high_watermark: watermark(&mut workspace, "disk_high_watermark")?,
+    };
+    workspace.finish()?;
+    Ok(keys)
+}
+
+/// `codex.sandbox`: each mode's tier, by its wire name.
+fn read_sandbox(codex: &mut Section<'_>) -> Result<Option<Vec<(String, SandboxTier)>>, String> {
+    codex
+        .string_map("sandbox")?
+        .map(|modes| {
+            modes
+                .into_iter()
+                .map(|(mode, tier)| {
+                    let tier = tier_named(&tier).ok_or_else(|| {
+                        codex.refuse(
+                            &format!("sandbox.{mode}"),
+                            format!("{tier:?} is not \"read-only\" or \"workspace-write\""),
+                        )
+                    })?;
+                    Ok((mode, tier))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .transpose()
 }
 
 /// A scan interval: a duration, never zero, since a zero interval would spin.

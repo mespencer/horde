@@ -45,7 +45,20 @@ pub struct WorkspaceFile {
 /// without its marker or with an argv the Worker would refuse.
 pub fn read(root: &mut Section<'_>) -> Result<WorkspaceFile, String> {
     let mut file = WorkspaceFile::default();
-    if let Some(mut workspace) = root.section("workspace")? {
+    if let Some(workspace) = root.section("workspace")? {
+        read_workspace(workspace, &mut file)?;
+    }
+    if let Some(mut placement) = root.section("placement")? {
+        file.keys.disk_pressure = placement.threshold("disk_pressure")?;
+        file.keys.disk_floor = placement.size("disk_floor")?;
+        placement.finish()?;
+    }
+    Ok(file)
+}
+
+/// The `[workspace]` table, finished.
+fn read_workspace(mut workspace: Section<'_>, file: &mut WorkspaceFile) -> Result<(), String> {
+    {
         let keys = &mut file.keys;
         keys.fetch_throttle = workspace.duration("fetch_throttle")?;
         keys.fetch_timeout = workspace.duration("fetch_timeout")?;
@@ -60,14 +73,8 @@ pub fn read(root: &mut Section<'_>) -> Result<WorkspaceFile, String> {
                 .transpose()?;
             reclaim.finish()?;
         }
-        workspace.finish()?;
     }
-    if let Some(mut placement) = root.section("placement")? {
-        file.keys.disk_pressure = placement.threshold("disk_pressure")?;
-        file.keys.disk_floor = placement.size("disk_floor")?;
-        placement.finish()?;
-    }
-    Ok(file)
+    workspace.finish()
 }
 
 /// One `{ marker, argv, timeout, output_paths }` rule.
