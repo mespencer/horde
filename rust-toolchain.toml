@@ -2,3 +2,6 @@
 channel = "1.95.0"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
 profile = "minimal"
+# The Windows cross-check (`clippy-windows`, ADR-0017) builds the standard
+# library for this target; rustup installs it with the toolchain.
+targets = ["x86_64-pc-windows-msvc"]

@@ -63,6 +63,7 @@ mismatch. `cargo fmt`, `cargo clippy` and `cargo test` are pinned by
 | cargo-machete | 0.9.2 | `cargo install --locked cargo-machete@0.9.2` |
 | cargo-modules | 0.26.0 | `cargo install --locked cargo-modules@0.26.0` |
 | cargo-gamma | 0.2.1, census-kill-final patch | `tools/cargo-gamma/install.sh` |
+| cargo-xwin | 0.23.1 | `cargo install --locked cargo-xwin@0.23.1`; also a host `clang` and `lld-link` (LLVM) |
 | jscpd | 5.0.14 | Node.js 18+; `npx` fetches `jscpd@5.0.14` itself |
 | buf | 1.69.0 | `brew install bufbuild/buf/buf`, or https://buf.build/docs/installation |
 
@@ -130,6 +131,30 @@ whereas a blanket allow also covers any non-test code that later lands in the fi
 `target/quality/clippy.log`. Cargo's own tallies (`could not compile …`, `aborting due
 to …`) are excluded from the count so it reflects distinct findings. An exit code other
 than 0 or 101 is an `error`, not a lint verdict.
+
+## clippy-windows
+
+**What.** `cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets --all-features
+-- -D warnings` across the selected packages: every target compiled and linted for
+Windows, from Linux, under the same deny-list and the same `-D warnings` as `clippy`.
+The target's standard library comes from `rust-toolchain.toml` (`targets`); cargo-xwin
+supplies the MSVC CRT and Windows SDK headers (downloaded once to its cache, accepting
+Microsoft's license on the operator's behalf) for the C that `ring` and `rusqlite`
+compile, and drives the host's `clang-cl`/`lld-link`.
+
+**Why.** A Windows machine can be a Worker (ADR-0017), and the platform seams —
+`cfg(unix)` here, `cfg(windows)` there — are where code rots unseen: a branch nobody
+compiles stops compiling, and nobody finds out until a Windows box is asked to run an
+agent. Compiling every target, tests included, keeps the Windows-only tests from rotting
+too, even though they run only on Windows.
+
+**What it does not do.** Run anything. Windows tests run on a Windows machine; ADR-0017
+lists them and how to run them. A pass here means "builds and lints for Windows", never
+"works on Windows".
+
+**Local.** `gauntlet run clippy-windows`, or the command above. Reading a run is exactly
+`clippy`'s: a `fail` counts diagnostics, the messages are in
+`target/quality/clippy-windows.log`, and an exit other than 0 or 101 is an `error`.
 
 ## test
 
@@ -580,6 +605,10 @@ instrumented at all. The gate does not trust that to stay true. `DANGEROUS` in t
 names the file; if it exists it must be an `exclude-files` entry of its own, and the gate
 refuses — `REFUSING TO MUTATE`, before anything is built — if the workspace listing or the
 run's own listing contains a single mutant in it. No mutation of `reap.rs` is ever run.
+
+The `cfg(windows)` files (each crate's `windows.rs`, ADR-0017) need no entry: gamma
+lists no mutant in code the host does not compile, and the gate refuses an entry that
+removes nothing.
 
 **Equivalent mutants are suppressed at the expression, not excluded.** Sometimes a
 mutation produces the expression that was already there. `Capabilities::none()` is

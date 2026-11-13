@@ -45,7 +45,7 @@ On the second machine, redeem it. The token file (or `HORDE_JOIN_TOKEN`) keeps t
 horde-worker --join-file token.txt --adapter claude
 ```
 
-The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`.
+The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`. A Windows machine joins the same way with `horde-worker.exe`; it needs `claude.exe` (Claude Code's native installer) or the native `codex.exe` on `PATH`, and ADR-0017 lists what differs there.
 
 If you can ssh to the second machine (Linux or macOS), one command does all of this from here:
 
