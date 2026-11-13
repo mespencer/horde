@@ -764,6 +764,8 @@ mod tests {
     /// success arm turns this accepted into a refusal.
     #[tokio::test]
     async fn two_legs_pair_and_carry_frames_both_ways() {
+        // Tunnel bytes are never logged at any level (ADR-0015).
+        let capture = crate::diagnostics::testfix::Capture::everything();
         let (log, registry) = expose_fixture().await;
         let (_epoch, mut lane) = registry.register_worker("w1");
 
@@ -787,21 +789,22 @@ mod tests {
         assert_eq!(accepted, accepted_frame());
 
         origin_feed
-            .send(Ok(data_frame(b"request".to_vec())))
+            .send(Ok(data_frame(b"tunnel-payload-up".to_vec())))
             .await
             .expect("send");
         let crossed = within("origin bytes reach the answerer", &mut answer_out).await;
-        assert_eq!(crossed, data_frame(b"request".to_vec()));
+        assert_eq!(crossed, data_frame(b"tunnel-payload-up".to_vec()));
 
         answer_feed
-            .send(Ok(data_frame(b"response".to_vec())))
+            .send(Ok(data_frame(b"tunnel-payload-down".to_vec())))
             .await
             .expect("send");
         let echoed = within("answer bytes reach the originator", &mut origin_out).await;
-        assert_eq!(echoed, data_frame(b"response".to_vec()));
+        assert_eq!(echoed, data_frame(b"tunnel-payload-down".to_vec()));
 
         origin_task.abort();
         answer_task.abort();
+        capture.assert_never_logged(&[b"tunnel-payload-up", b"tunnel-payload-down"]);
     }
 
     // -- refusal plumbing ---------------------------------------------------

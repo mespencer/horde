@@ -44,7 +44,10 @@ pub fn fingerprints_match(a: &str, b: &str) -> bool {
 
 /// What a human carries to the joining machine: the one-time secret and the
 /// Server fingerprint, in one copy-pasteable token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand and elides the secret (ADR-0015): Debug output
+/// lands in logs, and a derived impl would print a live credential there.
+#[derive(Clone, PartialEq, Eq)]
 pub struct JoinCode {
     /// The one-time secret the Server minted; redeemed exactly once.
     pub secret: String,
@@ -69,6 +72,15 @@ impl JoinCode {
             secret: secret.to_owned(),
             server_fingerprint: fingerprint.to_ascii_lowercase(),
         })
+    }
+}
+
+impl std::fmt::Debug for JoinCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinCode")
+            .field("secret", &"[REDACTED]")
+            .field("server_fingerprint", &self.server_fingerprint)
+            .finish()
     }
 }
 
@@ -99,6 +111,22 @@ mod tests {
         assert!(fingerprints_match("abc123", "ABC123"));
         assert!(!fingerprints_match("abc123", "abc124"));
         assert!(!fingerprints_match("abc123", "abc12"));
+    }
+
+    /// Debug output lands in logs, so it names the pin and never the secret.
+    #[test]
+    fn a_join_codes_debug_never_prints_its_secret() {
+        let code = JoinCode {
+            secret: "0123456789abcdef".to_owned(),
+            server_fingerprint: "b".repeat(64),
+        };
+        let debug = format!("{code:?}");
+        assert!(!debug.contains("0123456789abcdef"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        assert!(
+            debug.contains(&"b".repeat(64)),
+            "the pin is not a secret: {debug}"
+        );
     }
 
     #[test]
