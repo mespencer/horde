@@ -45,7 +45,9 @@ On the second machine, redeem it. The token file (or `HORDE_JOIN_TOKEN`) keeps t
 horde-worker --join-file token.txt --adapter claude
 ```
 
-The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`. To add another client machine instead, mint with `horde enroll client <name>` and redeem with `horde enroll join --token-file token.txt`.
+The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`.
+
+Agents on different machines share commits through the server's git Relay. A server started with `horde-server --serve --relay-mtls-bind 0.0.0.0:7779 --san box.lan ...` serves it to other machines; start each worker with `--workspace-root <dir> --relay https://box.lan:7779` and its git presents the worker's enrolled identity. `horde up` does not open the Relay yet. To add another client machine instead, mint with `horde enroll client <name>` and redeem with `horde enroll join --token-file token.txt`.
 
 ## Diagnosing a setup
 
