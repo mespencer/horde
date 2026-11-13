@@ -58,7 +58,11 @@ async fn served(
     let access = Arc::new(LogAccess::new(
         Some(LocalLogs::new(worker_logs, "horde-worker", None)),
         "w1",
-        AgentReadLimits::default(),
+        // Four calls before the limit, so the fifth meets it.
+        AgentReadLimits {
+            burst: 4,
+            ..AgentReadLimits::default()
+        },
     ));
     let endpoint = HordeEndpoint::new(horde.context().await?).with_logs(access);
     let (address, serving) =
@@ -120,6 +124,22 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     );
     assert!(!text.contains("srv.secret"));
     assert_eq!(server["truncated"], false);
+    assert_eq!(server["redacted"], 1, "{server}");
+    assert!(server["next_cursor"].is_string(), "{server}");
+
+    // Paging past everything: no records, and the cursor stays put.
+    let later = "2999-01-01T00:00:00.000000Z~horde~~0";
+    let past = view(
+        &mcp.call_tool(
+            "logs",
+            serde_json::json!({"target": "server", "cursor": later}),
+        )
+        .await
+        .expect("paged"),
+    )
+    .expect("json");
+    assert_eq!(past["records"].as_array().map(Vec::len), Some(0), "{past}");
+    assert_eq!(past["next_cursor"], later, "{past}");
 
     let capped = view(
         &mcp.call_tool(
@@ -133,7 +153,7 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     assert_eq!(capped["truncated"], true, "{capped}");
     assert_eq!(capped["records"].as_array().map(Vec::len), Some(0));
 
-    // The burst of three is spent: the fourth call is a tool error the model
+    // The burst of four is spent: the fifth call is a tool error the model
     // reads, not a protocol error.
     let limited = mcp
         .call_tool_raw("logs", serde_json::json!({}))
