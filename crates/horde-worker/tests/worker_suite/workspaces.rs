@@ -549,7 +549,7 @@ async fn archived(
     manager: &WorkspaceManager,
     agent: &str,
 ) -> horde_worker::workspace::ledger::LedgerRecord {
-    horde_worker::workspace::cleanup::mark_archived(&manager, "ws-1", agent)
+    horde_worker::workspace::cleanup::mark_archived(manager, "ws-1", agent)
         .await
         .expect("the agent has a ledgered checkout")
 }
