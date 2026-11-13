@@ -966,6 +966,15 @@ impl Client {
         })
     }
 
+    /// Opens a diagnostic-log read (ADR-0015): the server's, a worker's, or
+    /// an agent's records, then — with `follow` — new ones as they come.
+    pub async fn read_logs(
+        &mut self,
+        request: horde_proto::v1::ReadLogsRequest,
+    ) -> Result<tonic::Streaming<horde_proto::v1::ReadLogsResponse>, ClientError> {
+        Ok(self.inner.read_logs(request).await?.into_inner())
+    }
+
     /// Opens one tunnel leg, stripped to bare frames for the pump.
     pub async fn open_forward_tunnel(&mut self) -> Result<crate::forward::Tunnel, ClientError> {
         use tokio_stream::StreamExt as _;

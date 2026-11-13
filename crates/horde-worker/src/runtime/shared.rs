@@ -39,6 +39,10 @@ pub(super) struct Shared {
     /// Serves each Session's MCP endpoint and mints per-agent tokens. `None`
     /// means spawned agents get no endpoint — the in-process test shape.
     pub(super) endpoints: Option<Arc<crate::endpoint::EndpointManager>>,
+    /// This Worker's diagnostic logs (ADR-0015): where each harness's
+    /// stderr is written. `None` keeps stderr in the death tail only — the
+    /// in-process test shape.
+    pub(super) logs: Option<Arc<crate::logs::LogServing>>,
 }
 
 impl Shared {
@@ -51,7 +55,17 @@ impl Shared {
             broker: Arc::new(ShareBroker::new(None)),
             attachments: Arc::new(crate::blob::AttachmentBroker::new(None)),
             endpoints: None,
+            logs: None,
         }
+    }
+
+    /// The stderr sink one agent's harness is spawned under.
+    fn stderr_sink(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Option<Arc<dyn horde_adapter::stderr::StderrSink>> {
+        crate::logs::stderr_sink(self.logs.as_deref(), agent_id, session_id)
     }
 
     /// The journal sink results are stamped through (see
@@ -116,7 +130,19 @@ impl Shared {
     ) -> Result<(Box<dyn AgentSession>, bool), WorkerError> {
         let adapter = self.adapter_for(spawn)?;
         let spec = domain_spec(spawn, cwd, endpoint);
-        let session = adapter.spawn(&spec).await?;
+        let sink = self.stderr_sink(
+            &spawn
+                .agent_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            &spawn
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+        let session = horde_adapter::stderr::scoped(sink, adapter.spawn(&spec)).await?;
         let can_rewrite = adapter
             .capabilities()
             .supports(Capability::RewritesToolInput);
@@ -266,12 +292,15 @@ impl Shared {
         // uniqueness, not density, so the skip is free.
         let spec =
             domain_spec(&record.spawn, cwd, endpoint).with_turns_taken(record.turns_taken + 1);
-        let session = adapter
-            .resume(
+        let sink = self.stderr_sink(&record.agent_id, &record.session_id);
+        let session = horde_adapter::stderr::scoped(
+            sink,
+            adapter.resume(
                 &spec,
                 &horde_adapter::ProviderSessionId::new(provider_session_id),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         let can_rewrite = adapter
             .capabilities()
             .supports(Capability::RewritesToolInput);

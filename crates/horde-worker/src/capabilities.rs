@@ -28,6 +28,20 @@ pub fn hello(display_name: &str) -> Hello {
     }
 }
 
+/// [`hello`], advertising `logs.v1` when this Worker serves log reads
+/// (ADR-0015) — without the flag the Server refuses reads aimed here
+/// instead of waiting on a stream this Worker never opens.
+#[must_use]
+pub fn hello_serving_logs(display_name: &str, serves_logs: bool) -> Hello {
+    let mut hello = hello(display_name);
+    if serves_logs {
+        hello
+            .capability_flags
+            .push(horde_wire::logs::LOGS_CAPABILITY.to_owned());
+    }
+    hello
+}
+
 /// Operator-declared placement facts (fix a15): the config source for the
 /// advertisement's tags and reachable remotes. The scheduler has matched on
 /// both all along; before this, nothing could ever pass those filters.

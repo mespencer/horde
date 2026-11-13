@@ -72,6 +72,9 @@ pub struct EndpointManager {
     /// The tokens the serving gate accepts; shared with every endpoint this
     /// manager serves.
     registry: Arc<AgentRegistry>,
+    /// The `logs` verb's local files and per-agent limits (ADR-0015), one
+    /// set shared by every endpoint, so an agent's limits hold across them.
+    logs: std::sync::OnceLock<horde_mcp::logs::SharedLogAccess>,
     /// Each Agent's proxied toolset — hub link plus `local` children —
     /// shared with every endpoint this manager serves, resolved per request
     /// by caller identity.
@@ -109,9 +112,20 @@ impl std::fmt::Debug for EndpointManager {
 }
 
 impl EndpointManager {
+    /// Serves the agents' `logs` verb from this Worker's own files
+    /// (ADR-0015). Set once; endpoints bound after it carry it.
+    pub fn serve_logs(&self, local: horde_observe::reader::LocalLogs) {
+        let _ = self.logs.set(Arc::new(horde_mcp::logs::LogAccess::new(
+            Some(local),
+            &self.worker_id,
+            horde_observe::settings::AgentReadLimits::default(),
+        )));
+    }
+
     #[must_use]
     pub fn new(channel: tonic::transport::Channel, worker_id: &str) -> Self {
         Self {
+            logs: std::sync::OnceLock::new(),
             channel,
             worker_id: worker_id.to_owned(),
             registry: Arc::new(AgentRegistry::new()),
@@ -300,8 +314,11 @@ impl EndpointManager {
             horde_cli::client::Client::with_channel(self.channel.clone()),
             session_id,
         );
-        let endpoint = horde_mcp::endpoint::HordeEndpoint::new(context)
+        let mut endpoint = horde_mcp::endpoint::HordeEndpoint::new(context)
             .with_agent_proxies(Arc::clone(&self.proxies));
+        if let Some(logs) = self.logs.get() {
+            endpoint = endpoint.with_logs(Arc::clone(logs));
+        }
         let (bound, serving) = horde_mcp::server::serve(
             &EndpointConfig::loopback(0),
             Arc::clone(&self.registry),

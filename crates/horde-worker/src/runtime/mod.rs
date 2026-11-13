@@ -102,10 +102,30 @@ impl Runtime {
         channel: tonic::transport::Channel,
         worker_id: &str,
     ) -> Self {
-        self.shared.endpoints = Some(Arc::new(crate::endpoint::EndpointManager::new(
-            channel, worker_id,
-        )));
+        let endpoints = crate::endpoint::EndpointManager::new(channel, worker_id);
+        if let Some(logs) = &self.shared.logs {
+            endpoints.serve_logs(logs.local().clone());
+        }
+        self.shared.endpoints = Some(Arc::new(endpoints));
         self
+    }
+
+    /// Keeps this Worker's diagnostic logs (ADR-0015): every harness's
+    /// stderr goes to its agent's file, and the agents' `logs` verb reads
+    /// this Worker's files locally.
+    #[must_use]
+    pub fn with_logs(mut self, logs: Arc<crate::logs::LogServing>) -> Self {
+        if let Some(endpoints) = &self.shared.endpoints {
+            endpoints.serve_logs(logs.local().clone());
+        }
+        self.shared.logs = Some(logs);
+        self
+    }
+
+    /// The logs this Worker keeps and serves, when it keeps any.
+    #[must_use]
+    pub fn logs(&self) -> Option<&Arc<crate::logs::LogServing>> {
+        self.shared.logs.as_ref()
     }
 
     /// Points attachment transfer at the Server's blob store, over the

@@ -76,6 +76,9 @@ horde-adapter-claude = { path = "../horde-adapter-claude" }
 # The mTLS termination for an endpoint bound beyond loopback (DESIGN §3):
 # the acceptor and its revocation-aware verifier have one owner.
 horde-identity = { workspace = true }
+# The `logs` verb (ADR-0015) reads the worker's own files and redacts what
+# it returns through the one egress path.
+horde-observe = { workspace = true }
 horde-cli = { path = "../horde-cli" }
 horde-proto = { path = "../horde-proto" }
 horde-wire = { path = "../horde-wire" }

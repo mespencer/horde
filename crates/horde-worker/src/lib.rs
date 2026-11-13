@@ -36,6 +36,7 @@ pub mod hub;
 mod inbox;
 pub mod journal;
 pub mod login;
+pub mod logs;
 pub mod process;
 pub mod runtime;
 pub mod share;

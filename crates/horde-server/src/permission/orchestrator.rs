@@ -11,6 +11,11 @@
 //! or its parent; a wait may watch only a descendant. Everything else — the
 //! forward verbs included, which have their own chain treatment — is not an
 //! orchestrator verb and is left to the rest of the chain.
+//!
+//! `logs` (ADR-0015) rides the same allowance: it is read-only, its reach
+//! is already scoped server-side to the caller's own session, and the call
+//! and its result appear in the agent's output as a tool use, so the log
+//! records that the agent looked.
 
 use horde_proto::prost_types::value::Kind as ValueKind;
 use horde_proto::v1::ProposedToolCall;
@@ -25,7 +30,7 @@ pub fn orchestrator_verb(tool_name: &str) -> Option<&str> {
     let verb = horde_mcp::endpoint::horde_tool(tool_name)?;
     matches!(
         verb,
-        "spawn_agent" | "report_result" | "send_message" | "wait_for_agent"
+        "spawn_agent" | "report_result" | "send_message" | "wait_for_agent" | "logs"
     )
     .then_some(verb)
 }
@@ -35,7 +40,7 @@ pub fn orchestrator_verb(tool_name: &str) -> Option<&str> {
 #[must_use]
 pub fn own_orchestrator_verb(call: &ProposedToolCall, caller: &str, state: &SessionState) -> bool {
     match orchestrator_verb(&call.tool_name) {
-        Some("spawn_agent" | "report_result") => true,
+        Some("spawn_agent" | "report_result" | "logs") => true,
         Some("send_message") => string_argument(call, "to_agent_id").is_some_and(|target| {
             is_descendant(state, caller, target) || is_parent(state, caller, target)
         }),
@@ -137,12 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn both_harness_spellings_name_the_four_verbs_and_nothing_else() {
+    fn both_harness_spellings_name_the_verbs_and_nothing_else() {
         for verb in [
             "spawn_agent",
             "report_result",
             "send_message",
             "wait_for_agent",
+            "logs",
         ] {
             assert_eq!(orchestrator_verb(&format!("horde/{verb}")), Some(verb));
             assert_eq!(
@@ -161,6 +167,25 @@ mod tests {
         ] {
             assert_eq!(orchestrator_verb(tool), None, "{tool}");
         }
+    }
+
+    /// Reading logs is read-only and scoped by the server, so the shipped
+    /// mode lets an agent do it without a human in the loop.
+    #[test]
+    fn reading_logs_is_always_allowed_under_either_spelling() {
+        let state = tree();
+        for tool in ["horde/logs", "mcp__horde__logs"] {
+            assert!(own_orchestrator_verb(
+                &call(tool, "target", None),
+                "child",
+                &state
+            ));
+        }
+        assert!(!own_orchestrator_verb(
+            &call("other/logs", "target", None),
+            "child",
+            &state
+        ));
     }
 
     #[test]
