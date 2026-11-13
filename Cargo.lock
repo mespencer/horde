@@ -1313,6 +1313,7 @@ dependencies = [
  "horde-adapter-claude",
  "horde-cli",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-server",
  "horde-server-testkit",
