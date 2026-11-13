@@ -126,20 +126,29 @@ pub fn reclaim_from(value: &str) -> Result<(String, ReclaimPolicy), ClientError>
 ///
 /// A value that does not parse, a repo the list does not hold, or a
 /// timeout for a repo with no reclaim command.
-pub fn apply_reclaim(repos: &mut [WorkspaceRepo], args: &WorkspacePolicyArgs) -> Result<(), ClientError> {
+pub fn apply_reclaim(
+    repos: &mut [WorkspaceRepo],
+    args: &WorkspacePolicyArgs,
+) -> Result<(), ClientError> {
     for value in &args.reclaim {
         let (name, policy) = reclaim_from(value)?;
         let repo = find_repo(repos, &name, "--reclaim")?;
         repo.reclaim = Some(policy);
     }
     for value in &args.reclaim_timeout {
-        let (name, duration) = value.split_once('=').ok_or_else(|| {
-            invalid(format!("--reclaim-timeout takes REPO=DUR, got {value:?}"))
-        })?;
+        let (name, duration) = value
+            .split_once('=')
+            .ok_or_else(|| invalid(format!("--reclaim-timeout takes REPO=DUR, got {value:?}")))?;
         let duration = parse_duration("--reclaim-timeout", duration)?;
         let repo = find_repo(repos, name, "--reclaim-timeout")?;
-        match repo.reclaim.as_mut().and_then(|reclaim| reclaim.policy.as_mut()) {
-            Some(reclaim_policy::Policy::Command(command)) => command.timeout = Some(wire(duration)),
+        match repo
+            .reclaim
+            .as_mut()
+            .and_then(|reclaim| reclaim.policy.as_mut())
+        {
+            Some(reclaim_policy::Policy::Command(command)) => {
+                command.timeout = Some(wire(duration))
+            }
             _ => {
                 return Err(invalid(format!(
                     "--reclaim-timeout {name}: repo {name} has no reclaim command (set one with --reclaim)"
@@ -159,7 +168,12 @@ fn find_repo<'a>(
     repos
         .iter_mut()
         .find(|repo| repo.name == name)
-        .ok_or_else(|| invalid(format!("{flag} names repo {name:?}, not one of: {}", known.join(", "))))
+        .ok_or_else(|| {
+            invalid(format!(
+                "{flag} names repo {name:?}, not one of: {}",
+                known.join(", ")
+            ))
+        })
 }
 
 /// The cleanup overrides the flags set, or `None` when they set none.
@@ -167,7 +181,9 @@ fn find_repo<'a>(
 /// # Errors
 ///
 /// A duration that does not parse.
-pub fn cleanup_from(args: &WorkspacePolicyArgs) -> Result<Option<WorkspaceCleanupPolicy>, ClientError> {
+pub fn cleanup_from(
+    args: &WorkspacePolicyArgs,
+) -> Result<Option<WorkspaceCleanupPolicy>, ClientError> {
     let idle = args
         .idle_reclaim_after
         .as_deref()
@@ -248,7 +264,11 @@ pub fn checkout_fields(
         .collect::<Result<Vec<_>, _>>()?;
     Ok((
         mode_for(args.checkout_mode),
-        args.repos.iter().filter(|repo| !repo.is_empty()).cloned().collect(),
+        args.repos
+            .iter()
+            .filter(|repo| !repo.is_empty())
+            .cloned()
+            .collect(),
         bases,
         args.branch.clone().unwrap_or_default(),
     ))
@@ -260,7 +280,14 @@ mod tests {
 
     #[test]
     fn durations_take_seconds_minutes_hours_and_days() {
-        for (value, seconds) in [("0", 0), ("90", 90), ("90s", 90), ("10m", 600), ("4h", 14_400), ("1d", 86_400)] {
+        for (value, seconds) in [
+            ("0", 0),
+            ("90", 90),
+            ("90s", 90),
+            ("10m", 600),
+            ("4h", 14_400),
+            ("1d", 86_400),
+        ] {
             assert_eq!(
                 parse_duration("--x", value).expect("parses"),
                 Duration::from_secs(seconds),
@@ -279,13 +306,22 @@ mod tests {
         assert_eq!(repo, "atlas");
         assert!(matches!(auto.policy, Some(reclaim_policy::Policy::Auto(_))));
         let (_, none) = reclaim_from("atlas=none").expect("none");
-        assert!(matches!(none.policy, Some(reclaim_policy::Policy::Disabled(_))));
+        assert!(matches!(
+            none.policy,
+            Some(reclaim_policy::Policy::Disabled(_))
+        ));
         let (_, command) = reclaim_from(r#"atlas=["make","clean"]"#).expect("argv");
         let Some(reclaim_policy::Policy::Command(command)) = command.policy else {
             panic!("a command");
         };
         assert_eq!(command.argv, vec!["make", "clean"]);
-        for wrong in ["atlas", "=auto", "atlas=[]", "atlas=make clean", r#"atlas=[1]"#] {
+        for wrong in [
+            "atlas",
+            "=auto",
+            "atlas=[]",
+            "atlas=make clean",
+            r#"atlas=[1]"#,
+        ] {
             assert!(reclaim_from(wrong).is_err(), "{wrong}");
         }
     }
@@ -319,7 +355,11 @@ mod tests {
             ..WorkspacePolicyArgs::default()
         };
         let error = apply_reclaim(&mut list, &unknown).expect_err("ghost is unknown");
-        assert!(error.report().contains("not one of: atlas"), "{}", error.report());
+        assert!(
+            error.report().contains("not one of: atlas"),
+            "{}",
+            error.report()
+        );
 
         let mut list = repos();
         let orphan_timeout = WorkspacePolicyArgs {
@@ -331,7 +371,10 @@ mod tests {
 
     #[test]
     fn cleanup_overrides_are_set_only_when_named() {
-        assert_eq!(cleanup_from(&WorkspacePolicyArgs::default()).expect("none"), None);
+        assert_eq!(
+            cleanup_from(&WorkspacePolicyArgs::default()).expect("none"),
+            None
+        );
         let cleanup = cleanup_from(&WorkspacePolicyArgs {
             idle_reclaim_after: Some("0".to_owned()),
             archived_grace: Some("24h".to_owned()),

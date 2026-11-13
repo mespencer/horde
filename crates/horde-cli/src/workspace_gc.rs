@@ -24,7 +24,9 @@ use serde_json::json;
 
 use crate::client::{Client, ClientError, StreamUpdate, SyncOptions};
 use crate::render::Format;
-use crate::workspace_flags::{WorkspacePolicyArgs, apply_reclaim, cleanup_from, mode_for, parse_duration};
+use crate::workspace_flags::{
+    WorkspacePolicyArgs, apply_reclaim, cleanup_from, mode_for, parse_duration,
+};
 
 /// The heading every dry run's output starts with.
 pub const DRY_RUN_HEADING: &str = "DRY RUN — nothing was changed";
@@ -163,8 +165,12 @@ async fn repo_from_cwd() -> Result<(String, horde_proto::v1::WorkspaceRepo), Cli
             "--from-cwd needs a git work tree with an origin remote: {why}"
         )))
     };
-    let root = git_here(&["rev-parse", "--show-toplevel"]).await.map_err(refuse)?;
-    let url = git_here(&["remote", "get-url", "origin"]).await.map_err(refuse)?;
+    let root = git_here(&["rev-parse", "--show-toplevel"])
+        .await
+        .map_err(refuse)?;
+    let url = git_here(&["remote", "get-url", "origin"])
+        .await
+        .map_err(refuse)?;
     let branch = git_here(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .await
         .map(|head| head.trim_start_matches("origin/").to_owned())
@@ -227,7 +233,11 @@ pub async fn run_gc(client: &mut Client, args: &GcArgs, format: Format) -> Resul
         .collect_workspace_garbage(CollectWorkspaceGarbageRequest {
             workspace_definition_id: workspace.map(WorkspaceDefinitionId::new),
             worker_ids: args.workers.iter().map(WorkerId::new).collect(),
-            agent_ids: args.agents.iter().map(horde_proto::v1::AgentId::new).collect(),
+            agent_ids: args
+                .agents
+                .iter()
+                .map(horde_proto::v1::AgentId::new)
+                .collect(),
             level: args.level().into(),
             force: args.force,
             dry_run: args.dry_run,
@@ -240,7 +250,15 @@ pub async fn run_gc(client: &mut Client, args: &GcArgs, format: Format) -> Resul
         offline: names(&response.offline),
         unsupported: names(&response.unsupported),
     };
-    await_answers(client, &expected, response.sequence, wait, args.dry_run, format).await
+    await_answers(
+        client,
+        &expected,
+        response.sequence,
+        wait,
+        args.dry_run,
+        format,
+    )
+    .await
 }
 
 /// Runs `workspace instance list|remove`.
@@ -350,7 +368,15 @@ pub async fn run_delete(
         offline: Vec::new(),
         unsupported: Vec::new(),
     };
-    await_answers(client, &expected, response.purge_sequence, wait, args.dry_run, format).await
+    await_answers(
+        client,
+        &expected,
+        response.purge_sequence,
+        wait,
+        args.dry_run,
+        format,
+    )
+    .await
 }
 
 /// Runs `workspace log`: the housekeeping stream, filtered.
@@ -358,13 +384,19 @@ pub async fn run_delete(
 /// # Errors
 ///
 /// The stream's failure.
-pub async fn run_log(client: &mut Client, args: &LogArgs, format: Format) -> Result<(), ClientError> {
+pub async fn run_log(
+    client: &mut Client,
+    args: &LogArgs,
+    format: Format,
+) -> Result<(), ClientError> {
     let workspace = match &args.workspace {
         Some(reference) => Some(definition_id(client, reference).await?),
         None => None,
     };
     let mut stream = client
-        .follow(&SyncOptions::new(horde_proto::WORKSPACE_HOUSEKEEPING_STREAM).following(args.follow))
+        .follow(
+            &SyncOptions::new(horde_proto::WORKSPACE_HOUSEKEEPING_STREAM).following(args.follow),
+        )
         .await?;
     while let Some(update) = stream.next_update().await? {
         match update {
@@ -372,7 +404,9 @@ pub async fn run_log(client: &mut Client, args: &LogArgs, format: Format) -> Res
                 let Some(kind) = envelope.event.and_then(|event| event.kind) else {
                     continue;
                 };
-                if let Some(line) = log_line(&kind, workspace.as_deref(), args.worker.as_deref(), format) {
+                if let Some(line) =
+                    log_line(&kind, workspace.as_deref(), args.worker.as_deref(), format)
+                {
                     println!("{line}");
                 }
             }
@@ -490,7 +524,11 @@ impl Answers {
 }
 
 fn join(workers: &[&String]) -> String {
-    workers.iter().map(|worker| worker.as_str()).collect::<Vec<_>>().join(", ")
+    workers
+        .iter()
+        .map(|worker| worker.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Follows the housekeeping stream from `sequence` until every targeted
@@ -571,7 +609,11 @@ pub fn summary(expected: &Expected, answers: &Answers, dry_run: bool, format: Fo
 /// outcome, freed, reason), plus any unrecoverable files beneath it.
 #[must_use]
 pub fn cleanup_rows(cleanup: &WorkspaceCleanup, format: Format) -> String {
-    let worker = cleanup.worker_id.as_ref().map(ToString::to_string).unwrap_or_default();
+    let worker = cleanup
+        .worker_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
     let agent = cleanup
         .agent_id
         .as_ref()
@@ -654,7 +696,10 @@ pub fn prepared_detail(prepared: &horde_proto::v1::CheckoutPrepared) -> serde_js
 #[must_use]
 pub fn prepared_line(prepared: &horde_proto::v1::CheckoutPrepared) -> String {
     if prepared.repos.is_empty() {
-        return format!("lazy: nothing checked out of {}", prepared.available_repos.join(", "));
+        return format!(
+            "lazy: nothing checked out of {}",
+            prepared.available_repos.join(", ")
+        );
     }
     prepared
         .repos
@@ -692,14 +737,22 @@ pub fn resolution_name(resolution: i32) -> &'static str {
 
 /// One `workspace log` line, when the event passes the filters.
 #[must_use]
-pub fn log_line(kind: &Kind, workspace: Option<&str>, worker: Option<&str>, format: Format) -> Option<String> {
+pub fn log_line(
+    kind: &Kind,
+    workspace: Option<&str>,
+    worker: Option<&str>,
+    format: Format,
+) -> Option<String> {
     let matches = |event_workspace: Option<String>, event_worker: Option<String>| {
         workspace.is_none_or(|wanted| event_workspace.as_deref() == Some(wanted))
             && worker.is_none_or(|wanted| event_worker.as_deref() == Some(wanted))
     };
     match kind {
         Kind::WorkspaceCleanup(cleanup) => matches(
-            cleanup.workspace_definition_id.as_ref().map(ToString::to_string),
+            cleanup
+                .workspace_definition_id
+                .as_ref()
+                .map(ToString::to_string),
             cleanup.worker_id.as_ref().map(ToString::to_string),
         )
         .then(|| cleanup_rows(cleanup, format)),
@@ -708,7 +761,11 @@ pub fn log_line(kind: &Kind, workspace: Option<&str>, worker: Option<&str>, form
             pressure.worker_id.as_ref().map(ToString::to_string),
         )
         .then(|| {
-            let worker = pressure.worker_id.as_ref().map(ToString::to_string).unwrap_or_default();
+            let worker = pressure
+                .worker_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
             match format {
                 Format::Json => json!({
                     "type": "disk_pressure",
@@ -722,12 +779,19 @@ pub fn log_line(kind: &Kind, workspace: Option<&str>, worker: Option<&str>, form
                     "{worker}  disk pressure: {} free, below {}{}",
                     human_bytes(pressure.free_bytes),
                     human_bytes(pressure.low_watermark_bytes),
-                    if pressure.exhausted { "; nothing left to reclaim" } else { "" }
+                    if pressure.exhausted {
+                        "; nothing left to reclaim"
+                    } else {
+                        ""
+                    }
                 ),
             }
         }),
         Kind::WorkspaceGcRequested(requested) => matches(
-            requested.workspace_definition_id.as_ref().map(ToString::to_string),
+            requested
+                .workspace_definition_id
+                .as_ref()
+                .map(ToString::to_string),
             requested.worker_ids.first().map(ToString::to_string),
         )
         .then(|| match format {
@@ -743,7 +807,11 @@ pub fn log_line(kind: &Kind, workspace: Option<&str>, worker: Option<&str>, form
             Format::Human => format!(
                 "gc {} requested by {}: {}{}{}",
                 requested.request_id,
-                if requested.requested_by.is_empty() { "-" } else { &requested.requested_by },
+                if requested.requested_by.is_empty() {
+                    "-"
+                } else {
+                    &requested.requested_by
+                },
                 level_name(requested.level),
                 if requested.force { " --force" } else { "" },
                 if requested.dry_run { " --dry-run" } else { "" }
@@ -762,7 +830,11 @@ pub fn render_instances(instances: &[WorkspaceInstanceReport], format: Format) -
         })
         .to_string(),
         Format::Human if instances.is_empty() => "no instances reported".to_owned(),
-        Format::Human => instances.iter().map(instance_lines).collect::<Vec<_>>().join("\n"),
+        Format::Human => instances
+            .iter()
+            .map(instance_lines)
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -797,8 +869,14 @@ pub fn instance_json(report: &WorkspaceInstanceReport) -> serde_json::Value {
 pub fn instance_lines(report: &WorkspaceInstanceReport) -> String {
     let mut lines = vec![format!(
         "{} on {}: {}  {} ({} free of {})",
-        report.workspace_definition_id.as_ref().map_or_else(|| "-".to_owned(), ToString::to_string),
-        report.worker_id.as_ref().map_or_else(|| "-".to_owned(), ToString::to_string),
+        report
+            .workspace_definition_id
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), ToString::to_string),
+        report
+            .worker_id
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), ToString::to_string),
         instance_state_name(report.state),
         human_bytes(report.instance_bytes),
         human_bytes(report.filesystem_free_bytes),
@@ -807,7 +885,10 @@ pub fn instance_lines(report: &WorkspaceInstanceReport) -> String {
     for checkout in &report.checkouts {
         let mut line = format!(
             "  {}  {}  {}  [{}]  {}",
-            checkout.agent_id.as_ref().map_or_else(|| "-".to_owned(), ToString::to_string),
+            checkout
+                .agent_id
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string),
             checkout_state_name(checkout.state),
             checkout.branch,
             checkout.repos.join(","),
@@ -938,8 +1019,16 @@ mod tests {
         assert!(Harness::try_parse_from(["gc", "--force"]).is_err());
         assert!(Harness::try_parse_from(["gc", "--include-pins"]).is_err());
         assert!(Harness::try_parse_from(["gc", "--soft", "--hard"]).is_err());
-        let parsed = Harness::try_parse_from(["gc", "ws", "--hard", "--force", "--dry-run", "--worker", "w1"])
-            .expect("parses");
+        let parsed = Harness::try_parse_from([
+            "gc",
+            "ws",
+            "--hard",
+            "--force",
+            "--dry-run",
+            "--worker",
+            "w1",
+        ])
+        .expect("parses");
         assert!(parsed.args.force && parsed.args.dry_run);
         assert_eq!(parsed.args.workspace.as_deref(), Some("ws"));
         assert_eq!(parsed.args.workers, vec!["w1"]);
@@ -987,9 +1076,25 @@ mod tests {
     #[test]
     fn the_verdict_is_ok_only_when_everyone_answered_cleanly() {
         let mut answers = Answers::default();
-        assert!(answers.fold("gc-1", &cleanup("gc-other", Outcome::Refused), Format::Human).is_none());
-        assert!(answers.fold("gc-1", &cleanup("gc-1", Outcome::Done), Format::Human).is_some());
-        assert!(answers.fold("gc-1", &completed("gc-1", "w1"), Format::Human).is_none());
+        assert!(
+            answers
+                .fold(
+                    "gc-1",
+                    &cleanup("gc-other", Outcome::Refused),
+                    Format::Human
+                )
+                .is_none()
+        );
+        assert!(
+            answers
+                .fold("gc-1", &cleanup("gc-1", Outcome::Done), Format::Human)
+                .is_some()
+        );
+        assert!(
+            answers
+                .fold("gc-1", &completed("gc-1", "w1"), Format::Human)
+                .is_none()
+        );
         assert!(answers.verdict(&expected(&["w1"])).is_ok());
         assert_eq!(answers.bytes_freed, 2048);
     }
@@ -1006,21 +1111,33 @@ mod tests {
         let pending = Answers::default();
         let error = pending.verdict(&expected(&["w1"])).expect_err("pending");
         assert_eq!(error.exit_status(), 3);
-        assert!(error.to_string().contains("no answer yet from w1"), "{error}");
+        assert!(
+            error.to_string().contains("no answer yet from w1"),
+            "{error}"
+        );
 
         let offline = Expected {
             offline: vec!["w2".to_owned()],
             unsupported: vec!["w3".to_owned()],
             ..expected(&[])
         };
-        let error = Answers::default().verdict(&offline).expect_err("incomplete");
+        let error = Answers::default()
+            .verdict(&offline)
+            .expect_err("incomplete");
         assert_eq!(error.exit_status(), 3);
         let text = error.to_string();
-        assert!(text.contains("offline") && text.contains("w2") && text.contains("w3"), "{text}");
+        assert!(
+            text.contains("offline") && text.contains("w2") && text.contains("w3"),
+            "{text}"
+        );
 
         let mut failed = Answers::default();
         failed.fold("gc-1", &cleanup("gc-1", Outcome::Failed), Format::Human);
-        assert!(failed.verdict(&expected(&[])).is_err_and(|e| e.exit_status() == 1));
+        assert!(
+            failed
+                .verdict(&expected(&[]))
+                .is_err_and(|e| e.exit_status() == 1)
+        );
         let mut errored = Answers::default();
         errored.fold(
             "gc-1",
@@ -1032,7 +1149,11 @@ mod tests {
             }),
             Format::Human,
         );
-        assert!(errored.verdict(&expected(&["w1"])).is_err_and(|e| e.to_string().contains("no workspace support")));
+        assert!(
+            errored
+                .verdict(&expected(&["w1"]))
+                .is_err_and(|e| e.to_string().contains("no workspace support"))
+        );
     }
 
     #[test]
@@ -1041,10 +1162,14 @@ mod tests {
             panic!("a cleanup");
         };
         let human = cleanup_rows(&event, Format::Human);
-        assert!(human.contains("w1  agent-1  atlas  hard refused"), "{human}");
+        assert!(
+            human.contains("w1  agent-1  atlas  hard refused"),
+            "{human}"
+        );
         assert!(human.contains("untracked files: 1"), "{human}");
         assert!(human.contains("would lose .env  12 B"), "{human}");
-        let json: serde_json::Value = serde_json::from_str(&cleanup_rows(&event, Format::Json)).expect("json");
+        let json: serde_json::Value =
+            serde_json::from_str(&cleanup_rows(&event, Format::Json)).expect("json");
         assert_eq!(json["repos"][0]["outcome"], "refused");
         assert_eq!(json["repos"][0]["unrecoverable_files"][0]["path"], ".env");
         assert_eq!(json["tier"], "hard");
@@ -1062,7 +1187,8 @@ mod tests {
         let human = summary(&expected(&["w1", "w2"]), &answers, true, Format::Human);
         assert_eq!(human, "1 of 2 worker(s) answered; 2 KiB freed (would be)");
         let json: serde_json::Value =
-            serde_json::from_str(&summary(&expected(&["w1"]), &answers, false, Format::Json)).expect("json");
+            serde_json::from_str(&summary(&expected(&["w1"]), &answers, false, Format::Json))
+                .expect("json");
         assert_eq!(json["dry_run"], false);
         assert_eq!(json["bytes_freed"], 2048);
     }
@@ -1093,8 +1219,19 @@ mod tests {
             ..horde_proto::v1::WorkspaceGcRequested::default()
         });
         let line = log_line(&requested, None, None, Format::Human).expect("a line");
-        assert!(line.contains("gc gc-9") && line.contains("hard --force"), "{line}");
-        assert!(log_line(&Kind::NoteSent(horde_proto::v1::NoteSent::default()), None, None, Format::Human).is_none());
+        assert!(
+            line.contains("gc gc-9") && line.contains("hard --force"),
+            "{line}"
+        );
+        assert!(
+            log_line(
+                &Kind::NoteSent(horde_proto::v1::NoteSent::default()),
+                None,
+                None,
+                Format::Human
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1117,13 +1254,22 @@ mod tests {
             ..WorkspaceInstanceReport::default()
         };
         let human = render_instances(std::slice::from_ref(&report), Format::Human);
-        assert!(human.contains("ws-1 on w1: ready  4 KiB (1 GiB free of 2 GiB)"), "{human}");
-        assert!(human.contains("agent-1  orphan  horde/agent-1  [atlas]"), "{human}");
+        assert!(
+            human.contains("ws-1 on w1: ready  4 KiB (1 GiB free of 2 GiB)"),
+            "{human}"
+        );
+        assert!(
+            human.contains("agent-1  orphan  horde/agent-1  [atlas]"),
+            "{human}"
+        );
         assert!(human.contains("retained: untracked files: 1"), "{human}");
         let json: serde_json::Value =
             serde_json::from_str(&render_instances(&[report], Format::Json)).expect("json");
         assert_eq!(json["instances"][0]["checkouts"][0]["state"], "orphan");
-        assert_eq!(render_instances(&[], Format::Human), "no instances reported");
+        assert_eq!(
+            render_instances(&[], Format::Human),
+            "no instances reported"
+        );
     }
 
     #[test]
@@ -1216,7 +1362,10 @@ mod tests {
         for (state, name) in [
             (horde_proto::v1::CheckoutState::Active, "active"),
             (horde_proto::v1::CheckoutState::Idle, "idle"),
-            (horde_proto::v1::CheckoutState::ArchivedRetained, "archived-retained"),
+            (
+                horde_proto::v1::CheckoutState::ArchivedRetained,
+                "archived-retained",
+            ),
             (horde_proto::v1::CheckoutState::Orphan, "orphan"),
             (horde_proto::v1::CheckoutState::Unspecified, "unknown"),
         ] {

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use horde_proto::v1::workspace_cleanup::RetainedFile;
 
-use super::git::{commit_of, git, git_check, git_with, path_str, GitRun};
+use super::git::{GitRun, commit_of, git, git_check, git_with, path_str};
 
 /// The answer to "can this go without losing anything?".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,11 +147,17 @@ async fn dirty(checkout: &Path) -> Result<Option<String>, String> {
         ],
     )
     .await?;
-    let entries: Vec<&str> = status.split('\0').filter(|entry| !entry.is_empty()).collect();
+    let entries: Vec<&str> = status
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .collect();
     if entries.is_empty() {
         return Ok(None);
     }
-    let untracked = entries.iter().filter(|entry| entry.starts_with("??")).count();
+    let untracked = entries
+        .iter()
+        .filter(|entry| entry.starts_with("??"))
+        .count();
     let changed = entries.len() - untracked;
     Ok(Some(match (changed, untracked) {
         (0, untracked) => format!("untracked files: {untracked}"),
@@ -192,7 +198,9 @@ async fn is_locked(instance_repo: &Path, checkout: &Path) -> Result<bool, String
             .and_then(|line| line.strip_prefix("worktree "))
             .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.into()));
         path.as_deref() == Some(wanted.as_path())
-            && block.lines().any(|line| line == "locked" || line.starts_with("locked "))
+            && block
+                .lines()
+                .any(|line| line == "locked" || line.starts_with("locked "))
     }))
 }
 
@@ -341,7 +349,11 @@ pub struct Keepers {
 
 /// Fetches origin into the Instance repo for a reachability pass, and lists
 /// the Relay's share refs when a Relay URL is given.
-pub async fn keepers(instance_repo: &Path, relay_repo_url: Option<&str>, timeout: std::time::Duration) -> Keepers {
+pub async fn keepers(
+    instance_repo: &Path,
+    relay_repo_url: Option<&str>,
+    timeout: std::time::Duration,
+) -> Keepers {
     let origin_fetched = git_with(
         instance_repo,
         &["fetch", "--prune", "--no-tags", "origin"],
@@ -379,7 +391,13 @@ pub async fn reachable(instance_repo: &Path, reference: &str, keepers: &Keepers)
     if keepers.origin_fetched {
         match git(
             instance_repo,
-            &["for-each-ref", "--contains", &commit, "--format=%(refname)", "refs/remotes/origin"],
+            &[
+                "for-each-ref",
+                "--contains",
+                &commit,
+                "--format=%(refname)",
+                "refs/remotes/origin",
+            ],
         )
         .await
         {
@@ -390,15 +408,20 @@ pub async fn reachable(instance_repo: &Path, reference: &str, keepers: &Keepers)
     }
     for share in &keepers.relay_shares {
         if commit_of(instance_repo, share).await.is_some()
-            && git_check(instance_repo, &["merge-base", "--is-ancestor", &commit, share])
-                .await
-                .unwrap_or(false)
+            && git_check(
+                instance_repo,
+                &["merge-base", "--is-ancestor", &commit, share],
+            )
+            .await
+            .unwrap_or(false)
         {
             return Proof::Lossless;
         }
     }
     if keepers.origin_fetched {
-        Proof::not(format!("{commit} is on no origin branch and no Relay share"))
+        Proof::not(format!(
+            "{commit} is on no origin branch and no Relay share"
+        ))
     } else {
         Proof::not("not provable: the fetch from origin failed in this pass")
     }
@@ -408,7 +431,12 @@ pub async fn reachable(instance_repo: &Path, reference: &str, keepers: &Keepers)
 pub async fn local_refs(instance_repo: &Path) -> Result<Vec<String>, String> {
     let listing = git(
         instance_repo,
-        &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/horde"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/horde",
+        ],
     )
     .await?;
     Ok(listing.lines().map(str::to_owned).collect())
@@ -426,7 +454,9 @@ pub async fn pins(instance_repo: &Path) -> Result<Vec<String>, String> {
 
 /// Drops one ref.
 pub async fn delete_ref(instance_repo: &Path, reference: &str) -> Result<(), String> {
-    git(instance_repo, &["update-ref", "-d", reference]).await.map(|_| ())
+    git(instance_repo, &["update-ref", "-d", reference])
+        .await
+        .map(|_| ())
 }
 
 /// Whether the Instance's own working tree is clean (rule 1, applied to the
@@ -445,10 +475,19 @@ mod tests {
         assert!(is_under_any("target/", &roots));
         assert!(is_under_any("target/debug/x", &roots));
         assert!(is_under_any("build/out/a.o", &roots));
-        assert!(!is_under_any("targets/", &roots), "a prefix is not a parent");
+        assert!(
+            !is_under_any("targets/", &roots),
+            "a prefix is not a parent"
+        );
         assert!(!is_under_any(".env", &roots));
-        assert!(!is_under_any("build/", &roots), "a parent of a root is not under it");
-        assert!(!is_under_any("anything", &[String::new()]), "an empty root covers nothing");
+        assert!(
+            !is_under_any("build/", &roots),
+            "a parent of a root is not under it"
+        );
+        assert!(
+            !is_under_any("anything", &[String::new()]),
+            "an empty root covers nothing"
+        );
     }
 
     #[test]

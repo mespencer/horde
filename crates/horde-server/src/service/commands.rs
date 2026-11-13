@@ -1645,17 +1645,20 @@ mod tests {
             agent_id: None,
             occurred_at: None,
             idempotency_key: String::new(),
-            kind: Some(Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested {
-                request_id: request.to_owned(),
-                worker_ids: workers.iter().map(|w| WorkerId::new(*w)).collect(),
-                workspace_definition_id: definition.map(horde_proto::v1::WorkspaceDefinitionId::new),
-                level: horde_proto::v1::GcLevel::Hard.into(),
-                force: true,
-                dry_run: true,
-                remove_instance: true,
-                include_pins: true,
-                ..horde_proto::v1::WorkspaceGcRequested::default()
-            })),
+            kind: Some(Kind::WorkspaceGcRequested(
+                horde_proto::v1::WorkspaceGcRequested {
+                    request_id: request.to_owned(),
+                    worker_ids: workers.iter().map(|w| WorkerId::new(*w)).collect(),
+                    workspace_definition_id: definition
+                        .map(horde_proto::v1::WorkspaceDefinitionId::new),
+                    level: horde_proto::v1::GcLevel::Hard.into(),
+                    force: true,
+                    dry_run: true,
+                    remove_instance: true,
+                    include_pins: true,
+                    ..horde_proto::v1::WorkspaceGcRequested::default()
+                },
+            )),
         }
     }
 
@@ -1665,8 +1668,18 @@ mod tests {
     #[test]
     fn a_gc_request_commands_exactly_its_workers_with_stable_ids() {
         let rows = vec![
-            row(1, "horde-workspace-catalog", 1, definition_event("ws-1", false)),
-            row(2, "horde-workspace-housekeeping", 1, gc_event("gc-1", &["worker-a", "worker-b"], Some("ws-1"))),
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(
+                2,
+                "horde-workspace-housekeeping",
+                1,
+                gc_event("gc-1", &["worker-a", "worker-b"], Some("ws-1")),
+            ),
         ];
         let commands = fold(&rows);
         let workers: Vec<&str> = commands.iter().map(|(worker, _)| worker.as_str()).collect();
@@ -1685,8 +1698,16 @@ mod tests {
         assert_eq!(gc.request_id, "gc-1");
         assert_eq!(gc.level, i32::from(horde_proto::v1::GcLevel::Hard));
         assert!(gc.force && gc.dry_run && gc.remove_instance && gc.include_pins);
-        assert_eq!(gc.workspace_definition_id.map(|id| id.to_string()).as_deref(), Some("ws-1"));
-        assert_eq!(gc.carrying_stream.map(|id| id.to_string()).as_deref(), Some("horde-workspace-housekeeping"));
+        assert_eq!(
+            gc.workspace_definition_id
+                .map(|id| id.to_string())
+                .as_deref(),
+            Some("ws-1")
+        );
+        assert_eq!(
+            gc.carrying_stream.map(|id| id.to_string()).as_deref(),
+            Some("horde-workspace-housekeeping")
+        );
         assert_eq!(
             gc.policy.and_then(|p| p.archived_grace).map(|d| d.seconds),
             Some(86_400),
@@ -1694,7 +1715,15 @@ mod tests {
         );
         let refolded: Vec<String> = fold(&rows).into_iter().map(|(_, c)| c.command_id).collect();
         assert_eq!(refolded, ids, "a refold issues the same ids");
-        assert!(fold(&[row(1, "horde-workspace-housekeeping", 1, gc_event("gc-2", &[], None))]).is_empty());
+        assert!(
+            fold(&[row(
+                1,
+                "horde-workspace-housekeeping",
+                1,
+                gc_event("gc-2", &[], None)
+            )])
+            .is_empty()
+        );
     }
 
     /// A purge's commands still carry the deleted Definition's policy: the
@@ -1704,27 +1733,40 @@ mod tests {
         let mut overriding = definition("ws-1");
         overriding.cleanup = Some(horde_proto::v1::WorkspaceCleanupPolicy {
             idle_reclaim_after: None,
-            archived_grace: Some(horde_proto::prost_types::Duration { seconds: 7, nanos: 0 }),
+            archived_grace: Some(horde_proto::prost_types::Duration {
+                seconds: 7,
+                nanos: 0,
+            }),
         });
         let changed = |deleted| Event {
             agent_id: None,
             occurred_at: None,
             idempotency_key: String::new(),
-            kind: Some(Kind::WorkspaceDefinitionChanged(horde_proto::v1::WorkspaceDefinitionChanged {
-                definition: Some(overriding.clone()),
-                deleted,
-            })),
+            kind: Some(Kind::WorkspaceDefinitionChanged(
+                horde_proto::v1::WorkspaceDefinitionChanged {
+                    definition: Some(overriding.clone()),
+                    deleted,
+                },
+            )),
         };
         let rows = vec![
             row(1, "horde-workspace-catalog", 1, changed(false)),
             row(2, "horde-workspace-catalog", 2, changed(true)),
-            row(3, "horde-workspace-housekeeping", 1, gc_event("gc-1", &["worker-a"], Some("ws-1"))),
+            row(
+                3,
+                "horde-workspace-housekeeping",
+                1,
+                gc_event("gc-1", &["worker-a"], Some("ws-1")),
+            ),
         ];
         let commands = fold(&rows);
         let Some(Command::WorkspaceGc(gc)) = commands[0].1.command.clone() else {
             panic!("a gc command");
         };
-        assert_eq!(gc.policy.and_then(|p| p.archived_grace).map(|d| d.seconds), Some(7));
+        assert_eq!(
+            gc.policy.and_then(|p| p.archived_grace).map(|d| d.seconds),
+            Some(7)
+        );
     }
 
     /// A prewarm naming a definition the fold has not seen — or one that was

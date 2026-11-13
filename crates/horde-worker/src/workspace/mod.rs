@@ -352,15 +352,26 @@ impl WorkspaceManager {
         let wanted: Vec<String> = if record.repos.is_empty() {
             match mode {
                 CheckoutMode::Lazy => request.checkout_repos.clone(),
-                _ => definition.repos.iter().map(|repo| repo.name.clone()).collect(),
+                _ => definition
+                    .repos
+                    .iter()
+                    .map(|repo| repo.name.clone())
+                    .collect(),
             }
         } else {
             record.repos.iter().map(|repo| repo.name.clone()).collect()
         };
 
         let mut prepared = Vec::new();
-        for repo in definition.repos.iter().filter(|repo| wanted.contains(&repo.name)) {
-            let base = request.bases.iter().find(|base| base.repo_name == repo.name);
+        for repo in definition
+            .repos
+            .iter()
+            .filter(|repo| wanted.contains(&repo.name))
+        {
+            let base = request
+                .bases
+                .iter()
+                .find(|base| base.repo_name == repo.name);
             let added = if reused.contains(&repo.name) {
                 reused_repo(&agent_root, repo, &record).await?
             } else {
@@ -445,7 +456,11 @@ impl WorkspaceManager {
         })?;
         let agent_root = agents_dir.join(agent_id);
         let layout = PathBuf::from(layout_of(repo).map_err(WorkerError::Workspace)?);
-        let prepared = if record.repos.iter().any(|r| r.name == repo_name && !r.pending) {
+        let prepared = if record
+            .repos
+            .iter()
+            .any(|r| r.name == repo_name && !r.pending)
+        {
             reused_repo(&agent_root, repo, &record).await?
         } else {
             let requested = base.map(|reference| RepoBase {
@@ -562,7 +577,12 @@ impl WorkspaceManager {
             if destination.exists() {
                 tokio::fs::remove_dir_all(&destination)
                     .await
-                    .map_err(|error| workspace_error(format!("could not clear {}: {error}", destination.display())))?;
+                    .map_err(|error| {
+                        workspace_error(format!(
+                            "could not clear {}: {error}",
+                            destination.display()
+                        ))
+                    })?;
             }
         }
         let resolved = base::prepare_base(
@@ -909,7 +929,11 @@ fn validate_names(
 }
 
 fn repo_names(definition: &WorkspaceDefinition) -> Vec<String> {
-    definition.repos.iter().map(|repo| repo.name.clone()).collect()
+    definition
+        .repos
+        .iter()
+        .map(|repo| repo.name.clone())
+        .collect()
 }
 
 /// The agent's branch: the spawn's, else `horde/<agent-id>`.
@@ -928,7 +952,9 @@ async fn check_branch_name(instance_root: &Path, branch: &str) -> Result<(), Wor
             .await
             .is_err()
     {
-        return Err(workspace_error(format!("{branch:?} is not a valid branch name")));
+        return Err(workspace_error(format!(
+            "{branch:?} is not a valid branch name"
+        )));
     }
     Ok(())
 }
@@ -1027,7 +1053,12 @@ fn checked_out_repos(
     definition
         .repos
         .iter()
-        .filter(|repo| record.repos.iter().any(|r| r.name == repo.name && !r.pending))
+        .filter(|repo| {
+            record
+                .repos
+                .iter()
+                .any(|r| r.name == repo.name && !r.pending)
+        })
         .filter_map(|repo| Some((repo.name.clone(), PathBuf::from(layout_of(repo).ok()?))))
         .collect()
 }
@@ -1171,14 +1202,14 @@ async fn link_unmanaged(
             continue;
         }
         if let Some(parent) = link.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| workspace_error(format!("could not create {}: {error}", parent.display())))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                workspace_error(format!("could not create {}: {error}", parent.display()))
+            })?;
         }
         let target = instance_root.join(path);
-        tokio::fs::symlink(&target, &link)
-            .await
-            .map_err(|error| workspace_error(format!("could not link unmanaged path {path}: {error}")))?;
+        tokio::fs::symlink(&target, &link).await.map_err(|error| {
+            workspace_error(format!("could not link unmanaged path {path}: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -1207,9 +1238,12 @@ async fn worktree_repo(
         .map_err(WorkerError::Workspace)?;
     match plan {
         BranchPlan::Create => {
-            git(instance_repo, &["worktree", "add", "-b", branch, &destination, base])
-                .await
-                .map_err(WorkerError::Workspace)?;
+            git(
+                instance_repo,
+                &["worktree", "add", "-b", branch, &destination, base],
+            )
+            .await
+            .map_err(WorkerError::Workspace)?;
             Ok(true)
         }
         BranchPlan::Adopt => {
@@ -1237,7 +1271,13 @@ async fn clone_repo(
     let destination_str = path_str(destination);
     git(
         instance_repo,
-        &["clone", NO_LOCAL, "--", &path_str(instance_repo), &destination_str],
+        &[
+            "clone",
+            NO_LOCAL,
+            "--",
+            &path_str(instance_repo),
+            &destination_str,
+        ],
     )
     .await
     .map_err(WorkerError::Workspace)?;
@@ -1469,7 +1509,10 @@ mod tests {
         let error = validate_names(&definition, &unknown)
             .expect_err("ghost is unknown")
             .to_string();
-        assert!(error.contains("ghost") && error.contains("valid repos: atlas"), "{error}");
+        assert!(
+            error.contains("ghost") && error.contains("valid repos: atlas"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -77,7 +77,11 @@ pub fn advertise<'a>(
         max_concurrent_agents: 0,
         // ADR-0014's protocol: fresh bases, lazy checkout, branches, two-tier
         // cleanup. Only a Worker with workspaces implements any of it.
-        workspace_protocol: if supports_workspaces { WORKSPACE_PROTOCOL } else { 0 },
+        workspace_protocol: if supports_workspaces {
+            WORKSPACE_PROTOCOL
+        } else {
+            0
+        },
         workspace_free_bytes,
         workspace_total_bytes,
     }

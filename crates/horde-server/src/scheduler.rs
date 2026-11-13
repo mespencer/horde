@@ -238,8 +238,9 @@ impl DiskPlacement {
     /// Whether `(free, total)` is under pressure.
     #[must_use]
     pub fn pressured(&self, free: u64, total: u64) -> bool {
-        let share = u64::try_from(u128::from(total) * u128::from(self.pressure_basis_points) / 10_000)
-            .unwrap_or(u64::MAX);
+        let share =
+            u64::try_from(u128::from(total) * u128::from(self.pressure_basis_points) / 10_000)
+                .unwrap_or(u64::MAX);
         free < share.max(self.pressure_bytes)
     }
 
@@ -1153,11 +1154,14 @@ mod tests {
     #[test]
     fn the_disk_floor_excludes_and_pressure_reorders() {
         let harness = harness();
-        let scheduler = harness.scheduler.clone().with_disk_placement(DiskPlacement {
-            pressure_basis_points: 0,
-            pressure_bytes: 1_000,
-            floor_bytes: 100,
-        });
+        let scheduler = harness
+            .scheduler
+            .clone()
+            .with_disk_placement(DiskPlacement {
+                pressure_basis_points: 0,
+                pressure_bytes: 1_000,
+                floor_bytes: 100,
+            });
         let mut full = capabilities(&[]);
         full.workspace_free_bytes = 50;
         full.workspace_total_bytes = 10_000;
@@ -1174,7 +1178,11 @@ mod tests {
             workspace_definition_id: None,
             ..request
         };
-        assert_eq!(placed_on(scheduler.place(&no_workspace)), "full", "only workspace spawns need disk");
+        assert_eq!(
+            placed_on(scheduler.place(&no_workspace)),
+            "full",
+            "only workspace spawns need disk"
+        );
 
         let mut tight = capabilities(&[]);
         tight.workspace_free_bytes = 500;
@@ -1186,7 +1194,11 @@ mod tests {
         harness.registry.register("b-roomy", roomy);
         assert_eq!(placed_on(scheduler.place(&request)), "b-roomy");
         harness.registry.deregister("b-roomy");
-        assert_eq!(placed_on(scheduler.place(&request)), "a-tight", "pressure deprioritizes, never excludes");
+        assert_eq!(
+            placed_on(scheduler.place(&request)),
+            "a-tight",
+            "pressure deprioritizes, never excludes"
+        );
     }
 
     /// The whole preference order in one table: warmth beats the parent's

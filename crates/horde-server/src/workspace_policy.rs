@@ -92,7 +92,10 @@ pub fn resolve(
 /// # Errors
 ///
 /// [`ServerError::Invalid`] naming the path.
-pub fn validate_unmanaged_paths(repos: &[WorkspaceRepo], paths: &[String]) -> Result<(), ServerError> {
+pub fn validate_unmanaged_paths(
+    repos: &[WorkspaceRepo],
+    paths: &[String],
+) -> Result<(), ServerError> {
     let layouts: Vec<&str> = repos.iter().map(layout_of).collect();
     for (index, path) in paths.iter().enumerate() {
         let normal = !path.is_empty()
@@ -109,7 +112,11 @@ pub fn validate_unmanaged_paths(repos: &[WorkspaceRepo], paths: &[String]) -> Re
                 "unmanaged path {path:?} overlaps the repo laid out at {layout:?}"
             )));
         }
-        if let Some(other) = paths.iter().skip(index + 1).find(|other| nested(path, other)) {
+        if let Some(other) = paths
+            .iter()
+            .skip(index + 1)
+            .find(|other| nested(path, other))
+        {
             return Err(ServerError::Invalid(format!(
                 "unmanaged paths {path:?} and {other:?} nest inside each other"
             )));
@@ -178,18 +185,19 @@ pub fn validate_layouts(repos: &[WorkspaceRepo], mode: CheckoutMode) -> Result<(
 /// [`ServerError::Invalid`] naming the repo.
 pub fn validate_reclaim(repos: &[WorkspaceRepo]) -> Result<(), ServerError> {
     for repo in repos {
-        let Some(reclaim_policy::Policy::Command(command)) =
-            repo.reclaim.as_ref().and_then(|reclaim: &ReclaimPolicy| reclaim.policy.as_ref())
+        let Some(reclaim_policy::Policy::Command(command)) = repo
+            .reclaim
+            .as_ref()
+            .and_then(|reclaim: &ReclaimPolicy| reclaim.policy.as_ref())
         else {
             continue;
         };
-        reclaim_argv_shortfall(&command.argv, &command.output_paths)
-            .map_or(Ok(()), |why| {
-                Err(ServerError::Invalid(format!(
-                    "repo {}'s reclaim command {why}",
-                    repo.name
-                )))
-            })?;
+        reclaim_argv_shortfall(&command.argv, &command.output_paths).map_or(Ok(()), |why| {
+            Err(ServerError::Invalid(format!(
+                "repo {}'s reclaim command {why}",
+                repo.name
+            )))
+        })?;
     }
     Ok(())
 }
@@ -312,7 +320,11 @@ pub fn validated_spawn(
         ));
     }
     validate_branch(&spec.branch, agent_id)?;
-    let names: BTreeSet<&str> = definition.repos.iter().map(|repo| repo.name.as_str()).collect();
+    let names: BTreeSet<&str> = definition
+        .repos
+        .iter()
+        .map(|repo| repo.name.as_str())
+        .collect();
     let listed = || names.iter().copied().collect::<Vec<_>>().join(", ");
     for repo in &spec.checkout_repos {
         if !names.contains(repo.as_str()) {
@@ -405,15 +417,25 @@ mod tests {
             ..WorkspaceDefinition::default()
         };
         let layered = resolve(&configured, Some(&definition));
-        assert_eq!(layered.idle_reclaim_after.map(|d| d.seconds), Some(5), "the definition wins");
-        assert_eq!(layered.archived_grace.map(|d| d.seconds), Some(0), "the config fills the rest");
+        assert_eq!(
+            layered.idle_reclaim_after.map(|d| d.seconds),
+            Some(5),
+            "the definition wins"
+        );
+        assert_eq!(
+            layered.archived_grace.map(|d| d.seconds),
+            Some(0),
+            "the config fills the rest"
+        );
         assert_eq!(layered.archived_pin_ttl.map(|d| d.seconds), Some(30));
     }
 
     #[test]
     fn unmanaged_paths_stay_inside_apart_from_repos_and_each_other() {
         let repos = vec![repo("atlas", "code/atlas")];
-        assert!(validate_unmanaged_paths(&repos, &["data".to_owned(), "cache/w".to_owned()]).is_ok());
+        assert!(
+            validate_unmanaged_paths(&repos, &["data".to_owned(), "cache/w".to_owned()]).is_ok()
+        );
         for wrong in [
             vec!["/data".to_owned()],
             vec!["../data".to_owned()],
@@ -423,7 +445,10 @@ mod tests {
             vec!["code/atlas/data".to_owned()],
             vec!["data".to_owned(), "data/sub".to_owned()],
         ] {
-            assert!(validate_unmanaged_paths(&repos, &wrong).is_err(), "{wrong:?}");
+            assert!(
+                validate_unmanaged_paths(&repos, &wrong).is_err(),
+                "{wrong:?}"
+            );
         }
     }
 
@@ -442,7 +467,10 @@ mod tests {
     fn a_reclaim_argv_is_bounded_and_runs_no_relative_program() {
         let argv = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(reclaim_argv_shortfall(&argv(&["make", "clean"]), &[]), None);
-        assert_eq!(reclaim_argv_shortfall(&argv(&["/usr/bin/make"]), &argv(&["build"])), None);
+        assert_eq!(
+            reclaim_argv_shortfall(&argv(&["/usr/bin/make"]), &argv(&["build"])),
+            None
+        );
         assert!(reclaim_argv_shortfall(&[], &[]).is_some());
         assert!(reclaim_argv_shortfall(&argv(&["./clean.sh"]), &[]).is_some());
         assert!(reclaim_argv_shortfall(&argv(&["bin/clean"]), &[]).is_some());
@@ -469,8 +497,24 @@ mod tests {
             assert!(validate_branch(good, "agent-1").is_ok(), "{good}");
         }
         for bad in [
-            "-x", "/x", "a..b", "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a.lock", "a/",
-            "a.", "HEAD", "horde/agent-2", "a//b", "a@{b",
+            "-x",
+            "/x",
+            "a..b",
+            "a b",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "a.lock",
+            "a/",
+            "a.",
+            "HEAD",
+            "horde/agent-2",
+            "a//b",
+            "a@{b",
         ] {
             assert!(validate_branch(bad, "agent-1").is_err(), "{bad}");
         }
@@ -508,7 +552,10 @@ mod tests {
             repo_bases: vec![base("", "main")],
             ..AgentSpec::default()
         };
-        assert!(validated_spawn(bare, Some(&two), "a").is_err_and(|e| e.to_string().contains("REPO=REF")));
+        assert!(
+            validated_spawn(bare, Some(&two), "a")
+                .is_err_and(|e| e.to_string().contains("REPO=REF"))
+        );
         for wrong in [
             AgentSpec {
                 checkout_repos: vec!["ghost".to_owned()],
@@ -532,7 +579,10 @@ mod tests {
                 ..AgentSpec::default()
             },
         ] {
-            assert!(validated_spawn(wrong.clone(), Some(&two), "a").is_err(), "{wrong:?}");
+            assert!(
+                validated_spawn(wrong.clone(), Some(&two), "a").is_err(),
+                "{wrong:?}"
+            );
         }
         let lazy_without_workspace = AgentSpec {
             checkout_mode: CheckoutMode::Lazy.into(),

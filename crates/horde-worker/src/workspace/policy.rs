@@ -223,7 +223,9 @@ mod tests {
         };
         assert_eq!(WorkspacePolicy::explicit_command(Some(&auto)), Ok(None));
         let disabled = ReclaimPolicy {
-            policy: Some(reclaim_policy::Policy::Disabled(reclaim_policy::Disabled {})),
+            policy: Some(reclaim_policy::Policy::Disabled(
+                reclaim_policy::Disabled {},
+            )),
         };
         assert_eq!(
             WorkspacePolicy::explicit_command(Some(&disabled)),

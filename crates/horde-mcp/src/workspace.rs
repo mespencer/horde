@@ -93,8 +93,12 @@ mod tests {
     /// parent's commit fills every repo the caller did not name.
     #[test]
     fn explicit_bases_override_parent_bases_repo_by_repo() {
-        let requested = std::collections::BTreeMap::from([("atlas".to_owned(), "release/1.4".to_owned())]);
-        let merged = merged_bases(&requested, vec![parent("atlas", "aaa"), parent("proto", "bbb")]);
+        let requested =
+            std::collections::BTreeMap::from([("atlas".to_owned(), "release/1.4".to_owned())]);
+        let merged = merged_bases(
+            &requested,
+            vec![parent("atlas", "aaa"), parent("proto", "bbb")],
+        );
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].repo_name, "atlas");
         assert_eq!(merged[0].r#ref, "release/1.4");

@@ -286,7 +286,9 @@ fn human_detail(kind: Option<&Kind>, detail: &Value) -> String {
     match kind {
         Some(Kind::AgentLifecycleChanged(changed)) => lifecycle_line(changed),
         Some(Kind::CheckoutPrepared(prepared)) => crate::workspace_gc::prepared_line(prepared),
-        Some(Kind::WorkspaceCleanup(cleanup)) => crate::workspace_gc::cleanup_rows(cleanup, Format::Human),
+        Some(Kind::WorkspaceCleanup(cleanup)) => {
+            crate::workspace_gc::cleanup_rows(cleanup, Format::Human)
+        }
         _ => detail.as_str().unwrap_or_default().to_owned(),
     }
 }

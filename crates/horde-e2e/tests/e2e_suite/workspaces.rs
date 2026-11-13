@@ -30,19 +30,29 @@ async fn session(system: &System, title: &str, extra: &[&str]) -> (String, Strin
     args.extend_from_slice(extra);
     let created = system.cli_json(&args).await;
     (
-        created["session_id"].as_str().expect("a session id").to_owned(),
-        created["root_agent_id"].as_str().expect("a root agent id").to_owned(),
+        created["session_id"]
+            .as_str()
+            .expect("a session id")
+            .to_owned(),
+        created["root_agent_id"]
+            .as_str()
+            .expect("a root agent id")
+            .to_owned(),
     )
 }
 
 /// Waits for an agent's `checkout_prepared` event and returns it.
 async fn prepared(system: &System, session_id: &str, agent: &str) -> serde_json::Value {
     let events = system
-        .sync_until(session_id, &format!("{agent}'s checkout_prepared"), |events| {
-            events
-                .iter()
-                .any(|e| e["kind"] == "checkout_prepared" && e["agent_id"].as_str() == Some(agent))
-        })
+        .sync_until(
+            session_id,
+            &format!("{agent}'s checkout_prepared"),
+            |events| {
+                events.iter().any(|e| {
+                    e["kind"] == "checkout_prepared" && e["agent_id"].as_str() == Some(agent)
+                })
+            },
+        )
         .await;
     events
         .into_iter()
@@ -97,7 +107,10 @@ async fn agents_start_fresh_share_a_branch_and_check_out_lazily() {
     let (first_session, first) = session(&system, "first", &["--workspace", &definition_id]).await;
     let event = prepared(&system, &first_session, &first).await;
     let seed = git(&atlas, &["rev-parse", "HEAD"]).await;
-    assert!(event.to_string().contains(&seed), "starts at the seed: {event}");
+    assert!(
+        event.to_string().contains(&seed),
+        "starts at the seed: {event}"
+    );
 
     // Upstream moves on; the next agent starts from the new tip, with
     // the instance's own tree untouched.
@@ -113,8 +126,18 @@ async fn agents_start_fresh_share_a_branch_and_check_out_lazily() {
     .await;
     prepared(&system, &second_session, &second).await;
     let second_root = agent_root(&root, &definition_id, &second);
-    assert_eq!(git(&second_root.join("atlas"), &["rev-parse", "HEAD"]).await, tip);
-    assert!(!root.join(&definition_id).join("atlas").join("new.txt").exists(), "the instance tree stays put");
+    assert_eq!(
+        git(&second_root.join("atlas"), &["rev-parse", "HEAD"]).await,
+        tip
+    );
+    assert!(
+        !root
+            .join(&definition_id)
+            .join("atlas")
+            .join("new.txt")
+            .exists(),
+        "the instance tree stays put"
+    );
     for repo in ["atlas", "docs"] {
         assert_eq!(
             git(&second_root.join(repo), &["branch", "--show-current"]).await,
@@ -135,10 +158,18 @@ async fn agents_start_fresh_share_a_branch_and_check_out_lazily() {
     let lazy_root = agent_root(&root, &definition_id, &lazy);
     assert!(!lazy_root.join("docs").exists() && !lazy_root.join("atlas").exists());
     system.cli_json(&["send", &lazy, "go"]).await;
-    path_appears("the lazily checked-out docs", &lazy_root.join("docs").join(".git")).await;
+    path_appears(
+        "the lazily checked-out docs",
+        &lazy_root.join("docs").join(".git"),
+    )
+    .await;
     system
         .sync_until(&lazy_session, "the checkout's provenance", |events| {
-            events.iter().filter(|e| e["kind"] == "checkout_prepared").count() >= 2
+            events
+                .iter()
+                .filter(|e| e["kind"] == "checkout_prepared")
+                .count()
+                >= 2
         })
         .await;
     assert!(!lazy_root.join("atlas").exists(), "only what it asked for");
@@ -196,7 +227,13 @@ async fn gc_reclaims_softly_dry_runs_and_removes_only_what_is_provable() {
         .await;
     let definition_id = system
         .cli_field(
-            &["workspace", "create", "rusty", "--repo", &format!("crate={}", origin.display())],
+            &[
+                "workspace",
+                "create",
+                "rusty",
+                "--repo",
+                &format!("crate={}", origin.display()),
+            ],
             "workspace_definition_id",
         )
         .await;
@@ -207,13 +244,17 @@ async fn gc_reclaims_softly_dry_runs_and_removes_only_what_is_provable() {
     let clean_repo = agent_root(&root, &definition_id, &clean).join("crate");
     let dirty_repo = agent_root(&root, &definition_id, &dirty).join("crate");
     std::fs::create_dir_all(clean_repo.join("target/debug")).expect("target");
-    std::fs::write(clean_repo.join("target/debug/big.rlib"), vec![0_u8; 10_000]).expect("an artifact");
+    std::fs::write(clean_repo.join("target/debug/big.rlib"), vec![0_u8; 10_000])
+        .expect("an artifact");
 
     // Soft: cargo clean, the work stays.
     let (status, output) = human(&system, &["workspace", "gc", "--soft"]).await;
     assert_eq!(status, 0, "{output}");
     assert!(output.contains("soft done"), "{output}");
-    assert!(!clean_repo.join("target").exists(), "cargo clean ran: {output}");
+    assert!(
+        !clean_repo.join("target").exists(),
+        "cargo clean ran: {output}"
+    );
     assert!(clean_repo.join("src/lib.rs").exists());
 
     // Both agents archived; the default 24 h grace keeps both checkouts.
@@ -238,20 +279,40 @@ async fn gc_reclaims_softly_dry_runs_and_removes_only_what_is_provable() {
 
     // The dry run: headed, rows say would-do and refused, nothing changes.
     let (status, output) = human(&system, &["workspace", "gc", "--hard", "--dry-run"]).await;
-    assert!(output.starts_with("DRY RUN — nothing was changed"), "{output}");
+    assert!(
+        output.starts_with("DRY RUN — nothing was changed"),
+        "{output}"
+    );
     assert!(output.contains("would-do"), "{output}");
-    assert!(output.contains("refused") && output.contains("untracked files: 1"), "{output}");
+    assert!(
+        output.contains("refused") && output.contains("untracked files: 1"),
+        "{output}"
+    );
     assert_eq!(status, 1, "a refusal is exit 1: {output}");
-    assert!(clean_repo.exists() && dirty_repo.join("wip.txt").exists(), "a dry run changes nothing");
+    assert!(
+        clean_repo.exists() && dirty_repo.join("wip.txt").exists(),
+        "a dry run changes nothing"
+    );
 
     // For real: the provable one goes, the unprovable one stays.
     let (status, output) = human(&system, &["workspace", "gc", "--hard"]).await;
     assert_eq!(status, 1, "{output}");
-    assert!(!clean_repo.exists(), "the clean archived checkout is removed: {output}");
-    assert!(dirty_repo.join("wip.txt").exists(), "the dirty one is retained: {output}");
-    let listed = system.cli_json(&["workspace", "instance", "list", &definition_id]).await;
+    assert!(
+        !clean_repo.exists(),
+        "the clean archived checkout is removed: {output}"
+    );
+    assert!(
+        dirty_repo.join("wip.txt").exists(),
+        "the dirty one is retained: {output}"
+    );
+    let listed = system
+        .cli_json(&["workspace", "instance", "list", &definition_id])
+        .await;
     let retained = listed.to_string();
-    assert!(retained.contains("untracked files: 1"), "the retained reason is reported: {retained}");
+    assert!(
+        retained.contains("untracked files: 1"),
+        "the retained reason is reported: {retained}"
+    );
 
     // Forced, it goes too: exit 0.
     let (status, output) = human(&system, &["workspace", "gc", "--hard", "--force"]).await;
@@ -284,11 +345,22 @@ async fn orphans_are_reported_after_a_worker_reset() {
     let mut worker = system.spawn_worker("w-ws", &state, &borrowed).await;
     let definition_id = system
         .cli_field(
-            &["workspace", "create", "solo", "--repo", &format!("atlas={}", atlas.display())],
+            &[
+                "workspace",
+                "create",
+                "solo",
+                "--repo",
+                &format!("atlas={}", atlas.display()),
+            ],
             "workspace_definition_id",
         )
         .await;
-    let (session_id, agent) = session(&system, "before the reset", &["--workspace", &definition_id]).await;
+    let (session_id, agent) = session(
+        &system,
+        "before the reset",
+        &["--workspace", &definition_id],
+    )
+    .await;
     prepared(&system, &session_id, &agent).await;
     worker.terminate().await.expect("SIGTERM sends");
     let _ = worker.wait().await;
@@ -296,16 +368,27 @@ async fn orphans_are_reported_after_a_worker_reset() {
     // The worker's journal is gone for good; the operator says so.
     // `journal.sqlite3` is the daemon's journal file (horde-worker's
     // `JOURNAL_FILE`); its WAL siblings go with it.
-    for file in ["journal.sqlite3", "journal.sqlite3-wal", "journal.sqlite3-shm"] {
+    for file in [
+        "journal.sqlite3",
+        "journal.sqlite3-wal",
+        "journal.sqlite3-shm",
+    ] {
         let _ = std::fs::remove_file(state.join(file));
     }
-    assert!(!state.join("journal.sqlite3").exists(), "the journal is gone");
-    system.cli_json(&["worker", "reset", "w-ws", "--reason", "disk replaced"]).await;
+    assert!(
+        !state.join("journal.sqlite3").exists(),
+        "the journal is gone"
+    );
+    system
+        .cli_json(&["worker", "reset", "w-ws", "--reason", "disk replaced"])
+        .await;
     let mut worker = system.spawn_worker("w-ws", &state, &borrowed).await;
 
     let mut last = serde_json::Value::Null;
     for _ in 0..100 {
-        last = system.cli_json(&["workspace", "instance", "list", &definition_id]).await;
+        last = system
+            .cli_json(&["workspace", "instance", "list", &definition_id])
+            .await;
         if last["instances"][0]["checkouts"][0]["state"] == "orphan" {
             break;
         }
@@ -315,11 +398,17 @@ async fn orphans_are_reported_after_a_worker_reset() {
     assert_eq!(checkout["state"], "orphan", "{last}");
     assert_eq!(checkout["agent_id"].as_str(), Some(agent.as_str()));
     assert_eq!(checkout["session_id"].as_str(), Some(session_id.as_str()));
-    assert!(agent_root(&root, &definition_id, &agent).exists(), "reported, never removed by a scan");
+    assert!(
+        agent_root(&root, &definition_id, &agent).exists(),
+        "reported, never removed by a scan"
+    );
 
     let log = system.cli(&["workspace", "log", "--worker", "w-ws"]).await;
     let log = String::from_utf8_lossy(&log.stdout).into_owned();
-    assert!(log.contains("\"trigger\":\"scan\""), "the orphan's soft reclaim is logged: {log}");
+    assert!(
+        log.contains("\"trigger\":\"scan\""),
+        "the orphan's soft reclaim is logged: {log}"
+    );
 
     worker.terminate().await.expect("SIGTERM sends");
     let _ = worker.wait().await;

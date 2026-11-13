@@ -337,7 +337,10 @@ fn seconds(value: &str) -> Result<std::time::Duration, String> {
 /// A watermark flag: `10%`, `20GiB`, or both comma-separated.
 fn watermark(value: &str) -> Result<crate::runtime::Watermark, String> {
     let (basis_points, bytes) = horde_proto::units::parse_threshold(value)?;
-    Ok(crate::runtime::Watermark { basis_points, bytes })
+    Ok(crate::runtime::Watermark {
+        basis_points,
+        bytes,
+    })
 }
 
 /// Rejected at parse, not at spawn: `auto_review` had codex's own subagent
