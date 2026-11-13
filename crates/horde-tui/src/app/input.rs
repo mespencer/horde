@@ -80,6 +80,14 @@ impl App {
             Intent::Tab => self.tab(),
             Intent::Edit(edit) => self.edit(edit),
             Intent::Type(c) => return self.type_char(c),
+            other => return self.act_list(other),
+        }
+        Vec::new()
+    }
+
+    /// The list screens' intents.
+    fn act_list(&mut self, intent: Intent) -> Vec<Directive> {
+        match intent {
             Intent::Up => self.step(-1),
             Intent::Down => self.step(1),
             Intent::Activate => return self.activate(),

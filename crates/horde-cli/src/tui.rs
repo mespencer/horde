@@ -309,34 +309,50 @@ async fn perform(directives: Vec<Directive>, client: &mut Client, app: &mut App)
     }
 }
 
-/// One directive, one client verb — the same verbs the CLI exposes.
+/// One directive, one client verb — the same verbs the CLI exposes. Each
+/// family's executor hands back what it does not handle.
 async fn execute(
     directive: Directive,
     client: &mut Client,
     app: &mut App,
 ) -> Result<(), ClientError> {
+    let Some(directive) = execute_refresh(directive, client, app).await? else {
+        return Ok(());
+    };
+    let Some(directive) = execute_session(directive, client, app).await? else {
+        return Ok(());
+    };
+    execute_steer(directive, client).await
+}
+
+/// The directives that ask the server what a view shows.
+async fn execute_refresh(
+    directive: Directive,
+    client: &mut Client,
+    app: &mut App,
+) -> Result<Option<Directive>, ClientError> {
+    let update = match directive {
+        Directive::RefreshSessions => {
+            refresh_sessions(client, app).await?;
+            return Ok(None);
+        }
+        Directive::RefreshForwards => Update::Forwards(client.list_forwards(None).await?),
+        Directive::RefreshWorkers => Update::Workers(client.list_workers().await?),
+        Directive::RefreshWorkspaces => Update::Workspaces(workspaces(client).await?),
+        Directive::RefreshUsage { session_id } => Update::Usage(usage(client, session_id).await?),
+        other => return Ok(Some(other)),
+    };
+    app.apply(update);
+    Ok(None)
+}
+
+/// The directives that create or archive a session.
+async fn execute_session(
+    directive: Directive,
+    client: &mut Client,
+    app: &mut App,
+) -> Result<Option<Directive>, ClientError> {
     match directive {
-        Directive::RefreshSessions => refresh_sessions(client, app).await.map(drop),
-        Directive::RefreshForwards => {
-            let forwards = client.list_forwards(None).await?;
-            app.apply(Update::Forwards(forwards));
-            Ok(())
-        }
-        Directive::RefreshWorkers => {
-            let workers = client.list_workers().await?;
-            app.apply(Update::Workers(workers));
-            Ok(())
-        }
-        Directive::RefreshWorkspaces => {
-            let entries = workspaces(client).await?;
-            app.apply(Update::Workspaces(entries));
-            Ok(())
-        }
-        Directive::RefreshUsage { session_id } => {
-            let report = usage(client, session_id).await?;
-            app.apply(Update::Usage(report));
-            Ok(())
-        }
         Directive::NewSession { title } => {
             let (summary, _root) = client
                 .create_session(title.as_deref().unwrap_or_default(), "")
@@ -344,16 +360,16 @@ async fn execute(
             if let Some(session_id) = summary.session_id.as_ref().map(ToString::to_string) {
                 app.apply(Update::SessionCreated { session_id });
             }
-            Ok(())
         }
         Directive::Archive { session_id } => {
             client
                 .archive_session(&session_id, "archived from the TUI")
                 .await?;
-            refresh_sessions(client, app).await.map(drop)
+            refresh_sessions(client, app).await?;
         }
-        other => execute_steer(other, client).await,
+        other => return Ok(Some(other)),
     }
+    Ok(None)
 }
 
 /// The directives that answer or steer an agent: nothing comes back for
@@ -394,7 +410,7 @@ async fn execute_steer(directive: Directive, client: &mut Client) -> Result<(), 
             .interrupt(&agent_id, "interrupted from the TUI")
             .await
             .map(drop),
-        // `execute` handles the rest before delegating here.
+        // `execute` hands every other family to its own executor first.
         _ => Ok(()),
     }
 }
