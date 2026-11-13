@@ -278,26 +278,20 @@ pub fn checkout_fields(
 mod tests {
     use super::*;
 
+    /// The grammar is `horde_proto::units`'; what the flag adds is its name
+    /// in the refusal.
     #[test]
-    fn durations_take_seconds_minutes_hours_and_days() {
-        for (value, seconds) in [
-            ("0", 0),
-            ("90", 90),
-            ("90s", 90),
-            ("10m", 600),
-            ("4h", 14_400),
-            ("1d", 86_400),
-        ] {
-            assert_eq!(
-                parse_duration("--x", value).expect("parses"),
-                Duration::from_secs(seconds),
-                "{value}"
-            );
-        }
-        for wrong in ["", "4w", "h", "-1s", "1.5h", "99999999999999999999d"] {
-            let error = parse_duration("--archived-grace", wrong).expect_err("refused");
-            assert!(error.report().contains("--archived-grace"), "{wrong}");
-        }
+    fn a_duration_refusal_names_its_flag() {
+        assert_eq!(
+            parse_duration("--archived-grace", "24h").expect("parses"),
+            Duration::from_secs(86_400)
+        );
+        let error = parse_duration("--archived-grace", "4w").expect_err("refused");
+        assert!(
+            error.report().contains("--archived-grace"),
+            "{}",
+            error.report()
+        );
     }
 
     #[test]

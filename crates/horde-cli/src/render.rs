@@ -793,31 +793,27 @@ pub fn workspaces(definitions: &[horde_proto::v1::WorkspaceDefinition], format: 
     }
 }
 
-/// Renders one definition and its known instances — what `get` answers with.
+/// Renders one definition and its known instances — what `get` answers with:
+/// each instance with its checkouts (state, branch, size, retained reason)
+/// and its disk (ADR-0014).
 #[must_use]
 pub fn workspace_with_instances(
     response: &horde_proto::v1::GetWorkspaceDefinitionResponse,
     format: Format,
 ) -> String {
-    let instances: Vec<serde_json::Value> = response
-        .instances
-        .iter()
-        .map(|report| {
-            json!({
-                "worker_id": id(report.worker_id.as_ref().map(ToString::to_string)),
-                "state": instance_state(report.state),
-                "root_path": report.root_path,
-                "detail": report.detail,
-            })
-        })
-        .collect();
     match format {
         Format::Json => {
             let mut rendered = response
                 .definition
                 .as_ref()
                 .map_or_else(|| json!({}), workspace_json);
-            rendered["instances"] = serde_json::Value::Array(instances);
+            rendered["instances"] = serde_json::Value::Array(
+                response
+                    .instances
+                    .iter()
+                    .map(crate::workspace_gc::instance_json)
+                    .collect(),
+            );
             rendered.to_string()
         }
         Format::Human => {
@@ -829,12 +825,8 @@ pub fn workspace_with_instances(
             ];
             for report in &response.instances {
                 lines.push(format!(
-                    "  instance on {}: {}",
-                    report
-                        .worker_id
-                        .as_ref()
-                        .map_or_else(|| "-".to_owned(), ToString::to_string),
-                    instance_state(report.state)
+                    "  instance {}",
+                    crate::workspace_gc::instance_lines(report)
                 ));
             }
             lines.join("\n")
@@ -1776,7 +1768,7 @@ mod tests {
 
         let human = workspace_with_instances(&response, Format::Human);
         assert!(
-            human.contains("instance on w-1: ready"),
+            human.contains("  instance - on w-1: ready"),
             "the instances render under the definition: {human}"
         );
     }
