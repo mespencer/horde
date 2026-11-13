@@ -1503,6 +1503,58 @@ mod tests {
         }
     }
 
+    /// The fold binds a spawn's tier through the catalog it was given
+    /// (ADR-0016), not the shipped one: a tier only the configured catalog
+    /// holds binds, and without the catalog it binds nothing.
+    #[test]
+    fn a_spawn_command_binds_its_tier_through_the_configured_catalog() {
+        let mut spawned = spawn_event("agent-1", None);
+        if let Some(Kind::AgentSpawned(spawn)) = spawned.kind.as_mut() {
+            spawn.spec = Some(AgentSpec {
+                model: Some(horde_proto::v1::ModelSelection {
+                    selection: Some(horde_proto::v1::model_selection::Selection::Tier(
+                        "house".to_owned(),
+                    )),
+                }),
+                ..AgentSpec::default()
+            });
+        }
+        let rows = vec![
+            row(1, "s1", 1, spawned),
+            row(
+                2,
+                "s1",
+                2,
+                placement_event("agent-1", Some("worker-a"), PlacementState::Placed),
+            ),
+        ];
+        let catalog = crate::tiers::TierCatalog::default().with_tier(crate::tiers::Tier::new(
+            "house",
+            vec![crate::tiers::TierCandidate::new("codex", "gpt")],
+        ));
+        let binding_with = |projection: CommandProjection| {
+            let mut projection = projection;
+            rows.iter()
+                .flat_map(|global| projection.advance(global))
+                .find_map(|(_, issued)| match issued.command {
+                    Some(Command::SpawnAgent(spawn)) => Some(spawn.binding),
+                    _ => None,
+                })
+                .expect("a spawn command")
+        };
+        let bound = binding_with(CommandProjection::new().with_tiers(Arc::new(catalog)))
+            .expect("the configured tier binds");
+        assert_eq!(
+            (bound.provider.as_str(), bound.model.as_str()),
+            ("codex", "gpt")
+        );
+        assert_eq!(
+            binding_with(CommandProjection::new()),
+            None,
+            "the shipped catalog has no such tier"
+        );
+    }
+
     #[test]
     fn a_queued_placement_commands_nobody() {
         let rows = vec![

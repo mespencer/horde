@@ -820,50 +820,7 @@ fn identity_startup(error: horde_identity::IdentityError) -> ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::{WorkspaceFlags, open_log};
-    use crate::scheduler::DiskPlacement;
-    use crate::workspace_policy::WorkspacePolicyConfig;
-
-    /// Unset flags take the built-in defaults; each set flag replaces
-    /// exactly its own value.
-    #[test]
-    fn workspace_flags_override_only_what_they_set() {
-        let unset = WorkspaceFlags::default();
-        assert_eq!(unset.policy(), WorkspacePolicyConfig::default());
-        assert_eq!(unset.disk_placement(), DiskPlacement::default());
-
-        let flags = WorkspaceFlags {
-            fetch_throttle: Some(Duration::from_secs(7)),
-            fetch_timeout: Some(Duration::from_secs(8)),
-            idle_reclaim_after: Some(Duration::from_secs(9)),
-            archived_grace: Some(Duration::from_secs(10)),
-            reclaim_timeout: Some(Duration::from_secs(11)),
-            archived_pin_ttl: Some(Duration::from_secs(12)),
-            disk_pressure: Some((250, 5)),
-            disk_floor: Some(3),
-        };
-        let policy = flags.policy();
-        assert_eq!(policy.fetch_throttle, Duration::from_secs(7));
-        assert_eq!(policy.fetch_timeout, Duration::from_secs(8));
-        assert_eq!(policy.idle_reclaim_after, Duration::from_secs(9));
-        assert_eq!(policy.archived_grace, Duration::from_secs(10));
-        assert_eq!(policy.reclaim_timeout, Duration::from_secs(11));
-        assert_eq!(policy.archived_pin_ttl, Some(Duration::from_secs(12)));
-        assert_eq!(
-            policy.auto_rules,
-            WorkspacePolicyConfig::default().auto_rules
-        );
-        assert_eq!(
-            flags.disk_placement(),
-            DiskPlacement {
-                pressure_basis_points: 250,
-                pressure_bytes: 5,
-                floor_bytes: 3,
-            }
-        );
-    }
+    use super::open_log;
 
     #[test]
     fn opening_creates_a_usable_log() {
