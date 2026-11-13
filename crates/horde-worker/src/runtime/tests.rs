@@ -40,6 +40,28 @@ fn preauthorize_only_runtime(script: Script) -> Runtime {
 }
 
 fn spawn_command(sequence: u64, agent: &str, first_message: &str) -> StreamCommandsResponse {
+    spawn_of(sequence, agent, first_turn(first_message), None)
+}
+
+/// A spec whose only content is its initial assignment.
+fn first_turn(first_message: &str) -> horde_proto::v1::AgentSpec {
+    horde_proto::v1::AgentSpec {
+        initial_assignment: Some(Assignment {
+            assignment_id: None,
+            text: first_message.to_owned(),
+            payload: None,
+        }),
+        ..horde_proto::v1::AgentSpec::default()
+    }
+}
+
+/// One spawn command in session `s1`.
+fn spawn_of(
+    sequence: u64,
+    agent: &str,
+    spec: horde_proto::v1::AgentSpec,
+    workspace_policy: Option<horde_proto::v1::ResolvedWorkspacePolicy>,
+) -> StreamCommandsResponse {
     StreamCommandsResponse {
         command_sequence: sequence,
         command_id: format!("s1:{sequence}"),
@@ -47,14 +69,8 @@ fn spawn_command(sequence: u64, agent: &str, first_message: &str) -> StreamComma
         command: Some(Command::SpawnAgent(SpawnAgentCommand {
             session_id: Some(SessionId::new("s1")),
             agent_id: Some(AgentId::new(agent)),
-            spec: Some(horde_proto::v1::AgentSpec {
-                initial_assignment: Some(Assignment {
-                    assignment_id: None,
-                    text: first_message.to_owned(),
-                    payload: None,
-                }),
-                ..horde_proto::v1::AgentSpec::default()
-            }),
+            spec: Some(spec),
+            workspace_policy,
             ..SpawnAgentCommand::default()
         })),
     }
@@ -1831,33 +1847,17 @@ fn workspace_support_is_what_the_builder_installed() {
 /// A spawn command whose spec names `workspace`, under the worktree
 /// policy — the shape the server sends once placement chose this worker.
 fn workspace_spawn(sequence: u64, agent: &str, workspace: &str) -> StreamCommandsResponse {
-    StreamCommandsResponse {
-        command_sequence: sequence,
-        command_id: format!("s1:{sequence}"),
-        log_position: sequence,
-        command: Some(Command::SpawnAgent(SpawnAgentCommand {
-            session_id: Some(SessionId::new("s1")),
-            agent_id: Some(AgentId::new(agent)),
-            spec: Some(horde_proto::v1::AgentSpec {
-                initial_assignment: Some(Assignment {
-                    assignment_id: None,
-                    text: "hello".to_owned(),
-                    payload: None,
-                }),
-                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
-                    workspace,
-                )),
-                checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
-                ..horde_proto::v1::AgentSpec::default()
-            }),
-            // No grace: a lossless archived checkout goes at archive.
-            workspace_policy: Some(horde_proto::v1::ResolvedWorkspacePolicy {
-                archived_grace: Some(horde_proto::prost_types::Duration::default()),
-                ..horde_proto::v1::ResolvedWorkspacePolicy::default()
-            }),
-            ..SpawnAgentCommand::default()
-        })),
-    }
+    let spec = horde_proto::v1::AgentSpec {
+        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace)),
+        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
+        ..first_turn("hello")
+    };
+    // No grace: a lossless archived checkout goes at archive.
+    let policy = horde_proto::v1::ResolvedWorkspacePolicy {
+        archived_grace: Some(horde_proto::prost_types::Duration::default()),
+        ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+    };
+    spawn_of(sequence, agent, spec, Some(policy))
 }
 
 /// Applies a spawn that must fail the *agent* and not the command loop,
@@ -2197,13 +2197,7 @@ async fn a_command_with_no_body_is_acked_and_dropped() {
 /// its harness group) has stopped — and shutdown joins that release.
 #[tokio::test]
 async fn archiving_a_workspace_agent_gives_its_checkout_back() {
-    let (_temp, workspaces_root, mut runtime) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    runtime
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
-    settle(&runtime).await;
+    let (_temp, workspaces_root, mut runtime) = spawned_in_workspace().await;
     let checkout = workspaces_root
         .join("ws-1")
         .join(".horde-agents")
@@ -2357,13 +2351,7 @@ async fn an_event_with_nothing_to_journal_leaves_the_journal_untouched() {
 async fn the_workspace_verbs_answer_from_the_live_checkout() {
     use horde_mcp::workspace::WorkspaceAccess as _;
 
-    let (_temp, workspaces_root, mut runtime) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    runtime
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
-    settle(&runtime).await;
+    let (_temp, workspaces_root, runtime) = spawned_in_workspace().await;
     let access = super::access::WorkerWorkspaceAccess {
         shared: runtime.shared.clone(),
     };
@@ -2416,4 +2404,16 @@ async fn the_workspace_verbs_answer_from_the_live_checkout() {
         .expect_err("no workspaces");
     assert!(refused.contains("no workspaces"), "{refused}");
     runtime.shutdown().await;
+}
+
+/// A materialized runtime with `agent-1` spawned into `ws-1` and settled.
+async fn spawned_in_workspace() -> (tempfile::TempDir, std::path::PathBuf, Runtime) {
+    let (temp, root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    (temp, root, runtime)
 }
