@@ -12,7 +12,6 @@
 //! daemon fails them rather than skipping them.
 
 #[cfg(test)]
-#[path = "../common/mod.rs"]
 mod common;
 
 #[cfg(test)]

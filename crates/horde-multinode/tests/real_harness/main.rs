@@ -11,7 +11,7 @@
 //! for it never degrades to a skip.
 
 #[cfg(test)]
-#[path = "../common/mod.rs"]
+#[path = "../multinode_suite/common.rs"]
 mod common;
 
 #[cfg(test)]

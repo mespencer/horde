@@ -3,8 +3,11 @@
 //!
 //! Wrapped in `#[cfg(test)]` so the workspace's `expect_used` exemption
 //! applies (clippy exempts a `cfg(test)` module, not a bare helper), and
-//! `dead_code` is allowed module-wide because each test binary uses a
-//! different subset of it — the same arrangement as the relay suite's.
+//! `dead_code` is allowed module-wide because the real-harness binary
+//! includes this file too (by path) and uses a subset of it — the same
+//! arrangement as the relay suite's shared fixtures. It lives inside this
+//! suite's directory so cargo-machete, which scans each target's own
+//! directory, sees the dependencies it uses.
 #![allow(dead_code)]
 
 #[cfg(test)]
@@ -515,32 +518,42 @@ pub(crate) mod cluster {
             .to_owned()
     }
 
-    /// The first non-empty line of `stdout`, as JSON.
+    /// The first JSON line a `horde` verb printed.
     fn first_json_line(stdout: &str, args: &[&str]) -> Value {
-        let line = stdout
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_else(|| panic!("horde {args:?} printed nothing"));
-        serde_json::from_str(line)
-            .unwrap_or_else(|error| panic!("horde {args:?} printed non-JSON ({error}): {line}"))
+        json_lines(stdout)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("horde {args:?} printed no JSON line"))
     }
 
-    /// Every JSON line of a `sync` render.
+    /// Every non-blank line of a `--json` render, parsed; a line that is not
+    /// JSON fails the scenario naming it.
     fn json_lines(stdout: &str) -> Vec<Value> {
-        stdout
+        let mut parsed = Vec::new();
+        for line in stdout
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).expect("sync prints JSON lines"))
-            .collect()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            match serde_json::from_str(line) {
+                Ok(value) => parsed.push(value),
+                Err(error) => panic!("horde printed a non-JSON line ({error}): {line}"),
+            }
+        }
+        parsed
     }
 
-    /// The texts of every output chunk in a replay, in log order.
+    /// The text of every output chunk in a replay, oldest first.
     pub(crate) fn outputs(events: &[Value]) -> Vec<String> {
-        events
-            .iter()
-            .filter(|event| event["kind"] == "agent_output_chunk")
-            .filter_map(|event| event["detail"].as_str().map(ToOwned::to_owned))
-            .collect()
+        let mut texts = Vec::new();
+        for event in events {
+            if let (Some("agent_output_chunk"), Some(text)) =
+                (event["kind"].as_str(), event["detail"].as_str())
+            {
+                texts.push(text.to_owned());
+            }
+        }
+        texts
     }
 
     /// The events in a replay about `agent`.
