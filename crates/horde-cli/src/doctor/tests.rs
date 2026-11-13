@@ -418,4 +418,12 @@ fn windows_state_dirs_report_their_acl_and_disk() {
         checks[1].detail, "could not measure free space",
         "{checks:?}"
     );
+
+    // Absent, it is reported as inheriting its ACL — never "owner-only",
+    // which no mode makes it here.
+    let absent = state_dir_checks(&root.path().join("absent"));
+    assert_eq!(absent.len(), 1, "{absent:?}");
+    assert_eq!(absent[0].verdict, Verdict::Ok, "{absent:?}");
+    assert!(absent[0].detail.contains("inheriting"), "{absent:?}");
+    assert!(!absent[0].detail.contains("owner-only"), "{absent:?}");
 }
