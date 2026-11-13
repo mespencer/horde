@@ -23,8 +23,8 @@ use horde_worker::workspace::{CheckoutRequest, WorkspaceManager};
 use horde_worker::{ApplyCommand as _, Journal};
 
 use crate::workspace_rig::{
-    Rig, archive, cleanups, command, fresh_rig, kinds, materialize, policy, rig, settled_within,
-    spawn_in, three_repo_rig,
+    Rig, archive, cleanups, command, fresh_rig, kinds, materialize, observed_within, policy, rig,
+    settled_within, spawn_in, three_repo_rig,
 };
 use crate::workspaces::harness;
 
@@ -538,7 +538,7 @@ async fn gc(
 /// stopped, after the archive command itself completed, and journals the
 /// archive's soft reclaim when done.
 async fn released(rig: &Rig, agent: &str) {
-    settled_within("the archive's release", async {
+    observed_within("the archive's release", async {
         while !cleanups(&rig.journal).await.iter().any(|c| {
             c.trigger == i32::from(CleanupTrigger::Archive)
                 && c.agent_id
@@ -566,7 +566,7 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     assert!(rig.reporter.count() >= 1, "a materialize reports");
     spawn(&mut rig, "agent-1").await;
     archive(&mut rig, "agent-1").await;
-    settled_within("the archive's release", async {
+    observed_within("the archive's release", async {
         while cleanups(&rig.journal).await.is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -583,7 +583,7 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     assert_eq!(events[0].trigger, i32::from(CleanupTrigger::Archive));
     assert!(agent_root(&rig, "agent-1").exists());
     // The archive reports after it journals; wait for the report too.
-    settled_within("the archive's report", async {
+    observed_within("the archive's report", async {
         while !rig.reporter.last().first().is_some_and(|report| {
             report
                 .checkouts
@@ -945,7 +945,7 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
     );
 
     archive(&mut rig, "agent-1").await;
-    settled_within("the archive's removal", async {
+    observed_within("the archive's removal", async {
         while agent_root(&rig, "agent-1").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

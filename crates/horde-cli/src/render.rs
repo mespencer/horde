@@ -1387,6 +1387,38 @@ mod tests {
         workspace_with_instances, workspaces,
     };
 
+    /// A cleanup event in the human log reads as its rows — who, which
+    /// repo, the tier and outcome, what it freed — not as an empty detail.
+    #[test]
+    fn a_cleanup_event_renders_as_its_rows() {
+        use horde_proto::v1::workspace_cleanup::{RepoAction, repo_action::Outcome};
+        let cleanup = horde_proto::v1::WorkspaceCleanup {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            tier: horde_proto::v1::CleanupTier::Hard.into(),
+            repos: vec![RepoAction {
+                repo_name: "atlas".to_owned(),
+                outcome: Outcome::Done.into(),
+                bytes_freed: 2048,
+                ..RepoAction::default()
+            }],
+            ..horde_proto::v1::WorkspaceCleanup::default()
+        };
+        let envelope = EventEnvelope {
+            sequence: 7,
+            event: Some(Event {
+                kind: Some(Kind::WorkspaceCleanup(cleanup)),
+                ..Event::default()
+            }),
+            ..EventEnvelope::default()
+        };
+        let line = event(&envelope, Format::Human);
+        assert!(line.contains("workspace_cleanup"), "{line}");
+        assert!(
+            line.ends_with("  w-1  -  atlas  hard done  2 KiB"),
+            "{line}"
+        );
+    }
+
     /// The `mcp` renders: the empty catalog says so in words (a script or a
     /// human reading nothing cannot tell it from a swallowed error), a
     /// populated one carries the fields a follow-up command needs, and a

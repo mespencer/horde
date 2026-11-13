@@ -20,8 +20,8 @@ use horde_worker::workspace::WorkspaceManager;
 use horde_worker::{ApplyCommand as _, Journal};
 
 use crate::workspace_rig::{
-    Rig, TOTAL, archive, cleanups, command, events, fresh_rig, kinds, materialize, policy,
-    rig_with, settled_within, spawn_in, spawn_with, three_repo_rig, wire, worktree_in,
+    Rig, TOTAL, archive, cleanups, command, events, fresh_rig, kinds, materialize, observed_within,
+    policy, rig_with, settled_within, spawn_in, spawn_with, three_repo_rig, wire, worktree_in,
 };
 use crate::workspaces::harness;
 
@@ -105,7 +105,7 @@ fn agent_of(cleanup: &WorkspaceCleanup) -> String {
 /// Waits until `count` archive-triggered events for `agent` are journaled:
 /// the archive's release runs after the archive command completed.
 async fn released(rig: &Rig, agent: &str, count: usize) {
-    settled_within("the archive's release", async {
+    observed_within("the archive's release", async {
         while cleanups(&rig.journal)
             .await
             .iter()
@@ -440,6 +440,9 @@ async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let mut rig = looping_rig(temp.path(), Duration::from_millis(50)).await;
     spawn_in(&mut rig, "ws-1", "agent-1").await;
+    // Everything up to the spawn has reported; the archive's release
+    // reports once more, after it journals.
+    let before_archive = rig.reporter.count();
     archive(&mut rig, "agent-1").await;
     released(&rig, "agent-1", 2).await;
     let instance_repo = rig.root.join("ws-1/atlas");
@@ -450,13 +453,16 @@ async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
         )
     };
     assert!(pins().contains("agent-1"), "the removal pinned HEAD");
-    // The archive's own report, then a quiet baseline.
+    // The archive's own report, then a quiet baseline: nothing else
+    // reports until the scan loop starts.
     assert!(
         eventually(Duration::from_secs(30), || async {
-            rig.reporter
-                .last()
-                .first()
-                .is_some_and(|r| r.checkouts.is_empty())
+            rig.reporter.count() > before_archive
+                && rig
+                    .reporter
+                    .last()
+                    .first()
+                    .is_some_and(|r| r.checkouts.is_empty())
         })
         .await
     );
@@ -465,7 +471,7 @@ async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
     rig.runtime.replay_inbox().await.expect("the replay runs");
     let journal = rig.journal.clone();
     assert!(
-        eventually(Duration::from_secs(60), || {
+        eventually(Duration::from_secs(30), || {
             let journal = journal.clone();
             async move {
                 cleanups(&journal).await.iter().any(|c| {

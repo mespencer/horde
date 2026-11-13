@@ -414,7 +414,12 @@ async fn an_invalid_branch_name_is_refused() {
             .await
             .expect_err("refused")
             .to_string();
-        assert!(error.contains("is not a valid branch name"), "{error}");
+        // The worker's own check refuses, before git is asked to make the
+        // branch (git's refusal words it with single quotes).
+        assert!(
+            error.contains(&format!("{branch:?} is not a valid branch name")),
+            "{error}"
+        );
     }
     assert!(!manager.agents_dir("ws-1").join("agent-1").exists());
 }

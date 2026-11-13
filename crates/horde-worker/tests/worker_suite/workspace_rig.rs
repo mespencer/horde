@@ -166,6 +166,17 @@ pub(crate) async fn settled_within<F: std::future::Future>(what: &str, future: F
     }
 }
 
+/// Waits for something production writes once work already under way
+/// finishes — a journaled event, a report, a removed directory — under a
+/// ceiling that ends well inside a mutation run's per-mutant timeout: an
+/// event that never comes fails its test instead of stalling the run.
+pub(crate) async fn observed_within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    match tokio::time::timeout(Duration::from_secs(30), future).await {
+        Ok(value) => value,
+        Err(_) => panic!("{what} was never observed"),
+    }
+}
+
 pub(crate) fn wire(seconds: i64, nanos: i32) -> horde_proto::prost_types::Duration {
     horde_proto::prost_types::Duration { seconds, nanos }
 }
