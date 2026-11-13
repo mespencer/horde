@@ -79,10 +79,10 @@ pub use permission::{
 };
 pub use replay::{LineDecoder, ReplaySession};
 pub use spec::{AgentSpec, Delivery, McpEndpoint, TURNS_TAKEN_OPTION, TurnInput};
-pub use version::{HarnessVersion, SupportTable, SupportVerdict, VersionReport};
 pub use usage::{
     HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
 };
+pub use version::{HarnessVersion, SupportTable, SupportVerdict, VersionReport};
 
 pub use adapter::{Adapter, AgentSession};
 pub use error::Result;

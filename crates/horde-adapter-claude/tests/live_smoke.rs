@@ -163,51 +163,68 @@ fn stdio_claude(cwd: &std::path::Path, tools: &str) -> Command {
     command
 }
 
+/// What one stdio turn produced: its outcome and every prompt it raised.
+type StdioTurn = (
+    horde_adapter::TurnOutcome,
+    Vec<horde_adapter::ProposedToolCall>,
+);
+
 /// One turn on the stdio route: every `can_use_tool` prompt is answered by
 /// `decide` through the production encoders, and the turn's outcome and the
-/// prompts seen come back.
+/// prompts seen come back. Errors name the step that failed.
 async fn stdio_turn(
     cwd: &std::path::Path,
     tools: &str,
     prompt: &str,
     decide: impl Fn(&horde_adapter::ProposedToolCall) -> horde_adapter::PermissionDecision,
-) -> (horde_adapter::TurnOutcome, Vec<horde_adapter::ProposedToolCall>) {
+) -> Result<StdioTurn, String> {
     use horde_adapter_claude::permission::{encode_control_response, encode_decision};
     use horde_adapter_claude::wire::{ControlRequestKind, Event};
 
     let mut child = stdio_claude(cwd, tools)
         .spawn()
-        .expect("the `claude` binary must be on PATH for this manual test");
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    let stdout = child.stdout.take().expect("stdout was piped");
+        .map_err(|error| format!("the `claude` binary must be on PATH: {error}"))?;
+    let mut stdin = child.stdin.take().ok_or("stdin was not piped")?;
+    let stdout = child.stdout.take().ok_or("stdout was not piped")?;
+    let write = |line: String| format!("{line}\n").into_bytes();
     stdin
-        .write_all(format!("{}\n", encode_user_message(prompt)).as_bytes())
+        .write_all(&write(encode_user_message(prompt)))
         .await
-        .expect("writes");
-    stdin.flush().await.expect("flushes");
+        .map_err(|error| format!("writing the prompt: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| format!("flushing: {error}"))?;
 
     let mut assembler = TurnAssembler::new();
     let mut lines = BufReader::new(stdout).lines();
     let mut prompts = Vec::new();
     let mut outcome = None;
-    while let Some(line) = lines.next_line().await.expect("reads stdout") {
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|error| format!("reading stdout: {error}"))?
+    {
         if line.trim().is_empty() {
             continue;
         }
         let envelope = decode_line(&line)
-            .unwrap_or_else(|error| panic!("the live protocol no longer decodes: {error}"));
+            .map_err(|error| format!("the live protocol no longer decodes: {error}"))?;
         let events = assembler.feed(&envelope);
         if let Event::ControlRequest(request) = &envelope.event
             && let ControlRequestKind::CanUseTool(can_use) = &request.request
         {
             let call = can_use.to_proposed_call();
             let body = encode_decision(&decide(&call), &can_use.tool_name, &can_use.input)
-                .expect("the decision is expressible");
+                .ok_or("the decision is inexpressible for this prompt")?;
             stdin
-                .write_all(format!("{}\n", encode_control_response(&request.request_id, &body)).as_bytes())
+                .write_all(&write(encode_control_response(&request.request_id, &body)))
                 .await
-                .expect("answers");
-            stdin.flush().await.expect("flushes");
+                .map_err(|error| format!("answering: {error}"))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|error| format!("flushing: {error}"))?;
             prompts.push(call);
         }
         for event in events {
@@ -221,7 +238,7 @@ async fn stdio_turn(
     }
     drop(stdin);
     let _ = child.wait().await;
-    (outcome.expect("a live turn must close"), prompts)
+    Ok((outcome.ok_or("the live turn never closed")?, prompts))
 }
 
 /// The stdio route against the live CLI: the Write prompt arrives as a
@@ -241,12 +258,13 @@ async fn a_live_stdio_prompt_is_answered_and_the_narrowing_runs() {
             horde_adapter::PermissionDecision::allow_with(narrowed)
         },
     )
-    .await;
+    .await
+    .expect("a live stdio turn");
     assert!(outcome.status.is_completed(), "{outcome:?}");
     assert_eq!(prompts.len(), 1, "one Write, one prompt: {prompts:?}");
     assert_eq!(prompts[0].tool_name, "Write");
-    let written = std::fs::read_to_string(scratch.path().join("probe.txt"))
-        .expect("the allowed write ran");
+    let written =
+        std::fs::read_to_string(scratch.path().join("probe.txt")).expect("the allowed write ran");
     assert_eq!(written.trim(), "NARROWED_BY_HORDE");
 }
 
@@ -269,11 +287,19 @@ async fn a_live_question_is_answered_through_the_prompt() {
             )]))
         },
     )
-    .await;
+    .await
+    .expect("a live stdio turn");
     assert!(outcome.status.is_completed(), "{outcome:?}");
-    assert!(prompts.iter().all(horde_adapter::ProposedToolCall::is_question));
     assert!(
-        outcome.text.as_deref().is_some_and(|text| text.contains("Blue")),
+        prompts
+            .iter()
+            .all(horde_adapter::ProposedToolCall::is_question)
+    );
+    assert!(
+        outcome
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("Blue")),
         "{outcome:?}"
     );
 }

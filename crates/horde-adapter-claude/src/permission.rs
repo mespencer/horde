@@ -27,7 +27,9 @@
 //! keyed by question text (`13`). [`ask_user_questions`] lifts the questions
 //! into the domain's [`Question`]s so a client can answer them.
 
-use horde_adapter::{Answers, PermissionDecision, ProposedToolCall, Question, QuestionOption, ToolCallId};
+use horde_adapter::{
+    Answers, PermissionDecision, ProposedToolCall, Question, QuestionOption, ToolCallId,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -395,7 +397,10 @@ mod tests {
             "Write",
             &json!({"content": "ORIGINAL"}),
         ));
-        assert_eq!(body["updatedInput"], json!({"content": "REWRITTEN_BY_HORDE"}));
+        assert_eq!(
+            body["updatedInput"],
+            json!({"content": "REWRITTEN_BY_HORDE"})
+        );
     }
 
     /// The `13` shape: the questions echoed back with an `answers` map keyed
@@ -404,7 +409,10 @@ mod tests {
     fn an_answer_encodes_the_questions_plus_answers_keyed_by_text() {
         let input = recorded_question().input;
         let answers = Answers::from([
-            ("Which colour do you prefer?".to_owned(), vec!["Red".to_owned()]),
+            (
+                "Which colour do you prefer?".to_owned(),
+                vec!["Red".to_owned()],
+            ),
             ("Sizes?".to_owned(), vec!["S".to_owned(), "M".to_owned()]),
         ]);
         let body = parsed(encode_decision(

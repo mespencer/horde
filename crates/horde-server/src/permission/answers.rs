@@ -32,12 +32,15 @@ pub fn resolve_answers(
     let mut keys: Vec<&String> = raw.keys().collect();
     keys.sort();
     for key in keys {
-        let question = question_for(questions, key)
-            .ok_or_else(|| format!("no question matches {key:?}"))?;
+        let question =
+            question_for(questions, key).ok_or_else(|| format!("no question matches {key:?}"))?;
         if resolved.contains_key(&question.id) {
             return Err(format!("question {:?} is answered twice", question.id));
         }
-        let values = raw.get(key).map(|answer| answer.values.as_slice()).unwrap_or_default();
+        let values = raw
+            .get(key)
+            .map(|answer| answer.values.as_slice())
+            .unwrap_or_default();
         if values.is_empty() {
             return Err(format!("question {:?} has an empty answer", question.id));
         }
@@ -137,19 +140,29 @@ mod tests {
     }
 
     fn values(resolved: &HashMap<String, Answer>, id: &str) -> Vec<String> {
-        resolved.get(id).map(|a| a.values.clone()).unwrap_or_default()
+        resolved
+            .get(id)
+            .map(|a| a.values.clone())
+            .unwrap_or_default()
     }
 
     #[test]
     fn keys_resolve_by_id_then_by_position_and_values_by_label_then_number() {
         let questions = [
-            question("Which colour do you prefer?", &["Red", "Blue"], false, false),
+            question(
+                "Which colour do you prefer?",
+                &["Red", "Blue"],
+                false,
+                false,
+            ),
             question("sizes", &["S", "M", "L"], false, true),
         ];
-        let resolved =
-            resolve_answers(&questions, &raw(&[("1", &["2"]), ("sizes", &["S", "3"])]))
-                .expect("valid answers");
-        assert_eq!(values(&resolved, "Which colour do you prefer?"), vec!["Blue"]);
+        let resolved = resolve_answers(&questions, &raw(&[("1", &["2"]), ("sizes", &["S", "3"])]))
+            .expect("valid answers");
+        assert_eq!(
+            values(&resolved, "Which colour do you prefer?"),
+            vec!["Blue"]
+        );
         assert_eq!(values(&resolved, "sizes"), vec!["S", "L"]);
         assert_eq!(resolved.len(), 2, "keys are canonical question ids");
     }
@@ -157,9 +170,12 @@ mod tests {
     /// An id that looks like a number outranks the position it would name.
     #[test]
     fn an_exact_id_wins_over_a_position() {
-        let questions = [question("x", &[], true, false), question("1", &[], true, false)];
-        let resolved = resolve_answers(&questions, &raw(&[("1", &["one"]), ("x", &["ex"])]))
-            .expect("valid");
+        let questions = [
+            question("x", &[], true, false),
+            question("1", &[], true, false),
+        ];
+        let resolved =
+            resolve_answers(&questions, &raw(&[("1", &["one"]), ("x", &["ex"])])).expect("valid");
         assert_eq!(values(&resolved, "1"), vec!["one"]);
         assert_eq!(values(&resolved, "x"), vec!["ex"]);
     }

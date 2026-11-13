@@ -545,26 +545,28 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
 /// An id starting `q-` asks one question (`colour`: Red or Blue) — the shape
 /// a harness question reaches the Server in (W12c).
 fn permission_requested(agent: &str, request_id: &str) -> Event {
-    let tool_call = request_id.starts_with("q-").then(|| horde_proto::v1::ProposedToolCall {
-        tool_name: "AskUserQuestion".to_owned(),
-        input: Some(horde_proto::prost_types::Struct::default()),
-        rendered: "AskUserQuestion".to_owned(),
-        questions: vec![horde_proto::v1::Question {
-            id: "colour".to_owned(),
-            header: "Colour".to_owned(),
-            question: "Which colour?".to_owned(),
-            options: ["Red", "Blue"]
-                .into_iter()
-                .map(|label| horde_proto::v1::QuestionOption {
-                    label: label.to_owned(),
-                    description: String::new(),
-                })
-                .collect(),
-            multi_select: false,
-            allows_free_text: false,
-            secret: false,
-        }],
-    });
+    let tool_call = request_id
+        .starts_with("q-")
+        .then(|| horde_proto::v1::ProposedToolCall {
+            tool_name: "AskUserQuestion".to_owned(),
+            input: Some(horde_proto::prost_types::Struct::default()),
+            rendered: "AskUserQuestion".to_owned(),
+            questions: vec![horde_proto::v1::Question {
+                id: "colour".to_owned(),
+                header: "Colour".to_owned(),
+                question: "Which colour?".to_owned(),
+                options: ["Red", "Blue"]
+                    .into_iter()
+                    .map(|label| horde_proto::v1::QuestionOption {
+                        label: label.to_owned(),
+                        description: String::new(),
+                    })
+                    .collect(),
+                multi_select: false,
+                allows_free_text: false,
+                secret: false,
+            }],
+        });
     Event {
         agent_id: Some(AgentId::new(agent)),
         occurred_at: None,
@@ -763,38 +765,76 @@ async fn a_question_takes_canonical_answers_and_refuses_everything_else() {
         "is a question",
     );
     refuse(
-        answer_question(&mut harness, "plain", PermissionOutcome::Allow, false, &[("1", &["x"])])
-            .await
-            .expect_err("answers to a plain call are refused"),
+        answer_question(
+            &mut harness,
+            "plain",
+            PermissionOutcome::Allow,
+            false,
+            &[("1", &["x"])],
+        )
+        .await
+        .expect_err("answers to a plain call are refused"),
         "asked no question",
     );
     refuse(
-        answer_question(&mut harness, "q-1", PermissionOutcome::Deny, false, &[("1", &["Red"])])
-            .await
-            .expect_err("answers on a denial are refused"),
+        answer_question(
+            &mut harness,
+            "q-1",
+            PermissionOutcome::Deny,
+            false,
+            &[("1", &["Red"])],
+        )
+        .await
+        .expect_err("answers on a denial are refused"),
         "ALLOW",
     );
     refuse(
-        answer_question(&mut harness, "q-1", PermissionOutcome::Allow, true, &[("1", &["Red"])])
-            .await
-            .expect_err("a remembered answer is refused"),
+        answer_question(
+            &mut harness,
+            "q-1",
+            PermissionOutcome::Allow,
+            true,
+            &[("1", &["Red"])],
+        )
+        .await
+        .expect_err("a remembered answer is refused"),
         "remember_for_session",
     );
     refuse(
-        answer_question(&mut harness, "q-1", PermissionOutcome::Allow, false, &[("1", &["Green"])])
-            .await
-            .expect_err("a value outside closed options is refused"),
+        answer_question(
+            &mut harness,
+            "q-1",
+            PermissionOutcome::Allow,
+            false,
+            &[("1", &["Green"])],
+        )
+        .await
+        .expect_err("a value outside closed options is refused"),
         "\"Red\", \"Blue\"",
     );
 
-    answer_question(&mut harness, "q-1", PermissionOutcome::Allow, false, &[("1", &["2"])])
-        .await
-        .expect("position and option number resolve");
-    answer_permission(&mut harness, "q-2", "not now", PermissionOutcome::Deny, None)
-        .await
-        .expect("a question may be denied without answers");
+    answer_question(
+        &mut harness,
+        "q-1",
+        PermissionOutcome::Allow,
+        false,
+        &[("1", &["2"])],
+    )
+    .await
+    .expect("position and option number resolve");
+    answer_permission(
+        &mut harness,
+        "q-2",
+        "not now",
+        PermissionOutcome::Deny,
+        None,
+    )
+    .await
+    .expect("a question may be denied without answers");
 
-    let session_id = harness_session_id(&mut harness).await;
+    let session_id = harness_session_id(&mut harness)
+        .await
+        .expect("the seeded session lists");
     let mut stream = open_sync(&mut harness.control, &session_id, 0, false)
         .await
         .expect("the session syncs");
@@ -807,7 +847,11 @@ async fn a_question_takes_canonical_answers_and_refuses_everything_else() {
                 if let Some(Kind::PermissionDecided(decided)) =
                     envelope.event.and_then(|event| event.kind)
                     && let Some(decision) = decided.decision
-                    && decision.request_id.as_ref().map(ToString::to_string).as_deref()
+                    && decision
+                        .request_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref()
                         == Some("q-1")
                 {
                     journaled = Some(decision.answers);
@@ -825,17 +869,16 @@ async fn a_question_takes_canonical_answers_and_refuses_everything_else() {
 }
 
 /// The one session `harness_with_pending_permissions` seeded.
-async fn harness_session_id(harness: &mut Harness) -> String {
-    harness
+async fn harness_session_id(harness: &mut Harness) -> Setup<String> {
+    Ok(harness
         .control
         .list_sessions(horde_proto::v1::ListSessionsRequest::default())
-        .await
-        .expect("sessions list")
+        .await?
         .into_inner()
         .sessions
         .into_iter()
         .find_map(|session| session.session_id.map(|id| id.to_string()))
-        .expect("one session")
+        .ok_or("one session")?)
 }
 
 #[tokio::test]

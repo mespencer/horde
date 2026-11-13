@@ -123,12 +123,21 @@ fn harness_versions_are_classified_against_each_adapters_range() {
     let newer = harness_version_check("codex", Ok("codex-cli 0.170.0".to_owned()));
     assert_eq!(newer.verdict, Verdict::Warn);
     assert!(newer.detail.contains("untested"), "{newer:?}");
-    assert!(newer.fix.as_deref().is_some_and(|fix| fix.contains("first turn")));
+    assert!(
+        newer
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("first turn"))
+    );
 
     let old = harness_version_check("codex", Ok("codex-cli 0.145.0".to_owned()));
     assert_eq!(old.verdict, Verdict::Fail);
     assert!(old.detail.contains("below 0.147.0"), "{old:?}");
-    assert!(old.fix.as_deref().is_some_and(|fix| fix.contains("upgrade")));
+    assert!(
+        old.fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("upgrade"))
+    );
 
     let silent = harness_version_check("claude", Err("could not run: denied".to_owned()));
     assert_eq!(silent.verdict, Verdict::Warn);

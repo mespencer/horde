@@ -189,7 +189,11 @@ mod tests {
             );
             assert_eq!(
                 capabilities.harnesses[0].version,
-                codex.version.version.map(|v| v.to_string()).unwrap_or_default(),
+                codex
+                    .version
+                    .version
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
                 "the probed version is advertised as the version, never the raw banner"
             );
         }

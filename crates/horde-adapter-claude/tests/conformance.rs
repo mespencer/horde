@@ -355,10 +355,9 @@ async fn replay_with(
 }
 
 /// The prompts a transcript's stdout carries, lifted by the codec.
-fn prompts_in(name: &str) -> Vec<horde_adapter::ProposedToolCall> {
+fn prompts_in(name: &str) -> Result<Vec<horde_adapter::ProposedToolCall>, String> {
     let mut assembler = horde_adapter_claude::TurnAssembler::new();
-    load(name)
-        .expect("fixture must load")
+    Ok(load(name)?
         .outbound
         .iter()
         .filter_map(|line| decode_line(line).ok())
@@ -367,19 +366,22 @@ fn prompts_in(name: &str) -> Vec<horde_adapter::ProposedToolCall> {
             AgentEvent::PermissionRequested { request, .. } => Some(request),
             _ => None,
         })
-        .collect()
+        .collect())
 }
 
 /// `12a`: the Write the model proposed reaches Horde on stdout, before it
 /// runs, with the arguments the chain judges.
 #[test]
 fn a_stdio_prompt_surfaces_the_proposed_call_before_it_runs() {
-    let prompts = prompts_in("12a-stdio-perm-allow.jsonl");
+    let prompts = prompts_in("12a-stdio-perm-allow.jsonl").expect("fixture must load");
     let [prompt] = prompts.as_slice() else {
         panic!("one prompt, got {prompts:?}");
     };
     assert_eq!(prompt.tool_name, "Write");
-    assert_eq!(prompt.tool_call_id.as_str(), "toolu_01KPip6d4uHLM3smJUQAPZNz");
+    assert_eq!(
+        prompt.tool_call_id.as_str(),
+        "toolu_01KPip6d4uHLM3smJUQAPZNz"
+    );
     assert_eq!(prompt.input["content"], "hello");
     assert!(!prompt.is_question());
 }
@@ -403,14 +405,19 @@ async fn a_stdio_denial_is_the_turns_refusal() {
 /// prompt across two turns.
 #[test]
 fn a_session_grant_was_honoured_by_the_harness() {
-    assert_eq!(prompts_in("12d-stdio-perm-remember-session.jsonl").len(), 1);
+    assert_eq!(
+        prompts_in("12d-stdio-perm-remember-session.jsonl")
+            .expect("fixture must load")
+            .len(),
+        1
+    );
 }
 
 /// `13`: AskUserQuestion is a question only a human can answer, keyed by
 /// its text, and the model read the recorded answer back.
 #[tokio::test]
 async fn ask_user_question_surfaces_as_a_question_and_its_answer_reaches_the_model() {
-    let prompts = prompts_in("13-ask-user-question.jsonl");
+    let prompts = prompts_in("13-ask-user-question.jsonl").expect("fixture must load");
     let [prompt] = prompts.as_slice() else {
         panic!("one prompt, got {prompts:?}");
     };
@@ -431,7 +438,9 @@ async fn ask_user_question_surfaces_as_a_question_and_its_answer_reaches_the_mod
     .await
     .expect("must conform");
     assert_eq!(
-        records.last().and_then(|record| record.outcome.text.as_deref()),
+        records
+            .last()
+            .and_then(|record| record.outcome.text.as_deref()),
         Some("Red")
     );
 }
@@ -439,7 +448,9 @@ async fn ask_user_question_surfaces_as_a_question_and_its_answer_reaches_the_mod
 /// `14`–`16`: multi-turn, resume and interrupt are unchanged at 2.1.323.
 #[tokio::test]
 async fn the_2_1_323_baselines_match_the_2_1_226_findings() {
-    let multi = replay("14-multi-turn-2.1.323.jsonl").await.expect("conforms");
+    let multi = replay("14-multi-turn-2.1.323.jsonl")
+        .await
+        .expect("conforms");
     assert_eq!(multi.len(), 3, "three results on one process");
 
     let interrupted = replay("16-interrupt-control-2.1.323.jsonl")

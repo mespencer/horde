@@ -294,11 +294,8 @@ mod tests {
 
     #[test]
     fn a_call_is_a_question_exactly_when_it_asks_something() {
-        let plain = super::ProposedToolCall::new(
-            crate::ids::ToolCallId::new("t1"),
-            "Write",
-            json!({}),
-        );
+        let plain =
+            super::ProposedToolCall::new(crate::ids::ToolCallId::new("t1"), "Write", json!({}));
         assert!(!plain.is_question());
         assert!(plain.questions.is_empty());
         let asking = plain.asking(vec![super::Question {

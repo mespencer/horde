@@ -172,7 +172,9 @@ impl TurnAssembler {
     /// Every prompt still outstanding, consumed — the interrupt path, which
     /// must answer them all (the harness waits on each).
     pub fn withdraw_prompts(&mut self) -> Vec<OutstandingPrompt> {
-        core::mem::take(&mut self.outstanding).into_values().collect()
+        core::mem::take(&mut self.outstanding)
+            .into_values()
+            .collect()
     }
 
     /// The prompt the session is blocked on, if any.

@@ -1106,8 +1106,7 @@ mod stdio_prompts {
 
     /// The control_response the child received, parsed.
     async fn response_received(log_path: &std::path::Path) -> Value {
-        let recorded =
-            control_log_reaches(log_path, |log| log.contains("control_response")).await;
+        let recorded = control_log_reaches(log_path, |log| log.contains("control_response")).await;
         let line = recorded
             .lines()
             .find(|line| line.contains("control_response"))
@@ -1122,7 +1121,11 @@ mod stdio_prompts {
         let log = tempfile::tempdir().expect("a scratch dir");
         let log_path = log.path().join("control.log");
         let (mut session, _dir) = session_on(
-            &awaiting("r1", "Write", &json!({"file_path": "/w/x", "content": "ORIGINAL"})),
+            &awaiting(
+                "r1",
+                "Write",
+                &json!({"file_path": "/w/x", "content": "ORIGINAL"}),
+            ),
             &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
         )
         .await;
@@ -1227,7 +1230,9 @@ mod stdio_prompts {
         let journaled = within("the diagnostic is emitted", async {
             loop {
                 match session.next_event().await {
-                    Ok(Some(AgentEvent::Output { text, .. })) if text.contains("asked no question") => {
+                    Ok(Some(AgentEvent::Output { text, .. }))
+                        if text.contains("asked no question") =>
+                    {
                         return text;
                     }
                     Ok(Some(_)) => {}

@@ -216,7 +216,7 @@ fn serve(
 ) -> bool {
     for out in turn {
         if *out == AWAIT_CONTROL_RESPONSE {
-            if !stdout.flush().is_ok() || !await_response(stdin, stdout, behaviour) {
+            if stdout.flush().is_err() || !await_response(stdin, stdout, behaviour) {
                 return false;
             }
             continue;

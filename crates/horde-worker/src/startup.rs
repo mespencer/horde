@@ -666,9 +666,10 @@ async fn build_runtime(
                 // Probed, not assumed: the version picks the permission route
                 // (stdio from 2.1.323) and a refused version stops the Worker
                 // here, loudly, rather than failing every spawn (W12c).
-                let adapter = crate::ClaudeAdapter::new(harness_profile(config, "claude", &journal))
-                    .probe_version()
-                    .await;
+                let adapter =
+                    crate::ClaudeAdapter::new(harness_profile(config, "claude", &journal))
+                        .probe_version()
+                        .await;
                 admit_harness(&adapter.version)?;
                 runtime.with_adapter(Arc::new(adapter))
             }

@@ -2049,7 +2049,11 @@ mod tests {
         let answers = super::parse_answers(&pairs).expect("valid pairs");
         assert_eq!(answers["1"], vec!["Red".to_owned()]);
         assert_eq!(answers["sizes"], vec!["S".to_owned(), "M".to_owned()]);
-        assert_eq!(answers["note"], vec!["a=b".to_owned()], "only the first = splits");
+        assert_eq!(
+            answers["note"],
+            vec!["a=b".to_owned()],
+            "only the first = splits"
+        );
         assert_eq!(answers.len(), 3);
 
         for bad in ["Red", "=Red", "1="] {

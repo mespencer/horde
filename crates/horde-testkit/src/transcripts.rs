@@ -341,7 +341,10 @@ mod tests {
         let transcript =
             Transcript::load_from(directory.path(), "annotated.jsonl", HarnessOutputKey::In)
                 .expect("loads");
-        assert_eq!(transcript.outbound, vec![r#"{"method":"turn/started"}"#.to_owned()]);
+        assert_eq!(
+            transcript.outbound,
+            vec![r#"{"method":"turn/started"}"#.to_owned()]
+        );
         assert_eq!(transcript.inbound, vec![r#"{"id":1}"#.to_owned()]);
     }
 

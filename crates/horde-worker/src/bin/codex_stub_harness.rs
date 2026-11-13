@@ -570,7 +570,10 @@ mod tests {
             super::server_request_marker("!SERVER_REQUEST item/tool/requestUserInput {\"a\":1}"),
             Some(("item/tool/requestUserInput", "{\"a\":1}"))
         );
-        assert_eq!(super::server_request_marker("!SERVER_REQUEST nospace"), None);
+        assert_eq!(
+            super::server_request_marker("!SERVER_REQUEST nospace"),
+            None
+        );
         assert_eq!(
             super::server_request_marker("{\"method\":\"turn/started\"}"),
             None

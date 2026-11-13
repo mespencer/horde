@@ -845,7 +845,10 @@ mod tests {
         app.on_input(&key(KeyCode::Char('i')));
         let entries = app.inbox_entries();
         assert!(entries[0].permission.is_question());
-        assert_eq!(entries[0].permission.questions[0].options, vec!["Red", "Blue"]);
+        assert_eq!(
+            entries[0].permission.questions[0].options,
+            vec!["Red", "Blue"]
+        );
 
         assert_eq!(
             app.on_input(&key(KeyCode::Char('2'))),
@@ -857,8 +860,14 @@ mod tests {
                 )]),
             }]
         );
-        assert!(app.on_input(&key(KeyCode::Char('3'))).is_empty(), "no option 3");
-        assert!(app.on_input(&key(KeyCode::Char('0'))).is_empty(), "options count from 1");
+        assert!(
+            app.on_input(&key(KeyCode::Char('3'))).is_empty(),
+            "no option 3"
+        );
+        assert!(
+            app.on_input(&key(KeyCode::Char('0'))).is_empty(),
+            "options count from 1"
+        );
         assert!(
             app.on_input(&key(KeyCode::Char('y'))).is_empty(),
             "a question cannot be allowed, only answered"

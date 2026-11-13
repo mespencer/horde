@@ -498,11 +498,14 @@ impl AgentSession for LiveClaudeSession {
         let body = match encode_decision(&decision, &prompt.tool_name, &prompt.input) {
             Some(body) => body,
             None => {
-                let message =
-                    format!("{} asked no question, so answers cannot apply", prompt.tool_name);
-                if let Some(event) = self.assembler.note_diagnostic(format!(
-                    "claude prompt {tool_call_id}: {message}; denied"
-                )) {
+                let message = format!(
+                    "{} asked no question, so answers cannot apply",
+                    prompt.tool_name
+                );
+                if let Some(event) = self
+                    .assembler
+                    .note_diagnostic(format!("claude prompt {tool_call_id}: {message}; denied"))
+                {
                     self.pending.push_back(event);
                 }
                 serde_json::json!({ "behavior": "deny", "message": message })
@@ -921,7 +924,10 @@ mod tests {
         match error {
             horde_adapter::AdapterError::RefusedVersion { provider, detail } => {
                 assert_eq!(provider, "claude");
-                assert!(detail.contains("2.0.1") && detail.contains("2.1.226"), "{detail}");
+                assert!(
+                    detail.contains("2.0.1") && detail.contains("2.1.226"),
+                    "{detail}"
+                );
             }
             other => panic!("expected a version refusal, got {other:?}"),
         }
@@ -938,9 +944,19 @@ mod tests {
         adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
         let probed = adapter.probe_version().await;
         assert_eq!(probed.program, "/nonexistent/horde-test-claude");
-        assert_eq!(probed.extra_env, vec![("MARKER".to_owned(), "kept".to_owned())]);
-        assert_eq!(probed.version.verdict, horde_adapter::SupportVerdict::Untested);
-        assert!(probed.version.raw.contains("could not run"), "{}", probed.version.raw);
+        assert_eq!(
+            probed.extra_env,
+            vec![("MARKER".to_owned(), "kept".to_owned())]
+        );
+        assert_eq!(
+            probed.version.verdict,
+            horde_adapter::SupportVerdict::Untested
+        );
+        assert!(
+            probed.version.raw.contains("could not run"),
+            "{}",
+            probed.version.raw
+        );
         assert_eq!(
             probed.permission_route,
             horde_adapter_claude::version::PermissionRoute::Stdio
@@ -986,8 +1002,7 @@ mod tests {
         let stray = super::refusal_for(&ControlRequest {
             request_id: "p1".to_owned(),
             request: ControlRequestKind::CanUseTool(Box::new(
-                serde_json::from_value(serde_json::json!({"tool_name": "Write"}))
-                    .expect("parses"),
+                serde_json::from_value(serde_json::json!({"tool_name": "Write"})).expect("parses"),
             )),
         });
         let stray: serde_json::Value = serde_json::from_str(&stray).expect("JSON");

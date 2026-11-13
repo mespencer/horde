@@ -255,8 +255,14 @@ pub const SURFACE: &[Used] = &[
     client_request("turn/steer", &["threadId", "expectedTurnId", "input"]),
     client_request("turn/interrupt", &["threadId"]),
     // The replies the codec sends to server requests.
-    file("McpServerElicitationRequestResponse.json", &["action", "content"]),
-    file("CommandExecutionRequestApprovalResponse.json", &["decision"]),
+    file(
+        "McpServerElicitationRequestResponse.json",
+        &["action", "content"],
+    ),
+    file(
+        "CommandExecutionRequestApprovalResponse.json",
+        &["decision"],
+    ),
     file("FileChangeRequestApprovalResponse.json", &["decision"]),
     file(
         "PermissionsRequestApprovalResponse.json",
@@ -508,7 +514,11 @@ mod tests {
         assert_eq!(at("id"), "string");
         assert_eq!(at("maybe.v"), "null|string");
         assert_eq!(at("item.kind"), "enum:x,y");
-        assert_eq!(at("item.only_x"), "integer", "any branch may carry the path");
+        assert_eq!(
+            at("item.only_x"),
+            "integer",
+            "any branch may carry the path"
+        );
         assert_eq!(at("list.v"), "null|string", "arrays are transparent");
         assert_eq!(at("map.*.v"), "null|string");
         assert_eq!(at("list"), "array|object");
