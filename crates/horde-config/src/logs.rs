@@ -456,6 +456,19 @@ mod tests {
         let (blank, _) = resolve(Role::Worker, text, &[(LEVEL_VAR, " ")]).expect("resolves");
         assert_eq!(blank.level, "warn", "a blank variable sets nothing");
 
+        let (equal, _) = resolve(
+            Role::Server,
+            "[logs.agent_reads]\ndefault_bytes = \"4KiB\"\nmax_bytes = \"4KiB\"\n",
+            &[],
+        )
+        .expect("a default equal to the maximum is allowed");
+        assert_eq!(
+            equal
+                .agent_reads
+                .map(|reads| (reads.default_bytes, reads.max_bytes)),
+            Some((4096, 4096))
+        );
+
         let (server, _) = resolve(
             Role::Server,
             "[logs.agent_reads]\ndefault_bytes = \"1KiB\"\nmax_bytes = \"2KiB\"\ncalls_per_minute = 1\nburst = 9\n",
