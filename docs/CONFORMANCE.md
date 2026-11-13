@@ -167,7 +167,7 @@ only with W12c; until then the adapter answers it with an error.
 | Credential-less workers (relay-only git) | §8/§14 | Absent: workers clone remotes with ambient credentials (`horde-worker/src/workspace.rs:458`). |
 | Configuration layering: repo `.horde/` layer, prompt overlays | §13 | Absent; the role files, workspace and session layers exist (ADR-0016). |
 | Multi-user server | §1/§15 | Deferred; single-user assumptions remain load-bearing. |
-| Policy judge (production implementation) | §10 | Dropped (docs/WAVE12.md); the seam remains, nothing configures it, and a mode that wanted one escalates. |
+| Policy judge (production implementation) | §10 | Dropped (operator decision, 2026-11-13); the seam remains, nothing configures it, and a mode that wanted one escalates. |
 
 Delivered since W7d and removed from this list: port forwards (wave 8), the interactive-auth relay (W9a), the hub wire (W9b, worker-forwarded calls), the codex re-probe (ADR-0005 amendment), and Gherkin, fault injection and e2e hardening (wave 7).
 
