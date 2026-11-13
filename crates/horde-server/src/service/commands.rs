@@ -1519,7 +1519,7 @@ mod tests {
                 ..AgentSpec::default()
             });
         }
-        let rows = vec![
+        let rows = [
             row(1, "s1", 1, spawned),
             row(
                 2,
