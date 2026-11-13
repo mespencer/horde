@@ -98,7 +98,7 @@ fn instance_lines(
     };
     let mut spans = vec![
         Span::raw("    "),
-        Span::styled(fit(&worker, 16), theme::plain()),
+        Span::styled(fit(&worker, 16), theme::PLAIN),
         Span::styled(format!(" {}", fit(state, 14)), style),
         Span::styled(format!(" {}", instance.root_path), theme::dim()),
     ];

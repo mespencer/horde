@@ -1,0 +1,16 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: "styled_at(&app, 80, 12)"
+---
+‹Reset+b› horde ‹DarkGray› 1:session  2:agents  3:inbox ‹Cyan+b› 4:workspaces ‹DarkGray› 5:usage  6:logs  7:forwards
+‹Reset›
+‹Cyan+b›❯ horde‹DarkGray›  ‹Reset›
+‹Reset›    gpu-box         ‹Green› ready         ‹DarkGray› /a‹Reset›
+‹Reset›    gpu-box         ‹Yellow› degraded      ‹DarkGray› /b‹Reset›
+‹Reset›    gpu-box         ‹Yellow› materializing ‹DarkGray› /c‹Reset›
+‹Reset›    gpu-box         ‹Red› missing       ‹DarkGray› /d‹Reset›
+‹Reset›    gpu-box         ‹DarkGray› unknown        /e‹Reset›
+‹Reset›
+‹Reset›
+‹DarkGray› r refresh · esc back · q quit‹Reset›
+‹DarkGray› not attached · ○ connecting‹Reset›

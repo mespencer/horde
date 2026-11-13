@@ -13,10 +13,9 @@ pub fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
-#[must_use]
-pub fn plain() -> Style {
-    Style::new()
-}
+/// Unstyled text. A constant rather than a function: it is the default
+/// style itself, so there is nothing about it a test could tell apart.
+pub const PLAIN: Style = Style::new();
 
 #[must_use]
 pub fn bold() -> Style {

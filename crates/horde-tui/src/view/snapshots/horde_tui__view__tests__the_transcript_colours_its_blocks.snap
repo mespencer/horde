@@ -1,0 +1,40 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: "styled_at(&app, 80, 36)"
+---
+‹Reset›
+‹Reset›
+‹Reset›
+‹Reset›
+‹Reset›
+‹Reset›
+‹Reset›
+‹DarkGray›› ‹Reset+b›make the tests green‹Reset›
+‹Reset›
+‹DarkGray+i›✻ Thinking… The failure is probably in the parser.‹Reset›
+‹Reset›
+‹Green›● ‹Reset+b›Bash(cargo test -p parser)‹Reset›
+‹DarkGray›  ⎿ running 12 tests‹Reset›
+‹DarkGray›    test a ... ok‹Reset›
+‹DarkGray›    test b ... FAILED‹Reset›
+‹DarkGray›    … +2 lines (ctrl-o to expand)‹Reset›
+‹Reset›
+‹Reset›● One test fails: `b` expects a trailing newline. I'll ask a reviewer to check
+‹Reset›  the fix.
+‹Reset›
+‹Cyan›↳ ‹DarkGray›spawned reviewer‹Reset›
+‹Reset›
+‹Yellow›⚠ Interrupted · stop‹Reset›
+‹Reset›
+‹Green›◼ ‹Reset›result success: all green
+‹Reset›
+‹Yellow›◼ ‹Reset›result blocked: still red
+‹Reset›
+‹Red›✗ Failed‹Reset›
+‹Reset›
+‹DarkGray›· Archived‹Reset›
+‹Reset›╭──────────────────────────────────────────────────────────────────────────────╮
+‹Reset›│‹Cyan›› ‹DarkGray›message the agent, or / for commands‹Reset›                                        │
+‹Reset›╰──────────────────────────────────────────────────────────────────────────────╯
+‹DarkGray› enter send · alt-enter newline · / commands · ctrl-t agents · ? help‹Reset›
+‹Reset+b› ci-fix‹DarkGray› · ci-fix · claude · opus · on gpu-box · archived · ‹Green›● live‹Reset›

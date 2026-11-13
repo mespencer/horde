@@ -562,7 +562,7 @@ mod tests {
     use horde_tui::{App, Update};
 
     use super::{
-        DRAIN_CEILING, FollowEnd, Subscription, drain_into, ended_update, subscription_for,
+        DRAIN_CEILING, FollowEnd, Stream, Subscription, drain_into, ended_update, subscription_for,
     };
     use crate::ClientError;
 
@@ -674,6 +674,19 @@ mod tests {
         assert_eq!(
             ended_update(Err(refusal)),
             Some(Update::StreamEnded { reason: words })
+        );
+    }
+
+    /// Closing a stream stops its pump: a replaced subscription must not
+    /// keep reading from the server behind the new one.
+    #[tokio::test]
+    async fn closing_a_stream_cancels_its_pump() {
+        let stream = Stream(tokio::spawn(std::future::pending::<()>()));
+        stream.close();
+        let outcome = stream.0.await;
+        assert!(
+            outcome.is_err_and(|error| error.is_cancelled()),
+            "the pump must have been cancelled"
         );
     }
 }

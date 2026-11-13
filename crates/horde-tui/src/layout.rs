@@ -34,13 +34,7 @@ fn block_lines(rows: &mut Vec<Line<'static>>, block: &Block, details: bool, widt
     match block {
         Block::Message { from, text, note } => message_lines(rows, from, text, *note, width),
         Block::Assistant { text, .. } => {
-            marked(
-                rows,
-                ("● ", theme::plain()),
-                text.trim(),
-                theme::plain(),
-                width,
-            );
+            marked(rows, ("● ", theme::PLAIN), text.trim(), theme::PLAIN, width);
         }
         Block::Thinking { text, .. } => thinking_lines(rows, text, details, width),
         Block::Tool {
@@ -63,7 +57,7 @@ fn block_lines(rows: &mut Vec<Line<'static>>, block: &Block, details: bool, widt
                 rows,
                 ("◼ ", style),
                 &format!("result {status}: {summary}"),
-                theme::plain(),
+                theme::PLAIN,
                 width,
             );
         }
@@ -174,7 +168,7 @@ fn prompt_lines(
         Some(Settled::Denied) => (("✗ ", theme::error()), format!("denied: {summary}")),
         Some(Settled::Answered(answers)) => (("✓ ", theme::ok()), format!("answered: {answers}")),
     };
-    marked(rows, marker, &text, theme::plain(), width);
+    marked(rows, marker, &text, theme::PLAIN, width);
 }
 
 fn notice_lines(rows: &mut Vec<Line<'static>>, tone: Tone, text: &str, width: usize) {

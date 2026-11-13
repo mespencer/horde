@@ -526,14 +526,29 @@ async fn opening_the_tree_after_an_attach_replays_every_session() {
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
-/// The workspaces and usage views ask the real server and show its answer —
-/// empty here, which they must say rather than wait forever.
+/// The workspaces and usage views ask the real server and show its answer:
+/// the one definition it holds, and usage it has none of.
 #[tokio::test]
 async fn the_workspaces_and_usage_views_fill_from_the_server() {
     let endpoint = serve().await.expect("a listening server");
     seeded(&endpoint, "tui-views")
         .await
         .expect("a seeded session");
+
+    let mut client = Client::connect(&endpoint).await.expect("a client");
+    client
+        .create_workspace_definition(
+            "tui-ws",
+            vec![horde_proto::v1::WorkspaceRepo {
+                name: "horde".to_owned(),
+                remote_url: "https://example.invalid/horde.git".to_owned(),
+                default_branch: "main".to_owned(),
+                layout_path: "horde".to_owned(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("a workspace definition");
 
     let mut harness = start(&endpoint, App::overview())
         .await
@@ -544,7 +559,13 @@ async fn the_workspaces_and_usage_views_fill_from_the_server() {
         .await
         .expect("the workspaces view lists definitions from the server");
     assert_eq!(app.screen(), Screen::Workspaces);
-    assert_eq!(app.workspaces().map(<[_]>::len), Some(0));
+    let names: Vec<&str> = app
+        .workspaces()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry.definition.name.as_str())
+        .collect();
+    assert_eq!(names, ["tui-ws"], "the server's definition is listed");
 
     harness.press(KeyCode::Char('u')).await.expect("usage");
     let app = harness
@@ -600,5 +621,38 @@ async fn x_then_y_archives_the_selected_session() {
         listed.is_empty(),
         "the session must leave the live list: {listed:?}"
     );
+    harness.quit_from_list_screen().await.expect("q exits");
+}
+
+/// `/note <text>` sends a note, not an assignment, to the attached agent.
+#[tokio::test]
+async fn slash_note_sends_a_real_note() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, _) = seeded(&endpoint, "tui-note")
+        .await
+        .expect("a seeded session");
+    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
+        .await
+        .expect("a running loop");
+    harness
+        .state("the root agent to be known", |app| {
+            app.steer_target().is_some()
+        })
+        .await
+        .expect("the root arrives via replay");
+
+    harness.type_line("/note heads up").await.expect("compose");
+    harness.press(KeyCode::Enter).await.expect("run it");
+    let app = harness
+        .state("the note to round-trip", |app| {
+            feed_has(app, &session_id, "note", "heads up")
+        })
+        .await
+        .expect("the note must come back as a NoteSent event");
+    assert!(
+        !feed_has(&app, &session_id, "assign", "heads up"),
+        "a note is not an assignment"
+    );
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }

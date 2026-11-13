@@ -582,7 +582,7 @@ mod tests {
     };
 
     use super::{AgentNode, FEED_CAPACITY, SessionState, short_id};
-    use crate::fixtures::{decided, envelope, requested, spawned};
+    use crate::fixtures::{assignment, decided, envelope, requested, spawned};
 
     fn chunk(channel: AgentOutputChannel, text: &str) -> Kind {
         Kind::AgentOutputChunk(AgentOutputChunk {
@@ -594,6 +594,23 @@ mod tests {
 
     /// The feed keeps the newest [`FEED_CAPACITY`] lines and no more: the
     /// oldest falls off the front, exactly one per line past the cap.
+    /// A reopened stream re-delivers what was already folded; each position
+    /// folds once. Position zero is no position, so it always folds.
+    #[test]
+    fn a_redelivered_position_folds_once() {
+        let mut state = SessionState::new("s1");
+        let first = envelope(1, "a", assignment("do the thing"));
+        state.apply(&first);
+        state.apply(&first);
+        assert_eq!(state.feed.len(), 1, "the repeat is absorbed");
+        state.apply(&envelope(2, "a", assignment("and the next")));
+        assert_eq!(state.feed.len(), 2, "a new position still folds");
+        let unpositioned = envelope(0, "a", assignment("no position"));
+        state.apply(&unpositioned);
+        state.apply(&unpositioned);
+        assert_eq!(state.feed.len(), 4, "position zero is never a duplicate");
+    }
+
     #[test]
     fn the_feed_is_bounded_and_drops_its_oldest_lines() {
         let mut state = SessionState::new("s1");

@@ -82,10 +82,7 @@ fn permission_body(
     } else {
         request.tool_name.clone()
     };
-    let mut body = vec![Line::styled(
-        format!("{tool} wants to run:"),
-        theme::plain(),
-    )];
+    let mut body = vec![Line::styled(format!("{tool} wants to run:"), theme::PLAIN)];
     for row in wrap(&request.rendered, inner.saturating_sub(2)) {
         body.push(Line::from(vec![
             Span::raw("  "),
@@ -151,7 +148,7 @@ fn choice_line(highlighted: bool, label: &str, check: Option<bool>) -> Line<'sta
     let style = if highlighted {
         theme::selected()
     } else {
-        theme::plain()
+        theme::PLAIN
     };
     Line::from(vec![marker, Span::styled(format!("{box_}{label}"), style)])
 }

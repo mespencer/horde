@@ -252,7 +252,7 @@ pub fn lookup(table: &[Binding], key: &KeyEvent) -> Option<Intent> {
 /// A plain character — no control or alt — typed as text.
 #[must_use]
 pub fn typed(key: &KeyEvent) -> Option<char> {
-    let chord = key.modifiers.intersects(CTRL | ALT);
+    let chord = key.modifiers.intersects(CTRL.union(ALT));
     match key.code {
         KeyCode::Char(c) if !chord => Some(c),
         _ => None,

@@ -1172,3 +1172,57 @@ fn attached_to(app: &App) -> Option<(&str, Option<String>)> {
     app.attachment()
         .map(|a| (a.session_id.as_str(), a.agent_id.clone()))
 }
+
+/// The terminal's own resize event sets the viewport the scroll ceiling is
+/// judged against: a taller screen leaves less to scroll back through.
+#[test]
+fn a_terminal_resize_reclamps_the_scroll() {
+    let mut app = attached();
+    for sequence in 3..40 {
+        event(
+            &mut app,
+            "s1",
+            sequence,
+            "root-1",
+            chunk(
+                AgentOutputChannel::Assistant,
+                &format!("t{sequence}"),
+                "line",
+            ),
+        );
+    }
+    app.on_input(&TermEvent::Resize(80, 30));
+    for _ in 0..20 {
+        press(&mut app, KeyCode::PageUp);
+    }
+    assert_eq!(app.scroll(), 38 * 2 - 1 - 15, "rows less half of 30");
+}
+
+/// Esc on the inbox list, with no card open, goes back where it came from.
+#[test]
+fn esc_on_the_inbox_list_goes_back() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.screen(), Screen::Inbox);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen(), Screen::Overview);
+}
+
+/// The workspaces list is selectable, row by row, clamped to what is listed.
+#[test]
+fn the_workspaces_list_moves_its_selection() {
+    let mut app = App::overview();
+    let entry = |name: &str| crate::app::WorkspaceEntry {
+        definition: horde_proto::v1::WorkspaceDefinition {
+            name: name.to_owned(),
+            ..horde_proto::v1::WorkspaceDefinition::default()
+        },
+        instances: Vec::new(),
+    };
+    app.apply(Update::Workspaces(vec![entry("one"), entry("two")]));
+    press(&mut app, KeyCode::Char('w'));
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.selected(Screen::Workspaces), 1);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.selected(Screen::Workspaces), 1, "clamped to the last");
+}

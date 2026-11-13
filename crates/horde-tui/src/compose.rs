@@ -144,13 +144,16 @@ impl Compose {
     /// Deletes back to the start of the previous word (Ctrl-W).
     pub fn delete_word(&mut self) {
         let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let mut start = self.col;
-        while start > 0 && chars[start - 1] == ' ' {
-            start -= 1;
-        }
-        while start > 0 && chars[start - 1] != ' ' {
-            start -= 1;
-        }
+        let before = &chars[..self.col.min(chars.len())];
+        // Past any spaces just behind the cursor, then back over the word.
+        let word_end = before
+            .iter()
+            .rposition(|c| *c != ' ')
+            .map_or(0, |index| index + 1);
+        let start = before[..word_end]
+            .iter()
+            .rposition(|c| *c == ' ')
+            .map_or(0, |index| index + 1);
         let line = &mut self.lines[self.row];
         let (from, to) = (byte_at(line, start), byte_at(line, self.col));
         line.replace_range(from..to, "");
@@ -309,6 +312,23 @@ mod tests {
         assert_eq!(compose.text(), "one ");
         compose.delete_word();
         assert_eq!(compose.text(), "");
+
+        let mut compose = typed("ab cd ef");
+        compose.left();
+        compose.left();
+        compose.left();
+        compose.delete_word();
+        assert_eq!(
+            compose.text(),
+            "ab  ef",
+            "only the word behind the cursor goes"
+        );
+        assert_eq!(compose.cursor(), (0, 3));
+
+        let mut compose = typed("   ");
+        compose.delete_word();
+        assert_eq!(compose.text(), "", "a line of spaces clears");
+        assert_eq!(compose.cursor(), (0, 0));
 
         let mut compose = typed("keep this");
         compose.left();
