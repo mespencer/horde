@@ -10,9 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use horde_config::logs::LEVEL_VAR;
 use horde_config::values::show_string;
-use horde_config::{Document, LogKeys, Origin, Provenance, Role, Section};
+use horde_config::{Document, LogKeys, Provenance, Role};
 use horde_proto::v1::SessionSettings;
 
 use crate::client::{Client, ClientError};
@@ -43,21 +42,9 @@ impl ClientSettings {
         document: Option<&Document>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let empty = toml::Table::new();
-        let (table, origin) = document.map_or((&empty, Origin::Default), |document| {
-            (&document.table, document.origin())
-        });
-        let file_error = |message: String| match document {
-            Some(document) if !message.starts_with(LEVEL_VAR) => document.refusal(message),
-            _ => message,
-        };
+        let (mut root, origin) = horde_config::open(Role::Client, document);
+        let file_error = horde_config::refuser(document);
         let mut provenance = Provenance::default();
-        let mut root = Section::root(table);
-        for key in ["permissions", "tiers", "workspace", "placement"] {
-            root.foreign(key, "server");
-        }
-        root.foreign("worker", "worker");
-        root.foreign("codex", "worker");
         let filed_mode = match root.section("session").map_err(file_error)? {
             Some(mut session) => {
                 let mode = session.string("permission_mode").map_err(file_error)?;

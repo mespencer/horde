@@ -134,17 +134,26 @@ async fn the_binary_layers_defaults_file_and_flags_and_refuses_a_bad_file() {
     )
     .expect("writes");
     let dir = state.path().to_string_lossy().into_owned();
-    let output = support::within(
-        "--show-config must print and exit",
-        tokio::process::Command::new(harness::admitted_daemon())
-            .args(["--state-dir", &dir, "--workspace-report-interval", "30s"])
-            .args(["--show-config", "--origin"])
-            .output(),
-    )
-    .await
-    .expect("the binary runs");
-    assert!(output.status.success(), "{output:?}");
-    let shown = String::from_utf8_lossy(&output.stdout);
+    let run = |arguments: Vec<&str>| {
+        let mut command = tokio::process::Command::new(harness::admitted_daemon());
+        command.args(arguments);
+        async move {
+            support::within("the binary must exit, not run", command.output())
+                .await
+                .expect("the binary runs")
+        }
+    };
+    let shown = run(vec![
+        "--state-dir",
+        &dir,
+        "--workspace-report-interval",
+        "30s",
+        "--show-config",
+        "--origin",
+    ])
+    .await;
+    assert!(shown.status.success(), "{shown:?}");
+    let shown = String::from_utf8_lossy(&shown.stdout);
     for line in [
         "worker.workspace.scan_interval = 1m  # default".to_owned(),
         format!(
@@ -157,18 +166,11 @@ async fn the_binary_layers_defaults_file_and_flags_and_refuses_a_bad_file() {
     }
 
     std::fs::write(&file, "[worker.workspace]\nreport_interval = 10\n").expect("writes");
-    let output = support::within(
-        "a bad config file must refuse, not run",
-        tokio::process::Command::new(harness::admitted_daemon())
-            .args(["--state-dir", &dir])
-            .output(),
-    )
-    .await
-    .expect("the binary runs");
-    assert!(!output.status.success());
-    let refusal = String::from_utf8_lossy(&output.stderr);
+    let refused = run(vec!["--config", &file.to_string_lossy()]).await;
+    let refusal = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        refusal.contains(&format!("worker config {}", file.display()))
+        !refused.status.success()
+            && refusal.contains(&format!("worker config {}", file.display()))
             && refusal.contains("worker.workspace.report_interval: expected a duration"),
         "{refusal}"
     );

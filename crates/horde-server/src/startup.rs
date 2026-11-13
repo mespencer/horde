@@ -282,11 +282,6 @@ pub fn invocation_in(
     if args.check {
         return Ok(Invocation::CheckOnly { database });
     }
-    let document = horde_config::load(
-        horde_config::Role::Server,
-        args.config.as_deref(),
-        &state_dir.join(horde_config::Role::FILE_NAME),
-    )?;
     let flags = crate::config::ServerFlags {
         permission_mode: args.permission_mode,
         workspace: crate::config::WorkspaceFlags {
@@ -300,7 +295,12 @@ pub fn invocation_in(
             disk_floor: args.placement_disk_floor,
         },
     };
-    let settings = crate::config::ServerSettings::resolve(document.as_ref(), &flags, env)?;
+    let settings = crate::config::ServerSettings::load(
+        args.config.as_deref(),
+        &state_dir.join(horde_config::Role::FILE_NAME),
+        &flags,
+        env,
+    )?;
     if args.show_config {
         return Ok(Invocation::Print(settings.provenance.render(args.origin)));
     }
@@ -1030,8 +1030,8 @@ mod tests {
     #[test]
     fn the_config_file_layers_under_the_flags_and_show_config_prints_it() {
         let state = tempfile::tempdir().expect("a temp dir");
+        let file = state.path().join(horde_config::Role::FILE_NAME);
         let dir = state.path().to_string_lossy().into_owned();
-        let file = state.path().join("config.toml");
         std::fs::write(
             &file,
             "[permissions]\ndefault_mode = \"ask\"\n[workspace]\nfetch_throttle = \"2m\"\nfetch_timeout = \"9s\"\n",

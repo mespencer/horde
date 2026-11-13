@@ -198,35 +198,18 @@ mod tests {
             Origin::File("/s.toml".into()),
         );
 
-        let none = agent_entries(&server, &modes, &policy, None, None);
-        let shown: Vec<(&str, &str, String)> = none
-            .iter()
-            .map(|entry| {
-                (
-                    entry.key.as_str(),
-                    entry.value.as_str(),
-                    entry.origin.to_string(),
-                )
-            })
-            .collect();
+        let shown = |entries: Vec<horde_config::Entry>| -> Vec<String> {
+            entries
+                .iter()
+                .map(|entry| format!("{} = {}  # {}", entry.key, entry.value, entry.origin))
+                .collect()
+        };
         assert_eq!(
-            shown,
+            shown(agent_entries(&server, &modes, &policy, None, None)),
             [
-                (
-                    "agent.permission_mode",
-                    "\"bypass\"",
-                    "flag --permission-mode".to_owned()
-                ),
-                (
-                    "agent.workspace.archived_grace",
-                    "1d",
-                    "file /s.toml".to_owned()
-                ),
-                (
-                    "agent.workspace.idle_reclaim_after",
-                    "4h",
-                    "default".to_owned()
-                ),
+                "agent.permission_mode = \"bypass\"  # flag --permission-mode",
+                "agent.workspace.archived_grace = 1d  # file /s.toml",
+                "agent.workspace.idle_reclaim_after = 4h  # default",
             ]
         );
 
@@ -235,35 +218,18 @@ mod tests {
             idle_reclaim_after: Some(wire(std::time::Duration::from_secs(60))),
             archived_grace: None,
         });
-        let entries = agent_entries(&server, &modes, &policy, Some(session("")), Some(&api));
-        let shown: Vec<(&str, &str, String)> = entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.key.as_str(),
-                    entry.value.as_str(),
-                    entry.origin.to_string(),
-                )
-            })
-            .collect();
         assert_eq!(
-            shown,
+            shown(agent_entries(
+                &server,
+                &modes,
+                &policy,
+                Some(session("")),
+                Some(&api)
+            )),
             [
-                (
-                    "agent.permission_mode",
-                    "\"ask\"",
-                    "workspace api".to_owned()
-                ),
-                (
-                    "agent.workspace.archived_grace",
-                    "1d",
-                    "file /s.toml".to_owned()
-                ),
-                (
-                    "agent.workspace.idle_reclaim_after",
-                    "1m",
-                    "workspace api".to_owned()
-                ),
+                "agent.permission_mode = \"ask\"  # workspace api",
+                "agent.workspace.archived_grace = 1d  # file /s.toml",
+                "agent.workspace.idle_reclaim_after = 1m  # workspace api",
             ]
         );
         let sessioned = agent_entries(

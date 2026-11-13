@@ -742,14 +742,19 @@ mod tests {
 
         run_chain(&log, PermissionModes::shipped(), None).await;
 
-        let decisions = decisions_in(&log, "s1").await;
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].outcome, PermissionOutcome::Allow as i32);
+        let rulings: Vec<(i32, i32, String)> = decisions_in(&log, "s1")
+            .await
+            .into_iter()
+            .map(|decision| (decision.outcome, decision.decided_by, decision.reason))
+            .collect();
         assert_eq!(
-            decisions[0].decided_by,
-            PermissionLayer::DeterministicAllow as i32
+            rulings,
+            [(
+                PermissionOutcome::Allow as i32,
+                PermissionLayer::DeterministicAllow as i32,
+                super::BYPASS_REASON.to_owned()
+            )]
         );
-        assert_eq!(decisions[0].reason, super::BYPASS_REASON);
         assert_eq!(
             requests_in(&log, "s1").await.len(),
             1,
