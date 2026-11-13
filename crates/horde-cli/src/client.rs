@@ -263,6 +263,11 @@ pub enum ClientError {
     /// from "no".
     #[error("workspace cleanup incomplete: {0}")]
     CleanupPending(String),
+
+    /// `horde logs` was asked for something it cannot read: no target, an
+    /// unknown one, or a filter that does not parse.
+    #[error("{0}")]
+    Logs(String),
 }
 
 impl ClientError {

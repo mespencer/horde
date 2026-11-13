@@ -20,6 +20,7 @@ pub mod doctor;
 pub mod forward;
 pub mod front_door;
 pub mod login;
+pub mod logs;
 pub mod names;
 pub mod picker;
 pub mod render;
