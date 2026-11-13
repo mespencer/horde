@@ -409,9 +409,7 @@ async fn soft_reclaim_runs_cargo_clean_and_keeps_the_work() {
     let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
     let record = manager.records("ws-1").await.remove(0);
 
-    let event = manager
-        .soft_reclaim("ws-1", &record, explicit(&policy))
-        .await;
+    let event = soft(&manager, &record, &policy).await;
     let action = &event.repos[0];
     assert_eq!(action.outcome, i32::from(Outcome::Done), "{action:?}");
     assert_eq!(action.argv, vec!["cargo", "clean"]);
@@ -426,13 +424,17 @@ async fn soft_reclaim_runs_cargo_clean_and_keeps_the_work() {
     );
 
     std::fs::create_dir_all(repo.join("target/debug")).expect("rebuilt");
-    let archived = manager
-        .mark_archived("ws-1", "agent-1")
+    let archived = horde_worker::workspace::cleanup::mark_archived(&manager, "ws-1", "agent-1")
         .await
         .expect("archived");
-    let (event, removed) = manager
-        .hard_remove("ws-1", &archived, explicit(&policy), false)
-        .await;
+    let (event, removed) = horde_worker::workspace::cleanup::hard_remove(
+        &manager,
+        "ws-1",
+        &archived,
+        explicit(&policy),
+        false,
+    )
+    .await;
     assert!(
         removed,
         "target/ is the reclaim's output, not loss: {event:?}"
@@ -454,8 +456,7 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
     let prepared = checkout(&manager, &request("agent-1")).await;
     std::fs::write(prepared.root.join("crate/.env"), "SECRET=1").expect("an agent's .env");
     let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
-    let archived = manager
-        .mark_archived("ws-1", "agent-1")
+    let archived = horde_worker::workspace::cleanup::mark_archived(&manager, "ws-1", "agent-1")
         .await
         .expect("archived");
 
@@ -463,16 +464,23 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
         dry_run: true,
         ..explicit(&policy)
     };
-    let (event, removed) = manager.hard_remove("ws-1", &archived, dry, false).await;
+    let (event, removed) =
+        horde_worker::workspace::cleanup::hard_remove(&manager, "ws-1", &archived, dry, false)
+            .await;
     assert!(!removed);
     let action = &event.repos[0];
     assert_eq!(action.outcome, i32::from(Outcome::Refused));
     assert_eq!(action.unrecoverable_files.len(), 1, "{action:?}");
     assert_eq!(action.unrecoverable_files[0].path, ".env");
     assert_eq!(action.unrecoverable_files[0].bytes, 8);
-    let (event, removed) = manager
-        .hard_remove("ws-1", &archived, explicit(&policy), true)
-        .await;
+    let (event, removed) = horde_worker::workspace::cleanup::hard_remove(
+        &manager,
+        "ws-1",
+        &archived,
+        explicit(&policy),
+        true,
+    )
+    .await;
     assert!(removed, "{event:?}");
 
     definition.repos[0].reclaim = Some(horde_proto::v1::ReclaimPolicy {
@@ -483,9 +491,7 @@ async fn an_ignored_file_outside_the_reclaim_outputs_blocks_automatic_removal() 
     manager.materialize(&definition).await;
     checkout(&manager, &request("agent-2")).await;
     let record = manager.records("ws-1").await.remove(0);
-    let event = manager
-        .soft_reclaim("ws-1", &record, explicit(&policy))
-        .await;
+    let event = soft(&manager, &record, &policy).await;
     assert_eq!(event.repos[0].outcome, i32::from(Outcome::Skipped));
     assert_eq!(event.repos[0].reason, "no reclaim command");
 }
@@ -567,6 +573,29 @@ fn rig(root: &Path, journal: Journal) -> Rig {
         disk,
         root: root.to_path_buf(),
     }
+}
+
+/// A rig over `<temp>/workspaces` with a fresh in-memory journal.
+fn fresh_rig(temp: &Path) -> Rig {
+    rig(
+        &temp.join("workspaces"),
+        Journal::in_memory().expect("journal"),
+    )
+}
+
+/// The one-repo `atlas` Definition over a fresh origin under `temp`.
+fn atlas_definition(temp: &Path) -> WorkspaceDefinition {
+    let atlas = harness::origin(temp, "atlas");
+    harness::definition("ws-1", vec![harness::repo("atlas", &atlas)])
+}
+
+/// One explicit soft reclaim of `record`'s checkout in `ws-1`.
+async fn soft(
+    manager: &WorkspaceManager,
+    record: &horde_worker::workspace::ledger::LedgerRecord,
+    policy: &horde_worker::workspace::policy::WorkspacePolicy,
+) -> WorkspaceCleanup {
+    horde_worker::workspace::cleanup::soft_reclaim(manager, "ws-1", record, explicit(policy)).await
 }
 
 fn command(id: &str, kind: Command) -> StreamCommandsResponse {
@@ -697,12 +726,8 @@ fn agent_root(rig: &Rig, agent: &str) -> PathBuf {
 #[tokio::test]
 async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    );
+    let definition = atlas_definition(temp.path());
+    let mut rig = fresh_rig(temp.path());
     materialize(&mut rig, &definition, policy(1, 0)).await;
     assert!(rig.reporter.count() >= 1, "a materialize reports");
     spawn(&mut rig, "agent-1").await;
@@ -755,12 +780,8 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
 #[tokio::test]
 async fn an_idle_agent_is_reclaimed_once_per_idle_period() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    );
+    let definition = atlas_definition(temp.path());
+    let mut rig = fresh_rig(temp.path());
     materialize(&mut rig, &definition, policy(0, 1)).await;
     spawn(&mut rig, "agent-1").await;
     tokio::time::sleep(Duration::from_millis(1_100)).await;
@@ -798,12 +819,8 @@ async fn an_idle_agent_is_reclaimed_once_per_idle_period() {
 #[tokio::test]
 async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    );
+    let definition = atlas_definition(temp.path());
+    let mut rig = fresh_rig(temp.path());
     // A long grace and no idle reclaim: only pressure acts.
     materialize(&mut rig, &definition, policy(86_400, 0)).await;
     spawn(&mut rig, "agent-old").await;
@@ -868,8 +885,7 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
 #[tokio::test]
 async fn orphans_after_a_reset_are_reported_soft_at_most_and_removed_by_hard_gc() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
+    let definition = atlas_definition(temp.path());
     let root = temp.path().join("workspaces");
     let mut first = rig(&root, Journal::in_memory().expect("journal"));
     materialize(&mut first, &definition, policy(0, 0)).await;
@@ -933,12 +949,8 @@ async fn orphans_after_a_reset_are_reported_soft_at_most_and_removed_by_hard_gc(
 #[tokio::test]
 async fn gc_dry_runs_refuses_forces_and_drops_only_safe_pins() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let atlas = harness::origin(temp.path(), "atlas");
-    let definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
-    let mut rig = rig(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    );
+    let definition = atlas_definition(temp.path());
+    let mut rig = fresh_rig(temp.path());
     materialize(&mut rig, &definition, policy(86_400, 0)).await;
     spawn(&mut rig, "agent-dirty").await;
     std::fs::write(agent_root(&rig, "agent-dirty").join("atlas/wip.txt"), "wip").expect("dirty");
@@ -1059,10 +1071,7 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
     let atlas = harness::origin(temp.path(), "atlas");
     let mut definition = harness::definition("ws-1", vec![harness::repo("atlas", &atlas)]);
     definition.unmanaged_paths = vec!["data".to_owned()];
-    let mut rig = rig(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    );
+    let mut rig = fresh_rig(temp.path());
     materialize(&mut rig, &definition, policy(0, 0)).await;
     spawn(&mut rig, "agent-1").await;
     let link = agent_root(&rig, "agent-1").join("data");
@@ -1157,10 +1166,7 @@ async fn materialization_journals_its_progress_and_reports() {
         .map(|name| harness::repo(name, &harness::origin(temp.path(), name)))
         .collect();
     let definition = harness::definition("ws-1", repos);
-    let mut rig = rig(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-    );
+    let mut rig = fresh_rig(temp.path());
     materialize(&mut rig, &definition, policy(0, 0)).await;
     let steps: Vec<(String, u32, u32)> = journaled(&rig.journal)
         .await

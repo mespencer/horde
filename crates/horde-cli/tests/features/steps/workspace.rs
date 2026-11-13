@@ -10,7 +10,7 @@ use cucumber::{given, then, when};
 use horde_adapter_fake::{FakeAdapter, Script};
 use horde_proto::v1::event::Kind;
 
-use crate::world::{HordeWorld, RunningWorker, StepResult};
+use crate::world::{HordeWorld, StepResult};
 
 /// Runs one git command in `dir`, failing the step with git's own words.
 fn git(dir: &Path, args: &[&str]) -> StepResult<String> {
@@ -76,7 +76,6 @@ async fn a_workspace_over(world: &mut HordeWorld, workspace: String, origin: Str
 
 #[given("a workspace worker joins")]
 async fn a_workspace_worker_joins(world: &mut HordeWorld) -> StepResult {
-    let endpoint = world.endpoint()?.to_owned();
     let journal_dir = tempfile::tempdir()?;
     let journal = horde_worker::Journal::open(&journal_dir.path().join("journal.sqlite"))?;
     let root = journal_dir.path().join("workspaces");
@@ -87,26 +86,7 @@ async fn a_workspace_worker_joins(world: &mut HordeWorld) -> StepResult {
         Some(workspaces) => Some(workspaces.warm_instances().await),
         None => None,
     };
-    let config = horde_worker::DialConfig {
-        endpoint,
-        worker_id: "ws-box".to_owned(),
-        hello: horde_worker::capabilities::hello("ws-box"),
-        capabilities: horde_worker::capabilities::advertise(
-            runtime.adapters(),
-            warm,
-            &horde_worker::capabilities::DeclaredFacts::default(),
-        ),
-        identity: None,
-        last_local_journal_sequence: None,
-    };
-    let (mut connection, _registration) = horde_worker::Connection::dial(&config).await?;
-    let logins = horde_worker::login::LoginPlane::discarding(runtime.adapters());
-    let task = tokio::spawn(async move {
-        let mut runtime = runtime;
-        connection.run(&journal, &mut runtime, logins).await
-    });
-    world.worker = Some(RunningWorker::new(task, journal_dir));
-    Ok(())
+    crate::steps::worker::dial(world, runtime, journal, journal_dir, "ws-box", warm).await
 }
 
 #[when(expr = "the user starts a session in workspace {string}")]
@@ -174,13 +154,5 @@ async fn sees_checkout(world: &mut HordeWorld, needle: &str) -> StepResult {
             .then_some(())
         })
         .await?;
-    let endpoint = world.endpoint()?.to_owned();
-    let session = world.session()?.to_owned();
-    world.run_horde(&endpoint, &["sync", &session]).await?;
-    let run = world.last_run()?;
-    if run.success && run.stdout.contains(needle) {
-        Ok(())
-    } else {
-        Err(format!("the replay does not show {needle:?}: {}", run.stdout).into())
-    }
+    crate::steps::cli::replay_shows(world, needle).await
 }

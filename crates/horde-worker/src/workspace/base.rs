@@ -402,7 +402,7 @@ async fn worktree_holding(instance_repo: &Path, reference: &str) -> Result<Optio
 pub(crate) fn holder_name(path: &str) -> String {
     let mut components = Path::new(path).components().map(|c| c.as_os_str());
     while let Some(component) = components.next() {
-        if component == super::AGENTS_DIR
+        if component == super::paths::AGENTS_DIR
             && let Some(agent) = components.next().and_then(|agent| agent.to_str())
         {
             return format!("agent {agent}");

@@ -93,7 +93,7 @@ pub(super) async fn pump(
     journal: Journal,
     context: AgentContext,
     mut control: mpsc::Receiver<AgentControl>,
-    activity: std::sync::Arc<super::housekeeping::Activity>,
+    activity: std::sync::Arc<super::activity::Activity>,
 ) -> PumpExit {
     let agent_id = context.agent_id.clone();
     let mut pump = Pump::new(session, journal, context);

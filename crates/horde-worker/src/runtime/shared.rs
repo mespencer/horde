@@ -13,7 +13,7 @@ use horde_proto::v1::{
     DeliverMessageCommand, DeliveryMode, SpawnAgentCommand, deliver_message_command, event::Kind,
 };
 
-use super::housekeeping::{Activity, CheckoutLocks, Housekeeper, InstanceReporter};
+use super::activity::{Activity, CheckoutLocks, InstanceReporter};
 use crate::error::WorkerError;
 use crate::journal::{Journal, JournalEntry, RevivableAgent};
 use crate::share::{AgentCheckout, ShareBroker, StampingSink};
@@ -76,13 +76,6 @@ impl Shared {
         StampingSink::new(self.journal.sink(), Arc::clone(&self.broker))
     }
 
-    /// The housekeeper, when this Worker has workspaces.
-    pub(super) fn housekeeper(&self) -> Option<Housekeeper> {
-        self.workspaces
-            .clone()
-            .map(|workspaces| Housekeeper::new(self.clone(), workspaces))
-    }
-
     /// Remembers the policy a command carried for an Instance.
     pub(super) fn remember_policy(
         &self,
@@ -119,28 +112,6 @@ impl Shared {
     pub(super) async fn forget_endpoint(&self, agent_id: &str) {
         if let Some(endpoints) = &self.endpoints {
             endpoints.forget_agent(agent_id).await;
-        }
-    }
-
-    /// Gives back what a spawn minted for an agent whose harness never
-    /// started: the endpoint token (a credential nobody holds must not stay
-    /// valid), its `local` MCP children, and the checkout — nothing ran in
-    /// it, so it goes at once when lossless (ADR-0014).
-    pub(super) async fn abandon_spawn(&self, agent_id: &str, checkout: Option<&AgentCheckout>) {
-        self.forget_endpoint(agent_id).await;
-        if let Some(checkout) = checkout
-            && let Some(housekeeper) = self.housekeeper()
-        {
-            housekeeper.archived(agent_id, &checkout.root, true).await;
-        }
-    }
-
-    /// An archived agent's checkout: soft reclaim, then hard removal when
-    /// provably lossless and the grace allows; otherwise retained. Never the
-    /// old unconditional pin-and-force-remove (ADR-0014).
-    pub(super) async fn release_checkout(&self, agent_id: &str, root: &std::path::Path) {
-        if let Some(housekeeper) = self.housekeeper() {
-            housekeeper.archived(agent_id, root, false).await;
         }
     }
 

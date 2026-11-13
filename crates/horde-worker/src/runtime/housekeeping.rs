@@ -16,11 +16,9 @@
 //! skipped while the agent has a turn in flight. Hard removal never touches
 //! a live agent's checkout at all, not even forced.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::{
     CheckoutState, CleanupTier, CleanupTrigger, GcLevel, WorkerId, WorkspaceCleanup,
@@ -34,13 +32,6 @@ use crate::workspace::WorkspaceManager;
 use crate::workspace::cleanup::{Pass, tally};
 use crate::workspace::ledger::{LedgerRecord, now_ms};
 use crate::workspace::policy::WorkspacePolicy;
-
-/// Where the Worker's workspace facts go: `ReportWorkspaceInstances` with the
-/// whole set, authoritative.
-#[async_trait]
-pub trait InstanceReporter: Send + Sync {
-    async fn report(&self, reports: Vec<WorkspaceInstanceReport>);
-}
 
 /// A free-space threshold: a share of the filesystem, an absolute size, or
 /// the larger of the two.
@@ -92,100 +83,30 @@ impl Default for HousekeepingConfig {
     }
 }
 
-/// What the Runtime knows about each agent's activity.
-#[derive(Debug, Default)]
-pub struct Activity {
-    agents: Mutex<BTreeMap<String, AgentActivity>>,
+/// The housekeeper over a Runtime's shared state, when it has workspaces.
+pub(super) fn of(shared: &Shared) -> Option<Housekeeper> {
+    shared
+        .workspaces
+        .clone()
+        .map(|workspaces| Housekeeper::new(shared.clone(), workspaces))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct AgentActivity {
-    busy: bool,
-    last_active_ms: i64,
-    /// Soft-reclaimed for idleness since the last turn.
-    idle_reclaimed: bool,
-    /// When `last_active_ms` was last written through to the ledger.
-    written_ms: i64,
-}
-
-impl Activity {
-    /// Records whether the agent has a turn in flight. A turn starting
-    /// resets the idle flag: the next idle period may be reclaimed again.
-    pub fn set_busy(&self, agent_id: &str, busy: bool) {
-        let mut agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = agents.entry(agent_id.to_owned()).or_default();
-        if busy && !entry.busy {
-            entry.idle_reclaimed = false;
-        }
-        if busy || entry.busy {
-            entry.last_active_ms = now_ms();
-        }
-        entry.busy = busy;
-    }
-
-    /// Whether the agent has a turn in flight.
-    #[must_use]
-    pub fn is_busy(&self, agent_id: &str) -> bool {
-        self.agents
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(agent_id)
-            .is_some_and(|agent| agent.busy)
-    }
-
-    /// Forgets an ended agent.
-    pub fn forget(&self, agent_id: &str) {
-        self.agents
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(agent_id);
-    }
-
-    /// `(busy, last active, idle-reclaimed)` for one agent, if seen.
-    fn snapshot(&self, agent_id: &str) -> Option<AgentActivity> {
-        self.agents
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(agent_id)
-            .copied()
-    }
-
-    fn mark_idle_reclaimed(&self, agent_id: &str) {
-        if let Some(agent) = self
-            .agents
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(agent_id)
-        {
-            agent.idle_reclaimed = true;
-        }
-    }
-
-    /// Whether the agent's activity should be written through now (at most
-    /// once a minute), marking it written.
-    fn due_for_write(&self, agent_id: &str) -> Option<i64> {
-        let mut agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
-        let agent = agents.get_mut(agent_id)?;
-        let due = agent.last_active_ms > agent.written_ms
-            && now_ms().saturating_sub(agent.written_ms) >= 60_000;
-        due.then(|| {
-            agent.written_ms = now_ms();
-            agent.last_active_ms
-        })
+/// Gives back what a spawn minted for an agent whose harness never
+/// started: the endpoint token, its `local` MCP children, and the checkout
+/// — nothing ran in it, so it goes at once when lossless (ADR-0014).
+pub(super) async fn abandon_spawn(shared: &Shared, agent_id: &str, root: Option<&std::path::Path>) {
+    shared.forget_endpoint(agent_id).await;
+    if let (Some(root), Some(housekeeper)) = (root, of(shared)) {
+        housekeeper.archived(agent_id, root, true).await;
     }
 }
 
-/// Per-agent checkout locks: one async mutex per agent id.
-#[derive(Debug, Default)]
-pub(super) struct CheckoutLocks {
-    locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl CheckoutLocks {
-    /// The lock of one agent's checkout.
-    pub(super) fn of(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(locks.entry(agent_id.to_owned()).or_default())
+/// An archived agent's checkout: soft reclaim, then hard removal when
+/// provably lossless and the grace allows; otherwise retained. Never the
+/// old unconditional pin-and-force-remove (ADR-0014).
+pub(super) async fn release_checkout(shared: &Shared, agent_id: &str, root: &std::path::Path) {
+    if let Some(housekeeper) = of(shared) {
+        housekeeper.archived(agent_id, root, false).await;
     }
 }
 
@@ -276,10 +197,9 @@ impl Housekeeper {
         let lock = self.shared.checkout_locks.of(agent_id);
         let _held = lock.lock().await;
         self.shared.activity.forget(agent_id);
-        let Some(record) = self
-            .workspaces
-            .mark_archived(&definition_id, agent_id)
-            .await
+        let Some(record) =
+            crate::workspace::cleanup::mark_archived(&self.workspaces, &definition_id, agent_id)
+                .await
         else {
             return;
         };
@@ -293,16 +213,24 @@ impl Housekeeper {
         let mut events = Vec::new();
         if !abandoned {
             events.push(
-                self.workspaces
-                    .soft_reclaim(&definition_id, &record, pass)
-                    .await,
+                crate::workspace::cleanup::soft_reclaim(
+                    &self.workspaces,
+                    &definition_id,
+                    &record,
+                    pass,
+                )
+                .await,
             );
         }
         if abandoned || policy.archived_grace.is_zero() {
-            let (event, _) = self
-                .workspaces
-                .hard_remove(&definition_id, &record, pass, false)
-                .await;
+            let (event, _) = crate::workspace::cleanup::hard_remove(
+                &self.workspaces,
+                &definition_id,
+                &record,
+                pass,
+                false,
+            )
+            .await;
             events.push(event);
         }
         self.journal_cleanups(events).await;
@@ -414,9 +342,13 @@ impl Housekeeper {
             let busy = self.shared.activity.is_busy(&record.agent_id);
             if !busy && record.soft_reclaimed_at_ms.is_none() {
                 events.push(
-                    self.workspaces
-                        .soft_reclaim(definition_id, &record, pass)
-                        .await,
+                    crate::workspace::cleanup::soft_reclaim(
+                        &self.workspaces,
+                        definition_id,
+                        &record,
+                        pass,
+                    )
+                    .await,
                 );
             }
             let removable = match (level, standing) {
@@ -427,19 +359,28 @@ impl Housekeeper {
             };
             if removable {
                 let force = level == GcLevel::Hard && command.force;
-                let (event, _) = self
-                    .workspaces
-                    .hard_remove(definition_id, &record, pass, force)
-                    .await;
+                let (event, _) = crate::workspace::cleanup::hard_remove(
+                    &self.workspaces,
+                    definition_id,
+                    &record,
+                    pass,
+                    force,
+                )
+                .await;
                 events.push(event);
             }
         }
         if level == GcLevel::Hard && command.include_pins {
             let relay = self.shared.relay_repo_url();
             events.extend(
-                self.workspaces
-                    .unpin(definition_id, &relay, pass, command.force)
-                    .await,
+                crate::workspace::cleanup::unpin(
+                    &self.workspaces,
+                    definition_id,
+                    &relay,
+                    pass,
+                    command.force,
+                )
+                .await,
             );
         }
         events
@@ -461,9 +402,15 @@ impl Housekeeper {
             }
         }
         let relay = self.shared.relay_repo_url();
-        self.workspaces
-            .remove_instance(definition_id, &live, &relay, pass, force)
-            .await
+        crate::workspace::cleanup::remove_instance(
+            &self.workspaces,
+            definition_id,
+            &live,
+            &relay,
+            pass,
+            force,
+        )
+        .await
     }
 
     /// One scan pass: idle and orphan reclaim, grace expiry, then disk
@@ -492,17 +439,7 @@ impl Housekeeper {
             Standing::Live => self.scan_live(definition_id, record, &policy).await,
             Standing::Archived => self.scan_archived(definition_id, record, &policy).await,
             Standing::Orphan if !record.orphan_reported => {
-                let pass = Pass {
-                    trigger: CleanupTrigger::Scan,
-                    gc_request_id: "",
-                    dry_run: false,
-                    policy: &policy,
-                };
-                let event = self
-                    .workspaces
-                    .soft_reclaim(definition_id, record, pass)
-                    .await;
-                self.journal_cleanups(vec![event]).await;
+                self.soft(definition_id, record, CleanupTrigger::Scan).await;
                 true
             }
             Standing::Orphan | Standing::Remembered => false,
@@ -519,9 +456,13 @@ impl Housekeeper {
     ) -> bool {
         let activity = &self.shared.activity;
         if let Some(at) = activity.due_for_write(&record.agent_id) {
-            self.workspaces
-                .note_activity(definition_id, &record.agent_id, at)
-                .await;
+            crate::workspace::cleanup::note_activity(
+                &self.workspaces,
+                definition_id,
+                &record.agent_id,
+                at,
+            )
+            .await;
         }
         let Some(after) = policy.idle_reclaim_after else {
             return false;
@@ -551,10 +492,9 @@ impl Housekeeper {
             dry_run: false,
             policy,
         };
-        let event = self
-            .workspaces
-            .soft_reclaim(definition_id, record, pass)
-            .await;
+        let event =
+            crate::workspace::cleanup::soft_reclaim(&self.workspaces, definition_id, record, pass)
+                .await;
         self.journal_cleanups(vec![event]).await;
         true
     }
@@ -581,10 +521,14 @@ impl Housekeeper {
             dry_run: false,
             policy,
         };
-        let (event, removed) = self
-            .workspaces
-            .hard_remove(definition_id, record, pass, false)
-            .await;
+        let (event, removed) = crate::workspace::cleanup::hard_remove(
+            &self.workspaces,
+            definition_id,
+            record,
+            pass,
+            false,
+        )
+        .await;
         let reason_now = self
             .workspaces
             .records(definition_id)
@@ -620,11 +564,7 @@ impl Housekeeper {
         let mut changed = false;
         let candidates = self.pressure_candidates().await;
         for (definition_id, record) in &candidates {
-            if self
-                .workspaces
-                .filesystem()
-                .is_some_and(|(free, _)| free >= high)
-            {
+            if self.relieved(high) {
                 return changed;
             }
             let lock = self.shared.checkout_locks.of(&record.agent_id);
@@ -634,26 +574,12 @@ impl Housekeeper {
             if self.shared.activity.is_busy(&record.agent_id) {
                 continue;
             }
-            let policy = self.policy(definition_id);
-            let pass = Pass {
-                trigger: CleanupTrigger::DiskPressure,
-                gc_request_id: "",
-                dry_run: false,
-                policy: &policy,
-            };
-            let event = self
-                .workspaces
-                .soft_reclaim(definition_id, record, pass)
+            self.soft(definition_id, record, CleanupTrigger::DiskPressure)
                 .await;
-            self.journal_cleanups(vec![event]).await;
             changed = true;
         }
         for (definition_id, record) in self.archived_oldest_first().await {
-            if self
-                .workspaces
-                .filesystem()
-                .is_some_and(|(free, _)| free >= high)
-            {
+            if self.relieved(high) {
                 return changed;
             }
             let lock = self.shared.checkout_locks.of(&record.agent_id);
@@ -667,10 +593,14 @@ impl Housekeeper {
                 dry_run: false,
                 policy: &policy,
             };
-            let (event, removed) = self
-                .workspaces
-                .hard_remove(&definition_id, &record, pass, false)
-                .await;
+            let (event, removed) = crate::workspace::cleanup::hard_remove(
+                &self.workspaces,
+                &definition_id,
+                &record,
+                pass,
+                false,
+            )
+            .await;
             if removed {
                 self.journal_cleanups(vec![event]).await;
                 changed = true;
@@ -723,6 +653,28 @@ impl Housekeeper {
         archived.into_iter().chain(orphans).chain(idle).collect()
     }
 
+    /// Whether free space has reached `high` bytes.
+    fn relieved(&self, high: u64) -> bool {
+        self.workspaces
+            .filesystem()
+            .is_some_and(|(free, _)| free >= high)
+    }
+
+    /// One soft reclaim under `trigger` and its policy, journaled.
+    async fn soft(&self, definition_id: &str, record: &LedgerRecord, trigger: CleanupTrigger) {
+        let policy = self.policy(definition_id);
+        let pass = Pass {
+            trigger,
+            gc_request_id: "",
+            dry_run: false,
+            policy: &policy,
+        };
+        let event =
+            crate::workspace::cleanup::soft_reclaim(&self.workspaces, definition_id, record, pass)
+                .await;
+        self.journal_cleanups(vec![event]).await;
+    }
+
     /// Every archived checkout, oldest archive first: what disk pressure
     /// removes when lossless, after its soft reclaims.
     async fn archived_oldest_first(&self) -> Vec<(String, LedgerRecord)> {
@@ -753,19 +705,24 @@ impl Housekeeper {
                 policy: &policy,
             };
             events.extend(
-                self.workspaces
-                    .unpin(&definition_id, &relay, pass, false)
-                    .await
-                    .into_iter()
-                    .filter(|event| event.tier == i32::from(CleanupTier::Unpin))
-                    .filter(|event| {
-                        event.repos.iter().any(|action| {
-                            action.outcome
-                                == i32::from(
-                                    horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done,
-                                )
-                        })
-                    }),
+                crate::workspace::cleanup::unpin(
+                    &self.workspaces,
+                    &definition_id,
+                    &relay,
+                    pass,
+                    false,
+                )
+                .await
+                .into_iter()
+                .filter(|event| event.tier == i32::from(CleanupTier::Unpin))
+                .filter(|event| {
+                    event.repos.iter().any(|action| {
+                        action.outcome
+                            == i32::from(
+                                horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done,
+                            )
+                    })
+                }),
             );
         }
         let changed = !events.is_empty();
@@ -901,25 +858,6 @@ mod tests {
         assert_eq!(config.disk_high_watermark.basis_points, 1_500);
     }
 
-    /// A turn starting clears the idle flag; ending keeps the time.
-    #[test]
-    fn activity_tracks_turns_and_resets_the_idle_flag() {
-        let activity = Activity::default();
-        assert!(!activity.is_busy("a"));
-        activity.set_busy("a", true);
-        assert!(activity.is_busy("a"));
-        activity.mark_idle_reclaimed("a");
-        activity.set_busy("a", false);
-        let seen = activity.snapshot("a").expect("seen");
-        assert!(!seen.busy && seen.idle_reclaimed && seen.last_active_ms > 0);
-        activity.set_busy("a", true);
-        assert!(!activity.snapshot("a").expect("seen").idle_reclaimed);
-        assert!(activity.due_for_write("a").is_some());
-        assert_eq!(activity.due_for_write("a"), None, "at most once a minute");
-        activity.forget("a");
-        assert!(activity.snapshot("a").is_none());
-    }
-
     #[test]
     fn an_episode_ends_whole() {
         let mut episode = Episode {
@@ -928,17 +866,5 @@ mod tests {
         };
         episode.end();
         assert_eq!(episode, Episode::default());
-    }
-
-    #[tokio::test]
-    async fn one_agent_one_lock() {
-        let locks = CheckoutLocks::default();
-        let first = locks.of("a");
-        let _held = first.lock().await;
-        assert!(
-            locks.of("a").try_lock().is_err(),
-            "the same agent's lock is held"
-        );
-        assert!(locks.of("b").try_lock().is_ok(), "another agent's is not");
     }
 }

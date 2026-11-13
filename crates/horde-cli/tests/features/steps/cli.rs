@@ -123,11 +123,17 @@ async fn eventually_sees_in_replay(world: &mut HordeWorld, needle: String) -> St
         })
         .await?;
 
+    replay_shows(world, &needle).await
+}
+
+/// Replays the session through the real binary and checks `needle` is on
+/// its stdout — the observation a user makes.
+pub(crate) async fn replay_shows(world: &mut HordeWorld, needle: &str) -> StepResult {
     let endpoint = world.endpoint()?.to_owned();
     let session = world.session()?.to_owned();
     world.run_horde(&endpoint, &["sync", &session]).await?;
     let run = world.last_run()?;
-    if !(run.success && run.stdout.contains(&needle)) {
+    if !(run.success && run.stdout.contains(needle)) {
         return Err(format!(
             "the replay does not show {needle:?}: stdout {:?}, stderr {:?}",
             run.stdout, run.stderr
