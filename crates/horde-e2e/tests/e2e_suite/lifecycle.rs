@@ -254,6 +254,69 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
     assert!(status.success());
 }
 
+/// A harness question crosses the whole system and comes back answered
+/// (W12c): the fake harness asks and blocks, the question reaches the log
+/// with its options, a bare `horde approve` is refused (only answers settle a
+/// question), `horde answer` settles it by position and option number, and the
+/// agent receives the canonical answer.
+#[tokio::test]
+async fn a_question_is_asked_and_answered_from_the_cli() {
+    let system = System::launch().await;
+    let mut worker = system
+        .spawn_scripted_worker(
+            "w-1",
+            r#"[{"steps": [
+                {"ask_question": {"id": "q-1", "tool": "AskUserQuestion",
+                                  "questions": [{"id": "colour", "question": "Which colour?",
+                                                 "options": ["Red", "Blue"]}]}},
+                {"say": "answer received"}
+            ], "text": "done"}]"#,
+        )
+        .await;
+
+    let (session_id, root) = system.placed_session("e2e question").await;
+    system.cli_json(&["send", &root, "go"]).await;
+    system
+        .sync_until(&session_id, "the question", |events| {
+            has_kind(events, "permission_requested")
+        })
+        .await;
+
+    let refused = system.cli(&["approve", "q-1"]).await;
+    assert!(
+        !refused.status.success(),
+        "a question cannot be allowed without answers"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("is a question"),
+        "the refusal says what to do: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let answered = system.cli(&["answer", "q-1", "1=2"]).await;
+    assert!(
+        answered.status.success(),
+        "the answer must land: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+
+    let events = system
+        .sync_until(&session_id, "the answered turn", |events| {
+            outputs(events).iter().any(|text| text == "answer received")
+        })
+        .await;
+    assert!(
+        outputs(&events)
+            .iter()
+            .any(|text| text == "answered colour=Blue"),
+        "the agent received the canonical answer, keyed by id and valued by label: {events:?}"
+    );
+
+    worker.terminate().await.expect("SIGTERM sends");
+    let (status, _, _) = worker.wait().await.expect("the worker exits");
+    assert!(status.success());
+}
+
 /// One `horde interrupt` is one request and one acknowledgement, and then
 /// the log is quiet (ADR-0009).
 ///

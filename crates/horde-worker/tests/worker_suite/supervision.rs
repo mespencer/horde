@@ -678,10 +678,9 @@ mod side_effects {
 
     /// Answering a permission request that cannot exist must be an error.
     ///
-    /// Prompts arrive on the MCP endpoint, not on stdout, and that endpoint is
-    /// the next increment. Returning Ok here would let a decision that went
-    /// nowhere look like one that was applied — the failure the permission chain
-    /// cannot tolerate.
+    /// Nothing was prompted, so nothing is outstanding. Returning Ok here
+    /// would let a decision that went nowhere look like one that was applied
+    /// — the failure the permission chain cannot tolerate.
     #[tokio::test]
     async fn answering_a_permission_request_that_cannot_exist_is_an_error() {
         let (mut session, _dir) = session_on(RESULT_ONLY, &[]).await;
@@ -1047,5 +1046,284 @@ mod process_groups {
         assert!(is_gone(orphan).await, "the leftover child is dead");
         assert!(journal.harness_groups().await.expect("readable").is_empty());
         assert_eq!(reap_leftover_groups(&journal).await, 0, "nothing left");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The stdio permission route (W12c): can_use_tool prompts on stdout,
+// answered on stdin, through a real child process.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stdio_prompts {
+    use horde_adapter::{AgentEvent, PermissionDecision, ToolCallId, TurnInput};
+    use serde_json::{Value, json};
+
+    use super::harness::{session_on, within};
+    use crate::support::control_log_reaches;
+
+    const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s1","model":"m","claude_code_version":"2.1.323"}"#;
+
+    fn prompt(request_id: &str, tool: &str, input: &Value) -> String {
+        json!({"type": "control_request", "request_id": request_id, "request": {
+            "subtype": "can_use_tool", "tool_name": tool, "input": input,
+            "tool_use_id": format!("toolu_{request_id}")}})
+        .to_string()
+    }
+
+    fn result(text: &str) -> String {
+        json!({"type": "result", "subtype": "success", "is_error": false,
+               "session_id": "s1", "duration_ms": 1, "result": text})
+        .to_string()
+    }
+
+    /// A one-turn script: the prompt, a stall until Horde answers, the end.
+    fn awaiting(request_id: &str, tool: &str, input: &Value) -> String {
+        [
+            INIT.to_owned(),
+            prompt(request_id, tool, input),
+            "@await-control-response".to_owned(),
+            result("done"),
+        ]
+        .join("\n")
+    }
+
+    /// Events until the first permission request, which is returned.
+    async fn until_requested(
+        session: &mut Box<dyn horde_adapter::AgentSession>,
+    ) -> horde_adapter::ProposedToolCall {
+        within("the prompt surfaces", async {
+            loop {
+                match session.next_event().await {
+                    Ok(Some(AgentEvent::PermissionRequested { request, .. })) => return request,
+                    Ok(Some(_)) => {}
+                    other => panic!("the stream ended before the prompt: {other:?}"),
+                }
+            }
+        })
+        .await
+    }
+
+    /// The control_response the child received, parsed.
+    async fn response_received(log_path: &std::path::Path) -> Value {
+        let recorded =
+            control_log_reaches(log_path, |log| log.contains("control_response")).await;
+        let line = recorded
+            .lines()
+            .find(|line| line.contains("control_response"))
+            .unwrap_or_else(|| panic!("no control_response reached the child: {recorded:?}"));
+        serde_json::from_str(line).expect("the response is JSON")
+    }
+
+    /// A narrowing allow reaches the harness as `updatedInput`, correlated by
+    /// the harness's own request id, and the stalled turn then completes.
+    #[tokio::test]
+    async fn a_narrowed_allow_reaches_the_harness_and_the_turn_completes() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let (mut session, _dir) = session_on(
+            &awaiting("r1", "Write", &json!({"file_path": "/w/x", "content": "ORIGINAL"})),
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        let request = until_requested(&mut session).await;
+        assert_eq!(request.tool_name, "Write");
+        assert_eq!(request.tool_call_id.as_str(), "toolu_r1");
+
+        session
+            .answer_permission(
+                &request.tool_call_id,
+                PermissionDecision::allow_with(json!({"file_path": "/w/x", "content": "SAFE"})),
+            )
+            .await
+            .expect("the prompt is outstanding");
+        let response = response_received(&log_path).await;
+        assert_eq!(response["response"]["subtype"], "success");
+        assert_eq!(response["response"]["request_id"], "r1");
+        assert_eq!(
+            response["response"]["response"],
+            json!({"behavior": "allow", "updatedInput": {"file_path": "/w/x", "content": "SAFE"}})
+        );
+
+        let ended = super::harness::turn_end(&mut session).await;
+        assert!(ended.is_some_and(|outcome| outcome.status.is_completed()));
+        assert!(
+            session
+                .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+                .await
+                .is_err(),
+            "a prompt is answered once"
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// An AskUserQuestion answer reaches the harness keyed by question text.
+    #[tokio::test]
+    async fn an_answer_reaches_the_harness_keyed_by_question_text() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let input = json!({"questions": [{"question": "Colour?", "header": "C",
+            "options": [{"label": "Red", "description": ""}], "multiSelect": false}]});
+        let (mut session, _dir) = session_on(
+            &awaiting("r2", "AskUserQuestion", &input),
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+
+        let request = until_requested(&mut session).await;
+        assert!(request.is_question());
+        assert_eq!(request.questions[0].id, "Colour?");
+
+        session
+            .answer_permission(
+                &request.tool_call_id,
+                PermissionDecision::answer(horde_adapter::Answers::from([(
+                    "Colour?".to_owned(),
+                    vec!["Red".to_owned()],
+                )])),
+            )
+            .await
+            .expect("answers");
+        let response = response_received(&log_path).await;
+        assert_eq!(
+            response["response"]["response"]["updatedInput"]["answers"],
+            json!({"Colour?": "Red"})
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// Answers to a tool that asked nothing are denied with a reason the
+    /// agent reads, and the denial is journaled — never a silent allow.
+    #[tokio::test]
+    async fn answers_to_a_plain_tool_are_denied_and_journaled() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let (mut session, _dir) = session_on(
+            &awaiting("r3", "Bash", &json!({"command": "ls"})),
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        let request = until_requested(&mut session).await;
+
+        session
+            .answer_permission(
+                &request.tool_call_id,
+                PermissionDecision::answer(horde_adapter::Answers::new()),
+            )
+            .await
+            .expect("answered, as a denial");
+        let response = response_received(&log_path).await;
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+        assert!(
+            response["response"]["response"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("asked no question")),
+            "{response}"
+        );
+        let journaled = within("the diagnostic is emitted", async {
+            loop {
+                match session.next_event().await {
+                    Ok(Some(AgentEvent::Output { text, .. })) if text.contains("asked no question") => {
+                        return text;
+                    }
+                    Ok(Some(_)) => {}
+                    other => panic!("no diagnostic before {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(journaled.contains("denied"), "{journaled}");
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// An interrupt answers a parked prompt first (the harness waits on it),
+    /// then sends the interrupt.
+    #[tokio::test]
+    async fn an_interrupt_withdraws_a_parked_prompt_before_interrupting() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let (mut session, _dir) = session_on(
+            &awaiting("r4", "Write", &json!({})),
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        let request = until_requested(&mut session).await;
+
+        session.interrupt().await.expect("interrupts");
+        let recorded = control_log_reaches(&log_path, |log| {
+            log.contains("control_response") && log.contains("\"interrupt\"")
+        })
+        .await;
+        let withdrawn_at = recorded.find("withdrawn: the turn was interrupted");
+        let interrupt_at = recorded.find("\"interrupt\"");
+        assert!(
+            withdrawn_at.is_some() && withdrawn_at < interrupt_at,
+            "the prompt is denied before the interrupt goes out: {recorded:?}"
+        );
+        assert!(
+            session
+                .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+                .await
+                .is_err(),
+            "a withdrawn prompt is no longer answerable"
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// A control subtype Horde does not answer is refused with an error at
+    /// once, and a prompt outside any turn is denied — neither is left
+    /// unanswered for the harness to wait on.
+    #[tokio::test]
+    async fn unanswerable_control_requests_are_refused_not_ignored() {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let script = [
+            json!({"type": "control_request", "request_id": "h1",
+                   "request": {"subtype": "hook_callback"}})
+            .to_string(),
+            "@await-control-response".to_owned(),
+            prompt("early", "Write", &json!({})),
+            "@await-control-response".to_owned(),
+            INIT.to_owned(),
+            result("done"),
+        ]
+        .join("\n");
+        let (mut session, _dir) = session_on(
+            &script,
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        let ended = super::harness::turn_end(&mut session).await;
+        assert!(ended.is_some(), "neither request stalled the turn");
+
+        let recorded = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let responses: Vec<Value> = recorded
+            .lines()
+            .filter(|line| line.contains("control_response"))
+            .map(|line| serde_json::from_str(line).expect("JSON"))
+            .collect();
+        assert_eq!(responses.len(), 2, "{recorded}");
+        assert_eq!(responses[0]["response"]["subtype"], "error");
+        assert_eq!(responses[0]["response"]["request_id"], "h1");
+        assert!(
+            responses[0]["response"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("hook_callback"))
+        );
+        assert_eq!(responses[1]["response"]["request_id"], "early");
+        assert_eq!(responses[1]["response"]["response"]["behavior"], "deny");
+        assert!(
+            session
+                .answer_permission(&ToolCallId::new("toolu_early"), PermissionDecision::allow())
+                .await
+                .is_err()
+        );
+        session.shutdown().await.expect("shuts down");
     }
 }

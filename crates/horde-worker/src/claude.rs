@@ -799,8 +799,8 @@ mod tests {
         );
 
         assert!(
-            joined.contains("--permission-prompt-tool mcp__horde__approve"),
-            "the approve verb is addressed by its namespaced MCP name: {joined}"
+            joined.contains("--permission-prompt-tool stdio"),
+            "prompts ride stdout by default (W12c): {joined}"
         );
         assert!(
             joined.contains(r#"--settings {"permissions":{"allow":[],"deny":[]}}"#),
@@ -884,6 +884,115 @@ mod tests {
             .join(" ");
         assert!(joined.contains("--permission-prompt-tool mcp__custom__gate"));
         assert!(!joined.contains("mcp__horde__approve"));
+    }
+
+    /// The route follows the probed version: an adapter whose binary was
+    /// measured only on the MCP route keeps it, and addresses the approve
+    /// verb by its namespaced MCP name.
+    #[test]
+    fn a_pre_stdio_version_keeps_the_mcp_approve_route() {
+        let scratch = scratch();
+        let mut adapter = adapter_in(&scratch);
+        adapter.version = horde_adapter_claude::version::SUPPORT.classify("2.1.228 (Claude Code)");
+        adapter.permission_route =
+            horde_adapter_claude::version::PermissionRoute::for_version(&adapter.version);
+        let joined = adapter
+            .harness_spec(&endpoint_spec("t"), Vec::new())
+            .expect("a launch")
+            .args
+            .join(" ");
+        assert!(
+            joined.contains("--permission-prompt-tool mcp__horde__approve"),
+            "{joined}"
+        );
+        assert!(joined.contains("--permission-mode manual"), "{joined}");
+    }
+
+    /// A refused binary never starts: the spawn fails as a refusal naming
+    /// the version and the floor, before any process exists.
+    #[tokio::test]
+    async fn a_refused_version_refuses_the_spawn() {
+        let scratch = scratch();
+        let mut adapter = adapter_in(&scratch).with_program("/nonexistent/horde-test-claude");
+        adapter.version = horde_adapter_claude::version::SUPPORT.classify("2.0.1 (Claude Code)");
+        let Err(error) = adapter.spawn(&AgentSpec::default()).await else {
+            panic!("a refused version must not spawn");
+        };
+        match error {
+            horde_adapter::AdapterError::RefusedVersion { provider, detail } => {
+                assert_eq!(provider, "claude");
+                assert!(detail.contains("2.0.1") && detail.contains("2.1.226"), "{detail}");
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
+        assert_eq!(adapter.harness_version(), Some(&adapter.version));
+    }
+
+    /// The probe keeps the adapter it was called on, fails closed on a
+    /// missing binary, and picks the stdio route for an unreadable version.
+    #[tokio::test]
+    async fn the_probe_records_its_verdict_and_route_on_this_adapter() {
+        let scratch = scratch();
+        let mut adapter = adapter_in(&scratch).with_program("/nonexistent/horde-test-claude");
+        adapter.permission_route = horde_adapter_claude::version::PermissionRoute::McpTool;
+        adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
+        let probed = adapter.probe_version().await;
+        assert_eq!(probed.program, "/nonexistent/horde-test-claude");
+        assert_eq!(probed.extra_env, vec![("MARKER".to_owned(), "kept".to_owned())]);
+        assert_eq!(probed.version.verdict, horde_adapter::SupportVerdict::Untested);
+        assert!(probed.version.raw.contains("could not run"), "{}", probed.version.raw);
+        assert_eq!(
+            probed.permission_route,
+            horde_adapter_claude::version::PermissionRoute::Stdio
+        );
+    }
+
+    /// What a launch journals on its first turn: a warning only when the
+    /// version is not supported, and the route only when a chain is wired.
+    #[test]
+    fn launch_diagnostics_name_the_warning_and_the_route() {
+        let table = horde_adapter_claude::version::SUPPORT;
+        let supported = table.classify("2.1.300");
+        assert_eq!(
+            super::launch_diagnostics(&supported, Some("stdio")),
+            vec!["claude permission prompts: stdio control requests".to_owned()]
+        );
+        assert_eq!(
+            super::launch_diagnostics(&supported, Some("mcp__horde__approve")),
+            vec!["claude permission prompts: MCP tool mcp__horde__approve".to_owned()]
+        );
+        assert!(super::launch_diagnostics(&supported, None).is_empty());
+
+        let newer = super::launch_diagnostics(&table.classify("2.1.400"), None);
+        assert_eq!(newer.len(), 1);
+        assert!(newer[0].starts_with("harness version warning: claude 2.1.400 is untested"));
+    }
+
+    /// The refusals a control request gets when Horde has no decision.
+    #[test]
+    fn refusals_answer_every_control_request() {
+        use horde_adapter_claude::wire::{ControlRequest, ControlRequestKind};
+
+        let other = super::refusal_for(&ControlRequest {
+            request_id: "h1".to_owned(),
+            request: ControlRequestKind::Other {
+                subtype: "hook_callback".to_owned(),
+            },
+        });
+        let other: serde_json::Value = serde_json::from_str(&other).expect("JSON");
+        assert_eq!(other["response"]["subtype"], "error");
+        assert_eq!(other["response"]["request_id"], "h1");
+
+        let stray = super::refusal_for(&ControlRequest {
+            request_id: "p1".to_owned(),
+            request: ControlRequestKind::CanUseTool(Box::new(
+                serde_json::from_value(serde_json::json!({"tool_name": "Write"}))
+                    .expect("parses"),
+            )),
+        });
+        let stray: serde_json::Value = serde_json::from_str(&stray).expect("JSON");
+        assert_eq!(stray["response"]["subtype"], "success");
+        assert_eq!(stray["response"]["response"]["behavior"], "deny");
     }
 
     /// Both directions of the stderr distinction: a silent death reports no

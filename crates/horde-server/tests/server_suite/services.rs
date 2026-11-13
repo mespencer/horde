@@ -542,7 +542,29 @@ async fn a_worker_that_lost_its_journal_is_refused_over_the_wire() {
 }
 
 /// A permission request, journaled by the worker the way a real one arrives.
+/// An id starting `q-` asks one question (`colour`: Red or Blue) — the shape
+/// a harness question reaches the Server in (W12c).
 fn permission_requested(agent: &str, request_id: &str) -> Event {
+    let tool_call = request_id.starts_with("q-").then(|| horde_proto::v1::ProposedToolCall {
+        tool_name: "AskUserQuestion".to_owned(),
+        input: Some(horde_proto::prost_types::Struct::default()),
+        rendered: "AskUserQuestion".to_owned(),
+        questions: vec![horde_proto::v1::Question {
+            id: "colour".to_owned(),
+            header: "Colour".to_owned(),
+            question: "Which colour?".to_owned(),
+            options: ["Red", "Blue"]
+                .into_iter()
+                .map(|label| horde_proto::v1::QuestionOption {
+                    label: label.to_owned(),
+                    description: String::new(),
+                })
+                .collect(),
+            multi_select: false,
+            allows_free_text: false,
+            secret: false,
+        }],
+    });
     Event {
         agent_id: Some(AgentId::new(agent)),
         occurred_at: None,
@@ -552,6 +574,7 @@ fn permission_requested(agent: &str, request_id: &str) -> Event {
                 request: Some(horde_proto::v1::PermissionRequest {
                     request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
                     agent_id: Some(AgentId::new(agent)),
+                    tool_call,
                     ..horde_proto::v1::PermissionRequest::default()
                 }),
             },
@@ -685,6 +708,134 @@ async fn a_narrowing_is_accepted_with_allow_and_refused_with_deny() {
     .expect_err("a narrowing alongside DENY must be refused");
     assert_eq!(refused.code(), Code::InvalidArgument);
     assert!(refused.message().contains("ALLOW"));
+}
+
+/// Answers a pending question with raw `(key, values)` pairs.
+async fn answer_question(
+    harness: &mut Harness,
+    request_id: &str,
+    outcome: PermissionOutcome,
+    remember: bool,
+    answers: &[(&str, &[&str])],
+) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
+    harness
+        .control
+        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
+            request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+            outcome: outcome as i32,
+            reason: String::new(),
+            remember_for_session: remember,
+            updated_input: None,
+            answers: answers
+                .iter()
+                .map(|(key, values)| {
+                    (
+                        (*key).to_owned(),
+                        horde_proto::v1::Answer {
+                            values: values.iter().map(|v| (*v).to_owned()).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// A question is settled by answers or a denial and nothing else, answers
+/// settle nothing but a question, and what is journaled is canonical: the
+/// question's own id and the option's own label, however the human typed
+/// them (W12c).
+#[tokio::test]
+async fn a_question_takes_canonical_answers_and_refuses_everything_else() {
+    let mut harness = harness_with_pending_permissions(&["q-1", "q-2", "plain"])
+        .await
+        .expect("pending permissions must be arrangeable");
+
+    let refuse = |status: tonic::Status, needle: &str| {
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains(needle), "{status:?}");
+    };
+    refuse(
+        answer_permission(&mut harness, "q-1", "", PermissionOutcome::Allow, None)
+            .await
+            .expect_err("an allow without answers is refused"),
+        "is a question",
+    );
+    refuse(
+        answer_question(&mut harness, "plain", PermissionOutcome::Allow, false, &[("1", &["x"])])
+            .await
+            .expect_err("answers to a plain call are refused"),
+        "asked no question",
+    );
+    refuse(
+        answer_question(&mut harness, "q-1", PermissionOutcome::Deny, false, &[("1", &["Red"])])
+            .await
+            .expect_err("answers on a denial are refused"),
+        "ALLOW",
+    );
+    refuse(
+        answer_question(&mut harness, "q-1", PermissionOutcome::Allow, true, &[("1", &["Red"])])
+            .await
+            .expect_err("a remembered answer is refused"),
+        "remember_for_session",
+    );
+    refuse(
+        answer_question(&mut harness, "q-1", PermissionOutcome::Allow, false, &[("1", &["Green"])])
+            .await
+            .expect_err("a value outside closed options is refused"),
+        "\"Red\", \"Blue\"",
+    );
+
+    answer_question(&mut harness, "q-1", PermissionOutcome::Allow, false, &[("1", &["2"])])
+        .await
+        .expect("position and option number resolve");
+    answer_permission(&mut harness, "q-2", "not now", PermissionOutcome::Deny, None)
+        .await
+        .expect("a question may be denied without answers");
+
+    let session_id = harness_session_id(&mut harness).await;
+    let mut stream = open_sync(&mut harness.control, &session_id, 0, false)
+        .await
+        .expect("the session syncs");
+    let mut journaled = None;
+    while let Some(message) = stream.next().await {
+        if let Some(sync_events_response::Update::Batch(batch)) =
+            message.expect("the sync is healthy").update
+        {
+            for envelope in batch.events {
+                if let Some(Kind::PermissionDecided(decided)) =
+                    envelope.event.and_then(|event| event.kind)
+                    && let Some(decision) = decided.decision
+                    && decision.request_id.as_ref().map(ToString::to_string).as_deref()
+                        == Some("q-1")
+                {
+                    journaled = Some(decision.answers);
+                }
+            }
+        }
+    }
+    let answers = journaled.expect("the answer is journaled");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(
+        answers.get("colour").map(|answer| answer.values.clone()),
+        Some(vec!["Blue".to_owned()]),
+        "keyed by the question's id, valued by the option's label"
+    );
+}
+
+/// The one session `harness_with_pending_permissions` seeded.
+async fn harness_session_id(harness: &mut Harness) -> String {
+    harness
+        .control
+        .list_sessions(horde_proto::v1::ListSessionsRequest::default())
+        .await
+        .expect("sessions list")
+        .into_inner()
+        .sessions
+        .into_iter()
+        .find_map(|session| session.session_id.map(|id| id.to_string()))
+        .expect("one session")
 }
 
 #[tokio::test]
