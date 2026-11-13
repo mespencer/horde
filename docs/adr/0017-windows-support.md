@@ -114,7 +114,13 @@ pseudoconsole closes, never when its child exits, and the relay ends a
 login on output EOF. On Windows the master side is shared with the reaping
 wait, which closes the pseudoconsole as soon as the child is reaped; the
 reader then sees EOF and the relay's existing exit path runs. Resizes after
-that are no-ops. The client side (`horde worker login` in a Windows
+that are no-ops. portable-pty opens the pseudoconsole with
+`PSEUDOCONSOLE_INHERIT_CURSOR`, so a session's first output is a
+cursor-position query (`ESC[6n`) and the command does not progress until
+the answer (`ESC[row;colR`) arrives on its input: the relay carries the
+query to the client's terminal and the terminal's answer back, like any
+other bytes. A reader that is not a terminal must answer it itself, as the
+ConPTY tests do. The client side (`horde worker login` in a Windows
 terminal) has no SIGWINCH, so it polls the console size twice a second and
 sends each change.
 

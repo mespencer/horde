@@ -924,6 +924,27 @@ mod tests {
         let _code = within("kill and reap", super::kill_and_reap(&mut session)).await;
     }
 
+    /// Reads a ConPTY session to EOF the way the client's terminal would:
+    /// answering each cursor-position query. portable-pty opens the
+    /// pseudoconsole with `PSEUDOCONSOLE_INHERIT_CURSOR`, so before the
+    /// command makes progress conhost writes `ESC[6n` and waits for the
+    /// `ESC[row;colR` a real terminal sends back through the relayed input;
+    /// a reader that never answers sees the session stall, not end.
+    #[cfg(windows)]
+    async fn drain_as_a_terminal_would(session: &mut super::PtySession) -> String {
+        let mut seen = String::new();
+        let mut answered = 0;
+        while let Some(chunk) = session.output.recv().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            let asked = seen.matches("\u{1b}[6n").count();
+            for _ in answered..asked {
+                let _ = session.input.send(b"\x1b[1;1R".to_vec());
+            }
+            answered = asked;
+        }
+        seen
+    }
+
     /// A ConPTY session reaches EOF once its command exits: the reaping wait
     /// closes the pseudoconsole, without which a ConPTY's output never ends
     /// (ADR-0017) — and the code is the command's own.
@@ -952,12 +973,10 @@ mod tests {
         )
         .expect("cmd spawns in a ConPTY");
 
-        let mut seen = String::new();
-        within("the output reaches EOF", async {
-            while let Some(chunk) = session.output.recv().await {
-                seen.push_str(&String::from_utf8_lossy(&chunk));
-            }
-        })
+        let seen = within(
+            "the output reaches EOF",
+            drain_as_a_terminal_would(&mut session),
+        )
         .await;
         assert!(seen.contains("hello default"), "{seen:?}");
         let code = within("the reap returns", &mut session.reaped)
