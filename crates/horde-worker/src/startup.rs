@@ -599,12 +599,42 @@ async fn build_runtime(
     }
 
     if let Some(root) = &config.workspace_root {
-        runtime = runtime.with_workspaces(crate::WorkspaceManager::new(name, root.clone()));
+        runtime = runtime
+            .with_workspaces(crate::WorkspaceManager::new(name, root.clone()))
+            .with_housekeeping(config.housekeeping)
+            .with_instance_reporter(Arc::new(GrpcInstanceReporter {
+                channel: server_channel(server, identity)?,
+                worker_id: name.to_owned(),
+            }));
     }
     if let Some(relay) = &config.relay {
         runtime = runtime.with_relay(horde_relay::RelayLocation::new(relay));
     }
     Ok(runtime)
+}
+
+/// Reports the Instance set over the Worker's channel:
+/// `ReportWorkspaceInstances`, authoritative (ADR-0014). Best effort — a
+/// report that cannot be delivered is corrected by the next one.
+struct GrpcInstanceReporter {
+    channel: tonic::transport::Channel,
+    worker_id: String,
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::InstanceReporter for GrpcInstanceReporter {
+    async fn report(&self, reports: Vec<horde_proto::v1::WorkspaceInstanceReport>) {
+        let mut client =
+            horde_proto::v1::worker_service_client::WorkerServiceClient::new(self.channel.clone());
+        let request = horde_proto::v1::ReportWorkspaceInstancesRequest {
+            worker_id: Some(horde_proto::v1::WorkerId::new(self.worker_id.clone())),
+            reports,
+            authoritative: true,
+        };
+        if let Err(error) = client.report_workspace_instances(request).await {
+            tracing::debug!(%error, "the instance report did not reach the server");
+        }
+    }
 }
 
 /// The Worker-owned harness profile one provider's adapter launches under
@@ -686,8 +716,16 @@ async fn fresh_dial_config(
         Some(workspaces) => Some(workspaces.warm_instances().await),
         None => None,
     };
+    let filesystem = prepared
+        .runtime
+        .workspaces()
+        .and_then(crate::WorkspaceManager::filesystem);
     let mut advertised =
         capabilities::advertise(prepared.runtime.adapters(), warm, &prepared.declared);
+    if let Some((free, total)) = filesystem {
+        advertised.workspace_free_bytes = free;
+        advertised.workspace_total_bytes = total;
+    }
     advertised.provider_accounts = logins.held_accounts();
     DialConfig {
         endpoint: prepared.server.clone(),

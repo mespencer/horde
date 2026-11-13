@@ -96,6 +96,56 @@ impl ShareBroker {
         self.lock().get(agent_id).cloned()
     }
 
+    /// Every Agent with a registered checkout.
+    #[must_use]
+    pub fn agents(&self) -> Vec<String> {
+        self.lock().keys().cloned().collect()
+    }
+
+    /// Adds one repo to a registered Agent's checked-out set — what a
+    /// `workspace_checkout` makes stampable and dirty-checkable (ADR-0014).
+    /// Returns whether the Agent was registered.
+    pub fn add_repo(&self, agent_id: &str, repo_name: &str, relative: PathBuf) -> bool {
+        let mut checkouts = self.lock();
+        let Some(checkout) = checkouts.get_mut(agent_id) else {
+            return false;
+        };
+        if !checkout.repos.iter().any(|(name, _)| name == repo_name) {
+            checkout.repos.push((repo_name.to_owned(), relative));
+        }
+        true
+    }
+
+    /// The Relay this broker shares through, if any.
+    #[must_use]
+    pub fn relay(&self) -> Option<&RelayLocation> {
+        self.relay.as_ref()
+    }
+
+    /// Makes a commit present in an Instance repo rather than an Agent's
+    /// checkout: already there, then a peer checkout of the same repo on
+    /// this Worker, then the Relay. What a lazy receiver's payload and a
+    /// `PARENT` base missing after the fetch resolve through (ADR-0014).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Share`] when no route can deliver the commit,
+    /// including `NoRelay` when it is nowhere here and no Relay is set.
+    pub async fn obtain_into(
+        &self,
+        instance_repo: &std::path::Path,
+        repo_name: &str,
+        commit_sha: &str,
+    ) -> Result<(), WorkerError> {
+        let git_ref = GitRef {
+            repo_name: repo_name.to_owned(),
+            commit_sha: commit_sha.to_owned(),
+            branch: String::new(),
+        };
+        // No agent is excluded: every peer is a candidate source.
+        self.obtain_one("", &git_ref, instance_repo).await
+    }
+
     /// Every other Agent's path for `repo_name` — the peer candidates a
     /// receiver may fetch from without leaving this Worker.
     fn peer_paths(&self, repo_name: &str, excluding_agent: &str) -> Vec<PathBuf> {
@@ -249,6 +299,20 @@ impl ShareBroker {
         };
         obtain_share(receiver, &route, self.relay.as_ref(), &git_ref.commit_sha).await?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::workspace::base::CommitSource for ShareBroker {
+    async fn obtain_into(
+        &self,
+        instance_repo: &std::path::Path,
+        repo_name: &str,
+        sha: &str,
+    ) -> Result<(), String> {
+        ShareBroker::obtain_into(self, instance_repo, repo_name, sha)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 

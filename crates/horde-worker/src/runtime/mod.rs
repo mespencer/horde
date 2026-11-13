@@ -33,6 +33,8 @@
 //! `PermissionDecided` when they happened, and a second copy from the Worker
 //! would double every one of them in every client.
 
+mod access;
+mod housekeeping;
 mod lane;
 mod pump;
 mod shape;
@@ -53,6 +55,7 @@ use crate::client::ApplyCommand;
 use crate::error::WorkerError;
 use crate::journal::{CommandApplication, Journal};
 use crate::share::{ShareBroker, StampingSink};
+pub use housekeeping::{Activity, HousekeepingConfig, InstanceReporter, Watermark};
 use lane::{LaneHandle, LaneMessage, Ledger, lane_key, spawn_lane, workspace_lane};
 use shared::{Shared, workspace_of};
 
@@ -66,6 +69,10 @@ pub struct Runtime {
     reaped: usize,
     /// Whether the inbox left by a previous run has been replayed yet.
     replayed: bool,
+    /// The scan loop's settings, when workspaces are enabled.
+    housekeeping: HousekeepingConfig,
+    /// The running scan loop, started with the first command.
+    scan: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -87,7 +94,64 @@ impl Runtime {
             ledger: Ledger::new(),
             reaped: 0,
             replayed: false,
+            housekeeping: HousekeepingConfig::default(),
+            scan: None,
         }
+    }
+
+    /// Where the Instance set is reported after every materialize, cleanup
+    /// and scan that changed anything (ADR-0014).
+    #[must_use]
+    pub fn with_instance_reporter(mut self, reporter: Arc<dyn InstanceReporter>) -> Self {
+        self.shared.reporter = Some(reporter);
+        self
+    }
+
+    /// The workspace scan's machine-local settings.
+    #[must_use]
+    pub fn with_housekeeping(mut self, config: HousekeepingConfig) -> Self {
+        self.housekeeping = config;
+        self
+    }
+
+    /// Wires what needs the whole Runtime built: the endpoint's workspace
+    /// verbs and the scan loop. Idempotent; run before the first command.
+    fn finalize(&mut self) {
+        if self.scan.is_some() {
+            return;
+        }
+        let Some(housekeeper) = self.shared.housekeeper() else {
+            return;
+        };
+        if let Some(endpoints) = &self.shared.endpoints {
+            endpoints.set_workspace_access(Arc::new(access::WorkerWorkspaceAccess {
+                shared: self.shared.clone(),
+            }));
+        }
+        self.scan = Some(tokio::spawn(housekeeping::run(
+            housekeeper,
+            self.housekeeping,
+        )));
+    }
+
+    /// Runs one workspace scan now — what the scan loop does every
+    /// interval — returning whether it changed anything. For tests and
+    /// operators who will not wait a minute.
+    pub async fn scan_workspaces(&self) -> bool {
+        let Some(housekeeper) = self.shared.housekeeper() else {
+            return false;
+        };
+        let mut episode = housekeeping::Episode::default();
+        let changed = housekeeper.scan(&self.housekeeping, &mut episode).await;
+        housekeeper.report().await;
+        changed
+    }
+
+    /// Which agents have a turn in flight — the busy signal soft reclaim
+    /// waits on.
+    #[must_use]
+    pub fn activity(&self) -> Arc<Activity> {
+        Arc::clone(&self.shared.activity)
     }
 
     /// Enables the per-agent MCP endpoint (DESIGN §5): every spawned or
@@ -199,6 +263,7 @@ impl Runtime {
         if self.replayed {
             return Ok(0);
         }
+        self.finalize();
         let entries = self.shared.journal.replay_inbox().await?;
         self.replayed = true;
         let replayed = entries.len();
@@ -217,6 +282,9 @@ impl Runtime {
     /// "shutdown finished" and "shutdown actually reaped the agents" are
     /// different facts, and only the second one is evidence.
     pub async fn shutdown(mut self) -> usize {
+        if let Some(scan) = self.scan.take() {
+            scan.abort();
+        }
         if let Some(endpoints) = &self.shared.endpoints {
             endpoints.shutdown().await;
         }

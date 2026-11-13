@@ -93,9 +93,14 @@ pub(super) async fn pump(
     journal: Journal,
     context: AgentContext,
     mut control: mpsc::Receiver<AgentControl>,
+    activity: std::sync::Arc<super::housekeeping::Activity>,
 ) -> PumpExit {
+    let agent_id = context.agent_id.clone();
     let mut pump = Pump::new(session, journal, context);
     loop {
+        // Whether a turn is in flight: what keeps a soft reclaim out from
+        // under a working agent, and dates its idleness (ADR-0014).
+        activity.set_busy(&agent_id, pump.state != PumpState::Idle);
         let step = if pump.state == PumpState::Streaming {
             tokio::select! {
                 // Biased toward control so a shutdown or interrupt is never
