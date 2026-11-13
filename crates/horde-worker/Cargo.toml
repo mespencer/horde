@@ -19,6 +19,9 @@ horde-adapter = { workspace = true }
 # daemon, not only a test double: `horde-worker --adapter fake` is what lets
 # the end-to-end suite run this binary for real without a provider login.
 horde-adapter-fake = { workspace = true }
+# The worker's config file (ADR-0016): the strict reader and provenance
+# every role shares.
+horde-config = { workspace = true }
 horde-identity = { workspace = true }
 # The per-agent MCP endpoint (DESIGN §5, ADR-0004): the Worker stands one up
 # per Session, mints each agent's token, and supplies the journal sink and
@@ -55,6 +58,8 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.19"
+# The config file's parser (ADR-0016); the walk over it is horde-config's.
+toml = "1.2.1"
 tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
