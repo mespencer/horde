@@ -3,7 +3,8 @@
 //! Horde treats every provider the same way: a supervised child process with a
 //! wire protocol (DESIGN.md §4). This crate is the shape of that treatment —
 //! one trait pair plus the domain vocabulary each harness is normalized into.
-//! It holds no I/O and knows about no particular provider, so the rules it
+//! It holds no I/O — save the opt-in `probe` feature's one bounded
+//! `--version` run — and knows about no particular provider, so the rules it
 //! states are enforceable against all of them.
 //!
 //! # The seam in one paragraph

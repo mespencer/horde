@@ -398,6 +398,41 @@ impl ExecApprovalRequest {
     }
 }
 
+/// The thread, turn and item a 0.167 server request names — the header every
+/// item-scoped request shares.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RequestScope {
+    #[serde(rename = "threadId", default)]
+    pub thread_id: Option<String>,
+    #[serde(rename = "turnId", default)]
+    pub turn_id: Option<String>,
+    #[serde(rename = "itemId", default)]
+    pub item_id: Option<String>,
+}
+
+/// A server request whose params carry a [`RequestScope`].
+pub trait Scoped {
+    fn scope(&self) -> &RequestScope;
+}
+
+impl Scoped for FileChangeApprovalRequest {
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
+
+impl Scoped for PermissionsApprovalRequest {
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
+
+impl Scoped for UserInputRequest {
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
+
 /// The method file-change approvals arrive on (0.167, transcripts 36–37).
 ///
 /// At 0.148 this request was never sent — the thread parked at
@@ -410,12 +445,9 @@ pub const FILE_CHANGE_APPROVAL_METHOD: &str = "item/fileChange/requestApproval";
 /// which is why the assembler joins the two by item id.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FileChangeApprovalRequest {
-    #[serde(rename = "threadId", default)]
-    pub thread_id: Option<String>,
-    #[serde(rename = "turnId", default)]
-    pub turn_id: Option<String>,
-    #[serde(rename = "itemId", default)]
-    pub item_id: Option<String>,
+    /// Which thread, turn and item the request belongs to.
+    #[serde(flatten)]
+    pub scope: RequestScope,
     #[serde(default)]
     pub reason: Option<String>,
     /// A root codex asks to be granted write access under for the session.
@@ -433,12 +465,9 @@ pub const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval"
 /// empty profile grants nothing, which is how a refusal is spelled.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PermissionsApprovalRequest {
-    #[serde(rename = "threadId", default)]
-    pub thread_id: Option<String>,
-    #[serde(rename = "turnId", default)]
-    pub turn_id: Option<String>,
-    #[serde(rename = "itemId", default)]
-    pub item_id: Option<String>,
+    /// Which thread, turn and item the request belongs to.
+    #[serde(flatten)]
+    pub scope: RequestScope,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -457,12 +486,9 @@ pub const USER_INPUT_METHOD: &str = "item/tool/requestUserInput";
 /// `item/tool/requestUserInput`: questions with options, answered by id.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UserInputRequest {
-    #[serde(rename = "threadId", default)]
-    pub thread_id: Option<String>,
-    #[serde(rename = "turnId", default)]
-    pub turn_id: Option<String>,
-    #[serde(rename = "itemId", default)]
-    pub item_id: Option<String>,
+    /// Which thread, turn and item the request belongs to.
+    #[serde(flatten)]
+    pub scope: RequestScope,
     #[serde(default)]
     pub questions: Vec<UserInputQuestion>,
 }

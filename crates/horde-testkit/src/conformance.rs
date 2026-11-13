@@ -164,6 +164,18 @@ pub async fn check_session(
     check_session_with(session, messages, &|_| allow_all()).await
 }
 
+/// Drives a replayed recording through its `turns` turns — one placeholder
+/// message per recorded turn, since a recording's reply does not depend on
+/// what was sent — under an explicit permission policy.
+pub async fn check_recording(
+    session: &mut dyn AgentSession,
+    turns: usize,
+    policy: Policy<'_>,
+) -> Result<Vec<TurnRecord>, ConformanceFailure> {
+    let messages = vec!["replayed"; turns];
+    check_session_with(session, &messages, policy).await
+}
+
 /// Drives a session through `messages` under an explicit permission policy.
 pub async fn check_session_with(
     session: &mut dyn AgentSession,
@@ -791,6 +803,27 @@ mod tests {
         );
         assert_eq!(records[0].outcome.turn_id.as_str(), "t1");
         assert_eq!(records[1].outcome.turn_id.as_str(), "t2");
+    }
+
+    /// A recording is driven one turn per recorded turn, and its checks run.
+    #[tokio::test]
+    async fn check_recording_drives_every_recorded_turn() {
+        let mut session = ScriptedSession::new(vec![
+            conformant_events("t1", "s1"),
+            conformant_events("t2", "s1"),
+        ]);
+        let records = super::check_recording(&mut session, 2, &|_| super::allow_all())
+            .await
+            .expect("a conformant recording must pass");
+        assert_eq!(records.len(), 2);
+
+        let mut anonymous = ScriptedSession::anonymous(vec![conformant_events("t1", "s1")]);
+        assert!(
+            super::check_recording(&mut anonymous, 1, &|_| super::allow_all())
+                .await
+                .is_err(),
+            "the session checks run on a recording too"
+        );
     }
 
     #[tokio::test]

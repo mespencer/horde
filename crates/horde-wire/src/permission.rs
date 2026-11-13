@@ -243,25 +243,34 @@ pub fn questions_to_wire(questions: &[Question]) -> Vec<WireQuestion> {
 /// Wire questions → domain, field for field — what a client renders.
 #[must_use]
 pub fn questions_from_wire(questions: &[WireQuestion]) -> Vec<Question> {
-    questions
-        .iter()
-        .map(|question| Question {
-            id: question.id.clone(),
-            header: question.header.clone(),
-            question: question.question.clone(),
-            options: question
-                .options
-                .iter()
-                .map(|option| QuestionOption {
-                    label: option.label.clone(),
-                    description: option.description.clone(),
-                })
-                .collect(),
-            multi_select: question.multi_select,
-            allows_free_text: question.allows_free_text,
-            secret: question.secret,
-        })
-        .collect()
+    questions.iter().map(question_from_wire).collect()
+}
+
+fn question_from_wire(wire: &WireQuestion) -> Question {
+    let WireQuestion {
+        id,
+        header,
+        question,
+        options,
+        multi_select,
+        allows_free_text,
+        secret,
+    } = wire;
+    Question {
+        id: id.clone(),
+        header: header.clone(),
+        question: question.clone(),
+        options: options
+            .iter()
+            .map(|WireQuestionOption { label, description }| QuestionOption {
+                label: label.clone(),
+                description: description.clone(),
+            })
+            .collect(),
+        multi_select: *multi_select,
+        allows_free_text: *allows_free_text,
+        secret: *secret,
+    }
 }
 
 /// Domain answers → the wire map.

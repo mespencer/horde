@@ -477,9 +477,9 @@ async fn checked_replay(
     horde_testkit::conformance::ConformanceFailure,
 > {
     let turns = codex_turns(name);
-    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
+    let count = turns.len();
     let mut session = replay_session(turns);
-    horde_testkit::conformance::check_session_with(&mut session, &messages, policy).await
+    horde_testkit::conformance::check_recording(&mut session, count, policy).await
 }
 
 /// Transcript 18 — the decline path: the call fails without a byte reaching

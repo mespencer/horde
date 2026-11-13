@@ -9,7 +9,7 @@ use horde_adapter::{AgentEvent, AgentSession, OutputChannel, TurnInput, TurnStat
 use horde_adapter_claude::codec::decode_line;
 use horde_adapter_claude::replay::replay as replay_session;
 use horde_adapter_claude::wire::Event;
-use horde_testkit::conformance::{TurnRecord, check_session};
+use horde_testkit::conformance::TurnRecord;
 use horde_testkit::transcripts::{Transcript, all_transcript_names};
 
 /// Loads a transcript, reporting the file name alongside any failure.
@@ -23,13 +23,7 @@ fn load(name: &str) -> Result<Transcript, String> {
 
 /// Replays a whole transcript and returns one record per recorded turn.
 async fn replay(name: &str) -> Result<Vec<TurnRecord>, String> {
-    let turns = load(name)?.turns();
-    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
-    let mut session = replay_session(turns);
-
-    check_session(&mut session, &messages)
-        .await
-        .map_err(|error| format!("transcript {name} violated the adapter contract: {error}"))
+    replay_with(name, &|_| horde_testkit::conformance::allow_all()).await
 }
 
 #[test]
@@ -347,9 +341,8 @@ async fn replay_with(
     policy: horde_testkit::conformance::Policy<'_>,
 ) -> Result<Vec<TurnRecord>, String> {
     let turns = load(name)?.turns();
-    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
-    let mut session = replay_session(turns);
-    horde_testkit::conformance::check_session_with(&mut session, &messages, policy)
+    let mut session = replay_session(turns.clone());
+    horde_testkit::conformance::check_recording(&mut session, turns.len(), policy)
         .await
         .map_err(|error| format!("transcript {name} violated the adapter contract: {error}"))
 }

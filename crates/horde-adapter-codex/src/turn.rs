@@ -452,6 +452,22 @@ impl TurnAssembler {
         }
     }
 
+    /// The prelude every item-scoped request shares: its params parsed, the
+    /// turn it belongs to, and the tool-call identity it surfaces under.
+    /// `None` when the params do not parse or no turn can own the request —
+    /// the caller refuses it.
+    fn scoped_request<T: serde::de::DeserializeOwned + crate::wire::Scoped>(
+        &self,
+        params: &serde_json::Value,
+        prefix: &str,
+        rpc_id: u64,
+    ) -> Option<(T, TurnId, ToolCallId)> {
+        let request = serde_json::from_value::<T>(params.clone()).ok()?;
+        let turn_id = self.turn_for(request.scope().turn_id.as_deref())?;
+        let tool_call_id = Self::item_identity(request.scope().item_id.as_ref(), prefix, rpc_id);
+        Some((request, turn_id, tool_call_id))
+    }
+
     /// A file-change approval (0.167): the patch, joined from the started
     /// `fileChange` item, surfaced under [`FILE_CHANGE_TOOL_NAME`] so rules
     /// can match the paths it touches.
@@ -460,15 +476,11 @@ impl TurnAssembler {
         rpc_id: u64,
         params: &serde_json::Value,
     ) -> Vec<AgentEvent> {
-        let Ok(request) = serde_json::from_value::<FileChangeApprovalRequest>(params.clone())
+        let Some((request, turn_id, tool_call_id)) = self
+            .scoped_request::<FileChangeApprovalRequest>(params, "file-change-approval", rpc_id)
         else {
             return Vec::new();
         };
-        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
-            return Vec::new();
-        };
-        let tool_call_id =
-            Self::item_identity(request.item_id.as_ref(), "file-change-approval", rpc_id);
         let changes = self
             .turn
             .as_mut()
@@ -516,15 +528,11 @@ impl TurnAssembler {
         rpc_id: u64,
         params: &serde_json::Value,
     ) -> Vec<AgentEvent> {
-        let Ok(request) = serde_json::from_value::<PermissionsApprovalRequest>(params.clone())
+        let Some((request, turn_id, tool_call_id)) = self
+            .scoped_request::<PermissionsApprovalRequest>(params, "permissions-approval", rpc_id)
         else {
             return Vec::new();
         };
-        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
-            return Vec::new();
-        };
-        let tool_call_id =
-            Self::item_identity(request.item_id.as_ref(), "permissions-approval", rpc_id);
 
         let mut fields = serde_json::Map::new();
         fields.insert("permissions".to_owned(), request.permissions.clone());
@@ -552,7 +560,9 @@ impl TurnAssembler {
     /// A codex question (0.167): surfaced as a question only a human can
     /// answer, keyed by codex's own question ids.
     fn feed_user_input(&mut self, rpc_id: u64, params: &serde_json::Value) -> Vec<AgentEvent> {
-        let Ok(request) = serde_json::from_value::<UserInputRequest>(params.clone()) else {
+        let Some((request, turn_id, tool_call_id)) =
+            self.scoped_request::<UserInputRequest>(params, "user-input", rpc_id)
+        else {
             return Vec::new();
         };
         if request.questions.is_empty() {
@@ -560,10 +570,6 @@ impl TurnAssembler {
             // "question" no human could answer.
             return Vec::new();
         }
-        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
-            return Vec::new();
-        };
-        let tool_call_id = Self::item_identity(request.item_id.as_ref(), "user-input", rpc_id);
         let questions = request
             .questions
             .iter()
