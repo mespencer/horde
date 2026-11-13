@@ -24,7 +24,8 @@ fn json_lines(output: &std::process::Output) -> Vec<serde_json::Value> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("each line is one JSON record"))
+        // Null marks a line that was not JSON; callers assert there is none.
+        .map(|line| serde_json::from_str(line).unwrap_or(serde_json::Value::Null))
         .collect()
 }
 
@@ -62,6 +63,10 @@ async fn worker_logs_and_agent_stderr_reach_the_cli_and_the_agent_redacted() {
         String::from_utf8_lossy(&stderr.stderr)
     );
     let lines = json_lines(&stderr);
+    assert!(
+        !lines.contains(&serde_json::Value::Null),
+        "every line is JSON: {lines:?}"
+    );
     assert!(
         lines.iter().any(
             |record| record["line"] == "harness warning [REDACTED:join-token]"

@@ -247,6 +247,40 @@ async fn a_followed_worker_log_sees_new_records_and_ends_when_the_worker_vanishe
 }
 
 #[tokio::test]
+async fn a_client_dropping_its_follow_ends_the_workers_read() {
+    let core = ServerCore::new(EventLog::in_memory().expect("log"));
+    let endpoint = serve(core.clone()).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = dir.path().join("logs");
+    let logging = worker_records(&log_dir);
+    let journal = Journal::open(&dir.path().join("journal.sqlite")).expect("journal");
+    let logs = Arc::new(LogServing::new(
+        &log_dir,
+        logging.boot(),
+        Some(logging.tap().clone()),
+    ));
+    let runtime = Runtime::new(journal.clone()).with_logs(Arc::clone(&logs));
+    let config = config(&endpoint, &runtime, true);
+    let run = run_worker(&config, &journal, runtime, Some(Arc::clone(&logs))).await;
+
+    let mut follow = open(&endpoint, worker_read(true)).await.expect("follow");
+    follow
+        .message()
+        .await
+        .expect("a frame")
+        .expect("the initial records");
+    assert_eq!(logs.reads_in_flight(), 1, "the follow is being served");
+    drop(follow);
+    let mut polls = 0;
+    while logs.reads_in_flight() != 0 {
+        polls += 1;
+        assert!(polls < 200, "the worker kept serving a read nobody reads");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    run.abort();
+}
+
+#[tokio::test]
 async fn a_worker_that_predates_log_serving_is_refused_not_waited_on() {
     let core = ServerCore::new(EventLog::in_memory().expect("log"));
     let endpoint = serve(core.clone()).await;
