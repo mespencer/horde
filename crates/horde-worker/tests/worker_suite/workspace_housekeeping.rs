@@ -119,6 +119,21 @@ async fn released(rig: &Rig, agent: &str, count: usize) {
     .await;
 }
 
+/// Archives `agent` and waits for its release to finish: `count` archive
+/// events, then the report the release sends last, still holding the
+/// checkout's lock — which a scan skips rather than waits for.
+async fn archived_and_released(rig: &mut Rig, agent: &str, count: usize) {
+    let before = rig.reporter.count();
+    archive(rig, agent).await;
+    released(rig, agent, count).await;
+    observed_within("the release's report", async {
+        while rig.reporter.count() <= before {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
 fn agent_root(rig: &Rig, definition_id: &str, agent: &str) -> PathBuf {
     rig.root
         .join(definition_id)
@@ -248,7 +263,10 @@ fn pressure_events(events: &[WorkspaceCleanup]) -> usize {
 #[tokio::test]
 async fn free_space_between_the_watermarks_starts_no_episode() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let rig = atlas_rig_with(temp.path(), "agent-1").await;
+    // An archived checkout inside its grace: an episode would remove it
+    // whatever the agent's activity, so whether one starts is observable.
+    let mut rig = atlas_rig_with(temp.path(), "agent-1").await;
+    archived_and_released(&mut rig, "agent-1", 1).await;
     let config = horde_worker::runtime::HousekeepingConfig::default();
     let low = config.disk_low_watermark.bytes_of(TOTAL);
     let high = config.disk_high_watermark.bytes_of(TOTAL);
@@ -257,6 +275,45 @@ async fn free_space_between_the_watermarks_starts_no_episode() {
 
     assert!(!rig.runtime.scan_workspaces().await);
     assert_eq!(pressure_events(&cleanups(&rig.journal).await), 0);
+    assert!(
+        agent_root(&rig, "ws-1", "agent-1").exists(),
+        "the archived checkout stays through its grace"
+    );
+    rig.runtime.shutdown().await;
+}
+
+/// An episode started under the low watermark keeps going until the high
+/// one: free space between them still reclaims, here an archived
+/// checkout that appeared after the episode began.
+#[tokio::test]
+async fn an_episode_keeps_reclaiming_between_the_watermarks() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let mut rig = atlas_rig(temp.path(), policy(86_400, 0)).await;
+    let config = horde_worker::runtime::HousekeepingConfig::default();
+    let low = config.disk_low_watermark.bytes_of(TOTAL);
+    let high = config.disk_high_watermark.bytes_of(TOTAL);
+    rig.disk.set_free(low - 1);
+    rig.runtime.scan_workspaces().await;
+
+    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    archived_and_released(&mut rig, "agent-1", 1).await;
+    assert!(
+        agent_root(&rig, "ws-1", "agent-1").exists(),
+        "kept through its grace by the archive"
+    );
+    rig.disk.set_free(low + (high - low) / 2);
+    assert!(rig.runtime.scan_workspaces().await);
+    let removed: Vec<String> = cleanups(&rig.journal)
+        .await
+        .iter()
+        .filter(|c| {
+            c.trigger == i32::from(CleanupTrigger::DiskPressure)
+                && c.tier == i32::from(CleanupTier::Hard)
+        })
+        .map(agent_of)
+        .collect();
+    assert_eq!(removed, vec!["agent-1"]);
+    assert!(!agent_root(&rig, "ws-1", "agent-1").exists());
     rig.runtime.shutdown().await;
 }
 
@@ -386,8 +443,7 @@ async fn a_retained_checkout_is_not_rejournaled_for_the_same_reason() {
         "wip",
     )
     .expect("dirty");
-    archive(&mut rig, "agent-1").await;
-    released(&rig, "agent-1", 2).await;
+    archived_and_released(&mut rig, "agent-1", 2).await;
     let records = manager(&rig).records("ws-1").await;
     assert!(
         records
@@ -411,8 +467,7 @@ async fn the_longest_grace_is_reached_by_the_oldest_archive() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let mut rig = atlas_rig(temp.path(), policy(i64::MAX, 0)).await;
     spawn_in(&mut rig, "ws-1", "agent-1").await;
-    archive(&mut rig, "agent-1").await;
-    released(&rig, "agent-1", 1).await;
+    archived_and_released(&mut rig, "agent-1", 1).await;
     assert!(
         agent_root(&rig, "ws-1", "agent-1").exists(),
         "inside its grace"
@@ -424,7 +479,14 @@ async fn the_longest_grace_is_reached_by_the_oldest_archive() {
     json["archived_at_ms"] = serde_json::Value::from(i64::MIN);
     std::fs::write(&record, serde_json::to_vec(&json).expect("encodes")).expect("rewrites");
 
-    assert!(rig.runtime.scan_workspaces().await);
+    // The archive's release may still hold the checkout's lock, which a
+    // scan skips rather than waits for: scan until one acts.
+    observed_within("the scan past the grace", async {
+        while !rig.runtime.scan_workspaces().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     assert!(
         !agent_root(&rig, "ws-1", "agent-1").exists(),
         "removed: the grace is over"
