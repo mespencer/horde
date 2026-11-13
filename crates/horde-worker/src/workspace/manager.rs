@@ -1475,4 +1475,83 @@ mod tests {
             assert_eq!(resolution_name(resolution), name);
         }
     }
+
+    fn sh_git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=h", "-c", "user.email=h@t"])
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A crash between the ledger's `pending` write and the end of `worktree
+    /// add` leaves a half-built directory: the next checkout prunes git's
+    /// entry, clears the directory, and composes the repo afresh.
+    #[tokio::test]
+    async fn a_half_built_checkout_is_cleared_and_redone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let origin = temp.path().join("atlas-origin");
+        std::fs::create_dir_all(&origin).expect("origin");
+        sh_git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("README.md"), "atlas").expect("seed");
+        sh_git(&origin, &["add", "."]);
+        sh_git(&origin, &["commit", "-qm", "seed"]);
+        let manager = WorkspaceManager::new("w", temp.path().join("ws"));
+        let definition = WorkspaceDefinition {
+            workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+            repos: vec![WorkspaceRepo {
+                name: "atlas".to_owned(),
+                remote_url: origin.display().to_string(),
+                default_branch: "main".to_owned(),
+                ..WorkspaceRepo::default()
+            }],
+            ..WorkspaceDefinition::default()
+        };
+        manager.materialize(&definition).await;
+        let agents_dir = manager.agents_dir("ws-1");
+        let half_built = agents_dir.join("agent-1").join("atlas");
+        std::fs::create_dir_all(&half_built).expect("a half-built dir");
+        std::fs::write(half_built.join("partial"), "x").expect("partial");
+        let record = LedgerRecord {
+            agent_id: "agent-1".to_owned(),
+            policy: super::super::ledger::WORKTREE.to_owned(),
+            mode: "all".to_owned(),
+            branch: "horde/agent-1".to_owned(),
+            repos: vec![LedgerRepo {
+                name: "atlas".to_owned(),
+                pending: true,
+                ..LedgerRepo::default()
+            }],
+            ..LedgerRecord::default()
+        };
+        super::super::ledger::write(&agents_dir, &record)
+            .await
+            .expect("the crashed ledger");
+
+        let request = CheckoutRequest {
+            definition_id: "ws-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            policy: CheckoutPolicy::Worktree,
+            ..CheckoutRequest::default()
+        };
+        let prepared = manager
+            .checkout_agent(&request, &super::super::base::NoSource)
+            .await
+            .expect("the checkout is redone");
+        assert!(half_built.join(".git").is_file(), "a real worktree now");
+        assert!(
+            !half_built.join("partial").exists(),
+            "the half-built leftovers are gone"
+        );
+        assert_ne!(
+            prepared.prepared.repos[0].resolution,
+            i32::from(BaseResolution::Reused)
+        );
+        let after = super::super::ledger::read(&agents_dir, "agent-1")
+            .await
+            .expect("the ledger");
+        assert!(!after.repos[0].pending && after.repos[0].created_branch);
+    }
 }
