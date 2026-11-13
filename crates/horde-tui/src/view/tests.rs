@@ -295,19 +295,22 @@ fn a_refusal_shows_in_the_hint_line() {
     insta::assert_snapshot!(drawn(&app));
 }
 
+/// The conversation plus a second session, `docs`, whose root agent was
+/// spawned and then went through `extra`.
+fn with_docs_session(app: &mut App, extra: Vec<Kind>) {
+    conversation(app);
+    app.apply(Update::Sessions(vec![summary("s2", "docs", "root-2")]));
+    let mut kinds = vec![spawned(None, &["docs"])];
+    kinds.extend(extra);
+    fold(app, "s2", "root-2", kinds);
+}
+
 /// Two sessions, one with a lost agent and one waiting prompt.
 fn tree() -> App {
     let mut app = App::overview();
-    conversation(&mut app);
-    app.apply(Update::Sessions(vec![summary("s2", "docs", "root-2")]));
-    fold(
+    with_docs_session(
         &mut app,
-        "s2",
-        "root-2",
-        vec![
-            spawned(None, &["docs"]),
-            placement(PlacementState::Lost, Some("worker-9")),
-        ],
+        vec![placement(PlacementState::Lost, Some("worker-9"))],
     );
     fold(
         &mut app,
@@ -868,9 +871,7 @@ fn a_shrinking_inbox_keeps_a_selected_entry() {
 #[test]
 fn the_tree_marks_the_attached_session() {
     let mut app = App::attached("s2", None);
-    conversation(&mut app);
-    app.apply(Update::Sessions(vec![summary("s2", "docs", "root-2")]));
-    fold(&mut app, "s2", "root-2", vec![spawned(None, &["docs"])]);
+    with_docs_session(&mut app, Vec::new());
     ctrl(&mut app, 't');
     let screen = drawn(&app);
     let marked: Vec<&str> = screen

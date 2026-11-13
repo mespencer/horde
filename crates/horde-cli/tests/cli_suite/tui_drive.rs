@@ -213,22 +213,26 @@ async fn n_denies_with_the_tui_reason() {
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
-#[tokio::test]
-async fn composing_in_an_attached_session_sends_a_real_assignment() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-send")
-        .await
-        .expect("a seeded session");
-
-    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
-        .await
-        .expect("a running loop");
+/// Seeds a session and hands back a loop attached to it, once the replay has
+/// taught the app its root agent — the shared preamble of the compose, note,
+/// send-now and interrupt round trips.
+async fn attached_to_seeded(title: &str) -> Setup<(String, Harness)> {
+    let endpoint = serve().await?;
+    let (_, session_id, _) = seeded(&endpoint, title).await?;
+    let mut harness = start(&endpoint, App::attached(session_id.clone(), None)).await?;
     harness
         .state("the replay to teach the app its root agent", |app| {
             app.steer_target().is_some()
         })
+        .await?;
+    Ok((session_id, harness))
+}
+
+#[tokio::test]
+async fn composing_in_an_attached_session_sends_a_real_assignment() {
+    let (session_id, mut harness) = attached_to_seeded("tui-send")
         .await
-        .expect("the root agent arrives via the session's own AgentSpawned event");
+        .expect("a loop attached to a seeded session whose root agent is known");
 
     harness
         .type_line("fix the flaky test")
@@ -256,20 +260,9 @@ async fn composing_in_an_attached_session_sends_a_real_assignment() {
 
 #[tokio::test]
 async fn ctrl_x_interrupts_the_attached_agent_for_real() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-interrupt")
+    let (session_id, mut harness) = attached_to_seeded("tui-interrupt")
         .await
-        .expect("a seeded session");
-
-    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the root agent to be known", |app| {
-            app.steer_target().is_some()
-        })
-        .await
-        .expect("the root arrives via replay");
+        .expect("a loop attached to a seeded session whose root agent is known");
 
     harness.press_ctrl('x').await.expect("interrupt");
     harness
@@ -627,19 +620,9 @@ async fn x_then_y_archives_the_selected_session() {
 /// `/note <text>` sends a note, not an assignment, to the attached agent.
 #[tokio::test]
 async fn slash_note_sends_a_real_note() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-note")
+    let (session_id, mut harness) = attached_to_seeded("tui-note")
         .await
-        .expect("a seeded session");
-    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the root agent to be known", |app| {
-            app.steer_target().is_some()
-        })
-        .await
-        .expect("the root arrives via replay");
+        .expect("a loop attached to a seeded session whose root agent is known");
 
     harness.type_line("/note heads up").await.expect("compose");
     harness.press(KeyCode::Enter).await.expect("run it");
@@ -661,19 +644,9 @@ async fn slash_note_sends_a_real_note() {
 /// agent as an assignment at once rather than queueing.
 #[tokio::test]
 async fn ctrl_s_sends_now() {
-    let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "tui-now")
+    let (session_id, mut harness) = attached_to_seeded("tui-now")
         .await
-        .expect("a seeded session");
-    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the root agent to be known", |app| {
-            app.steer_target().is_some()
-        })
-        .await
-        .expect("the root arrives via replay");
+        .expect("a loop attached to a seeded session whose root agent is known");
 
     harness
         .type_line("stop and do this")
