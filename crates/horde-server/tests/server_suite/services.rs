@@ -151,6 +151,7 @@ async fn answer_permission(
             reason: reason.to_owned(),
             remember_for_session: false,
             updated_input,
+            answers: std::collections::HashMap::new(),
         })
         .await
         .map(tonic::Response::into_inner)

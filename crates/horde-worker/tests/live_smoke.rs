@@ -26,7 +26,7 @@
 use horde_adapter::{
     Adapter, AgentEvent, AgentSession, AgentSpec, PermissionDecision, TurnInput, TurnStatus,
 };
-use horde_worker::{ClaudeAdapter, CodexAdapter, ExecInterception, HarnessProfile};
+use horde_worker::{ClaudeAdapter, CodexAdapter, HarnessProfile};
 
 /// The Worker-owned profile one provider's live smoke runs under: the
 /// production launch shape, rooted where the operator signed it in.
@@ -165,14 +165,15 @@ async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
 #[tokio::test]
 #[ignore = "spends real subscription quota and needs a ChatGPT login"]
 async fn the_real_codex_routes_an_exec_approval_and_honors_both_verdicts() {
-    let adapter = CodexAdapter::new(live_profile("codex"))
-        .probe_exec_interception()
-        .await;
-    let ExecInterception::Routed { version } = adapter.exec_interception.clone() else {
+    let adapter = CodexAdapter::new(live_profile("codex")).probe_version().await;
+    if !adapter
+        .version
+        .at_least(horde_adapter_codex::version::FIRST_EXEC_ROUTING)
+    {
         eprintln!("SKIP: this codex does not route exec approvals; nothing to smoke");
         return;
-    };
-    eprintln!("probed {version}");
+    }
+    eprintln!("probed {}", adapter.version.describe());
 
     // One agent per verdict: an accept after a decline in the same thread
     // would be measuring codex's retry behavior, not the decision encoding.

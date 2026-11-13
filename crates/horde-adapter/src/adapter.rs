@@ -34,6 +34,13 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// What a probe of the launched binary's version found, when the adapter
+    /// probed one (W12c). `None` for adapters with nothing to probe — the
+    /// fake, a stub — which the Worker advertises as an empty version.
+    fn harness_version(&self) -> Option<&crate::version::VersionReport> {
+        None
+    }
+
     /// Starts a new conversation.
     ///
     /// **Not guaranteed to be side-effect-free.** A harness may write to

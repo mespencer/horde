@@ -92,6 +92,7 @@ async fn round_trip(
             reason,
             remember_for_session: false,
             updated_input: narrowing.as_ref(),
+            answers: horde_adapter::Answers::new(),
         })
         .await?;
 

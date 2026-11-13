@@ -173,6 +173,7 @@ async fn deny_first_escalation(endpoint: &str, session_id: &str) -> Setup<()> {
             reason: "denied over http",
             remember_for_session: false,
             updated_input: None,
+            answers: horde_adapter::Answers::new(),
         })
         .await?;
     Ok(())

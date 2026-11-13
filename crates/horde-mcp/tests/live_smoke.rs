@@ -67,6 +67,7 @@ async fn answer_first_escalation(endpoint: &str, session_id: &str) -> Setup<Stri
             reason: "smoke test denies everything",
             remember_for_session: false,
             updated_input: None,
+            answers: horde_adapter::Answers::new(),
         })
         .await?;
     eprintln!("SMOKE answered {request_id} with deny");

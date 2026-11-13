@@ -77,6 +77,7 @@ pub fn failure_reason(error: &AdapterError) -> String {
         }
         AdapterError::Protocol { .. } => MALFORMED_STREAM,
         AdapterError::Unauthenticated { .. }
+        | AdapterError::RefusedVersion { .. }
         | AdapterError::Unsupported { .. }
         | AdapterError::UnknownPermissionRequest { .. }
         | AdapterError::AwaitingDecision { .. } => REFUSAL,
@@ -450,6 +451,7 @@ mod tests {
                     tool_call_id: ToolCallId::new("toolu_07"),
                     tool_name: "Bash".to_owned(),
                     input: json!({ "command": "docker rm horde-test" }),
+                    questions: Vec::new(),
                 },
             },
         )
@@ -490,6 +492,7 @@ mod tests {
                     tool_call_id: ToolCallId::new("toolu_08"),
                     tool_name: "Bash".to_owned(),
                     input: json!(["not", "an", "object"]),
+                    questions: Vec::new(),
                 },
             },
         )

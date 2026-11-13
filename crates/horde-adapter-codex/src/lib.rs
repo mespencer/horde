@@ -55,14 +55,18 @@ pub mod wire;
 pub use codec::{
     APPROVALS_REVIEWER, ExecDecision, ThreadConfig, approvals_reviewer_from_config, decode_line,
     encode_decision_decline, encode_elicitation_response, encode_exec_approval_response,
-    encode_initialize, encode_initialized, encode_interrupt, encode_method_not_found, encode_steer,
-    encode_thread_resume, encode_thread_start, encode_turn_start,
+    encode_initialize, encode_initialized, encode_interrupt, encode_method_not_found,
+    encode_permissions_response, encode_steer, encode_thread_resume, encode_thread_start,
+    encode_turn_start, encode_user_input_response, encode_withdrawal,
 };
 pub use identity::RevivalIdentity;
 pub use replay::{ReplaySession, replay};
 pub use sandbox::{SandboxPolicy, SandboxTier, TierChoice};
-pub use turn::{ApprovalKind, EXEC_TOOL_NAME, ResolvedApproval, TurnAssembler};
-pub use version::routes_exec_approvals;
+pub use turn::{
+    ApprovalKind, EXEC_TOOL_NAME, FILE_CHANGE_TOOL_NAME, PERMISSIONS_TOOL_NAME, ResolvedApproval,
+    TurnAssembler, USER_INPUT_TOOL_NAME,
+};
+pub use version::{SUPPORT, routes_exec_approvals, routes_file_change_approvals};
 
 use horde_adapter::{Capabilities, Capability};
 
@@ -92,9 +96,11 @@ pub const PROVIDER: &str = "codex";
 /// codec always sends. That claim is therefore **not** in this baseline set:
 /// it is version-gated, and only [`capabilities_with_exec_interception`] holds
 /// it, for an adapter that has probed the launched binary
-/// ([`version::routes_exec_approvals`]). File-change approvals never route in
-/// any measured configuration — they park the thread instead (transcripts
-/// 28/31) — so no version lifts the kind-blind floor above `SandboxAtSpawn`.
+/// ([`version::routes_exec_approvals`]). File-change approvals parked the
+/// thread at 0.148 (transcripts 28/31) and route at 0.167 (36–37), so that
+/// claim is gated the same way, from its own first measured version —
+/// [`capabilities_for`] holds both. Only with all three per-kind claims does
+/// the kind-blind floor lift above `SandboxAtSpawn`.
 ///
 /// [`Capability::RewritesToolInput`] stays absent: both reply vocabularies
 /// are accept-or-decline-shaped, with nowhere to carry replacement arguments,
@@ -128,6 +134,21 @@ pub fn capabilities() -> Capabilities {
 #[must_use]
 pub fn capabilities_with_exec_interception() -> Capabilities {
     capabilities().with(Capability::PreAuthorizeExecCommands)
+}
+
+/// The claims a probed binary earns: [`capabilities`], plus exec gating at
+/// 0.147+ and file-change gating at 0.167+. An unreadable version earns
+/// neither — fail closed.
+#[must_use]
+pub fn capabilities_for(report: &horde_adapter::VersionReport) -> Capabilities {
+    let mut claimed = capabilities();
+    if report.at_least(version::FIRST_EXEC_ROUTING) {
+        claimed = claimed.with(Capability::PreAuthorizeExecCommands);
+    }
+    if routes_file_change_approvals(report) {
+        claimed = claimed.with(Capability::PreAuthorizeFileChanges);
+    }
+    claimed
 }
 
 #[cfg(test)]
@@ -205,6 +226,39 @@ mod tests {
             PermissionEnforcement::PerCall,
             "a probed 0.147+ binary earns per-call exec gating (transcripts 25/33)"
         );
+    }
+
+    /// Each per-kind claim arrives at its own measured version, and the
+    /// kind-blind floor lifts only once every kind is gated.
+    #[test]
+    fn a_probed_version_earns_exactly_its_measured_claims() {
+        use horde_adapter::ToolCallKind;
+
+        let at = |output: &str| super::capabilities_for(&super::SUPPORT.classify(output));
+
+        let unreadable = at("codex-cli");
+        assert_eq!(unreadable, capabilities(), "an unreadable version earns nothing");
+
+        let v0148 = at("codex-cli 0.148.0");
+        assert!(v0148.supports(Capability::PreAuthorizeExecCommands));
+        assert!(!v0148.supports(Capability::PreAuthorizeFileChanges));
+        assert_eq!(
+            v0148.permission_enforcement(),
+            PermissionEnforcement::SandboxAtSpawn
+        );
+
+        let v0167 = at("codex-cli 0.167.0");
+        assert!(v0167.supports(Capability::PreAuthorizeExecCommands));
+        assert!(v0167.supports(Capability::PreAuthorizeFileChanges));
+        assert!(!v0167.supports(Capability::PreAuthorizeToolCalls));
+        assert!(!v0167.supports(Capability::RewritesToolInput));
+        for kind in ToolCallKind::ALL {
+            assert_eq!(
+                v0167.permission_enforcement_for(kind),
+                PermissionEnforcement::PerCall,
+                "{kind:?} routes at 0.167 (transcripts 34-37, 17-18)"
+            );
+        }
     }
 
     #[test]

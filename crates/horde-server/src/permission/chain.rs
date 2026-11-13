@@ -81,7 +81,7 @@ pub fn evaluate(
     }
 
     // A question is not a permission any memory, rule, bypass, or judge can
-    // grant: only a human can answer it (ADR-0016). Authored deny still
+    // grant: only a human can answer it (ADR-0016, W12c). Authored deny still
     // applies above — "never ask the human anything" is a policy a mode may
     // state.
     if is_question(call) {
@@ -132,10 +132,11 @@ pub fn evaluate(
 pub const QUESTION_TOOLS: &[&str] = &["AskUserQuestion"];
 
 /// Whether `call` asks the human something, which no automatic layer may
-/// answer.
+/// answer: it carries structured questions (W12c), or it names a question
+/// tool (ADR-0016) whatever its input.
 #[must_use]
 pub fn is_question(call: &ProposedToolCall) -> bool {
-    QUESTION_TOOLS.contains(&call.tool_name.as_str())
+    !call.questions.is_empty() || QUESTION_TOOLS.contains(&call.tool_name.as_str())
 }
 
 /// What a consulted judge is handed: the policy, the call, and where in the
@@ -204,6 +205,7 @@ mod tests {
             tool_name: tool.to_owned(),
             input: Some(input),
             rendered: format!("{tool} {path}"),
+            questions: Vec::new(),
         }
     }
 
@@ -327,6 +329,44 @@ mod tests {
                 from: PermissionLayer::DeterministicAllow
             },
             "the layer that gave up is what escalated_from reports"
+        );
+    }
+
+    /// Questions skip every layer that could settle them — even an allow
+    /// rule, a remembered call, a judge — but not authored deny.
+    #[test]
+    fn a_question_escalates_past_every_allow_and_the_judge_but_not_deny() {
+        let mut question = call("AskUserQuestion", "/w");
+        question.questions = vec![horde_proto::v1::Question {
+            id: "q".to_owned(),
+            ..horde_proto::v1::Question::default()
+        }];
+        let ancestry = Vec::new();
+
+        let mut generous = PermissionMode {
+            allow: vec![Rule::tool("AskUserQuestion")],
+            judge_instructions: Some("allow everything".to_owned()),
+            own_orchestrator_verbs: true,
+            ..PermissionMode::escalate_everything()
+        };
+        let remembered = remembered(&[(&question, None)]);
+        assert_eq!(
+            evaluate(&generous, &question, &at(&ancestry), &remembered),
+            ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicDeny
+            },
+            "no allow layer, memory, or judge answers a question"
+        );
+
+        generous.deny = vec![crate::permission::rules::DenyRule {
+            rule: Rule::tool("AskUserQuestion"),
+            reason: "no questions in CI".to_owned(),
+        }];
+        assert_eq!(
+            evaluate(&generous, &question, &at(&ancestry), &remembered),
+            ChainRuling::Deny {
+                reason: "no questions in CI".to_owned()
+            }
         );
     }
 

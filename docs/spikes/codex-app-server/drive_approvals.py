@@ -33,6 +33,7 @@ SCRATCH = pathlib.Path(__file__).resolve().parent
 TRANSCRIPTS = SCRATCH / "transcripts"
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 TURN_CEILING = 60  # seconds; a hang is recorded, not waited out
+IDLE_GRACE = 10  # seconds a turn/completed may trail an idle status
 
 # Isolation from the user's ~/.codex: the probe runs under a fresh CODEX_HOME
 # holding only a copy of auth.json. That removes the user's MCP servers, hooks
@@ -314,11 +315,15 @@ def run_probe(name, *, reviewer, policy, sandbox, client_name, prompt, decision=
                 if method == "thread/status/changed":
                     finding["last_status"] = p.get("status")
                     # A turn that ends via idle without turn/completed is the
-                    # ADR-0005 interrupt shape; treat post-answer idle as done.
+                    # ADR-0005 interrupt shape. Idle usually precedes
+                    # turn/completed by one frame, so idle only ends the wait
+                    # when no turn/completed follows within a grace period —
+                    # breaking on idle itself (as 20-33 did) cut the terminal
+                    # frame off every recording.
                     if (p.get("status") or {}).get("type") == "idle" and seen.count(
                             "item/completed"):
+                        deadline = min(deadline, time.time() + IDLE_GRACE)
                         outcome = "idle-without-turn/completed"
-                        break
             finding[outcome_key] = outcome or (
                 f"HANG >{TURN_CEILING}s (last status: {finding.get('last_status')})")
             finding.setdefault("methods_seen", []).extend(sorted(set(seen)))

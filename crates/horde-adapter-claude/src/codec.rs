@@ -7,7 +7,7 @@
 use horde_adapter::AdapterError;
 use serde_json::{Value, json};
 
-use crate::wire::{Envelope, Event};
+use crate::wire::{ControlRequest, ControlRequestKind, Envelope, Event};
 
 /// Decodes one line of the harness's stdout.
 ///
@@ -64,6 +64,10 @@ fn classify(raw: &Value, event_type: String, line: &str) -> Result<Event, Adapte
         "user" => Event::User(typed(raw, &event_type, line)?),
         "result" => Event::Result(Box::new(typed(raw, &event_type, line)?)),
         "control_response" => Event::ControlResponse(typed(raw, &event_type, line)?),
+        "control_request" => Event::ControlRequest(control_request(raw, line)?),
+        "control_cancel_request" => Event::ControlCancel {
+            request_id: string_at(raw, "request_id"),
+        },
         "rate_limit_event" => Event::RateLimit(typed(raw, &event_type, line)?),
         "stream_event" => Event::StreamEvent,
         "system" => system_event(raw, &event_type, line)?,
@@ -83,6 +87,35 @@ fn system_event(raw: &Value, event_type: &str, line: &str) -> Result<Event, Adap
             subtype: other.unwrap_or_default().to_owned(),
         },
     })
+}
+
+/// A `control_request`, split on its subtype. Only `can_use_tool` is modelled;
+/// every other subtype keeps its name so the caller can refuse it by name.
+fn control_request(raw: &Value, line: &str) -> Result<ControlRequest, AdapterError> {
+    let request_id = string_at(raw, "request_id");
+    let body = raw.get("request").cloned().unwrap_or(Value::Null);
+    let request = match body.get("subtype").and_then(Value::as_str) {
+        Some("can_use_tool") => ControlRequestKind::CanUseTool(Box::new(
+            serde_json::from_value(body).map_err(|source| AdapterError::Protocol {
+                message: format!("malformed `can_use_tool` control request: {source}"),
+                raw: line.to_owned(),
+            })?,
+        )),
+        other => ControlRequestKind::Other {
+            subtype: other.unwrap_or_default().to_owned(),
+        },
+    };
+    Ok(ControlRequest {
+        request_id,
+        request,
+    })
+}
+
+fn string_at(raw: &Value, field: &str) -> String {
+    raw.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Deserializes a known envelope shape, keeping the raw line in the error so a
@@ -207,6 +240,71 @@ mod tests {
             }
             other => panic!("expected Assistant, got {other:?}"),
         }
+    }
+
+    /// The `12a` request decodes into its typed body, correlated by the
+    /// harness's id; an unmodelled subtype keeps its name.
+    #[test]
+    fn control_requests_decode_by_subtype() {
+        use crate::wire::ControlRequestKind;
+
+        let envelope = decode_line(
+            r#"{"type":"control_request","request_id":"7a32","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/w/p.txt","content":"hello"},"tool_use_id":"toolu_01"}}"#,
+        )
+        .expect("the recorded shape must decode");
+        let Event::ControlRequest(request) = envelope.event else {
+            panic!("expected a control request, got {:?}", envelope.event);
+        };
+        assert_eq!(request.request_id, "7a32");
+        let ControlRequestKind::CanUseTool(can_use) = request.request else {
+            panic!("expected can_use_tool");
+        };
+        assert_eq!(can_use.tool_name, "Write");
+        assert_eq!(can_use.tool_use_id, "toolu_01");
+        assert_eq!(can_use.input["content"], "hello");
+
+        let other = decode_line(
+            r#"{"type":"control_request","request_id":"r2","request":{"subtype":"hook_callback"}}"#,
+        )
+        .expect("decodes");
+        assert_eq!(
+            other.event,
+            Event::ControlRequest(crate::wire::ControlRequest {
+                request_id: "r2".to_owned(),
+                request: ControlRequestKind::Other {
+                    subtype: "hook_callback".to_owned()
+                },
+            })
+        );
+
+        let bare = decode_line(r#"{"type":"control_request"}"#).expect("decodes");
+        assert_eq!(
+            bare.event,
+            Event::ControlRequest(crate::wire::ControlRequest {
+                request_id: String::new(),
+                request: ControlRequestKind::Other {
+                    subtype: String::new()
+                },
+            })
+        );
+
+        let error = decode_line(
+            r#"{"type":"control_request","request_id":"r3","request":{"subtype":"can_use_tool"}}"#,
+        )
+        .expect_err("a can_use_tool with no tool is a drifted protocol");
+        assert!(error.to_string().contains("can_use_tool"), "{error}");
+    }
+
+    #[test]
+    fn a_cancel_names_the_request_it_withdraws() {
+        let envelope = decode_line(r#"{"type":"control_cancel_request","request_id":"7a32"}"#)
+            .expect("decodes");
+        assert_eq!(
+            envelope.event,
+            Event::ControlCancel {
+                request_id: "7a32".to_owned()
+            }
+        );
     }
 
     #[test]
