@@ -39,6 +39,8 @@ pub mod paths;
 pub mod policy;
 pub mod reclaim;
 pub mod removal;
+#[cfg(test)]
+pub(crate) mod test_git;
 
 pub use manager::{
     AddedRepo, CheckoutRequest, FsStats, PreparedCheckout, StatvfsStats, WorkspaceManager,

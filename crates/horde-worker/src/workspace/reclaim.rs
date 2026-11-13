@@ -24,6 +24,10 @@ pub const OUTPUT_TAIL_BYTES: usize = 4096;
 /// How long a timed-out command's group has between SIGTERM and SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a finished command's output pipes may stay open: a process it
+/// left in the background can hold them forever, and a reclaim must end.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// How long a size walk may run before its answer is left unset.
 pub const SIZE_WALK_CAP: Duration = Duration::from_secs(30);
 
@@ -245,9 +249,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
             };
         }
     };
-    for reader in readers.into_iter().flatten() {
-        let _ = reader.await;
-    }
+    let output_tail = drain(readers, leader, &tail).await;
     let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
     let succeeded = status.is_some_and(|status| status.success());
     Ran {
@@ -258,8 +260,34 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
         } else {
             format!("{program} exited with status {exit_code}")
         },
-        output_tail: tail_text(&tail),
+        output_tail,
     }
+}
+
+/// Waits for the output readers of a command that has exited, for at most
+/// [`DRAIN_GRACE`]; a pipe still open past it belongs to a process the
+/// command left behind, so its group is killed and the readers dropped.
+async fn drain(
+    readers: [Option<tokio::task::JoinHandle<()>>; 2],
+    leader: Option<u32>,
+    tail: &Arc<Mutex<Vec<u8>>>,
+) -> String {
+    let mut readers: Vec<_> = readers.into_iter().flatten().collect();
+    let drained = tokio::time::timeout(DRAIN_GRACE, async {
+        for reader in &mut readers {
+            let _ = reader.await;
+        }
+    })
+    .await;
+    if drained.is_err() {
+        if let Some(leader) = leader {
+            crate::process::signal_spawned_group(leader, Signal::SIGKILL);
+        }
+        for reader in &readers {
+            reader.abort();
+        }
+    }
+    tail_text(tail)
 }
 
 /// SIGTERM to the group, a grace, then SIGKILL, then the reap.
@@ -332,7 +360,10 @@ fn walk_size(root: &Path, deadline: std::time::Instant) -> Option<u64> {
     let mut total = 0_u64;
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
-        if std::time::Instant::now() > deadline {
+        if deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .is_zero()
+        {
             return None;
         }
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
@@ -418,6 +449,7 @@ mod tests {
         .await;
         assert!(!ran.succeeded);
         assert_eq!(ran.exit_code, 3);
+        assert_eq!(ran.reason, "sh exited with status 3");
         assert!(ran.reason.contains("status 3"), "{ran:?}");
         assert!(ran.output_tail.contains("boom"), "{ran:?}");
     }
@@ -445,6 +477,7 @@ mod tests {
             !empty.succeeded && empty.reason.contains("empty"),
             "{empty:?}"
         );
+        assert_eq!(empty.exit_code, -1, "a refusal has no exit status");
     }
 
     /// A command past its timeout is killed with its whole group: a child it
@@ -461,21 +494,37 @@ mod tests {
         )
         .await;
         assert!(!ran.succeeded);
+        assert_eq!(ran.exit_code, -1, "a killed command has no exit status");
         assert!(ran.reason.contains("timed out"), "{ran:?}");
-        let pid = std::fs::read_to_string(&marker).expect("the child wrote its pid");
-        let pid: i32 = pid.trim().parse().expect("a pid");
         // The background sleep was in the group: it is gone (or a zombie
         // already reparented and reaped).
-        let mut alive = true;
+        let pid = written_pid(&marker);
+        assert!(
+            gone_soon(pid).await,
+            "the grandchild {pid} survived its group's kill"
+        );
+    }
+
+    /// The pid a test's shell wrote to `marker`.
+    fn written_pid(marker: &Path) -> i32 {
+        std::fs::read_to_string(marker)
+            .expect("the child wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid")
+    }
+
+    /// Whether `pid` is gone, or only a zombie, within five seconds.
+    async fn gone_soon(pid: i32) -> bool {
         for _ in 0..50 {
-            alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
                 && !is_zombie(pid);
             if !alive {
-                break;
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(!alive, "the grandchild {pid} survived its group's kill");
+        false
     }
 
     fn is_zombie(pid: i32) -> bool {
@@ -495,6 +544,7 @@ mod tests {
         )
         .await;
         assert_eq!(action.outcome, i32::from(Outcome::Skipped));
+        assert_eq!(action.repo_name, "atlas");
         assert_eq!(action.reason, "no reclaim command");
         assert!(action.argv.is_empty());
     }
@@ -514,6 +564,104 @@ mod tests {
         assert_eq!(action.outcome, i32::from(Outcome::Done), "{action:?}");
         assert_eq!(action.bytes_freed, 10_000);
         assert!(dir.path().join("keep.txt").exists());
+    }
+
+    /// A failed run records which repo, why, the status and the output.
+    #[tokio::test]
+    async fn a_failed_run_records_its_repo_status_and_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolved = Resolved::Run(CommandSpec {
+            argv: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "echo out; echo err >&2; exit 4".to_owned(),
+            ],
+            timeout: None,
+            output_paths: Vec::new(),
+        });
+        let action = run("atlas", dir.path(), &resolved, Duration::from_secs(10)).await;
+        assert_eq!(action.outcome, i32::from(Outcome::Failed), "{action:?}");
+        assert_eq!(action.repo_name, "atlas");
+        assert_eq!(action.reason, "sh exited with status 4");
+        assert_eq!(action.exit_code, 4);
+        assert!(
+            action.output_tail.contains("out") && action.output_tail.contains("err"),
+            "{action:?}"
+        );
+    }
+
+    /// A command killed by a signal has no exit code: it reads as -1.
+    #[tokio::test]
+    async fn a_command_killed_by_a_signal_reports_no_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ran = execute(
+            &["sh".to_owned(), "-c".to_owned(), "kill -KILL $$".to_owned()],
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(!ran.succeeded);
+        assert_eq!(ran.exit_code, -1);
+        assert_eq!(ran.reason, "sh exited with status -1");
+    }
+
+    /// Output on either stream, or both, is kept whole.
+    #[tokio::test]
+    async fn output_on_each_stream_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for script in ["echo only-out", "echo only-err >&2", "echo a; echo b >&2"] {
+            let ran = execute(
+                &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                dir.path(),
+                Duration::from_secs(10),
+            )
+            .await;
+            assert!(ran.succeeded, "{ran:?}");
+            let mut lines: Vec<&str> = ran.output_tail.lines().collect();
+            lines.sort_unstable();
+            let mut wanted: Vec<&str> = script
+                .split("; ")
+                .map(|part| part.trim_start_matches("echo ").trim_end_matches(" >&2"))
+                .collect();
+            wanted.sort_unstable();
+            assert_eq!(lines, wanted, "{script}");
+        }
+    }
+
+    /// A process the command left in the background holding its output
+    /// open does not hold the reclaim: it ends shortly after the command,
+    /// with what was written, and the leftover is killed with the group.
+    #[tokio::test]
+    async fn a_background_process_holding_the_output_does_not_hold_the_reclaim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("child.pid");
+        let script = format!("sleep 600 & echo $! > {}; echo done", marker.display());
+        let started = std::time::Instant::now();
+        let ran = execute(
+            &["sh".to_owned(), "-c".to_owned(), script],
+            dir.path(),
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(30), "{ran:?}");
+        assert!(ran.succeeded, "{ran:?}");
+        assert_eq!(ran.output_tail.trim(), "done");
+        let pid = written_pid(&marker);
+        assert!(gone_soon(pid).await, "the leftover {pid} survived");
+    }
+
+    #[test]
+    fn a_walk_past_its_deadline_leaves_the_size_unset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a"), vec![0_u8; 100]).expect("file");
+        assert_eq!(walk_size(dir.path(), std::time::Instant::now()), None);
+        assert_eq!(
+            walk_size(
+                dir.path(),
+                std::time::Instant::now() + Duration::from_secs(60)
+            ),
+            Some(100)
+        );
     }
 
     #[tokio::test]

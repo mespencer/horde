@@ -457,6 +457,44 @@ mod tests {
         }
     }
 
+    /// The workspace intervals parse as durations, default to the ADR's
+    /// values, and a zero interval — which would spin the scan — is refused.
+    #[test]
+    fn workspace_intervals_parse_default_and_refuse_zero() {
+        let defaults = parsed_with(&[], &[]).expect("parses");
+        assert_eq!(
+            defaults.housekeeping,
+            crate::runtime::HousekeepingConfig::default()
+        );
+        let set = parsed_with(
+            &[
+                "--workspace-scan-interval",
+                "90s",
+                "--workspace-pin-scan-interval",
+                "2h",
+                "--workspace-report-interval",
+                "5m",
+            ],
+            &[],
+        )
+        .expect("parses");
+        assert_eq!(
+            set.housekeeping.scan_interval,
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            set.housekeeping.pin_scan_interval,
+            std::time::Duration::from_secs(7_200)
+        );
+        assert_eq!(
+            set.housekeeping.report_interval,
+            std::time::Duration::from_secs(300)
+        );
+        let zero = parsed_with(&["--workspace-scan-interval", "0s"], &[])
+            .expect_err("a zero interval would spin");
+        assert!(zero.contains("longer than zero"), "{zero}");
+    }
+
     /// Where to dial, by precedence: the flag over the variable; neither
     /// leaves it to the stored endpoint at startup. The state dir defaults
     /// under HOME, never the working directory.

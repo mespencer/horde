@@ -582,6 +582,20 @@ mod tests {
     /// `forget_agent` or `shutdown` that silently did nothing would leave
     /// an archived agent's credential (and the whole endpoint) alive.
     ///
+    /// A served endpoint's URL and the bearer token minted for it.
+    fn url_and_token(endpoint: horde_adapter::McpEndpoint) -> (String, String) {
+        let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
+            panic!("the worker serves HTTP");
+        };
+        let token = headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .and_then(|(_, value)| value.strip_prefix("Bearer "))
+            .expect("a bearer token")
+            .to_owned();
+        (url, token)
+    }
+
     /// After shutdown, every assertion is on state this process owns: the
     /// manager's reaped count and its refusal to serve again. Three sweeps
     /// proved that asserting on OS-level port state here instead — connect
@@ -597,15 +611,7 @@ mod tests {
             .endpoint_for("s1", "agent-1", sink(), &bare())
             .await
             .expect("the endpoint serves");
-        let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
-            panic!("the worker serves HTTP");
-        };
-        let token = headers
-            .iter()
-            .find(|(name, _)| name == "Authorization")
-            .and_then(|(_, value)| value.strip_prefix("Bearer "))
-            .expect("a bearer token")
-            .to_owned();
+        let (url, token) = url_and_token(endpoint);
 
         let dial = |token: String, url: String| async move {
             horde_mcp::hub::Upstream::dial(
@@ -656,6 +662,67 @@ mod tests {
                 .is_err(),
             "a shut-down manager must refuse to serve new endpoints"
         );
+    }
+
+    /// A workspace backend that answers every checkout with one fixed path
+    /// — an alternate backend, standing in for the Worker's workspaces.
+    struct FixedWorkspace;
+
+    #[async_trait::async_trait]
+    impl horde_mcp::workspace::WorkspaceAccess for FixedWorkspace {
+        async fn parent_bases(
+            &self,
+            _agent_id: &str,
+        ) -> Result<Vec<horde_proto::v1::RepoBase>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn checkout(
+            &self,
+            agent_id: &str,
+            repo: &str,
+            _base: Option<&str>,
+        ) -> Result<horde_mcp::workspace::CheckoutAnswer, String> {
+            Ok(horde_mcp::workspace::CheckoutAnswer {
+                stale_reason: String::new(),
+                resolution: "fresh".to_owned(),
+                base_commit_sha: "abc".to_owned(),
+                branch: format!("horde/{agent_id}"),
+                path: format!("/w/{agent_id}/{repo}"),
+            })
+        }
+    }
+
+    /// The workspace access set on the manager is what the served
+    /// endpoint's `workspace_checkout` answers through, for the calling
+    /// agent.
+    #[tokio::test]
+    async fn the_workspace_access_backs_the_served_checkout_verb() {
+        let manager = manager();
+        manager.set_workspace_access(std::sync::Arc::new(FixedWorkspace));
+        let endpoint = manager
+            .endpoint_for("s1", "agent-1", sink(), &bare())
+            .await
+            .expect("the endpoint serves");
+        let (url, token) = url_and_token(endpoint);
+        let upstream = horde_mcp::hub::Upstream::dial(
+            "horde",
+            &url,
+            Some(&token),
+            &[("x-horde-agent", "agent-1")],
+        )
+        .await
+        .expect("the minted pair dials");
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("repo".to_owned(), serde_json::Value::from("docs"));
+        let answered = upstream
+            .call("workspace_checkout", Some(arguments))
+            .await
+            .expect("the call is answered");
+        assert_ne!(answered.is_error, Some(true), "{answered:?}");
+        let rendered = serde_json::to_string(&answered).expect("renders");
+        assert!(rendered.contains("/w/agent-1/docs"), "{rendered}");
+        assert_eq!(manager.shutdown().await, 1);
     }
 
     /// The Debug form reaches logs; it must say what it is (the credential

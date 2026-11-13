@@ -478,6 +478,15 @@ mod tests {
         assert!(reclaim_argv_shortfall(&vec!["x".to_owned(); 65], &[]).is_some());
         assert!(reclaim_argv_shortfall(&argv(&["make", &"a".repeat(4096)]), &[]).is_some());
         assert!(reclaim_argv_shortfall(&argv(&["make"]), &argv(&["../out"])).is_some());
+        // The bounds are inclusive: exactly 64 entries and exactly 4 KiB pass.
+        assert_eq!(reclaim_argv_shortfall(&vec!["x".to_owned(); 64], &[]), None);
+        assert_eq!(
+            reclaim_argv_shortfall(&argv(&["make", &"a".repeat(4092)]), &[]),
+            None
+        );
+        // A Windows-style relative path and an empty program are refused too.
+        assert!(reclaim_argv_shortfall(&argv(&["tools\\clean"]), &[]).is_some());
+        assert!(reclaim_argv_shortfall(&argv(&[""]), &[]).is_some());
         let repos = vec![WorkspaceRepo {
             reclaim: Some(ReclaimPolicy {
                 policy: Some(reclaim_policy::Policy::Command(reclaim_policy::Command {
@@ -519,6 +528,7 @@ mod tests {
             assert!(validate_branch(bad, "agent-1").is_err(), "{bad}");
         }
         assert!(validate_branch(&"a".repeat(201), "agent-1").is_err());
+        assert!(validate_branch(&"a".repeat(200), "agent-1").is_ok());
     }
 
     fn definition(repos: &[&str]) -> WorkspaceDefinition {
@@ -592,6 +602,21 @@ mod tests {
         assert!(needs_workspace_protocol(&lazy_without_workspace));
         assert!(validated_spawn(AgentSpec::default(), None, "a").is_ok());
         assert!(!needs_workspace_protocol(&AgentSpec::default()));
+        let branch_only = AgentSpec {
+            branch: "feat".to_owned(),
+            ..AgentSpec::default()
+        };
+        assert!(needs_workspace_protocol(&branch_only));
+        let bases_only = AgentSpec {
+            repo_bases: vec![base("atlas", "main")],
+            ..AgentSpec::default()
+        };
+        assert!(needs_workspace_protocol(&bases_only));
+        let checkout_only = AgentSpec {
+            checkout_repos: vec!["atlas".to_owned()],
+            ..AgentSpec::default()
+        };
+        assert!(needs_workspace_protocol(&checkout_only));
         let shared_plain = AgentSpec {
             checkout_policy: CheckoutPolicy::Shared.into(),
             ..AgentSpec::default()

@@ -1038,9 +1038,9 @@ async fn shared_checkout(
             .await
             .unwrap_or_default();
         repos.push((repo.name.clone(), PathBuf::from(layout)));
+        // No branch: the shared policy works on whatever the Instance has.
         prepared.push(PreparedRepo {
             repo_name: repo.name.clone(),
-            branch: String::new(),
             base_commit_sha: head,
             resolution: BaseResolution::InstanceHead.into(),
             ..PreparedRepo::default()
@@ -1332,6 +1332,11 @@ async fn clone_repo(
         .map(|_| ())
         .map_err(WorkerError::Workspace)
 }
+
+// The checkout composition suite: real repos, real git, one manager.
+#[cfg(test)]
+#[path = "manager_tests.rs"]
+mod composition_tests;
 
 #[cfg(test)]
 mod tests {

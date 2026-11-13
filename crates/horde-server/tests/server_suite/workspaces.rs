@@ -92,6 +92,44 @@ async fn report_instance(harness: &mut Harness, worker: &str, definition: &str) 
     Ok(())
 }
 
+/// A second workspace, `other`, over `atlas` alone.
+async fn other_workspace(harness: &mut Harness) -> Result<String, tonic::Status> {
+    define(
+        harness,
+        CreateWorkspaceDefinitionRequest {
+            name: "other".to_owned(),
+            repos: vec![repo("atlas", "")],
+            ..CreateWorkspaceDefinitionRequest::default()
+        },
+    )
+    .await
+}
+
+/// `worker`'s command stream, from its first command.
+async fn commands_of(
+    harness: &mut Harness,
+    worker: &str,
+) -> Result<tonic::Streaming<horde_proto::v1::StreamCommandsResponse>, tonic::Status> {
+    Ok(harness
+        .worker
+        .stream_commands(StreamCommandsRequest {
+            worker_id: Some(WorkerId::new(worker)),
+            resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
+        })
+        .await?
+        .into_inner())
+}
+
+/// The stream's next command, within ten seconds.
+async fn next_command(
+    commands: &mut tonic::Streaming<horde_proto::v1::StreamCommandsResponse>,
+) -> Setup<horde_proto::v1::StreamCommandsResponse> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), commands.message())
+        .await??
+        .ok_or_else(|| "the command stream ended".into())
+}
+
 /// A harness whose workspace a protocol-2 worker reports holding.
 async fn held_workspace() -> Setup<(Harness, String)> {
     let mut harness = connect().await?;
@@ -197,16 +235,9 @@ async fn spawn(
 async fn a_held_branch_is_refused_with_its_holder_named() {
     let mut harness = connect().await.expect("a harness");
     let workspace = plain_workspace(&mut harness).await.expect("a workspace");
-    let other = define(
-        &mut harness,
-        CreateWorkspaceDefinitionRequest {
-            name: "other".to_owned(),
-            repos: vec![repo("atlas", "")],
-            ..CreateWorkspaceDefinitionRequest::default()
-        },
-    )
-    .await
-    .expect("another workspace");
+    let other = other_workspace(&mut harness)
+        .await
+        .expect("another workspace");
     let (session, _root) = seed(&mut harness, "claims", "k-claims")
         .await
         .expect("a session");
@@ -335,21 +366,12 @@ async fn gc_targets_holders_and_commands_them() {
     assert_eq!(names(&answer.offline), vec!["away"]);
     assert!(answer.request_id.starts_with("gc-") && answer.sequence > 0);
 
-    let mut commands = harness
-        .worker
-        .stream_commands(StreamCommandsRequest {
-            worker_id: Some(WorkerId::new("new-worker")),
-            resume_from_command_sequence: 1,
-            resume_after_log_position: 0,
-        })
+    let mut commands = commands_of(&mut harness, "new-worker")
         .await
-        .expect("the stream opens")
-        .into_inner();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(10), commands.message())
+        .expect("the stream opens");
+    let first = next_command(&mut commands)
         .await
-        .expect("a command in time")
-        .expect("the stream")
-        .expect("a command");
+        .expect("a command in time");
     let Some(Command::WorkspaceGc(gc)) = first.command else {
         panic!("a gc command, got {first:?}");
     };
@@ -482,4 +504,238 @@ async fn instance_removal_targets_one_worker_or_says_why_not() {
             .expect_err("both are required");
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
     }
+}
+
+/// An update keeps the checkout mode and cleanup policy it does not name,
+/// and replaces the ones it does.
+#[tokio::test]
+async fn an_update_changes_only_the_checkout_mode_and_cleanup_it_names() {
+    let mut harness = connect().await.expect("a harness");
+    let created = harness
+        .control
+        .create_workspace_definition(CreateWorkspaceDefinitionRequest {
+            name: "modal".to_owned(),
+            repos: vec![repo("atlas", "")],
+            checkout_mode: CheckoutMode::Lazy.into(),
+            ..CreateWorkspaceDefinitionRequest::default()
+        })
+        .await
+        .expect("creates")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    let update = |etag: String, request: horde_proto::v1::UpdateWorkspaceDefinitionRequest| {
+        horde_proto::v1::UpdateWorkspaceDefinitionRequest {
+            workspace_definition_id: created.workspace_definition_id.clone(),
+            etag,
+            ..request
+        }
+    };
+
+    let renamed = harness
+        .control
+        .update_workspace_definition(update(
+            created.etag.clone(),
+            horde_proto::v1::UpdateWorkspaceDefinitionRequest {
+                name: "renamed".to_owned(),
+                ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
+            },
+        ))
+        .await
+        .expect("updates")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(
+        renamed.checkout_mode,
+        i32::from(CheckoutMode::Lazy),
+        "an unnamed mode is unchanged"
+    );
+
+    let cleanup = horde_proto::v1::WorkspaceCleanupPolicy {
+        idle_reclaim_after: Some(horde_proto::prost_types::Duration {
+            seconds: 90,
+            nanos: 0,
+        }),
+        archived_grace: None,
+    };
+    let changed = harness
+        .control
+        .update_workspace_definition(update(
+            renamed.etag.clone(),
+            horde_proto::v1::UpdateWorkspaceDefinitionRequest {
+                checkout_mode: CheckoutMode::All.into(),
+                cleanup: Some(cleanup),
+                ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
+            },
+        ))
+        .await
+        .expect("updates")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    assert_eq!(changed.checkout_mode, i32::from(CheckoutMode::All));
+    assert_eq!(changed.cleanup, Some(cleanup));
+    assert_eq!(changed.name, "renamed");
+
+    let kept = harness
+        .control
+        .update_workspace_definition(update(
+            changed.etag.clone(),
+            horde_proto::v1::UpdateWorkspaceDefinitionRequest::default(),
+        ))
+        .await
+        .expect("updates")
+        .into_inner()
+        .definition
+        .expect("a definition");
+    assert_eq!(kept.cleanup, Some(cleanup), "an unset cleanup is unchanged");
+    assert_eq!(kept.checkout_mode, i32::from(CheckoutMode::All));
+}
+
+/// A gc naming a workspace carries it to the command; an empty name is a
+/// whole-worker gc. A soft gc needs no force, and a forced hard one is
+/// accepted.
+#[tokio::test]
+async fn gc_carries_its_workspace_and_force_is_only_for_hard() {
+    let (mut harness, workspace) = held_workspace().await.expect("a held workspace");
+    let gc = |definition: &str, level: GcLevel, force: bool| CollectWorkspaceGarbageRequest {
+        workspace_definition_id: Some(WorkspaceDefinitionId::new(definition)),
+        worker_ids: vec![WorkerId::new("new-worker")],
+        level: level.into(),
+        force,
+        ..CollectWorkspaceGarbageRequest::default()
+    };
+    let soft = harness
+        .control
+        .collect_workspace_garbage(gc(&workspace, GcLevel::Soft, false))
+        .await
+        .expect("a soft gc needs no force")
+        .into_inner();
+    harness
+        .control
+        .collect_workspace_garbage(gc("", GcLevel::Hard, true))
+        .await
+        .expect("a forced hard gc is accepted");
+
+    let mut commands = commands_of(&mut harness, "new-worker")
+        .await
+        .expect("the stream opens");
+    let mut gcs = Vec::new();
+    while gcs.len() < 2 {
+        let next = next_command(&mut commands)
+            .await
+            .expect("a command in time");
+        if let Some(Command::WorkspaceGc(gc)) = next.command {
+            gcs.push(gc);
+        }
+    }
+    assert_eq!(gcs[0].request_id, soft.request_id);
+    assert_eq!(
+        gcs[0]
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string),
+        Some(workspace),
+        "the named workspace rides the command"
+    );
+    assert_eq!(
+        gcs[1].workspace_definition_id, None,
+        "an empty name is none"
+    );
+    assert!(gcs[1].force);
+}
+
+/// The listing filters by workspace, and an empty filter is no filter.
+#[tokio::test]
+async fn instances_list_by_workspace_and_an_empty_filter_lists_all() {
+    let (mut harness, workspace) = held_workspace().await.expect("a held workspace");
+    let other = other_workspace(&mut harness).await.expect("defines");
+    register(&mut harness, "second-worker", 2)
+        .await
+        .expect("registers");
+    report_instance(&mut harness, "second-worker", &other)
+        .await
+        .expect("reports");
+    let list = |worker: &str, definition: &str| ListWorkspaceInstancesRequest {
+        worker_id: Some(WorkerId::new(worker)),
+        workspace_definition_id: Some(WorkspaceDefinitionId::new(definition)),
+    };
+    let held_by = |instances: Vec<WorkspaceInstanceReport>| {
+        let mut pairs = instances
+            .into_iter()
+            .map(|i| {
+                (
+                    i.worker_id.map(|id| id.to_string()).unwrap_or_default(),
+                    i.workspace_definition_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        pairs.sort();
+        pairs
+    };
+    let by_workspace = harness
+        .control
+        .list_workspace_instances(list("", &other))
+        .await
+        .expect("lists")
+        .into_inner()
+        .instances;
+    assert_eq!(
+        held_by(by_workspace),
+        vec![("second-worker".to_owned(), other.clone())]
+    );
+    let everything = harness
+        .control
+        .list_workspace_instances(list("", ""))
+        .await
+        .expect("lists")
+        .into_inner()
+        .instances;
+    assert_eq!(
+        held_by(everything),
+        vec![
+            ("new-worker".to_owned(), workspace),
+            ("second-worker".to_owned(), other),
+        ]
+    );
+}
+
+/// A prewarm primes the Instance cache with a materializing entry that says
+/// why it is there, before the Worker reports anything.
+#[tokio::test]
+async fn a_prewarm_lists_its_instance_as_requested() {
+    let mut harness = connect().await.expect("a harness");
+    let workspace = plain_workspace(&mut harness).await.expect("a workspace");
+    register(&mut harness, "cold-worker", 2)
+        .await
+        .expect("registers");
+    harness
+        .control
+        .prewarm_workspace(horde_proto::v1::PrewarmWorkspaceRequest {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new(&workspace)),
+            worker_id: Some(WorkerId::new("cold-worker")),
+            session_id: None,
+        })
+        .await
+        .expect("prewarms");
+    let listed = harness
+        .control
+        .list_workspace_instances(ListWorkspaceInstancesRequest {
+            worker_id: Some(WorkerId::new("cold-worker")),
+            workspace_definition_id: None,
+        })
+        .await
+        .expect("lists")
+        .into_inner()
+        .instances;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].state,
+        i32::from(WorkspaceInstanceState::Materializing)
+    );
+    assert_eq!(listed[0].detail, "materialization requested");
 }

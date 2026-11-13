@@ -1640,6 +1640,42 @@ mod tests {
         }
     }
 
+    /// The Server's configured defaults, not the built-in ones, ride a
+    /// command from a projection given them.
+    #[test]
+    fn a_configured_workspace_policy_rides_the_commands_it_resolves() {
+        let config = crate::workspace_policy::WorkspacePolicyConfig {
+            fetch_throttle: std::time::Duration::from_secs(7),
+            ..crate::workspace_policy::WorkspacePolicyConfig::default()
+        };
+        let mut projection = CommandProjection::new().with_workspace_policy(Arc::new(config));
+        let rows = [
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(2, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued: Vec<_> = rows
+            .iter()
+            .flat_map(|global| projection.advance(global))
+            .collect();
+        assert_eq!(issued.len(), 1);
+        match issued[0].1.command.as_ref().expect("a command") {
+            Command::MaterializeWorkspace(materialize) => assert_eq!(
+                materialize
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.fetch_throttle)
+                    .map(|d| d.seconds),
+                Some(7)
+            ),
+            other => panic!("expected a materialize command, got {other:?}"),
+        }
+    }
+
     fn gc_event(request: &str, workers: &[&str], definition: Option<&str>) -> Event {
         Event {
             agent_id: None,

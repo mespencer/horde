@@ -602,3 +602,387 @@ async fn horde_new_detach_creates_headlessly_and_plain_new_refuses_first() {
         "the root agent rides along, same as session new"
     );
 }
+
+/// The ceiling on any one `horde` subprocess or wait below: generous for a
+/// loaded machine, and short of the mutation run's own test timeout, so a
+/// verb that never stops fails its test instead of hanging the binary.
+const CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`horde`], bounded by [`CEILING`].
+async fn bounded(endpoint: &str, args: &[&str]) -> Setup<Run> {
+    tokio::time::timeout(CEILING, horde(endpoint, args))
+        .await
+        .map_err(|_| format!("horde {args:?} did not finish"))?
+}
+
+/// Starts `horde` with its output piped, for a test that acts while the
+/// verb runs.
+fn started(endpoint: &str, args: &[&str]) -> Setup<tokio::process::Child> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--endpoint")
+        .arg(endpoint)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?)
+}
+
+/// The id of the newest gc request on the log, waiting for there to be
+/// more than `after` of them.
+async fn newest_gc_request(endpoint: &str, after: usize) -> Setup<String> {
+    tokio::time::timeout(CEILING, async {
+        loop {
+            let requests = common::gc_requests(endpoint).await?;
+            if requests.len() > after
+                && let Some(newest) = requests.last()
+            {
+                return Ok(newest.request_id.clone());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| "no new gc request landed")?
+}
+
+/// A served plane with the `suite` workspace defined: the endpoint, the
+/// definition and its id.
+async fn suite() -> Setup<(String, horde_proto::v1::WorkspaceDefinition, String)> {
+    let endpoint = serve().await?;
+    let definition = common::define_workspace(&endpoint, "suite").await?;
+    let id = common::definition_id(&definition);
+    Ok((endpoint, definition, id))
+}
+
+/// `instance list` prints each Instance a worker reports — where it lives
+/// and its state — and says so when a filter leaves none.
+#[tokio::test]
+async fn instance_list_prints_what_workers_report() {
+    let (endpoint, _, id) = suite().await.expect("a served suite");
+    common::report_instance(&endpoint, "test-worker", &id)
+        .await
+        .expect("reported");
+
+    let listed = bounded(&endpoint, &["workspace", "instance", "list", "suite"])
+        .await
+        .expect("the binary must run");
+    assert!(listed.success, "stderr was: {}", listed.stderr);
+    assert!(
+        listed
+            .stdout
+            .contains(&format!("{id} on test-worker: ready")),
+        "{:?}",
+        listed.stdout
+    );
+
+    let none = bounded(
+        &endpoint,
+        &["workspace", "instance", "list", "--worker", "nobody"],
+    )
+    .await
+    .expect("the binary must run");
+    assert!(none.success, "stderr was: {}", none.stderr);
+    assert_eq!(none.stdout.trim(), "no instances reported");
+}
+
+/// `workspace log` prints the housekeeping stream's events and, without
+/// `--follow`, stops once it has caught up.
+#[tokio::test]
+async fn the_log_prints_housekeeping_and_stops_at_the_end() {
+    let (endpoint, _, _) = suite().await.expect("a served suite");
+    let gc = bounded(
+        &endpoint,
+        &[
+            "workspace",
+            "gc",
+            "suite",
+            "--hard",
+            "--force",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect("the binary must run");
+    assert!(gc.success, "stderr was: {}", gc.stderr);
+    let request = newest_gc_request(&endpoint, 0)
+        .await
+        .expect("the request lands");
+
+    let log = bounded(&endpoint, &["workspace", "log"])
+        .await
+        .expect("the binary must run");
+    assert!(log.success, "stderr was: {}", log.stderr);
+    let line = log
+        .stdout
+        .lines()
+        .find(|line| line.contains(&format!("gc {request} requested by")))
+        .unwrap_or_else(|| panic!("the request is printed: {:?}", log.stdout));
+    assert!(line.ends_with(": hard --force"), "{line}");
+}
+
+/// `workspace log --follow` keeps reading past the end of the stream: an
+/// event appended after it caught up is printed too. Bounded on both ends —
+/// each line has [`CEILING`] to arrive, and the follower is killed after.
+#[tokio::test]
+async fn the_log_follows_events_appended_after_it_caught_up() {
+    use tokio::io::AsyncBufReadExt as _;
+    let (endpoint, _, _) = suite().await.expect("a served suite");
+    let gc = |level: &'static str| {
+        let endpoint = endpoint.clone();
+        async move {
+            let run = bounded(
+                &endpoint,
+                &["workspace", "gc", "suite", level, "--wait", "1s"],
+            )
+            .await
+            .expect("the binary must run");
+            assert!(run.success, "stderr was: {}", run.stderr);
+        }
+    };
+    gc("--soft").await;
+    let first = newest_gc_request(&endpoint, 0)
+        .await
+        .expect("the request lands");
+
+    let mut follower =
+        started(&endpoint, &["workspace", "log", "--follow"]).expect("the follower starts");
+    let stdout = follower.stdout.take().expect("piped stdout");
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut next_line_naming = async |request: &str| loop {
+        let line = tokio::time::timeout(CEILING, lines.next_line())
+            .await
+            .unwrap_or_else(|_| panic!("a line naming {request} must arrive"))
+            .expect("stdout reads");
+        let Some(line) = line else {
+            panic!("the follower stopped before printing {request}");
+        };
+        if line.contains(request) {
+            return line;
+        }
+    };
+    next_line_naming(&first).await;
+
+    // The follower has replayed the first request, so it has caught up or is
+    // about to; this one is appended after.
+    gc("--hard").await;
+    let second = newest_gc_request(&endpoint, 1)
+        .await
+        .expect("the request lands");
+    let line = next_line_naming(&second).await;
+    assert!(line.contains("hard"), "{line}");
+    follower.kill().await.expect("the follower stops");
+}
+
+/// A dry run's heading is human output only: a `--json` dry run prints
+/// none, a real run prints none, and a human dry run opens with it.
+#[tokio::test]
+async fn only_a_human_dry_run_prints_the_dry_run_heading() {
+    let (endpoint, _, _) = suite().await.expect("a served suite");
+    let heading = horde_cli::workspace_gc::DRY_RUN_HEADING;
+    let human_dry = bounded(
+        &endpoint,
+        &["workspace", "gc", "suite", "--dry-run", "--wait", "1s"],
+    )
+    .await
+    .expect("the binary must run");
+    assert!(human_dry.success, "stderr was: {}", human_dry.stderr);
+    assert!(
+        human_dry.stdout.starts_with(heading),
+        "{:?}",
+        human_dry.stdout
+    );
+    for args in [
+        &[
+            "--json",
+            "workspace",
+            "gc",
+            "suite",
+            "--dry-run",
+            "--wait",
+            "1s",
+        ][..],
+        &["workspace", "gc", "suite", "--wait", "1s"][..],
+    ] {
+        let run = bounded(&endpoint, args).await.expect("the binary must run");
+        assert!(run.success, "stderr was: {}", run.stderr);
+        assert!(!run.stdout.contains(heading), "{args:?}: {:?}", run.stdout);
+    }
+}
+
+/// `workspace delete` says it deleted the definition — except for a dry-run
+/// purge, which deletes nothing and must not claim to.
+#[tokio::test]
+async fn delete_reports_a_deletion_only_when_one_happened() {
+    let (endpoint, definition, id) = suite().await.expect("a served suite");
+    let dry = bounded(
+        &endpoint,
+        &[
+            "workspace",
+            "delete",
+            &id,
+            "--etag",
+            &definition.etag,
+            "--purge",
+            "--dry-run",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect("the binary must run");
+    assert!(dry.success, "stderr was: {}", dry.stderr);
+    assert!(!dry.stdout.contains("deleted"), "{:?}", dry.stdout);
+
+    let real = bounded(
+        &endpoint,
+        &["workspace", "delete", &id, "--etag", &definition.etag],
+    )
+    .await
+    .expect("the binary must run");
+    assert!(real.success, "stderr was: {}", real.stderr);
+    assert_eq!(real.stdout.trim(), format!("deleted {id}"));
+}
+
+/// `workspace create --from-cwd` defines a one-repo workspace from the git
+/// repo the shell is in: named for its directory, at its origin URL, on
+/// origin's default branch.
+#[tokio::test]
+async fn create_from_cwd_reads_the_repo_the_shell_is_in() {
+    let endpoint = serve().await.expect("a listening server");
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let repo = temp.path().join("cwd-atlas");
+    std::fs::create_dir(&repo).expect("the repo dir");
+    for args in [
+        &["init", "--quiet"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/cwd-atlas.git",
+        ][..],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ][..],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+    let created = tokio::time::timeout(
+        CEILING,
+        Command::new(env!("CARGO_BIN_EXE_horde"))
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .args(["workspace", "create", "--from-cwd"])
+            .current_dir(&repo)
+            .output(),
+    )
+    .await
+    .expect("bounded")
+    .expect("the binary runs");
+    assert!(
+        created.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("a client");
+    let definition = client
+        .get_workspace_definition("cwd-atlas")
+        .await
+        .expect("named for its directory")
+        .definition
+        .expect("a definition");
+    assert_eq!(definition.repos.len(), 1);
+    assert_eq!(definition.repos[0].name, "cwd-atlas");
+    assert_eq!(
+        definition.repos[0].remote_url,
+        "https://example.invalid/cwd-atlas.git"
+    );
+    assert_eq!(definition.repos[0].default_branch, "trunk");
+}
+
+/// A gc waits for the targeted worker's answer and prints it: its cleanup
+/// as rows, then a summary counting it — and exits 0 once it has answered
+/// cleanly.
+#[tokio::test]
+async fn a_gc_waits_for_the_workers_answer_and_prints_it() {
+    let (endpoint, definition, id) = suite().await.expect("a served suite");
+    common::register_workspace_worker(&endpoint, "test-worker")
+        .await
+        .expect("registered");
+    common::report_instance(&endpoint, "test-worker", &id)
+        .await
+        .expect("reported");
+
+    let gc = started(
+        &endpoint,
+        &["workspace", "gc", "suite", "--hard", "--wait", "25s"],
+    )
+    .expect("the gc starts");
+    let request = newest_gc_request(&endpoint, 0)
+        .await
+        .expect("the request lands");
+    let worker = Some(horde_proto::v1::WorkerId::new("test-worker"));
+    let answers = [
+        horde_proto::v1::event::Kind::WorkspaceCleanup(horde_proto::v1::WorkspaceCleanup {
+            worker_id: worker.clone(),
+            workspace_definition_id: definition.workspace_definition_id.clone(),
+            tier: horde_proto::v1::CleanupTier::Hard.into(),
+            gc_request_id: request.clone(),
+            repos: vec![horde_proto::v1::workspace_cleanup::RepoAction {
+                repo_name: "atlas".to_owned(),
+                outcome: horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done.into(),
+                bytes_freed: 2048,
+                ..horde_proto::v1::workspace_cleanup::RepoAction::default()
+            }],
+            ..horde_proto::v1::WorkspaceCleanup::default()
+        }),
+        horde_proto::v1::event::Kind::WorkspaceGcCompleted(horde_proto::v1::WorkspaceGcCompleted {
+            request_id: request.clone(),
+            worker_id: worker,
+            bytes_freed: 2048,
+            ..horde_proto::v1::WorkspaceGcCompleted::default()
+        }),
+    ];
+    for (sequence, kind) in (1_u64..).zip(answers) {
+        common::journal_event_at(
+            &endpoint,
+            horde_proto::WORKSPACE_HOUSEKEEPING_STREAM,
+            sequence,
+            horde_proto::v1::Event {
+                kind: Some(kind),
+                ..horde_proto::v1::Event::default()
+            },
+        )
+        .await
+        .expect("the worker's answer lands");
+    }
+
+    let output = tokio::time::timeout(CEILING, gc.wait_with_output())
+        .await
+        .expect("the gc finishes once answered")
+        .expect("the gc's output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("test-worker  -  atlas  hard done  2 KiB"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1 of 1 worker(s) answered; 2 KiB freed"),
+        "{stdout}"
+    );
+}

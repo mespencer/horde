@@ -229,6 +229,21 @@ mod tests {
         assert_eq!(list(dir.path()).await.len(), 1);
     }
 
+    /// Only an absent record is fine to remove: a record path that cannot
+    /// be removed (here a directory squatting on it) is an error, not a
+    /// silent success.
+    #[tokio::test]
+    async fn a_record_that_cannot_be_removed_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let squatter = ledger_dir(dir.path()).join("agent-a.json");
+        std::fs::create_dir_all(squatter.join("inside")).expect("a directory in the way");
+        let error = remove(dir.path(), "agent-a")
+            .await
+            .expect_err("a directory is not removable as a record");
+        assert!(error.contains("could not remove"), "{error}");
+        assert!(squatter.exists());
+    }
+
     #[test]
     fn a_record_knows_its_repos_and_policy() {
         let mut record = record("agent-a");

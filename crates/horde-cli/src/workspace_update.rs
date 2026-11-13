@@ -133,8 +133,39 @@ mod tests {
             name: "atlas".to_owned(),
             unmanaged_paths: vec!["datasets".to_owned()],
             etag: "read-etag".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
+                name: "atlas".to_owned(),
+                remote_url: "https://git.example/atlas.git".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
+            }],
             ..WorkspaceDefinition::default()
         }
+    }
+
+    /// A reclaim change with no `--repo` carries the current repo set with
+    /// only its reclaim edited; a timeout alone needs a command, so it is
+    /// checked against that same current set.
+    #[test]
+    fn a_reclaim_alone_rides_the_current_repos() {
+        let request = request_from(
+            &parsed(&["atlas", "--etag", "e", "--reclaim", "atlas=auto"]),
+            &current(),
+        )
+        .expect("a request");
+        assert_eq!(request.repos.len(), 1);
+        assert_eq!(request.repos[0].remote_url, "https://git.example/atlas.git");
+        assert!(request.repos[0].reclaim.is_some(), "the reclaim landed");
+
+        let timeout_only = request_from(
+            &parsed(&["atlas", "--etag", "e", "--reclaim-timeout", "atlas=5m"]),
+            &current(),
+        )
+        .expect_err("a timeout needs a command");
+        assert!(
+            !timeout_only.report().contains("not one of"),
+            "the timeout was checked against the current repos: {}",
+            timeout_only.report()
+        );
     }
 
     #[test]

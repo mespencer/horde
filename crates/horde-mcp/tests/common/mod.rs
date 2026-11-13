@@ -452,6 +452,72 @@ pub mod mcp_client {
 
 // Unused where a binary never waits on the log; the module-scoped `dead_code`
 // allow does not reach imports.
+/// A session whose root works in a one-repo workspace (`atlas`), on a
+/// server of its own: what the workspace-aware spawn and checkout paths
+/// need, since the Server fills a child's workspace from its parent's spec.
+pub struct WorkspaceSession {
+    pub endpoint: String,
+    pub session_id: String,
+    pub root: String,
+    pub definition: horde_proto::v1::WorkspaceDefinition,
+}
+
+/// Defines the `atlas` workspace and roots a session in it, with `root`'s
+/// other fields (type, model) as the caller gives them.
+pub async fn workspace_session(root: horde_proto::v1::AgentSpec) -> Setup<WorkspaceSession> {
+    let endpoint = horde_server_testkit::serve().await?;
+    let definition = horde_server_testkit::define_atlas_workspace(&endpoint, "atlas-ws").await?;
+    let mut client = Client::connect(&endpoint).await?;
+    let (summary, root) = client
+        .create_session_with(
+            "lineage",
+            horde_proto::v1::AgentSpec {
+                workspace_definition_id: definition.workspace_definition_id.clone(),
+                ..root
+            },
+            "",
+        )
+        .await?;
+    let session_id = summary
+        .session_id
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or("a session id")?;
+    Ok(WorkspaceSession {
+        endpoint,
+        session_id,
+        root: root.to_string(),
+        definition,
+    })
+}
+
+/// The spec the log recorded for `agent_id`'s spawn.
+pub async fn recorded_spec(
+    endpoint: &str,
+    session_id: &str,
+    agent_id: &str,
+) -> Setup<Option<horde_proto::v1::AgentSpec>> {
+    let mut client = Client::connect(endpoint).await?;
+    let mut recorded = None;
+    client
+        .sync(
+            &horde_cli::client::SyncOptions::new(session_id.to_owned()),
+            |envelope| {
+                let Some(event) = envelope.event.as_ref() else {
+                    return;
+                };
+                if event.agent_id.as_ref().map(ToString::to_string).as_deref() == Some(agent_id)
+                    && let Some(horde_proto::v1::event::Kind::AgentSpawned(spawned)) = &event.kind
+                {
+                    recorded.clone_from(&spawned.spec);
+                }
+            },
+            |_| {},
+        )
+        .await?;
+    Ok(recorded)
+}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 pub use bounds::{stage, within};

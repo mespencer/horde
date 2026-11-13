@@ -378,6 +378,27 @@ mod tests {
         .expect("some");
         assert_eq!(cleanup.idle_reclaim_after.map(|d| d.seconds), Some(0));
         assert_eq!(cleanup.archived_grace.map(|d| d.seconds), Some(86_400));
+
+        // Either override alone is still an override; the other stays unset.
+        let idle_only = cleanup_from(&WorkspacePolicyArgs {
+            idle_reclaim_after: Some("4h".to_owned()),
+            ..WorkspacePolicyArgs::default()
+        })
+        .expect("parses")
+        .expect("an idle override alone");
+        assert_eq!(
+            idle_only.idle_reclaim_after.map(|d| d.seconds),
+            Some(14_400)
+        );
+        assert_eq!(idle_only.archived_grace, None);
+        let grace_only = cleanup_from(&WorkspacePolicyArgs {
+            archived_grace: Some("1h".to_owned()),
+            ..WorkspacePolicyArgs::default()
+        })
+        .expect("parses")
+        .expect("a grace override alone");
+        assert_eq!(grace_only.archived_grace.map(|d| d.seconds), Some(3_600));
+        assert_eq!(grace_only.idle_reclaim_after, None);
     }
 
     #[test]

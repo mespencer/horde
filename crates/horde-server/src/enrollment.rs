@@ -498,4 +498,15 @@ mod tests {
             Vec::<String>::new()
         );
     }
+
+    /// Both workspace streams are reserved on their own: neither is a
+    /// session, while an ordinary session id is one.
+    #[test]
+    fn the_workspace_catalog_and_housekeeping_streams_are_each_reserved() {
+        assert!(super::is_reserved_stream(crate::workspace::CATALOG_STREAM));
+        assert!(super::is_reserved_stream(
+            horde_proto::WORKSPACE_HOUSEKEEPING_STREAM
+        ));
+        assert!(!super::is_reserved_stream("session-1"));
+    }
 }
