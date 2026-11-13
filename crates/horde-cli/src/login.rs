@@ -379,6 +379,21 @@ async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>) {
     }
 }
 
+/// Sends `now` when it differs from `last` (and remembers it), returning
+/// whether the watcher should keep going — `false` once the pump is gone.
+/// The polling watcher's step on Windows, kept here where it is tested.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) async fn send_if_changed(
+    resize_tx: &tokio::sync::mpsc::Sender<(u16, u16)>,
+    last: &mut (u16, u16),
+    now: (u16, u16),
+) -> bool {
+    if std::mem::replace(last, now) == now {
+        return true;
+    }
+    resize_tx.send(now).await.is_ok()
+}
+
 /// The verb's verdict on how the pump ended: the clean exit code to print,
 /// or the failure in the operator's words. Pure, so its table is pinned by
 /// unit tests rather than staged through a terminal.
@@ -469,6 +484,28 @@ mod tests {
         }
         assert_eq!(sent, Some(super::terminal_size()));
         watcher.abort();
+    }
+
+    /// A polled size is sent only when it changed, and remembered; a gone
+    /// pump stops the watcher, an unchanged size never asks it to.
+    #[tokio::test]
+    async fn a_polled_size_is_sent_only_when_it_changes() {
+        let (resize_tx, mut resizes) = tokio::sync::mpsc::channel(4);
+        let mut last = (80, 24);
+        assert!(super::send_if_changed(&resize_tx, &mut last, (80, 24)).await);
+        assert!(resizes.try_recv().is_err(), "an unchanged size is not sent");
+        assert!(super::send_if_changed(&resize_tx, &mut last, (100, 30)).await);
+        assert_eq!(resizes.try_recv().ok(), Some((100, 30)));
+        assert_eq!(last, (100, 30), "the sent size is remembered");
+        drop(resizes);
+        assert!(
+            super::send_if_changed(&resize_tx, &mut last, (100, 30)).await,
+            "no send, so a gone pump is not noticed yet"
+        );
+        assert!(
+            !super::send_if_changed(&resize_tx, &mut last, (90, 30)).await,
+            "a change to a gone pump stops the watcher"
+        );
     }
 
     /// The scripted relay: feed frames in, observe what the client sent.

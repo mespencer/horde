@@ -55,11 +55,8 @@ pub(crate) async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16
     loop {
         tick.tick().await;
         let now = crate::login::terminal_size();
-        if now != last {
-            last = now;
-            if resize_tx.send(now).await.is_err() {
-                return;
-            }
+        if !crate::login::send_if_changed(&resize_tx, &mut last, now).await {
+            return;
         }
     }
 }
@@ -71,12 +68,9 @@ pub(crate) async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16
 #[cfg(windows)]
 pub(crate) fn stop_signals() -> Result<impl std::future::Future<Output = ()>, crate::ClientError> {
     use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
-    let failed = |error: std::io::Error| {
-        crate::ClientError::Up(format!("cannot listen for signals: {error}"))
-    };
-    let mut interrupt = ctrl_c().map_err(failed)?;
-    let mut broke = ctrl_break().map_err(failed)?;
-    let mut closed = ctrl_close().map_err(failed)?;
+    let (mut interrupt, mut broke, mut closed) = ctrl_c()
+        .and_then(|interrupt| Ok((interrupt, ctrl_break()?, ctrl_close()?)))
+        .map_err(|error| crate::ClientError::Up(format!("cannot listen for signals: {error}")))?;
     Ok(async move {
         tokio::select! {
             _ = interrupt.recv() => {}

@@ -872,16 +872,14 @@ mod tests {
         assert_eq!(code, Some(7), "the exit code is the command's own");
     }
 
-    /// The kill path: a command that would run forever is killed by handle
-    /// and provably reaped — the wait returns — with no orphan left behind.
+    /// A shell that would run forever, in an 80x24 PTY.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn killing_a_login_reaps_it_provably() {
+    fn endless_session() -> super::PtySession {
         let recipe = LoginRecipe::terminal_only(
             "/bin/sh",
             vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
         );
-        let mut session = spawn_login_pty(
+        spawn_login_pty(
             &recipe,
             PtySize {
                 rows: 24,
@@ -890,7 +888,15 @@ mod tests {
                 pixel_height: 0,
             },
         )
-        .expect("the shell spawns");
+        .expect("the shell spawns")
+    }
+
+    /// The kill path: a command that would run forever is killed by handle
+    /// and provably reaped — the wait returns — with no orphan left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killing_a_login_reaps_it_provably() {
+        let mut session = endless_session();
 
         // A signal death has whatever code the platform reports; the reap
         // returning at all is the witness that matters.
@@ -905,20 +911,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_resize_reaches_the_pty() {
-        let recipe = LoginRecipe::terminal_only(
-            "/bin/sh",
-            vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
-        );
-        let mut session = spawn_login_pty(
-            &recipe,
-            PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-        )
-        .expect("the shell spawns");
+        let mut session = endless_session();
         let wanted = PtySize {
             rows: 40,
             cols: 132,
