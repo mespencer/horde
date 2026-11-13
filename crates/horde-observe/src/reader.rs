@@ -302,10 +302,9 @@ pub fn select(mut records: Vec<Record>, filter: &Filter, window: &Window) -> Sel
             truncated,
         };
     }
-    if let Some(tail) = window.tail
-        && matched.len() > tail
-    {
-        matched.drain(..matched.len() - tail);
+    if let Some(tail) = window.tail {
+        let older = matched.len().saturating_sub(tail);
+        matched.drain(..older);
     }
     if let Some(cap) = window.max_bytes {
         let mut used = 0;
@@ -501,10 +500,55 @@ mod tests {
         selection.records.iter().map(Record::message).collect()
     }
 
+    /// A follow step that must finish: a filter that admits nothing fails
+    /// here in seconds instead of waiting forever on a live tap.
+    async fn bounded<F: std::future::Future>(future: F) -> Option<F::Output> {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .ok()
+    }
+
+    #[test]
+    fn a_local_log_with_a_tap_can_be_followed() {
+        let tap = LogTap::default();
+        let logs = LocalLogs::new("/nowhere", "horde-worker", Some(tap.clone()));
+        let mut receiver = logs.tap().expect("followable").subscribe();
+        tap.publish(Arc::from("seen"));
+        assert_eq!(receiver.try_recv().as_deref(), Ok("seen"));
+    }
+
+    #[test]
+    fn a_tail_exactly_as_long_as_the_matches_keeps_them_all() {
+        let records: Vec<Record> = (1..=3)
+            .map(|n| rec(n, "INFO", &format!("m{n}"), ""))
+            .collect();
+        let tail = Window {
+            tail: Some(3),
+            ..Window::default()
+        };
+        assert_eq!(
+            msgs(&select(records, &Filter::default(), &tail)),
+            ["m1", "m2", "m3"]
+        );
+    }
+
     #[test]
     fn levels_parse_and_order() {
-        assert_eq!(Level::parse("WARN"), Ok(Level::Warn));
-        assert_eq!(Level::parse("warning"), Ok(Level::Warn));
+        for (name, level) in [
+            ("trace", Level::Trace),
+            ("DEBUG", Level::Debug),
+            ("Info", Level::Info),
+            ("WARN", Level::Warn),
+            ("warning", Level::Warn),
+            ("error", Level::Error),
+        ] {
+            assert_eq!(Level::parse(name), Ok(level), "{name}");
+            assert_eq!(
+                Level::parse(level.as_str()),
+                Ok(level),
+                "{name} round trips"
+            );
+        }
         assert!(Level::parse("loud").is_err());
         assert!(Level::Trace < Level::Debug && Level::Warn < Level::Error);
         assert_eq!(Level::Info.as_str(), "info");
@@ -767,16 +811,23 @@ torn"#,
         };
         let mut last: Option<Cursor> = Some(old.key.clone());
         let target = Target::Agent("a1".to_owned());
-        match next_followed(&mut receiver, &target, &filter, &mut last).await {
+        match bounded(next_followed(&mut receiver, &target, &filter, &mut last))
+            .await
+            .expect("a lag is reported, not waited on")
+        {
             Some(Followed::Lagged(1)) => {}
             other => panic!("expected a lag of one, got {other:?}"),
         }
-        let followed = next_followed(&mut receiver, &target, &filter, &mut last).await;
+        let followed = bounded(next_followed(&mut receiver, &target, &filter, &mut last))
+            .await
+            .expect("an admitted record arrives");
         assert_eq!(followed, Some(Followed::Record(fresh.clone())));
         assert_eq!(last.as_ref(), Some(&fresh.key));
         drop(tap);
         assert_eq!(
-            next_followed(&mut receiver, &target, &filter, &mut last).await,
+            bounded(next_followed(&mut receiver, &target, &filter, &mut last))
+                .await
+                .expect("a closed tap ends the follow"),
             None
         );
         assert_eq!(fresh.key.source, Source::Horde);

@@ -260,9 +260,9 @@ mod tests {
         assert_eq!(record.key.boot, "boot1");
         assert!(
             receiver
-                .recv()
-                .await
-                .is_ok_and(|line| line.contains("deprecated"))
+                .try_recv()
+                .is_ok_and(|line| line.contains("deprecated")),
+            "published as it was written"
         );
         assert_eq!(writer.agent(), "agent-1");
     }

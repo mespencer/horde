@@ -599,7 +599,10 @@ mod tests {
             tracing::info!(target: QUIET_TARGET, "serving a query");
             tracing::info!("visible");
         });
-        let seen = tap.recv().await.expect("one record");
+        let seen = tokio::time::timeout(Duration::from_secs(5), tap.recv())
+            .await
+            .expect("the record reaches the tap")
+            .expect("one record");
         assert!(seen.contains("visible"), "{seen}");
         assert!(
             tap.try_recv().is_err(),

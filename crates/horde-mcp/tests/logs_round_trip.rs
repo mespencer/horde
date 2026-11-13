@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::mcp_client::McpClient;
-use common::{Setup, seeded_on};
+use common::{Setup, seeded_on, within};
 use horde_mcp::endpoint::HordeEndpoint;
 use horde_mcp::identity::AgentRegistry;
 use horde_mcp::logs::LogAccess;
@@ -93,7 +93,7 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     );
 
     let own = view(
-        &mcp.call_tool("logs", serde_json::json!({}))
+        &within("a logs call", mcp.call_tool("logs", serde_json::json!({})))
             .await
             .expect("self"),
     )
@@ -109,9 +109,12 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     assert!(own["next_cursor"].is_string());
 
     let server = view(
-        &mcp.call_tool(
-            "logs",
-            serde_json::json!({"target": "server", "grep": "minted"}),
+        &within(
+            "a logs call",
+            mcp.call_tool(
+                "logs",
+                serde_json::json!({"target": "server", "grep": "minted"}),
+            ),
         )
         .await
         .expect("server"),
@@ -130,9 +133,12 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     // Paging past everything: no records, and the cursor stays put.
     let later = "2999-01-01T00:00:00.000000Z~horde~~0";
     let past = view(
-        &mcp.call_tool(
-            "logs",
-            serde_json::json!({"target": "server", "cursor": later}),
+        &within(
+            "a logs call",
+            mcp.call_tool(
+                "logs",
+                serde_json::json!({"target": "server", "cursor": later}),
+            ),
         )
         .await
         .expect("paged"),
@@ -142,9 +148,12 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     assert_eq!(past["next_cursor"], later, "{past}");
 
     let capped = view(
-        &mcp.call_tool(
-            "logs",
-            serde_json::json!({"target": "server", "max_bytes": 1}),
+        &within(
+            "a logs call",
+            mcp.call_tool(
+                "logs",
+                serde_json::json!({"target": "server", "max_bytes": 1}),
+            ),
         )
         .await
         .expect("capped"),
@@ -155,10 +164,12 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
 
     // The burst of four is spent: the fifth call is a tool error the model
     // reads, not a protocol error.
-    let limited = mcp
-        .call_tool_raw("logs", serde_json::json!({}))
-        .await
-        .expect("an answer");
+    let limited = within(
+        "a logs call",
+        mcp.call_tool_raw("logs", serde_json::json!({})),
+    )
+    .await
+    .expect("an answer");
     assert_eq!(limited["result"]["isError"], true, "{limited}");
     assert!(limited.to_string().contains("retry after"), "{limited}");
 }
