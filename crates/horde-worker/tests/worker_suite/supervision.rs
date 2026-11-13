@@ -1104,6 +1104,34 @@ mod stdio_prompts {
         .await
     }
 
+    /// A live session on a one-prompt script, sent its turn and drained to the
+    /// prompt: the session, the prompt, and the control log's path (with the
+    /// directories that must outlive the child).
+    struct Prompted {
+        session: Box<dyn horde_adapter::AgentSession>,
+        request: horde_adapter::ProposedToolCall,
+        log_path: std::path::PathBuf,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    async fn prompted(request_id: &str, tool: &str, input: &Value) -> Prompted {
+        let log = tempfile::tempdir().expect("a scratch dir");
+        let log_path = log.path().join("control.log");
+        let (mut session, dir) = session_on(
+            &awaiting(request_id, tool, input),
+            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        )
+        .await;
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        let request = until_requested(&mut session).await;
+        Prompted {
+            session,
+            request,
+            log_path,
+            _dirs: (log, dir),
+        }
+    }
+
     /// The control_response the child received, parsed.
     async fn response_received(log_path: &std::path::Path) -> Value {
         let recorded = control_log_reaches(log_path, |log| log.contains("control_response")).await;
@@ -1118,20 +1146,17 @@ mod stdio_prompts {
     /// the harness's own request id, and the stalled turn then completes.
     #[tokio::test]
     async fn a_narrowed_allow_reaches_the_harness_and_the_turn_completes() {
-        let log = tempfile::tempdir().expect("a scratch dir");
-        let log_path = log.path().join("control.log");
-        let (mut session, _dir) = session_on(
-            &awaiting(
-                "r1",
-                "Write",
-                &json!({"file_path": "/w/x", "content": "ORIGINAL"}),
-            ),
-            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
+        let Prompted {
+            mut session,
+            request,
+            log_path,
+            _dirs,
+        } = prompted(
+            "r1",
+            "Write",
+            &json!({"file_path": "/w/x", "content": "ORIGINAL"}),
         )
         .await;
-        session.send(TurnInput::queued("go")).await.expect("sends");
-
-        let request = until_requested(&mut session).await;
         assert_eq!(request.tool_name, "Write");
         assert_eq!(request.tool_call_id.as_str(), "toolu_r1");
 
@@ -1165,18 +1190,14 @@ mod stdio_prompts {
     /// An AskUserQuestion answer reaches the harness keyed by question text.
     #[tokio::test]
     async fn an_answer_reaches_the_harness_keyed_by_question_text() {
-        let log = tempfile::tempdir().expect("a scratch dir");
-        let log_path = log.path().join("control.log");
         let input = json!({"questions": [{"question": "Colour?", "header": "C",
             "options": [{"label": "Red", "description": ""}], "multiSelect": false}]});
-        let (mut session, _dir) = session_on(
-            &awaiting("r2", "AskUserQuestion", &input),
-            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-        )
-        .await;
-        session.send(TurnInput::queued("go")).await.expect("sends");
-
-        let request = until_requested(&mut session).await;
+        let Prompted {
+            mut session,
+            request,
+            log_path,
+            _dirs,
+        } = prompted("r2", "AskUserQuestion", &input).await;
         assert!(request.is_question());
         assert_eq!(request.questions[0].id, "Colour?");
 
@@ -1202,15 +1223,12 @@ mod stdio_prompts {
     /// agent reads, and the denial is journaled — never a silent allow.
     #[tokio::test]
     async fn answers_to_a_plain_tool_are_denied_and_journaled() {
-        let log = tempfile::tempdir().expect("a scratch dir");
-        let log_path = log.path().join("control.log");
-        let (mut session, _dir) = session_on(
-            &awaiting("r3", "Bash", &json!({"command": "ls"})),
-            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-        )
-        .await;
-        session.send(TurnInput::queued("go")).await.expect("sends");
-        let request = until_requested(&mut session).await;
+        let Prompted {
+            mut session,
+            request,
+            log_path,
+            _dirs,
+        } = prompted("r3", "Bash", &json!({"command": "ls"})).await;
 
         session
             .answer_permission(
@@ -1249,15 +1267,12 @@ mod stdio_prompts {
     /// then sends the interrupt.
     #[tokio::test]
     async fn an_interrupt_withdraws_a_parked_prompt_before_interrupting() {
-        let log = tempfile::tempdir().expect("a scratch dir");
-        let log_path = log.path().join("control.log");
-        let (mut session, _dir) = session_on(
-            &awaiting("r4", "Write", &json!({})),
-            &[("HORDE_STUB_CONTROL_LOG", &log_path.to_string_lossy())],
-        )
-        .await;
-        session.send(TurnInput::queued("go")).await.expect("sends");
-        let request = until_requested(&mut session).await;
+        let Prompted {
+            mut session,
+            request,
+            log_path,
+            _dirs,
+        } = prompted("r4", "Write", &json!({})).await;
 
         session.interrupt().await.expect("interrupts");
         let recorded = control_log_reaches(&log_path, |log| {

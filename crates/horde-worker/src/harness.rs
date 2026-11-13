@@ -252,36 +252,7 @@ impl SecretFile {
 
 /// The journal is the production ledger: a group remembered there survives
 /// the Worker, which is the whole point.
-/// Runs `program --version` once, bounded, and classifies what it said
-/// against `table` (W12c).
-///
-/// The child is killed if the ceiling fires (`kill_on_drop`), so a wedged
-/// binary costs the ceiling once and leaves nothing behind. Every failure —
-/// a missing binary, a hang, unreadable output — reads as an unreadable
-/// version: untested, never supported and never refused, with the reason
-/// kept for the journal and `horde doctor`.
-pub async fn probe_version(
-    program: &str,
-    table: horde_adapter::SupportTable,
-    ceiling: std::time::Duration,
-) -> horde_adapter::VersionReport {
-    let probe = tokio::process::Command::new(program)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(ceiling, probe).await {
-        Err(_elapsed) => horde_adapter::VersionReport::unreadable(
-            table,
-            format!("`{program} --version` answered nothing within {ceiling:?}"),
-        ),
-        Ok(Err(error)) => horde_adapter::VersionReport::unreadable(
-            table,
-            format!("`{program} --version` could not run: {error}"),
-        ),
-        Ok(Ok(output)) => table.classify(&String::from_utf8_lossy(&output.stdout)),
-    }
-}
+pub use horde_adapter::version::probe_version;
 
 #[async_trait::async_trait]
 impl GroupLedger for Journal {

@@ -143,16 +143,37 @@ async fn answer_permission(
     outcome: PermissionOutcome,
     updated_input: Option<horde_proto::prost_types::Struct>,
 ) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
+    send_answer(
+        harness,
+        horde_proto::v1::AnswerPermissionRequest {
+            reason: reason.to_owned(),
+            updated_input,
+            ..answer_to(request_id, outcome)
+        },
+    )
+    .await
+}
+
+/// The answer every helper starts from: this request, this outcome, nothing
+/// else.
+fn answer_to(
+    request_id: &str,
+    outcome: PermissionOutcome,
+) -> horde_proto::v1::AnswerPermissionRequest {
+    horde_proto::v1::AnswerPermissionRequest {
+        request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
+        outcome: outcome as i32,
+        ..horde_proto::v1::AnswerPermissionRequest::default()
+    }
+}
+
+async fn send_answer(
+    harness: &mut Harness,
+    request: horde_proto::v1::AnswerPermissionRequest,
+) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
     harness
         .control
-        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
-            request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
-            outcome: outcome as i32,
-            reason: reason.to_owned(),
-            remember_for_session: false,
-            updated_input,
-            answers: std::collections::HashMap::new(),
-        })
+        .answer_permission(request)
         .await
         .map(tonic::Response::into_inner)
 }
@@ -720,14 +741,10 @@ async fn answer_question(
     remember: bool,
     answers: &[(&str, &[&str])],
 ) -> Result<horde_proto::v1::AnswerPermissionResponse, tonic::Status> {
-    harness
-        .control
-        .answer_permission(horde_proto::v1::AnswerPermissionRequest {
-            request_id: Some(horde_proto::v1::PermissionRequestId::new(request_id)),
-            outcome: outcome as i32,
-            reason: String::new(),
+    send_answer(
+        harness,
+        horde_proto::v1::AnswerPermissionRequest {
             remember_for_session: remember,
-            updated_input: None,
             answers: answers
                 .iter()
                 .map(|(key, values)| {
@@ -739,9 +756,10 @@ async fn answer_question(
                     )
                 })
                 .collect(),
-        })
-        .await
-        .map(tonic::Response::into_inner)
+            ..answer_to(request_id, outcome)
+        },
+    )
+    .await
 }
 
 /// A question is settled by answers or a denial and nothing else, answers

@@ -191,7 +191,7 @@ pub async fn report(inputs: &Inputs) -> Vec<Check> {
     for (check, found) in harnesses {
         checks.push(check);
         if let Some((name, path)) = found {
-            let output = version_output(&path).await;
+            let output = horde_adapter::version::run_version(&path, VERSION_CEILING).await;
             checks.push(harness_version_check(&name, output));
         }
     }
@@ -379,21 +379,6 @@ pub fn harness_checks(
             }
         })
         .collect()
-}
-
-/// One bounded `--version` run: what the binary printed, or why it printed
-/// nothing.
-async fn version_output(program: &Path) -> Result<String, String> {
-    let probe = tokio::process::Command::new(program)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(VERSION_CEILING, probe).await {
-        Err(_elapsed) => Err(format!("answered nothing within {VERSION_CEILING:?}")),
-        Ok(Err(error)) => Err(format!("could not run: {error}")),
-        Ok(Ok(output)) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
-    }
 }
 
 /// A harness's version, classified against its adapter's measured range:
