@@ -134,7 +134,7 @@ fn render_inbox(app: &App, frame: &mut Frame<'_>) {
         frame,
         header_line("inbox", entries.len(), app),
         rows,
-        "[y] allow  [n] deny  [enter] attach  [o] overview  [q] quit",
+        "[y] allow  [1-9] answer  [n] deny  [enter] attach  [o] overview  [q] quit",
     );
 }
 
@@ -326,7 +326,23 @@ fn permission_summary(permission: &PendingPermission) -> String {
     } else {
         permission.tree_path.join(" > ")
     };
-    let mut text = format!("{who} wants `{}`", permission.rendered);
+    let mut text = match permission.questions.as_slice() {
+        [] => format!("{who} wants `{}`", permission.rendered),
+        [question, rest @ ..] => {
+            let mut asked = format!("{who} asks: {}", question.question);
+            for (index, option) in question.options.iter().enumerate() {
+                asked.push_str(&format!("  [{}] {option}", index + 1));
+            }
+            if !rest.is_empty() {
+                asked.push_str(&format!(
+                    "  (+{} more; `horde answer {}`)",
+                    rest.len(),
+                    permission.request_id
+                ));
+            }
+            asked
+        }
+    };
     if !permission.mode.is_empty() {
         text.push_str(&format!("  (mode {})", permission.mode));
     }
@@ -335,8 +351,10 @@ fn permission_summary(permission: &PendingPermission) -> String {
 
 fn session_footer(pending: &[PendingPermission]) -> String {
     let mut footer = String::new();
-    if !pending.is_empty() {
-        footer.push_str("[y] allow  [n] deny  ");
+    match pending.first() {
+        Some(front) if front.is_question() => footer.push_str("[1-9] answer  [n] deny  "),
+        Some(_) => footer.push_str("[y] allow  [n] deny  "),
+        None => {}
     }
     footer.push_str("[enter] send  [ctrl-x] interrupt  [esc] detach  [ctrl-c] quit");
     footer
@@ -360,6 +378,7 @@ mod tests {
             rendered: "ls".to_owned(),
             mode: String::new(),
             sequence: 1,
+            questions: Vec::new(),
         }
     }
 
@@ -419,6 +438,40 @@ mod tests {
         assert!(
             two.concat().contains("(+1 more)"),
             "two waiting means one hidden: {two:?}"
+        );
+    }
+
+    /// A question renders what it asks and its numbered options, the footer
+    /// offers answers instead of allow, and a multi-question request points
+    /// at `horde answer`.
+    #[test]
+    fn a_question_renders_its_options_and_the_answer_keys() {
+        use crate::state::PendingQuestion;
+
+        let mut asking = pending("q-1");
+        asking.tree_path = vec!["root".to_owned()];
+        asking.questions = vec![PendingQuestion {
+            id: "colour".to_owned(),
+            question: "Which colour?".to_owned(),
+            options: vec!["Red".to_owned(), "Blue".to_owned()],
+        }];
+        assert_eq!(
+            super::permission_summary(&asking),
+            "root asks: Which colour?  [1] Red  [2] Blue"
+        );
+        assert!(super::session_footer(std::slice::from_ref(&asking)).starts_with("[1-9] answer  [n] deny"));
+        assert!(super::session_footer(&[pending("p")]).starts_with("[y] allow  [n] deny"));
+        assert!(super::session_footer(&[]).starts_with("[enter] send"));
+
+        asking.questions.push(PendingQuestion {
+            id: "size".to_owned(),
+            question: "Size?".to_owned(),
+            options: Vec::new(),
+        });
+        assert!(
+            super::permission_summary(&asking).ends_with("(+1 more; `horde answer q-1`)"),
+            "{}",
+            super::permission_summary(&asking)
         );
     }
 }

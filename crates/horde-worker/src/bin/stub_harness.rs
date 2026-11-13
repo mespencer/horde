@@ -28,6 +28,12 @@
 //!   then exit. A supervisor that has read that turn is guaranteed its next
 //!   write meets EPIPE: the write-side face of a death, forced rather than
 //!   left to the scheduler.
+//!
+//! A transcript line reading exactly `@await-control-response` is not
+//! written: the stub stops there until a `control_response` arrives on
+//! stdin, records it in `HORDE_STUB_CONTROL_LOG`, and carries on — the stall
+//! a real harness imposes while a `can_use_tool` prompt is unanswered
+//! (W12c, transcript `12e`).
 
 use std::io::{BufRead, Write};
 
@@ -99,6 +105,14 @@ fn is_control(line: &str) -> bool {
     line.contains("\"control_request\"")
 }
 
+/// Whether this stdin line answers a control request the stub sent.
+fn is_control_response(line: &str) -> bool {
+    line.contains("\"control_response\"")
+}
+
+/// The transcript marker that waits for Horde's answer to a prompt.
+const AWAIT_CONTROL_RESPONSE: &str = "@await-control-response";
+
 /// What the environment asked this run to do.
 struct Behaviour {
     exit_after: Option<usize>,
@@ -164,10 +178,17 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut served = 0_usize;
+    let mut lines = stdin.lock().lines();
 
-    for line in stdin.lock().lines() {
+    while let Some(line) = lines.next() {
         let Ok(line) = line else { break };
 
+        // An answer that arrived outside any await (late, or unsolicited):
+        // recorded, never spent as a turn.
+        if is_control_response(&line) {
+            behaviour.record(&line);
+            continue;
+        }
         if is_control(&line) {
             behaviour.record(&line);
             if behaviour.acknowledge(&mut stdout) {
@@ -187,7 +208,7 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
             close_descriptor(0);
         }
 
-        if !serve(&mut stdout, turn) || behaviour.done_after(served) {
+        if !serve(&mut stdout, turn, &mut lines, behaviour) || behaviour.done_after(served) {
             break;
         }
     }
@@ -195,9 +216,21 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
     std::process::ExitCode::from(behaviour.exit_code)
 }
 
-/// Writes one turn's lines. `false` means the pipe is gone.
-fn serve(stdout: &mut std::io::Stdout, turn: &[&str]) -> bool {
+/// Writes one turn's lines, stopping at each await marker until stdin
+/// brings a `control_response`. `false` means a pipe is gone.
+fn serve(
+    stdout: &mut std::io::Stdout,
+    turn: &[&str],
+    stdin: &mut impl Iterator<Item = std::io::Result<String>>,
+    behaviour: &Behaviour,
+) -> bool {
     for out in turn {
+        if *out == AWAIT_CONTROL_RESPONSE {
+            if !stdout.flush().is_ok() || !await_response(stdin, stdout, behaviour) {
+                return false;
+            }
+            continue;
+        }
         if writeln!(stdout, "{out}").is_err() {
             return false;
         }
@@ -216,3 +249,24 @@ fn close_descriptor(descriptor: i32) {
 /// See the Unix twin: on Windows a staged hang-up closes nothing.
 #[cfg(not(unix))]
 fn close_descriptor(_descriptor: i32) {}
+
+/// Reads stdin until a `control_response` arrives, recording it. Control
+/// requests met on the way (an interrupt) are recorded and acknowledged as
+/// they would be between turns. `false` means stdin closed first.
+fn await_response(
+    stdin: &mut impl Iterator<Item = std::io::Result<String>>,
+    stdout: &mut std::io::Stdout,
+    behaviour: &Behaviour,
+) -> bool {
+    for line in stdin.by_ref() {
+        let Ok(line) = line else { return false };
+        behaviour.record(&line);
+        if is_control_response(&line) {
+            return true;
+        }
+        if is_control(&line) && !behaviour.acknowledge(stdout) {
+            return false;
+        }
+    }
+    false
+}
