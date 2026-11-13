@@ -240,7 +240,10 @@ impl RotatingFiles {
         let full = self
             .current
             .as_ref()
-            .is_none_or(|(_, _, size)| *size > 0 && size + needed > self.set.max_file_bytes);
+            // A file is never empty here: one opens only to take a line, and
+            // a failed write discards it. So an oversized line still lands,
+            // alone, in the fresh file it opens.
+            .is_none_or(|(_, _, size)| size + needed > self.set.max_file_bytes);
         let pruned = if full {
             self.open_next(now)?
         } else {
@@ -343,6 +346,62 @@ mod tests {
         assert_eq!(listed.iter().map(|f| f.len).sum::<u64>(), 120);
         assert!(first.is_some_and(|path| path.exists()), "not renamed");
         assert_eq!(listed.iter().map(|f| f.n).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    /// The size counts each line's newline, and a file exactly at its
+    /// size is full, not over.
+    #[test]
+    fn the_size_counts_newlines_and_a_full_file_is_not_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut exact = RotatingFiles::new(set(dir.path(), Some("exact")));
+        exact
+            .write(&"a".repeat(49), SystemTime::now())
+            .expect("write");
+        exact
+            .write(&"a".repeat(49), SystemTime::now())
+            .expect("write");
+        assert_eq!(list(dir.path(), None).len(), 1, "50 + 50 bytes fit in 100");
+
+        let over = tempfile::tempdir().expect("tempdir");
+        let mut files = RotatingFiles::new(set(over.path(), Some("over")));
+        files
+            .write(&"b".repeat(50), SystemTime::now())
+            .expect("write");
+        files
+            .write(&"b".repeat(50), SystemTime::now())
+            .expect("write");
+        assert_eq!(list(over.path(), None).len(), 2, "51 + 51 bytes do not");
+    }
+
+    /// The header's bytes count toward the file's size.
+    #[test]
+    fn the_header_counts_toward_the_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = FileSet {
+            max_file_bytes: 12,
+            ..set(dir.path(), Some("b"))
+        };
+        let mut files = RotatingFiles::new(small).with_header(|_| "HHHH".to_owned());
+        for _ in 0..3 {
+            files.write("abc", SystemTime::now()).expect("write");
+        }
+        let listed = list(dir.path(), None);
+        let first = std::fs::read_to_string(&listed[0].path).expect("read");
+        assert_eq!(
+            first, "HHHH\nabc\n",
+            "5 + 4 bytes, and the next 4 would pass 12"
+        );
+        assert_eq!(listed.len(), 3);
+    }
+
+    #[test]
+    fn debug_names_the_family_and_its_current_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut files = RotatingFiles::new(set(dir.path(), Some("b")));
+        files.write("x", SystemTime::now()).expect("write");
+        let debug = format!("{files:?}");
+        assert!(debug.starts_with("RotatingFiles"), "{debug}");
+        assert!(debug.contains("horde-worker.b.1.jsonl"), "{debug}");
     }
 
     #[test]
