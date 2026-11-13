@@ -43,7 +43,12 @@ through it and stop it with a `Stop`:
 
 The Win32 calls come from `process-wrap` (`job-object`, `kill-on-drop`,
 `tokio1`): the workspace forbids `unsafe`, and the crate was already in the
-lock file through `rmcp`.
+lock file through `rmcp`. The Worker needs 10.0 or later: 9.x moved its
+wrapper registry out of the command while the hooks ran, so the job wrapper
+never saw `KillOnDrop` and made the job *without* kill-on-close — a dropped
+tree lost its root but left every grandchild running (found by
+`dropping_the_tree_kills_the_job` on the first Windows run). `rmcp` keeps
+its own 9.x.
 
 **Graceful stop on Windows is stdin EOF.** A console-less child has no
 SIGTERM, and `GenerateConsoleCtrlEvent` needs a shared console (which a
@@ -157,8 +162,8 @@ sends each change.
 * **Windows tests exist but run only on Windows.** Nothing in the
   gauntlet runs them; a Windows machine does (below). A pass of
   `clippy-windows` means "builds for Windows", never "works on Windows".
-* **New Windows-only dependencies:** `process-wrap` (already locked),
-  `fs4`, `junction`. `nix` moved to `cfg(unix)` dependencies.
+* **New Windows-only dependencies:** `process-wrap` 10 (9.x was already
+  locked through `rmcp`), `fs4`, `junction`. `nix` moved to `cfg(unix)` dependencies.
 * **The real-machine run is the acceptance test.** Supervision, ConPTY
   login and the job semantics are pinned by Windows tests written here and
   first run on a Windows box.
