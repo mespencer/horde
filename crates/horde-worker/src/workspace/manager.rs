@@ -306,32 +306,18 @@ impl WorkspaceManager {
             .collect();
         let wanted = wanted_repos(&record, &definition, request, mode);
 
-        let mut prepared = Vec::new();
-        for repo in definition
-            .repos
-            .iter()
-            .filter(|repo| wanted.contains(&repo.name))
-        {
-            let base = request
-                .bases
-                .iter()
-                .find(|base| base.repo_name == repo.name);
-            let added = if reused.contains(&repo.name) {
-                reused_repo(&agent_root, repo, &record).await?
-            } else {
-                self.add_one(
-                    &instance_root,
-                    &agents_dir,
-                    &mut record,
-                    repo,
-                    base,
-                    request.fetch,
-                    source,
-                )
-                .await?
-            };
-            prepared.push(added);
-        }
+        let prepared = self
+            .compose_repos(
+                &instance_root,
+                &agents_dir,
+                &mut record,
+                &definition,
+                request,
+                &wanted,
+                &reused,
+                source,
+            )
+            .await?;
         // Written even with no repo checked out: a lazy agent that starts
         // with none still has a checkout to add to, and an orphan to find.
         super::ledger::write(&agents_dir, &record)
@@ -348,6 +334,49 @@ impl WorkspaceManager {
             prepared,
             &manifest,
         ))
+    }
+
+    /// Checks out each wanted repo: reused as the ledger has it, or added.
+    #[allow(clippy::too_many_arguments)]
+    async fn compose_repos(
+        &self,
+        instance_root: &Path,
+        agents_dir: &Path,
+        record: &mut LedgerRecord,
+        definition: &WorkspaceDefinition,
+        request: &CheckoutRequest,
+        wanted: &[String],
+        reused: &[String],
+        source: &dyn CommitSource,
+    ) -> Result<Vec<PreparedRepo>, WorkerError> {
+        let agent_root = agents_dir.join(&record.agent_id);
+        let mut prepared = Vec::new();
+        for repo in definition
+            .repos
+            .iter()
+            .filter(|repo| wanted.contains(&repo.name))
+        {
+            let base = request
+                .bases
+                .iter()
+                .find(|base| base.repo_name == repo.name);
+            let added = if reused.contains(&repo.name) {
+                reused_repo(&agent_root, repo, record).await?
+            } else {
+                self.add_one(
+                    instance_root,
+                    agents_dir,
+                    record,
+                    repo,
+                    base,
+                    request.fetch,
+                    source,
+                )
+                .await?
+            };
+            prepared.push(added);
+        }
+        Ok(prepared)
     }
 
     /// Adds one repo to a live agent's checkout: `workspace_checkout`.
