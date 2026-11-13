@@ -683,7 +683,9 @@ mod tests {
     async fn closing_a_stream_cancels_its_pump() {
         let stream = Stream(tokio::spawn(std::future::pending::<()>()));
         stream.close();
-        let outcome = stream.0.await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stream.0)
+            .await
+            .expect("a cancelled pump finishes at once");
         assert!(
             outcome.is_err_and(|error| error.is_cancelled()),
             "the pump must have been cancelled"

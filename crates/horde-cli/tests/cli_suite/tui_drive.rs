@@ -656,3 +656,36 @@ async fn slash_note_sends_a_real_note() {
     harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
+
+/// Ctrl-S sends the compose text with interrupt delivery: it reaches the
+/// agent as an assignment at once rather than queueing.
+#[tokio::test]
+async fn ctrl_s_sends_now() {
+    let endpoint = serve().await.expect("a listening server");
+    let (_, session_id, _) = seeded(&endpoint, "tui-now")
+        .await
+        .expect("a seeded session");
+    let mut harness = start(&endpoint, App::attached(session_id.clone(), None))
+        .await
+        .expect("a running loop");
+    harness
+        .state("the root agent to be known", |app| {
+            app.steer_target().is_some()
+        })
+        .await
+        .expect("the root arrives via replay");
+
+    harness
+        .type_line("stop and do this")
+        .await
+        .expect("compose");
+    harness.press_ctrl('s').await.expect("send now");
+    harness
+        .state("the urgent assignment to round-trip", |app| {
+            feed_has(app, &session_id, "assign", "stop and do this")
+        })
+        .await
+        .expect("ctrl-s must send for real");
+    harness.press_ctrl('t').await.expect("to the tree");
+    harness.quit_from_list_screen().await.expect("q exits");
+}

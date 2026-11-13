@@ -863,3 +863,20 @@ fn a_shrinking_inbox_keeps_a_selected_entry() {
         "the remaining entry is selected: {screen}"
     );
 }
+
+/// The tree marks the attached session, and only that one.
+#[test]
+fn the_tree_marks_the_attached_session() {
+    let mut app = App::attached("s2", None);
+    conversation(&mut app);
+    app.apply(Update::Sessions(vec![summary("s2", "docs", "root-2")]));
+    fold(&mut app, "s2", "root-2", vec![spawned(None, &["docs"])]);
+    ctrl(&mut app, 't');
+    let screen = drawn(&app);
+    let marked: Vec<&str> = screen
+        .lines()
+        .filter(|line| line.contains("(attached)"))
+        .collect();
+    assert_eq!(marked.len(), 1, "one session is attached: {screen}");
+    assert!(marked[0].contains("docs"), "and it is docs: {screen}");
+}
