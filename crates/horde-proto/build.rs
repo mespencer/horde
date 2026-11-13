@@ -36,9 +36,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
 
-    let proto_root = manifest_dir
-        .join("../../proto")
-        .canonicalize()
+    // `dunce` rather than `Path::canonicalize`: on Windows the std call
+    // returns a verbatim `\\?\C:\...` path, which protoc rejects as an
+    // include path. dunce returns the plain form whenever one exists, and on
+    // Unix it is `std::fs::canonicalize` itself.
+    let proto_root = dunce::canonicalize(manifest_dir.join("../../proto"))
         .map_err(|e| format!("proto root not found next to crates/horde-proto: {e}"))?;
 
     let files: Vec<PathBuf> = PROTO_FILES.iter().map(|f| proto_root.join(f)).collect();

@@ -30,16 +30,19 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 tonic = { version = "0.14.6", features = ["channel", "router", "server"] }
 
 [build-dependencies]
+# build.rs canonicalizes the proto root without Windows' verbatim prefix.
+dunce = "1.0.5"
 prost-build = "0.14.4"
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"
 
 [package.metadata.cargo-machete]
 # `tonic-prost` is used only from code generated into OUT_DIR, which machete
-# does not scan. The three build-dependencies are used by build.rs, which
+# does not scan. The build-dependencies are used by build.rs, which
 # machete does not scan either — see docs/QUALITY_GATES.md, machete section.
 ignored = [
     "tonic-prost",
+    "dunce",
     "prost-build",
     "protoc-bin-vendored",
     "tonic-prost-build",
