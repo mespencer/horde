@@ -744,21 +744,21 @@ pub async fn await_registration(
     name: &str,
     limit: Duration,
 ) -> Result<(), ClientError> {
-    let deadline = tokio::time::Instant::now() + limit;
-    loop {
-        let workers = client.list_workers().await?;
-        if workers.iter().any(|worker| worker.name == name) {
-            return Ok(());
+    let wait = async {
+        loop {
+            let workers = client.list_workers().await?;
+            if workers.iter().any(|worker| worker.name == name) {
+                return Ok(());
+            }
+            tokio::time::sleep(REGISTRATION_POLL).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(refusal(format!(
-                "{name} joined but did not register within {}s; its log on the remote machine \
-                 (~/.horde/worker.log, or the service's journal) says why",
-                limit.as_secs()
-            )));
-        }
-        tokio::time::sleep(REGISTRATION_POLL).await;
-    }
+    };
+    tokio::time::timeout(limit, wait).await.unwrap_or_else(|_| {
+        Err(refusal(format!(
+            "{name} joined but did not register within {limit:?}; its log on the remote \
+             machine (~/.horde/worker.log, or the service's journal) says why"
+        )))
+    })
 }
 
 /// Runs `horde worker add` for real.

@@ -23,3 +23,4 @@ mod secure;
 mod tui_drive;
 mod tui_pty;
 mod verbs;
+mod worker_add;

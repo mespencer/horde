@@ -242,9 +242,10 @@ quoting, so a non-POSIX login shell (fish, zsh) runs it unchanged.
   logout either.
 - Harness install recipes (DESIGN §3) remain deferred. The verb reports
   missing harnesses and does not install them.
-- Tests: the plan's scripts run for real under `sh` in unit tests. The e2e
-  suite drives the whole verb against a real server and worker through
-  ssh/scp stand-ins. An `#[ignore]`d scenario, gated on
-  `HORDE_SSH_DOCKER_TEST=1`, runs it over real ssh into an sshd container.
+- Tests: the plan's scripts run for real under `sh` in unit tests. The CLI
+  suite drives the real `horde` binary against a secured server, joining
+  the real `horde-worker` through ssh/scp stand-ins. An `#[ignore]`d e2e
+  scenario, gated on `HORDE_SSH_DOCKER_TEST=1`, runs it over real ssh into
+  an sshd container.
   The service paths are covered by unit-content tests only, because neither
   systemd nor launchd runs in a container here.
