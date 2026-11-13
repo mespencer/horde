@@ -1,0 +1,34 @@
+[package]
+name = "horde-multinode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The multi-node tier: Horde's real binaries in separate Docker containers, each with its own network identity, driven through docker compose."
+
+[lints]
+workspace = true
+
+# Everything lives in dev-dependencies: this crate is its scenario suite. The
+# scenarios drive the product binaries only through `docker compose` and the
+# `horde` CLI's `--json` renders inside the containers, so they need no wire
+# types and no product library — the image built from
+# docker/multinode/Dockerfile is the system under test.
+#
+# Every scenario is `#[ignore]`d: it needs a Docker daemon and builds the
+# image, which the ordinary gauntlet must not require. Run them with
+# `cargo nextest run -p horde-multinode --run-ignored only` (docs/TESTING.md).
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+
+# The fake-adapter scenarios, one binary.
+[[test]]
+name = "multinode_suite"
+path = "tests/multinode_suite/main.rs"
+
+# The opt-in real-harness smoke (`--profile real`), its own binary so the
+# fake suite never needs provider credentials.
+[[test]]
+name = "real_harness"
+path = "tests/real_harness/main.rs"

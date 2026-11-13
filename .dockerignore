@@ -1,0 +1,18 @@
+# The Docker build context is the workspace root (docker/multinode/Dockerfile).
+# Only what `cargo build` reads belongs in it: build output, worktrees, VCS
+# metadata and mutation debris would only slow every context transfer and
+# invalidate the source layer for nothing.
+target/
+**/target/
+.claude/
+.git/
+mutants.out/
+**/mutants.out/
+mutants.out.old/
+**/mutants.out.old/
+scratch/
+gen/
+# The harness's own files: editing a compose file or a fixture must not
+# rebuild the binaries.
+docker/
+!docker/multinode/horde-node

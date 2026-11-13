@@ -1,0 +1,5 @@
+[{"steps": [
+    {"use_horde": {"id": "call-r", "tool": "report_result",
+                   "input": {"status": "success",
+                             "summary": "the finding is committed"}}}
+], "text": "reported"}]
