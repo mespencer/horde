@@ -288,12 +288,27 @@ fn a_timeout_fails_the_gate() {
     );
 }
 
-#[test]
-fn a_narrowed_full_sweep_is_not_recorded_as_a_whole_tree_sweep() {
+/// Every response up to and including a clean run, for a one-file
+/// workspace measured whole.
+fn whole_tree_script() -> Vec<CommandOutput> {
     let workspace = listing(&[(PRODUCT, "a")]);
     let mut script = preflight();
     script.extend(audit(&workspace));
     script.extend([ok(&workspace), ok("")]);
+    script
+}
+
+/// An `--incremental` context whose last green full sweep is recorded.
+fn after_a_recorded_sweep(dir: &Path) -> GateContext {
+    let ctx = ctx_at(dir).since_last_full_sweep(true);
+    std::fs::create_dir_all(&ctx.log_dir).expect("log dir");
+    std::fs::write(ctx.log_dir.join(LAST_FULL_SWEEP), "0123456789abcdef\n").expect("marker");
+    ctx
+}
+
+#[test]
+fn a_narrowed_full_sweep_is_not_recorded_as_a_whole_tree_sweep() {
+    let script = whole_tree_script();
     let run = measure_with(
         |ctx| {
             GateContext::new(&ctx.workspace_root, vec!["a".to_owned()]).measuring_everything(true)
@@ -541,9 +556,7 @@ fn an_incremental_run_diffs_against_the_last_green_full_sweep() {
     script.extend(audit(&workspace));
     script.extend([ok(&section(PRODUCT)), ok(&workspace), ok("")]);
     let dir = tempfile::tempdir().expect("temp dir");
-    let ctx = ctx_at(dir.path()).since_last_full_sweep(true);
-    std::fs::create_dir_all(&ctx.log_dir).expect("log dir");
-    std::fs::write(ctx.log_dir.join(LAST_FULL_SWEEP), "0123456789abcdef\n").expect("marker");
+    let ctx = after_a_recorded_sweep(dir.path());
     let runner = ScriptedRunner::new(script).writing(
         6,
         &artifact_dir(&ctx).join("gamma-report.json"),
@@ -572,9 +585,7 @@ fn an_incremental_run_with_nothing_changed_is_skipped() {
     script.extend(audit(&workspace));
     script.push(ok(""));
     let dir = tempfile::tempdir().expect("temp dir");
-    let ctx = ctx_at(dir.path()).since_last_full_sweep(true);
-    std::fs::create_dir_all(&ctx.log_dir).expect("log dir");
-    std::fs::write(ctx.log_dir.join(LAST_FULL_SWEEP), "0123456789abcdef\n").expect("marker");
+    let ctx = after_a_recorded_sweep(dir.path());
     let runner = ScriptedRunner::new(script);
     let outcome = measure(&ctx, &runner, &settings());
     assert_eq!(outcome.label(), "skipped");
@@ -697,10 +708,7 @@ fn a_run_that_exits_non_zero_is_an_instrument_error() {
 
 #[test]
 fn a_report_left_by_an_earlier_run_is_never_read_as_this_one() {
-    let workspace = listing(&[(PRODUCT, "a")]);
-    let mut script = preflight();
-    script.extend(audit(&workspace));
-    script.extend([ok(&workspace), ok("")]);
+    let script = whole_tree_script();
     let dir = tempfile::tempdir().expect("temp dir");
     let ctx = ctx_at(dir.path()).measuring_everything(true);
     std::fs::create_dir_all(artifact_dir(&ctx)).expect("artifacts");
