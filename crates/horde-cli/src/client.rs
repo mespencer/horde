@@ -80,6 +80,11 @@ pub enum ClientError {
         source: horde_identity::IdentityError,
     },
 
+    /// The client config file broke a rule (ADR-0016): the refusal names
+    /// the file and the key.
+    #[error("{0}")]
+    Config(String),
+
     /// Enrollment failed: a malformed token, a refused join, or the
     /// identity failing to persist.
     #[error("enrollment failed: {0}")]
@@ -441,6 +446,9 @@ pub struct Client {
     /// The same channel, kept so sibling services on the server's one
     /// endpoint (the blob store) are reachable without a second dial.
     channel: Channel,
+    /// What a new session's settings are when its flags name none — the
+    /// client config file's `session.*` (ADR-0016).
+    session_defaults: horde_proto::v1::SessionSettings,
 }
 
 impl Client {
@@ -550,7 +558,40 @@ impl Client {
             // worker spine ingests is one this client can be sent back.
             inner: horde_proto::limited!(ControlPlaneServiceClient::new(channel.clone())),
             channel,
+            session_defaults: horde_proto::v1::SessionSettings::default(),
         }
+    }
+
+    /// Carries the client config's session defaults (ADR-0016) into every
+    /// session this client creates through the front door.
+    #[must_use]
+    pub fn with_session_defaults(mut self, defaults: horde_proto::v1::SessionSettings) -> Self {
+        self.session_defaults = defaults;
+        self
+    }
+
+    /// The session settings a create uses when its flags name none.
+    #[must_use]
+    pub fn session_defaults(&self) -> &horde_proto::v1::SessionSettings {
+        &self.session_defaults
+    }
+
+    /// The server's effective configuration (ADR-0016), with the per-agent
+    /// keys for an agent created in `workspace` and `session` when named.
+    pub async fn effective_config(
+        &mut self,
+        workspace: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<horde_proto::v1::ConfigEntry>, ClientError> {
+        Ok(self
+            .inner
+            .get_effective_config(horde_proto::v1::GetEffectiveConfigRequest {
+                workspace: workspace.to_owned(),
+                session_id: session_id.map(SessionId::new),
+            })
+            .await?
+            .into_inner()
+            .entries)
     }
 
     /// The blob service over this client's channel, at the shared ceiling.

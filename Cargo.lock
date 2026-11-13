@@ -1196,6 +1196,7 @@ dependencies = [
  "cucumber",
  "horde-adapter",
  "horde-adapter-fake",
+ "horde-config",
  "horde-identity",
  "horde-observe",
  "horde-proto",
@@ -1211,6 +1212,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tracing",
 ]

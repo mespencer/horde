@@ -17,6 +17,7 @@ mod common;
 mod binary;
 mod blob;
 mod cli;
+mod config;
 mod login_pty;
 mod round_trip;
 mod secure;

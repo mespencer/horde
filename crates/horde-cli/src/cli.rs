@@ -80,6 +80,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// The client config file. Defaults to `~/.horde/client/config.toml`,
+    /// which may be absent; a file named here must exist (ADR-0016).
+    #[arg(long, global = true)]
+    pub config: Option<std::path::PathBuf>,
+
     /// No verb is the front door (ADR-0008): no live sessions creates one,
     /// auto-named, and attaches; exactly one attaches it; several open the
     /// picker. Headless or `--json`, it fails fast with the candidates.
@@ -146,6 +151,10 @@ pub enum Command {
     /// ports there.
     #[command(subcommand)]
     Forward(ForwardCommand),
+    /// The effective configuration, this client's or the server's, with
+    /// where each value came from (ADR-0016).
+    #[command(subcommand)]
+    Config(crate::config::ConfigCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -881,12 +890,29 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
         .await;
     }
 
+    let settings = crate::config::ClientSettings::load(
+        cli.config.as_deref(),
+        std::env::var_os("HOME").map(Into::into),
+        |name| std::env::var(name).ok(),
+    )
+    .map_err(ClientError::Config)?;
+    // This client's own configuration needs no server.
+    if let Some(Command::Config(crate::config::ConfigCommand::Show(args))) = &cli.command
+        && !args.asks_server()
+    {
+        let entries = crate::config::local_entries(&settings);
+        println!("{}", crate::config::render(&entries, args.origin, format));
+        return Ok(());
+    }
+
     let resolved = resolve_connection(
         cli.endpoint.as_deref(),
         cli.identity.as_deref(),
         std::env::var_os("HOME").map(Into::into),
     )?;
-    let mut client = connect(&resolved).await?;
+    let mut client = connect(&resolved)
+        .await?
+        .with_session_defaults(settings.session);
     dispatch(&mut client, cli, &resolved, format).await
 }
 
@@ -959,6 +985,11 @@ async fn dispatch_admin(
         Command::Prewarm(args) => run_prewarm(client, args, format).await,
         Command::Worker(command) => run_worker(client, command, &resolved.endpoint, format).await,
         Command::Enroll(command) => run_enroll(client, command, &resolved.endpoint, format).await,
+        Command::Config(crate::config::ConfigCommand::Show(args)) => {
+            let entries = crate::config::server_entries(client, args).await?;
+            println!("{}", crate::config::render(&entries, args.origin, format));
+            Ok(())
+        }
         // Unreachable while `dispatch` and this match agree; refusing loudly
         // (rather than a silent no-op) is what keeps a drift between them
         // diagnosable.
