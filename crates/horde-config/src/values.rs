@@ -13,7 +13,7 @@ pub fn show_duration(duration: &Duration) -> String {
     }
     [(86_400, "d"), (3_600, "h"), (60, "m")]
         .into_iter()
-        .find(|(scale, _)| seconds % scale == 0)
+        .find(|(scale, _)| seconds.is_multiple_of(*scale))
         .map_or_else(
             || format!("{seconds}s"),
             |(scale, unit)| format!("{}{unit}", seconds / scale),
@@ -42,7 +42,7 @@ pub fn show_size(bytes: &u64) -> String {
         (1 << 10, "KiB"),
     ]
     .into_iter()
-    .find(|(scale, _)| bytes % scale == 0)
+    .find(|(scale, _)| bytes.is_multiple_of(*scale))
     .map_or_else(
         || bytes.to_string(),
         |(scale, unit)| format!("{}{unit}", bytes / scale),
