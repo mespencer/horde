@@ -16,6 +16,7 @@ mod common;
 
 mod binary;
 mod blobs;
+mod configuration;
 mod contracts;
 mod enrollment;
 mod forwards;
