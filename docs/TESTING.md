@@ -26,6 +26,7 @@ Rules about the instruments themselves, each one paid for somewhere by a green r
 | Property | **proptest** (used, not just declared) | Invariants under generated inputs: event-log ordering/resume (sync-from-any-offset ≡ full replay), tier selection strategies. Reconciliation idempotence and capability attenuation were listed here before their mechanisms existed; they return to this row with them (attenuation has no mechanism to test yet — DESIGN §5) |
 | Integration | `tests/*.rs` per crate, shared `horde-testkit` | Real components, transport collapsed to in-process where possible: server + SQLite, relay against real git repos, worker supervising a FakeAdapter |
 | Multi-process e2e | `horde-testkit` process harness | Real `horde-server` + real `horde-worker`(s) + CLI client over real localhost gRPC/mTLS: spawn trees, assign/result flows, attach/replay, enrollment |
+| Multi-node (Docker) | `crates/horde-multinode` over `docker/multinode/compose.yaml`, `#[ignore]`d (§7) | The real binaries in separate containers with separate network identities: placement across workers, the Relay's mTLS door, cross-worker shares, worker kill/restart against the lease, network partitions, a second client machine |
 | Fault injection | testkit network proxy (toxiproxy-style, in-repo) | The spotty-network requirement is *tested*, not aspired to: sever/delay/flap worker↔server mid-turn, assert journaling + reconciliation, permission-block behavior |
 | Behavioral (Gherkin) | **cucumber-rs** (pinned `=0.23.0`), workspace-root `features/*.feature`, one `features` test binary in `horde-cli` (W6e's one-binary rule) | Cross-component scenarios in domain language (CONTEXT.md terms): "Given a worker partitioned mid-assignment… the result arrives after reconnect." Living spec for the orchestration semantics; small, curated, not a parallel test universe. Steps drive the real `horde` binary, the client library, a real worker on the FakeAdapter, and the secured enrollment path; `harness = false`, so step code runs under the full lint deny-list — no `expect` anywhere in it |
 | Adapter conformance | golden transcripts | Recorded real harness sessions (claude stream-json, ACP) replayed against adapters; the same suite runs against the FakeAdapter to prove the fake stays honest |
@@ -68,3 +69,84 @@ Development is local-only — no PRs, no hosted CI (IMPLEMENTATION.md's ground r
 ## 6. Horde-specific must-cover list
 
 The scenarios the suite exists to hold, mapped to layers: event-log resume equivalence (property), partition → journal → reconcile (fault injection + Gherkin), permission chain incl. judge fallback and tree-path routing (unit + e2e), capability attenuation (property — once its mechanism lands, DESIGN §5), spawn-queued-with-reason semantics (integration), relay push/fetch across two workers (e2e), checkout policies incl. multi-repo worktree composition (integration), enrollment + revocation (e2e), stream-json adapter conformance (golden transcripts — the ADR-0003 spike grows into this suite), tier selection strategies (unit + property), TUI zoom levels and inbox (snapshots).
+
+## 7. Multi-node over Docker
+
+The multi-process e2e tier runs every process on one host, so every "machine" shares a loopback interface, a disk, and a clock. The multi-node tier runs Horde's real release binaries in separate containers, each with its own hostname and address on a bridge network, so multi-machine behaviour crosses a real network: name resolution, TLS by host name, connections that die without a FIN, disks that do not overlap.
+
+### Topology
+
+`docker/multinode/compose.yaml`, one project per scenario:
+
+| Service | Runs | Notes |
+|---|---|---|
+| `server` | `horde-server --serve` on `0.0.0.0:7777`/`:7778`, the Relay's mTLS door on `:7779`, `--san server`, `--worker-lease 15` | State in a named volume; its bootstrap token is the root of trust |
+| `worker-1` … `worker-3` | `horde-worker` on the fake adapter, `--workspace-root /work`, `--relay https://server:7779` | `worker-1` runs `fixtures/report.json`: an agent's first turn calls `report_result`; later turns echo |
+| `client`, `client-2` | idle; the runner `exec`s `horde --json` in them | `client` joins with the bootstrap token, `client-2` with a code `client` mints |
+| `origin` | `git daemon` serving `git://origin/atlas.git` (one seed commit) | The upstream every workspace clones |
+| `worker-real` | profile `real` only: the host's `claude` and `codex` | See [Real harnesses](#real-harnesses) |
+
+Trust is bootstrapped only through the operator flows, with mTLS throughout and no `--insecure`. `client` redeems the server's bootstrap token with `horde enroll join --token-file /dev/stdin`. The runner mints each worker's token with `horde worker enroll <name>` and writes it to the worker container's `/join/token` over `docker compose exec` stdin. The worker entrypoint (`docker/multinode/horde-node`) redeems it with `--join-file`. A restarted worker finds its identity and stored endpoint, and needs neither.
+
+The image (`docker/multinode/Dockerfile`) is a two-stage build: `rust:1.95.0-slim-trixie` compiles the three binaries in release with BuildKit cache mounts for the registry and target directory, and `debian:trixie-slim` (plus `git`, `procps`, `ca-certificates`) runs them as uid 10001. Both base images are pinned by digest. `.dockerignore` keeps `target/`, `.claude/`, `.git/` and the harness's own files out of the context.
+
+### Running
+
+```sh
+# Build the image (the scenarios also do this; it is a cache hit after the first time).
+docker compose -f docker/multinode/compose.yaml build server
+
+# Every fake-adapter scenario. They run in parallel, one compose project each.
+cargo nextest run -p horde-multinode --test multinode_suite --run-ignored only
+```
+
+Every scenario is `#[ignore]`d, so the gauntlet's `test` gate never needs Docker. Asked for explicitly, a scenario with no Docker daemon fails; it never skips. Set `HORDE_MULTINODE_KEEP=1` to leave a project running after the test for a post-mortem (`docker compose -p hmn-<scenario>-<pid> logs`). A failing scenario prints every service's last 80 log lines. `HORDE_MULTINODE_IMAGE` builds and runs a differently tagged image, which is how a deliberately broken build is checked against the scenarios without touching the real tag.
+
+Measured on the 32-core development host: a cold image build takes 3 min 51 s, and an incremental rebuild after a one-line worker change takes about 50 s. The six scenarios take 31 s wall-clock in parallel, between 9 s and 31 s each. The lease and partition scenarios are the slow ones, because they wait out real keepalives and a 15 s lease.
+
+### Scenarios
+
+| Scenario | File | Holds |
+|---|---|---|
+| Placement across workers | `placement.rs` | Three unpinned sessions land one per worker (least loaded), and each is started by the worker it landed on |
+| Git relay and cross-worker share | `relay.rs` | A commit made on `worker-1` is stamped on the sender's result, staged to the server's mirror through the mTLS door, absent from the origin, and present in the receiver's checkout on `worker-2` after a `--git-ref` send. A container with no identity is refused at the same door |
+| Kill and restart inside the lease | `liveness.rs` | SIGKILL, restart: the worker redials with its stored identity and the next message revives the agent, nothing re-run |
+| Kill past the lease | `liveness.rs` | The started agent goes `lost` and `failed` in the log, messages to it are refused, and the returning worker redials and takes new work |
+| Network partition | `partition.rs` | `docker network disconnect` (sockets open, packets dropped), a message sent into the partition, `connect`: delivered once after the heal, never lost |
+| A second client machine | `attach.rs` | `client-2`, enrolled through `horde enroll client`, follows a session (`sync --follow`, the scriptable attach) and sees a reply produced on a third container |
+
+Assertions read the server's event log through the CLI's JSON output (`horde --json sync`, `agent status`, `worker list`) inside a client container, plus the git state of the containers' disks where a share is the claim.
+
+The relay scenario has been checked both ways: built with the worker's identity presentation disabled, it fails with git's `certificate signer not trusted` refusal surfacing in the log.
+
+### Adding a scenario
+
+1. Add a module under `crates/horde-multinode/tests/multinode_suite/` and register it in `main.rs`.
+2. Open with `Cluster::up("<short-name>")`. The name becomes part of the compose project name, so keep it short and unique.
+3. Drive the system only through `cluster.horde_json(...)` (the CLI in `client`), `cluster.exec(service, ...)` for what an operator would do on that machine, and `compose`, `partition` and `heal` for faults. Assert on CLI JSON and on-disk git state. Never assert on log text.
+4. Mark it `#[ignore = "needs Docker; run with --run-ignored only (docs/TESTING.md)"]` and keep every wait bounded. The harness's waits all are.
+
+### Real harnesses
+
+`worker-real` (compose profile `real`) bind-mounts the host's `claude` binary and the directory holding codex's native binaries, plus signed-in profile directories that become the worker-owned `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (`/state/harness/<provider>/default`). Credentials are never in the image. Use dedicated profile directories rather than your everyday `~/.claude`. The container writes to them, for example to refresh tokens.
+
+```sh
+export HORDE_CLAUDE_BIN="$(readlink -f "$(command -v claude)")"
+export HORDE_CODEX_BIN_DIR=<npm prefix>/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin
+export HORDE_CLAUDE_PROFILE=$HOME/horde-docker/claude   # CLAUDE_CONFIG_DIR=... claude, then /login
+export HORDE_CODEX_PROFILE=$HOME/horde-docker/codex     # CODEX_HOME=... codex login
+export HORDE_UID=$(id -u) HORDE_GID=$(id -g)
+cargo nextest run -p horde-multinode --test real_harness --run-ignored only
+```
+
+The smoke spends real quota: one Claude (haiku) and one Codex turn. With any variable unset it fails, naming the missing ones.
+
+### Not covered
+
+- Clock skew between machines, and asymmetric or lossy links. Partitions here are total, and the in-repo fault proxy (§2) still owns delay and flapping.
+- A server restart or server-host failure across machines. The fault suite covers server kill on one host.
+- Port forwards and interactive login across containers. Both stay in the single-host e2e tier.
+- Different OSes and CPU architectures. Every container is the same Linux x86_64 image; the macOS and Windows workers are exercised by hand (W12g).
+- Performance and scale. Three workers is a topology, not a load test.
+- Credential-less workers (DESIGN §8 end state). Workers still clone the origin directly, with ambient access.
+
