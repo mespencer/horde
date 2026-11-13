@@ -23,6 +23,7 @@ mod lifecycle;
 mod lineage;
 #[cfg(test)]
 mod logins;
+mod logs;
 #[cfg(test)]
 mod relay_payload;
 #[cfg(test)]
