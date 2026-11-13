@@ -18,3 +18,9 @@ Two files are lightly edited, and only in ways that do not touch what is parsed:
 - `jscpd-report-duplicated.json` — the `fragment` field (the full duplicated
   source text) was replaced with a placeholder to keep the file small, and the
   two file paths were shortened. Every counted field is as jscpd produced it.
+- `gamma-report-survivors.json` — a real `cargo gamma run --package
+  horde-observe` report from before its survivors were killed; each file's
+  `source` field (the whole source text) was replaced with a placeholder and
+  `projectRoot` rewritten to `/repo`. Every mutant entry is as gamma wrote it.
+- `gamma-list.json` — the first three entries of a real
+  `cargo gamma list --json --package horde-observe`, unedited.

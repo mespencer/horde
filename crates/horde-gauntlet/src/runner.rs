@@ -40,6 +40,43 @@ pub fn resolve<'a>(
         .collect())
 }
 
+/// Removes the gates named in `skipped` from a selection.
+///
+/// A skip is refused when it names no gate — a typo would otherwise run the
+/// gate it meant to skip — or when a gate still selected consumes the skipped
+/// one's output, because that gate would then read a stale artifact.
+///
+/// # Errors
+///
+/// Returns a message naming the unknown gate or the dependency.
+pub fn without<'a>(
+    gates: &[RegisteredGate],
+    selected: Vec<&'a RegisteredGate>,
+    skipped: &[String],
+) -> Result<Vec<&'a RegisteredGate>, String> {
+    if let Some(name) = skipped.iter().find(|name| find(gates, name).is_none()) {
+        return Err(unknown_gate(gates, name));
+    }
+    let kept: Vec<&RegisteredGate> = selected
+        .into_iter()
+        .filter(|gate| !skipped.iter().any(|name| name == gate.spec.name))
+        .collect();
+    for gate in &kept {
+        if let Some(dependency) = gate
+            .spec
+            .depends_on
+            .iter()
+            .find(|dependency| skipped.iter().any(|name| name == *dependency))
+        {
+            return Err(format!(
+                "cannot skip `{dependency}`: `{}` reads its output; skip both or neither",
+                gate.spec.name
+            ));
+        }
+    }
+    Ok(kept)
+}
+
 fn collect<'a>(gates: &'a [RegisteredGate], name: &'a str, needed: &mut Vec<&'a str>) {
     if needed.contains(&name) {
         return;
@@ -181,6 +218,50 @@ mod tests {
         let resolved = resolve(&gates, &[]).expect("no names to be wrong");
         assert_eq!(names(&resolved).len(), gates.len());
         assert_eq!(names(&resolved)[0], "fmt");
+    }
+
+    #[test]
+    fn a_skipped_gate_is_left_out_of_the_run() {
+        let gates = registry();
+        let selected = resolve(&gates, &[]).expect("everything");
+        let kept = without(&gates, selected, &["mutants".to_owned()]).expect("mutants is a gate");
+        assert_eq!(kept.len(), gates.len() - 1);
+        assert!(!names(&kept).contains(&"mutants"), "{:?}", names(&kept));
+    }
+
+    #[test]
+    fn skipping_nothing_keeps_the_selection() {
+        let gates = registry();
+        let selected = resolve(&gates, &["fmt".to_owned()]).expect("registered");
+        assert_eq!(
+            names(&without(&gates, selected, &[]).expect("no skips")),
+            vec!["fmt"]
+        );
+    }
+
+    #[test]
+    fn skipping_a_gate_that_does_not_exist_is_refused() {
+        let gates = registry();
+        let selected = resolve(&gates, &[]).expect("everything");
+        let message = without(&gates, selected, &["mutnats".to_owned()]).expect_err("typo");
+        assert!(message.contains("unknown gate `mutnats`"), "{message}");
+    }
+
+    #[test]
+    fn skipping_a_gate_another_selected_gate_reads_is_refused() {
+        let gates = registry();
+        let selected = resolve(&gates, &[]).expect("everything");
+        let message =
+            without(&gates, selected, &["coverage".to_owned()]).expect_err("crap reads it");
+        assert!(message.contains("`crap` reads its output"), "{message}");
+        let selected = resolve(&gates, &[]).expect("everything");
+        let both = without(
+            &gates,
+            selected,
+            &["coverage".to_owned(), "crap".to_owned()],
+        )
+        .expect("skipping both is coherent");
+        assert!(!names(&both).contains(&"crap"));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! hunted descendants through a system-wide `ps -A`; cargo-mutants flipped
 //! `ppid == parent` to `!=`, the test ran the mutant, and it SIGKILLed every
 //! process on the machine. So this file holds only the guard, the sweep's
-//! selection and the sending, and `.cargo/mutants.toml` excludes it. What
+//! selection and the sending, and `gamma.toml` excludes it. What
 //! is harmless to mutate — reading the table — lives in [`crate::ps`].
 //!
 //! # The two leaks it closes
