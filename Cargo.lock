@@ -1313,11 +1313,17 @@ dependencies = [
 name = "horde-observe"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
+ "hex",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "regex",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-stream",
  "tonic",

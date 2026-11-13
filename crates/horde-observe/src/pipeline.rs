@@ -53,6 +53,18 @@ impl ServiceIdentity {
         self.principal = principal;
         self
     }
+
+    /// The binary's name.
+    #[must_use]
+    pub fn service(&self) -> &'static str {
+        self.service
+    }
+
+    /// The enrolled principal, when there is one.
+    #[must_use]
+    pub fn principal(&self) -> Option<String> {
+        self.principal.clone()
+    }
 }
 
 /// A live export pipeline: the tracer provider, and the count of what it has

@@ -1,4 +1,17 @@
-//! OTLP export for the tracing Horde's binaries already emit (DESIGN §12).
+//! Local diagnostic logs (ADR-0015) and OTLP export for the tracing Horde's
+//! binaries already emit (DESIGN §12).
+//!
+//! # Local logs
+//!
+//! Each daemon writes bounded, rotating JSON lines under `<state>/logs`
+//! ([`layer::FileLogging`], [`files`]); a worker also keeps each harness's
+//! stderr in `logs/agents/` ([`agents`]). [`reader`] reads them back for
+//! `horde logs`, `ControlPlane/ReadLogs` and the `logs` MCP verb, and every
+//! path that serves a record off the machine redacts it through
+//! [`reader::egress`] ([`redact`]). Logs are never session facts: nothing
+//! decides from them, and losing every file loses no state.
+//!
+//! # OTLP export
 //!
 //! This crate is the export pipeline, not the instrumentation: the spans and
 //! events in the tree stay where they are, and a binary that opts in gets them
@@ -37,12 +50,21 @@
 //! `horde`, `horde-worker`), and `horde.principal` is the enrolled mTLS
 //! principal (`worker:name`, `client:name`) when the binary has one.
 
+pub mod agents;
 mod config;
 mod export;
+pub mod files;
+pub mod layer;
 mod pipeline;
+pub mod reader;
+pub mod record;
+pub mod redact;
+pub mod settings;
 mod subscriber;
+pub mod tap;
 
 pub use config::{ConfigError, ENDPOINT_VAR, OtlpConfig, SAMPLE_VAR, from_env};
+pub use layer::FileLogging;
 pub use pipeline::{
     InitError, PRINCIPAL_ATTRIBUTE, PipelineError, ServiceIdentity, Telemetry, init_from_env,
     pipeline,

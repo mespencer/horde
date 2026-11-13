@@ -184,7 +184,7 @@ async fn an_exported_span_carries_the_service_identity_fields_and_events() {
         ServiceIdentity::new("horde-observe-smoke").with_principal(Some("worker:smoke".to_owned()));
     let telemetry = pipeline(&config, &identity).expect("a lazy pipeline must build");
 
-    let dispatch = stderr_subscriber(EnvFilter::new("info"), Some(&telemetry));
+    let dispatch = stderr_subscriber(EnvFilter::new("info"), Some(&telemetry), None);
     tracing::dispatcher::with_default(&dispatch, || {
         let span = tracing::info_span!(target: "horde_smoke", "smoke_turn", agent = "a-1");
         let _entered = span.entered();
@@ -263,7 +263,7 @@ async fn a_zero_ratio_exports_nothing_where_one_exports_everything() {
         &identity,
     )
     .expect("a lazy pipeline must build");
-    let dispatch = silent_subscriber(&none);
+    let dispatch = silent_subscriber(Some(&none), None).expect("export is a layer");
     tracing::dispatcher::with_default(&dispatch, || {
         let _entered = tracing::info_span!(target: "horde_smoke", "unsampled_turn").entered();
     });
@@ -280,7 +280,7 @@ async fn a_zero_ratio_exports_nothing_where_one_exports_everything() {
         &identity,
     )
     .expect("a lazy pipeline must build");
-    let dispatch = silent_subscriber(&all);
+    let dispatch = silent_subscriber(Some(&all), None).expect("export is a layer");
     tracing::dispatcher::with_default(&dispatch, || {
         let _entered = tracing::info_span!(target: "horde_smoke", "sentinel_turn").entered();
     });
@@ -301,7 +301,7 @@ async fn a_zero_ratio_exports_nothing_where_one_exports_everything() {
 async fn an_unreachable_collector_costs_spans_and_never_blocks() {
     let telemetry = harness::doomed_telemetry().await;
 
-    let dispatch = silent_subscriber(&telemetry);
+    let dispatch = silent_subscriber(Some(&telemetry), None).expect("export is a layer");
     tracing::dispatcher::with_default(&dispatch, || {
         for turn in 0..3 {
             let _entered =
@@ -349,7 +349,7 @@ async fn dropping_the_telemetry_drains_the_queue_while_the_subscriber_still_live
     // The dispatch stays alive across the drop, exactly like a binary's
     // global subscriber — dropping it first would hand the flush to the
     // SDK's last-reference shutdown and prove nothing about Drop.
-    let dispatch = silent_subscriber(&telemetry);
+    let dispatch = silent_subscriber(Some(&telemetry), None).expect("export is a layer");
     tracing::dispatcher::with_default(&dispatch, || {
         let _entered = tracing::info_span!(target: "horde_smoke", "flushed_turn").entered();
     });
@@ -375,7 +375,7 @@ async fn dropping_the_telemetry_drains_the_queue_while_the_subscriber_still_live
 async fn shutdown_drains_the_queue_and_accounts_for_what_it_could_not_deliver() {
     let telemetry = harness::doomed_telemetry().await;
 
-    let dispatch = silent_subscriber(&telemetry);
+    let dispatch = silent_subscriber(Some(&telemetry), None).expect("export is a layer");
     tracing::dispatcher::with_default(&dispatch, || {
         let _entered = tracing::info_span!(target: "horde_smoke", "last_turn").entered();
     });
