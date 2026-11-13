@@ -889,10 +889,16 @@ impl ControlPlaneService for ControlPlane {
                             .agents
                             .get(&pending.agent_id)
                             .is_some_and(|agent| agent.rewrites_tool_input);
+                        let questions = pending
+                            .tool_call
+                            .as_ref()
+                            .map(|call| call.questions.clone())
+                            .unwrap_or_default();
                         ControlFlow::Break((
                             state.session_id.clone(),
                             pending.agent_id.clone(),
                             rewrites,
+                            questions,
                         ))
                     }
                     None => ControlFlow::Continue(()),
@@ -900,7 +906,7 @@ impl ControlPlaneService for ControlPlane {
             )
             .await
             .map_err(Status::from)?;
-        let (session_id, agent_id, rewrites) = found.ok_or_else(|| {
+        let (session_id, agent_id, rewrites, questions) = found.ok_or_else(|| {
             Status::from(ServerError::Invalid(format!(
                 "no permission request {request_id} is awaiting a decision"
             )))
@@ -919,6 +925,7 @@ impl ControlPlaneService for ControlPlane {
             )));
         }
         refuse_unappliable_narrowing(request.updated_input.is_some(), rewrites, &agent_id)?;
+        let answers = checked_answers(&request, &questions, &request_id)?;
 
         let sequence = self
             .append_agent_event(
@@ -939,6 +946,7 @@ impl ControlPlaneService for ControlPlane {
                         // hop, so this is deliberately a move and not a
                         // `unwrap_or_default`.
                         updated_input: request.updated_input,
+                        answers,
                     }),
                 }),
             )
@@ -1863,6 +1871,49 @@ fn require_client_role<T>(request: &Request<T>, verb: &str) -> Result<(), Status
         )));
     }
     Ok(())
+}
+
+/// The answers a human decision may journal, canonical, or the refusal.
+///
+/// A question can only be settled by answers or a denial; answers can only
+/// settle a question (W12c). Every mismatch is refused here, before anything
+/// is journaled, so neither a client nor the harness can believe a question
+/// was answered when it was not — or that answers reached a tool that ignores
+/// them. Remember-for-session never rides an answer: a remembered answer
+/// would answer the next question nobody saw.
+fn checked_answers(
+    request: &AnswerPermissionRequest,
+    questions: &[horde_proto::v1::Question],
+    request_id: &str,
+) -> Result<std::collections::HashMap<String, horde_proto::v1::Answer>, Status> {
+    let allow = request.outcome == i32::from(horde_proto::v1::PermissionOutcome::Allow);
+    let invalid = |message: String| Status::from(ServerError::Invalid(message));
+    if request.answers.is_empty() {
+        if allow && !questions.is_empty() {
+            return Err(invalid(format!(
+                "permission request {request_id} is a question: answer it (`horde answer \
+                 {request_id} 1=…`) or deny it"
+            )));
+        }
+        return Ok(std::collections::HashMap::new());
+    }
+    if questions.is_empty() {
+        return Err(invalid(format!(
+            "permission request {request_id} asked no question, so answers cannot apply"
+        )));
+    }
+    if !allow {
+        return Err(invalid(
+            "answers ride only an ALLOW decision; a denial answers nothing".to_owned(),
+        ));
+    }
+    if request.updated_input.is_some() || request.remember_for_session {
+        return Err(invalid(
+            "answers cannot be combined with updated_input or remember_for_session".to_owned(),
+        ));
+    }
+    crate::permission::answers::resolve_answers(questions, &request.answers)
+        .map_err(|reason| invalid(format!("permission request {request_id}: {reason}")))
 }
 
 /// Refuses a narrowing for an agent whose adapter cannot apply one

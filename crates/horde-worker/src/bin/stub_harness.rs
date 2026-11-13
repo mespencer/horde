@@ -28,6 +28,12 @@
 //!   then exit. A supervisor that has read that turn is guaranteed its next
 //!   write meets EPIPE: the write-side face of a death, forced rather than
 //!   left to the scheduler.
+//!
+//! A transcript line reading exactly `@await-control-response` is not
+//! written: the stub stops there until a `control_response` arrives on
+//! stdin, records it in `HORDE_STUB_CONTROL_LOG`, and carries on — the stall
+//! a real harness imposes while a `can_use_tool` prompt is unanswered
+//! (W12c, transcript `12e`).
 
 use std::io::{BufRead, Write};
 
@@ -89,6 +95,14 @@ fn is_control(line: &str) -> bool {
     line.contains("\"control_request\"")
 }
 
+/// Whether this stdin line answers a control request the stub sent.
+fn is_control_response(line: &str) -> bool {
+    line.contains("\"control_response\"")
+}
+
+/// The transcript marker that waits for Horde's answer to a prompt.
+const AWAIT_CONTROL_RESPONSE: &str = "@await-control-response";
+
 /// What the environment asked this run to do.
 struct Behaviour {
     exit_after: Option<usize>,
@@ -132,7 +146,7 @@ impl Behaviour {
     /// Answers a control request unless told to swallow it.
     ///
     /// `false` means the pipe is gone, which ends the session.
-    fn acknowledge(&self, stdout: &mut std::io::Stdout) -> bool {
+    fn acknowledge(&self, stdout: &mut impl Write) -> bool {
         if self.ignore_interrupt {
             return true;
         }
@@ -154,10 +168,17 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut served = 0_usize;
+    let mut lines = stdin.lock().lines();
 
-    for line in stdin.lock().lines() {
+    while let Some(line) = lines.next() {
         let Ok(line) = line else { break };
 
+        // An answer that arrived outside any await (late, or unsolicited):
+        // recorded, never spent as a turn.
+        if is_control_response(&line) {
+            behaviour.record(&line);
+            continue;
+        }
         if is_control(&line) {
             behaviour.record(&line);
             if behaviour.acknowledge(&mut stdout) {
@@ -177,7 +198,7 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
             let _ = nix::unistd::close(0);
         }
 
-        if !serve(&mut stdout, turn) || behaviour.done_after(served) {
+        if !serve(&mut stdout, turn, &mut lines, behaviour) || behaviour.done_after(served) {
             break;
         }
     }
@@ -185,12 +206,104 @@ fn replay(turns: &[Vec<&str>], behaviour: &Behaviour) -> std::process::ExitCode 
     std::process::ExitCode::from(behaviour.exit_code)
 }
 
-/// Writes one turn's lines. `false` means the pipe is gone.
-fn serve(stdout: &mut std::io::Stdout, turn: &[&str]) -> bool {
+/// Writes one turn's lines, stopping at each await marker until stdin
+/// brings a `control_response`. `false` means a pipe is gone.
+fn serve(
+    stdout: &mut std::io::Stdout,
+    turn: &[&str],
+    stdin: &mut impl Iterator<Item = std::io::Result<String>>,
+    behaviour: &Behaviour,
+) -> bool {
     for out in turn {
+        if *out == AWAIT_CONTROL_RESPONSE {
+            if stdout.flush().is_err() || !await_response(stdin, stdout, behaviour) {
+                return false;
+            }
+            continue;
+        }
         if writeln!(stdout, "{out}").is_err() {
             return false;
         }
     }
     stdout.flush().is_ok()
+}
+
+/// Reads stdin until a `control_response` arrives, recording it. Control
+/// requests met on the way (an interrupt) are recorded and acknowledged as
+/// they would be between turns. `false` means stdin closed first.
+fn await_response(
+    stdin: &mut impl Iterator<Item = std::io::Result<String>>,
+    stdout: &mut impl Write,
+    behaviour: &Behaviour,
+) -> bool {
+    for line in stdin.by_ref() {
+        let Ok(line) = line else { return false };
+        behaviour.record(&line);
+        if is_control_response(&line) {
+            return true;
+        }
+        if is_control(&line) && !behaviour.acknowledge(stdout) {
+            return false;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Behaviour, await_response};
+
+    fn quiet() -> Behaviour {
+        Behaviour {
+            exit_after: None,
+            exit_code: 0,
+            ignore_interrupt: false,
+            control_log: None,
+            hang_up: false,
+        }
+    }
+
+    fn lines(input: &[&str]) -> impl Iterator<Item = std::io::Result<String>> {
+        input
+            .iter()
+            .map(|line| Ok((*line).to_owned()))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// The await ends on the answer, acknowledging a control request met on
+    /// the way and leaving later input unread.
+    #[test]
+    fn an_await_ends_on_the_response_and_acknowledges_requests_on_the_way() {
+        let mut stdin = lines(&[
+            r#"{"type":"control_request","request":{"subtype":"interrupt"}}"#,
+            r#"{"type":"control_response","response":{}}"#,
+            "next turn",
+        ]);
+        let mut stdout = Vec::new();
+        assert!(await_response(&mut stdin, &mut stdout, &quiet()));
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf-8").lines().count(),
+            1,
+            "one acknowledgement for the one request"
+        );
+        assert_eq!(
+            stdin.next().map(Result::ok),
+            Some(Some("next turn".to_owned()))
+        );
+    }
+
+    /// Stdin closing, or failing, before the answer ends the await as lost.
+    #[test]
+    fn an_await_without_a_response_reports_the_pipe_lost() {
+        let mut stdout = Vec::new();
+        assert!(!await_response(
+            &mut lines(&["noise"]),
+            &mut stdout,
+            &quiet()
+        ));
+        let mut failing = std::iter::once(Err(std::io::Error::other("closed")));
+        assert!(!await_response(&mut failing, &mut stdout, &quiet()));
+        assert!(stdout.is_empty(), "noise is not acknowledged");
+    }
 }

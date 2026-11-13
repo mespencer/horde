@@ -36,6 +36,27 @@ pub struct PendingPermission {
     pub mode: String,
     /// Log position of the request, which is its arrival order.
     pub sequence: u64,
+    /// The questions the request asks, when it is a question (W12c) — only
+    /// answers or a denial settle it.
+    pub questions: Vec<PendingQuestion>,
+}
+
+/// One question a pending request asks, as the inbox shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    /// The key its answer is filed under.
+    pub id: String,
+    pub question: String,
+    /// The option labels, in the order offered; answered by 1-based number.
+    pub options: Vec<String>,
+}
+
+impl PendingPermission {
+    /// Whether only answers (or a denial) can settle this request.
+    #[must_use]
+    pub fn is_question(&self) -> bool {
+        !self.questions.is_empty()
+    }
 }
 
 /// One rendered line of a session's feed.
@@ -212,6 +233,24 @@ impl SessionState {
                                 .map_or_else(String::new, |call| call.rendered.clone()),
                             mode: request.permission_mode.clone(),
                             sequence,
+                            questions: request
+                                .tool_call
+                                .as_ref()
+                                .map(|call| {
+                                    call.questions
+                                        .iter()
+                                        .map(|question| PendingQuestion {
+                                            id: question.id.clone(),
+                                            question: question.question.clone(),
+                                            options: question
+                                                .options
+                                                .iter()
+                                                .map(|option| option.label.clone())
+                                                .collect(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         },
                     );
                 }

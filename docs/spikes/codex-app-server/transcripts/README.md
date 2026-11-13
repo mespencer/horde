@@ -58,6 +58,14 @@ distilled finding.
 | `31-filechange-user-granular-ro-horde-patch.jsonl` | 0.148 | **granular**, read-only, apply_patch, decline | same park as 28 — granular does not unpark file-change; the fileChange approval never reaches the client in either policy |
 | `32-0147-exec-user-onrequest-ro-horde-write.jsonl` | **0.147** | on-request, read-only, write, decline | **NO request — parks at `waitingOnApproval`.** At 0.147 `on-request` does not route exec approvals |
 | `33-0147-exec-user-granular-ro-horde-write.jsonl` | **0.147** | **granular**, read-only, write, decline | `item/commandExecution/requestApproval` **does** fire and decline blocks it. Granular already routed exec at 0.147; only `on-request` changed at 0.148 |
+| `34-0167-exec-user-granular-ro-horde-write.jsonl` | **0.167** | granular, read-only, write, decline | Exec approval unchanged: asked before the command, declined, blocked. The request gains `kind:"command"`; every notification gains `emittedAtMs` |
+| `35-0167-…-write-accept.jsonl` | 0.167 | same, accept | Accepted, the write ran |
+| `36-0167-filechange-user-granular-ro-horde-patch.jsonl` | 0.167 | granular, read-only, apply_patch, decline | **`item/fileChange/requestApproval` now routes** (28/31 parked): the patch rides `item/started [fileChange].changes`, the request names the item; declined → item `declined` |
+| `37-0167-…-patch-accept.jsonl` | 0.167 | same, accept | Accepted, the patch applied |
+| `38-0167-userinput-user-granular-ro-horde-ask.jsonl` | 0.167 | `--enable default_mode_request_user_input` | `item/tool/requestUserInput` with id/header/question/options; answered `{"answers":{"colour":{"answers":["Red"]}}}`, the model replied "Red" |
+| `39-0167-permissions-user-granular-ro-horde-perms.jsonl` | 0.167 | `--enable request_permissions_tool`, accept | `item/permissions/requestApproval` for `{"network":{"enabled":true}}`; granting it (scope `turn`) let the following exec — itself approved — reach the network |
+| `40-0167-exec-user-onrequest-ro-horde-write.jsonl` | 0.167 | on-request, read-only, write, decline | Same as 34: plain `on-request` routes exec too |
+| `41-0167-basic-user-granular-ro-horde-two-turns.jsonl` | 0.167 | granular, two plain turns | The baseline: `turn/completed` per turn, per-call usage readings |
 
 Files 17–19 were recorded by `drive_mcp.py` with `mcp_stub.py` as the upstream
 MCP server (configured per-process via `-c mcp_servers.…` overrides, so the
@@ -68,6 +76,14 @@ carries `tool_params_display`, which the lost captures never recorded. Note the
 elicitation params carry the **turn id and server name but not the tool name**;
 the tool's identity comes from the `item/started [mcpToolCall]` that precedes
 the request in the same turn.
+
+Files 34–41 (W12c, 2026-11-13) were recorded by `drive_approvals.py` against
+codex-cli 0.167.0 on Linux, after two driver fixes: frames are read on a
+thread (the old `select()` + `readline()` lost buffered frames until the next
+write — `emittedAtMs` showed codex had sent them on time), and an idle status
+no longer ends the turn before its `turn/completed`. Their scratch paths are
+rewritten to `/tmp/horde-w12c/…`, and the installation id, host name and user
+agent are scrubbed.
 
 Redaction: account email, account/installation ids, and the scratch session path
 are replaced; third-party MCP tool schemas are elided to a count. No credentials

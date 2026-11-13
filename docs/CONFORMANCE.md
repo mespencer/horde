@@ -74,7 +74,7 @@ citations are for `9218ac2`.
 | a15 advertisement fed | CLOSED | Warm instances, tags, remotes on every registration (`horde-worker/src/startup.rs:534-536,678-691`). The worker never calls `ReportCapabilities`/`ReportWorkspaceInstances`, so warmth refreshes only at re-registration. |
 | a16 coverage threshold | CLOSED | `FLOOR_PERCENT = 95.0` (`gates/coverage.rs:20`). |
 
-**Contract disagreements (Part 2):** 1 CLOSED (unique keys; a reused key on a different event kind is refused loudly, `service/shared.rs:370,422-442`). 2 CLOSED (as a8). 3 CLOSED — clients send full specs, and MCP-spawned children inherit the parent's `agent_type` unless they name another (`horde-server/src/lineage.rs:28`; `horde-mcp/src/verbs.rs:171`), so hub allowlists resolve for them (checked at `9218ac2`). 4, 5, 6, 9, 11 CLOSED (a6, a4, a9, a11, a14). 7 OPEN — `RevivalIdentity::is_resumable_under` (`horde-adapter/src/identity.rs:24,61`) is still called only by its tests. 8 OPEN — journal and session sequences are both raw `uint64` on the wire. 10 PARTIAL (as a13). 12 PARTIAL — `workspace_definition_id` is read and `horde new` exists; `MaterializationProgress` has no producer (its comment now says so) and `unmanaged_paths` is read by no worker code.
+**Contract disagreements (Part 2):** 1 CLOSED (unique keys; a reused key on a different event kind is refused loudly, `service/shared.rs:370,422-442`). 2 CLOSED (as a8). 3 CLOSED — clients send full specs, and MCP-spawned children inherit the parent's `agent_type` unless they name another (`horde-server/src/lineage.rs:28`; `horde-mcp/src/verbs.rs:171`), so hub allowlists resolve for them (checked at `9218ac2`). 4, 5, 6, 9, 11 CLOSED (a6, a4, a9, a11, a14). 7 CLOSED (W12c) — `RevivalIdentity` and `is_resumable_under` were deleted rather than wired: revival rebuilds the spec from the journaled spawn command, so the account directory is re-derived under the journal's own state directory and the guard would compare a directory with itself (`horde-adapter/src/identity.rs` module docs). 8 OPEN — journal and session sequences are both raw `uint64` on the wire. 10 PARTIAL (as a13). 12 PARTIAL — `workspace_definition_id` is read and `horde new` exists; `MaterializationProgress` has no producer (its comment now says so) and `unmanaged_paths` is read by no worker code.
 
 **DESIGN amendments (Part 2, (b)):** landed in W7f and kept current since; spot-checked at `22f2599`: §4's Codex bullet (DESIGN.md §4), ADR-0001's worker-table scope ruling, TESTING.md §5, and the `horde new` proto comment.
 
@@ -1027,6 +1027,8 @@ subsystems hold different beliefs about one shared contract:
    (`identity.rs:24-63`, never called in production); the worker journal's
    `RevivableAgent` actually carries the pairing (`journal.rs:129-140`). Two
    types for one contract; the guard the type exists for is never enforced.
+   *CLOSED in W12c by deleting the type and guard: the journal's spawn
+   command is the one mechanism.*
 8. **Number spaces.** Worker `journal_sequence` vs. session `sequence` diverge
    the moment a worker serves two sessions; feeding one to the other yields a
    plausible wrong offset. Handled today by identity-matching instead of

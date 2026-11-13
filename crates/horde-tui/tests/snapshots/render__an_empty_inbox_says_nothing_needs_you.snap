@@ -25,4 +25,4 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"[y] allow  [n] deny  [enter] attach  [o] overview  [q] quit                     "
+"[y] allow  [1-9] answer  [n] deny  [enter] attach  [o] overview  [q] quit       "

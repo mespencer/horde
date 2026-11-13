@@ -62,6 +62,12 @@ pub enum AdapterError {
     #[error("the session is waiting for a decision on tool call {tool_call_id}")]
     AwaitingDecision { tool_call_id: ToolCallId },
 
+    /// The installed harness is a version this adapter refuses to drive
+    /// (W12c): older than a release its claims depend on. A property of the
+    /// machine, not the moment — the answer is an upgrade, or another Worker.
+    #[error("refusing the {provider} harness: {detail}")]
+    RefusedVersion { provider: String, detail: String },
+
     /// Talking to the harness failed at the transport level.
     #[error("i/o error talking to the harness: {0}")]
     Io(#[from] std::io::Error),
@@ -78,6 +84,7 @@ impl AdapterError {
         match self {
             Self::HarnessExited { .. } | Self::Io(_) | Self::Protocol { .. } => true,
             Self::Spawn { .. }
+            | Self::RefusedVersion { .. }
             | Self::Unauthenticated { .. }
             | Self::Unsupported { .. }
             | Self::UnknownPermissionRequest { .. }
@@ -151,5 +158,15 @@ mod tests {
         );
 
         assert!(AdapterError::HarnessExited { exit_code: Some(1) }.is_retryable_here());
+
+        let refused = AdapterError::RefusedVersion {
+            provider: "codex".to_owned(),
+            detail: "codex 0.145.0 is refused: below 0.147.0".to_owned(),
+        };
+        assert!(!refused.is_retryable_here(), "an old binary stays old");
+        assert_eq!(
+            refused.to_string(),
+            "refusing the codex harness: codex 0.145.0 is refused: below 0.147.0"
+        );
     }
 }

@@ -126,6 +126,7 @@ fn escalation(agent_id: &str, request_id: &str, rendered: &str) -> Event {
                     tool_name: "Bash".to_owned(),
                     input: None,
                     rendered: rendered.to_owned(),
+                    questions: Vec::new(),
                 }),
                 tree_path: vec!["tui".to_owned(), "runner".to_owned()],
                 permission_mode: "manual".to_owned(),

@@ -3,7 +3,8 @@
 //! Horde treats every provider the same way: a supervised child process with a
 //! wire protocol (DESIGN.md §4). This crate is the shape of that treatment —
 //! one trait pair plus the domain vocabulary each harness is normalized into.
-//! It holds no I/O and knows about no particular provider, so the rules it
+//! It holds no I/O — save the opt-in `probe` feature's one bounded
+//! `--version` run — and knows about no particular provider, so the rules it
 //! states are enforceable against all of them.
 //!
 //! # The seam in one paragraph
@@ -67,19 +68,22 @@ pub mod permission;
 pub mod replay;
 pub mod spec;
 pub mod usage;
+pub mod version;
 
 pub use capability::{Capabilities, Capability, PermissionEnforcement, ToolCallKind};
 pub use error::AdapterError;
 pub use event::{AgentEvent, ChunkCounters, OutputChannel, TurnOutcome, TurnStatus};
-pub use identity::RevivalIdentity;
 pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId, account_dir};
 pub use login::LoginRecipe;
-pub use permission::{PermissionDecision, PermissionDenial, ProposedToolCall};
+pub use permission::{
+    Answers, PermissionDecision, PermissionDenial, ProposedToolCall, Question, QuestionOption,
+};
 pub use replay::{LineDecoder, ReplaySession};
 pub use spec::{AgentSpec, Delivery, McpEndpoint, TURNS_TAKEN_OPTION, TurnInput};
 pub use usage::{
     HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
 };
+pub use version::{HarnessVersion, SupportTable, SupportVerdict, VersionReport};
 
 pub use adapter::{Adapter, AgentSession};
 pub use error::Result;

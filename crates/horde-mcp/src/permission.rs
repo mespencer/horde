@@ -228,7 +228,7 @@ impl PermissionBroker {
         prompt: &PromptRequest,
     ) -> Result<serde_json::Value, PermissionError> {
         let decision = self.adjudicate(identity, prompt).await?;
-        Ok(encode_tool_response(&decision, &prompt.input))
+        Ok(encode_tool_response(&decision_body(&decision, prompt)))
     }
 }
 
@@ -250,11 +250,31 @@ fn requested(
                 tool_name: prompt.tool_name.clone(),
                 input: as_struct(&prompt.input),
                 rendered: rendered(prompt),
+                // An AskUserQuestion over the fallback route still asks a
+                // human, exactly as it does over stdio.
+                questions: horde_wire::permission::questions_to_wire(
+                    &prompt.to_proposed_call().questions,
+                ),
             }),
             forward,
             ..horde_proto::v1::PermissionRequest::default()
         }),
     }
+}
+
+/// The decision body Claude reads, for the fallback route.
+///
+/// An answer the call cannot carry — answers to a tool that asked nothing —
+/// becomes a denial saying so, never an allow that silently drops them.
+#[must_use]
+pub fn decision_body(decision: &PermissionDecision, prompt: &PromptRequest) -> serde_json::Value {
+    horde_adapter_claude::permission::encode_decision(decision, &prompt.tool_name, &prompt.input)
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "behavior": "deny",
+                "message": format!("{} asked no question, so answers cannot apply", prompt.tool_name),
+            })
+        })
 }
 
 /// A one-line rendering of the call, for approval UIs.

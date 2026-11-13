@@ -130,3 +130,190 @@ async fn the_codec_still_understands_a_live_claude() {
         println!("note: unmodelled event types from this CLI: {unmodelled:?}");
     }
 }
+
+/// Spawns the real `claude` on the stdio permission route (W12c) in `cwd`,
+/// offering only `tools`.
+fn stdio_claude(cwd: &std::path::Path, tools: &str) -> Command {
+    let mut command = Command::new("claude");
+    command
+        .current_dir(cwd)
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "haiku",
+            "--tools",
+            tools,
+        ])
+        .args(
+            IsolationFlags {
+                mcp_config: None,
+                permission_prompt_tool: Some(horde_adapter_claude::permission::STDIO_PROMPT_TOOL),
+            }
+            .argv(),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    command
+}
+
+/// What one stdio turn produced: its outcome and every prompt it raised.
+type StdioTurn = (
+    horde_adapter::TurnOutcome,
+    Vec<horde_adapter::ProposedToolCall>,
+);
+
+/// One turn on the stdio route: every `can_use_tool` prompt is answered by
+/// `decide` through the production encoders, and the turn's outcome and the
+/// prompts seen come back. Errors name the step that failed.
+async fn stdio_turn(
+    cwd: &std::path::Path,
+    tools: &str,
+    prompt: &str,
+    decide: impl Fn(&horde_adapter::ProposedToolCall) -> horde_adapter::PermissionDecision,
+) -> Result<StdioTurn, String> {
+    use horde_adapter_claude::permission::{encode_control_response, encode_decision};
+    use horde_adapter_claude::wire::{ControlRequestKind, Event};
+
+    let mut child = stdio_claude(cwd, tools)
+        .spawn()
+        .map_err(|error| format!("the `claude` binary must be on PATH: {error}"))?;
+    let mut stdin = child.stdin.take().ok_or("stdin was not piped")?;
+    let stdout = child.stdout.take().ok_or("stdout was not piped")?;
+    let write = |line: String| format!("{line}\n").into_bytes();
+    stdin
+        .write_all(&write(encode_user_message(prompt)))
+        .await
+        .map_err(|error| format!("writing the prompt: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| format!("flushing: {error}"))?;
+
+    let mut assembler = TurnAssembler::new();
+    let mut lines = BufReader::new(stdout).lines();
+    let mut prompts = Vec::new();
+    let mut outcome = None;
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|error| format!("reading stdout: {error}"))?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope = decode_line(&line)
+            .map_err(|error| format!("the live protocol no longer decodes: {error}"))?;
+        let events = assembler.feed(&envelope);
+        if let Event::ControlRequest(request) = &envelope.event
+            && let ControlRequestKind::CanUseTool(can_use) = &request.request
+        {
+            let call = can_use.to_proposed_call();
+            let body = encode_decision(&decide(&call), &can_use.tool_name, &can_use.input)
+                .ok_or("the decision is inexpressible for this prompt")?;
+            stdin
+                .write_all(&write(encode_control_response(&request.request_id, &body)))
+                .await
+                .map_err(|error| format!("answering: {error}"))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|error| format!("flushing: {error}"))?;
+            prompts.push(call);
+        }
+        for event in events {
+            if let AgentEvent::TurnEnded(ended) = event {
+                outcome = Some(ended);
+            }
+        }
+        if outcome.is_some() {
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = child.wait().await;
+    Ok((outcome.ok_or("the live turn never closed")?, prompts))
+}
+
+/// The stdio route against the live CLI: the Write prompt arrives as a
+/// `can_use_tool` control request before anything is written, and the
+/// harness writes the **narrowed** content Horde answered with.
+#[tokio::test]
+#[ignore = "spawns the real claude binary and spends tokens; run manually"]
+async fn a_live_stdio_prompt_is_answered_and_the_narrowing_runs() {
+    let scratch = tempfile::tempdir().expect("a scratch cwd");
+    let (outcome, prompts) = stdio_turn(
+        scratch.path(),
+        "Write",
+        "Use the Write tool to create the file probe.txt containing exactly: ORIGINAL",
+        |call| {
+            let mut narrowed = call.input.clone();
+            narrowed["content"] = serde_json::json!("NARROWED_BY_HORDE");
+            horde_adapter::PermissionDecision::allow_with(narrowed)
+        },
+    )
+    .await
+    .expect("a live stdio turn");
+    assert!(outcome.status.is_completed(), "{outcome:?}");
+    assert_eq!(prompts.len(), 1, "one Write, one prompt: {prompts:?}");
+    assert_eq!(prompts[0].tool_name, "Write");
+    let written =
+        std::fs::read_to_string(scratch.path().join("probe.txt")).expect("the allowed write ran");
+    assert_eq!(written.trim(), "NARROWED_BY_HORDE");
+}
+
+/// `AskUserQuestion` against the live CLI: the question arrives as a prompt
+/// carrying questions, and the answer reaches the model.
+#[tokio::test]
+#[ignore = "spawns the real claude binary and spends tokens; run manually"]
+async fn a_live_question_is_answered_through_the_prompt() {
+    let scratch = tempfile::tempdir().expect("a scratch cwd");
+    let (outcome, prompts) = stdio_turn(
+        scratch.path(),
+        "AskUserQuestion",
+        "Before doing anything, use the AskUserQuestion tool to ask me which colour I prefer, \
+         offering exactly two options: Red and Blue. Then reply with just the colour I chose.",
+        |call| {
+            let question = call.questions.first().expect("the prompt is a question");
+            horde_adapter::PermissionDecision::answer(horde_adapter::Answers::from([(
+                question.id.clone(),
+                vec!["Blue".to_owned()],
+            )]))
+        },
+    )
+    .await
+    .expect("a live stdio turn");
+    assert!(outcome.status.is_completed(), "{outcome:?}");
+    assert!(
+        prompts
+            .iter()
+            .all(horde_adapter::ProposedToolCall::is_question)
+    );
+    assert!(
+        outcome
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("Blue")),
+        "{outcome:?}"
+    );
+}
+
+/// The installed CLI's version, against the measured table.
+#[test]
+#[ignore = "runs the real claude binary; run manually"]
+fn the_installed_claude_version_is_classified() {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .expect("claude is on PATH");
+    let report =
+        horde_adapter_claude::version::SUPPORT.classify(&String::from_utf8_lossy(&output.stdout));
+    println!("{}", report.describe());
+    assert!(!report.is_refused(), "{}", report.describe());
+}

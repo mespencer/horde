@@ -85,6 +85,11 @@ pub enum Directive {
     Deny {
         request_id: String,
     },
+    /// Answer a question request (W12c): question id to chosen labels.
+    Answer {
+        request_id: String,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
+    },
     SendAssignment {
         agent_id: String,
         text: String,
@@ -503,6 +508,12 @@ impl App {
             KeyCode::Char('y') => {
                 return answer(selected_entry(&entries, self.inbox_selected), true);
             }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                return choose(
+                    selected_entry(&entries, self.inbox_selected).map(|entry| &entry.permission),
+                    c,
+                );
+            }
             KeyCode::Char('n') => {
                 return answer(selected_entry(&entries, self.inbox_selected), false);
             }
@@ -588,6 +599,12 @@ impl App {
             if c == 'n' {
                 return answer_one(self.scoped_pending().first(), false);
             }
+            // A digit picks an option only when the front prompt is a
+            // question; otherwise it is the start of a message.
+            let pending = self.scoped_pending();
+            if c.is_ascii_digit() && pending.first().is_some_and(PendingPermission::is_question) {
+                return choose(pending.first(), c);
+            }
         }
         self.input.push(c);
         Vec::new()
@@ -654,11 +671,39 @@ fn answer_one(permission: Option<&PendingPermission>, allow: bool) -> Vec<Direct
         return Vec::new();
     };
     let request_id = permission.request_id.clone();
-    if allow {
-        vec![Directive::Approve { request_id }]
-    } else {
+    if !allow {
         vec![Directive::Deny { request_id }]
+    } else if permission.is_question() {
+        // A question cannot be "allowed": only answers settle it, and the
+        // Server would refuse a bare allow. The digit keys answer.
+        Vec::new()
+    } else {
+        vec![Directive::Approve { request_id }]
     }
+}
+
+/// Answers a single-question request with option `digit` (1-based). A
+/// request asking several questions — or a digit naming no option — is left
+/// to `horde answer`, where every question can be answered at once.
+fn choose(permission: Option<&PendingPermission>, digit: char) -> Vec<Directive> {
+    let Some(permission) = permission else {
+        return Vec::new();
+    };
+    let [question] = permission.questions.as_slice() else {
+        return Vec::new();
+    };
+    let label = digit
+        .to_digit(10)
+        .and_then(|number| usize::try_from(number).ok())
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| question.options.get(index));
+    let Some(label) = label else {
+        return Vec::new();
+    };
+    vec![Directive::Answer {
+        request_id: permission.request_id.clone(),
+        answers: std::collections::BTreeMap::from([(question.id.clone(), vec![label.clone()])]),
+    }]
 }
 
 /// One step toward the top of a list, stopping there.
@@ -752,6 +797,130 @@ mod tests {
                 ..PermissionRequest::default()
             }),
         })
+    }
+
+    /// A question request: one question per `(id, options)` pair (W12c).
+    fn question_kind(request_id: &str, questions: &[(&str, &[&str])]) -> Kind {
+        Kind::PermissionRequested(PermissionRequested {
+            request: Some(PermissionRequest {
+                request_id: Some(PermissionRequestId::new(request_id)),
+                tool_call: Some(horde_proto::v1::ProposedToolCall {
+                    tool_name: "AskUserQuestion".to_owned(),
+                    input: None,
+                    rendered: "AskUserQuestion".to_owned(),
+                    questions: questions
+                        .iter()
+                        .map(|(id, options)| horde_proto::v1::Question {
+                            id: (*id).to_owned(),
+                            question: format!("{id}?"),
+                            options: options
+                                .iter()
+                                .map(|label| horde_proto::v1::QuestionOption {
+                                    label: (*label).to_owned(),
+                                    description: String::new(),
+                                })
+                                .collect(),
+                            ..horde_proto::v1::Question::default()
+                        })
+                        .collect(),
+                }),
+                ..PermissionRequest::default()
+            }),
+        })
+    }
+
+    /// The inbox answers a single question by option number; `y` cannot
+    /// "allow" a question; a digit naming no option, or a request asking
+    /// several questions, sends nothing; `n` still denies.
+    #[test]
+    fn digits_answer_a_single_question_and_nothing_else() {
+        let mut app = App::overview();
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        app.apply(event_in(
+            "s1",
+            1,
+            "root-1",
+            question_kind("q-1", &[("colour", &["Red", "Blue"])]),
+        ));
+        app.on_input(&key(KeyCode::Char('i')));
+        let entries = app.inbox_entries();
+        assert!(entries[0].permission.is_question());
+        assert_eq!(
+            entries[0].permission.questions[0].options,
+            vec!["Red", "Blue"]
+        );
+
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('2'))),
+            vec![Directive::Answer {
+                request_id: "q-1".to_owned(),
+                answers: std::collections::BTreeMap::from([(
+                    "colour".to_owned(),
+                    vec!["Blue".to_owned()]
+                )]),
+            }]
+        );
+        assert!(
+            app.on_input(&key(KeyCode::Char('3'))).is_empty(),
+            "no option 3"
+        );
+        assert!(
+            app.on_input(&key(KeyCode::Char('0'))).is_empty(),
+            "options count from 1"
+        );
+        assert!(
+            app.on_input(&key(KeyCode::Char('y'))).is_empty(),
+            "a question cannot be allowed, only answered"
+        );
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('n'))),
+            vec![Directive::Deny {
+                request_id: "q-1".to_owned()
+            }]
+        );
+
+        let mut several = App::overview();
+        several.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        several.apply(event_in(
+            "s1",
+            1,
+            "root-1",
+            question_kind("q-2", &[("a", &["x"]), ("b", &["y"])]),
+        ));
+        several.on_input(&key(KeyCode::Char('i')));
+        assert!(
+            several.on_input(&key(KeyCode::Char('1'))).is_empty(),
+            "several questions are answered with `horde answer`"
+        );
+    }
+
+    /// Attached, a digit answers the front prompt only when it is a question;
+    /// otherwise it starts a message.
+    #[test]
+    fn attached_digits_answer_a_question_and_otherwise_compose() {
+        let mut app = App::attached("s1", None);
+        app.apply(event_in(
+            "s1",
+            1,
+            "root-1",
+            question_kind("q-1", &[("colour", &["Red"])]),
+        ));
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('1'))),
+            vec![Directive::Answer {
+                request_id: "q-1".to_owned(),
+                answers: std::collections::BTreeMap::from([(
+                    "colour".to_owned(),
+                    vec!["Red".to_owned()]
+                )]),
+            }]
+        );
+        assert!(app.input().is_empty());
+
+        let mut plain = App::attached("s2", None);
+        plain.apply(event_in("s2", 1, "root-2", request_kind("req-1")));
+        assert!(plain.on_input(&key(KeyCode::Char('1'))).is_empty());
+        assert_eq!(plain.input(), "1", "a digit is a letter when nothing asks");
     }
 
     /// An app watching two sessions, the second holding one escalation.

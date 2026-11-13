@@ -1,0 +1,2 @@
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/horde-w12c/codex-home"))
+[2m2026-11-13T06:51:04.262723Z[0m [31mERROR[0m [2mcodex_app_server[0m[2m:[0m Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces.

@@ -396,6 +396,8 @@ async fn approve_reaches_the_server_and_an_unknown_request_is_refused() {
         vec!["approve", "no-such-request"],
         vec!["approve", "no-such-request", "--deny", "--reason", "nope"],
         vec!["approve", "no-such-request", "--remember"],
+        vec!["approve", "no-such-request", "--answer", "1=Red"],
+        vec!["answer", "no-such-request", "1=Red"],
     ] {
         let error = invoke(&endpoint, &case)
             .await
@@ -404,6 +406,18 @@ async fn approve_reaches_the_server_and_an_unknown_request_is_refused() {
             error.to_string().contains("no-such-request"),
             "{case:?} must name what was not found: {error}"
         );
+    }
+
+    // Contradictory or malformed answers are refused locally, naming why.
+    for (case, needle) in [
+        (
+            vec!["approve", "no-such-request", "--deny", "--answer", "1=Red"],
+            "contradict",
+        ),
+        (vec!["answer", "no-such-request", "Red"], "QUESTION=VALUE"),
+    ] {
+        let error = invoke(&endpoint, &case).await.expect_err("refused locally");
+        assert!(error.to_string().contains(needle), "{case:?}: {error}");
     }
 }
 

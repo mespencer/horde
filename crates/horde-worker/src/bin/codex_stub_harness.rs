@@ -16,7 +16,9 @@
 //!   block behind the marker stands in for what the harness does once
 //!   answered. `!EXEC_APPROVAL ` does the same on
 //!   `item/commandExecution/requestApproval`, the exec seam the 2026-08-19
-//!   re-probe measured. A `!CLOSE_STDOUT` line closes the stub's stdout and
+//!   re-probe measured. `!SERVER_REQUEST <method> <params>` does the same on
+//!   any method — the 0.167 requests (W12c) and whatever comes next. A
+//!   `!CLOSE_STDOUT` line closes the stub's stdout and
 //!   leaves stdin open (still read, still logged): the client sees the
 //!   harness end while its writes would still succeed.
 //! * `codex-stub-harness --version` prints `HORDE_CODEX_STUB_VERSION` (default
@@ -291,9 +293,12 @@ fn play_block(block: &[String], stdin: &mut impl BufRead, next_server_id: &mut u
 
 /// The method a marker line asks for, with its params — or `None` for a raw
 /// line.
-fn server_request_marker(line: &str) -> Option<(&'static str, &str)> {
+fn server_request_marker(line: &str) -> Option<(&str, &str)> {
     if let Some(params) = line.strip_prefix("!ELICIT ") {
         return Some(("mcpServer/elicitation/request", params));
+    }
+    if let Some(rest) = line.strip_prefix("!SERVER_REQUEST ") {
+        return rest.split_once(' ');
     }
     line.strip_prefix("!EXEC_APPROVAL ")
         .map(|params| ("item/commandExecution/requestApproval", params))
@@ -560,6 +565,14 @@ mod tests {
                 "item/commandExecution/requestApproval",
                 "{\"command\":\"true\"}"
             ))
+        );
+        assert_eq!(
+            super::server_request_marker("!SERVER_REQUEST item/tool/requestUserInput {\"a\":1}"),
+            Some(("item/tool/requestUserInput", "{\"a\":1}"))
+        );
+        assert_eq!(
+            super::server_request_marker("!SERVER_REQUEST nospace"),
+            None
         );
         assert_eq!(
             super::server_request_marker("{\"method\":\"turn/started\"}"),

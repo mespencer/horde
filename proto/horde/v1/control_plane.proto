@@ -336,6 +336,11 @@ message AnswerPermissionRequest {
   //
   // Meaningful only with outcome ALLOW.
   google.protobuf.Struct updated_input = 5;
+
+  // Answers to the request's questions, keyed by Question.id — see
+  // PermissionDecision.answers. Required with ALLOW on a question request,
+  // refused anywhere else.
+  map<string, Answer> answers = 6;
 }
 
 message AnswerPermissionResponse {

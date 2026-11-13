@@ -12,7 +12,7 @@
 //! * **`SessionEstablished` journals a lifecycle transition, not the provider
 //!   session id as data.** The wire vocabulary has no session-established
 //!   kind, and the revival identity is Worker-local by design — the Worker,
-//!   not the Server, revives agents (`RevivalIdentity`). The Session log gets
+//!   not the Server, revives agents (`horde_adapter::identity`). The Session log gets
 //!   the honest observable fact: the agent went from starting to running, on
 //!   which model.
 //! * **`ToolCompleted` journals nothing.** The tool's output already rode
@@ -77,6 +77,7 @@ pub fn failure_reason(error: &AdapterError) -> String {
         }
         AdapterError::Protocol { .. } => MALFORMED_STREAM,
         AdapterError::Unauthenticated { .. }
+        | AdapterError::RefusedVersion { .. }
         | AdapterError::Unsupported { .. }
         | AdapterError::UnknownPermissionRequest { .. }
         | AdapterError::AwaitingDecision { .. } => REFUSAL,
@@ -450,6 +451,7 @@ mod tests {
                     tool_call_id: ToolCallId::new("toolu_07"),
                     tool_name: "Bash".to_owned(),
                     input: json!({ "command": "docker rm horde-test" }),
+                    questions: Vec::new(),
                 },
             },
         )
@@ -490,6 +492,7 @@ mod tests {
                     tool_call_id: ToolCallId::new("toolu_08"),
                     tool_name: "Bash".to_owned(),
                     input: json!(["not", "an", "object"]),
+                    questions: Vec::new(),
                 },
             },
         )

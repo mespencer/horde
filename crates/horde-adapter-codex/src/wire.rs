@@ -1,8 +1,9 @@
 //! Serde types for the `codex app-server` protocol, transcribed from the W2c
 //! golden transcripts rather than from the schema.
 //!
-//! The schema (`codex app-server generate-json-schema`) declares 89 client
-//! methods and 70 server notifications. Almost none of them matter to a Worker,
+//! The schema (`codex app-server generate-json-schema`) declared 89 client
+//! methods and 70 server notifications at 0.147; at 0.167 it is 106 client
+//! requests, 86 notifications and 10 server requests. Almost none of them matter to a Worker,
 //! so this models the frames that actually appeared in a driven session and
 //! lets the rest fall into [`Notification::Other`]. That is deliberate: a codec
 //! that enumerated all 70 would break on every Codex release, whereas one that
@@ -64,6 +65,11 @@ pub enum Notification {
     /// The `error` notification (0.147.0 schema): a turn-scoped failure with
     /// a `willRetry` bit that separates a hiccup from a verdict.
     Error(ErrorBody),
+    /// `serverRequest/resolved` (0.167): codex saying a server request is
+    /// settled — after Horde's answer, or on its own (a question's
+    /// `autoResolutionMs`, a turn ending under it). An approval Horde still
+    /// holds for that request id is stale from here on.
+    ServerRequestResolved(ServerRequestResolved),
     Other {
         method: String,
     },
@@ -212,6 +218,32 @@ pub struct Item {
     /// reads `"user rejected MCP tool call"` here (transcript 18).
     #[serde(default)]
     pub error: Option<ItemError>,
+    /// `fileChange` items: the patch, per file, before it is applied — what
+    /// a file-change approval is judged on, since the approval itself names
+    /// only the item (transcript 36).
+    #[serde(default)]
+    pub changes: Option<Vec<FileChange>>,
+}
+
+/// One file inside a `fileChange` item.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    /// `{"type":"add"}`, `{"type":"delete"}`, `{"type":"update", …}` — kept
+    /// whole, so a rule or a human sees exactly what codex said.
+    #[serde(default)]
+    pub kind: serde_json::Value,
+    #[serde(default)]
+    pub diff: Option<String>,
+}
+
+/// `serverRequest/resolved`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ServerRequestResolved {
+    #[serde(rename = "threadId", default)]
+    pub thread_id: Option<String>,
+    #[serde(rename = "requestId")]
+    pub request_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -234,6 +266,11 @@ impl Item {
     #[must_use]
     pub fn is_mcp_tool_call(&self) -> bool {
         self.kind == "mcpToolCall"
+    }
+
+    #[must_use]
+    pub fn is_file_change(&self) -> bool {
+        self.kind == "fileChange"
     }
 }
 
@@ -361,6 +398,125 @@ impl ExecApprovalRequest {
     }
 }
 
+/// The thread, turn and item a 0.167 server request names — the header every
+/// item-scoped request shares.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RequestScope {
+    #[serde(rename = "threadId", default)]
+    pub thread_id: Option<String>,
+    #[serde(rename = "turnId", default)]
+    pub turn_id: Option<String>,
+    #[serde(rename = "itemId", default)]
+    pub item_id: Option<String>,
+}
+
+/// A server request whose params carry a [`RequestScope`].
+pub trait Scoped {
+    fn scope(&self) -> &RequestScope;
+}
+
+impl Scoped for FileChangeApprovalRequest {
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
+
+impl Scoped for PermissionsApprovalRequest {
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
+
+impl Scoped for UserInputRequest {
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
+
+/// The method file-change approvals arrive on (0.167, transcripts 36–37).
+///
+/// At 0.148 this request was never sent — the thread parked at
+/// `waitingOnApproval` instead (transcripts 28, 31). The reply speaks the
+/// `decision` vocabulary: `accept`, `acceptForSession`, `decline`, `cancel`.
+pub const FILE_CHANGE_APPROVAL_METHOD: &str = "item/fileChange/requestApproval";
+
+/// `item/fileChange/requestApproval`. Names the item, not the patch: the
+/// diff rides the `fileChange` item started just before it (transcript 36),
+/// which is why the assembler joins the two by item id.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FileChangeApprovalRequest {
+    /// Which thread, turn and item the request belongs to.
+    #[serde(flatten)]
+    pub scope: RequestScope,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// A root codex asks to be granted write access under for the session.
+    #[serde(rename = "grantRoot", default)]
+    pub grant_root: Option<String>,
+}
+
+/// The method sandbox-widening requests arrive on (0.167, behind the
+/// `request_permissions_tool` feature; transcript 39).
+pub const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
+
+/// `item/permissions/requestApproval`: the agent asking for more sandbox —
+/// network, extra filesystem roots — for the turn or the session. The reply
+/// grants a profile (`{"permissions": …, "scope": "turn"|"session"}`); an
+/// empty profile grants nothing, which is how a refusal is spelled.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PermissionsApprovalRequest {
+    /// Which thread, turn and item the request belongs to.
+    #[serde(flatten)]
+    pub scope: RequestScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `{"network":{"enabled":true},"fileSystem":null}` — kept whole: it is
+    /// both what the chain judges and what an allow grants back.
+    #[serde(default)]
+    pub permissions: serde_json::Value,
+}
+
+/// The method agent questions arrive on (0.167, behind the
+/// `default_mode_request_user_input` feature outside plan mode; transcript
+/// 38).
+pub const USER_INPUT_METHOD: &str = "item/tool/requestUserInput";
+
+/// `item/tool/requestUserInput`: questions with options, answered by id.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UserInputRequest {
+    /// Which thread, turn and item the request belongs to.
+    #[serde(flatten)]
+    pub scope: RequestScope,
+    #[serde(default)]
+    pub questions: Vec<UserInputQuestion>,
+}
+
+/// One question inside a [`UserInputRequest`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UserInputQuestion {
+    pub id: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub question: String,
+    #[serde(rename = "isOther", default)]
+    pub is_other: bool,
+    #[serde(rename = "isSecret", default)]
+    pub is_secret: bool,
+    #[serde(default)]
+    pub options: Option<Vec<UserInputOption>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UserInputOption {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TokenUsageUpdated {
     #[serde(rename = "threadId", default)]
@@ -451,6 +607,9 @@ impl Notification {
             "item/started" => parse(params).map_or_else(other, Self::ItemStarted),
             "item/completed" => parse(params).map_or_else(other, Self::ItemCompleted),
             "error" => parse(params).map_or_else(other, Self::Error),
+            "serverRequest/resolved" => {
+                parse(params).map_or_else(other, Self::ServerRequestResolved)
+            }
             "thread/tokenUsage/updated" => {
                 parse(params).map_or_else(other, Self::TokenUsageUpdated)
             }

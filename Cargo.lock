@@ -1159,6 +1159,7 @@ dependencies = [
  "horde-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1170,6 +1171,7 @@ dependencies = [
  "horde-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1195,6 +1197,8 @@ dependencies = [
  "clap",
  "cucumber",
  "horde-adapter",
+ "horde-adapter-claude",
+ "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-identity",
  "horde-observe",

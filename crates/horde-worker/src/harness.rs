@@ -252,6 +252,8 @@ impl SecretFile {
 
 /// The journal is the production ledger: a group remembered there survives
 /// the Worker, which is the whole point.
+pub use horde_adapter::version::probe_version;
+
 #[async_trait::async_trait]
 impl GroupLedger for Journal {
     async fn opened(&self, group: &HarnessGroup) -> Result<(), String> {

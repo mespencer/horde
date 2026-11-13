@@ -11,7 +11,11 @@ workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
-horde-adapter = { path = "../horde-adapter" }
+horde-adapter = { path = "../horde-adapter", features = ["probe"] }
+# `horde doctor` classifies the local harness binaries against each adapter's
+# measured version range (W12c); the tables live with the codecs.
+horde-adapter-claude = { workspace = true }
+horde-adapter-codex = { workspace = true }
 # Enrollment is a client verb (DESIGN §3: "horde worker enroll", and clients
 # enroll identically), and the mTLS channel config is the identity crate's.
 horde-identity = { workspace = true }

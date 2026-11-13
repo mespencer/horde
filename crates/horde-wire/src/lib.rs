@@ -43,8 +43,9 @@ pub fn result_status_name(status: i32) -> &'static str {
 
 pub use capability::{UnknownCapability, capability_from_wire, capability_to_wire};
 pub use permission::{
-    ConversionError, permission_decision_from_wire, permission_decision_to_wire,
-    proposed_tool_call_to_wire, struct_to_json,
+    ConversionError, answers_from_wire, answers_to_wire, permission_decision_from_wire,
+    permission_decision_to_wire, proposed_tool_call_to_wire, questions_from_wire,
+    questions_to_wire, struct_to_json,
 };
 pub use usage::{
     UnreadableUtilization, rate_window_from_wire, rate_window_to_wire, token_usage_from_wire,

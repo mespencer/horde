@@ -35,6 +35,49 @@ message ProposedToolCall {
 
   // Human-readable rendering for approval UIs, e.g. "docker rm horde-test".
   string rendered = 3;
+
+  // Set when the harness is asking the human a question rather than (or as
+  // well as) asking to run something: Claude's AskUserQuestion, codex's
+  // item/tool/requestUserInput. A request carrying questions is never settled
+  // by a deterministic rule or the Policy Judge — only a human can answer it,
+  // and the answer rides PermissionDecision.answers (W12c).
+  repeated Question questions = 4;
+}
+
+// One question a harness asked, with the options it offered.
+message Question {
+  // The key the answer is filed under: codex's question id, or Claude's
+  // question text (Claude keys its answers by the question itself).
+  string id = 1;
+
+  // A short label for the question, e.g. "Colour".
+  string header = 2;
+
+  // The question as the harness asked it.
+  string question = 3;
+
+  // The choices offered. Empty means free text only.
+  repeated QuestionOption options = 4;
+
+  // Whether more than one option may be chosen.
+  bool multi_select = 5;
+
+  // Whether an answer outside the offered options is acceptable.
+  bool allows_free_text = 6;
+
+  // Whether the answer is a secret a client should not echo.
+  bool secret = 7;
+}
+
+message QuestionOption {
+  string label = 1;
+
+  string description = 2;
+}
+
+// The answer to one Question: the chosen option labels, or free text.
+message Answer {
+  repeated string values = 1;
 }
 
 // An escalation awaiting a decision. Rides the event log like everything else,
@@ -100,4 +143,12 @@ message PermissionDecision {
   // carrying this field rather than drop it, so a narrowing that failed to
   // apply is never mistaken for one that took effect.
   google.protobuf.Struct updated_input = 7;
+
+  // Answers to the request's ProposedToolCall.questions, keyed by Question.id.
+  //
+  // Meaningful only with outcome ALLOW on a request that carried questions:
+  // an ALLOW without answers on a question is refused at the Server, and
+  // answers on a request that asked nothing are refused too, so a client can
+  // never believe it answered something the harness did not hear.
+  map<string, Answer> answers = 8;
 }

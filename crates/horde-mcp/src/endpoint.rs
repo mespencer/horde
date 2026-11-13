@@ -204,6 +204,12 @@ pub fn declared_result(
             forward_id: String::new(),
             message: format!("denied: {message}"),
         },
+        // A forward asks no question; an answer cannot grant one.
+        horde_adapter::PermissionDecision::Answer { .. } => ForwardResult {
+            granted: false,
+            forward_id: String::new(),
+            message: "denied: a forward cannot be answered, only allowed or denied".to_owned(),
+        },
         horde_adapter::PermissionDecision::Allow { .. } => ForwardResult {
             granted: true,
             forward_id: horde_proto::forward::derived_forward_id(request_id),
@@ -408,10 +414,7 @@ impl HordeEndpoint {
             .await
             .map_err(internal)?;
 
-        Ok(horde_adapter_claude::permission::encode_decision(
-            &decision,
-            &prompt.input,
-        ))
+        Ok(crate::permission::decision_body(&decision, &prompt).to_string())
     }
 
     #[tool(
@@ -684,6 +687,14 @@ impl HordeEndpoint {
                 // around it rather than retry it.
                 Ok(CallToolResult::error(vec![
                     rmcp::model::ContentBlock::text(format!("permission denied: {message}")),
+                ]))
+            }
+            horde_adapter::PermissionDecision::Answer { .. } => {
+                // A proxied tool asks no question, so answers cannot run it.
+                Ok(CallToolResult::error(vec![
+                    rmcp::model::ContentBlock::text(format!(
+                        "permission denied: {name} asked no question, so answers cannot apply"
+                    )),
                 ]))
             }
             horde_adapter::PermissionDecision::Allow { updated_input, .. } => {

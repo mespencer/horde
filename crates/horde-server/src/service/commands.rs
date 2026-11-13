@@ -2357,6 +2357,7 @@ mod tests {
             reason: String::new(),
             remember_for_session: false,
             updated_input,
+            answers: std::collections::HashMap::new(),
         }
     }
 
