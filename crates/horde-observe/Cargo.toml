@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
-description = "OTLP export for the tracing the binaries already emit: opt-in, sampled, and never in the product's way."
+description = "Local diagnostic logs (bounded rotating JSON lines, harness stderr, egress redaction) and opt-in OTLP export for the tracing the binaries already emit."
 
 [lints]
 workspace = true
@@ -18,12 +18,23 @@ workspace = true
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "trace"] }
 opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace"] }
+getrandom = { workspace = true }
+hex = { workspace = true }
+# `--grep` and the redactor's shapes: linear-time matching with a bound on
+# the compiled size, so a reader's pattern cannot stall a daemon.
+regex = "1.13.1"
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+# RFC 3339 timestamps: formatted by hand at a fixed width, parsed here.
+time = { workspace = true, features = ["parsing"] }
+# The tap is a broadcast channel; follow reads it from async tasks.
+tokio = { workspace = true, features = ["sync"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "registry"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # The smoke suite's collector is a real OTLP/gRPC receiver: the generated
 # TraceService, served over the workspace's own tonic — not a mock of this
 # crate's exporter. Pinned exactly for the same reason as the stack above.
