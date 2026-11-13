@@ -137,7 +137,7 @@ struct ServerArgs {
     show_config: bool,
 
     /// With --show-config, name the layer each value came from.
-    #[arg(long, requires = "show_config")]
+    #[arg(long)]
     origin: bool,
 
     /// The config file. Defaults to `<state-dir>/config.toml`, which may be
@@ -260,6 +260,9 @@ pub fn invocation_in(
         Err(error) if !error.use_stderr() => return Ok(Invocation::Print(error.to_string())),
         Err(error) => return Err(error.to_string()),
     };
+    if args.origin && !args.show_config {
+        return Err("--origin only qualifies --show-config".to_owned());
+    }
     let state_dir = match (args.state_dir, home) {
         (Some(dir), _) => dir,
         (None, Some(home)) => home.join(DEFAULT_STATE_SUBDIR),
@@ -1021,6 +1024,75 @@ mod tests {
         assert_eq!(defaulted.worker_lease, None);
     }
 
+    /// The state dir's config file sits between the defaults and the flags
+    /// (ADR-0016): `--show-config --origin` prints what `--serve` would run
+    /// with, each key with its layer, and the served config carries it.
+    #[test]
+    fn the_config_file_layers_under_the_flags_and_show_config_prints_it() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let dir = state.path().to_string_lossy().into_owned();
+        let file = state.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "[permissions]\ndefault_mode = \"ask\"\n[workspace]\nfetch_throttle = \"2m\"\nfetch_timeout = \"9s\"\n",
+        )
+        .expect("writes");
+        let in_state = |extra: &[&str]| {
+            let mut arguments = vec!["--state-dir", dir.as_str()];
+            arguments.extend_from_slice(extra);
+            super::invocation_in(arguments.into_iter().map(str::to_owned), None, |name| {
+                (name == "HORDE_LOG").then(|| "warn".to_owned())
+            })
+        };
+        let Ok(super::Invocation::Serve(served)) =
+            in_state(&["--serve", "--workspace-fetch-throttle", "5s"])
+        else {
+            panic!("serves");
+        };
+        assert_eq!(served.settings.modes.default_name(), "ask");
+        assert_eq!(served.settings.workspace.fetch_throttle.as_secs(), 5);
+        assert_eq!(served.settings.workspace.fetch_timeout.as_secs(), 9);
+        assert_eq!(served.settings.logs.level, "warn");
+
+        let Ok(super::Invocation::Print(shown)) = in_state(&[
+            "--show-config",
+            "--origin",
+            "--workspace-fetch-throttle",
+            "5s",
+            "--permission-mode",
+            "bypass",
+        ]) else {
+            panic!("--show-config prints");
+        };
+        let from_file = format!("# file {}", file.display());
+        for line in [
+            "permissions.default_mode = \"bypass\"  # flag --permission-mode".to_owned(),
+            "workspace.fetch_throttle = 5s  # flag --workspace-fetch-throttle".to_owned(),
+            format!("workspace.fetch_timeout = 9s  {from_file}"),
+            "workspace.reclaim_timeout = 10m  # default".to_owned(),
+            "logs.level = \"warn\"  # env HORDE_LOG".to_owned(),
+        ] {
+            assert!(shown.contains(&line), "{line} in:\n{shown}");
+        }
+        let Ok(super::Invocation::Print(plain)) = in_state(&["--show-config"]) else {
+            panic!("--show-config prints");
+        };
+        assert!(plain.contains("workspace.fetch_throttle = 2m\n") && !plain.contains('#'));
+
+        std::fs::write(&file, "[permissions]\ndefault_mode = \"askk\"\n").expect("writes");
+        let refused = in_state(&["--serve"]).expect_err("a mode nobody defined");
+        assert_eq!(
+            refused,
+            format!(
+                "server config {}: permissions.default_mode: no mode named \"askk\" (defined: ask, bypass)",
+                file.display()
+            )
+        );
+        let missing = in_state(&["--serve", "--config", "/nonexistent/server.toml"])
+            .expect_err("a named file must exist");
+        assert!(missing.contains("/nonexistent/server.toml"), "{missing}");
+    }
+
     /// A mistyped flag silently falling back to a default would serve on the
     /// wrong interface; every wrong shape must be a refusal that names it.
     #[test]
@@ -1051,6 +1123,14 @@ mod tests {
             (&["--serve", "--blob-max-bytes", "lots"][..], "lots"),
             (&["--serve", "--blob-max-bytes"][..], "--blob-max-bytes"),
             (&["--worker-lease", "30"][..], "--serve"),
+            (&["--permission-mode", "ask"][..], "--serve"),
+            (&["--config", "/tmp/c.toml"][..], "--serve"),
+            (&["--check", "--origin"][..], "--show-config"),
+            (
+                &["--serve", "--permission-mode", ""][..],
+                "--permission-mode",
+            ),
+            (&["--show-config", "x.db"][..], "[DATABASE]"),
             (&["--serve", "--worker-lease", "soon"][..], "soon"),
             (&["--serve", "--worker-lease", "0"][..], "--worker-lease"),
             (&["--serve", "a.db", "b.db"][..], "b.db"),
