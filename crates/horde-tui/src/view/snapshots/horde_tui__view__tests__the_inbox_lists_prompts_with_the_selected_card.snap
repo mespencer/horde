@@ -1,9 +1,17 @@
 ---
-source: crates/horde-tui/tests/render.rs
+source: crates/horde-tui/src/view/tests.rs
 expression: drawn(&app)
 ---
-" forwards                                                                       "
-"  no live forwards — agents declare them, or `horde forward expose`             "
+" horde  1:session  2:agents  3:inbox 2  4:workspaces  5:usage  6:logs  7:forward"
+"                                                                                "
+"  ci-fix             reviewer wants `git push`                                  "
+"❯ docs               root-2 asks: Publish the docs??                            "
+"                                                                                "
+"╭─ Question 1/1 · root-2 ──────────────────────────────────────────────────────╮"
+"│ Publish the docs??                                                           │"
+"│ ❯ 1. now                                                                     │"
+"│   2. later                                                                   │"
+"╰─ ↑↓ enter · space toggle · ←→ question · n decline ──────────────────────────╯"
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -16,13 +24,5 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"[r] refresh  [o] overview  [q] quit                                             "
+" answer in the card · esc back to the list                                      "
+" not attached · ● live                                                          "

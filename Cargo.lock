@@ -1428,6 +1428,8 @@ dependencies = [
  "horde-proto",
  "insta",
  "ratatui",
+ "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

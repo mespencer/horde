@@ -1,0 +1,28 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: drawn(&app)
+---
+"                                                                                "
+"✻ Thinking… The failure is probably in the parser.                              "
+"                                                                                "
+"● Bash(cargo test -p parser)                                                    "
+"  ⎿ running 12 tests                                                            "
+"    test a ... ok                                                               "
+"    test b ... FAILED                                                           "
+"    … +2 lines (ctrl-o to expand)                                               "
+"                                                                                "
+"● One test fails: `b` expects a trailing newline. I'll ask a reviewer to check  "
+"  the fix.                                                                      "
+"                                                                                "
+"↳ spawned reviewer                                                              "
+"                                                                                "
+"› also fix the lint                                                             "
+"                                                                                "
+"● Read(src/lib.rs)                                                              "
+"    running…                                                                    "
+"✻ Working… (esc to interrupt)                                                   "
+"╭──────────────────────────────────────────────────────────────────────────────╮"
+"│› queue a message for the next turn (ctrl-s sends now)                        │"
+"╰──────────────────────────────────────────────────────────────────────────────╯"
+" enter queue · ctrl-s send now · esc interrupt · ctrl-t agents · ? help         "
+" ci-fix · ci-fix · claude · opus · on gpu-box · working · ● live                "

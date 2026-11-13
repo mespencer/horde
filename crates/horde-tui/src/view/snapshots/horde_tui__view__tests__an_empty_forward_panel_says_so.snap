@@ -1,9 +1,10 @@
 ---
-source: crates/horde-tui/tests/render.rs
+source: crates/horde-tui/src/view/tests.rs
 expression: drawn(&app)
 ---
-" inbox                                                                          "
-"  nothing needs you                                                             "
+" horde  1:session  2:agents  3:inbox  4:workspaces  5:usage  6:logs  7:forwards "
+"                                                                                "
+"  no live forwards — agents declare them, or `horde forward expose`             "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -23,6 +24,5 @@ expression: drawn(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"[y] allow  [1-9] answer  [n] deny  [enter] attach  [o] overview  [q] quit       "
+" r refresh · esc back · q quit                                                  "
+" not attached · ○ connecting                                                    "
