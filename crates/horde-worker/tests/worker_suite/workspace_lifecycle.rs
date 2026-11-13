@@ -575,6 +575,17 @@ fn rig(root: &Path, journal: Journal) -> Rig {
     }
 }
 
+/// Waits for workspace work — clones, fetches, worktree adds, reclaim
+/// commands — under a ceiling sized for real git under a parallel suite's
+/// load (plain `cargo test` runs every test in one process at once), while
+/// still turning a hang into a failure rather than a stuck run.
+async fn settled_within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    match tokio::time::timeout(Duration::from_secs(120), future).await {
+        Ok(value) => value,
+        Err(_) => panic!("{what} must finish rather than hang"),
+    }
+}
+
 /// A rig over `<temp>/workspaces` with a fresh in-memory journal.
 fn fresh_rig(temp: &Path) -> Rig {
     rig(
@@ -631,7 +642,7 @@ async fn materialize(
         ))
         .await
         .expect("the materialize applies");
-    crate::support::within("the materialize", rig.runtime.settled()).await;
+    settled_within("the materialize", rig.runtime.settled()).await;
 }
 
 async fn spawn(rig: &mut Rig, agent: &str) {
@@ -653,7 +664,7 @@ async fn spawn(rig: &mut Rig, agent: &str) {
         ))
         .await
         .expect("the spawn applies");
-    crate::support::within("the spawn", rig.runtime.settled()).await;
+    settled_within("the spawn", rig.runtime.settled()).await;
 }
 
 async fn archive(rig: &mut Rig, agent: &str) {
@@ -667,7 +678,7 @@ async fn archive(rig: &mut Rig, agent: &str) {
         ))
         .await
         .expect("the archive applies");
-    crate::support::within("the archive", rig.runtime.settled()).await;
+    settled_within("the archive", rig.runtime.settled()).await;
 }
 
 async fn gc(
@@ -692,7 +703,7 @@ async fn gc(
         ))
         .await
         .expect("the gc applies");
-    crate::support::within("the gc", rig.runtime.settled()).await;
+    settled_within("the gc", rig.runtime.settled()).await;
 }
 
 /// Every journaled event of one kind, in journal order.
@@ -721,7 +732,7 @@ async fn cleanups(journal: &Journal) -> Vec<WorkspaceCleanup> {
 /// stopped, after the archive command itself completed, and journals the
 /// archive's soft reclaim when done.
 async fn released(rig: &Rig, agent: &str) {
-    crate::support::within("the archive's release", async {
+    settled_within("the archive's release", async {
         while !cleanups(&rig.journal).await.iter().any(|c| {
             c.trigger == i32::from(CleanupTrigger::Archive)
                 && c.agent_id
@@ -749,7 +760,7 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     assert!(rig.reporter.count() >= 1, "a materialize reports");
     spawn(&mut rig, "agent-1").await;
     archive(&mut rig, "agent-1").await;
-    crate::support::within("the archive's release", async {
+    settled_within("the archive's release", async {
         while cleanups(&rig.journal).await.is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -766,7 +777,7 @@ async fn an_archived_checkout_is_kept_through_its_grace_then_removed() {
     assert_eq!(events[0].trigger, i32::from(CleanupTrigger::Archive));
     assert!(agent_root(&rig, "agent-1").exists());
     // The archive reports after it journals; wait for the report too.
-    crate::support::within("the archive's report", async {
+    settled_within("the archive's report", async {
         while !rig.reporter.last().first().is_some_and(|report| {
             report
                 .checkouts
@@ -1121,14 +1132,14 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
         .apply(remove("rm-live", true))
         .await
         .expect("applies");
-    crate::support::within("the removal", rig.runtime.settled()).await;
+    settled_within("the removal", rig.runtime.settled()).await;
     assert!(
         rig.root.join("ws-1").exists(),
         "refused with a live agent, even forced"
     );
 
     archive(&mut rig, "agent-1").await;
-    crate::support::within("the archive's removal", async {
+    settled_within("the archive's removal", async {
         while agent_root(&rig, "agent-1").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1142,7 +1153,7 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
         .apply(remove("rm-data", false))
         .await
         .expect("applies");
-    crate::support::within("the removal", rig.runtime.settled()).await;
+    settled_within("the removal", rig.runtime.settled()).await;
     assert!(
         rig.root.join("ws-1").exists(),
         "non-empty unmanaged data needs --force"
@@ -1161,7 +1172,7 @@ async fn an_instance_is_removed_only_without_live_agents_and_with_unmanaged_data
         .apply(remove("rm-force", true))
         .await
         .expect("applies");
-    crate::support::within("the removal", rig.runtime.settled()).await;
+    settled_within("the removal", rig.runtime.settled()).await;
     assert!(!rig.root.join("ws-1").exists(), "forced");
     let missing = journaled(&rig.journal).await.into_iter().any(|kind| {
         matches!(kind, Kind::WorkspaceInstanceChanged(c)
