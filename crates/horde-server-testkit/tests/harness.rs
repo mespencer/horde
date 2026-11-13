@@ -509,3 +509,32 @@ async fn the_oversized_round_trip_reads_back_the_note_and_the_chunk_whole() {
         "the note, then the chunk, both whole"
     );
 }
+
+/// The atlas workspace helper defines what it says: the name it was given
+/// over the one `atlas` repo, as the Server stored it.
+#[tokio::test]
+async fn the_atlas_workspace_is_defined_by_name_over_its_one_repo() {
+    let endpoint = within("the server", serve()).await.expect("a server");
+    let definition = within(
+        "the definition",
+        horde_server_testkit::define_atlas_workspace(&endpoint, "named-ws"),
+    )
+    .await
+    .expect("defined");
+    assert_eq!(definition.name, "named-ws");
+    let repos: Vec<(&str, &str, &str)> = definition
+        .repos
+        .iter()
+        .map(|repo| {
+            (
+                repo.name.as_str(),
+                repo.remote_url.as_str(),
+                repo.default_branch.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        repos,
+        vec![("atlas", "https://example.invalid/atlas.git", "main")]
+    );
+}
