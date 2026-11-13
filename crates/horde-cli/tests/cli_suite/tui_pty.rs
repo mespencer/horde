@@ -474,45 +474,6 @@ async fn ctrl_x_interrupts_on_the_server() {
     quit(horde).await.expect("a clean exit");
 }
 
-/// An escalation journaled the way a worker would.
-fn escalation(
-    agent_id: &str,
-    request_id: &str,
-    questions: Vec<horde_proto::v1::Question>,
-) -> horde_proto::v1::Event {
-    use horde_proto::v1::{
-        AgentId, Event, PermissionRequest, PermissionRequestId, PermissionRequested,
-        ProposedToolCall, event::Kind,
-    };
-    Event {
-        agent_id: Some(AgentId::new(agent_id)),
-        occurred_at: None,
-        idempotency_key: format!("perm-{request_id}"),
-        kind: Some(Kind::PermissionRequested(PermissionRequested {
-            request: Some(PermissionRequest {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                agent_id: Some(AgentId::new(agent_id)),
-                tool_call: Some(ProposedToolCall {
-                    tool_name: if questions.is_empty() {
-                        "Bash"
-                    } else {
-                        "AskUserQuestion"
-                    }
-                    .to_owned(),
-                    input: None,
-                    rendered: "docker rm x".to_owned(),
-                    questions,
-                }),
-                tree_path: vec!["pty".to_owned()],
-                permission_mode: "manual".to_owned(),
-                escalated_from: 0,
-                expires_at: None,
-                forward: None,
-            }),
-        })),
-    }
-}
-
 /// The decision the log recorded for a request: its outcome and answers.
 async fn decision_for(
     endpoint: &str,
@@ -546,7 +507,7 @@ async fn y_approves_a_permission_inline() {
     crate::common::journal_event(
         &endpoint,
         &session_id,
-        escalation(&root, "req-pty-1", Vec::new()),
+        crate::common::escalation(&root, "req-pty-1", "docker rm x", Vec::new()),
     )
     .await
     .expect("an escalation");
@@ -594,9 +555,10 @@ async fn a_multi_question_request_is_answered_in_place() {
     crate::common::journal_event(
         &endpoint,
         &session_id,
-        escalation(
+        crate::common::escalation(
             &root,
             "req-pty-2",
+            "AskUserQuestion",
             vec![
                 question("when", "Publish when?", ["now", "later"]),
                 question("where", "Publish where?", ["main", "docs"]),

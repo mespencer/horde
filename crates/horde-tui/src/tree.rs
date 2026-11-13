@@ -181,12 +181,13 @@ mod tests {
     }
 
     fn placed(state: PlacementState, worker: Option<&str>) -> Kind {
+        let placement = Placement {
+            worker_id: worker.map(WorkerId::new),
+            state: state as i32,
+            ..Placement::default()
+        };
         Kind::PlacementChanged(PlacementChanged {
-            placement: Some(Placement {
-                state: state as i32,
-                worker_id: worker.map(WorkerId::new),
-                ..Placement::default()
-            }),
+            placement: Some(placement),
             adapter_capabilities: Vec::new(),
         })
     }
@@ -217,6 +218,14 @@ mod tests {
         })
     }
 
+    /// Agent `a` spawned, then one chunk of output on `channel` in turn `t1`.
+    fn after_output(channel: AgentOutputChannel) -> SessionState {
+        let mut state = SessionState::new("s1");
+        state.apply(&envelope(1, "a", spawned(None, &["a"])));
+        state.apply(&envelope(2, "a", chunk(channel, "t1", "hi")));
+        state
+    }
+
     #[test]
     fn output_starts_work_and_every_turn_end_stops_it() {
         let stops = [
@@ -229,13 +238,7 @@ mod tests {
             placed(PlacementState::Lost, None),
         ];
         for stop in stops {
-            let mut state = SessionState::new("s1");
-            state.apply(&envelope(1, "a", spawned(None, &["a"])));
-            state.apply(&envelope(
-                2,
-                "a",
-                chunk(AgentOutputChannel::Assistant, "t1", "hi"),
-            ));
+            let mut state = after_output(AgentOutputChannel::Assistant);
             assert!(node(&state).working, "output means a turn is in flight");
             state.apply(&envelope(3, "a", stop.clone()));
             assert!(!node(&state).working, "{stop:?} ends the turn");
@@ -244,13 +247,7 @@ mod tests {
 
     #[test]
     fn diagnostics_unbound_usage_and_running_do_not_end_work() {
-        let mut state = SessionState::new("s1");
-        state.apply(&envelope(1, "a", spawned(None, &["a"])));
-        state.apply(&envelope(
-            2,
-            "a",
-            chunk(AgentOutputChannel::HarnessDiagnostic, "t", "x"),
-        ));
+        let mut state = after_output(AgentOutputChannel::HarnessDiagnostic);
         assert!(
             !node(&state).working,
             "the harness talking to itself is not a turn"

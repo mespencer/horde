@@ -427,10 +427,7 @@ fn attach_by_name_finds_agents_then_sessions_and_refuses_ambiguity() {
         summary("s3-abd", "docs", "r3"),
     ]));
     app.run(Slash::Attach(Some("reviewer".to_owned())));
-    assert_eq!(
-        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
-        Some("kid")
-    );
+    assert_eq!(scoped_agent(&app).as_deref(), Some("kid"));
     app.run(Slash::Attach(Some("ci-fix".to_owned())));
     assert_eq!(
         app.attachment().and_then(|a| a.agent_id.clone()),
@@ -439,7 +436,7 @@ fn attach_by_name_finds_agents_then_sessions_and_refuses_ambiguity() {
     );
     app.run(Slash::Attach(Some("kid".to_owned())));
     assert_eq!(
-        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
+        scoped_agent(&app).as_deref(),
         Some("kid"),
         "an id works too"
     );
@@ -707,11 +704,7 @@ fn enter_opens_the_inbox_card_and_g_goes_to_the_agent() {
     );
     press(&mut app, KeyCode::Char('g'));
     assert_eq!(app.screen(), Screen::Session);
-    assert_eq!(
-        app.attachment()
-            .map(|a| (a.session_id.as_str(), a.agent_id.clone())),
-        Some(("s2", None))
-    );
+    assert_eq!(attached_to(&app), Some(("s2", None)));
 }
 
 #[test]
@@ -793,10 +786,7 @@ fn enter_in_the_tree_attaches_to_the_row() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(
-        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
-        Some("kid")
-    );
+    assert_eq!(scoped_agent(&app).as_deref(), Some("kid"));
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Enter);
@@ -1014,18 +1004,11 @@ fn re_attaching_restores_the_launched_agent_scope() {
     ]));
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Enter);
-    assert_eq!(
-        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
-        Some("kid")
-    );
+    assert_eq!(scoped_agent(&app).as_deref(), Some("kid"));
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(
-        app.attachment()
-            .map(|a| (a.session_id.as_str(), a.agent_id.clone())),
-        Some(("s2", None))
-    );
+    assert_eq!(attached_to(&app), Some(("s2", None)));
 }
 
 #[test]
@@ -1177,4 +1160,15 @@ fn sessions_are_named_and_summaries_without_ids_are_dropped() {
     assert_eq!(app.status(), "the server said no");
     app.directive_failed(&Directive::RefreshSessions, "later");
     assert_eq!(app.status(), "later");
+}
+
+/// The agent the attachment is scoped to, if any.
+fn scoped_agent(app: &App) -> Option<String> {
+    app.attachment().and_then(|a| a.agent_id.clone())
+}
+
+/// The attachment as `(session, agent scope)`.
+fn attached_to(app: &App) -> Option<(&str, Option<String>)> {
+    app.attachment()
+        .map(|a| (a.session_id.as_str(), a.agent_id.clone()))
 }
