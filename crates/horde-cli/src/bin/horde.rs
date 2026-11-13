@@ -67,7 +67,11 @@ async fn main() -> ExitCode {
 
     // Off the runtime's worker threads: both flushes block.
     let _ = tokio::task::spawn_blocking(move || {
-        horde_cli::logs::finish_observability(telemetry, file);
+        horde_cli::logs::finish_observability(
+            telemetry,
+            file.as_ref(),
+            std::time::Duration::from_secs(2),
+        );
     })
     .await;
     code
