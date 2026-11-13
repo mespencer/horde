@@ -19,10 +19,48 @@ use std::path::Path;
 use crate::git::{GitError, check, git, raw};
 use crate::resolve::ShareRoute;
 
-/// Where Workers reach the Relay, e.g. `http://127.0.0.1:7420`.
+/// Where Workers reach the Relay, e.g. `http://127.0.0.1:7420` (the
+/// server's loopback door) or `https://horde.lan:7779` (its mTLS door).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayLocation {
     base: String,
+    identity: Option<RelayIdentity>,
+}
+
+/// The certificate a Worker's git dial presents at the Relay's mTLS door
+/// (DESIGN §3, §8): the PEM files of the Worker's own enrolled identity,
+/// handed to git as `http.sslCert`/`http.sslKey`, with the server's CA as
+/// the only trust root (`http.sslCAInfo`) — a share is never verified
+/// against the machine's public roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayIdentity {
+    pub certificate: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+    pub ca: std::path::PathBuf,
+}
+
+impl RelayIdentity {
+    /// The identity a `horde_identity::StoredIdentity` directory holds.
+    #[must_use]
+    pub fn in_dir(directory: &Path) -> Self {
+        Self {
+            certificate: directory.join("identity.pem"),
+            key: directory.join("identity.key"),
+            ca: directory.join("ca.pem"),
+        }
+    }
+
+    /// The `-c` options that make one git invocation present this identity.
+    fn git_options(&self) -> Vec<String> {
+        [
+            ("http.sslCert", &self.certificate),
+            ("http.sslKey", &self.key),
+            ("http.sslCAInfo", &self.ca),
+        ]
+        .into_iter()
+        .flat_map(|(key, path)| ["-c".to_owned(), format!("{key}={}", path.display())])
+        .collect()
+    }
 }
 
 impl RelayLocation {
@@ -30,13 +68,33 @@ impl RelayLocation {
     pub fn new(base: &str) -> Self {
         Self {
             base: base.trim_end_matches('/').to_owned(),
+            identity: None,
         }
+    }
+
+    /// The same location, dialled presenting `identity`.
+    #[must_use]
+    pub fn with_identity(mut self, identity: RelayIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// The URL one repo's mirror is fetched from and pushed to.
     #[must_use]
     pub fn repo_url(&self, repo_name: &str) -> String {
         format!("{}/{repo_name}", self.base)
+    }
+
+    /// The git argv for `verb` against this Relay: the identity options, if
+    /// any, come first — `-c` is a git option, not a subcommand option.
+    fn git_args(&self, verb: &[&str]) -> Vec<String> {
+        let mut args = self
+            .identity
+            .as_ref()
+            .map(RelayIdentity::git_options)
+            .unwrap_or_default();
+        args.extend(verb.iter().map(|word| (*word).to_owned()));
+        args
     }
 }
 
@@ -155,11 +213,17 @@ async fn verify_present(repo: &Path, commit_sha: &str, because: &str) -> Result<
     }
 }
 
-/// The Relay URL for a cross-Worker route, or the honest refusal.
-fn relay_url(relay: Option<&RelayLocation>, repo_name: &str) -> Result<String, ShareError> {
-    relay
-        .map(|relay| relay.repo_url(repo_name))
-        .ok_or(ShareError::NoRelay)
+/// The Relay a cross-Worker route needs, or the honest refusal.
+fn required(relay: Option<&RelayLocation>) -> Result<&RelayLocation, ShareError> {
+    relay.ok_or(ShareError::NoRelay)
+}
+
+/// Runs one git verb against `relay` in `repo`.
+async fn relay_git(repo: &Path, relay: &RelayLocation, verb: &[&str]) -> Result<(), ShareError> {
+    let args = relay.git_args(verb);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    git(repo, &borrowed).await?;
+    Ok(())
 }
 
 /// The sender's half: make `commit_sha` reachable along `route`.
@@ -183,9 +247,10 @@ pub async fn stage_share(
 ) -> Result<(), ShareError> {
     verify_present(sender_repo, commit_sha, "the sender does not have it").await?;
     if let ShareRoute::ViaRelay { repo_name } = route {
-        let url = relay_url(relay, repo_name)?;
+        let relay = required(relay)?;
+        let url = relay.repo_url(repo_name);
         let refspec = format!("{commit_sha}:{}", share_ref(commit_sha));
-        git(sender_repo, &["push", "--", &url, &refspec]).await?;
+        relay_git(sender_repo, relay, &["push", "--", &url, &refspec]).await?;
     }
     Ok(())
 }
@@ -222,9 +287,10 @@ pub async fn obtain_share(
             verify_present(receiver_repo, commit_sha, "the peer fetch did not bring it").await
         }
         ShareRoute::ViaRelay { repo_name } => {
-            let url = relay_url(relay, repo_name)?;
+            let relay = required(relay)?;
+            let url = relay.repo_url(repo_name);
             let share = share_ref(commit_sha);
-            git(receiver_repo, &["fetch", "--", &url, &share]).await?;
+            relay_git(receiver_repo, relay, &["fetch", "--", &url, &share]).await?;
             verify_present(
                 receiver_repo,
                 commit_sha,
