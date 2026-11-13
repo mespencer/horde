@@ -1129,7 +1129,9 @@ mod tests {
 
     /// One recipe dispatched through the production `answer_dispatch` over
     /// a scripted tunnel, with the attach already read — the arrangement
-    /// the full-relay and fault tests share.
+    /// the full-relay and fault tests share. Unix only, like them: their
+    /// commands are `/bin/sh` scripts (the ConPTY tests cover Windows).
+    #[cfg(unix)]
     async fn dispatched(
         recipe: LoginRecipe,
     ) -> (
@@ -1155,6 +1157,7 @@ mod tests {
     /// callback port, the PTY's prompt crosses as output, typed input
     /// reaches the command, the exit frame carries the code, and the exited
     /// announce line lands — the whole worker half without a server.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dispatched_login_relays_prompts_input_and_exit() {
         let recipe = LoginRecipe {
@@ -1223,6 +1226,7 @@ mod tests {
     /// The fault the spec names: the client vanishes mid-login. The relay
     /// leg ending is the order to kill; the announce line lands only after
     /// the wait returned — the owned reap witness, no OS state asserted.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_vanished_client_kills_and_provably_reaps_the_login() {
         let recipe = LoginRecipe::terminal_only(
