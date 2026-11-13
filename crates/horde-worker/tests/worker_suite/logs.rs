@@ -17,7 +17,6 @@ use horde_server::EventLog;
 use horde_server::service::ServerCore;
 use horde_worker::logs::LogServing;
 use horde_worker::{DialConfig, Journal, Runtime, capabilities};
-use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::support::{place_agent, serve, server_log_at_least};
 
@@ -165,11 +164,34 @@ fn worker_records(dir: &std::path::Path) -> FileLogging {
 }
 
 fn emit(logging: &FileLogging, message: &str) {
-    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-    tracing::dispatcher::with_default(&dispatch, || {
+    logging.with_default(|| {
         tracing::info!(target: "horde_worker", "{message}");
     });
     assert!(logging.flush(Duration::from_secs(5)));
+}
+
+/// A worker dialing `endpoint` that serves the logs its own file layer
+/// writes under `dir`, followable through that layer's tap.
+async fn logging_worker(
+    dir: &std::path::Path,
+    endpoint: &str,
+) -> (
+    FileLogging,
+    Arc<LogServing>,
+    tokio::task::JoinHandle<Result<(), horde_worker::WorkerError>>,
+) {
+    let log_dir = dir.join("logs");
+    let logging = worker_records(&log_dir);
+    let journal = Journal::open(&dir.join("journal.sqlite")).expect("journal");
+    let logs = Arc::new(LogServing::new(
+        &log_dir,
+        logging.boot(),
+        Some(logging.tap().clone()),
+    ));
+    let runtime = Runtime::new(journal.clone()).with_logs(Arc::clone(&logs));
+    let config = config(endpoint, &runtime, true);
+    let run = run_worker(&config, &journal, runtime, Some(Arc::clone(&logs))).await;
+    (logging, logs, run)
 }
 
 fn worker_read(follow: bool) -> ReadLogsRequest {
@@ -192,18 +214,7 @@ async fn a_followed_worker_log_sees_new_records_and_ends_when_the_worker_vanishe
         .await
         .expect("the fault proxy binds");
     let dir = tempfile::tempdir().expect("tempdir");
-    let log_dir = dir.path().join("logs");
-    let logging = worker_records(&log_dir);
-
-    let journal = Journal::open(&dir.path().join("journal.sqlite")).expect("journal");
-    let logs = Arc::new(LogServing::new(
-        &log_dir,
-        logging.boot(),
-        Some(logging.tap().clone()),
-    ));
-    let runtime = Runtime::new(journal.clone()).with_logs(Arc::clone(&logs));
-    let config = config(&proxy.endpoint(), &runtime, true);
-    let _run = run_worker(&config, &journal, runtime, Some(logs)).await;
+    let (logging, _logs, _run) = logging_worker(dir.path(), &proxy.endpoint()).await;
 
     let (records, end) = drain(open(&upstream, worker_read(false)).await.expect("read")).await;
     assert_eq!(end, Some(LogEndReason::Done as i32));
@@ -251,17 +262,7 @@ async fn a_client_dropping_its_follow_ends_the_workers_read() {
     let core = ServerCore::new(EventLog::in_memory().expect("log"));
     let endpoint = serve(core.clone()).await;
     let dir = tempfile::tempdir().expect("tempdir");
-    let log_dir = dir.path().join("logs");
-    let logging = worker_records(&log_dir);
-    let journal = Journal::open(&dir.path().join("journal.sqlite")).expect("journal");
-    let logs = Arc::new(LogServing::new(
-        &log_dir,
-        logging.boot(),
-        Some(logging.tap().clone()),
-    ));
-    let runtime = Runtime::new(journal.clone()).with_logs(Arc::clone(&logs));
-    let config = config(&endpoint, &runtime, true);
-    let run = run_worker(&config, &journal, runtime, Some(Arc::clone(&logs))).await;
+    let (_logging, logs, run) = logging_worker(dir.path(), &endpoint).await;
 
     let mut follow = open(&endpoint, worker_read(true)).await.expect("follow");
     follow

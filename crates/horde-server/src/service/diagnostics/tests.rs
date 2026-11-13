@@ -3,64 +3,43 @@
 
 use std::time::{Duration, Instant};
 
-use horde_identity::{PeerIdentity, Principal, PrincipalRole};
 use horde_observe::reader::LocalLogs;
 use horde_observe::settings::LogSettings;
 use horde_proto::v1::{
-    AgentId, CreateSessionRequest, LogEndReason, LogFilter, LogRecords, ReadLogsRequest,
-    ReadLogsResponse, ServerTarget, control_plane_service_server::ControlPlaneService,
-    read_logs_request, read_logs_response,
+    AgentId, LogEndReason, LogFilter, LogRecords, ReadLogsRequest, ReadLogsResponse, ServerTarget,
+    control_plane_service_server::ControlPlaneService, read_logs_request, read_logs_response,
 };
 use horde_wire::logs::Frame;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
-use tracing_subscriber::layer::SubscriberExt as _;
 
-use super::{Authorized, Resolved, authorize, relay};
+use super::authorize;
+use crate::diagnostics::{Authorized, BINARY, Resolved, relay};
 use crate::log::EventLog;
 use crate::service::control_plane::ControlPlane;
+use crate::service::control_plane::delivery_tests::as_worker;
+use crate::service::control_plane::list_tests::titled;
 use crate::service::shared::ServerCore;
-
-fn as_worker<T>(name: &str, mut request: Request<T>) -> Request<T> {
-    request.extensions_mut().insert(PeerIdentity {
-        principal: Principal::new(PrincipalRole::Worker, name).expect("a valid name"),
-        serial_hex: "aa".to_owned(),
-    });
-    request
-}
-
-async fn session(plane: &ControlPlane) -> String {
-    plane
-        .create_session(Request::new(CreateSessionRequest {
-            title: "logs".to_owned(),
-            ..CreateSessionRequest::default()
-        }))
-        .await
-        .expect("the session is created")
-        .into_inner()
-        .session
-        .and_then(|summary| summary.session_id)
-        .map(|id| id.to_string())
-        .expect("a session id")
-}
 
 /// A core whose server log holds records of two sessions and one
 /// process-level record, written by the real file layer.
 async fn core_with_logs(dir: &std::path::Path) -> (ControlPlane, ServerCore, String, String) {
     let logging = horde_observe::FileLogging::start(
         dir,
-        super::BINARY,
+        BINARY,
         &LogSettings::daemon(),
-        &horde_observe::ServiceIdentity::new(super::BINARY),
+        &horde_observe::ServiceIdentity::new(BINARY),
     )
     .expect("start");
     let core = ServerCore::new(EventLog::in_memory().expect("log"))
-        .with_local_logs(LocalLogs::new(dir, super::BINARY, None));
+        .with_local_logs(LocalLogs::new(dir, BINARY, None));
     let plane = ControlPlane::new(core.clone());
-    let (mine, theirs) = (session(&plane).await, session(&plane).await);
-    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-    tracing::dispatcher::with_default(&dispatch, || {
+    let (mine, theirs) = (
+        titled(&plane, "mine", "logs-mine").await,
+        titled(&plane, "theirs", "logs-theirs").await,
+    );
+    logging.with_default(|| {
         tracing::info!(target: "horde_server", session = mine.as_str(), "mine");
         tracing::info!(target: "horde_server", session = theirs.as_str(), "theirs");
         tracing::info!(target: "horde_server", "process-level");

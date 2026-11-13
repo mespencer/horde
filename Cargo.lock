@@ -1213,7 +1213,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1309,7 +1308,6 @@ dependencies = [
  "tonic",
  "tower-service",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1447,7 +1445,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

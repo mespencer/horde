@@ -295,6 +295,23 @@ impl FileLogging {
         &self.binary
     }
 
+    /// A subscriber of this file layer alone, for a caller that installs
+    /// it somewhere other than the global slot.
+    #[must_use]
+    pub fn dispatch(&self) -> tracing::Dispatch {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::Dispatch::new(tracing_subscriber::registry().with(self.layer()))
+    }
+
+    /// Runs `f` with this file layer as the thread's subscriber, then waits
+    /// for what it wrote to reach the file: how a library or test writes
+    /// real records without claiming the process's global subscriber.
+    pub fn with_default<R>(&self, f: impl FnOnce() -> R) -> R {
+        let result = tracing::dispatcher::with_default(&self.dispatch(), f);
+        self.flush(Duration::from_secs(5));
+        result
+    }
+
     /// Records this as the running process's file logging — the binaries
     /// do, once, when they install it — so the process's own serving paths
     /// can follow its tap. A second registration is ignored.
@@ -484,8 +501,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime};
 
-    use tracing_subscriber::layer::SubscriberExt as _;
-
     use super::{FileLogging, RETRY_AFTER, Stamp, WriterState, new_boot};
     use crate::files::{FileSet, RotatingFiles, list};
     use crate::pipeline::ServiceIdentity;
@@ -524,8 +539,7 @@ mod tests {
     fn each_record_is_one_json_object_with_boot_seq_and_hoisted_conventions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let logging = logging(dir.path(), "info");
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             let span = tracing::info_span!("pump", session = "s1", agent = "a1");
             let _entered = span.enter();
             tracing::info!(target: "horde_worker", turns = 3_u64, "turn ended");
@@ -560,8 +574,7 @@ mod tests {
     fn an_events_own_fields_outrank_its_spans_and_late_records_update_spans() {
         let dir = tempfile::tempdir().expect("tempdir");
         let logging = logging(dir.path(), "info");
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             let span = tracing::info_span!("rpc", session = tracing::field::Empty);
             let _entered = span.enter();
             span.record("session", "s-late");
@@ -582,8 +595,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let logging = logging(dir.path(), "info");
         let mut tap = logging.tap().subscribe();
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-        tracing::dispatcher::with_default(&dispatch, || {
+        logging.with_default(|| {
             tracing::info!(target: QUIET_TARGET, "serving a query");
             tracing::info!("visible");
         });

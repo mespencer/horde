@@ -16,7 +16,6 @@ use horde_mcp::logs::LogAccess;
 use horde_mcp::server::{EndpointConfig, serve};
 use horde_observe::reader::LocalLogs;
 use horde_observe::settings::{AgentLogSettings, AgentReadLimits, LogSettings};
-use tracing_subscriber::layer::SubscriberExt as _;
 
 const TOKEN: &str = "logs-round-trip-token";
 
@@ -33,8 +32,7 @@ async fn served(
         &LogSettings::daemon(),
         &horde_observe::ServiceIdentity::new("horde-server"),
     )?;
-    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logging.layer()));
-    tracing::dispatcher::with_default(&dispatch, || {
+    logging.with_default(|| {
         tracing::info!(target: "horde_server", "server minted horde://join/h:1/srv.secret");
     });
     if !logging.flush(Duration::from_secs(5)) {
