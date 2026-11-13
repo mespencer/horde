@@ -35,3 +35,14 @@ append-only journal — `applied_command` (the at-least-once dedupe watermark),
 The criterion for the next mutable table is the same two tests: a table that
 holds a session fact the log lacks, or that can commit apart from the events it
 describes, is a side channel and a bug.
+
+**Amendment (2026-11-13, ADR-0015): diagnostic logs are a third category.**
+Beside session facts and the permitted operational tables, a process's
+diagnostic logs (its JSON-lines files and each harness's stderr) pass beside
+the session log under two tests. First, nothing decides from a log: no fold,
+placement, permission chain, reconnect or revival reads one. People and
+agents read logs, and what an agent then does goes through the verbs as
+events. Second, a log line may repeat a session fact but never originate one.
+A line that is the only record of something a client would need is a missing
+event, and the fix is to add the event. Losing every log file therefore loses
+no state, and a log read is never journaled.
