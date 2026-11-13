@@ -1,7 +1,8 @@
 //! `horde doctor`: this machine's setup, checked end to end, in the order
 //! a connection depends on it — identity, endpoint, certificates, the
 //! server itself (a real mTLS `Hello`), then the local worker's harness
-//! binaries, state-directory permissions and disk.
+//! binaries and their versions (classified against each adapter's measured
+//! range — W12c), state-directory permissions and disk.
 //!
 //! Every check carries a verdict and, when it is not `ok`, the fix in
 //! words; `--json` carries the same checks as data. Everything the checks
@@ -26,6 +27,9 @@ const LOW_DISK_KIB: u64 = 2 * 1024 * 1024;
 
 /// …and below this, a failure: journals and checkouts stop fitting.
 const CRITICAL_DISK_KIB: u64 = 256 * 1024;
+
+/// How long one harness's `--version` may take.
+const VERSION_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The harness binaries looked for when `--harness` names none.
 const DEFAULT_HARNESSES: &[&str] = &["claude", "codex"];
@@ -183,7 +187,14 @@ pub async fn report(inputs: &Inputs) -> Vec<Check> {
     if let Some(resolved) = &resolved {
         checks.push(server_check(resolved).await);
     }
-    checks.extend(harness_checks(&inputs.harnesses, inputs.path.as_deref()));
+    let harnesses = harness_checks(&inputs.harnesses, inputs.path.as_deref());
+    for (check, found) in harnesses {
+        checks.push(check);
+        if let Some((name, path)) = found {
+            let output = version_output(&path).await;
+            checks.push(harness_version_check(&name, output));
+        }
+    }
     let mut dirs = vec![identity_dir];
     dirs.extend(inputs.state_dirs.iter().cloned());
     for dir in &dirs {
@@ -332,9 +343,12 @@ async fn server_check(resolved: &crate::connection::ResolvedConnection) -> Check
     }
 }
 
-/// Each harness binary, looked for on `path`.
+/// Each harness binary, looked for on `path`, with where it was found.
 #[must_use]
-pub fn harness_checks(harnesses: &[String], path: Option<&std::ffi::OsStr>) -> Vec<Check> {
+pub fn harness_checks(
+    harnesses: &[String],
+    path: Option<&std::ffi::OsStr>,
+) -> Vec<(Check, Option<(String, PathBuf)>)> {
     let wanted: Vec<String> = if harnesses.is_empty() {
         DEFAULT_HARNESSES
             .iter()
@@ -348,17 +362,76 @@ pub fn harness_checks(harnesses: &[String], path: Option<&std::ffi::OsStr>) -> V
         .map(|name| {
             let label = format!("harness {name}");
             match on_path(name, path) {
-                Some(found) => Check::ok(&label, found.display().to_string()),
-                None => Check::not_ok(
-                    &label,
-                    Verdict::Warn,
-                    format!("{name} is not on PATH"),
-                    "install it (or put it on PATH) on this worker, or run the worker without \
-                     that --adapter; placement skips workers lacking a harness",
+                Some(found) => (
+                    Check::ok(&label, found.display().to_string()),
+                    Some((name.clone(), found)),
+                ),
+                None => (
+                    Check::not_ok(
+                        &label,
+                        Verdict::Warn,
+                        format!("{name} is not on PATH"),
+                        "install it (or put it on PATH) on this worker, or run the worker \
+                         without that --adapter; placement skips workers lacking a harness",
+                    ),
+                    None,
                 ),
             }
         })
         .collect()
+}
+
+/// One bounded `--version` run: what the binary printed, or why it printed
+/// nothing.
+async fn version_output(program: &Path) -> Result<String, String> {
+    let probe = tokio::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(VERSION_CEILING, probe).await {
+        Err(_elapsed) => Err(format!("answered nothing within {VERSION_CEILING:?}")),
+        Ok(Err(error)) => Err(format!("could not run: {error}")),
+        Ok(Ok(output)) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+    }
+}
+
+/// A harness's version, classified against its adapter's measured range:
+/// supported is `ok`, untested a warning, refused a failure (the worker will
+/// not start with it). A harness no adapter knows is reported, not judged.
+#[must_use]
+pub fn harness_version_check(name: &str, output: Result<String, String>) -> Check {
+    let label = format!("harness {name} version");
+    let table = match name {
+        "claude" => horde_adapter_claude::version::SUPPORT,
+        "codex" => horde_adapter_codex::SUPPORT,
+        _ => {
+            return match output {
+                Ok(text) => Check::ok(&label, text.trim().to_owned()),
+                Err(why) => Check::ok(&label, format!("unknown ({why})")),
+            };
+        }
+    };
+    let report = match output {
+        Ok(text) => table.classify(&text),
+        Err(why) => horde_adapter::VersionReport::unreadable(table, why),
+    };
+    match report.verdict {
+        horde_adapter::SupportVerdict::Supported => Check::ok(&label, report.describe()),
+        horde_adapter::SupportVerdict::Untested => Check::not_ok(
+            &label,
+            Verdict::Warn,
+            report.describe(),
+            "agents run, with a warning journaled on each one's first turn; if they fail with \
+             a malformed stream, install a version inside the tested range",
+        ),
+        horde_adapter::SupportVerdict::Refused => Check::not_ok(
+            &label,
+            Verdict::Fail,
+            report.describe(),
+            "upgrade the harness on this machine; the worker refuses to start with it",
+        ),
+    }
 }
 
 /// The first executable file named `name` in `path`'s directories.

@@ -1195,6 +1195,8 @@ dependencies = [
  "clap",
  "cucumber",
  "horde-adapter",
+ "horde-adapter-claude",
+ "horde-adapter-codex",
  "horde-adapter-fake",
  "horde-identity",
  "horde-observe",
