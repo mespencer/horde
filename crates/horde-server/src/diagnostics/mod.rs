@@ -370,4 +370,6 @@ pub async fn relay(
 }
 
 #[cfg(test)]
+pub(crate) mod testfix;
+#[cfg(test)]
 mod tests;

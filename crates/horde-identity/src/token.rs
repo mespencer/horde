@@ -63,12 +63,24 @@ pub enum TokenError {
 const FINGERPRINT_DIGITS: usize = 64;
 
 /// One self-contained join token, ready to redeem.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand (ADR-0015): it shows the listener and the
+/// code's pin, never the secret — Debug output lands in logs.
+#[derive(Clone, PartialEq, Eq)]
 pub struct JoinToken {
     /// The enrollment listener as `host:port` — exactly the path segment.
     pub host_port: String,
     /// The unchanged `secret.fingerprint` interior.
     pub code: JoinCode,
+}
+
+impl std::fmt::Debug for JoinToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinToken")
+            .field("host_port", &self.host_port)
+            .field("code", &self.code)
+            .finish()
+    }
 }
 
 impl JoinToken {
@@ -232,6 +244,16 @@ mod tests {
             secret: "00ff".to_owned(),
             server_fingerprint: "a".repeat(64),
         }
+    }
+
+    /// The token's Debug names where it redeems, never what redeems it.
+    #[test]
+    fn a_tokens_debug_never_prints_its_secret() {
+        let token = JoinToken::new("host:7000", code());
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("00ff"), "{debug}");
+        assert!(debug.contains("host:7000"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
     }
 
     #[test]
