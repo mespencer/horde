@@ -601,22 +601,13 @@ async fn pump_login(
 }
 
 /// Resizes the PTY, best effort: a PTY already gone has nothing to resize.
-#[cfg(not(windows))]
+/// On Windows the ConPTY is resized only while it is open
+/// ([`crate::windows::resize_pty`]).
 fn resize_pty(master: &Master, size: PtySize) {
+    #[cfg(windows)]
+    crate::windows::resize_pty(master, size);
+    #[cfg(not(windows))]
     let _ = master.resize(size);
-}
-
-/// Resizes the ConPTY while it is open; once the command has exited and the
-/// pseudoconsole is closed, there is nothing to resize.
-#[cfg(windows)]
-fn resize_pty(master: &Master, size: PtySize) {
-    if let Some(master) = master
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-    {
-        let _ = master.resize(size);
-    }
 }
 
 /// Kills the child by handle and waits for the reap, draining whatever
@@ -908,6 +899,36 @@ mod tests {
             session.reaped.is_finished(),
             "the wait thread is done: the child was reaped, not abandoned"
         );
+    }
+
+    /// A resize reaches the PTY: its size afterwards is the one asked for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resize_reaches_the_pty() {
+        let recipe = LoginRecipe::terminal_only(
+            "/bin/sh",
+            vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
+        );
+        let mut session = spawn_login_pty(
+            &recipe,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("the shell spawns");
+        let wanted = PtySize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        super::resize_pty(&session.master, wanted);
+        let size = session.master.get_size().expect("the pty answers its size");
+        assert_eq!((size.rows, size.cols), (40, 132));
+        let _code = within("kill and reap", super::kill_and_reap(&mut session)).await;
     }
 
     /// A ConPTY session reaches EOF once its command exits: the reaping wait

@@ -541,9 +541,13 @@ pub async fn reap_leftover_groups(ledger: &dyn GroupLedger) -> usize {
             return 0;
         }
     };
+    #[cfg_attr(windows, expect(unused_mut, reason = "nothing is swept on Windows"))]
     let mut reaped = 0;
     for group in groups {
-        reaped += usize::from(sweep_leftover(&group).await);
+        #[cfg(unix)]
+        {
+            reaped += usize::from(sweep_leftover(&group).await);
+        }
         ledger.closed(group.pgid).await;
     }
     reaped
@@ -574,16 +578,6 @@ async fn sweep_leftover(group: &HarnessGroup) -> bool {
         }
         Leftover::Gone => false,
     }
-}
-
-/// Never anything to sweep on Windows (see [`reap_leftover_groups`]).
-#[cfg(not(unix))]
-#[expect(
-    clippy::unused_async,
-    reason = "the Unix sweep probes asynchronously; the call site is shared"
-)]
-async fn sweep_leftover(_group: &HarnessGroup) -> bool {
-    false
 }
 
 #[cfg(test)]

@@ -72,39 +72,26 @@ impl std::fmt::Debug for ProcessTree {
 
 impl ProcessTree {
     /// Spawns `command` as the root of a new tree: a new process group on
-    /// Unix, a new kill-on-close Job Object on Windows. `kill_on_drop` is set
-    /// here, so a tree dropped without a stop still loses its root.
+    /// Unix, a new kill-on-close Job Object on Windows
+    /// ([`crate::windows::spawn_in_job`]). `kill_on_drop` is set here, so a
+    /// tree dropped without a stop still loses its root.
     ///
     /// # Errors
     ///
     /// The spawn failing (a missing binary, most often), or on Windows the
     /// job failing to form — in which case the child is not left running.
-    #[cfg(unix)]
     pub fn spawn(mut command: Command) -> std::io::Result<Self> {
-        // Its own group, so stopping it reaches everything it started.
-        command.kill_on_drop(true).process_group(0);
-        let child = command.spawn()?;
-        let pgid = child.id();
-        Ok(Self { child, pgid })
-    }
-
-    /// Spawns `command` as the root of a new tree: a new process group on
-    /// Unix, a new kill-on-close Job Object on Windows (`process-wrap` does
-    /// the Win32 work — `CREATE_SUSPENDED`, the job, the assignment, the
-    /// resume — because the workspace forbids `unsafe`).
-    ///
-    /// # Errors
-    ///
-    /// The spawn failing (a missing binary, most often), or the job failing
-    /// to form — in which case the child is not left running.
-    #[cfg(windows)]
-    pub fn spawn(mut command: Command) -> std::io::Result<Self> {
-        use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
         command.kill_on_drop(true);
-        let mut wrapped = CommandWrap::from(command);
-        // KillOnDrop first: it is what makes the job kill-on-close.
-        wrapped.wrap(KillOnDrop).wrap(JobObject);
-        wrapped.spawn().map(|child| Self { child })
+        #[cfg(windows)]
+        return crate::windows::spawn_in_job(command).map(|child| Self { child });
+        #[cfg(unix)]
+        {
+            // Its own group, so stopping it reaches everything it started.
+            command.process_group(0);
+            let child = command.spawn()?;
+            let pgid = child.id();
+            Ok(Self { child, pgid })
+        }
     }
 
     /// The root's OS process id while it is unreaped.
@@ -188,12 +175,31 @@ impl ProcessTree {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
+mod unix_tests {
+    use super::ProcessTree;
+
+    /// The debug view names the tree and its live root's pid.
+    #[tokio::test]
+    async fn the_debug_view_names_the_root() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        let mut tree = ProcessTree::spawn(command).expect("sleep spawns");
+        let pid = tree.id().expect("a live root");
+        let shown = format!("{tree:?}");
+        assert!(shown.starts_with("ProcessTree"), "{shown}");
+        assert!(shown.contains(&pid.to_string()), "{shown}");
+        tree.kill_root().await.expect("kills");
+    }
+}
+
+#[cfg(test)]
 #[cfg(windows)]
 mod windows_tests {
     use std::process::Stdio;
     use std::time::Duration;
 
-    use horde_server_testkit::process::windows::gone_soon;
+    use horde_server_testkit::windows::gone_soon;
     use tokio::io::AsyncBufReadExt;
 
     use super::{ProcessTree, Stop};

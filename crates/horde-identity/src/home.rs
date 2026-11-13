@@ -80,4 +80,13 @@ mod tests {
         assert_eq!(home_from(true, env(&[])), None);
         assert_eq!(home_from(true, env(&[("USERPROFILE", "")])), None);
     }
+
+    /// This process's home is a real directory: the suites run with `HOME`
+    /// set (on Windows, at least `USERPROFILE`), and an empty path is no
+    /// home.
+    #[test]
+    fn this_process_has_a_home_directory() {
+        let home = super::home_dir().expect("a home");
+        assert!(home.is_dir(), "{}", home.display());
+    }
 }

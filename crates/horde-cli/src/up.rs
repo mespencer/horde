@@ -302,26 +302,8 @@ fn stop_signals() -> Result<impl Future<Output = ()>, ClientError> {
     })
 }
 
-/// The stop signals on Windows, registered now: ctrl-c, ctrl-break, or the
-/// console closing (ADR-0017). The daemons share this console, so the same
-/// ctrl-c reaches them too, and the teardown's bounded wait lets them act
-/// on it.
 #[cfg(windows)]
-fn stop_signals() -> Result<impl Future<Output = ()>, ClientError> {
-    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
-    let failed =
-        |error: std::io::Error| ClientError::Up(format!("cannot listen for signals: {error}"));
-    let mut interrupt = ctrl_c().map_err(failed)?;
-    let mut broke = ctrl_break().map_err(failed)?;
-    let mut closed = ctrl_close().map_err(failed)?;
-    Ok(async move {
-        tokio::select! {
-            _ = interrupt.recv() => {}
-            _ = broke.recv() => {}
-            _ = closed.recv() => {}
-        }
-    })
-}
+use crate::windows::stop_signals;
 
 /// Stands the machine up, announces the ready line, holds until `shutdown`
 /// or a started daemon's death, and tears down only what it started.

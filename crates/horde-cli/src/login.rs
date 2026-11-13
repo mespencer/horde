@@ -241,7 +241,7 @@ impl Drop for RawModeGuard {
 }
 
 /// The terminal's size, or the classic default off a pipe.
-fn terminal_size() -> (u16, u16) {
+pub(crate) fn terminal_size() -> (u16, u16) {
     ratatui::crossterm::terminal::size().unwrap_or((80, 24))
 }
 
@@ -359,34 +359,20 @@ fn terminal_feeds() -> TerminalFeeds {
     (typed, resizes, winch)
 }
 
-/// Sends the terminal's size on every SIGWINCH.
-#[cfg(unix)]
+/// Sends the terminal's size on every SIGWINCH. Windows has none; there the
+/// size is polled ([`crate::windows::watch_resizes`]).
 async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>) {
-    let Ok(mut signals) =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-    else {
-        return;
-    };
-    while signals.recv().await.is_some() {
-        if resize_tx.send(terminal_size()).await.is_err() {
+    #[cfg(windows)]
+    return crate::windows::watch_resizes(resize_tx).await;
+    #[cfg(unix)]
+    {
+        let Ok(mut signals) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        else {
             return;
-        }
-    }
-}
-
-/// Windows has no SIGWINCH, and a console resize arrives only as an input
-/// record the raw stdin reader would have to decode: the size polled
-/// instead, twice a second, sending each change (ADR-0017).
-#[cfg(windows)]
-async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>) {
-    let mut last = terminal_size();
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
-    loop {
-        tick.tick().await;
-        let now = terminal_size();
-        if now != last {
-            last = now;
-            if resize_tx.send(now).await.is_err() {
+        };
+        while signals.recv().await.is_some() {
+            if resize_tx.send(terminal_size()).await.is_err() {
                 return;
             }
         }
@@ -458,6 +444,32 @@ mod tests {
 
     use super::{LoginEnd, LoginStream, callback_of, pump_login};
     use crate::forward::testing::within;
+
+    /// A SIGWINCH sends the terminal's size. The signal is sent until one
+    /// lands after the watcher registered (count-bounded); SIGWINCH is
+    /// ignored by default, so an early one is harmless.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_window_change_sends_the_terminal_size() {
+        let (resize_tx, mut resizes) = tokio::sync::mpsc::channel(4);
+        let watcher = tokio::spawn(super::watch_resizes(resize_tx));
+        let pid = std::process::id().to_string();
+        let mut sent = None;
+        for _ in 0..50 {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-WINCH", &pid])
+                .status()
+                .await;
+            if let Ok(Some(size)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), resizes.recv()).await
+            {
+                sent = Some(size);
+                break;
+            }
+        }
+        assert_eq!(sent, Some(super::terminal_size()));
+        watcher.abort();
+    }
 
     /// The scripted relay: feed frames in, observe what the client sent.
     fn scripted_stream() -> (

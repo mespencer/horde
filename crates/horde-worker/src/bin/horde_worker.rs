@@ -61,9 +61,12 @@ async fn serve_until_terminated(config: &startup::WorkerConfig) -> ExitCode {
 /// stops a daemon) or ctrl-c (how an operator does). The racing itself is
 /// [`startup::first_of`], where it is tested; failing to even listen for
 /// SIGTERM degrades to ctrl-c alone — the default disposition would kill the
-/// process on SIGTERM anyway.
-#[cfg(unix)]
+/// process on SIGTERM anyway. On Windows the console's stop events stand in
+/// for SIGTERM ([`horde_worker::windows::console_stop`], ADR-0017).
 async fn termination() {
+    #[cfg(windows)]
+    return horde_worker::windows::console_stop().await;
+    #[cfg(unix)]
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut sigterm) => {
             startup::first_of(wait_for_ctrl_c(), async move {
@@ -78,42 +81,10 @@ async fn termination() {
     }
 }
 
-/// Resolves when the process is asked to stop on Windows: ctrl-c or
-/// ctrl-break (how an operator, or a console-sharing parent, stops it), the
-/// console closing, or the system shutting down — Windows' SIGTERMs
-/// (ADR-0017). Failing to listen for the console events degrades to ctrl-c
-/// alone.
-#[cfg(windows)]
-async fn termination() {
-    use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
-    let console = async {
-        let (Ok(mut broke), Ok(mut closed), Ok(mut shut_down)) =
-            (ctrl_break(), ctrl_close(), ctrl_shutdown())
-        else {
-            tracing::warn!("could not listen for ctrl-break, close or shutdown; ctrl-c only");
-            return std::future::pending::<()>().await;
-        };
-        startup::first_of(
-            async move {
-                let _ = broke.recv().await;
-            },
-            startup::first_of(
-                async move {
-                    let _ = closed.recv().await;
-                },
-                async move {
-                    let _ = shut_down.recv().await;
-                },
-            ),
-        )
-        .await;
-    };
-    startup::first_of(wait_for_ctrl_c(), console).await;
-}
-
 /// Parks on ctrl-c. A registration failure parks forever instead: with no
 /// signal to hear, returning would stop a healthy daemon, and the operator
 /// still holds SIGKILL.
+#[cfg(unix)]
 async fn wait_for_ctrl_c() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "could not listen for shutdown");

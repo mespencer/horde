@@ -101,32 +101,27 @@ async fn fresh_token(file: &Path, before: &str, deadline: Duration) -> Option<St
 /// Sends SIGHUP to `pid`, the re-mint request a running server listens for.
 ///
 /// The pid comes from a file on disk, not from a process this one spawned,
-/// so [`hangup_target`] vets it first.
+/// so [`hangup_target`] vets it first. Windows has no SIGHUP (ADR-0017), so
+/// there this refuses with [`unsupported_remint`]
+/// ([`crate::windows::send_hangup`]).
 ///
 /// # Errors
 ///
 /// The pid refused, or the signal failing (the pid gone, or not ours).
-#[cfg(unix)]
 pub fn send_hangup(pid: u32) -> std::io::Result<()> {
-    let target = hangup_target(pid)?;
-    nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGHUP)
-        .map_err(|errno| std::io::Error::other(format!("SIGHUP to {pid} failed: {errno}")))
-}
-
-/// Windows has no SIGHUP, so a running server there cannot be asked to
-/// re-mint (ADR-0017): refused in words that name the way that works.
-///
-/// # Errors
-///
-/// Always [`std::io::ErrorKind::Unsupported`].
-#[cfg(not(unix))]
-pub fn send_hangup(pid: u32) -> std::io::Result<()> {
-    Err(unsupported_remint(pid))
+    #[cfg(windows)]
+    return crate::windows::send_hangup(pid);
+    #[cfg(unix)]
+    {
+        let target = hangup_target(pid)?;
+        nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGHUP)
+            .map_err(|errno| std::io::Error::other(format!("SIGHUP to {pid} failed: {errno}")))
+    }
 }
 
 /// The refusal `--remint` gives on a platform without SIGHUP.
 #[cfg_attr(unix, allow(dead_code))]
-fn unsupported_remint(pid: u32) -> std::io::Error {
+pub(crate) fn unsupported_remint(pid: u32) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!(
@@ -172,7 +167,7 @@ mod tests {
     }
 
     /// On Windows the binary's hang-up refuses with that same refusal.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     #[test]
     fn send_hangup_refuses_without_sighup() {
         let error = super::send_hangup(4242).expect_err("no SIGHUP here");

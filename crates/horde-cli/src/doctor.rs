@@ -73,7 +73,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn ok(name: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn ok(name: &str, detail: impl Into<String>) -> Self {
         Self {
             name: name.to_owned(),
             verdict: Verdict::Ok,
@@ -361,27 +361,22 @@ pub fn harness_checks(harnesses: &[String], path: Option<&std::ffi::OsStr>) -> V
         .collect()
 }
 
-/// The first executable file named `name` in `path`'s directories.
-#[cfg(unix)]
+/// The first executable file named `name` in `path`'s directories. On
+/// Windows, `name.exe` — the only form the Worker can launch
+/// ([`crate::windows::on_path`]).
 pub(crate) fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::split_paths(path?)
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-}
-
-/// The first executable file named `name` in `path`'s directories, on
-/// Windows: `name.exe` — the only form the Worker can launch, since
-/// `CreateProcess` resolves a bare name to `.exe` alone and a `.cmd` shim
-/// (npm's) is not a program (ADR-0017).
-#[cfg(windows)]
-pub(crate) fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    std::env::split_paths(path?)
-        .map(|dir| dir.join(windows_program(name)))
-        .find(|candidate| std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file()))
+    #[cfg(windows)]
+    return crate::windows::on_path(name, path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(path?)
+            .map(|dir| dir.join(name))
+            .find(|candidate| {
+                std::fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+    }
 }
 
 /// The file Windows launches for a bare program name: `name.exe`, unless the
@@ -405,57 +400,45 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
     vec![permission_check(&label, dir, &meta), disk_check(dir)]
 }
 
-#[cfg(unix)]
+/// Whether a state directory is owner-only. Windows has no mode bits; its
+/// answer is the inherited ACL ([`crate::windows::permission_check`]).
 fn permission_check(label: &str, dir: &Path, meta: &std::fs::Metadata) -> Check {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 == 0 {
-        Check::ok(label, format!("owner-only ({mode:o})"))
-    } else {
-        Check::not_ok(
-            label,
-            Verdict::Warn,
-            format!("mode {mode:o} lets other users look inside"),
-            &format!("chmod 700 {}", dir.display()),
-        )
+    #[cfg(windows)]
+    return crate::windows::permission_check(label, dir, meta);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            Check::ok(label, format!("owner-only ({mode:o})"))
+        } else {
+            Check::not_ok(
+                label,
+                Verdict::Warn,
+                format!("mode {mode:o} lets other users look inside"),
+                &format!("chmod 700 {}", dir.display()),
+            )
+        }
     }
 }
 
-/// Windows has no mode bits to read: a state directory's privacy is the
-/// ACL it inherits — the user's profile grants the user, SYSTEM and
-/// Administrators alone (ADR-0017). Reported as such, never as a mode.
-#[cfg(not(unix))]
-fn permission_check(label: &str, dir: &Path, _meta: &std::fs::Metadata) -> Check {
-    Check::ok(
-        label,
-        format!(
-            "inherits its ACL (no mode bits on this platform); `icacls {}` shows who may look \
-             inside",
-            dir.display()
-        ),
-    )
-}
-
-#[cfg(unix)]
+/// Free space on `dir`'s filesystem, by `df`; Windows has none
+/// ([`crate::windows::disk_check`]).
 fn disk_check(dir: &Path) -> Check {
-    let label = format!("disk {}", dir.display());
-    let output = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(dir)
-        .output();
-    let available = output
-        .ok()
-        .and_then(|out| available_kib(&String::from_utf8_lossy(&out.stdout)));
-    disk_verdict(&label, available)
-}
-
-/// Free space on Windows, where there is no `df`: `GetDiskFreeSpaceExW`
-/// (through `fs4`), the bytes this user may still write, in KiB.
-#[cfg(windows)]
-fn disk_check(dir: &Path) -> Check {
-    let label = format!("disk {}", dir.display());
-    let available = fs4::available_space(dir).ok().map(|bytes| bytes / 1024);
-    disk_verdict(&label, available)
+    #[cfg(windows)]
+    return crate::windows::disk_check(dir);
+    #[cfg(unix)]
+    {
+        let label = format!("disk {}", dir.display());
+        let output = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(dir)
+            .output();
+        let available = output
+            .ok()
+            .and_then(|out| available_kib(&String::from_utf8_lossy(&out.stdout)));
+        disk_verdict(&label, available)
+    }
 }
 
 /// The verdict on `available` KiB free (`None`: `df` gave no answer).
