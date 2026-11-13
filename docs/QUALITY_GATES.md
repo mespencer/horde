@@ -18,6 +18,8 @@ $ gauntlet run                       # every gate
 $ gauntlet run crap                  # one gate, plus whatever it depends on
 $ gauntlet run clippy -p horde-proto # narrow to a package
 $ gauntlet run --full                # mutants measures the whole tree, not just the change
+$ gauntlet run --incremental         # mutants measures what changed since the last green --full
+$ gauntlet run --skip mutants        # every gate but mutants: the day-to-day handoff
 $ gauntlet list                      # the registry, with enforcement levels
 $ gauntlet report --format markdown  # re-render the last run
 ```
@@ -60,7 +62,7 @@ mismatch. `cargo fmt`, `cargo clippy` and `cargo test` are pinned by
 | cargo-crap | 0.3.1 | `cargo install --locked cargo-crap@0.3.1` |
 | cargo-machete | 0.9.2 | `cargo install --locked cargo-machete@0.9.2` |
 | cargo-modules | 0.26.0 | `cargo install --locked cargo-modules@0.26.0` |
-| cargo-mutants | 27.1.0 | `cargo install --locked cargo-mutants@27.1.0` |
+| cargo-gamma | 0.2.1, census-kill-final patch | `tools/cargo-gamma/install.sh` |
 | jscpd | 5.0.14 | Node.js 18+; `npx` fetches `jscpd@5.0.14` itself |
 | buf | 1.69.0 | `brew install bufbuild/buf/buf`, or https://buf.build/docs/installation |
 
@@ -352,8 +354,9 @@ no schema is not reported as a broken instrument.
 
 ## mutants
 
-**What.** `cargo mutants`, **zero missed mutants**. Scoped to the diff against the
-merge-base with `main` when there is one, and to the whole tree when there is not.
+**What.** [cargo-gamma](https://crates.io/crates/cargo-gamma) **0.2.1**, with one patch
+(below), **zero missed mutants**. Scoped to the diff against the merge-base with `main`
+when there is one, and to the whole tree when there is not.
 
 **Why.** Coverage says a line ran. A mutant says the line's behaviour was *checked*.
 Agent-written tests are unusually good at the first and unusually bad at the second:
@@ -362,192 +365,238 @@ one of those stays green when the code under it is quietly wrong, and every one 
 is exactly what a surviving mutant points at. A mutation that stays green is a finding,
 not a relief.
 
-**Scope: the change under test.** This is the only gate that does not measure
-everything, and what it measures is always "what did this change introduce":
+**The engine.** Until wave 12 this gate ran cargo-mutants, which rebuilds the mutated
+package once per mutant; a whole-tree sweep took 2–10 hours. Gamma compiles every
+selected mutant into one instrumented build as a runtime switch (a *schema*), measures
+which tests reach each mutation site, and runs only those tests with that mutant
+switched on. The build is paid once per run, not once per mutant. Its operators are not
+cargo-mutants' — it generates roughly 15,000 mutants on this tree where cargo-mutants
+generated about 2,400, including string-literal and `None`→`Some` mutations
+cargo-mutants never made — so counts are not comparable across the change, and the
+first gamma sweep found survivors in code cargo-mutants had passed (see the pilot
+below). `const fn`s and const initializers are not mutated, and doctests are not its
+oracle.
 
-| where | baseline | scope |
+**Missed means missed.** The gate reads `gamma-report.json` (schema 2), not gamma's
+console, and counts every mutant no test assertion rejected:
+
+| gamma status | counts as | why |
 |---|---|---|
-| on a branch | merge-base with `main` | the branch's own work |
-| on `main` | `HEAD`'s first parent | what the tip commit (usually a merge) brought in |
-| no `main`, or a root commit | — | the whole tree |
+| `Killed` | caught | a test failed with the mutant on, and passed again without it |
+| `Survived` | **missed** | every test that reaches it passed |
+| `Timeout`, or `Survived` *timed out* | **missed** | a timeout is not a kill (below) |
+| `Survived` *out of memory* | **missed** | the tests breached their memory ceiling rather than failing an assertion |
+| `NoCoverage` | **missed** | no test reaches the code at all |
+| `CompileError` | unviable — excluded | not a statement about the tests |
+| `Ignored` | excluded | a `gamma::skip` suppression, or a *flaky* kill — reported separately |
+
+A status the gate does not know is an `error`, never skipped: a new way to fail that a
+reader drops is a missed mutant reported as nothing. Every missed mutant is written, one
+per line, to `target/quality/mutants/missed.txt`; gamma's own HTML, SARIF and JSON
+reports are beside it.
+
+This is a deliberate change from cargo-mutants' tally, which counted a timeout as
+caught. Gamma derives each test binary's budget from *that binary's* measured baseline
+(5× it, at least 60 s — `gamma.toml`), so the old objection — one clock started once for
+the whole run, under whatever load the machine had then — no longer holds, and a
+timeout is what it always was: a mutant nobody evaluated. The fix for one is never a
+longer timeout; it is a bounded test that turns the hang into a failure (the fix
+hierarchy in *Bound every wait* below).
+
+**Scope.**
+
+| how | baseline | scope |
+|---|---|---|
+| `gauntlet run` on a branch | merge-base with `main` | the branch's own work |
+| `gauntlet run` on `main` | `HEAD`'s first parent | what the tip commit (usually a merge) brought in |
+| no `main`, a root commit, or an empty diff | — | the whole tree |
+| `gauntlet run --incremental` | the last green full sweep | everything changed since the tree was last measured whole |
 | `gauntlet run --full` | — | the whole tree |
 
 On a branch, merging `main` in *moves* the merge-base to `main`'s tip, so the diff stays
-the branch's own work and the mutant count tracks what the branch changed rather than how
-large the workspace has become. On `main` the merge-base is `HEAD` itself, which would
-leave nothing to compare against — so the baseline is the first parent, which for a merge
-commit is precisely the trunk it landed on. Same question, asked of the merge.
+the branch's own work. On `main` the merge-base is `HEAD` itself, so the baseline is the
+first parent, which for a merge commit is precisely the trunk it landed on. Falling back
+to the whole tree when there is no baseline is deliberate: an absent branch must never
+quietly shrink the gate to nothing.
 
-**What this scope cannot see.** A gate that only ever looks at diffs never re-examines
-code no recent diff has touched. Not hypothetical: the first whole-tree run on this
-workspace found **92 surviving mutants** in crates that had only ever been measured
-through somebody's diff. Treat a green diff-scoped row as "this change is covered", never
-as "the workspace is covered" — the row says which it is, in words, for that reason.
+Gamma refuses a diff that names Rust it does not survey — `tests/`, `benches/`,
+`examples/`, `build.rs`, the spikes — and refuses one that names nothing it surveys,
+such as a docs-only change. Both refusals would read as a broken instrument. So the gate
+keeps only the diff sections for files gamma's own `--no-config` listing puts mutants
+in; a diff with nothing left is `skipped` ("nothing mutable in changed code"), never
+`pass`. The narrowed diff is `target/quality/mutants.diff`. Taking the file set from
+gamma rather than from path globs kept here means it cannot drift from what gamma
+mutates.
 
-**When the whole-tree sweep runs: at every wave boundary.** `--full` is the answer to the
-other question, and the thing that failed before was not that the sweep was skipped but
-that nobody had ever run it at all. A calendar reminder would be the same promise in a
-new costume, so the sweep is pinned to an event this project already has:
-IMPLEMENTATION.md's waves. Before a wave is declared finished, whoever is running it does:
+**Incremental sweeps.** A green `--full` run over the whole workspace, on a clean tree,
+records `HEAD` in `target/quality/mutants-last-green-full-sweep`; the row says so. A
+dirty tree is reported and not recorded — a sweep measures the working tree, so it
+vouches for a commit only when the tree *was* that commit. `--incremental` then diffs
+against that commit: on the same worktree, between wave boundaries, it re-measures
+everything that changed since the tree was last shown whole, whatever branch it came
+from. With nothing recorded it measures the whole tree. An incremental run never
+advances the record: a change to *tests* can let a mutant in untouched code survive,
+and only a full sweep looks there.
 
+**What a diff-scoped run cannot see.** A gate that only ever looks at diffs never
+re-examines code no recent diff has touched — the first whole-tree cargo-mutants run on
+this workspace found 92 survivors that way. Treat a green diff-scoped row as "this change
+is covered", never as "the workspace is covered".
+
+**When the whole-tree sweep runs: at every wave boundary.** Before a wave is declared
+finished, whoever is running it does `gauntlet run --full`, and the next wave does not
+start on a red one. Day-to-day handoffs run `gauntlet run --skip mutants` plus the
+relevant suites; each item's final handoff runs `gauntlet run mutants` (its diff). This
+is deliberately *not* enforced by a timer inside the gate: a gate that reds because of
+the calendar rather than the code teaches people to ignore it.
+
+**Speed, and the knobs.** The gate passes, and nothing else should:
+
+* **`--jobs`** — `HORDE_MUTANTS_JOBS`, default half the cores up to 16 (16 on the
+  32-core development machine). Gamma measures the baseline at the same width and
+  splits the cores between concurrent harnesses, so budgets are calibrated under the
+  load the mutants run under. Two cores per job, because these suites spawn servers and
+  processes of their own.
+* **A memory ceiling per test binary** — `HORDE_MUTANTS_MEMORY_MIB`, default 4096
+  (`0`/`off` disables). Each mutant is held to gamma's ceiling derived from its binary's
+  baseline peak, `max(2 × peak, peak + 128 MiB)`; the baseline is held to half the cap
+  and the headroom within that, so no ceiling exceeds the cap and `jobs × cap` (64 GiB
+  by default) bounds the run. A mutant over its ceiling is `OUTOFMEM` — missed. Linux
+  enforcement needs a delegated cgroup v2; gamma re-runs itself in a systemd user scope
+  to get one, and a host that cannot provide it stops the run rather than pretend.
+* **`--cap-lints=allow`** — appended to `CARGO_ENCODED_RUSTFLAGS` (existing flags are
+  kept). The workspace denies `unwrap`, `expect` and `panic!`, which is exactly what some
+  mutators write; capping scores those mutants instead of withdrawing them as unviable.
+  `allow`, not `warn`: rustc takes the first `--cap-lints`, and at `warn` every
+  instrumented compile renders thousands of warnings about gamma's guard code.
+* **The `mutants` profile** — `gamma.toml` selects it: `inherits = "test"`,
+  `debug = false`. One instrumented whole-workspace build per run, and debuginfo is the
+  bulk of its link cost.
+* **A persistent cache.** Gamma keeps a copy of the workspace and the instrumented
+  `target/` in a per-workspace cache and rebuilds incrementally from it, reusing what it
+  learned about unviable mutants (`--incremental build`, its default). The default
+  location is gamma's own, `~/.cache/cargo-gamma/<workspace>`; `HORDE_MUTANTS_CACHE_DIR`
+  names another. It is not `target/quality`: gamma refuses a redirected cache when any
+  directory above it is writable by another user (it builds executables there and runs
+  them), and with this machine's `umask 002` every directory from the worktrees root down
+  is group-writable. `cargo gamma clean` in a workspace removes its cache; the cache of a
+  deleted worktree is left behind and is safe to delete by hand.
+* **The census-kill-final patch.** When a census has narrowed a mutant's run to the tests
+  that reach it and that filtered run fails, stock 0.2.1 re-runs the whole test binary and
+  keeps only that outcome (cargo-gamma-lib `src/exec/sweep.rs`, the
+  `CensusSelection::Selected` branch), so every kill pays for its binary twice. The patch
+  treats a filtered *failure* as final; timeouts, stalls and memory breaches are still
+  re-run whole, and kill confirmation (the failing test re-run with no mutant active,
+  which turns an unstable test into `flaky`) is unchanged. It was written for atlas; the
+  patch file is byte-identical, so one patched binary serves both repositories.
+
+**Install, and how the gate knows.** `tools/cargo-gamma/install.sh` downloads both 0.2.1
+crates from crates.io, checks them against the index's checksums, applies the patch,
+installs `--locked`, and stamps the patch's and binary's digests beside the binary
+(`cargo-gamma.atlas-patch`). The gate checks `cargo gamma --version` like every other pin
+and then runs `install.sh --check`, which finds the binary `cargo gamma` would run and
+compares the stamp; a stock build of the same version is an `error` naming the installer.
+
+**The pilot.** {{PILOT}}
+
+**Do not edit the tree during a run.** Gamma copies the workspace into its cache at the
+start and re-reads sources while it instruments them. The first pilot sweep died after
+12½ minutes with `internal error: no guard was emitted for the mutant at …` because a
+file was edited while it built. Run long sweeps from a worktree nobody is editing.
+
+**The disk pre-flight: 40 GiB free, or the run does not start.** Before listing anything,
+the gate reads `df -P -k` on the workspace's volume and reports `error` below 40 GiB. An
+`error`, not a `fail`: the code was never judged. Gamma's cache holds a workspace copy and
+a whole instrumented build ({{CACHE}} after a full sweep here); a run that dies of a full
+disk mid-build has spent its most expensive part for nothing.
+
+**Exclusions: two kinds of file, and nothing else.** Skipping code because its mutants
+survive is how a mutation gate becomes decorative. `gamma.toml`'s `exclude-files` admits
+a file for one of two reasons, each argued in a comment above the entry:
+
+*A test fixture.* A binary that exists **to be spawned by the test suite** — a stub
+harness, the fault suite's worker-runner, the scripted `fake-login` — is fixture wearing a
+`[[bin]]`'s clothes; mutating it measures the fixture. The criterion is *who exercises
+whom*: a binary the suite runs is excluded; a binary the suite tests (`horde`,
+`horde-server`, `horde-worker`) is not. Each entry is one literal path from the workspace
+root — no globs, because a glob's reach is a question only a glob engine can answer, and
+`src/bin/**` once took a product binary out with a fixture.
+
+*A file whose mutants are dangerous.* `crates/horde-server-testkit/src/reap.rs` sends real
+signals to processes chosen at runtime; a mutant of an earlier version SIGKILLed every
+process on the machine (IMPLEMENTATION.md, the wave-11 incident). Gamma compiles every
+mutant of every discovered file into the test binary, so excluding it from *selection*
+would not be enough; `exclude-files` drops it before it is parsed, so it is never
+instrumented at all. The gate does not trust that to stay true. `DANGEROUS` in the gate
+names the file; if it exists it must be an `exclude-files` entry of its own, and the gate
+refuses — `REFUSING TO MUTATE`, before anything is built — if the workspace listing or the
+run's own listing contains a single mutant in it. No mutation of `reap.rs` is ever run.
+
+**Equivalent mutants are suppressed at the expression, not excluded.** Sometimes a
+mutation produces the expression that was already there. `Capabilities::none()` is
+`Self::default()` over a type deriving `Default`, and gamma's `fn_value.default` mutation
+is `Default::default()` — the same expression. Such a mutant is suppressed in the source,
+on the line above, naming the one mutator and arguing the equivalence:
+
+```rust
+// #[gamma::skip(fn_value.default, reason = "the body is `Self::default()` over a `Capabilities` that derives `Default`, so the mutant `Default::default()` is the same expression")]
+pub fn none() -> Self {
 ```
-gauntlet run --full        # ~24 minutes at 1100 mutants; expect to schedule around it
-```
 
-and the next wave does not start on a red one. Wave boundaries are the right moment
-because that is exactly when the next tranche of work is about to be built on whatever
-the last one left behind, and they arrive often enough that a sweep is never archaeology.
-Once there is a release process, tagging joins the list.
+There are two, `Capabilities::none` and `Script::echoing`. **The criterion is identity,
+not difficulty:** "no test kills it", "it would need an awkward harness", "the mutant is
+obviously harmless" are findings, and belong in the test suite.
 
-This is deliberately *not* enforced by a timer inside the gate. A gate that reds because
-of the calendar rather than the code teaches people to ignore it, and the gate has no
-honest way to know when the last sweep happened — nothing in git records it. Making the
-sweep an owned step in an existing ritual is weaker than a machine check and stronger
-than a good intention, and it is the strongest thing available here.
+**Every exclusion and suppression proves itself.** Before a run, the gate lists the whole
+workspace twice — `cargo gamma list --json --workspace`, with `gamma.toml` and with
+`--no-config` — and compares the populations mutant by mutant (by file, position, mutator
+and replacement; gamma's `id` also encodes a replacement's position among its siblings
+and shifts when one is not generated). Refused, each with the entry or mutant named:
 
-Falling back to the whole tree when there is no baseline is deliberate: an absent branch
-or a root commit must never quietly shrink the gate to nothing. Timeouts live in
-`.cargo/mutants.toml`; `--jobs`, `--profile` and `--full` live in the gate.
+* an entry that is not one literal `.rs` path, or names a path not in the tree (gamma
+  itself already refuses a glob that matches nothing);
+* an entry with no reason written beside it;
+* an entry that did not take — the configured listing still has a mutant in its file;
+* an entry that removed nothing — both listings agree about its file;
+* a removal no entry accounts for, or a mutant only the configured listing has;
+* a suppressed mutant with no `reason`, or one suppressed by the configuration rather
+  than in the source;
+* a `gamma::skip` directive in the source that suppresses nothing — the expression it
+  argued about has changed or gone (`cargo gamma unsuppress` removes those).
 
-**The build profile: `--profile=mutants`.** Every mutant pays an incremental rebuild and
-relink of the mutated package's test binaries, debuginfo is the bulk of that link cost,
-and nothing in a mutation run reads it — no debugger attaches, and the verdict is read
-from the harness's tally, never a backtrace. The workspace manifest therefore defines
-`[profile.mutants]` (`inherits = "test"`, `debug = false`) and the gate passes
-`--profile=mutants`. Per the "faster test tool" lesson below, this is a measurement, not
-an assumption: on one horde-server shard (`--shard 0/32 --jobs 4`, idle machine) the same
-24 mutants took **116.1s** wall without the profile and **97.0s** with it — a **1.20×**
-speed-up, with an identical verdict both ways (23 caught, 1 unviable). Unlike the nextest
-experiment, this lever matches the physics: the per-mutant floor *is* the incremental
-build-and-link, and debuginfo is the part of it nothing consumes. A test in the gate
-holds the manifest and the flag together, so the profile cannot be dropped from
-`Cargo.toml` while the gate still asks for it.
+One difference between the listings is accounted for by name rather than refused: gamma
+decides whether a type implements `Default` from the declarations it parses, by name. An
+excluded file is not parsed, so when it declares a same-named type that derives
+`Default`, gamma stops generating `Default::default()` replacements for the other one —
+which would not have compiled. Today that is horde-server's `Invocation` and the fault
+suite's worker-runner's: two mutants of `startup::invocation`. Such a removal is
+recognised by its replacement.
 
-**The disk pre-flight: 40 GiB free, or the run does not start.** Before launching
-cargo-mutants — and only for this gate; the fast gates neither clone the tree nor build
-anything a plain `cargo test` would not — the gate reads `df -P -k` on the workspace's
-volume and reports `error` below **40 GiB** free. An `error`, not a `fail`: the code was
-never judged, the instrument had nowhere to run. The message names the threshold, the
-observed free space, and where the missing gigabytes usually are: worktree `target/`
-directories, `target/llvm-cov-target`, and stale `cargo-mutants-*` scratch trees under
-the system temp directory (`/var/folders` on macOS). The evidence behind the number: a
-run at `--jobs 4` clones a ~2–3 GB scratch tree per job and grows each clone's
-incremental `target/` from there; two full sweeps died of disk exhaustion in a single
-week, and a near-full APFS volume also silently *serialized* a jobs=4 run to ~1.1×
-parallelism — the run degrades before it fails, so a guard that waited for the failure
-would still let the slow lie through.
+**Local.** `gauntlet run mutants` (the diff), `gauntlet run mutants --full` (the tree), or
+`cargo gamma run` directly — with the flags the gate's log shows, which are the whole
+configuration. `cargo gamma explain <id>` explains a mutant.
 
-**Two kinds of exclusion, and nothing else.** Skipping a function because its mutants
-survive is how a mutation gate becomes decorative. If a function cannot be
-mutation-tested, the fix is normally to move its logic somewhere that can be — which is
-why the gauntlet's own I/O is behind the `CommandRunner` seam and its parsing is in pure
-functions. `.cargo/mutants.toml` admits exactly two shapes of `exclude_re` entry, and the
-gate refuses anything else outright rather than accepting it and leaving it unverified.
+**How to read.** A `fail` gives the number missed, split into survived / timed out / out of
+memory / uncovered, and points at `missed.txt`. A `pass` reports how many were caught and
+how many were unviable, excluded or flaky. `skipped` means there was nothing to mutate —
+a change to tests, docs or build scripts, an incremental run with no change, a report
+with no scored mutant — and never means "measured clean". An `error` means the instrument
+did not measure: a stock cargo-gamma, a refused exclusion, a dangerous file in a listing,
+a failed baseline, a non-zero exit, a missing or unreadable report.
 
-*A file, when the file is test fixture.* A binary that exists **to be spawned by the test
-suite** — a stub harness a process-supervision test launches — is fixture wearing a
-`[[bin]]`'s clothes, and mutating it measures the fixture rather than the product. The
-criterion is *who exercises whom*: a binary the suite runs is excluded; a binary the suite
-tests is not. `horde-cli`'s `bin/horde.rs` is a product the suite tests, so it stays in
-scope — which is why the entry names one path, with `\.` for a dot, rather than
-`src/bin/**`, a glob that would take the product out with the fixture:
+**Responding to a missed mutant.** Each line of `missed.txt` is a specific edit no test
+noticed (`file:line:col: mutator -> replacement [status]`; `gamma-report.html` shows the
+code). In order of preference:
 
-```toml
-exclude_re = ['crates/horde-worker/src/bin/stub_harness\.rs']
-```
-
-The path is written **from the workspace root**, `crates/` and all. Earlier revisions of
-this section omitted the `crates/` prefix, and when the exclusion first landed for real the
-self-check refused it — *"excludes horde-worker/src/bin/stub_harness.rs, which is not in
-the tree"*. The regex would in fact have matched, because `exclude_re` is tested against a
-mutant description that begins with the full path; it is the gate's *existence* check that
-insists on a path a reader can go and look at. That is the check earning its keep: a
-prefix-less path is one directory rename away from silently excluding nothing at all.
-
-*A function, when its mutant is provably equivalent.* Sometimes cargo-mutants' rewrite
-produces the expression that was already there. `Capabilities::none()` is written
-`Self::default()` over a type deriving `Default`, and the mutation is
-`-> Self with Default::default()`: the same expression, character for character. No test
-can distinguish them, and a test written to look as if it had would be asserting on
-nothing — a hollow test is worse than the survivor it hides, because it also lies about
-coverage. Such an entry names the function as a Rust path and **must** carry a comment
-arguing the equivalence:
-
-```toml
-exclude_re = [
-    # `Capabilities::none()` is written `Self::default()`, and `Capabilities`
-    # derives `Default`, so the mutated expression is the original.
-    'Capabilities::none',
-]
-```
-
-**The criterion is identity, not difficulty.** An equivalence entry requires the mutated
-expression to be *provably identical* to the original. "No test kills it", "it would need
-an awkward harness", "the mutant is obviously harmless" are all findings, not
-equivalences, and belong in the test suite. The comment is mandatory because equivalence
-is an argument rather than an observation: nothing in the tree records it, so the next
-reader either finds the reasoning written down or has to re-derive it — and re-deriving it
-is exactly the work people skip.
-
-**Every exclusion proves itself, four ways.** Before a mutation run, the gate lists the
-mutants twice — `cargo mutants --list` and `cargo mutants --list --no-config`. The
-difference between the two listings *is* what the configuration removed, measured rather
-than inferred from reading the patterns. Four lies are refused:
-
-* *It names nothing.* An exclusion for a path no longer in the tree is indistinguishable
-  from one still doing its job, so it silently misstates what is being measured — the same
-  reason `baselines/module-cycles.txt` ratchets in both directions.
-* *It was configured but did not apply.* `exclude_re` is a regex over each mutant's
-  description, not a path glob, so an anchoring mistake makes an exclusion quietly do
-  nothing and the mutants it named get tested anyway. This is not hypothetical: a
-  `--exclude 'src/bin/**'` was accepted without complaint and the stub binary's mutants
-  were tested regardless. Configured is not applied.
-* *It removed nothing.* An entry whose two listings agree is inert, and an inert entry
-  reads exactly like one holding something back. Nothing inside the excluded listing can
-  tell those apart; only the comparison can.
-* *It removed something it does not name.* Anything missing from the excluded listing that
-  no entry claims means the configuration is wider than it reads — an over-broad pattern,
-  or a key this gate does not parse at all. A bare `none` would match `announced.is_none()`
-  in cargo-mutants' regex but not in the gate's idea of "names this function", so its
-  collateral surfaces here instead of passing as intended.
-
-An equivalence entry has one extra obligation: it must remove **exactly one** mutant.
-Equivalence is a claim about a single mutated expression, so a function that has grown a
-second one has outgrown the argument made for it. Widening the entry to cover the new
-mutant would silently exclude untested behaviour; the entry reds instead, and the argument
-has to be made again for what grew.
-
-Both listings cost nothing when there are no exclusions, which is the usual case: they run
-only once something is excluded.
-
-**Local.** `gauntlet run mutants`, or `cargo mutants` directly. Survivors are listed in
-`target/quality/mutants.out/missed.txt`.
-
-**How to read.** A `fail` gives the number of survivors and points at `missed.txt`; each
-line there is a specific edit that no test noticed. A `pass` reports how many mutants were
-caught, how many were unviable (did not compile — legitimately not a finding), and how
-many timed out. Timeouts count as caught in the tally — a mutant that hangs the suite did
-change behaviour — and the count is surfaced separately so a creeping number cannot hide
-inside a green row. Read that number every time, and read it as *unevaluated* rather than
-as killed: "A timeout is not a kill" below says why the classification is not stable. A
-run that produced no tally at all is an `error`, not a clean sheet — *unless* it said why
-it had nothing to do, in which case it is `skipped`.
-
-**A change with nothing mutable in it is `skipped`, and never `pass`.** cargo-mutants
-mutates product code, not tests: `#[cfg(test)]` modules and `tests/` are not mutated at
-all. So a diff can be full of Rust and still generate zero mutants — which is exactly what
-a test-only refactor is — and cargo-mutants then exits 0 having printed no tally. There
-are four wordings for it, depending on which stage the work ran out at (`Diff changes no
-Rust source files`, `No mutants to filter`, `diff matched no mutants`, `No mutants found
-under the active filters` / `No mutants were generated`), and the gate reads all of them.
-The row says `skipped` with the reason, because "no mutant survived" and "no mutant was
-ever built" are different facts and only one of them is evidence about the change.
-
-One message in that family is **not** in it: `No mutants were viable`, whose own text
-continues "perhaps there is a problem with building in a scratch directory". That is the
-instrument failing, so it stays an `error`. It is one word away from `No mutants were
-generated`, which is precisely how a broken build would come to be reported as a clean
-sheet; a test pins the distinction.
+1. *Survived:* write the assertion that fails for the changed behaviour — on the value,
+   not on "it returned `Ok`". If the behaviour does not matter, the code is dead; delete it.
+2. *Uncovered:* nothing reaches it from its package's tests (gamma judges a mutant by its
+   own package's tests). Test it there, or move it to where its tests are.
+3. *Timeout / out of memory:* the mutant made something not terminate. Do not raise the
+   timeout. Make the loop structurally unable to spin, or bound the test by count, so the
+   mutant fails in seconds.
+4. *Provably equivalent:* only then a `gamma::skip` with the one mutator and the argument
+   as its reason. A reviewer should be able to check the argument without running anything.
 
 ---
 
@@ -611,7 +660,9 @@ per-mutant timeout from that mutant's own baseline, read a timeout as
 **unevaluated**: it is not evidence that a test noticed the change, and a green
 row containing timeouts has not been shown to be green. Re-run them on a quiet
 machine before believing the row — and never close out a survivor by observing
-that it timed out on the next attempt.
+that it timed out on the next attempt. (Wave 12 drew the conclusion this lesson
+pointed at: under cargo-gamma, whose budgets are per test binary, the gate counts a
+timeout as **missed**.)
 
 **Bound every wait — but bound *progress* by count or structure, never by clock.**
 The way to turn a timeout into a kill is to give each wait a ceiling and assert on

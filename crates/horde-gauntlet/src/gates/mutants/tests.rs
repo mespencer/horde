@@ -337,8 +337,27 @@ fn the_run_command_carries_scope_cache_jobs_memory_and_capped_lints() {
          --in-diff /repo/target/quality/mutants.diff --package a \
          --artifact-dir /repo/target/quality/mutants --cache-dir /cache --jobs 16 \
          --memory enforce --baseline-memory-limit 2147483648B --memory-multiplier 2 \
-         --memory-headroom 134217728B"
+         --memory-headroom 134217728B -- --skip \
+         reap::tests::a_real_orphaned_leader_is_reaped_by_its_directory"
     );
+}
+
+#[test]
+fn every_skipped_test_exists_and_tests_only_unmutated_code() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let reap = std::fs::read_to_string(root.join(audit::DANGEROUS[0])).expect("reap.rs");
+    for (test, why) in SKIPPED_TESTS {
+        assert!(!why.is_empty(), "{test} needs its reason");
+        let (module, name) = test.rsplit_once("::").expect("a test path");
+        assert_eq!(
+            module, "reap::tests",
+            "only tests of the never-mutated reaper may be skipped"
+        );
+        assert!(
+            reap.contains(&format!("fn {name}()")),
+            "{test} no longer exists"
+        );
+    }
 }
 
 #[test]
