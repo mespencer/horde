@@ -615,31 +615,42 @@ fn terminal_at(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
 /// palette spends colour on state. The markers describe the cells; they
 /// encode nothing about which style the renderer was meant to pick.
 fn styled_at(app: &App, width: u16, height: u16) -> String {
-    use ratatui::style::Modifier;
     let terminal = terminal_at(app, width, height);
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
     for y in 0..height {
-        let mut current = String::new();
-        let mut row = String::new();
-        for x in 0..width {
-            let cell = &buffer[(x, y)];
-            let mut tag = format!("{:?}", cell.fg);
-            for (flag, name) in [(Modifier::BOLD, "+b"), (Modifier::ITALIC, "+i")] {
-                if cell.modifier.contains(flag) {
-                    tag.push_str(name);
-                }
-            }
-            if tag != current {
-                row.push_str(&format!("‹{tag}›"));
-                current = tag;
-            }
-            row.push_str(cell.symbol());
-        }
-        out.push_str(row.trim_end());
+        out.push_str(styled_row(buffer, width, y).trim_end());
         out.push('\n');
     }
     out
+}
+
+/// One row of [`styled_at`], a marker opening each run of one style.
+fn styled_row(buffer: &ratatui::buffer::Buffer, width: u16, y: u16) -> String {
+    let mut current = String::new();
+    let mut row = String::new();
+    for x in 0..width {
+        let cell = &buffer[(x, y)];
+        let tag = style_tag(cell);
+        if tag != current {
+            row.push_str(&format!("‹{tag}›"));
+            current = tag;
+        }
+        row.push_str(cell.symbol());
+    }
+    row
+}
+
+/// A cell's foreground colour and the modifiers the palette uses.
+fn style_tag(cell: &ratatui::buffer::Cell) -> String {
+    use ratatui::style::Modifier;
+    let mut tag = format!("{:?}", cell.fg);
+    for (flag, name) in [(Modifier::BOLD, "+b"), (Modifier::ITALIC, "+i")] {
+        if cell.modifier.contains(flag) {
+            tag.push_str(name);
+        }
+    }
+    tag
 }
 
 fn alt_enter(app: &mut App) {
