@@ -1266,7 +1266,7 @@ impl ControlPlaneService for ControlPlane {
         let mode = horde_proto::v1::CheckoutMode::try_from(checkout_mode).unwrap_or_default();
         crate::workspace_policy::validate_definition_fields(&repos, &request.unmanaged_paths, mode)
             .map_err(Status::from)?;
-        let cleanup = request.cleanup.or_else(|| current.cleanup.clone());
+        let cleanup = request.cleanup.or(current.cleanup);
         let stamped = self
             .append_definition(
                 horde_proto::v1::WorkspaceDefinition {

@@ -914,7 +914,7 @@ mod tests {
         assert!(!seen.busy && seen.idle_reclaimed && seen.last_active_ms > 0);
         activity.set_busy("a", true);
         assert!(!activity.snapshot("a").expect("seen").idle_reclaimed);
-        assert_eq!(activity.due_for_write("a").is_some(), true);
+        assert!(activity.due_for_write("a").is_some());
         assert_eq!(activity.due_for_write("a"), None, "at most once a minute");
         activity.forget("a");
         assert!(activity.snapshot("a").is_none());

@@ -468,8 +468,9 @@ pub enum SessionCommand {
         /// The session's title; omitted draws a thematic name.
         title: Option<String>,
         /// What the root agent is: type, tier, workspace, mode, first task.
+        /// Boxed: the spec flags dwarf every other variant.
         #[command(flatten)]
-        spec: SpecArgs,
+        spec: Box<SpecArgs>,
         /// Makes a retry after a lost response safe.
         #[arg(long, default_value = "")]
         idempotency_key: String,
