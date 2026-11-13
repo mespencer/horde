@@ -27,10 +27,10 @@ fn parsed(words: &[&str]) -> Result<AddArgs, Box<dyn std::error::Error>> {
             .into_iter()
             .chain(words.iter().copied()),
     )?;
-    match cli.command {
-        Some(Command::Worker(WorkerCommand::Add(args))) => Ok(args),
-        other => Err(format!("not worker add: {other:?}").into()),
+    if let Some(Command::Worker(WorkerCommand::Add(args))) = cli.command {
+        return Ok(args);
     }
+    Err("not worker add".into())
 }
 
 fn message(error: &ClientError) -> String {
@@ -334,7 +334,7 @@ async fn execute_returns_stdout_and_feeds_stdin() -> Outcome {
 }
 
 #[tokio::test]
-async fn execute_refuses_failures_hangs_and_missing_programs() -> Outcome {
+async fn execute_refuses_a_failing_command_with_what_it_said() {
     let failing = Invocation {
         program: "sh".to_owned(),
         args: vec![
@@ -344,33 +344,35 @@ async fn execute_refuses_failures_hangs_and_missing_programs() -> Outcome {
     };
     let error = execute("probe", &failing, None, Duration::from_secs(10))
         .await
-        .err()
-        .ok_or("refused")?;
+        .expect_err("a failing command is refused");
     let text = message(&error);
     assert!(text.contains("probe failed (exit 255)"), "{text}");
     assert!(text.contains("ssh could not connect"), "{text}");
     assert!(text.contains("said\noops"), "{text}");
+}
 
+#[tokio::test]
+async fn execute_refuses_a_command_that_outlives_its_limit() {
     let hanging = Invocation {
         program: "sleep".to_owned(),
         args: vec!["30".to_owned()],
     };
     let error = execute("start", &hanging, None, Duration::from_millis(200))
         .await
-        .err()
-        .ok_or("refused")?;
+        .expect_err("a hang is refused");
     assert!(message(&error).contains("start: no answer within 200ms"));
+}
 
+#[tokio::test]
+async fn execute_refuses_a_program_that_does_not_exist() {
     let missing = Invocation {
         program: "/nonexistent/ssh".to_owned(),
         args: Vec::new(),
     };
     let error = execute("probe", &missing, None, Duration::from_secs(1))
         .await
-        .err()
-        .ok_or("refused")?;
+        .expect_err("a missing program is refused");
     assert!(message(&error).contains("could not run /nonexistent/ssh"));
-    Ok(())
 }
 
 #[test]
@@ -583,4 +585,19 @@ fn adapter_words_are_the_worker_flag_values() {
     assert_eq!(AdapterArg::Claude.word(), "claude");
     assert_eq!(AdapterArg::Codex.word(), "codex");
     assert_eq!(AdapterArg::Fake.word(), "fake");
+}
+
+#[test]
+fn only_a_machine_known_not_to_linger_earns_the_linger_warning() {
+    let started = |linger| plan::Started {
+        linger,
+        ..plan::Started::default()
+    };
+    let warning = linger_warning(&started(Some(false)), "me@box").unwrap_or_default();
+    assert!(
+        warning.contains("`loginctl enable-linger` on me@box"),
+        "{warning}"
+    );
+    assert_eq!(linger_warning(&started(Some(true)), "me@box"), None);
+    assert_eq!(linger_warning(&started(None), "me@box"), None);
 }
