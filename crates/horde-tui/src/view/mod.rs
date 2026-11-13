@@ -48,7 +48,10 @@ fn render_list_screen(app: &App, frame: &mut Frame<'_>, screen: Screen) {
         Screen::Logs => panels::logs(),
         _ => panels::help(),
     };
-    frame.render_widget(Paragraph::new(scrolled(body, app.selected(screen), areas[2])), areas[2]);
+    frame.render_widget(
+        Paragraph::new(scrolled(body, app.selected(screen), areas[2])),
+        areas[2],
+    );
     frame.render_widget(Paragraph::new(hint_line(app, hints)), areas[3]);
     frame.render_widget(Paragraph::new(status_line(app)), areas[4]);
 }
@@ -131,7 +134,10 @@ fn status_line(app: &App) -> Line<'static> {
 }
 
 fn attached_status(app: &App, session: &crate::state::SessionState) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(format!(" {}", session.display_name()), theme::bold())];
+    let mut spans = vec![Span::styled(
+        format!(" {}", session.display_name()),
+        theme::bold(),
+    )];
     let Some(agent_id) = app.viewed_agent() else {
         return spans;
     };
@@ -146,7 +152,10 @@ fn attached_status(app: &App, session: &crate::state::SessionState) -> Vec<Span<
         facts.push(format!("on {}", app.worker_name(worker)));
     }
     facts.push(node.state_word().to_owned());
-    spans.push(Span::styled(format!(" · {}", facts.join(" · ")), theme::dim()));
+    spans.push(Span::styled(
+        format!(" · {}", facts.join(" · ")),
+        theme::dim(),
+    ));
     spans
 }
 

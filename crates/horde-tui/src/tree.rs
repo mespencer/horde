@@ -1,6 +1,8 @@
 //! The agent tree's nodes and the per-agent facts events add to them.
 
-use horde_proto::v1::{AgentLifecycleState, AgentOutputChannel, Event, PlacementState, event::Kind};
+use horde_proto::v1::{
+    AgentLifecycleState, AgentOutputChannel, Event, PlacementState, event::Kind,
+};
 
 use crate::words::agent_lifecycle_name;
 
@@ -51,7 +53,10 @@ impl AgentNode {
 /// The per-agent facts later events add to a spawned agent's node. An event
 /// about an agent the replay never saw spawn changes nothing: a node
 /// invented here would claim a place in a tree nobody recorded.
-pub(crate) fn note_facts(agents: &mut std::collections::BTreeMap<String, AgentNode>, event: &Event) {
+pub(crate) fn note_facts(
+    agents: &mut std::collections::BTreeMap<String, AgentNode>,
+    event: &Event,
+) {
     let Some(node) = event
         .agent_id
         .as_ref()
@@ -80,7 +85,10 @@ pub(crate) fn note_facts(agents: &mut std::collections::BTreeMap<String, AgentNo
 /// path (its own display name), or a short id for an agent the replay never
 /// saw spawn. Empty for session-scoped events, which have no agent.
 #[must_use]
-pub fn agent_name(agents: &std::collections::BTreeMap<String, AgentNode>, agent_id: &str) -> String {
+pub fn agent_name(
+    agents: &std::collections::BTreeMap<String, AgentNode>,
+    agent_id: &str,
+) -> String {
     agents
         .get(agent_id)
         .and_then(|node| node.tree_path.last())
@@ -223,7 +231,11 @@ mod tests {
         for stop in stops {
             let mut state = SessionState::new("s1");
             state.apply(&envelope(1, "a", spawned(None, &["a"])));
-            state.apply(&envelope(2, "a", chunk(AgentOutputChannel::Assistant, "t1", "hi")));
+            state.apply(&envelope(
+                2,
+                "a",
+                chunk(AgentOutputChannel::Assistant, "t1", "hi"),
+            ));
             assert!(node(&state).working, "output means a turn is in flight");
             state.apply(&envelope(3, "a", stop.clone()));
             assert!(!node(&state).working, "{stop:?} ends the turn");
@@ -234,9 +246,20 @@ mod tests {
     fn diagnostics_unbound_usage_and_running_do_not_end_work() {
         let mut state = SessionState::new("s1");
         state.apply(&envelope(1, "a", spawned(None, &["a"])));
-        state.apply(&envelope(2, "a", chunk(AgentOutputChannel::HarnessDiagnostic, "t", "x")));
-        assert!(!node(&state).working, "the harness talking to itself is not a turn");
-        state.apply(&envelope(3, "a", chunk(AgentOutputChannel::ToolCall, "t", "Bash")));
+        state.apply(&envelope(
+            2,
+            "a",
+            chunk(AgentOutputChannel::HarnessDiagnostic, "t", "x"),
+        ));
+        assert!(
+            !node(&state).working,
+            "the harness talking to itself is not a turn"
+        );
+        state.apply(&envelope(
+            3,
+            "a",
+            chunk(AgentOutputChannel::ToolCall, "t", "Bash"),
+        ));
         for (sequence, kind) in [
             (4, usage("", "", "", "")),
             (5, lifecycle(AgentLifecycleState::Running)),
@@ -253,17 +276,36 @@ mod tests {
     #[test]
     fn placement_and_usage_fill_in_worker_and_binding() {
         let mut state = SessionState::new("s1");
-        state.apply(&envelope(1, "a", spawned_asking(Some(Selection::Tier("fast".to_owned())))));
-        assert_eq!((node(&state).harness.as_str(), node(&state).model.as_str()), ("", "tier fast"));
-        state.apply(&envelope(2, "a", placed(PlacementState::Placed, Some("w1"))));
+        state.apply(&envelope(
+            1,
+            "a",
+            spawned_asking(Some(Selection::Tier("fast".to_owned()))),
+        ));
+        assert_eq!(
+            (node(&state).harness.as_str(), node(&state).model.as_str()),
+            ("", "tier fast")
+        );
+        state.apply(&envelope(
+            2,
+            "a",
+            placed(PlacementState::Placed, Some("w1")),
+        ));
         state.apply(&envelope(3, "a", placed(PlacementState::Queued, None)));
-        assert_eq!(node(&state).worker_id.as_deref(), Some("w1"), "an unset worker keeps the last");
+        assert_eq!(
+            node(&state).worker_id.as_deref(),
+            Some("w1"),
+            "an unset worker keeps the last"
+        );
         assert_eq!(node(&state).placement, PlacementState::Queued as i32);
         state.apply(&envelope(4, "a", usage("t", "claude", "opus", "work")));
         state.apply(&envelope(5, "a", usage("t", "", "", "")));
         let bound = node(&state);
         assert_eq!(
-            (bound.harness.as_str(), bound.model.as_str(), bound.account.as_str()),
+            (
+                bound.harness.as_str(),
+                bound.model.as_str(),
+                bound.account.as_str()
+            ),
             ("claude", "opus", "work"),
             "an empty binding field keeps what was known"
         );
@@ -278,14 +320,27 @@ mod tests {
             provider_account: String::new(),
         });
         state.apply(&envelope(1, "a", spawned_asking(Some(concrete))));
-        assert_eq!((node(&state).harness.as_str(), node(&state).model.as_str()), ("codex", "gpt-9"));
+        assert_eq!(
+            (node(&state).harness.as_str(), node(&state).model.as_str()),
+            ("codex", "gpt-9")
+        );
         state.apply(&envelope(2, "a", spawned_asking(None)));
         assert_eq!(node(&state).model, "", "no selection asks for nothing");
 
-        state.apply(&envelope(3, "ghost", chunk(AgentOutputChannel::Assistant, "t", "boo")));
-        assert!(!state.agents.contains_key("ghost"), "facts never invent a node");
+        state.apply(&envelope(
+            3,
+            "ghost",
+            chunk(AgentOutputChannel::Assistant, "t", "boo"),
+        ));
+        assert!(
+            !state.agents.contains_key("ghost"),
+            "facts never invent a node"
+        );
         let mut orphan = envelope(4, "", lifecycle(AgentLifecycleState::Idle));
-        orphan.event.iter_mut().for_each(|event| event.agent_id = Some(AgentId::new("nobody")));
+        orphan
+            .event
+            .iter_mut()
+            .for_each(|event| event.agent_id = Some(AgentId::new("nobody")));
         state.apply(&orphan);
         assert_eq!(state.agents.len(), 1);
     }
@@ -307,7 +362,11 @@ mod tests {
         assert_eq!(word(idle, lost, true), "LOST");
         assert_eq!(word(idle, 0, true), "working");
         assert_eq!(word(0, queued, false), "queued");
-        assert_eq!(word(idle, queued, false), "idle", "a lifecycle outranks the queue");
+        assert_eq!(
+            word(idle, queued, false),
+            "idle",
+            "a lifecycle outranks the queue"
+        );
         assert_eq!(word(idle, 0, false), "idle");
         assert_eq!(word(0, 0, false), "unspecified");
     }

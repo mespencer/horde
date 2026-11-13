@@ -17,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use horde_proto::v1::{
-    AccountHeadroom, EventEnvelope, ForwardStatus, SessionSummary, UsageAggregate,
-    WorkerSummary, WorkspaceDefinition, WorkspaceInstanceReport,
+    AccountHeadroom, EventEnvelope, ForwardStatus, SessionSummary, UsageAggregate, WorkerSummary,
+    WorkspaceDefinition, WorkspaceInstanceReport,
 };
 
 use crate::compose::Compose;
@@ -451,7 +451,10 @@ impl App {
         self.replayed
             .iter()
             .map(|session_id| {
-                let folded = self.sessions.get(session_id).map_or(0, |session| session.stream_head);
+                let folded = self
+                    .sessions
+                    .get(session_id)
+                    .map_or(0, |session| session.stream_head);
                 (session_id.clone(), folded + 1)
             })
             .collect()
@@ -652,8 +655,10 @@ impl App {
 
     /// A decision on the log settles a request answered from here.
     fn forget_settled(&mut self, envelope: &EventEnvelope) {
-        if let Some(horde_proto::v1::event::Kind::PermissionDecided(decided)) =
-            envelope.event.as_ref().and_then(|event| event.kind.as_ref())
+        if let Some(horde_proto::v1::event::Kind::PermissionDecided(decided)) = envelope
+            .event
+            .as_ref()
+            .and_then(|event| event.kind.as_ref())
             && let Some(id) = decided
                 .decision
                 .as_ref()
@@ -690,7 +695,10 @@ impl App {
             "stale"
         } else if self.last_stream_activity.is_none() {
             "connecting"
-        } else if self.attached_session().is_some_and(|session| !session.caught_up) {
+        } else if self
+            .attached_session()
+            .is_some_and(|session| !session.caught_up)
+        {
             "syncing"
         } else {
             "live"
@@ -784,7 +792,11 @@ fn push_subtree(rows: &mut Vec<TreeRow>, session: &SessionState, agent_id: &str,
 }
 
 /// Whether the attachment's scope claims this escalation.
-fn in_scope(session: &SessionState, attachment: &Attachment, permission: &PendingPermission) -> bool {
+fn in_scope(
+    session: &SessionState,
+    attachment: &Attachment,
+    permission: &PendingPermission,
+) -> bool {
     match attachment.agent_id.as_ref() {
         None => true,
         Some(root) => session.in_subtree(root, &permission.agent_id),

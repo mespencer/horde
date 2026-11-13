@@ -215,9 +215,15 @@ mod tests {
     fn every_command_parses_by_name_and_alias() {
         let cases = [
             ("/attach", Slash::Attach(None)),
-            ("/attach  brisk-warband ", Slash::Attach(Some("brisk-warband".to_owned()))),
+            (
+                "/attach  brisk-warband ",
+                Slash::Attach(Some("brisk-warband".to_owned())),
+            ),
             ("/new", Slash::New(None)),
-            ("/new fix the build", Slash::New(Some("fix the build".to_owned()))),
+            (
+                "/new fix the build",
+                Slash::New(Some("fix the build".to_owned())),
+            ),
             ("/agents", Slash::Agents),
             ("/tree", Slash::Agents),
             ("/sessions", Slash::Agents),
@@ -232,7 +238,10 @@ mod tests {
             ("/details", Slash::Details),
             ("/expand", Slash::Details),
             ("/archive", Slash::Archive(None)),
-            ("/archive old-one", Slash::Archive(Some("old-one".to_owned()))),
+            (
+                "/archive old-one",
+                Slash::Archive(Some("old-one".to_owned())),
+            ),
             ("/help", Slash::Help),
             ("/?", Slash::Help),
             ("/quit", Slash::Quit),
@@ -266,7 +275,10 @@ mod tests {
     #[test]
     fn completion_matches_prefixes_until_the_word_ends() {
         let names = |text: &str| -> Vec<&str> {
-            completions(text).iter().map(|command| command.name).collect()
+            completions(text)
+                .iter()
+                .map(|command| command.name)
+                .collect()
         };
         assert_eq!(names("/a"), vec!["attach", "agents", "archive"]);
         assert_eq!(names("/").len(), COMMANDS.len());

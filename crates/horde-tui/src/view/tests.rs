@@ -9,8 +9,8 @@
 
 use horde_proto::v1::{
     AgentId, AgentOutputChannel, ForwardDirection, ForwardId, ForwardIntent, ForwardSpec,
-    ForwardStatus, PlacementState, RepoInstanceReport, SessionId, SessionSummary,
-    TokenUsage, UsageAggregate, UsageGroupKey, WorkerId, WorkerSummary, WorkspaceDefinition,
+    ForwardStatus, PlacementState, RepoInstanceReport, SessionId, SessionSummary, TokenUsage,
+    UsageAggregate, UsageGroupKey, WorkerId, WorkerSummary, WorkspaceDefinition,
     WorkspaceInstanceReport, WorkspaceInstanceState, WorkspaceRepo, event::Kind,
 };
 use ratatui::Terminal;
@@ -19,7 +19,9 @@ use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifi
 
 use super::render;
 use crate::app::{App, Update, UsageReport, WorkspaceEntry};
-use crate::fixtures::{asked, assignment, bound, chunk, envelope_in, placement, requested, spawned};
+use crate::fixtures::{
+    asked, assignment, bound, chunk, envelope_in, placement, requested, spawned,
+};
 
 /// Draws the app once at 80×24 and hands back the buffer as text.
 fn drawn(app: &App) -> String {
@@ -36,7 +38,10 @@ fn press(app: &mut App, code: KeyCode) {
 }
 
 fn ctrl(app: &mut App, c: char) {
-    app.on_input(&TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
+    app.on_input(&TermEvent::Key(KeyEvent::new(
+        KeyCode::Char(c),
+        KeyModifiers::CONTROL,
+    )));
 }
 
 fn typed(app: &mut App, text: &str) {
@@ -59,7 +64,9 @@ fn summary(session_id: &str, title: &str, root: &str) -> SessionSummary {
 fn fold(app: &mut App, session: &str, agent: &str, kinds: Vec<Kind>) {
     for kind in kinds {
         let next = app.session(session).map_or(0, |state| state.stream_head) + 1;
-        app.apply(Update::Event(Box::new(envelope_in(session, next, agent, kind))));
+        app.apply(Update::Event(Box::new(envelope_in(
+            session, next, agent, kind,
+        ))));
     }
 }
 
@@ -83,17 +90,47 @@ fn workers(app: &mut App) {
 fn conversation(app: &mut App) {
     app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
     workers(app);
-    fold(app, "s1", "root-1", vec![
-        spawned(None, &["ci-fix"]),
-        placement(PlacementState::Placed, Some("worker-1")),
-        assignment("make the tests green"),
-        chunk(AgentOutputChannel::Reasoning, "t1", "The failure is probably in the parser."),
-        chunk(AgentOutputChannel::ToolCall, "t1", r#"Bash {"command":"cargo test -p parser"}"#),
-        chunk(AgentOutputChannel::ToolResult, "t1", "running 12 tests\ntest a ... ok\ntest b ... FAILED\ntest c ... ok\nfailures: b"),
-        chunk(AgentOutputChannel::Assistant, "t1", "One test fails: `b` expects a trailing "),
-        chunk(AgentOutputChannel::Assistant, "t1", "newline. I'll ask a reviewer to check the fix."),
-    ]);
-    fold(app, "s1", "kid", vec![spawned(Some("root-1"), &["ci-fix", "reviewer"])]);
+    fold(
+        app,
+        "s1",
+        "root-1",
+        vec![
+            spawned(None, &["ci-fix"]),
+            placement(PlacementState::Placed, Some("worker-1")),
+            assignment("make the tests green"),
+            chunk(
+                AgentOutputChannel::Reasoning,
+                "t1",
+                "The failure is probably in the parser.",
+            ),
+            chunk(
+                AgentOutputChannel::ToolCall,
+                "t1",
+                r#"Bash {"command":"cargo test -p parser"}"#,
+            ),
+            chunk(
+                AgentOutputChannel::ToolResult,
+                "t1",
+                "running 12 tests\ntest a ... ok\ntest b ... FAILED\ntest c ... ok\nfailures: b",
+            ),
+            chunk(
+                AgentOutputChannel::Assistant,
+                "t1",
+                "One test fails: `b` expects a trailing ",
+            ),
+            chunk(
+                AgentOutputChannel::Assistant,
+                "t1",
+                "newline. I'll ask a reviewer to check the fix.",
+            ),
+        ],
+    );
+    fold(
+        app,
+        "s1",
+        "kid",
+        vec![spawned(Some("root-1"), &["ci-fix", "reviewer"])],
+    );
     fold(app, "s1", "root-1", vec![bound("t1", "claude", "opus")]);
     caught_up(app, "s1");
 }
@@ -122,17 +159,31 @@ fn ctrl_o_expands_tool_input_and_output() {
 #[test]
 fn a_working_agent_shows_the_spinner_line_and_queue_hints() {
     let mut app = attached_conversation();
-    fold(&mut app, "s1", "root-1", vec![
-        assignment("also fix the lint"),
-        chunk(AgentOutputChannel::ToolCall, "t2", r#"Read {"file_path":"src/lib.rs"}"#),
-    ]);
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![
+            assignment("also fix the lint"),
+            chunk(
+                AgentOutputChannel::ToolCall,
+                "t2",
+                r#"Read {"file_path":"src/lib.rs"}"#,
+            ),
+        ],
+    );
     insta::assert_snapshot!(drawn(&app));
 }
 
 #[test]
 fn a_permission_waits_inline_with_its_choices() {
     let mut app = attached_conversation();
-    fold(&mut app, "s1", "kid", vec![requested("req-1", "git push --force origin main")]);
+    fold(
+        &mut app,
+        "s1",
+        "kid",
+        vec![requested("req-1", "git push --force origin main")],
+    );
     press(&mut app, KeyCode::Down);
     insta::assert_snapshot!(drawn(&app));
 }
@@ -140,10 +191,18 @@ fn a_permission_waits_inline_with_its_choices() {
 #[test]
 fn a_multi_question_request_is_answered_in_place() {
     let mut app = attached_conversation();
-    fold(&mut app, "s1", "root-1", vec![asked("q-1", &[
-        ("Which branch?", &["main", "release"]),
-        ("Run the slow tests?", &["yes", "no"]),
-    ])]);
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![asked(
+            "q-1",
+            &[
+                ("Which branch?", &["main", "release"]),
+                ("Run the slow tests?", &["yes", "no"]),
+            ],
+        )],
+    );
     typed(&mut app, "2");
     insta::assert_snapshot!(drawn(&app));
 }
@@ -151,7 +210,12 @@ fn a_multi_question_request_is_answered_in_place() {
 #[test]
 fn an_answered_prompt_says_it_is_waiting_for_the_server() {
     let mut app = attached_conversation();
-    fold(&mut app, "s1", "root-1", vec![requested("req-1", "rm -rf target")]);
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![requested("req-1", "rm -rf target")],
+    );
     typed(&mut app, "y");
     insta::assert_snapshot!(drawn(&app));
 }
@@ -185,7 +249,16 @@ fn a_new_session_invites_the_first_message() {
 fn a_subagent_attach_scopes_prompts_and_badges_the_rest() {
     let mut app = App::attached("s1", Some("kid".to_owned()));
     conversation(&mut app);
-    fold(&mut app, "s1", "kid", vec![chunk(AgentOutputChannel::Assistant, "k1", "Reviewing the diff.")]);
+    fold(
+        &mut app,
+        "s1",
+        "kid",
+        vec![chunk(
+            AgentOutputChannel::Assistant,
+            "k1",
+            "Reviewing the diff.",
+        )],
+    );
     fold(&mut app, "s1", "root-1", vec![requested("req-root", "ls")]);
     insta::assert_snapshot!(drawn(&app));
 }
@@ -227,14 +300,24 @@ fn tree() -> App {
     let mut app = App::overview();
     conversation(&mut app);
     app.apply(Update::Sessions(vec![summary("s2", "docs", "root-2")]));
-    fold(&mut app, "s2", "root-2", vec![
-        spawned(None, &["docs"]),
-        placement(PlacementState::Lost, Some("worker-9")),
-    ]);
-    fold(&mut app, "s1", "kid", vec![
-        placement(PlacementState::Placed, Some("worker-1")),
-        requested("req-1", "git push"),
-    ]);
+    fold(
+        &mut app,
+        "s2",
+        "root-2",
+        vec![
+            spawned(None, &["docs"]),
+            placement(PlacementState::Lost, Some("worker-9")),
+        ],
+    );
+    fold(
+        &mut app,
+        "s1",
+        "kid",
+        vec![
+            placement(PlacementState::Placed, Some("worker-1")),
+            requested("req-1", "git push"),
+        ],
+    );
     app
 }
 
@@ -260,7 +343,12 @@ fn archive_asks_in_the_hint_line() {
 #[test]
 fn the_inbox_lists_prompts_with_the_selected_card() {
     let mut app = tree();
-    fold(&mut app, "s2", "root-2", vec![asked("q-9", &[("Publish the docs?", &["now", "later"])])]);
+    fold(
+        &mut app,
+        "s2",
+        "root-2",
+        vec![asked("q-9", &[("Publish the docs?", &["now", "later"])])],
+    );
     press(&mut app, KeyCode::Char('i'));
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
@@ -290,23 +378,26 @@ fn workspaces_show_definitions_instances_and_checkouts() {
                 repos: vec![repo("horde", "main"), repo("atlas", "")],
                 ..WorkspaceDefinition::default()
             },
-            instances: vec![WorkspaceInstanceReport {
-                worker_id: Some(WorkerId::new("worker-1")),
-                state: WorkspaceInstanceState::Ready as i32,
-                root_path: "/srv/horde/ws/horde".to_owned(),
-                repos: vec![RepoInstanceReport {
-                    repo_name: "horde".to_owned(),
-                    path: "/srv/horde/ws/horde/horde".to_owned(),
-                    head_commit_sha: "2df0ef0123456789".to_owned(),
-                    dirty: true,
-                }],
-                ..WorkspaceInstanceReport::default()
-            }, WorkspaceInstanceReport {
-                worker_id: None,
-                state: WorkspaceInstanceState::Degraded as i32,
-                detail: "atlas failed to fetch".to_owned(),
-                ..WorkspaceInstanceReport::default()
-            }],
+            instances: vec![
+                WorkspaceInstanceReport {
+                    worker_id: Some(WorkerId::new("worker-1")),
+                    state: WorkspaceInstanceState::Ready as i32,
+                    root_path: "/srv/horde/ws/horde".to_owned(),
+                    repos: vec![RepoInstanceReport {
+                        repo_name: "horde".to_owned(),
+                        path: "/srv/horde/ws/horde/horde".to_owned(),
+                        head_commit_sha: "2df0ef0123456789".to_owned(),
+                        dirty: true,
+                    }],
+                    ..WorkspaceInstanceReport::default()
+                },
+                WorkspaceInstanceReport {
+                    worker_id: None,
+                    state: WorkspaceInstanceState::Degraded as i32,
+                    detail: "atlas failed to fetch".to_owned(),
+                    ..WorkspaceInstanceReport::default()
+                },
+            ],
         },
         WorkspaceEntry {
             definition: WorkspaceDefinition {
@@ -333,12 +424,14 @@ fn workspaces_loading_and_empty_say_which() {
 fn usage_shows_agents_trees_and_accounts() {
     let mut app = App::attached("s1", None);
     conversation(&mut app);
-    let tokens = |input, output| Some(TokenUsage {
-        input_tokens: input,
-        output_tokens: output,
-        cache_read_input_tokens: 1_000,
-        ..TokenUsage::default()
-    });
+    let tokens = |input, output| {
+        Some(TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: 1_000,
+            ..TokenUsage::default()
+        })
+    };
     app.apply(Update::Usage(UsageReport {
         scope: "session ci-fix".to_owned(),
         by_agent: vec![UsageAggregate {
@@ -401,26 +494,43 @@ fn help_lists_keys_from_the_binding_tables() {
 fn the_forward_panel_shows_names_reachability_and_backing() {
     let mut app = App::overview();
     conversation(&mut app);
-    let forward = |name: &str, direction: ForwardDirection, port, backer: Option<&str>, backed, reachable| ForwardStatus {
-        intent: Some(ForwardIntent {
-            forward_id: Some(ForwardId::new(format!("fwd-{name}"))),
-            session_id: Some(SessionId::new("s1")),
-            spec: Some(ForwardSpec {
-                name: name.to_owned(),
-                direction: direction as i32,
-                worker_port: port,
-                ..ForwardSpec::default()
-            }),
-            backer_client_id: backer.map(horde_proto::v1::ClientId::new),
-            ..ForwardIntent::default()
-        }),
-        worker_reachable: reachable,
-        backed,
-    };
+    let forward =
+        |name: &str, direction: ForwardDirection, port, backer: Option<&str>, backed, reachable| {
+            ForwardStatus {
+                intent: Some(ForwardIntent {
+                    forward_id: Some(ForwardId::new(format!("fwd-{name}"))),
+                    session_id: Some(SessionId::new("s1")),
+                    spec: Some(ForwardSpec {
+                        name: name.to_owned(),
+                        direction: direction as i32,
+                        worker_port: port,
+                        ..ForwardSpec::default()
+                    }),
+                    backer_client_id: backer.map(horde_proto::v1::ClientId::new),
+                    ..ForwardIntent::default()
+                }),
+                worker_reachable: reachable,
+                backed,
+            }
+        };
     app.apply(Update::Forwards(vec![
         forward("vite", ForwardDirection::Expose, 5173, None, false, true),
-        forward("db", ForwardDirection::Inject, 5432, Some("laptop"), true, true),
-        forward("redis", ForwardDirection::Inject, 6379, Some("laptop"), false, false),
+        forward(
+            "db",
+            ForwardDirection::Inject,
+            5432,
+            Some("laptop"),
+            true,
+            true,
+        ),
+        forward(
+            "redis",
+            ForwardDirection::Inject,
+            6379,
+            Some("laptop"),
+            false,
+            false,
+        ),
     ]));
     press(&mut app, KeyCode::Char('f'));
     insta::assert_snapshot!(drawn(&app));

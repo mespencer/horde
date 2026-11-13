@@ -110,11 +110,17 @@ impl Transcript {
     /// kind of text from the same turn, a new block otherwise.
     fn stream(&mut self, turn: &str, text: &str, thinking: bool) {
         let merged = match self.blocks.back_mut() {
-            Some(Block::Assistant { turn: last, text: body }) if !thinking && last == turn => {
+            Some(Block::Assistant {
+                turn: last,
+                text: body,
+            }) if !thinking && last == turn => {
                 body.push_str(text);
                 true
             }
-            Some(Block::Thinking { turn: last, text: body }) if thinking && last == turn => {
+            Some(Block::Thinking {
+                turn: last,
+                text: body,
+            }) if thinking && last == turn => {
                 body.push_str(text);
                 true
             }
@@ -144,14 +150,18 @@ impl Transcript {
     /// Attaches a result to the oldest unanswered call of the same turn, or
     /// stands alone when no call is waiting for it.
     fn tool_result(&mut self, turn: &str, text: &str) {
-        let waiting = self.blocks.iter_mut().rev().filter_map(|block| match block {
-            Block::Tool {
-                turn: call_turn,
-                result: result @ None,
-                ..
-            } if call_turn == turn => Some(result),
-            _ => None,
-        });
+        let waiting = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .filter_map(|block| match block {
+                Block::Tool {
+                    turn: call_turn,
+                    result: result @ None,
+                    ..
+                } if call_turn == turn => Some(result),
+                _ => None,
+            });
         if let Some(slot) = waiting.last() {
             *slot = Some(text.to_owned());
             return;
@@ -247,7 +257,9 @@ impl Scribe<'_> {
     fn transcribe_output(&mut self, agent_id: &str, chunk: &horde_proto::v1::AgentOutputChunk) {
         let transcript = self.transcript_mut(agent_id);
         match AgentOutputChannel::try_from(chunk.channel) {
-            Ok(AgentOutputChannel::Reasoning) => transcript.stream(&chunk.turn_id, &chunk.text, true),
+            Ok(AgentOutputChannel::Reasoning) => {
+                transcript.stream(&chunk.turn_id, &chunk.text, true)
+            }
             Ok(AgentOutputChannel::ToolCall) => transcript.tool_call(&chunk.turn_id, &chunk.text),
             Ok(AgentOutputChannel::ToolResult) => {
                 transcript.tool_result(&chunk.turn_id, &chunk.text);
@@ -258,7 +270,13 @@ impl Scribe<'_> {
         }
     }
 
-    fn transcribe_message(&mut self, agent_id: &str, from: Option<&Actor>, text: String, note: bool) {
+    fn transcribe_message(
+        &mut self,
+        agent_id: &str,
+        from: Option<&Actor>,
+        text: String,
+        note: bool,
+    ) {
         let from = self.speaker(from);
         self.transcript_mut(agent_id)
             .push(Block::Message { from, text, note });
@@ -266,7 +284,9 @@ impl Scribe<'_> {
 
     fn speaker(&self, from: Option<&Actor>) -> Speaker {
         match from.and_then(|actor| actor.actor.as_ref()) {
-            Some(actor::Actor::AgentId(id)) => Speaker::Agent(agent_name(self.agents, &id.to_string())),
+            Some(actor::Actor::AgentId(id)) => {
+                Speaker::Agent(agent_name(self.agents, &id.to_string()))
+            }
             Some(actor::Actor::Server(_)) => Speaker::Server,
             _ => Speaker::Human,
         }
@@ -298,14 +318,27 @@ impl Scribe<'_> {
     }
 
     fn transcribe_result(&mut self, agent_id: &str, reported: &horde_proto::v1::ResultReported) {
-        let (status, summary) = reported.result.as_ref().map_or(("unspecified", String::new()), |result| {
-            (crate::words::result_status_name(result.status), result.summary.clone())
-        });
+        let (status, summary) =
+            reported
+                .result
+                .as_ref()
+                .map_or(("unspecified", String::new()), |result| {
+                    (
+                        crate::words::result_status_name(result.status),
+                        result.summary.clone(),
+                    )
+                });
         let name = agent_name(self.agents, agent_id);
-        let parent = self.agents.get(agent_id).and_then(|node| node.parent.clone());
+        let parent = self
+            .agents
+            .get(agent_id)
+            .and_then(|node| node.parent.clone());
         if let Some(parent) = parent {
             self.transcript_mut(&parent).push(Block::Child {
-                text: format!("{name} reported {status}: {}", crate::wrap::clip(&summary, 200)),
+                text: format!(
+                    "{name} reported {status}: {}",
+                    crate::wrap::clip(&summary, 200)
+                ),
             });
         }
         self.transcript_mut(agent_id)
@@ -336,7 +369,8 @@ impl Scribe<'_> {
             Kind::PermissionDecided(decided) => self.transcribe_decision(decided),
             _ => {
                 if let Some((tone, text)) = notice(kind) {
-                    self.transcript_mut(agent_id).push(Block::Notice { tone, text });
+                    self.transcript_mut(agent_id)
+                        .push(Block::Notice { tone, text });
                 }
             }
         }
@@ -378,10 +412,9 @@ fn notice(kind: &Kind) -> Option<(Tone, String)> {
     match kind {
         Kind::AgentLifecycleChanged(changed) => lifecycle_notice(changed),
         Kind::PlacementChanged(changed) => changed.placement.as_ref().and_then(placement_notice),
-        Kind::TurnInterrupted(interrupted) => Some((
-            Tone::Warn,
-            with_reason("Interrupted", &interrupted.reason),
-        )),
+        Kind::TurnInterrupted(interrupted) => {
+            Some((Tone::Warn, with_reason("Interrupted", &interrupted.reason)))
+        }
         Kind::WorkspaceInstanceChanged(changed) => changed
             .report
             .as_ref()
@@ -393,8 +426,12 @@ fn notice(kind: &Kind) -> Option<(Tone, String)> {
 
 fn lifecycle_notice(changed: &horde_proto::v1::AgentLifecycleChanged) -> Option<(Tone, String)> {
     match AgentLifecycleState::try_from(changed.state) {
-        Ok(AgentLifecycleState::Failed) => Some((Tone::Error, with_reason("Failed", &changed.reason))),
-        Ok(AgentLifecycleState::Archived) => Some((Tone::Info, with_reason("Archived", &changed.reason))),
+        Ok(AgentLifecycleState::Failed) => {
+            Some((Tone::Error, with_reason("Failed", &changed.reason)))
+        }
+        Ok(AgentLifecycleState::Archived) => {
+            Some((Tone::Info, with_reason("Archived", &changed.reason)))
+        }
         _ => None,
     }
 }
@@ -403,9 +440,15 @@ fn placement_notice(placement: &horde_proto::v1::Placement) -> Option<(Tone, Str
     let reason = &placement.reason;
     match PlacementState::try_from(placement.state) {
         Ok(PlacementState::Queued) => Some((Tone::Warn, with_reason("Queued", reason))),
-        Ok(PlacementState::Lost) => Some((Tone::Error, with_reason("LOST with its worker", reason))),
-        Ok(PlacementState::Expired) => Some((Tone::Error, with_reason("Placement expired", reason))),
-        Ok(PlacementState::Cancelled) => Some((Tone::Warn, with_reason("Placement cancelled", reason))),
+        Ok(PlacementState::Lost) => {
+            Some((Tone::Error, with_reason("LOST with its worker", reason)))
+        }
+        Ok(PlacementState::Expired) => {
+            Some((Tone::Error, with_reason("Placement expired", reason)))
+        }
+        Ok(PlacementState::Cancelled) => {
+            Some((Tone::Warn, with_reason("Placement cancelled", reason)))
+        }
         _ => None,
     }
 }

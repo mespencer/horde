@@ -15,7 +15,9 @@ use crate::state::{PendingPermission, PendingQuestion};
 /// What the human settled on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    Allow { remember: bool },
+    Allow {
+        remember: bool,
+    },
     Deny,
     /// Question id to the chosen labels and/or free text.
     Answer(BTreeMap<String, Vec<String>>),
@@ -41,11 +43,7 @@ pub enum PromptKey {
 }
 
 /// The rows a permission request offers, in order.
-pub const PERMISSION_CHOICES: [&str; 3] = [
-    "Yes",
-    "Yes, and don't ask again this session",
-    "No",
-];
+pub const PERMISSION_CHOICES: [&str; 3] = ["Yes", "Yes, and don't ask again this session", "No"];
 
 /// The cursor over one pending request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +153,11 @@ impl PromptCursor {
         }
     }
 
-    fn enter(&mut self, request: &PendingPermission, question: &PendingQuestion) -> Option<Decision> {
+    fn enter(
+        &mut self,
+        request: &PendingPermission,
+        question: &PendingQuestion,
+    ) -> Option<Decision> {
         let row = self.row();
         let multi = question.multi_select && row < question.options.len();
         if row < question.options.len() && (!multi || self.chosen_here().is_empty()) {
@@ -164,7 +166,11 @@ impl PromptCursor {
         self.advance(request)
     }
 
-    fn space(&mut self, request: &PendingPermission, question: &PendingQuestion) -> Option<Decision> {
+    fn space(
+        &mut self,
+        request: &PendingPermission,
+        question: &PendingQuestion,
+    ) -> Option<Decision> {
         let row = self.row();
         if row >= question.options.len() {
             return None;
@@ -385,8 +391,16 @@ mod tests {
         );
 
         let mut cursor = PromptCursor::new(&asking);
-        assert_eq!(cursor.press(&asking, PromptKey::Char('3')), None, "no option 3");
-        assert_eq!(cursor.press(&asking, PromptKey::Char('y')), None, "y cannot allow");
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Char('3')),
+            None,
+            "no option 3"
+        );
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Char('y')),
+            None,
+            "y cannot allow"
+        );
         cursor.press(&asking, PromptKey::Down);
         cursor.press(&asking, PromptKey::Down);
         assert_eq!(cursor.row(), 1, "two rows, no free text");
@@ -427,8 +441,16 @@ mod tests {
         assert_eq!(cursor.press(&asking, PromptKey::Space), None);
         cursor.press(&asking, PromptKey::Down);
         cursor.press(&asking, PromptKey::Down);
-        assert_eq!(cursor.press(&asking, PromptKey::Char('3')), None, "a digit toggles too");
-        assert_eq!(cursor.press(&asking, PromptKey::Char('1')), None, "and untoggles");
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Char('3')),
+            None,
+            "a digit toggles too"
+        );
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Char('1')),
+            None,
+            "and untoggles"
+        );
         cursor.press(&asking, PromptKey::Char('2'));
         assert_eq!(
             cursor.press(&asking, PromptKey::Enter),
@@ -484,7 +506,11 @@ mod tests {
         let asking = request(vec![question("name", &[])]);
         let mut cursor = PromptCursor::new(&asking);
         assert!(cursor.on_free_text(&asking));
-        assert_eq!(cursor.press(&asking, PromptKey::Enter), None, "blank is no answer");
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Enter),
+            None,
+            "blank is no answer"
+        );
         cursor.press(&asking, PromptKey::Char('z'));
         assert_eq!(
             cursor.press(&asking, PromptKey::Enter),

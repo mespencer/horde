@@ -499,7 +499,10 @@ async fn slash_new_creates_a_session_and_attaches_to_it() {
     let mut harness = start(&endpoint, App::attached(first.clone(), None))
         .await
         .expect("a running loop");
-    harness.type_line("/new fresh-start").await.expect("compose");
+    harness
+        .type_line("/new fresh-start")
+        .await
+        .expect("compose");
     harness.press(KeyCode::Enter).await.expect("run it");
 
     let app = harness
@@ -546,7 +549,8 @@ async fn opening_the_tree_after_an_attach_replays_every_session() {
         .expect("a running loop");
     harness
         .state("the target's replay to catch up", |app| {
-            app.session(&target).is_some_and(|session| session.caught_up)
+            app.session(&target)
+                .is_some_and(|session| session.caught_up)
         })
         .await
         .expect("the target replays");
@@ -554,9 +558,8 @@ async fn opening_the_tree_after_an_attach_replays_every_session() {
     harness.press_ctrl('t').await.expect("to the tree");
     harness
         .state("the neighbour's history", |app| {
-            app.session(&other).is_some_and(|session| {
-                session.feed.iter().any(|line| line.label == "spawned")
-            })
+            app.session(&other)
+                .is_some_and(|session| session.feed.iter().any(|line| line.label == "spawned"))
         })
         .await
         .expect("the tree must replay the sessions it lists");
@@ -568,7 +571,9 @@ async fn opening_the_tree_after_an_attach_replays_every_session() {
 #[tokio::test]
 async fn the_workspaces_and_usage_views_fill_from_the_server() {
     let endpoint = serve().await.expect("a listening server");
-    seeded(&endpoint, "tui-views").await.expect("a seeded session");
+    seeded(&endpoint, "tui-views")
+        .await
+        .expect("a seeded session");
 
     let mut harness = start(&endpoint, App::overview())
         .await
@@ -613,7 +618,9 @@ async fn x_then_y_archives_the_selected_session() {
         .await
         .expect("a running loop");
     harness
-        .state("the session to be listed", |app| app.session(&session_id).is_some())
+        .state("the session to be listed", |app| {
+            app.session(&session_id).is_some()
+        })
         .await
         .expect("listed");
     harness.press(KeyCode::Char('x')).await.expect("ask");

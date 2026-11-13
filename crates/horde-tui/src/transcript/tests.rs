@@ -6,9 +6,9 @@ use horde_proto::v1::{
     Actor, AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentResult,
     AgentSpawned, AgentSpec, Answer, Assignment, AssignmentSent, ClientId, Note, NoteSent,
     PermissionDecided, PermissionDecision, PermissionOutcome, PermissionRequestId,
-    PermissionRequested, Placement, PlacementChanged, PlacementState, ResultReported,
-    ResultStatus, ServerActor, TurnInterrupted, WorkspaceInstanceChanged,
-    WorkspaceInstanceReport, actor, event::Kind,
+    PermissionRequested, Placement, PlacementChanged, PlacementState, ResultReported, ResultStatus,
+    ServerActor, TurnInterrupted, WorkspaceInstanceChanged, WorkspaceInstanceReport, actor,
+    event::Kind,
 };
 
 use super::{Block, Settled, Speaker, TRANSCRIPT_CAPACITY, Tone};
@@ -19,7 +19,11 @@ use crate::state::SessionState;
 fn family() -> SessionState {
     let mut state = SessionState::new("s1");
     state.apply(&envelope(1, "root", spawned(None, &["lead"])));
-    state.apply(&envelope(2, "kid", spawned(Some("root"), &["lead", "helper"])));
+    state.apply(&envelope(
+        2,
+        "kid",
+        spawned(Some("root"), &["lead", "helper"]),
+    ));
     state
 }
 
@@ -105,7 +109,11 @@ fn results_attach_to_their_calls_in_order_within_the_turn() {
         &mut state,
         "kid",
         vec![
-            chunk(AgentOutputChannel::ToolCall, "t1", "Read {\"file_path\":\"a\"}"),
+            chunk(
+                AgentOutputChannel::ToolCall,
+                "t1",
+                "Read {\"file_path\":\"a\"}",
+            ),
             chunk(AgentOutputChannel::ToolCall, "t1", "Grep"),
             chunk(AgentOutputChannel::ToolResult, "t1", "contents of a"),
             chunk(AgentOutputChannel::ToolResult, "t2", "stray"),
@@ -127,7 +135,11 @@ fn results_attach_to_their_calls_in_order_within_the_turn() {
         "the oldest waiting call of the same turn takes the result; a result \
          from another turn stands alone"
     );
-    fold(&mut state, "kid", vec![chunk(AgentOutputChannel::ToolResult, "t1", "matches")]);
+    fold(
+        &mut state,
+        "kid",
+        vec![chunk(AgentOutputChannel::ToolResult, "t1", "matches")],
+    );
     assert!(
         matches!(&blocks(&state, "kid")[1], Block::Tool { result: Some(text), .. } if text == "matches")
     );
@@ -150,8 +162,14 @@ fn messages_name_who_sent_them() {
         &mut state,
         "kid",
         vec![
-            assignment(from(actor::Actor::ClientId(ClientId::new("laptop"))), "do it"),
-            assignment(from(actor::Actor::AgentId(AgentId::new("root"))), "from lead"),
+            assignment(
+                from(actor::Actor::ClientId(ClientId::new("laptop"))),
+                "do it",
+            ),
+            assignment(
+                from(actor::Actor::AgentId(AgentId::new("root"))),
+                "from lead",
+            ),
             assignment(from(actor::Actor::Server(ServerActor {})), "revived"),
             assignment(None, "anon"),
             Kind::AssignmentSent(AssignmentSent::default()),
@@ -221,7 +239,10 @@ fn a_spawn_shows_in_the_parent_and_opens_the_child_with_its_assignment() {
             note: false
         }]
     );
-    assert!(blocks(&state, "solo").is_empty(), "no brief, no opening message");
+    assert!(
+        blocks(&state, "solo").is_empty(),
+        "no brief, no opening message"
+    );
 }
 
 #[test]
@@ -235,7 +256,11 @@ fn a_result_lands_in_the_agent_and_its_parent() {
         }),
     });
     fold(&mut state, "kid", vec![reported]);
-    fold(&mut state, "root", vec![Kind::ResultReported(ResultReported::default())]);
+    fold(
+        &mut state,
+        "root",
+        vec![Kind::ResultReported(ResultReported::default())],
+    );
     assert_eq!(
         blocks(&state, "kid"),
         vec![Block::Reported {
@@ -268,8 +293,18 @@ fn prompts_record_how_they_were_settled() {
         decision: Some(PermissionDecision {
             request_id: Some(PermissionRequestId::new("q")),
             answers: [
-                ("size".to_owned(), Answer { values: vec!["L".to_owned()] }),
-                ("colour".to_owned(), Answer { values: vec!["Red".to_owned(), "Blue".to_owned()] }),
+                (
+                    "size".to_owned(),
+                    Answer {
+                        values: vec!["L".to_owned()],
+                    },
+                ),
+                (
+                    "colour".to_owned(),
+                    Answer {
+                        values: vec!["Red".to_owned(), "Blue".to_owned()],
+                    },
+                ),
             ]
             .into(),
             ..PermissionDecision::default()

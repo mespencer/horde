@@ -115,7 +115,11 @@ pub const COMPOSE: &[Binding] = &[
     (KeyCode::Char('a'), CTRL, Intent::Edit(Edit::Home)),
     (KeyCode::Char('e'), CTRL, Intent::Edit(Edit::End)),
     (KeyCode::Char('w'), CTRL, Intent::Edit(Edit::DeleteWord)),
-    (KeyCode::Char('u'), CTRL, Intent::Edit(Edit::DeleteToLineStart)),
+    (
+        KeyCode::Char('u'),
+        CTRL,
+        Intent::Edit(Edit::DeleteToLineStart),
+    ),
     (KeyCode::Backspace, NONE, Intent::Edit(Edit::Backspace)),
     (KeyCode::Delete, NONE, Intent::Edit(Edit::Delete)),
     (KeyCode::Left, NONE, Intent::Edit(Edit::Left)),
@@ -135,7 +139,11 @@ pub const PROMPT: &[Binding] = &[
     (KeyCode::Right, NONE, Intent::Prompt(PromptKey::Right)),
     (KeyCode::Enter, NONE, Intent::Prompt(PromptKey::Enter)),
     (KeyCode::Char(' '), NONE, Intent::Prompt(PromptKey::Space)),
-    (KeyCode::Backspace, NONE, Intent::Prompt(PromptKey::Backspace)),
+    (
+        KeyCode::Backspace,
+        NONE,
+        Intent::Prompt(PromptKey::Backspace),
+    ),
     (KeyCode::Tab, NONE, Intent::Tab),
     (KeyCode::Esc, NONE, Intent::Escape),
     (KeyCode::Char('x'), CTRL, Intent::Interrupt),
@@ -144,17 +152,61 @@ pub const PROMPT: &[Binding] = &[
 /// The inbox list, checked before [`LIST`]: answer the selected entry in
 /// place, open its card, or go to its agent.
 pub const INBOX: &[Binding] = &[
-    (KeyCode::Char('y'), NONE, Intent::Prompt(PromptKey::Char('y'))),
-    (KeyCode::Char('n'), NONE, Intent::Prompt(PromptKey::Char('n'))),
-    (KeyCode::Char('1'), NONE, Intent::Prompt(PromptKey::Char('1'))),
-    (KeyCode::Char('2'), NONE, Intent::Prompt(PromptKey::Char('2'))),
-    (KeyCode::Char('3'), NONE, Intent::Prompt(PromptKey::Char('3'))),
-    (KeyCode::Char('4'), NONE, Intent::Prompt(PromptKey::Char('4'))),
-    (KeyCode::Char('5'), NONE, Intent::Prompt(PromptKey::Char('5'))),
-    (KeyCode::Char('6'), NONE, Intent::Prompt(PromptKey::Char('6'))),
-    (KeyCode::Char('7'), NONE, Intent::Prompt(PromptKey::Char('7'))),
-    (KeyCode::Char('8'), NONE, Intent::Prompt(PromptKey::Char('8'))),
-    (KeyCode::Char('9'), NONE, Intent::Prompt(PromptKey::Char('9'))),
+    (
+        KeyCode::Char('y'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('y')),
+    ),
+    (
+        KeyCode::Char('n'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('n')),
+    ),
+    (
+        KeyCode::Char('1'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('1')),
+    ),
+    (
+        KeyCode::Char('2'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('2')),
+    ),
+    (
+        KeyCode::Char('3'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('3')),
+    ),
+    (
+        KeyCode::Char('4'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('4')),
+    ),
+    (
+        KeyCode::Char('5'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('5')),
+    ),
+    (
+        KeyCode::Char('6'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('6')),
+    ),
+    (
+        KeyCode::Char('7'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('7')),
+    ),
+    (
+        KeyCode::Char('8'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('8')),
+    ),
+    (
+        KeyCode::Char('9'),
+        NONE,
+        Intent::Prompt(PromptKey::Char('9')),
+    ),
     (KeyCode::Char('g'), NONE, Intent::Attach),
 ];
 
@@ -264,8 +316,8 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        COMPOSE, Edit, GLOBAL, Intent, LIST, PROMPT, Screen, as_prompt, as_text, ignored,
-        key_name, lookup, resolve, typed,
+        COMPOSE, Edit, GLOBAL, Intent, LIST, PROMPT, Screen, as_prompt, as_text, ignored, key_name,
+        lookup, resolve, typed,
     };
     use crate::prompt::PromptKey;
 
@@ -283,15 +335,27 @@ mod tests {
         assert_eq!(lookup(COMPOSE, &shift_enter), Some(Intent::Newline));
         let question = key(KeyCode::Char('?'), KeyModifiers::SHIFT);
         assert_eq!(lookup(LIST, &question), Some(Intent::Goto(Screen::Help)));
-        let ctrl_shift_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let ctrl_shift_c = key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         assert_eq!(lookup(GLOBAL, &ctrl_shift_c), Some(Intent::Cancel));
-        assert_eq!(lookup(GLOBAL, &key(KeyCode::Char('c'), KeyModifiers::NONE)), None);
+        assert_eq!(
+            lookup(GLOBAL, &key(KeyCode::Char('c'), KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]
     fn plain_characters_type_and_chords_do_not() {
-        assert_eq!(typed(&key(KeyCode::Char('a'), KeyModifiers::NONE)), Some('a'));
-        assert_eq!(typed(&key(KeyCode::Char('A'), KeyModifiers::SHIFT)), Some('A'));
+        assert_eq!(
+            typed(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some('a')
+        );
+        assert_eq!(
+            typed(&key(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
         assert_eq!(typed(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)), None);
         assert_eq!(typed(&key(KeyCode::Char('a'), KeyModifiers::ALT)), None);
         assert_eq!(typed(&key(KeyCode::Enter, KeyModifiers::NONE)), None);
@@ -301,22 +365,38 @@ mod tests {
     fn resolution_tries_tables_in_order_then_the_fallback() {
         let tables: &[&[_]] = &[GLOBAL, COMPOSE];
         let ctrl_t = key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(resolve(tables, &ctrl_t, as_text), Some(Intent::Goto(Screen::Overview)));
+        assert_eq!(
+            resolve(tables, &ctrl_t, as_text),
+            Some(Intent::Goto(Screen::Overview))
+        );
         let left = key(KeyCode::Left, KeyModifiers::NONE);
-        assert_eq!(resolve(tables, &left, as_text), Some(Intent::Edit(Edit::Left)));
+        assert_eq!(
+            resolve(tables, &left, as_text),
+            Some(Intent::Edit(Edit::Left))
+        );
         let q = key(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(resolve(tables, &q, as_text), Some(Intent::Type('q')));
-        assert_eq!(resolve(&[GLOBAL, PROMPT], &q, as_prompt), Some(Intent::Prompt(PromptKey::Char('q'))));
+        assert_eq!(
+            resolve(&[GLOBAL, PROMPT], &q, as_prompt),
+            Some(Intent::Prompt(PromptKey::Char('q')))
+        );
         assert_eq!(resolve(&[GLOBAL, LIST], &q, ignored), Some(Intent::Quit));
         let z = key(KeyCode::Char('z'), KeyModifiers::NONE);
         assert_eq!(resolve(&[GLOBAL, LIST], &z, ignored), None);
         let ctrl_z = key(KeyCode::Char('z'), KeyModifiers::CONTROL);
-        assert_eq!(resolve(tables, &ctrl_z, as_text), None, "an unbound chord is not text");
+        assert_eq!(
+            resolve(tables, &ctrl_z, as_text),
+            None,
+            "an unbound chord is not text"
+        );
     }
 
     #[test]
     fn keys_name_themselves_for_the_help_screen() {
-        assert_eq!(key_name(KeyCode::Char('t'), KeyModifiers::CONTROL), "ctrl-t");
+        assert_eq!(
+            key_name(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            "ctrl-t"
+        );
         assert_eq!(key_name(KeyCode::Char('3'), KeyModifiers::ALT), "alt-3");
         assert_eq!(key_name(KeyCode::Enter, KeyModifiers::SHIFT), "shift-enter");
         assert_eq!(key_name(KeyCode::Char(' '), KeyModifiers::NONE), "space");

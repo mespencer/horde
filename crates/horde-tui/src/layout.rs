@@ -34,7 +34,13 @@ fn block_lines(rows: &mut Vec<Line<'static>>, block: &Block, details: bool, widt
     match block {
         Block::Message { from, text, note } => message_lines(rows, from, text, *note, width),
         Block::Assistant { text, .. } => {
-            marked(rows, ("● ", theme::plain()), text.trim(), theme::plain(), width);
+            marked(
+                rows,
+                ("● ", theme::plain()),
+                text.trim(),
+                theme::plain(),
+                width,
+            );
         }
         Block::Thinking { text, .. } => thinking_lines(rows, text, details, width),
         Block::Tool {
@@ -53,13 +59,25 @@ fn block_lines(rows: &mut Vec<Line<'static>>, block: &Block, details: bool, widt
             } else {
                 theme::warn()
             };
-            marked(rows, ("◼ ", style), &format!("result {status}: {summary}"), theme::plain(), width);
+            marked(
+                rows,
+                ("◼ ", style),
+                &format!("result {status}: {summary}"),
+                theme::plain(),
+                width,
+            );
         }
         Block::Notice { tone, text } => notice_lines(rows, *tone, text, width),
     }
 }
 
-fn message_lines(rows: &mut Vec<Line<'static>>, from: &Speaker, text: &str, note: bool, width: usize) {
+fn message_lines(
+    rows: &mut Vec<Line<'static>>,
+    from: &Speaker,
+    text: &str,
+    note: bool,
+    width: usize,
+) {
     let label = match (from, note) {
         (Speaker::Human, false) => String::new(),
         (Speaker::Human, true) => "note: ".to_owned(),
@@ -67,7 +85,13 @@ fn message_lines(rows: &mut Vec<Line<'static>>, from: &Speaker, text: &str, note
         (Speaker::Agent(name), true) => format!("note from {name}: "),
         (Speaker::Server, _) => "server: ".to_owned(),
     };
-    marked(rows, ("› ", theme::dim()), &format!("{label}{text}"), theme::bold(), width);
+    marked(
+        rows,
+        ("› ", theme::dim()),
+        &format!("{label}{text}"),
+        theme::bold(),
+        width,
+    );
 }
 
 fn thinking_lines(rows: &mut Vec<Line<'static>>, text: &str, details: bool, width: usize) {
@@ -76,7 +100,13 @@ fn thinking_lines(rows: &mut Vec<Line<'static>>, text: &str, details: bool, widt
     } else {
         format!("Thinking… {}", clip(text.trim(), width.saturating_sub(14)))
     };
-    marked(rows, ("✻ ", theme::thinking()), &shown, theme::thinking(), width);
+    marked(
+        rows,
+        ("✻ ", theme::thinking()),
+        &shown,
+        theme::thinking(),
+        width,
+    );
 }
 
 fn tool_lines(
@@ -88,7 +118,11 @@ fn tool_lines(
     width: usize,
 ) {
     if !name.is_empty() {
-        let bullet = if result.is_some() { theme::ok() } else { theme::warn() };
+        let bullet = if result.is_some() {
+            theme::ok()
+        } else {
+            theme::warn()
+        };
         let head = format!("{name}({})", tool_summary(input));
         marked(rows, ("● ", bullet), &head, theme::bold(), width);
         if details && !input.is_empty() {
@@ -105,7 +139,11 @@ fn tool_lines(
 /// rest, unless details are on.
 fn result_lines(rows: &mut Vec<Line<'static>>, text: &str, details: bool, width: usize) {
     let all: Vec<&str> = text.trim_end().lines().collect();
-    let shown = if details { all.len() } else { all.len().min(COLLAPSED_RESULT_LINES) };
+    let shown = if details {
+        all.len()
+    } else {
+        all.len().min(COLLAPSED_RESULT_LINES)
+    };
     let mut body = all[..shown].join("\n");
     if body.is_empty() {
         body = "(no output)".to_owned();
@@ -124,7 +162,12 @@ fn result_lines(rows: &mut Vec<Line<'static>>, text: &str, details: bool, width:
     }
 }
 
-fn prompt_lines(rows: &mut Vec<Line<'static>>, summary: &str, settled: Option<&Settled>, width: usize) {
+fn prompt_lines(
+    rows: &mut Vec<Line<'static>>,
+    summary: &str,
+    settled: Option<&Settled>,
+    width: usize,
+) {
     let (marker, text) = match settled {
         None => (("◆ ", theme::needs_you()), format!("needs you: {summary}")),
         Some(Settled::Allowed) => (("✓ ", theme::ok()), format!("allowed: {summary}")),
@@ -140,7 +183,11 @@ fn notice_lines(rows: &mut Vec<Line<'static>>, tone: Tone, text: &str, width: us
         Tone::Warn => ("⚠ ", theme::warn()),
         Tone::Error => ("✗ ", theme::error()),
     };
-    let style = if tone == Tone::Info { theme::dim() } else { marker.1 };
+    let style = if tone == Tone::Info {
+        theme::dim()
+    } else {
+        marker.1
+    };
     marked(rows, marker, text, style, width);
 }
 
@@ -164,7 +211,10 @@ fn marked(
 /// A paragraph indented under its block's marker.
 fn indented(rows: &mut Vec<Line<'static>>, text: &str, style: Style, width: usize) {
     for row in wrap(text, width.saturating_sub(4)) {
-        rows.push(Line::from(vec![Span::raw("    "), Span::styled(row, style)]));
+        rows.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(row, style),
+        ]));
     }
 }
 
@@ -214,7 +264,12 @@ mod tests {
     fn text_of(transcript: &Transcript, details: bool, width: u16) -> Vec<String> {
         transcript_lines(transcript, details, width)
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect()
     }
 
@@ -243,7 +298,10 @@ mod tests {
             ]
         );
         let expanded = text_of(&transcript, true, 60);
-        assert!(expanded.contains(&"    \"command\": \"ls -la\",".to_owned()), "{expanded:?}");
+        assert!(
+            expanded.contains(&"    \"command\": \"ls -la\",".to_owned()),
+            "{expanded:?}"
+        );
         assert!(expanded.contains(&"    e".to_owned()));
         assert!(!expanded.iter().any(|row| row.contains("+2 lines")));
     }
@@ -273,23 +331,82 @@ mod tests {
     #[test]
     fn every_block_kind_has_its_marker() {
         let transcript = of(vec![
-            Block::Message { from: Speaker::Human, text: "fix it".to_owned(), note: false },
-            Block::Message { from: Speaker::Human, text: "fyi".to_owned(), note: true },
-            Block::Message { from: Speaker::Agent("lead".to_owned()), text: "go".to_owned(), note: false },
-            Block::Message { from: Speaker::Agent("lead".to_owned()), text: "hm".to_owned(), note: true },
-            Block::Message { from: Speaker::Server, text: "x".to_owned(), note: false },
-            Block::Assistant { turn: "t".to_owned(), text: " done \n".to_owned() },
-            Block::Thinking { turn: "t".to_owned(), text: "line one\nline two".to_owned() },
-            Block::Prompt { request_id: "r".to_owned(), summary: "rm x".to_owned(), settled: None },
-            Block::Prompt { request_id: "r".to_owned(), summary: "rm x".to_owned(), settled: Some(Settled::Allowed) },
-            Block::Prompt { request_id: "r".to_owned(), summary: "rm x".to_owned(), settled: Some(Settled::Denied) },
-            Block::Prompt { request_id: "r".to_owned(), summary: "q".to_owned(), settled: Some(Settled::Answered("a → b".to_owned())) },
-            Block::Child { text: "spawned kid".to_owned() },
-            Block::Reported { status: "success", summary: "ok".to_owned() },
-            Block::Reported { status: "blocked", summary: "no".to_owned() },
-            Block::Notice { tone: Tone::Info, text: "i".to_owned() },
-            Block::Notice { tone: Tone::Warn, text: "w".to_owned() },
-            Block::Notice { tone: Tone::Error, text: "e".to_owned() },
+            Block::Message {
+                from: Speaker::Human,
+                text: "fix it".to_owned(),
+                note: false,
+            },
+            Block::Message {
+                from: Speaker::Human,
+                text: "fyi".to_owned(),
+                note: true,
+            },
+            Block::Message {
+                from: Speaker::Agent("lead".to_owned()),
+                text: "go".to_owned(),
+                note: false,
+            },
+            Block::Message {
+                from: Speaker::Agent("lead".to_owned()),
+                text: "hm".to_owned(),
+                note: true,
+            },
+            Block::Message {
+                from: Speaker::Server,
+                text: "x".to_owned(),
+                note: false,
+            },
+            Block::Assistant {
+                turn: "t".to_owned(),
+                text: " done \n".to_owned(),
+            },
+            Block::Thinking {
+                turn: "t".to_owned(),
+                text: "line one\nline two".to_owned(),
+            },
+            Block::Prompt {
+                request_id: "r".to_owned(),
+                summary: "rm x".to_owned(),
+                settled: None,
+            },
+            Block::Prompt {
+                request_id: "r".to_owned(),
+                summary: "rm x".to_owned(),
+                settled: Some(Settled::Allowed),
+            },
+            Block::Prompt {
+                request_id: "r".to_owned(),
+                summary: "rm x".to_owned(),
+                settled: Some(Settled::Denied),
+            },
+            Block::Prompt {
+                request_id: "r".to_owned(),
+                summary: "q".to_owned(),
+                settled: Some(Settled::Answered("a → b".to_owned())),
+            },
+            Block::Child {
+                text: "spawned kid".to_owned(),
+            },
+            Block::Reported {
+                status: "success",
+                summary: "ok".to_owned(),
+            },
+            Block::Reported {
+                status: "blocked",
+                summary: "no".to_owned(),
+            },
+            Block::Notice {
+                tone: Tone::Info,
+                text: "i".to_owned(),
+            },
+            Block::Notice {
+                tone: Tone::Warn,
+                text: "w".to_owned(),
+            },
+            Block::Notice {
+                tone: Tone::Error,
+                text: "e".to_owned(),
+            },
         ]);
         let rows: Vec<String> = text_of(&transcript, false, 60)
             .into_iter()
@@ -317,8 +434,19 @@ mod tests {
                 "✗ e",
             ]
         );
-        let thinking = text_of(&of(vec![Block::Thinking { turn: "t".to_owned(), text: "a\nb".to_owned() }]), true, 40);
-        assert_eq!(thinking, vec!["✻ a", "  b"], "details show the whole thought");
+        let thinking = text_of(
+            &of(vec![Block::Thinking {
+                turn: "t".to_owned(),
+                text: "a\nb".to_owned(),
+            }]),
+            true,
+            40,
+        );
+        assert_eq!(
+            thinking,
+            vec!["✻ a", "  b"],
+            "details show the whole thought"
+        );
     }
 
     #[test]
@@ -327,7 +455,10 @@ mod tests {
             turn: "t".to_owned(),
             text: "one two three four".to_owned(),
         }]);
-        assert_eq!(text_of(&transcript, false, 10), vec!["● one two", "  three", "  four"]);
+        assert_eq!(
+            text_of(&transcript, false, 10),
+            vec!["● one two", "  three", "  four"]
+        );
     }
 
     #[test]
