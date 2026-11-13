@@ -143,7 +143,10 @@ mod tests {
                    "session_id":"s1","duration_ms":5,"result":"done"})
             .to_string(),
         ]]);
-        session.send(TurnInput::queued("go")).await.expect("replays");
+        session
+            .send(TurnInput::queued("go"))
+            .await
+            .expect("replays");
         assert!(matches!(
             session.next_event().await,
             Ok(Some(AgentEvent::SessionEstablished { .. }))

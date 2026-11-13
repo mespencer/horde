@@ -117,9 +117,15 @@ async fn the_real_claude_still_streams_a_turn_through_the_supervisor() {
 #[tokio::test]
 #[ignore = "spends real tokens and needs a claude login"]
 async fn the_real_claude_asks_on_stdio_and_runs_the_narrowed_call() {
-    let mut adapter = ClaudeAdapter::new(live_profile("claude")).probe_version().await;
+    let mut adapter = ClaudeAdapter::new(live_profile("claude"))
+        .probe_version()
+        .await;
     eprintln!("probed {}", adapter.version.describe());
-    assert!(!adapter.version.is_refused(), "{}", adapter.version.describe());
+    assert!(
+        !adapter.version.is_refused(),
+        "{}",
+        adapter.version.describe()
+    );
     // A chain is wired by the prompt tool alone here: no endpoint, so no
     // MCP config, but the stdio route and the settings hardening apply.
     adapter.permission_prompt_tool = Some("stdio".to_owned());
@@ -146,7 +152,10 @@ async fn the_real_claude_asks_on_stdio_and_runs_the_narrowed_call() {
                 let mut narrowed = request.input.clone();
                 narrowed["content"] = serde_json::json!("NARROWED_BY_HORDE");
                 session
-                    .answer_permission(&request.tool_call_id, PermissionDecision::allow_with(narrowed))
+                    .answer_permission(
+                        &request.tool_call_id,
+                        PermissionDecision::allow_with(narrowed),
+                    )
                     .await
                     .expect("the prompt is answerable");
             }
@@ -157,8 +166,7 @@ async fn the_real_claude_asks_on_stdio_and_runs_the_narrowed_call() {
     };
     assert!(outcome.status.is_completed(), "{outcome:?}");
     assert!(asked >= 1, "the Write must have been asked about");
-    let written =
-        std::fs::read_to_string(scratch.path().join("probe.txt")).expect("the write ran");
+    let written = std::fs::read_to_string(scratch.path().join("probe.txt")).expect("the write ran");
     assert_eq!(written.trim(), "NARROWED_BY_HORDE");
     session.shutdown().await.expect("shutdown kills by handle");
 }
@@ -171,7 +179,9 @@ async fn the_real_claude_asks_on_stdio_and_runs_the_narrowed_call() {
 #[tokio::test]
 #[ignore = "spends real subscription quota and needs a ChatGPT login"]
 async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
-    let adapter = CodexAdapter::new(live_profile("codex")).probe_version().await;
+    let adapter = CodexAdapter::new(live_profile("codex"))
+        .probe_version()
+        .await;
     let (_scratch, mut session) = codex_session_in_scratch(&adapter)
         .await
         .expect("a codex session in a scratch cwd");
@@ -218,7 +228,9 @@ async fn the_real_codex_app_server_still_streams_a_turn_through_the_adapter() {
 #[tokio::test]
 #[ignore = "spends real subscription quota and needs a ChatGPT login"]
 async fn the_real_codex_routes_an_exec_approval_and_honors_both_verdicts() {
-    let adapter = CodexAdapter::new(live_profile("codex")).probe_version().await;
+    let adapter = CodexAdapter::new(live_profile("codex"))
+        .probe_version()
+        .await;
     if !adapter
         .version
         .at_least(horde_adapter_codex::version::FIRST_EXEC_ROUTING)

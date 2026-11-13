@@ -228,10 +228,7 @@ impl PermissionBroker {
         prompt: &PromptRequest,
     ) -> Result<serde_json::Value, PermissionError> {
         let decision = self.adjudicate(identity, prompt).await?;
-        Ok(encode_tool_response(&decision_body(
-            &decision,
-            prompt,
-        )))
+        Ok(encode_tool_response(&decision_body(&decision, prompt)))
     }
 }
 

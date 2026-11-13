@@ -454,11 +454,20 @@ mod w12c_tests {
         let (exec, name) = withdraw(ApprovalKind::ExecCommand {
             proposed_amendment: None,
         });
-        assert_eq!((exec["result"]["decision"].clone(), name), (json!("cancel"), "cancel"));
+        assert_eq!(
+            (exec["result"]["decision"].clone(), name),
+            (json!("cancel"), "cancel")
+        );
         let (file, name) = withdraw(ApprovalKind::FileChange);
-        assert_eq!((file["result"]["decision"].clone(), name), (json!("cancel"), "cancel"));
+        assert_eq!(
+            (file["result"]["decision"].clone(), name),
+            (json!("cancel"), "cancel")
+        );
         let (mcp, name) = withdraw(ApprovalKind::McpElicitation);
-        assert_eq!((mcp["result"]["action"].clone(), name), (json!("decline"), "decline"));
+        assert_eq!(
+            (mcp["result"]["action"].clone(), name),
+            (json!("decline"), "decline")
+        );
         let (perms, name) = withdraw(ApprovalKind::Permissions {
             requested: json!({"network": {"enabled": true}}),
         });
@@ -468,7 +477,10 @@ mod w12c_tests {
             "a withdrawal grants nothing, whatever was asked"
         );
         let (input, name) = withdraw(ApprovalKind::UserInput);
-        assert_eq!((input["result"].clone(), name), (json!({"answers": {}}), "no answers"));
+        assert_eq!(
+            (input["result"].clone(), name),
+            (json!({"answers": {}}), "no answers")
+        );
         assert_eq!(input["id"], 9);
     }
 }

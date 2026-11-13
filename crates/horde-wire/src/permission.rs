@@ -339,9 +339,9 @@ pub fn permission_decision_from_wire(
         // narrowing, and guessing which half the client meant is how a
         // declined question would run anyway.
         return match (outcome, &decision.updated_input) {
-            (PermissionOutcome::Allow, None) => {
-                Ok(PermissionDecision::answer(answers_from_wire(&decision.answers)))
-            }
+            (PermissionOutcome::Allow, None) => Ok(PermissionDecision::answer(answers_from_wire(
+                &decision.answers,
+            ))),
             (PermissionOutcome::Allow, Some(_)) => Err(ConversionError::AnswersWithRewrite),
             _ => Err(ConversionError::AnswersWithoutAllow),
         };
@@ -566,7 +566,10 @@ mod tests {
     fn every_conversion_error_explains_itself() {
         for (error, needle) in [
             (ConversionError::AnswersWithRewrite, "both answers"),
-            (ConversionError::AnswersWithoutAllow, "without outcome ALLOW"),
+            (
+                ConversionError::AnswersWithoutAllow,
+                "without outcome ALLOW",
+            ),
         ] {
             assert!(error.to_string().contains(needle), "{error}");
         }

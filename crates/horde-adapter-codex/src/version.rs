@@ -41,7 +41,9 @@ pub const FIRST_FILE_CHANGE_ROUTING: HarnessVersion = HarnessVersion::new(0, 167
 /// No version found is `false` — fail closed.
 #[must_use]
 pub fn routes_exec_approvals(version_output: &str) -> bool {
-    SUPPORT.classify(version_output).at_least(FIRST_EXEC_ROUTING)
+    SUPPORT
+        .classify(version_output)
+        .at_least(FIRST_EXEC_ROUTING)
 }
 
 /// Whether a probed binary routes file-change approvals.
@@ -67,9 +69,15 @@ mod tests {
             "the six-configuration null result (ADR-0005)"
         );
         assert!(!routes_exec_approvals("codex-cli 0.146.9"));
-        assert!(routes_exec_approvals("codex-cli 1.0.0"), "later majors keep it");
+        assert!(
+            routes_exec_approvals("codex-cli 1.0.0"),
+            "later majors keep it"
+        );
         for output in ["", "command not found", "codex-cli", "v.next"] {
-            assert!(!routes_exec_approvals(output), "{output:?} must fail closed");
+            assert!(
+                !routes_exec_approvals(output),
+                "{output:?} must fail closed"
+            );
         }
     }
 
@@ -85,7 +93,9 @@ mod tests {
             !routes_file_change_approvals(&SUPPORT.classify("codex-cli 0.166.9")),
             "unmeasured below 0.167; 0.148 parks (transcripts 28/31)"
         );
-        assert!(!routes_file_change_approvals(&SUPPORT.classify("codex-cli")));
+        assert!(!routes_file_change_approvals(
+            &SUPPORT.classify("codex-cli")
+        ));
     }
 
     #[test]

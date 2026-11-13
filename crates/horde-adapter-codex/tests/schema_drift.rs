@@ -24,21 +24,23 @@ fn snapshot_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/surface.json")
 }
 
-fn committed() -> (String, Extracted) {
-    let text = std::fs::read_to_string(snapshot_path()).expect("the snapshot is committed");
-    let value: serde_json::Value = serde_json::from_str(&text).expect("the snapshot is JSON");
+fn committed() -> Result<(String, Extracted), String> {
+    let text = std::fs::read_to_string(snapshot_path())
+        .map_err(|error| format!("the snapshot is committed: {error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("the snapshot is JSON: {error}"))?;
     let version = value["codex_version"]
         .as_str()
-        .expect("the snapshot names its codex")
+        .ok_or("the snapshot names its codex")?
         .to_owned();
-    let surface: Extracted =
-        serde_json::from_value(value["surface"].clone()).expect("the surface is a map of maps");
-    (version, surface)
+    let surface: Extracted = serde_json::from_value(value["surface"].clone())
+        .map_err(|error| format!("the surface is a map of maps: {error}"))?;
+    Ok((version, surface))
 }
 
 #[test]
 fn the_snapshot_covers_exactly_what_the_codec_declares_and_all_of_it_exists() {
-    let (version, surface) = committed();
+    let (version, surface) = committed().expect("the committed snapshot loads");
     assert!(version.starts_with("codex-cli "), "{version}");
 
     let declared: BTreeMap<String, Vec<&str>> = SURFACE
@@ -73,7 +75,7 @@ fn the_snapshot_covers_exactly_what_the_codec_declares_and_all_of_it_exists() {
 /// values exec and file-change replies use, and the elicitation actions.
 #[test]
 fn the_reply_vocabularies_the_codec_sends_are_in_the_schema() {
-    let (_, surface) = committed();
+    let (_, surface) = committed().expect("the committed snapshot loads");
     let decision = &surface["CommandExecutionRequestApprovalResponse.json"]["decision"];
     for value in ["accept", "acceptForSession", "decline", "cancel"] {
         assert!(decision.contains(value), "{decision}");
@@ -121,7 +123,7 @@ fn the_installed_codex_schema_matches_the_snapshot() {
         return;
     }
 
-    let (recorded_version, recorded) = committed();
+    let (recorded_version, recorded) = committed().expect("the committed snapshot loads");
     let mut drift = Vec::new();
     for (key, paths) in &fresh {
         for (path, summary) in paths {

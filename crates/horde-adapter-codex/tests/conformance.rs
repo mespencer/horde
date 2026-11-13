@@ -615,17 +615,14 @@ async fn the_capability_claims_are_honest_about_gating() {
 // W12c — codex-cli 0.167.0 (transcripts 34–41).
 // ---------------------------------------------------------------------------
 
-/// The request a recording surfaces under `tool_name`, or a panic naming it.
-fn requested_as(events: &[AgentEvent], tool_name: &str) -> horde_adapter::ProposedToolCall {
-    events
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::PermissionRequested { request, .. } if request.tool_name == tool_name => {
-                Some(request.clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("no {tool_name} request surfaced in {events:?}"))
+/// The request a recording surfaces under `tool_name`, if any.
+fn requested_as(events: &[AgentEvent], tool_name: &str) -> Option<horde_adapter::ProposedToolCall> {
+    events.iter().find_map(|event| match event {
+        AgentEvent::PermissionRequested { request, .. } if request.tool_name == tool_name => {
+            Some(request.clone())
+        }
+        _ => None,
+    })
 }
 
 /// Transcript 36 — the file-change approval that 0.148 never sent (28/31)
@@ -635,7 +632,7 @@ fn requested_as(events: &[AgentEvent], tool_name: &str) -> horde_adapter::Propos
 #[test]
 fn a_file_change_approval_surfaces_with_its_patch_before_it_applies() {
     let (events, _) = replay("36-0167-filechange-user-granular-ro-horde-patch.jsonl");
-    let request = requested_as(&events, "apply_patch");
+    let request = requested_as(&events, "apply_patch").expect("the request surfaces");
     let changes = request.input["changes"]
         .as_array()
         .expect("the patch rides the proposal");
@@ -661,7 +658,10 @@ fn a_file_change_approval_surfaces_with_its_patch_before_it_applies() {
                 if tool_call_id == &request.tool_call_id)
         })
         .expect("the declined patch completes as a failed tool");
-    assert!(request_at < completed_at, "the question precedes the verdict");
+    assert!(
+        request_at < completed_at,
+        "the question precedes the verdict"
+    );
 }
 
 /// Transcripts 36–37 under the conformance driver: declined, the turn still
@@ -684,7 +684,11 @@ async fn file_change_recordings_satisfy_the_contract_both_ways() {
     )
     .await
     .expect("the accepted recording satisfies the contract");
-    assert!(accepted.iter().all(|record| record.outcome.denials.is_empty()));
+    assert!(
+        accepted
+            .iter()
+            .all(|record| record.outcome.denials.is_empty())
+    );
 }
 
 /// Transcript 38 — codex's question surfaces as a question only a human can
@@ -693,7 +697,7 @@ async fn file_change_recordings_satisfy_the_contract_both_ways() {
 #[tokio::test]
 async fn a_codex_question_surfaces_as_a_question_and_takes_answers() {
     let (events, _) = replay("38-0167-userinput-user-granular-ro-horde-ask.jsonl");
-    let request = requested_as(&events, "request_user_input");
+    let request = requested_as(&events, "request_user_input").expect("the request surfaces");
     let [question] = request.questions.as_slice() else {
         panic!("one question, got {:?}", request.questions);
     };
@@ -711,16 +715,21 @@ async fn a_codex_question_surfaces_as_a_question_and_takes_answers() {
     assert!(question.allows_free_text, "isOther: true");
     assert!(!question.secret);
 
-    let records = checked_replay("38-0167-userinput-user-granular-ro-horde-ask.jsonl", &|_| {
-        horde_adapter::PermissionDecision::answer(horde_adapter::Answers::from([(
-            "colour".to_owned(),
-            vec!["Red".to_owned()],
-        )]))
-    })
+    let records = checked_replay(
+        "38-0167-userinput-user-granular-ro-horde-ask.jsonl",
+        &|_| {
+            horde_adapter::PermissionDecision::answer(horde_adapter::Answers::from([(
+                "colour".to_owned(),
+                vec!["Red".to_owned()],
+            )]))
+        },
+    )
     .await
     .expect("the question recording satisfies the contract");
     assert_eq!(
-        records.last().and_then(|record| record.outcome.text.as_deref()),
+        records
+            .last()
+            .and_then(|record| record.outcome.text.as_deref()),
         Some("Red"),
         "the recorded answer reached the model"
     );
@@ -731,7 +740,7 @@ async fn a_codex_question_surfaces_as_a_question_and_takes_answers() {
 #[test]
 fn a_permissions_request_surfaces_with_the_profile_it_asks_for() {
     let (events, _) = replay("39-0167-permissions-user-granular-ro-horde-perms.jsonl");
-    let request = requested_as(&events, "request_permissions");
+    let request = requested_as(&events, "request_permissions").expect("the request surfaces");
     assert_eq!(
         request.input["permissions"],
         serde_json::json!({"network": {"enabled": true}, "fileSystem": null})
@@ -743,7 +752,7 @@ fn a_permissions_request_surfaces_with_the_profile_it_asks_for() {
         "{:?}",
         request.input
     );
-    let exec = requested_as(&events, "exec");
+    let exec = requested_as(&events, "exec").expect("the request surfaces");
     assert!(
         exec.input["command"]
             .as_str()
@@ -784,7 +793,8 @@ async fn every_0167_recording_satisfies_the_contract() {
         .collect();
     assert_eq!(answers, vec![Some("OK"), Some("AGAIN")]);
     assert!(
-        two.iter().all(|record| record.outcome.usage.tokens.input_tokens > 0),
+        two.iter()
+            .all(|record| record.outcome.usage.tokens.input_tokens > 0),
         "each turn bills its own tokens"
     );
 }

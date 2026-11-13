@@ -237,7 +237,11 @@ mod tests {
         let at = |output: &str| super::capabilities_for(&super::SUPPORT.classify(output));
 
         let unreadable = at("codex-cli");
-        assert_eq!(unreadable, capabilities(), "an unreadable version earns nothing");
+        assert_eq!(
+            unreadable,
+            capabilities(),
+            "an unreadable version earns nothing"
+        );
 
         let v0148 = at("codex-cli 0.148.0");
         assert!(v0148.supports(Capability::PreAuthorizeExecCommands));

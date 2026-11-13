@@ -16,10 +16,10 @@ use horde_adapter::{
 };
 
 use crate::wire::{
-    EXEC_APPROVAL_METHOD, ErrorBody, ExecApprovalRequest, FILE_CHANGE_APPROVAL_METHOD,
-    FileChange, FileChangeApprovalRequest, Frame, Item, MCP_ELICITATION_METHOD, McpElicitation,
-    Notification, PERMISSIONS_APPROVAL_METHOD, PermissionsApprovalRequest, TokenCounts,
-    USER_INPUT_METHOD, UserInputRequest,
+    EXEC_APPROVAL_METHOD, ErrorBody, ExecApprovalRequest, FILE_CHANGE_APPROVAL_METHOD, FileChange,
+    FileChangeApprovalRequest, Frame, Item, MCP_ELICITATION_METHOD, McpElicitation, Notification,
+    PERMISSIONS_APPROVAL_METHOD, PermissionsApprovalRequest, TokenCounts, USER_INPUT_METHOD,
+    UserInputRequest,
 };
 
 /// The tool name an exec approval surfaces under.
@@ -239,10 +239,14 @@ impl TurnAssembler {
             Frame::ServerRequest { id, method, params } if method == EXEC_APPROVAL_METHOD => {
                 self.feed_exec_approval(*id, params)
             }
-            Frame::ServerRequest { id, method, params } if method == FILE_CHANGE_APPROVAL_METHOD => {
+            Frame::ServerRequest { id, method, params }
+                if method == FILE_CHANGE_APPROVAL_METHOD =>
+            {
                 self.feed_file_change_approval(*id, params)
             }
-            Frame::ServerRequest { id, method, params } if method == PERMISSIONS_APPROVAL_METHOD => {
+            Frame::ServerRequest { id, method, params }
+                if method == PERMISSIONS_APPROVAL_METHOD =>
+            {
                 self.feed_permissions_approval(*id, params)
             }
             Frame::ServerRequest { id, method, params } if method == USER_INPUT_METHOD => {
@@ -597,7 +601,8 @@ impl TurnAssembler {
     /// an answer from Horde already removed it, so what is left here was
     /// resolved by codex itself and can no longer be answered.
     fn request_resolved(&mut self, rpc_id: u64) {
-        self.outstanding.retain(|_, approval| approval.rpc_id != rpc_id);
+        self.outstanding
+            .retain(|_, approval| approval.rpc_id != rpc_id);
     }
 
     /// An MCP tool-call elicitation: the interception point, as an event.

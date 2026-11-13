@@ -777,7 +777,9 @@ fn is_adjudicable_method(method: &str) -> bool {
 fn unadjudicable_refusal(id: u64, method: &str) -> String {
     match method {
         MCP_ELICITATION_METHOD => encode_elicitation_response(id, false),
-        PERMISSIONS_APPROVAL_METHOD => encode_permissions_response(id, &serde_json::json!({}), false),
+        PERMISSIONS_APPROVAL_METHOD => {
+            encode_permissions_response(id, &serde_json::json!({}), false)
+        }
         USER_INPUT_METHOD => encode_user_input_response(id, &horde_adapter::Answers::new()),
         _ => encode_decision_decline(id),
     }
@@ -868,7 +870,10 @@ impl Reply {
                 for_session,
             } => (
                 encode_permissions_response(rpc_id, granted, *for_session),
-                match (granted.as_object().is_some_and(|map| !map.is_empty()), for_session) {
+                match (
+                    granted.as_object().is_some_and(|map| !map.is_empty()),
+                    for_session,
+                ) {
                     (false, _) => "empty grant".to_owned(),
                     (true, true) => "grant for session".to_owned(),
                     (true, false) => "grant for turn".to_owned(),
@@ -1247,7 +1252,10 @@ mod tests {
         match error {
             AdapterError::RefusedVersion { provider, detail } => {
                 assert_eq!(provider, "codex");
-                assert!(detail.contains("0.145.0") && detail.contains("0.147.0"), "{detail}");
+                assert!(
+                    detail.contains("0.145.0") && detail.contains("0.147.0"),
+                    "{detail}"
+                );
             }
             other => panic!("expected a version refusal, got {other:?}"),
         }
@@ -1270,7 +1278,10 @@ mod tests {
             vec![("MARKER".to_owned(), "kept".to_owned())],
             "unrelated configuration survives the probe"
         );
-        assert_eq!(probed.version.verdict, horde_adapter::SupportVerdict::Untested);
+        assert_eq!(
+            probed.version.verdict,
+            horde_adapter::SupportVerdict::Untested
+        );
         assert!(
             probed.version.raw.contains("/nonexistent/horde-test-codex")
                 && probed.version.raw.contains("could not run"),
@@ -1295,8 +1306,14 @@ mod tests {
             serde_json::from_str(&super::unadjudicable_refusal(3, method))
                 .expect("we produced this")
         };
-        assert_eq!(refusal(MCP_ELICITATION_METHOD)["result"], serde_json::json!({"action": "decline"}));
-        assert_eq!(refusal(EXEC_APPROVAL_METHOD)["result"], serde_json::json!({"decision": "decline"}));
+        assert_eq!(
+            refusal(MCP_ELICITATION_METHOD)["result"],
+            serde_json::json!({"action": "decline"})
+        );
+        assert_eq!(
+            refusal(EXEC_APPROVAL_METHOD)["result"],
+            serde_json::json!({"decision": "decline"})
+        );
         assert_eq!(
             refusal(FILE_CHANGE_APPROVAL_METHOD)["result"],
             serde_json::json!({"decision": "decline"})
@@ -1305,7 +1322,10 @@ mod tests {
             refusal(PERMISSIONS_APPROVAL_METHOD)["result"],
             serde_json::json!({"permissions": {}, "scope": "turn"})
         );
-        assert_eq!(refusal(USER_INPUT_METHOD)["result"], serde_json::json!({"answers": {}}));
+        assert_eq!(
+            refusal(USER_INPUT_METHOD)["result"],
+            serde_json::json!({"answers": {}})
+        );
 
         for method in [
             MCP_ELICITATION_METHOD,
@@ -1340,9 +1360,15 @@ mod tests {
             "codex file-change approvals: sandbox tier only (codex 0.148.0; 0.167+ routes them)"
         );
         let newer = lines("codex-cli 0.170.0");
-        assert!(newer[0].starts_with("harness version warning: codex 0.170.0 is untested"), "{newer:?}");
+        assert!(
+            newer[0].starts_with("harness version warning: codex 0.170.0 is untested"),
+            "{newer:?}"
+        );
         let unreadable = lines("codex-cli");
-        assert!(unreadable[0].contains("version unreadable"), "{unreadable:?}");
+        assert!(
+            unreadable[0].contains("version unreadable"),
+            "{unreadable:?}"
+        );
         assert_eq!(
             unreadable[1],
             "codex exec approvals: sandbox tier only (version unreadable; 0.147+ routes them)"
@@ -1371,7 +1397,11 @@ mod tests {
             Mapped::expressed(Reply::Decision(ExecDecision::AcceptForSession))
         );
         assert_eq!(
-            reply_for(&file, &PermissionDecision::allow_with(proposal.clone()), &proposal),
+            reply_for(
+                &file,
+                &PermissionDecision::allow_with(proposal.clone()),
+                &proposal
+            ),
             Mapped::expressed(Reply::Decision(ExecDecision::Accept)),
             "a restatement is an allow"
         );
@@ -1417,18 +1447,30 @@ mod tests {
             Mapped::expressed(nothing.clone())
         );
         assert_eq!(
-            reply_for(&perms, &PermissionDecision::allow_with(json!({})), &proposal),
+            reply_for(
+                &perms,
+                &PermissionDecision::allow_with(json!({})),
+                &proposal
+            ),
             Mapped::declined(nothing.clone())
         );
         assert_eq!(
-            reply_for(&perms, &PermissionDecision::answer(answers.clone()), &proposal),
+            reply_for(
+                &perms,
+                &PermissionDecision::answer(answers.clone()),
+                &proposal
+            ),
             Mapped::declined(nothing)
         );
 
         // Questions take answers; a refusal answers nothing.
         let question = ApprovalKind::UserInput;
         assert_eq!(
-            reply_for(&question, &PermissionDecision::answer(answers.clone()), &proposal),
+            reply_for(
+                &question,
+                &PermissionDecision::answer(answers.clone()),
+                &proposal
+            ),
             Mapped::expressed(Reply::Answers(answers.clone()))
         );
         assert_eq!(
@@ -1461,7 +1503,11 @@ mod tests {
             Mapped::declined(Reply::Elicitation { accept: false })
         );
         assert_eq!(
-            reply_for(&ApprovalKind::McpElicitation, &PermissionDecision::allow(), &proposal),
+            reply_for(
+                &ApprovalKind::McpElicitation,
+                &PermissionDecision::allow(),
+                &proposal
+            ),
             Mapped::expressed(Reply::Elicitation { accept: true })
         );
     }
@@ -1476,7 +1522,10 @@ mod tests {
         let name = |reply: Reply| reply.encode(7).1;
         assert_eq!(name(Reply::Elicitation { accept: true }), "accept");
         assert_eq!(name(Reply::Elicitation { accept: false }), "decline");
-        assert_eq!(name(Reply::Decision(ExecDecision::AcceptForSession)), "acceptForSession");
+        assert_eq!(
+            name(Reply::Decision(ExecDecision::AcceptForSession)),
+            "acceptForSession"
+        );
         assert_eq!(
             name(Reply::Permissions {
                 granted: json!({"network": {"enabled": true}}),

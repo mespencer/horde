@@ -174,10 +174,9 @@ impl VersionReport {
         let table = &self.table;
         let range = format!("{}–{}", table.tested_from, table.tested_through);
         match (self.verdict, self.version) {
-            (SupportVerdict::Supported, Some(version)) => format!(
-                "{} {version} is supported (tested {range})",
-                table.provider
-            ),
+            (SupportVerdict::Supported, Some(version)) => {
+                format!("{} {version} is supported (tested {range})", table.provider)
+            }
             (SupportVerdict::Refused, Some(version)) => format!(
                 "{} {version} is refused: below {} ({})",
                 table.provider, table.floor, table.floor_reason
@@ -247,7 +246,10 @@ mod tests {
             "a suffixed token is skipped, not misread"
         );
         assert_eq!(parse("1.2.3.4"), None, "too many parts");
-        assert_eq!(parse("codex(0.147.0)"), Some(HarnessVersion::new(0, 147, 0)));
+        assert_eq!(
+            parse("codex(0.147.0)"),
+            Some(HarnessVersion::new(0, 147, 0))
+        );
         assert_eq!(parse("(0.148.0"), Some(HarnessVersion::new(0, 148, 0)));
         assert_eq!(parse("0.149.0)"), Some(HarnessVersion::new(0, 149, 0)));
         for nothing in ["", "command not found", "codex-cli", "v.next", "0.x.1"] {
@@ -260,7 +262,11 @@ mod tests {
     fn the_verdict_follows_the_table_at_every_boundary() {
         let at = |major, minor, patch| TABLE.verdict(HarnessVersion::new(major, minor, patch));
         assert_eq!(at(1, 1, 99), SupportVerdict::Refused);
-        assert_eq!(at(1, 2, 0), SupportVerdict::Untested, "the floor itself drives");
+        assert_eq!(
+            at(1, 2, 0),
+            SupportVerdict::Untested,
+            "the floor itself drives"
+        );
         assert_eq!(at(1, 3, 99), SupportVerdict::Untested);
         assert_eq!(at(1, 4, 0), SupportVerdict::Supported);
         assert_eq!(at(1, 9, 3), SupportVerdict::Supported);
@@ -275,17 +281,27 @@ mod tests {
         assert_eq!(report.version, None);
         assert_eq!(report.raw, "banner changed");
         assert!(!report.is_refused());
-        assert!(!report.at_least(HarnessVersion::new(0, 0, 0)), "fails closed");
+        assert!(
+            !report.at_least(HarnessVersion::new(0, 0, 0)),
+            "fails closed"
+        );
 
         let failed = VersionReport::unreadable(TABLE, "could not run");
         assert_eq!(failed.verdict, SupportVerdict::Untested);
-        assert!(failed.describe().contains("could not run"), "{}", failed.describe());
+        assert!(
+            failed.describe().contains("could not run"),
+            "{}",
+            failed.describe()
+        );
     }
 
     #[test]
     fn each_description_names_the_version_and_the_evidence() {
         let supported = TABLE.classify("toy 1.5.0");
-        assert_eq!(supported.describe(), "toy 1.5.0 is supported (tested 1.4.0–1.9.3)");
+        assert_eq!(
+            supported.describe(),
+            "toy 1.5.0 is supported (tested 1.4.0–1.9.3)"
+        );
         assert!(supported.at_least(HarnessVersion::new(1, 5, 0)));
         assert!(!supported.at_least(HarnessVersion::new(1, 5, 1)));
 
@@ -298,7 +314,9 @@ mod tests {
 
         let untested = TABLE.classify("toy 2.0.0");
         assert!(
-            untested.describe().starts_with("toy 2.0.0 is untested (tested 1.4.0–1.9.3)"),
+            untested
+                .describe()
+                .starts_with("toy 2.0.0 is untested (tested 1.4.0–1.9.3)"),
             "{}",
             untested.describe()
         );

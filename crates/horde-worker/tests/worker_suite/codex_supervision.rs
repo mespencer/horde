@@ -1558,10 +1558,8 @@ mod codex_0167_requests {
             .answer_permission(&proposal.tool_call_id, PermissionDecision::allow())
             .await
             .expect("answerable");
-        let recorded = control_log_shows(&log_path, |log| {
-            log.contains("\"decision\":\"accept\"")
-        })
-        .await;
+        let recorded =
+            control_log_shows(&log_path, |log| log.contains("\"decision\":\"accept\"")).await;
         assert!(recorded.contains("\"decision\":\"accept\""), "{recorded}");
         let (events, outcome) = events_through_turn_end(&mut session).await;
         assert!(outcome.is_some_and(|outcome| outcome.denials.is_empty()));
@@ -1584,7 +1582,8 @@ mod codex_0167_requests {
                                   "isOther": true, "isSecret": false,
                                   "options": [{"label": "Red", "description": "r"}]}]})
         );
-        let (mut session, log_path, _dirs) = harness::approval_session(&script_with(&request)).await;
+        let (mut session, log_path, _dirs) =
+            harness::approval_session(&script_with(&request)).await;
 
         let proposal = surfaced_request(&mut session).await;
         assert_eq!(proposal.tool_name, "request_user_input");
@@ -1601,7 +1600,8 @@ mod codex_0167_requests {
             )
             .await
             .expect("answerable");
-        let recorded = control_log_shows(&log_path, |log| log.contains("\"answers\":{\"colour\"")).await;
+        let recorded =
+            control_log_shows(&log_path, |log| log.contains("\"answers\":{\"colour\"")).await;
         assert!(
             recorded.contains(r#""answers":{"colour":{"answers":["Red"]}}"#),
             "{recorded}"
@@ -1623,30 +1623,43 @@ mod codex_0167_requests {
                    "cwd": "/w", "reason": "needs network", "permissions": asked})
         );
 
-        let (mut session, log_path, _dirs) = harness::approval_session(&script_with(&request)).await;
+        let (mut session, log_path, _dirs) =
+            harness::approval_session(&script_with(&request)).await;
         let proposal = surfaced_request(&mut session).await;
         assert_eq!(proposal.tool_name, "request_permissions");
         assert_eq!(proposal.input["permissions"], asked);
         assert_eq!(proposal.input["reason"], "needs network");
         session
-            .answer_permission(&proposal.tool_call_id, PermissionDecision::allow().remembered())
+            .answer_permission(
+                &proposal.tool_call_id,
+                PermissionDecision::allow().remembered(),
+            )
             .await
             .expect("answerable");
         let recorded = control_log_shows(&log_path, |log| log.contains("\"scope\"")).await;
         assert!(
-            recorded.contains(r#""permissions":{"fileSystem":null,"network":{"enabled":true}},"scope":"session""#),
+            recorded.contains(
+                r#""permissions":{"fileSystem":null,"network":{"enabled":true}},"scope":"session""#
+            ),
             "{recorded}"
         );
         session.shutdown().await.expect("shuts down");
 
-        let (mut session, log_path, _dirs) = harness::approval_session(&script_with(&request)).await;
+        let (mut session, log_path, _dirs) =
+            harness::approval_session(&script_with(&request)).await;
         let proposal = surfaced_request(&mut session).await;
         session
-            .answer_permission(&proposal.tool_call_id, PermissionDecision::deny("no network"))
+            .answer_permission(
+                &proposal.tool_call_id,
+                PermissionDecision::deny("no network"),
+            )
             .await
             .expect("answerable");
         let recorded = control_log_shows(&log_path, |log| log.contains("\"scope\"")).await;
-        assert!(recorded.contains(r#""permissions":{},"scope":"turn""#), "{recorded}");
+        assert!(
+            recorded.contains(r#""permissions":{},"scope":"turn""#),
+            "{recorded}"
+        );
         let (_, outcome) = events_through_turn_end(&mut session).await;
         let outcome = outcome.expect("the turn ends");
         assert_eq!(outcome.denials.len(), 1);

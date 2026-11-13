@@ -459,7 +459,10 @@ mod tests {
             super::permission_summary(&asking),
             "root asks: Which colour?  [1] Red  [2] Blue"
         );
-        assert!(super::session_footer(std::slice::from_ref(&asking)).starts_with("[1-9] answer  [n] deny"));
+        assert!(
+            super::session_footer(std::slice::from_ref(&asking))
+                .starts_with("[1-9] answer  [n] deny")
+        );
         assert!(super::session_footer(&[pending("p")]).starts_with("[y] allow  [n] deny"));
         assert!(super::session_footer(&[]).starts_with("[enter] send"));
 
