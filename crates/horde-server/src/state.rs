@@ -154,6 +154,9 @@ pub struct SessionState {
     pub remembered_allows: BTreeMap<RememberedCall, Option<Struct>>,
     /// Forward intents by id, closed ones included (ADR-0006).
     pub forwards: BTreeMap<String, ForwardState>,
+    /// The session's own settings (ADR-0016's session layer), from the
+    /// root spawn.
+    pub settings: horde_proto::v1::SessionSettings,
 }
 
 impl SessionState {
@@ -238,8 +241,9 @@ impl SessionState {
             return;
         };
         let parent = spawned.parent_agent_id.as_ref().map(ToString::to_string);
-        if parent.is_none() {
-            self.root_agent_id.get_or_insert_with(|| agent_id.clone());
+        if parent.is_none() && self.root_agent_id.is_none() {
+            self.root_agent_id = Some(agent_id.clone());
+            self.settings = spawned.session.clone().unwrap_or_default();
         }
         // The root's first tree-path element is the session's display name.
         if names_the_session(parent.as_deref(), &self.title)
@@ -515,6 +519,7 @@ mod tests {
 
     fn spawned(parent: Option<&str>, agent_type: &str) -> Kind {
         Kind::AgentSpawned(AgentSpawned {
+            session: None,
             parent_agent_id: parent.map(AgentId::new),
             spawned_by: None,
             spec: Some(AgentSpec {
@@ -812,9 +817,35 @@ mod tests {
         );
     }
 
+    /// The session layer is the root spawn's: a later parentless spawn
+    /// cannot replace it.
+    #[test]
+    fn the_session_settings_come_from_the_root_spawn_only() {
+        let settings = |mode: &str| horde_proto::v1::SessionSettings {
+            permission_mode: mode.to_owned(),
+        };
+        let spawn = |agent: &str, mode: &str| Event {
+            agent_id: Some(AgentId::new(agent)),
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::AgentSpawned(AgentSpawned {
+                session: Some(settings(mode)),
+                ..AgentSpawned::default()
+            })),
+        };
+        let state = super::fixture::projected(&[spawn("root", "ask"), spawn("other", "bypass")]);
+        assert_eq!(state.root_agent_id.as_deref(), Some("root"));
+        assert_eq!(state.settings, settings("ask"));
+        assert_eq!(
+            super::fixture::projected(&[]).settings,
+            horde_proto::v1::SessionSettings::default()
+        );
+    }
+
     #[test]
     fn the_permission_mode_rides_the_projection_from_the_spawn_spec() {
         let with_mode = Kind::AgentSpawned(AgentSpawned {
+            session: None,
             parent_agent_id: None,
             spawned_by: None,
             spec: Some(AgentSpec {
@@ -1403,6 +1434,7 @@ pub(crate) mod fixture {
             occurred_at: None,
             idempotency_key: String::new(),
             kind: Some(Kind::AgentSpawned(AgentSpawned {
+                session: None,
                 parent_agent_id: parent.map(AgentId::new),
                 spawned_by: None,
                 spec: Some(AgentSpec::default()),

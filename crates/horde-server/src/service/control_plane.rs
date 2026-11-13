@@ -292,8 +292,40 @@ impl ControlPlane {
         if let Some(id) = workspace.as_deref() {
             self.required_definition(id).await.map_err(Status::from)?;
         }
-        validate_model_selection(Some(spec))?;
+        validate_model_selection(Some(spec), &self.core.tiers)?;
         Ok(workspace)
+    }
+
+    /// `spec` with the permission mode the layers choose when it names none
+    /// (ADR-0016): the session's, else its workspace's, else the server's
+    /// default. Stamped into the spawn so the log records the mode the agent
+    /// runs under and the worker can map it (codex's sandbox).
+    async fn stamped_mode(
+        &self,
+        mut spec: horde_proto::v1::AgentSpec,
+        session: Option<crate::config::SessionLayer<'_>>,
+    ) -> Result<horde_proto::v1::AgentSpec, Status> {
+        if !spec.permission_mode.is_empty() {
+            return Ok(spec);
+        }
+        let workspace = match spec
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) => Some(self.required_definition(&id).await.map_err(Status::from)?),
+            None => None,
+        };
+        let (mode, _) = crate::config::agent_mode(
+            "",
+            session,
+            workspace.as_ref(),
+            &self.core.permission_modes,
+            &horde_config::Origin::Default,
+        );
+        spec.permission_mode = mode;
+        Ok(spec)
     }
 
     /// A spawn's ADR-0014 fields, validated against its Definition (a bare
@@ -521,7 +553,8 @@ impl ControlPlaneService for ControlPlane {
         if let Some(id) = root_workspace.as_deref() {
             self.required_definition(id).await.map_err(Status::from)?;
         }
-        validate_model_selection(Some(&root_agent))?;
+        validate_model_selection(Some(&root_agent), &self.core.tiers)?;
+        let settings = request.settings.unwrap_or_default();
 
         // The session id and root agent id are server-assigned. Derived from the
         // idempotency key when one is supplied, so a retry after a lost response
@@ -535,12 +568,22 @@ impl ControlPlaneService for ControlPlane {
         let serialized = self.core.placement_lock.clone();
         let held = serialized.lock().await;
         let root_agent = self.validated_checkout(root_agent, &root_agent_id).await?;
+        let root_agent = self
+            .stamped_mode(
+                root_agent,
+                Some(crate::config::SessionLayer {
+                    id: &session_id,
+                    permission_mode: &settings.permission_mode,
+                }),
+            )
+            .await?;
 
         let spawned = Event {
             agent_id: Some(AgentId::new(root_agent_id.clone())),
             occurred_at: None,
             idempotency_key: request.idempotency_key.clone(),
             kind: Some(Kind::AgentSpawned(AgentSpawned {
+                session: Some(settings),
                 parent_agent_id: None,
                 spawned_by: actor,
                 spec: Some(root_agent),
@@ -1052,6 +1095,15 @@ impl ControlPlaneService for ControlPlane {
             return Ok(Response::new(response));
         }
         let spec = self.validated_checkout(spec, &agent_id).await?;
+        let spec = self
+            .stamped_mode(
+                spec,
+                Some(crate::config::SessionLayer {
+                    id: &session_id,
+                    permission_mode: &state.settings.permission_mode,
+                }),
+            )
+            .await?;
 
         // The agent exists whether or not it is placed: spawn never blocks, and
         // an unmatched spawn comes back queued with a reason (DESIGN.md §6).
@@ -1063,7 +1115,7 @@ impl ControlPlaneService for ControlPlane {
             .and_then(|parent_id| state.agents.get(parent_id))
             .and_then(|parent_state| parent_state.worker_id.clone());
         let constraints = spec.placement.clone().unwrap_or_default();
-        let harness = placement::requested_provider(Some(&spec));
+        let harness = placement::requested_provider(Some(&spec), &self.core.tiers);
         let placement = self.core.scheduler.place(&PlacementRequest {
             constraints: &constraints,
             parent_worker_id: parent_worker.as_deref(),
@@ -1082,6 +1134,7 @@ impl ControlPlaneService for ControlPlane {
                 occurred_at: None,
                 idempotency_key: request.idempotency_key.clone(),
                 kind: Some(Kind::AgentSpawned(AgentSpawned {
+                    session: None,
                     parent_agent_id: parent.clone().map(AgentId::new),
                     // A client identity, or nothing: an MCP-initiated spawn
                     // arrives over the worker's channel and its true actor is
@@ -1142,6 +1195,7 @@ impl ControlPlaneService for ControlPlane {
         }
 
         let definition = horde_proto::v1::WorkspaceDefinition {
+            permission_mode: request.permission_mode,
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(format!(
                 "ws-{}",
                 uuid_like()
@@ -1267,6 +1321,11 @@ impl ControlPlaneService for ControlPlane {
         crate::workspace_policy::validate_definition_fields(&repos, &request.unmanaged_paths, mode)
             .map_err(Status::from)?;
         let cleanup = request.cleanup.or(current.cleanup);
+        let permission_mode = match (request.clear_permission_mode, request.permission_mode) {
+            (true, _) => String::new(),
+            (false, mode) if mode.is_empty() => current.permission_mode.clone(),
+            (false, mode) => mode,
+        };
         let stamped = self
             .append_definition(
                 horde_proto::v1::WorkspaceDefinition {
@@ -1276,6 +1335,7 @@ impl ControlPlaneService for ControlPlane {
                     etag: String::new(),
                     checkout_mode,
                     cleanup,
+                    permission_mode,
                     ..current
                 },
                 false,
@@ -1589,6 +1649,61 @@ impl ControlPlaneService for ControlPlane {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(DeleteMcpServerResponse {}))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_effective_config(
+        &self,
+        request: Request<horde_proto::v1::GetEffectiveConfigRequest>,
+    ) -> Result<Response<horde_proto::v1::GetEffectiveConfigResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = if request.workspace.is_empty() {
+            None
+        } else {
+            let catalog = self.catalog().await.map_err(Status::from)?;
+            let found = catalog
+                .get(&request.workspace)
+                .or_else(|| catalog.get_by_name(&request.workspace))
+                .cloned();
+            Some(found.ok_or_else(|| {
+                Status::from(ServerError::NoSuchWorkspace {
+                    wanted: request.workspace.clone(),
+                })
+            })?)
+        };
+        let session = match request
+            .session_id
+            .as_ref()
+            .filter(|id| !id.value.is_empty())
+        {
+            Some(id) => Some(self.project_named(Some(id)).await?),
+            None => None,
+        };
+        let mut entries = self.core.config.entries().to_vec();
+        if workspace.is_some() || session.is_some() {
+            entries.extend(crate::config::agent_entries(
+                &self.core.config,
+                &self.core.permission_modes,
+                &self.core.workspace_policy,
+                session
+                    .as_ref()
+                    .map(|(id, state)| crate::config::SessionLayer {
+                        id,
+                        permission_mode: &state.settings.permission_mode,
+                    }),
+                workspace.as_ref(),
+            ));
+        }
+        Ok(Response::new(horde_proto::v1::GetEffectiveConfigResponse {
+            entries: entries
+                .into_iter()
+                .map(|entry| horde_proto::v1::ConfigEntry {
+                    key: entry.key,
+                    value: entry.value,
+                    origin: entry.origin.to_string(),
+                })
+                .collect(),
+        }))
     }
 
     async fn list_workers(
@@ -2034,14 +2149,16 @@ fn client_principal_of<T>(request: &Request<T>) -> Option<String> {
 /// # Errors
 ///
 /// `InvalidArgument` naming the tier and the known ones.
-fn validate_model_selection(spec: Option<&horde_proto::v1::AgentSpec>) -> Result<(), Status> {
+fn validate_model_selection(
+    spec: Option<&horde_proto::v1::AgentSpec>,
+    catalog: &crate::tiers::TierCatalog,
+) -> Result<(), Status> {
     let Some(horde_proto::v1::model_selection::Selection::Tier(tier)) = spec
         .and_then(|spec| spec.model.as_ref())
         .and_then(|model| model.selection.as_ref())
     else {
         return Ok(());
     };
-    let catalog = crate::tiers::TierCatalog::shipped_defaults();
     if catalog.get(tier).is_none() {
         return Err(Status::invalid_argument(format!(
             "tier {tier:?} is not in the catalog; known tiers: {}",

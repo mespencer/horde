@@ -56,7 +56,8 @@ impl Default for WorkspacePolicyConfig {
 
 /// A duration on the wire; one past the wire's range saturates to its
 /// largest.
-fn wire(duration: Duration) -> horde_proto::prost_types::Duration {
+#[must_use]
+pub fn wire(duration: Duration) -> horde_proto::prost_types::Duration {
     horde_proto::prost_types::Duration::try_from(duration).unwrap_or(
         horde_proto::prost_types::Duration {
             seconds: i64::MAX,

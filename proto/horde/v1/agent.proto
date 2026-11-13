@@ -306,6 +306,14 @@ message AgentSummary {
   google.protobuf.Timestamp created_at = 9;
 }
 
+// Settings that apply to every Agent a Client creates in one Session
+// (ADR-0016's session layer). Empty fields leave the decision to the
+// Workspace and Server layers below.
+message SessionSettings {
+  // The permission mode for Agents in this Session whose spawn names none.
+  string permission_mode = 1;
+}
+
 message SessionSummary {
   SessionId session_id = 1;
 

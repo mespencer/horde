@@ -145,6 +145,11 @@ service ControlPlaneService {
   // command exits or either peer's stream ends — the login dies with either.
   // Client channels only: a Worker principal is refused.
   rpc WorkerLogin(stream WorkerLoginRequest) returns (stream WorkerLoginResponse);
+
+  // The Server's effective configuration, one entry per key with the layer
+  // that decided it (ADR-0016). With a Workspace or Session it adds the
+  // per-agent keys for an Agent a Client would create there.
+  rpc GetEffectiveConfig(GetEffectiveConfigRequest) returns (GetEffectiveConfigResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +183,9 @@ message CreateSessionRequest {
 
   // Makes retry after a lost response safe.
   string idempotency_key = 4;
+
+  // The Session's settings (ADR-0016's session layer).
+  SessionSettings settings = 5;
 }
 
 message CreateSessionResponse {
@@ -387,6 +395,9 @@ message CreateWorkspaceDefinitionRequest {
   CheckoutMode checkout_mode = 4;
 
   WorkspaceCleanupPolicy cleanup = 5;
+
+  // The Workspace's permission mode (ADR-0016). Empty: the Server's.
+  string permission_mode = 6;
 }
 
 message CreateWorkspaceDefinitionResponse {
@@ -438,6 +449,12 @@ message UpdateWorkspaceDefinitionRequest {
 
   // Unset: unchanged.
   WorkspaceCleanupPolicy cleanup = 7;
+
+  // Empty: unchanged, unless clear_permission_mode is set.
+  string permission_mode = 8;
+
+  // Clears the Workspace's permission mode, so the Server's applies.
+  bool clear_permission_mode = 9;
 }
 
 message UpdateWorkspaceDefinitionResponse {
@@ -772,4 +789,29 @@ message QueryUsageResponse {
   // whether or not the group_by named them, because headroom is a fact about
   // the account, not about the grouping.
   repeated AccountHeadroom accounts = 2;
+}
+
+message GetEffectiveConfigRequest {
+  // A Workspace by id or name; empty for none.
+  string workspace = 1;
+
+  // A Session by id; empty for none.
+  SessionId session_id = 2;
+}
+
+// One effective key.
+message ConfigEntry {
+  // The dotted key path, as the config file spells it.
+  string key = 1;
+
+  // The value as the file would spell it.
+  string value = 2;
+
+  // The layer that decided it: "default", "file <path>", "flag --<name>",
+  // "env <VAR>", "workspace <name>", "session <id>".
+  string origin = 3;
+}
+
+message GetEffectiveConfigResponse {
+  repeated ConfigEntry entries = 1;
 }

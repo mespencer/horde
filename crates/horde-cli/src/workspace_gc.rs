@@ -154,6 +154,7 @@ pub async fn create_request(
         unmanaged_paths: unmanaged_paths.to_vec(),
         checkout_mode: mode_for(policy.checkout_mode).into(),
         cleanup: cleanup_from(policy)?,
+        permission_mode: policy.permission_mode.clone().unwrap_or_default(),
     })
 }
 

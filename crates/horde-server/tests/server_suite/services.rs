@@ -410,6 +410,7 @@ async fn creating_a_session_twice_with_one_key_creates_one_session() {
     let mut harness = connect_to(core).await.expect("the harness must connect");
 
     let request = || CreateSessionRequest {
+        settings: None,
         title: "retried".to_owned(),
         workspace_definition_id: None,
         root_agent: Some(AgentSpec::default()),

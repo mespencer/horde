@@ -271,6 +271,7 @@ async fn a_session_rooted_in_an_unknown_workspace_is_refused() {
     let refused = harness
         .control
         .create_session(horde_proto::v1::CreateSessionRequest {
+            settings: None,
             title: "ghost".to_owned(),
             workspace_definition_id: None,
             root_agent: Some(AgentSpec {

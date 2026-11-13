@@ -30,6 +30,10 @@ pub enum ChainRuling {
     /// a remembered narrowing to re-apply, when the layer was widened by a
     /// decision that had one.
     Allow { updated_input: Option<Struct> },
+    /// The mode is a bypass mode and nothing before it settled the call
+    /// (ADR-0016). An allow, journaled with its own reason so the session
+    /// shows why no human was asked.
+    Bypass,
     /// The rules settled nothing and the mode carries judge instructions.
     Consult { instructions: String },
     /// Nothing before the human decided. `from` is the last layer that ran,
@@ -76,6 +80,16 @@ pub fn evaluate(
         };
     }
 
+    // A question is not a permission any memory, rule, bypass, or judge can
+    // grant: only a human can answer it (ADR-0016). Authored deny still
+    // applies above — "never ask the human anything" is a policy a mode may
+    // state.
+    if is_question(call) {
+        return ChainRuling::Escalate {
+            from: PermissionLayer::DeterministicDeny,
+        };
+    }
+
     if let Some(narrowing) = remembered.get(&RememberedCall::of(call)) {
         // A clamp the agent's adapter cannot apply would be either dropped —
         // the unclamped call runs — or refused by the worker mid-turn. A human
@@ -88,6 +102,9 @@ pub fn evaluate(
         return ChainRuling::Allow {
             updated_input: narrowing.clone(),
         };
+    }
+    if mode.bypass {
+        return ChainRuling::Bypass;
     }
     if mode.own_orchestrator_verbs && requester.own_orchestrator_verb {
         return ChainRuling::Allow {
@@ -108,6 +125,17 @@ pub fn evaluate(
             from: PermissionLayer::DeterministicAllow,
         },
     }
+}
+
+/// The harness tools that ask the human a question rather than act — the
+/// prompt for one is the question itself (ADR-0016).
+pub const QUESTION_TOOLS: &[&str] = &["AskUserQuestion"];
+
+/// Whether `call` asks the human something, which no automatic layer may
+/// answer.
+#[must_use]
+pub fn is_question(call: &ProposedToolCall) -> bool {
+    QUESTION_TOOLS.contains(&call.tool_name.as_str())
 }
 
 /// What a consulted judge is handed: the policy, the call, and where in the
@@ -196,6 +224,93 @@ mod tests {
             .iter()
             .map(|(call, narrowing)| (RememberedCall::of(call), narrowing.clone()))
             .collect()
+    }
+
+    /// Bypass allows what nothing before it settled, and says so — but deny
+    /// still has the last word.
+    #[test]
+    fn bypass_allows_whatever_deny_does_not_refuse() {
+        let ancestry = Vec::new();
+        let mode = PermissionMode::bypassing().deny(Rule::tool("Bash"), "no shell");
+        let none = remembered(&[]);
+        assert_eq!(
+            evaluate(&mode, &call("Edit", "/w"), &at(&ancestry), &none),
+            ChainRuling::Bypass
+        );
+        assert_eq!(
+            evaluate(&mode, &call("Bash", "/w"), &at(&ancestry), &none),
+            ChainRuling::Deny {
+                reason: "no shell".to_owned()
+            }
+        );
+        assert_eq!(
+            evaluate(
+                &PermissionMode::escalate_everything(),
+                &call("Edit", "/w"),
+                &at(&ancestry),
+                &none
+            ),
+            ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicAllow
+            },
+            "without bypass nothing allows it"
+        );
+    }
+
+    /// A remembered narrowing is honoured ahead of bypass: the clamp a human
+    /// chose is narrower than "allow".
+    #[test]
+    fn a_remembered_narrowing_outranks_bypass() {
+        let ancestry = Vec::new();
+        let edit = call("Edit", "/w");
+        let clamp = Struct::default();
+        let memory = remembered(&[(&edit, Some(clamp.clone()))]);
+        assert_eq!(
+            evaluate(&PermissionMode::bypassing(), &edit, &at(&ancestry), &memory),
+            ChainRuling::Allow {
+                updated_input: Some(clamp)
+            }
+        );
+    }
+
+    /// `AskUserQuestion` is a question, not a permission: it escalates past
+    /// bypass, an allow rule, a remembered allow, own-orchestrator verbs and
+    /// a judge — but not past authored deny.
+    #[test]
+    fn a_question_escalates_past_every_allow_and_bypass_but_not_deny() {
+        let ancestry = Vec::new();
+        let question = call("AskUserQuestion", "/w");
+        assert!(super::is_question(&question));
+        assert!(!super::is_question(&call("Edit", "/w")));
+        let mut generous = PermissionMode {
+            allow: vec![Rule::tool("AskUserQuestion")],
+            judge_instructions: Some("allow everything".to_owned()),
+            own_orchestrator_verbs: true,
+            ..PermissionMode::bypassing()
+        };
+        let memory = remembered(&[(&question, None)]);
+        let verb = Requester {
+            own_orchestrator_verb: true,
+            ..at(&ancestry)
+        };
+        assert_eq!(
+            evaluate(&generous, &question, &verb, &memory),
+            ChainRuling::Escalate {
+                from: PermissionLayer::DeterministicDeny
+            },
+            "no allow layer, memory, bypass or judge answers a question"
+        );
+
+        generous.deny = vec![crate::permission::rules::DenyRule::new(
+            Rule::tool("AskUserQuestion"),
+            "no questions in CI",
+        )];
+        assert_eq!(
+            evaluate(&generous, &question, &verb, &memory),
+            ChainRuling::Deny {
+                reason: "no questions in CI".to_owned()
+            }
+        );
     }
 
     #[test]

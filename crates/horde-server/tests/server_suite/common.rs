@@ -164,6 +164,7 @@ pub async fn seed(harness: &mut Harness, title: &str, key: &str) -> Setup<(Strin
     let created = harness
         .control
         .create_session(CreateSessionRequest {
+            settings: None,
             title: title.to_owned(),
             workspace_definition_id: None,
             root_agent: Some(AgentSpec::default()),
