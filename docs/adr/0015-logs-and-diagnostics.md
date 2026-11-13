@@ -14,7 +14,7 @@ an open inconsistency with §3's mTLS-everywhere posture. And when an agent
 suspects that the *system* is the problem (a worker that stopped
 materializing, a harness that rate-limits silently), it cannot look at all.
 
-The operator's intent for W12h (docs/WAVE12.md) is development and
+The operator's intent for W12h is development and
 self-debugging, not an observability stack: no OTLP database, bounded
 rotating local logs per binary, `horde logs` over the existing mTLS
 connections, an MCP tool so agents can read worker and server logs, and logs
