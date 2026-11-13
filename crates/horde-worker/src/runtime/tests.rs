@@ -2362,7 +2362,13 @@ async fn the_workspace_verbs_answer_from_the_live_checkout() {
         .expect("a repo the agent has");
     assert_eq!(answer.resolution, "reused");
     assert_eq!(answer.branch, "horde/agent-1");
-    assert!(answer.path.ends_with("agent-1/atlas"), "{}", answer.path);
+    // By path components, not text: the answer is a native path, which
+    // Windows separates with `\`.
+    assert!(
+        std::path::Path::new(&answer.path).ends_with("agent-1/atlas"),
+        "{}",
+        answer.path
+    );
 
     let unknown = access
         .checkout("agent-1", "ghost", None)

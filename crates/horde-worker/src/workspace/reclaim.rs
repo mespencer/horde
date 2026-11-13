@@ -412,8 +412,14 @@ mod tests {
 
     #[test]
     fn only_a_bare_name_or_an_absolute_path_may_run() {
+        // An absolute program as this platform spells one: `/usr/bin/make`
+        // is only rooted on Windows, where absolute needs a drive.
+        #[cfg(unix)]
+        const ABSOLUTE_MAKE: &str = "/usr/bin/make";
+        #[cfg(windows)]
+        const ABSOLUTE_MAKE: &str = r"C:\tools\make.exe";
         assert!(is_runnable_program("cargo"));
-        assert!(is_runnable_program("/usr/bin/make"));
+        assert!(is_runnable_program(ABSOLUTE_MAKE));
         assert!(!is_runnable_program("./clean.sh"));
         assert!(!is_runnable_program("scripts/clean"));
         assert!(!is_runnable_program(""));

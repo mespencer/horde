@@ -89,7 +89,17 @@ fn statvfs_reports_the_real_filesystem() {
     assert!(total > 1, "{total}");
     assert!(free > 1, "{free}");
     assert!(free <= total, "{free} of {total}");
-    assert_eq!(StatvfsStats.stats(&dir.path().join("absent")), None);
+    // An absent path: Unix `statvfs` fails on it, while Windows'
+    // `GetDiskFreeSpaceExW` answers for the volume the path would be on.
+    let absent = StatvfsStats.stats(&dir.path().join("absent"));
+    #[cfg(unix)]
+    assert_eq!(absent, None);
+    #[cfg(windows)]
+    assert_eq!(
+        absent.map(|(_, total)| total),
+        Some(total),
+        "an absent path reports its volume"
+    );
 }
 
 /// The manager reports as its Worker, has fetched nothing yet, and asks
