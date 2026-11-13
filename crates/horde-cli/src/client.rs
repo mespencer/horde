@@ -68,6 +68,12 @@ pub enum ClientError {
         source: serde_json::Error,
     },
 
+    /// `--answer` / `horde answer` pairs that could not be read, or that
+    /// contradict the rest of the command — refused locally, before a round
+    /// trip that could only come back as a server-side refusal.
+    #[error("{0}")]
+    Answers(String),
+
     /// The identity directory did not yield a usable identity.
     ///
     /// Distinct from a connection failure because the remedy is local:
@@ -866,6 +872,7 @@ impl Client {
                 reason: answer.reason.to_owned(),
                 remember_for_session: answer.remember_for_session,
                 updated_input,
+                answers: horde_wire::permission::answers_to_wire(&answer.answers),
             })
             .await?
             .into_inner()
@@ -1500,6 +1507,11 @@ pub struct PermissionAnswer<'a> {
     /// "allow with no arguments at all", which is a different instruction, and
     /// the distinction survives all the way to the harness.
     pub updated_input: Option<&'a serde_json::Value>,
+    /// Answers to the request's questions, keyed by question id or by the
+    /// question's 1-based position (W12c). The Server resolves the keys
+    /// against the request it holds and refuses any that match nothing.
+    /// Empty for a plain approval.
+    pub answers: horde_adapter::Answers,
 }
 
 impl<'a> PermissionAnswer<'a> {
@@ -1512,6 +1524,16 @@ impl<'a> PermissionAnswer<'a> {
             reason: "",
             remember_for_session: false,
             updated_input: None,
+            answers: horde_adapter::Answers::new(),
+        }
+    }
+
+    /// Answer the request's questions.
+    #[must_use]
+    pub fn answering(request_id: &'a str, answers: horde_adapter::Answers) -> Self {
+        Self {
+            answers,
+            ..Self::allow(request_id)
         }
     }
 
@@ -1524,6 +1546,7 @@ impl<'a> PermissionAnswer<'a> {
             reason,
             remember_for_session: false,
             updated_input: None,
+            answers: horde_adapter::Answers::new(),
         }
     }
 

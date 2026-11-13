@@ -8,10 +8,12 @@
 //!
 //! * **Every server request gets a reply.** An unanswered one parks the
 //!   harness at `waitingOnApproval` forever (transcript 19). MCP tool-call
-//!   elicitations and exec approvals (`item/commandExecution/requestApproval`,
-//!   re-probe transcripts 20–33) become permission events the chain
-//!   adjudicates; everything else is refused — deny-by-default, because Horde
-//!   has no chain seam for it (ADR-0005, as amended 2026-08-19).
+//!   elicitations, exec approvals (`item/commandExecution/requestApproval`,
+//!   re-probe transcripts 20–33), and — from 0.167 — file-change approvals,
+//!   sandbox-widening requests and questions (transcripts 36–39) become
+//!   permission events the chain adjudicates; everything else is refused —
+//!   deny-by-default, because Horde has no chain seam for it (ADR-0005, as
+//!   amended 2026-08-19 and 2026-11-13).
 //! * **`send` never awaits a turn response.** A turn request's failure comes
 //!   back interleaved with the stream, and blocking the pump on it would
 //!   deadlock against an elicitation only the pump can answer. Failures
@@ -26,17 +28,21 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, Capabilities, Delivery,
-    McpEndpoint, PermissionDecision, ProviderSessionId, Result, ToolCallId, TurnInput,
+    McpEndpoint, PermissionDecision, ProviderSessionId, Result, SupportVerdict, ToolCallId,
+    TurnInput, VersionReport,
 };
 use horde_adapter_codex::codec::{
     ExecDecision, ThreadConfig, decode_line, encode_decision_decline, encode_elicitation_response,
     encode_exec_approval_response, encode_initialize, encode_initialized, encode_interrupt,
-    encode_method_not_found, encode_steer, encode_thread_resume, encode_thread_start,
-    encode_turn_start,
+    encode_method_not_found, encode_permissions_response, encode_steer, encode_thread_resume,
+    encode_thread_start, encode_turn_start, encode_user_input_response, encode_withdrawal,
 };
 use horde_adapter_codex::sandbox::SandboxPolicy;
 use horde_adapter_codex::turn::{ApprovalKind, TurnAssembler};
-use horde_adapter_codex::wire::{EXEC_APPROVAL_METHOD, Frame, MCP_ELICITATION_METHOD, RpcError};
+use horde_adapter_codex::wire::{
+    EXEC_APPROVAL_METHOD, FILE_CHANGE_APPROVAL_METHOD, Frame, MCP_ELICITATION_METHOD,
+    PERMISSIONS_APPROVAL_METHOD, RpcError, USER_INPUT_METHOD,
+};
 
 use crate::harness::HarnessProfile;
 use crate::process::{HarnessSpec, SupervisedHarness, SupervisorError};
@@ -70,44 +76,40 @@ pub struct CodexAdapter {
     /// declared broken. Generous for a real harness; tests shrink it so a
     /// child that answers nothing fails in seconds.
     pub response_ceiling: std::time::Duration,
-    /// Whether the binary this adapter launches routes exec approvals — the
-    /// version gate on [`Capability::PreAuthorizeExecCommands`]. Set by
-    /// [`Self::probe_exec_interception`]; defaults to the floor, because a
-    /// claim nobody measured is a chain that silently gates nothing.
-    pub exec_interception: ExecInterception,
+    /// What the launched binary's `--version` said, classified against
+    /// [`horde_adapter_codex::SUPPORT`] (W12c). It gates the per-kind claims
+    /// — exec at 0.147+, file changes at 0.167+ — and refuses a binary below
+    /// the floor. Set by [`Self::probe_version`]; defaults to unreadable,
+    /// which claims the floor, because a claim nobody measured is a chain
+    /// that silently gates nothing.
+    pub version: VersionReport,
 }
 
-/// What is known about the launched codex's exec-approval routing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecInterception {
-    /// Unprobed, unparseable, or below 0.147: only the sandbox tier enforces
-    /// exec, and the capability claim stays at the floor. The reason is kept
-    /// for the journal, so "why was this agent not gated?" has an answer.
-    SandboxOnly { reason: String },
-    /// The probed binary is 0.147+ (transcripts 25/33): exec approvals route
-    /// to the client under the granular policy this adapter always sends.
-    Routed { version: String },
-}
-
-impl ExecInterception {
-    /// The unprobed default.
-    fn unprobed() -> Self {
-        Self::SandboxOnly {
-            reason: "codex version not probed".to_owned(),
-        }
+/// The journal lines naming the enforcement each call kind actually gets on
+/// this binary, plus the version verdict itself when it is not "supported".
+fn enforcement_diagnostics(version: &VersionReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if version.verdict != SupportVerdict::Supported {
+        lines.push(format!("harness version warning: {}", version.describe()));
     }
-
-    /// One journal line naming the enforcement exec calls actually get.
-    fn diagnostic(&self) -> String {
-        match self {
-            Self::Routed { version } => {
-                format!("codex exec approvals: routed to the permission chain ({version})")
-            }
-            Self::SandboxOnly { reason } => {
-                format!("codex exec approvals: sandbox tier only ({reason})")
-            }
-        }
-    }
+    let shown = version
+        .version
+        .map_or_else(|| "version unreadable".to_owned(), |v| format!("codex {v}"));
+    lines.push(
+        if version.at_least(horde_adapter_codex::version::FIRST_EXEC_ROUTING) {
+            format!("codex exec approvals: routed to the permission chain ({shown})")
+        } else {
+            format!("codex exec approvals: sandbox tier only ({shown}; 0.147+ routes them)")
+        },
+    );
+    lines.push(
+        if horde_adapter_codex::routes_file_change_approvals(version) {
+            format!("codex file-change approvals: routed to the permission chain ({shown})")
+        } else {
+            format!("codex file-change approvals: sandbox tier only ({shown}; 0.167+ routes them)")
+        },
+    );
+    lines
 }
 
 impl CodexAdapter {
@@ -120,7 +122,10 @@ impl CodexAdapter {
             sandbox_policy: SandboxPolicy::default(),
             extra_env: Vec::new(),
             response_ceiling: std::time::Duration::from_secs(30),
-            exec_interception: ExecInterception::unprobed(),
+            version: VersionReport::unreadable(
+                horde_adapter_codex::SUPPORT,
+                "codex version not probed",
+            ),
         }
     }
 
@@ -133,18 +138,20 @@ impl CodexAdapter {
         self
     }
 
-    /// Probes the launched binary's version and records whether it routes
-    /// exec approvals (0.147+, transcripts 25/33 — the gate is
-    /// [`horde_adapter_codex::routes_exec_approvals`]).
+    /// Probes the launched binary's version and classifies it (W12c).
     ///
     /// One `--version` invocation, bounded by the response ceiling. Every
     /// failure — a binary that is missing, hangs, errs, or prints something
-    /// unreadable — fails closed to [`ExecInterception::SandboxOnly`] with the
-    /// reason kept for the journal: the floor claim is always honest, whereas
-    /// a guessed `Routed` advertises a chain that would gate nothing.
+    /// unreadable — reads as an unreadable version: untested, claiming only
+    /// the floor, with the reason kept for the journal.
     #[must_use]
-    pub async fn probe_exec_interception(mut self) -> Self {
-        self.exec_interception = probe_version(&self.program, self.response_ceiling).await;
+    pub async fn probe_version(mut self) -> Self {
+        self.version = crate::harness::probe_version(
+            &self.program,
+            horde_adapter_codex::SUPPORT,
+            self.response_ceiling,
+        )
+        .await;
         self
     }
 
@@ -177,6 +184,12 @@ impl CodexAdapter {
         spec: &AgentSpec,
         resume_thread: Option<&ProviderSessionId>,
     ) -> Result<Box<dyn AgentSession>> {
+        if self.version.is_refused() {
+            return Err(AdapterError::RefusedVersion {
+                provider: horde_adapter_codex::PROVIDER.to_owned(),
+                detail: self.version.describe(),
+            });
+        }
         let launch = self.harness_spec(spec).map_err(launch_failure)?;
         let harness = SupervisedHarness::spawn(&launch)
             .await
@@ -201,11 +214,12 @@ impl CodexAdapter {
             tier.tier.wire_name(),
             tier.reason
         ));
-        // The other half of the enforcement audit trail: whether exec calls
-        // are chain-gated on this binary, or the tier is all there is.
-        session
-            .assembler
-            .note_startup_diagnostic(self.exec_interception.diagnostic());
+        // The other half of the enforcement audit trail: which call kinds are
+        // chain-gated on this binary, or the tier is all there is — and an
+        // untested version's warning, on the record where its failures land.
+        for line in enforcement_diagnostics(&self.version) {
+            session.assembler.note_startup_diagnostic(line);
+        }
 
         // initialize → initialized → thread/start|thread/resume. Awaiting is
         // safe here: no turn is running, so nothing the pump must answer can
@@ -267,15 +281,14 @@ impl Adapter for CodexAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // The exec-interception claim is earned by the probe, never assumed:
-        // an unprobed adapter claims the floor, so placement can only rely on
-        // per-call exec gating where a 0.147+ binary actually answered.
-        match &self.exec_interception {
-            ExecInterception::Routed { .. } => {
-                horde_adapter_codex::capabilities_with_exec_interception()
-            }
-            ExecInterception::SandboxOnly { .. } => horde_adapter_codex::capabilities(),
-        }
+        // The per-kind claims are earned by the probe, never assumed: an
+        // unprobed adapter claims the floor, so placement can only rely on
+        // per-call gating where the binary actually answered a version.
+        horde_adapter_codex::capabilities_for(&self.version)
+    }
+
+    fn harness_version(&self) -> Option<&VersionReport> {
+        Some(&self.version)
     }
 
     fn login_recipe(&self) -> Option<horde_adapter::LoginRecipe> {
@@ -388,42 +401,6 @@ fn mcp_server_overrides(endpoint: Option<&McpEndpoint>) -> McpOverrides {
 /// unescaped in a path or URL would silently truncate the override.
 fn toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-/// One bounded `--version` run, classified.
-///
-/// The child is killed if the ceiling fires (`kill_on_drop`), so a wedged
-/// binary costs the ceiling once and leaves nothing behind.
-async fn probe_version(program: &str, ceiling: std::time::Duration) -> ExecInterception {
-    let probe = tokio::process::Command::new(program)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(ceiling, probe).await {
-        Err(_elapsed) => ExecInterception::SandboxOnly {
-            reason: format!("`{program} --version` answered nothing within {ceiling:?}"),
-        },
-        Ok(Err(error)) => ExecInterception::SandboxOnly {
-            reason: format!("`{program} --version` could not run: {error}"),
-        },
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let text = text.trim();
-            if horde_adapter_codex::routes_exec_approvals(text) {
-                ExecInterception::Routed {
-                    version: text.to_owned(),
-                }
-            } else {
-                ExecInterception::SandboxOnly {
-                    reason: format!(
-                        "`{program} --version` reported {text:?}, which does not route \
-                         exec approvals (0.147+ does — transcripts 25/33)"
-                    ),
-                }
-            }
-        }
-    }
 }
 
 /// Whether an RPC failure means the account is not signed in, as opposed to
@@ -647,16 +624,7 @@ impl LiveCodexSession {
     /// withdrawal is not a chain refusal, so nothing lands in the denials.
     async fn request_interrupt(&mut self) -> Result<()> {
         for withdrawn in self.assembler.withdraw_outstanding() {
-            let (reply, encoding) = match &withdrawn.kind {
-                ApprovalKind::ExecCommand { .. } => (
-                    encode_exec_approval_response(withdrawn.rpc_id, &ExecDecision::Cancel),
-                    ExecDecision::Cancel.wire_name(),
-                ),
-                ApprovalKind::McpElicitation => (
-                    encode_elicitation_response(withdrawn.rpc_id, false),
-                    "decline",
-                ),
-            };
+            let (reply, encoding) = encode_withdrawal(&withdrawn);
             if let Some(event) = self.assembler.note_decision(format!(
                 "codex approval withdrawn by interrupt → {encoding}"
             )) {
@@ -789,7 +757,14 @@ impl LiveCodexSession {
 /// Named predicate: everything else is refused outright, so widening this by
 /// accident would offer the chain requests it has no vocabulary to answer.
 fn is_adjudicable_method(method: &str) -> bool {
-    method == MCP_ELICITATION_METHOD || method == EXEC_APPROVAL_METHOD
+    matches!(
+        method,
+        MCP_ELICITATION_METHOD
+            | EXEC_APPROVAL_METHOD
+            | FILE_CHANGE_APPROVAL_METHOD
+            | PERMISSIONS_APPROVAL_METHOD
+            | USER_INPUT_METHOD
+    )
 }
 
 /// The refusal an adjudicable-method request gets when it could not become a
@@ -800,10 +775,11 @@ fn is_adjudicable_method(method: &str) -> bool {
 /// answered with `action`) deserializes to nothing server-side, and then
 /// nothing was answered at all — the transcript-19 park.
 fn unadjudicable_refusal(id: u64, method: &str) -> String {
-    if method == MCP_ELICITATION_METHOD {
-        encode_elicitation_response(id, false)
-    } else {
-        encode_decision_decline(id)
+    match method {
+        MCP_ELICITATION_METHOD => encode_elicitation_response(id, false),
+        PERMISSIONS_APPROVAL_METHOD => encode_permissions_response(id, &serde_json::json!({}), false),
+        USER_INPUT_METHOD => encode_user_input_response(id, &horde_adapter::Answers::new()),
+        _ => encode_decision_decline(id),
     }
 }
 
@@ -856,6 +832,155 @@ fn exec_decision_for(
         },
         None if decision.remembers_for_session() => Ok(ExecDecision::AcceptForSession),
         None => Ok(ExecDecision::Accept),
+    }
+}
+
+/// What one decision becomes on the wire for one outstanding request kind.
+#[derive(Debug, Clone, PartialEq)]
+enum Reply {
+    /// An MCP elicitation: `accept` or `decline`.
+    Elicitation { accept: bool },
+    /// The `decision` vocabulary exec and file-change approvals share.
+    Decision(ExecDecision),
+    /// A sandbox-widening grant; an empty profile grants nothing.
+    Permissions {
+        granted: serde_json::Value,
+        for_session: bool,
+    },
+    /// Answers to a codex question; empty answers nothing.
+    Answers(horde_adapter::Answers),
+}
+
+impl Reply {
+    /// The line to write, and the encoding's name for the journal.
+    fn encode(&self, rpc_id: u64) -> (String, String) {
+        match self {
+            Self::Elicitation { accept } => (
+                encode_elicitation_response(rpc_id, *accept),
+                if *accept { "accept" } else { "decline" }.to_owned(),
+            ),
+            Self::Decision(decision) => (
+                encode_exec_approval_response(rpc_id, decision),
+                decision.wire_name().to_owned(),
+            ),
+            Self::Permissions {
+                granted,
+                for_session,
+            } => (
+                encode_permissions_response(rpc_id, granted, *for_session),
+                match (granted.as_object().is_some_and(|map| !map.is_empty()), for_session) {
+                    (false, _) => "empty grant".to_owned(),
+                    (true, true) => "grant for session".to_owned(),
+                    (true, false) => "grant for turn".to_owned(),
+                },
+            ),
+            Self::Answers(answers) => (
+                encode_user_input_response(rpc_id, answers),
+                format!("{} answer(s)", answers.len()),
+            ),
+        }
+    }
+}
+
+/// A [`Reply`], and whether the decision had to be declined because the
+/// kind's vocabulary cannot carry it.
+#[derive(Debug, Clone, PartialEq)]
+struct Mapped {
+    reply: Reply,
+    inexpressible: bool,
+}
+
+impl Mapped {
+    fn expressed(reply: Reply) -> Self {
+        Self {
+            reply,
+            inexpressible: false,
+        }
+    }
+
+    fn declined(reply: Reply) -> Self {
+        Self {
+            reply,
+            inexpressible: true,
+        }
+    }
+}
+
+/// The chain's decision, mapped into the outstanding request's vocabulary.
+///
+/// Every vocabulary is allow-or-refuse shaped except the question's, so the
+/// shared rules are: a narrowing that restates the proposal is an allow; one
+/// that actually rewrites is declined (`RewritesToolInput` is not claimed);
+/// answers apply only to a question, and anything else answered is declined;
+/// a question allowed without answers is answered with nothing.
+fn reply_for(
+    kind: &ApprovalKind,
+    decision: &PermissionDecision,
+    proposal: &serde_json::Value,
+) -> Mapped {
+    let rewrites = decision
+        .updated_input()
+        .is_some_and(|updated| updated != proposal);
+    let answered = decision.answers().is_some();
+    match kind {
+        ApprovalKind::McpElicitation => {
+            if decision.updated_input().is_some() || answered {
+                Mapped::declined(Reply::Elicitation { accept: false })
+            } else {
+                Mapped::expressed(Reply::Elicitation {
+                    accept: decision.is_allow(),
+                })
+            }
+        }
+        ApprovalKind::ExecCommand { proposed_amendment } if !answered => {
+            match exec_decision_for(decision, proposal, proposed_amendment.as_deref()) {
+                Ok(exec) => Mapped::expressed(Reply::Decision(exec)),
+                Err(InexpressibleNarrowing) => {
+                    Mapped::declined(Reply::Decision(ExecDecision::Decline))
+                }
+            }
+        }
+        ApprovalKind::ExecCommand { .. } => {
+            Mapped::declined(Reply::Decision(ExecDecision::Decline))
+        }
+        ApprovalKind::FileChange => {
+            if rewrites || answered {
+                Mapped::declined(Reply::Decision(ExecDecision::Decline))
+            } else if !decision.is_allow() {
+                Mapped::expressed(Reply::Decision(ExecDecision::Decline))
+            } else if decision.remembers_for_session() {
+                Mapped::expressed(Reply::Decision(ExecDecision::AcceptForSession))
+            } else {
+                Mapped::expressed(Reply::Decision(ExecDecision::Accept))
+            }
+        }
+        ApprovalKind::Permissions { requested } => {
+            let nothing = || Reply::Permissions {
+                granted: serde_json::json!({}),
+                for_session: false,
+            };
+            if rewrites || answered {
+                Mapped::declined(nothing())
+            } else if decision.is_allow() {
+                Mapped::expressed(Reply::Permissions {
+                    granted: requested.clone(),
+                    for_session: decision.remembers_for_session(),
+                })
+            } else {
+                Mapped::expressed(nothing())
+            }
+        }
+        ApprovalKind::UserInput => match decision {
+            PermissionDecision::Answer { answers } => {
+                Mapped::expressed(Reply::Answers(answers.clone()))
+            }
+            PermissionDecision::Deny { .. } => {
+                Mapped::expressed(Reply::Answers(horde_adapter::Answers::new()))
+            }
+            PermissionDecision::Allow { .. } => {
+                Mapped::declined(Reply::Answers(horde_adapter::Answers::new()))
+            }
+        },
     }
 }
 
@@ -964,55 +1089,41 @@ impl AgentSession for LiveCodexSession {
             });
         };
 
-        // A narrowing neither reply vocabulary can carry is declined — never
+        // A decision a reply vocabulary cannot carry is declined — never
         // downgraded to running the un-narrowed original, and never left
         // unanswered either: an error here reaches nobody who would re-answer,
         // and an unanswered request parks the harness forever (transcript 19).
         // The decline is journaled with why, below.
-        let (exec_decision, inexpressible) = match &kind {
-            // Accept-or-decline: there is nowhere to carry replacement
-            // arguments, so any narrowing is inexpressible.
-            ApprovalKind::McpElicitation => (None, decision.updated_input().is_some()),
-            ApprovalKind::ExecCommand { proposed_amendment } => {
-                let proposal = self
-                    .assembler
-                    .approval_input(tool_call_id)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                match exec_decision_for(&decision, &proposal, proposed_amendment.as_deref()) {
-                    Ok(exec_decision) => (Some(exec_decision), false),
-                    Err(InexpressibleNarrowing) => (Some(ExecDecision::Decline), true),
-                }
-            }
-        };
-        let allowed = decision.is_allow() && !inexpressible;
+        let proposal = self
+            .assembler
+            .approval_input(tool_call_id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let mapped = reply_for(&kind, &decision, &proposal);
+        let allowed = decision.is_allow() && !mapped.inexpressible;
         let Some(resolved) = self.assembler.resolve_approval(tool_call_id, allowed) else {
             return Err(AdapterError::UnknownPermissionRequest {
                 tool_call_id: tool_call_id.clone(),
             });
         };
-        let (reply, encoding) = match exec_decision {
-            None => (
-                encode_elicitation_response(resolved.rpc_id, allowed),
-                if allowed { "accept" } else { "decline" }.to_owned(),
-            ),
-            Some(exec_decision) => (
-                encode_exec_approval_response(resolved.rpc_id, &exec_decision),
-                exec_decision.wire_name().to_owned(),
-            ),
-        };
+        let (reply, encoding) = mapped.reply.encode(resolved.rpc_id);
+        let inexpressible = mapped.inexpressible;
 
         // Every decision is journaled with the codex encoding it became, so
         // the audit trail shows both what the chain said and what the harness
         // was actually told.
-        let chain_said = if decision.is_allow() { "allow" } else { "deny" };
+        let chain_said = match &decision {
+            PermissionDecision::Answer { .. } => "answer",
+            PermissionDecision::Allow { .. } => "allow",
+            PermissionDecision::Deny { .. } => "deny",
+        };
         let remembering = if decision.remembers_for_session() {
             " (remember for session)"
         } else {
             ""
         };
         let narrowing = if inexpressible {
-            " with a narrowing codex cannot express, so declined rather than run un-narrowed"
+            " that codex's reply cannot express, so declined rather than run un-narrowed"
         } else {
             ""
         };
@@ -1043,7 +1154,7 @@ impl AgentSession for LiveCodexSession {
 
 #[cfg(test)]
 mod tests {
-    use horde_adapter::{Adapter, Capability, McpEndpoint};
+    use horde_adapter::{Adapter, AdapterError, Capability, McpEndpoint, PermissionDecision};
 
     use super::{
         CodexAdapter, McpOverrides, is_approval_method, is_auth_failure, mcp_server_overrides,
@@ -1094,12 +1205,12 @@ mod tests {
         assert!(!claimed.supports(Capability::PreAuthorizeToolCalls));
     }
 
-    /// The exec-interception claim is earned by the probe, never assumed: an
-    /// unprobed adapter claims the floor, a probed 0.147+ one claims the exec
-    /// gate, and neither ever claims blanket gating (file changes park,
-    /// transcripts 28/31).
+    /// The per-kind claims are earned by the probe, never assumed: an
+    /// unprobed adapter claims the floor, a probed 0.148 claims exec, a
+    /// probed 0.167 claims exec and file changes, and none ever claims the
+    /// blanket gate.
     #[test]
-    fn the_exec_gating_claim_follows_the_probe_verdict() {
+    fn the_gating_claims_follow_the_probed_version() {
         let unprobed = unspawned();
         assert!(
             !unprobed
@@ -1107,126 +1218,295 @@ mod tests {
                 .supports(Capability::PreAuthorizeExecCommands),
             "no probe, no claim"
         );
+        assert_eq!(unprobed.harness_version(), Some(&unprobed.version));
 
-        let mut routed = unspawned();
-        routed.exec_interception = super::ExecInterception::Routed {
-            version: "codex-cli 0.148.0".to_owned(),
+        let at = |output: &str| {
+            let mut adapter = unspawned();
+            adapter.version = horde_adapter_codex::SUPPORT.classify(output);
+            adapter.capabilities()
         };
-        assert!(
-            routed
-                .capabilities()
-                .supports(Capability::PreAuthorizeExecCommands),
-            "a probed 0.147+ binary earns the claim"
-        );
-        assert!(
-            !routed
-                .capabilities()
-                .supports(Capability::PreAuthorizeToolCalls),
-            "and never the blanket claim — file changes stay ungated"
-        );
-
-        let mut refused = unspawned();
-        refused.exec_interception = super::ExecInterception::SandboxOnly {
-            reason: "codex-cli 0.145.0".to_owned(),
-        };
-        assert_eq!(refused.capabilities(), horde_adapter_codex::capabilities());
+        let v0148 = at("codex-cli 0.148.0");
+        assert!(v0148.supports(Capability::PreAuthorizeExecCommands));
+        assert!(!v0148.supports(Capability::PreAuthorizeFileChanges));
+        assert!(!v0148.supports(Capability::PreAuthorizeToolCalls));
+        let v0167 = at("codex-cli 0.167.0");
+        assert!(v0167.supports(Capability::PreAuthorizeFileChanges));
+        assert!(!v0167.supports(Capability::PreAuthorizeToolCalls));
+        assert_eq!(at("codex-cli 0.145.0"), horde_adapter_codex::capabilities());
     }
 
-    /// The probe fails closed: a binary that cannot run yields the floor with
-    /// a reason the journal can quote, never a guessed claim.
+    /// A refused binary never starts: the spawn fails as a refusal naming
+    /// the version and the floor, before any process exists.
     #[tokio::test]
-    async fn a_probe_that_cannot_run_fails_closed_with_its_reason() {
-        let probed = super::probe_version(
-            "/nonexistent/horde-test-codex-binary",
-            std::time::Duration::from_secs(2),
-        )
-        .await;
-        match probed {
-            super::ExecInterception::SandboxOnly { reason } => {
-                assert!(
-                    reason.contains("could not run"),
-                    "the journal must say why the claim is absent: {reason}"
-                );
+    async fn a_refused_version_refuses_the_spawn() {
+        let mut adapter = unspawned().with_program("/nonexistent/horde-test-codex");
+        adapter.version = horde_adapter_codex::SUPPORT.classify("codex-cli 0.145.0");
+        let Err(error) = adapter.spawn(&horde_adapter::AgentSpec::default()).await else {
+            panic!("a refused version must not spawn");
+        };
+        match error {
+            AdapterError::RefusedVersion { provider, detail } => {
+                assert_eq!(provider, "codex");
+                assert!(detail.contains("0.145.0") && detail.contains("0.147.0"), "{detail}");
             }
-            other => panic!("a missing binary must claim nothing, got {other:?}"),
+            other => panic!("expected a version refusal, got {other:?}"),
         }
     }
 
-    /// The probe builder records its verdict on the adapter it was called on
-    /// — not on a fresh default, which would silently discard the program,
-    /// the policy, and every other field the caller configured.
+    /// The probe fails closed and keeps the adapter it was called on — not a
+    /// fresh default, which would silently discard the program and every
+    /// other field the caller configured.
     #[tokio::test]
     async fn the_probe_builder_keeps_the_adapter_it_probed() {
         let mut adapter = unspawned().with_program("/nonexistent/horde-test-codex");
         adapter.response_ceiling = std::time::Duration::from_secs(2);
         adapter.extra_env = vec![("MARKER".to_owned(), "kept".to_owned())];
 
-        let probed = adapter.probe_exec_interception().await;
+        let probed = adapter.probe_version().await;
 
-        assert_eq!(
-            probed.program, "/nonexistent/horde-test-codex",
-            "the probed binary is the configured one, not a default"
-        );
+        assert_eq!(probed.program, "/nonexistent/horde-test-codex");
         assert_eq!(
             probed.extra_env,
             vec![("MARKER".to_owned(), "kept".to_owned())],
             "unrelated configuration survives the probe"
         );
-        match &probed.exec_interception {
-            super::ExecInterception::SandboxOnly { reason } => assert!(
-                reason.contains("/nonexistent/horde-test-codex"),
-                "the verdict names the binary that was actually probed: {reason}"
-            ),
-            other => panic!("a missing binary must claim nothing, got {other:?}"),
-        }
+        assert_eq!(probed.version.verdict, horde_adapter::SupportVerdict::Untested);
+        assert!(
+            probed.version.raw.contains("/nonexistent/horde-test-codex")
+                && probed.version.raw.contains("could not run"),
+            "the verdict names the binary that was actually probed: {}",
+            probed.version.raw
+        );
+        assert_eq!(probed.capabilities(), horde_adapter_codex::capabilities());
     }
 
     /// The unadjudicable refusal speaks each method's own reply vocabulary —
-    /// swapped, either reply deserializes to nothing server-side and the
-    /// harness parks (transcript 19). And only the two chain-seam methods are
-    /// adjudicable at all.
+    /// swapped, a reply deserializes to nothing server-side and the harness
+    /// parks (transcript 19). Every chain-seam method is adjudicable; nothing
+    /// else is.
     #[test]
     fn unadjudicable_refusals_speak_the_asking_methods_vocabulary() {
-        use horde_adapter_codex::wire::{EXEC_APPROVAL_METHOD, MCP_ELICITATION_METHOD};
+        use horde_adapter_codex::wire::{
+            EXEC_APPROVAL_METHOD, FILE_CHANGE_APPROVAL_METHOD, MCP_ELICITATION_METHOD,
+            PERMISSIONS_APPROVAL_METHOD, USER_INPUT_METHOD,
+        };
 
-        let elicitation: serde_json::Value =
-            serde_json::from_str(&super::unadjudicable_refusal(3, MCP_ELICITATION_METHOD))
-                .expect("we produced this");
-        assert_eq!(elicitation["result"]["action"], "decline");
-        assert!(elicitation["result"].get("decision").is_none());
-
-        let exec: serde_json::Value =
-            serde_json::from_str(&super::unadjudicable_refusal(4, EXEC_APPROVAL_METHOD))
-                .expect("we produced this");
-        assert_eq!(exec["result"]["decision"], "decline");
-        assert!(exec["result"].get("action").is_none());
-
-        assert!(super::is_adjudicable_method(MCP_ELICITATION_METHOD));
-        assert!(super::is_adjudicable_method(EXEC_APPROVAL_METHOD));
-        assert!(
-            !super::is_adjudicable_method("item/fileChange/requestApproval"),
-            "file-change approvals have no chain seam (transcripts 28/31)"
+        let refusal = |method: &str| -> serde_json::Value {
+            serde_json::from_str(&super::unadjudicable_refusal(3, method))
+                .expect("we produced this")
+        };
+        assert_eq!(refusal(MCP_ELICITATION_METHOD)["result"], serde_json::json!({"action": "decline"}));
+        assert_eq!(refusal(EXEC_APPROVAL_METHOD)["result"], serde_json::json!({"decision": "decline"}));
+        assert_eq!(
+            refusal(FILE_CHANGE_APPROVAL_METHOD)["result"],
+            serde_json::json!({"decision": "decline"})
         );
+        assert_eq!(
+            refusal(PERMISSIONS_APPROVAL_METHOD)["result"],
+            serde_json::json!({"permissions": {}, "scope": "turn"})
+        );
+        assert_eq!(refusal(USER_INPUT_METHOD)["result"], serde_json::json!({"answers": {}}));
+
+        for method in [
+            MCP_ELICITATION_METHOD,
+            EXEC_APPROVAL_METHOD,
+            FILE_CHANGE_APPROVAL_METHOD,
+            PERMISSIONS_APPROVAL_METHOD,
+            USER_INPUT_METHOD,
+        ] {
+            assert!(super::is_adjudicable_method(method), "{method}");
+        }
         assert!(!super::is_adjudicable_method("attestation/generate"));
+        assert!(!super::is_adjudicable_method("item/tool/call"));
     }
 
-    /// The enforcement audit line each verdict journals at spawn.
+    /// The enforcement audit lines each version journals at spawn.
     #[test]
-    fn the_interception_diagnostic_names_the_enforcement_and_the_evidence() {
-        let routed = super::ExecInterception::Routed {
-            version: "codex-cli 0.148.0".to_owned(),
+    fn the_enforcement_diagnostics_name_each_kind_and_the_evidence() {
+        let lines = |output: &str| {
+            super::enforcement_diagnostics(&horde_adapter_codex::SUPPORT.classify(output))
         };
         assert_eq!(
-            routed.diagnostic(),
-            "codex exec approvals: routed to the permission chain (codex-cli 0.148.0)"
+            lines("codex-cli 0.167.0"),
+            vec![
+                "codex exec approvals: routed to the permission chain (codex 0.167.0)".to_owned(),
+                "codex file-change approvals: routed to the permission chain (codex 0.167.0)"
+                    .to_owned(),
+            ],
+            "a supported version journals no warning"
         );
-        let floor = super::ExecInterception::SandboxOnly {
-            reason: "codex version not probed".to_owned(),
+        assert_eq!(
+            lines("codex-cli 0.148.0")[1],
+            "codex file-change approvals: sandbox tier only (codex 0.148.0; 0.167+ routes them)"
+        );
+        let newer = lines("codex-cli 0.170.0");
+        assert!(newer[0].starts_with("harness version warning: codex 0.170.0 is untested"), "{newer:?}");
+        let unreadable = lines("codex-cli");
+        assert!(unreadable[0].contains("version unreadable"), "{unreadable:?}");
+        assert_eq!(
+            unreadable[1],
+            "codex exec approvals: sandbox tier only (version unreadable; 0.147+ routes them)"
+        );
+    }
+
+    /// Each kind's decision table, row by row.
+    #[test]
+    fn the_new_kinds_map_every_decision_into_their_own_vocabulary() {
+        use horde_adapter::Answers;
+        use serde_json::json;
+
+        use super::{ApprovalKind, ExecDecision, Mapped, Reply, reply_for};
+
+        let proposal = json!({"changes": []});
+        let answers = Answers::from([("q".to_owned(), vec!["a".to_owned()])]);
+
+        // File changes speak the decision vocabulary.
+        let file = ApprovalKind::FileChange;
+        assert_eq!(
+            reply_for(&file, &PermissionDecision::allow(), &proposal),
+            Mapped::expressed(Reply::Decision(ExecDecision::Accept))
+        );
+        assert_eq!(
+            reply_for(&file, &PermissionDecision::allow().remembered(), &proposal),
+            Mapped::expressed(Reply::Decision(ExecDecision::AcceptForSession))
+        );
+        assert_eq!(
+            reply_for(&file, &PermissionDecision::allow_with(proposal.clone()), &proposal),
+            Mapped::expressed(Reply::Decision(ExecDecision::Accept)),
+            "a restatement is an allow"
+        );
+        assert_eq!(
+            reply_for(&file, &PermissionDecision::deny("no"), &proposal),
+            Mapped::expressed(Reply::Decision(ExecDecision::Decline))
+        );
+        for inexpressible in [
+            PermissionDecision::allow_with(json!({"changes": ["other"]})),
+            PermissionDecision::answer(answers.clone()),
+        ] {
+            assert_eq!(
+                reply_for(&file, &inexpressible, &proposal),
+                Mapped::declined(Reply::Decision(ExecDecision::Decline))
+            );
+        }
+
+        // Permissions grant what was asked, or nothing.
+        let asked = json!({"network": {"enabled": true}});
+        let perms = ApprovalKind::Permissions {
+            requested: asked.clone(),
         };
         assert_eq!(
-            floor.diagnostic(),
-            "codex exec approvals: sandbox tier only (codex version not probed)"
+            reply_for(&perms, &PermissionDecision::allow(), &proposal),
+            Mapped::expressed(Reply::Permissions {
+                granted: asked.clone(),
+                for_session: false
+            })
         );
+        assert_eq!(
+            reply_for(&perms, &PermissionDecision::allow().remembered(), &proposal),
+            Mapped::expressed(Reply::Permissions {
+                granted: asked,
+                for_session: true
+            })
+        );
+        let nothing = Reply::Permissions {
+            granted: json!({}),
+            for_session: false,
+        };
+        assert_eq!(
+            reply_for(&perms, &PermissionDecision::deny("no"), &proposal),
+            Mapped::expressed(nothing.clone())
+        );
+        assert_eq!(
+            reply_for(&perms, &PermissionDecision::allow_with(json!({})), &proposal),
+            Mapped::declined(nothing.clone())
+        );
+        assert_eq!(
+            reply_for(&perms, &PermissionDecision::answer(answers.clone()), &proposal),
+            Mapped::declined(nothing)
+        );
+
+        // Questions take answers; a refusal answers nothing.
+        let question = ApprovalKind::UserInput;
+        assert_eq!(
+            reply_for(&question, &PermissionDecision::answer(answers.clone()), &proposal),
+            Mapped::expressed(Reply::Answers(answers.clone()))
+        );
+        assert_eq!(
+            reply_for(&question, &PermissionDecision::deny("no"), &proposal),
+            Mapped::expressed(Reply::Answers(Answers::new()))
+        );
+        assert_eq!(
+            reply_for(&question, &PermissionDecision::allow(), &proposal),
+            Mapped::declined(Reply::Answers(Answers::new())),
+            "an allow without answers answers nothing, and says so"
+        );
+
+        // The older kinds refuse answers too.
+        assert_eq!(
+            reply_for(
+                &ApprovalKind::ExecCommand {
+                    proposed_amendment: None
+                },
+                &PermissionDecision::answer(answers.clone()),
+                &proposal
+            ),
+            Mapped::declined(Reply::Decision(ExecDecision::Decline))
+        );
+        assert_eq!(
+            reply_for(
+                &ApprovalKind::McpElicitation,
+                &PermissionDecision::answer(answers),
+                &proposal
+            ),
+            Mapped::declined(Reply::Elicitation { accept: false })
+        );
+        assert_eq!(
+            reply_for(&ApprovalKind::McpElicitation, &PermissionDecision::allow(), &proposal),
+            Mapped::expressed(Reply::Elicitation { accept: true })
+        );
+    }
+
+    /// The journal names each reply's encoding.
+    #[test]
+    fn each_reply_names_its_encoding_for_the_journal() {
+        use serde_json::json;
+
+        use super::{ExecDecision, Reply};
+
+        let name = |reply: Reply| reply.encode(7).1;
+        assert_eq!(name(Reply::Elicitation { accept: true }), "accept");
+        assert_eq!(name(Reply::Elicitation { accept: false }), "decline");
+        assert_eq!(name(Reply::Decision(ExecDecision::AcceptForSession)), "acceptForSession");
+        assert_eq!(
+            name(Reply::Permissions {
+                granted: json!({"network": {"enabled": true}}),
+                for_session: true
+            }),
+            "grant for session"
+        );
+        assert_eq!(
+            name(Reply::Permissions {
+                granted: json!({"network": {"enabled": true}}),
+                for_session: false
+            }),
+            "grant for turn"
+        );
+        assert_eq!(
+            name(Reply::Permissions {
+                granted: json!({}),
+                for_session: true
+            }),
+            "empty grant"
+        );
+        assert_eq!(
+            name(Reply::Answers(horde_adapter::Answers::from([(
+                "q".to_owned(),
+                vec!["a".to_owned()]
+            )]))),
+            "1 answer(s)"
+        );
+        let (line, _) = Reply::Elicitation { accept: true }.encode(7);
+        assert!(line.contains("\"id\":7"), "{line}");
     }
 
     /// The endpoint rides `-c` overrides, never a `config.toml` write:

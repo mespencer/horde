@@ -410,6 +410,7 @@ async fn elicited_and_answered(
         tool_call_id: horde_adapter::ToolCallId::new(item_id),
         tool_name: tool_name.to_owned(),
         input: arguments,
+        questions: Vec::new(),
     };
     let agent_id = stack.horde.agent_id.clone();
     stack
@@ -439,6 +440,7 @@ async fn elicited_and_answered(
             reason: "answered at the elicitation",
             remember_for_session: false,
             updated_input: None,
+            answers: horde_adapter::Answers::new(),
         })
         .await?;
     Ok(())

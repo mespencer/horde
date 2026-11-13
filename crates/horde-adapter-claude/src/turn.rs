@@ -7,6 +7,7 @@
 //! than decorative.
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 
 use horde_adapter::{
     AgentEvent, HeadroomSource, OutputChannel, PermissionDenial, ProviderSessionId, RateWindow,
@@ -14,7 +15,9 @@ use horde_adapter::{
 };
 use serde_json::Value;
 
-use crate::wire::{ContentBlock, Envelope, Event, Message, TurnResult};
+use crate::wire::{
+    ContentBlock, ControlRequest, ControlRequestKind, Envelope, Event, Init, Message, TurnResult,
+};
 
 /// Number of variants in [`OutputChannel`], for the per-channel chunk counters.
 const CHANNEL_COUNT: usize = 5;
@@ -37,6 +40,26 @@ pub struct TurnAssembler {
     turn_ordinal: u64,
     chunk_counters: [u64; CHANNEL_COUNT],
     usage: UsageAccumulator,
+    /// Whether a turn is open: between an `init` and its `result`.
+    turn_open: bool,
+    /// `can_use_tool` prompts awaiting Horde's answer, by the tool-call id the
+    /// [`AgentEvent::PermissionRequested`] carried.
+    outstanding: BTreeMap<ToolCallId, OutstandingPrompt>,
+    /// Facts owed to the journal, emitted on the next turn to open — an
+    /// output event needs a turn to belong to.
+    startup_diagnostics: Vec<String>,
+    /// Whether the init's own version report has been checked yet.
+    checked_init_version: bool,
+}
+
+/// A permission prompt Horde has been offered and not yet answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutstandingPrompt {
+    /// The harness's correlation id the `control_response` must echo.
+    pub request_id: String,
+    pub tool_name: String,
+    /// The proposal, which an unmodified allow echoes back.
+    pub input: Value,
 }
 
 impl TurnAssembler {
@@ -73,7 +96,7 @@ impl TurnAssembler {
     /// partial-message deltas carry nothing the assembled messages do not.
     pub fn feed(&mut self, envelope: &Envelope) -> Vec<AgentEvent> {
         match &envelope.event {
-            Event::Init(init) => self.begin_turn(&init.session_id, &init.model),
+            Event::Init(init) => self.begin_turn(init),
             Event::Assistant(message) => self.assistant_events(message),
             Event::User(message) => self.tool_result_events(message),
             Event::Result(result) => vec![self.end_turn(result)],
@@ -90,6 +113,12 @@ impl TurnAssembler {
                     resets_at_unix: rate_limit.rate_limit_info.resets_at,
                 },
             }],
+            Event::ControlRequest(request) => self.control_request(request),
+            Event::ControlCancel { request_id } => {
+                self.outstanding
+                    .retain(|_, prompt| &prompt.request_id != request_id);
+                Vec::new()
+            }
             Event::ControlResponse(_)
             | Event::StreamEvent
             | Event::System { .. }
@@ -97,9 +126,82 @@ impl TurnAssembler {
         }
     }
 
+    /// A `can_use_tool` prompt becomes a permission event, tracked until
+    /// answered. Anything else — another subtype, or a prompt with no open
+    /// turn to attribute it to — produces nothing, and the caller (which owns
+    /// stdin) must refuse it: the harness waits on every control request.
+    fn control_request(&mut self, request: &ControlRequest) -> Vec<AgentEvent> {
+        let ControlRequestKind::CanUseTool(can_use) = &request.request else {
+            return Vec::new();
+        };
+        if !self.turn_open {
+            return Vec::new();
+        }
+        let mut proposed = can_use.to_proposed_call();
+        if proposed.tool_call_id.as_str().is_empty() {
+            // Shape drift tolerated: an answerable prompt beats a dropped one.
+            proposed.tool_call_id = ToolCallId::new(format!("control-{}", request.request_id));
+        }
+        self.outstanding.insert(
+            proposed.tool_call_id.clone(),
+            OutstandingPrompt {
+                request_id: request.request_id.clone(),
+                tool_name: can_use.tool_name.clone(),
+                input: can_use.input.clone(),
+            },
+        );
+        vec![AgentEvent::PermissionRequested {
+            turn_id: self.turn_id(),
+            request: proposed,
+        }]
+    }
+
+    /// The prompt outstanding under `tool_call_id`, if any — a peek, so a
+    /// caller can encode its answer before consuming it.
+    #[must_use]
+    pub fn outstanding_prompt(&self, tool_call_id: &ToolCallId) -> Option<&OutstandingPrompt> {
+        self.outstanding.get(tool_call_id)
+    }
+
+    /// Consumes the prompt outstanding under `tool_call_id`. `None` means
+    /// nothing was waiting there, which the caller reports as an error.
+    pub fn resolve_prompt(&mut self, tool_call_id: &ToolCallId) -> Option<OutstandingPrompt> {
+        self.outstanding.remove(tool_call_id)
+    }
+
+    /// Every prompt still outstanding, consumed — the interrupt path, which
+    /// must answer them all (the harness waits on each).
+    pub fn withdraw_prompts(&mut self) -> Vec<OutstandingPrompt> {
+        core::mem::take(&mut self.outstanding).into_values().collect()
+    }
+
+    /// The prompt the session is blocked on, if any.
+    #[must_use]
+    pub fn awaiting_decision(&self) -> Option<ToolCallId> {
+        self.outstanding.keys().next().cloned()
+    }
+
+    /// Queues a fact for the journal — the version verdict, the permission
+    /// route — emitted as a harness diagnostic when the next turn opens.
+    pub fn note_startup_diagnostic(&mut self, text: impl Into<String>) {
+        self.startup_diagnostics.push(text.into());
+    }
+
+    /// A diagnostic on the open turn now, or queued for the next one when no
+    /// turn is open — delayed rather than lost.
+    pub fn note_diagnostic(&mut self, text: String) -> Option<AgentEvent> {
+        if self.turn_open {
+            Some(self.output(OutputChannel::HarnessDiagnostic, text))
+        } else {
+            self.startup_diagnostics.push(text);
+            None
+        }
+    }
+
     /// `system`/`init` opens each turn — it is a turn header, not a process
     /// handshake, and arrives once per user message.
-    fn begin_turn(&mut self, session_id: &str, model: &str) -> Vec<AgentEvent> {
+    fn begin_turn(&mut self, init: &Init) -> Vec<AgentEvent> {
+        let session_id = init.session_id.as_str();
         let is_new_session = self.session_id.as_deref() != Some(session_id);
         if is_new_session {
             self.session_id = Some(session_id.to_owned());
@@ -108,15 +210,33 @@ impl TurnAssembler {
 
         self.turn_ordinal = self.turn_ordinal.saturating_add(1);
         self.chunk_counters = [0; CHANNEL_COUNT];
+        self.turn_open = true;
 
-        if self.announced_session {
-            return Vec::new();
+        let mut events = Vec::new();
+        if !self.announced_session {
+            self.announced_session = true;
+            events.push(AgentEvent::SessionEstablished {
+                provider_session_id: ProviderSessionId::new(session_id),
+                model: init.model.clone(),
+            });
         }
-        self.announced_session = true;
-        vec![AgentEvent::SessionEstablished {
-            provider_session_id: ProviderSessionId::new(session_id),
-            model: model.to_owned(),
-        }]
+        if !self.checked_init_version {
+            self.checked_init_version = true;
+            if let Some(reported) = &init.claude_code_version {
+                let report = crate::version::SUPPORT.classify(reported);
+                if report.verdict != horde_adapter::SupportVerdict::Supported {
+                    self.startup_diagnostics.push(format!(
+                        "harness version warning (from the init): {}",
+                        report.describe()
+                    ));
+                }
+            }
+        }
+        // After SessionEstablished, which must precede any output.
+        for text in core::mem::take(&mut self.startup_diagnostics) {
+            events.push(self.output(OutputChannel::HarnessDiagnostic, text));
+        }
+        events
     }
 
     /// A stable, replay-deterministic turn identifier.
@@ -185,6 +305,7 @@ impl TurnAssembler {
     }
 
     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {
+        self.turn_open = false;
         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but
         // counts only the requested model, while a turn can bill auxiliary
         // models too (a `--model sonnet` run billed haiku alongside it). The

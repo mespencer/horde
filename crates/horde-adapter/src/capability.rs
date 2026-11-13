@@ -101,11 +101,20 @@ pub enum Capability {
     /// spawn — an adapter must probe the launched binary before holding it,
     /// because at 0.146 and below no configuration routed the request.
     ///
-    /// Deliberately does **not** cover file changes: `apply_patch` approvals
-    /// never reach the client in any measured policy — the thread parks at
-    /// `waitingOnApproval` forever instead (transcripts 28 and 31) — so
-    /// [`ToolCallKind::FileChange`] stays gated only by the broad claim.
+    /// Deliberately does **not** cover file changes, which route on a
+    /// different version boundary — see [`Self::PreAuthorizeFileChanges`].
     PreAuthorizeExecCommands,
+
+    /// Horde sees a proposed **file change** (codex's `apply_patch`) before it
+    /// is applied — and only those.
+    ///
+    /// The third per-kind claim, version-gated like the exec one. At codex
+    /// 0.148 a file-change approval never reached the client — the thread
+    /// parked at `waitingOnApproval` forever (transcripts 28, 31) — and at
+    /// 0.167.0 `item/fileChange/requestApproval` arrives before the patch
+    /// applies and its decision is honoured both ways (W12c, transcripts
+    /// 36–37). Held only for a probed 0.167+ binary.
+    PreAuthorizeFileChanges,
 
     /// A permission decision may replace the tool's arguments, not just permit
     /// or refuse the call. Implies [`Self::PreAuthorizeToolCalls`] in practice.
@@ -136,13 +145,14 @@ pub enum Capability {
 
 impl Capability {
     /// Every capability, for exhaustiveness checks in tests and reports.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Resumable,
         Self::InterruptibleTurn,
         Self::AmendActiveTurn,
         Self::PreAuthorizeToolCalls,
         Self::PreAuthorizeMcpToolCalls,
         Self::PreAuthorizeExecCommands,
+        Self::PreAuthorizeFileChanges,
         Self::RewritesToolInput,
         Self::SandboxTierAtSpawn,
         Self::ReportsHeadroom,
@@ -171,7 +181,8 @@ pub enum ToolCallKind {
     /// Split from [`Self::ExecCommand`] by measurement, not taxonomy: codex
     /// 0.148 routes exec approvals to the client but parks a file-change
     /// approval forever (transcripts 28, 31), so the two kinds genuinely have
-    /// different enforcement answers on the same provider.
+    /// different enforcement answers on the same provider — until 0.167,
+    /// which routes both (transcripts 36–37).
     FileChange,
 }
 
@@ -330,10 +341,10 @@ impl Capabilities {
                 self.supports(Capability::PreAuthorizeToolCalls)
                     || self.supports(Capability::PreAuthorizeExecCommands)
             }
-            // No scoped claim exists for file changes: no measured provider
-            // routes them separately (codex parks them, transcripts 28/31),
-            // and an unclaimable capability would only invite a false claim.
-            ToolCallKind::FileChange => self.supports(Capability::PreAuthorizeToolCalls),
+            ToolCallKind::FileChange => {
+                self.supports(Capability::PreAuthorizeToolCalls)
+                    || self.supports(Capability::PreAuthorizeFileChanges)
+            }
         };
         if gated {
             PermissionEnforcement::PerCall
@@ -461,6 +472,25 @@ mod tests {
             "the exec claim must not change the MCP answer"
         );
 
+        let codex_0167_shaped = codex_0147_shaped
+            .clone()
+            .with(Capability::PreAuthorizeFileChanges);
+        assert_eq!(
+            codex_0167_shaped.permission_enforcement_for(ToolCallKind::FileChange),
+            PermissionEnforcement::PerCall,
+            "file-change approvals route at 0.167 (transcripts 36-37)"
+        );
+        let file_changes_only = Capabilities::none()
+            .with(Capability::PreAuthorizeFileChanges)
+            .with(Capability::SandboxTierAtSpawn);
+        for kind in [ToolCallKind::Mcp, ToolCallKind::ExecCommand] {
+            assert_eq!(
+                file_changes_only.permission_enforcement_for(kind),
+                PermissionEnforcement::SandboxAtSpawn,
+                "the file-change claim gates file changes only, not {kind:?}"
+            );
+        }
+
         let claude_shaped = Capabilities::none().with(Capability::PreAuthorizeToolCalls);
         for kind in ToolCallKind::ALL {
             assert_eq!(
@@ -497,7 +527,14 @@ mod tests {
         assert_eq!(
             broad.permission_enforcement(),
             PermissionEnforcement::PerCall,
-            "only the broad claim lifts the floor to per-call"
+            "the broad claim lifts the floor to per-call"
+        );
+
+        let every_kind_scoped = codex_shaped.with(Capability::PreAuthorizeFileChanges);
+        assert_eq!(
+            every_kind_scoped.permission_enforcement(),
+            PermissionEnforcement::PerCall,
+            "with every kind gated by its own claim, the floor is per-call too"
         );
     }
 

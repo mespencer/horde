@@ -105,6 +105,9 @@ pub enum Command {
     Interrupt(InterruptArgs),
     /// Answer a permission escalation from any attached client.
     Approve(ApproveArgs),
+    /// Answer an agent's question (Claude AskUserQuestion, codex
+    /// request_user_input): `horde answer <request> 1=Red`.
+    Answer(AnswerArgs),
     /// Spawn an agent under an existing one.
     Spawn(SpawnArgs),
     /// One agent's lifecycle: state, worker, last change.
@@ -595,6 +598,20 @@ pub struct ApproveArgs {
     /// ignored there.
     #[arg(long, value_name = "JSON")]
     pub update_input: Option<String>,
+    /// Answer one of the request's questions, as `QUESTION=VALUE`;
+    /// repeatable, and repeating a question picks several values. QUESTION is
+    /// the question's id or its 1-based position; VALUE is an option label,
+    /// an option's 1-based number, or free text where the question allows it.
+    #[arg(long = "answer", value_name = "QUESTION=VALUE")]
+    pub answers: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AnswerArgs {
+    pub request_id: String,
+    /// `QUESTION=VALUE` pairs, as for `horde approve --answer`.
+    #[arg(required = true, value_name = "QUESTION=VALUE")]
+    pub answers: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -880,6 +897,7 @@ async fn dispatch(
         Some(Command::Send(args)) => run_send(client, args, format).await,
         Some(Command::Interrupt(args)) => run_interrupt(client, args, format).await,
         Some(Command::Approve(args)) => run_approve(client, args, format).await,
+        Some(Command::Answer(args)) => run_answer(client, args, format).await,
         Some(Command::Spawn(args)) => run_spawn(client, args, format).await,
         // Routed here rather than through the admin table because serving
         // needs the invocation's identity: backing is keyed to the enrolled
@@ -1954,6 +1972,14 @@ async fn run_approve(
         None => None,
     };
 
+    let answers = parse_answers(&args.answers)?;
+    if args.deny && !answers.is_empty() {
+        return Err(ClientError::Answers(
+            "--answer and --deny contradict each other: a refusal answers nothing".to_owned(),
+        ));
+    }
+    let verb = if answers.is_empty() { verb } else { "answered" };
+
     let sequence = client
         .answer_permission(PermissionAnswer {
             request_id: &args.request_id,
@@ -1961,10 +1987,53 @@ async fn run_approve(
             reason: &args.reason,
             remember_for_session: args.remember,
             updated_input: narrowing.as_ref(),
+            answers,
         })
         .await?;
     println!("{}", render::sequence(verb, sequence, format));
     Ok(())
+}
+
+async fn run_answer(
+    client: &mut Client,
+    args: &AnswerArgs,
+    format: Format,
+) -> Result<(), ClientError> {
+    let answers = parse_answers(&args.answers)?;
+    let sequence = client
+        .answer_permission(PermissionAnswer::answering(&args.request_id, answers))
+        .await?;
+    println!("{}", render::sequence("answered", sequence, format));
+    Ok(())
+}
+
+/// `QUESTION=VALUE` pairs into answers: split at the first `=`, repeated
+/// questions accumulate values in order. Keys and values are passed through
+/// verbatim — resolving a position or an option number is the Server's job,
+/// because only it holds the request's questions.
+///
+/// # Errors
+///
+/// [`ClientError::Answers`] for a pair with no `=` or an empty side.
+pub fn parse_answers(pairs: &[String]) -> Result<horde_adapter::Answers, ClientError> {
+    let mut answers = horde_adapter::Answers::new();
+    for pair in pairs {
+        let Some((question, value)) = pair.split_once('=') else {
+            return Err(ClientError::Answers(format!(
+                "{pair:?} is not QUESTION=VALUE"
+            )));
+        };
+        if question.is_empty() || value.is_empty() {
+            return Err(ClientError::Answers(format!(
+                "{pair:?} needs both a question and a value"
+            )));
+        }
+        answers
+            .entry(question.to_owned())
+            .or_default()
+            .push(value.to_owned());
+    }
+    Ok(answers)
 }
 
 #[cfg(test)]
@@ -1973,6 +2042,45 @@ mod tests {
     use horde_proto::v1::{DeliveryMode, PermissionOutcome};
 
     use super::{AttachArgs, Cli, Command, SessionCommand, SyncArgs, delivery_for, outcome_for};
+
+    #[test]
+    fn answers_parse_split_at_the_first_equals_and_accumulate() {
+        let pairs = ["1=Red", "sizes=S", "sizes=M", "note=a=b"].map(str::to_owned);
+        let answers = super::parse_answers(&pairs).expect("valid pairs");
+        assert_eq!(answers["1"], vec!["Red".to_owned()]);
+        assert_eq!(answers["sizes"], vec!["S".to_owned(), "M".to_owned()]);
+        assert_eq!(answers["note"], vec!["a=b".to_owned()], "only the first = splits");
+        assert_eq!(answers.len(), 3);
+
+        for bad in ["Red", "=Red", "1="] {
+            let error = super::parse_answers(&[bad.to_owned()]).expect_err("refused");
+            assert!(error.to_string().contains(bad), "{error}");
+        }
+        assert!(
+            super::parse_answers(&[])
+                .expect("nothing is fine")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_answer_verb_requires_at_least_one_pair() {
+        assert!(Cli::try_parse_from(["horde", "answer", "req-1"]).is_err());
+        let cli = Cli::try_parse_from(["horde", "answer", "req-1", "1=Red", "2=3"])
+            .expect("valid arguments");
+        let Some(Command::Answer(args)) = &cli.command else {
+            panic!("expected answer, got {:?}", cli.command);
+        };
+        assert_eq!(args.request_id, "req-1");
+        assert_eq!(args.answers, vec!["1=Red".to_owned(), "2=3".to_owned()]);
+
+        let cli = Cli::try_parse_from(["horde", "approve", "req-2", "--answer", "q=v"])
+            .expect("valid arguments");
+        let Some(Command::Approve(args)) = &cli.command else {
+            panic!("expected approve, got {:?}", cli.command);
+        };
+        assert_eq!(args.answers, vec!["q=v".to_owned()]);
+    }
 
     #[test]
     fn delivery_defaults_to_the_turn_boundary_and_flips_only_when_asked() {

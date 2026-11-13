@@ -50,6 +50,13 @@ pub enum Event {
     Result(Box<TurnResult>),
     /// Acknowledges a `control_request`, e.g. an interrupt.
     ControlResponse(ControlResponse),
+    /// The harness asking Horde something and waiting for the answer — under
+    /// `--permission-prompt-tool stdio`, a `can_use_tool` permission prompt
+    /// (W12c, transcripts `12a`–`13`).
+    ControlRequest(ControlRequest),
+    /// The harness withdrawing a control request it sent earlier, so its
+    /// answer is no longer wanted.
+    ControlCancel { request_id: String },
     /// The provider's own rate-limit state.
     RateLimit(RateLimit),
     /// Token-level deltas, only present with `--include-partial-messages`.
@@ -79,6 +86,29 @@ pub struct Init {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// The CLI's own version, e.g. `2.1.323` — reported per turn since at
+    /// least 2.1.323, checked against the support table as a second opinion
+    /// to the Worker's `--version` probe.
+    #[serde(default)]
+    pub claude_code_version: Option<String>,
+}
+
+/// A `control_request` the harness wrote to stdout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlRequest {
+    /// The harness's correlation id; the answer must echo it.
+    pub request_id: String,
+    pub request: ControlRequestKind,
+}
+
+/// What a control request asks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlRequestKind {
+    /// May this tool run? Boxed: it carries the tool's whole input.
+    CanUseTool(Box<crate::permission::CanUseTool>),
+    /// A subtype Horde does not answer (hook callbacks, SDK MCP traffic).
+    /// It still must be answered — with an error — or the harness waits.
+    Other { subtype: String },
 }
 
 /// An `assistant` or `user` envelope.

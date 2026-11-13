@@ -235,6 +235,9 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
             input,
         });
     }
+    if let Some(ask) = object.get("ask_question") {
+        return ask_question_step(ask);
+    }
     if let Some(call) = object.get("use_horde") {
         // A real MCP call against the agent's own endpoint — the operator
         // form of "here the agent reports its result" or "here it spawns a
@@ -246,7 +249,64 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
             input,
         });
     }
-    Err("a step must be one of say, think, ask_permission, use_horde".to_owned())
+    Err("a step must be one of say, think, ask_permission, ask_question, use_horde".to_owned())
+}
+
+/// `{"ask_question": {"id", "tool", "questions": [{"id", "question", "options": [..]}]}}`
+/// — the operator form of a harness question (W12c).
+fn ask_question_step(value: &serde_json::Value) -> Result<Step, String> {
+    let (tool_call_id, tool_name, _) = tool_step_fields("ask_question", value)?;
+    let questions = value
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .filter(|questions| !questions.is_empty())
+        .ok_or("ask_question needs a non-empty questions array")?
+        .iter()
+        .map(|question| {
+            let text = |field: &str| {
+                question
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let id = text("id");
+            if id.is_empty() {
+                return Err("every question needs a non-empty id".to_owned());
+            }
+            let options = question
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(|label| horde_adapter::QuestionOption {
+                            label: label.to_owned(),
+                            description: String::new(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(horde_adapter::Question {
+                id,
+                header: text("header"),
+                question: text("question"),
+                options,
+                multi_select: question
+                    .get("multi_select")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                allows_free_text: true,
+                secret: false,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Step::AskQuestion {
+        tool_call_id,
+        tool_name,
+        questions,
+    })
 }
 
 /// The `{id, tool, input}` triple both tool-shaped steps share.
@@ -543,6 +603,31 @@ pub async fn prepare(
     })
 }
 
+/// Whether a probed harness may be registered: a refused version stops the
+/// Worker with the reason and the fix; an untested one is registered with a
+/// warning here (and journaled again on each agent's first turn).
+///
+/// # Errors
+///
+/// The refusal, naming the version, the floor, and what to do.
+pub fn admit_harness(version: &horde_adapter::VersionReport) -> Result<(), String> {
+    match version.verdict {
+        horde_adapter::SupportVerdict::Refused => Err(format!(
+            "{}; upgrade it on this machine, or start the worker without --adapter {}",
+            version.describe(),
+            version.table.provider
+        )),
+        horde_adapter::SupportVerdict::Untested => {
+            tracing::warn!(harness = version.table.provider, "{}", version.describe());
+            Ok(())
+        }
+        horde_adapter::SupportVerdict::Supported => {
+            tracing::info!(harness = version.table.provider, "{}", version.describe());
+            Ok(())
+        }
+    }
+}
+
 /// Assembles the Runtime a configuration asks for.
 ///
 /// Async for one reason: the codex adapter probes its binary's version before
@@ -577,9 +662,16 @@ async fn build_runtime(
                 }
                 runtime.with_adapter(Arc::new(fake))
             }
-            AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new(
-                harness_profile(config, "claude", &journal),
-            ))),
+            AdapterChoice::Claude => {
+                // Probed, not assumed: the version picks the permission route
+                // (stdio from 2.1.323) and a refused version stops the Worker
+                // here, loudly, rather than failing every spawn (W12c).
+                let adapter = crate::ClaudeAdapter::new(harness_profile(config, "claude", &journal))
+                    .probe_version()
+                    .await;
+                admit_harness(&adapter.version)?;
+                runtime.with_adapter(Arc::new(adapter))
+            }
             AdapterChoice::Codex => {
                 // Belt and braces on the transcript-23 hazard: the flag was
                 // validated at parse, and the value is re-validated here so a
@@ -588,11 +680,13 @@ async fn build_runtime(
                 horde_adapter_codex::approvals_reviewer_from_config(
                     config.codex_approvals_reviewer.as_deref(),
                 )?;
-                // Probed, not assumed: the exec-gating capability claim is
-                // version-gated (ADR-0005, 2026-08-19 amendment).
+                // Probed, not assumed: the per-kind gating claims are
+                // version-gated (ADR-0005, 2026-08-19 and 2026-11-13
+                // amendments), and a refused version stops the Worker here.
                 let adapter = crate::CodexAdapter::new(harness_profile(config, "codex", &journal))
-                    .probe_exec_interception()
+                    .probe_version()
                     .await;
+                admit_harness(&adapter.version)?;
                 runtime.with_adapter(Arc::new(adapter))
             }
         };

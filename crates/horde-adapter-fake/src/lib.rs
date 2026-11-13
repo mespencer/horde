@@ -131,6 +131,7 @@ impl FakeAdapter {
             steps: VecDeque::new(),
             current: None,
             waiting_on: None,
+            waiting_on_question: false,
             denials: Vec::new(),
             chunk_counters: horde_adapter::ChunkCounters::new(),
             cumulative_tokens: TokenUsage::default(),
@@ -277,6 +278,9 @@ pub struct FakeSession {
     steps: VecDeque<Step>,
     current: Option<CurrentTurn>,
     waiting_on: Option<ToolCallId>,
+    /// Whether the call `waiting_on` names is a question — the one kind an
+    /// answer can settle.
+    waiting_on_question: bool,
     denials: Vec<PermissionDenial>,
     chunk_counters: horde_adapter::ChunkCounters,
     cumulative_tokens: TokenUsage,
@@ -366,11 +370,26 @@ impl FakeSession {
                     let turn_id = self.turn_id();
                     self.pending.push_back(AgentEvent::PermissionRequested {
                         turn_id,
-                        request: ProposedToolCall {
+                        request: ProposedToolCall::new(tool_call_id, tool_name, input),
+                    });
+                }
+                Step::AskQuestion {
+                    tool_call_id,
+                    tool_name,
+                    questions,
+                } => {
+                    let tool_call_id = ToolCallId::new(tool_call_id);
+                    self.waiting_on = Some(tool_call_id.clone());
+                    self.waiting_on_question = true;
+                    let turn_id = self.turn_id();
+                    self.pending.push_back(AgentEvent::PermissionRequested {
+                        turn_id,
+                        request: ProposedToolCall::new(
                             tool_call_id,
                             tool_name,
-                            input,
-                        },
+                            serde_json::Value::Object(serde_json::Map::new()),
+                        )
+                        .asking(questions),
                     });
                 }
             }
@@ -730,9 +749,37 @@ impl AgentSession for FakeSession {
         }
 
         self.waiting_on = None;
+        let was_question = core::mem::take(&mut self.waiting_on_question);
         let turn_id = self.turn_id();
 
         match decision {
+            PermissionDecision::Answer { answers } if was_question => {
+                // Rendered so a test can see exactly which answers arrived.
+                let rendered = answers
+                    .iter()
+                    .map(|(question, chosen)| format!("{question}={}", chosen.join("|")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.emit_output(OutputChannel::ToolResult, format!("answered {rendered}"));
+                self.pending.push_back(AgentEvent::ToolCompleted {
+                    turn_id,
+                    tool_call_id: tool_call_id.clone(),
+                    is_error: false,
+                });
+            }
+            PermissionDecision::Answer { .. } => {
+                // A harness running a tool with answers it would ignore is
+                // the silent drop the seam forbids; the fake fails the call.
+                self.emit_output(
+                    OutputChannel::ToolResult,
+                    "answers apply only to questions".to_owned(),
+                );
+                self.pending.push_back(AgentEvent::ToolCompleted {
+                    turn_id,
+                    tool_call_id: tool_call_id.clone(),
+                    is_error: true,
+                });
+            }
             PermissionDecision::Allow {
                 updated_input,
                 remember_for_session,

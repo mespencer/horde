@@ -77,7 +77,13 @@ fn harness(adapter: &dyn Adapter) -> HarnessCapability {
         // Registered means runnable: the Runtime only holds adapters it can
         // drive. "Installed but unregistered" is not a state this Worker has.
         installed: true,
-        version: String::new(),
+        // The probed `major.minor.patch`, when the adapter probed one and it
+        // was readable; empty is honest for the fake and an unreadable banner.
+        version: adapter
+            .harness_version()
+            .and_then(|report| report.version)
+            .map(|version| version.to_string())
+            .unwrap_or_default(),
         installable: false,
         capabilities: adapter
             .capabilities()
@@ -171,21 +177,20 @@ mod tests {
         let mut codex = crate::codex::CodexAdapter::new(crate::harness::HarnessProfile::new(
             "/nonexistent/horde-test-profile",
         ));
-        for interception in [
-            crate::codex::ExecInterception::SandboxOnly {
-                reason: "unprobed".to_owned(),
-            },
-            crate::codex::ExecInterception::Routed {
-                version: "codex-cli 0.148.0".to_owned(),
-            },
-        ] {
-            codex.exec_interception = interception;
+        for output in ["codex-cli", "codex-cli 0.148.0", "codex-cli 0.167.0"] {
+            codex.version = horde_adapter_codex::SUPPORT.classify(output);
             let capabilities = advertise([&codex as &dyn Adapter], None, &DeclaredFacts::default());
             assert!(
                 !capabilities.harnesses[0]
                     .capabilities
                     .contains(&i32::from(AdapterCapability::ToolCallGating)),
-                "no probe verdict may advertise blanket gating: file changes stay ungated"
+                "no probe verdict may advertise blanket gating ({output}): the per-kind \
+                 claims graduate to the wire only when placement matches per kind"
+            );
+            assert_eq!(
+                capabilities.harnesses[0].version,
+                codex.version.version.map(|v| v.to_string()).unwrap_or_default(),
+                "the probed version is advertised as the version, never the raw banner"
             );
         }
 

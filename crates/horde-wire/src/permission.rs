@@ -12,12 +12,17 @@
 //! is specifically an object. That asymmetry is surfaced as
 //! [`ConversionError::NotAnObject`] rather than smoothed over.
 
-use horde_adapter::permission::{PermissionDecision, ProposedToolCall};
+use std::collections::HashMap;
+
+use horde_adapter::permission::{
+    Answers, PermissionDecision, ProposedToolCall, Question, QuestionOption,
+};
 use horde_proto::prost_types::value::Kind;
 use horde_proto::prost_types::{ListValue, Struct, Value as WireValue};
 use horde_proto::v1::{
-    PermissionDecision as WirePermissionDecision, PermissionOutcome,
-    ProposedToolCall as WireProposedToolCall,
+    Answer as WireAnswer, PermissionDecision as WirePermissionDecision, PermissionOutcome,
+    ProposedToolCall as WireProposedToolCall, Question as WireQuestion,
+    QuestionOption as WireQuestionOption,
 };
 use serde_json::{Map, Number, Value as JsonValue};
 
@@ -46,6 +51,16 @@ pub enum ConversionError {
     /// without the rewrite capability must refuse, so a narrowing that failed
     /// to apply is never mistaken for one that took effect.
     RewriteUnsupported,
+    /// The wire said ALLOW with both answers and replacement arguments.
+    ///
+    /// An answer is how a question proceeds and a narrowing is how a tool
+    /// call does; one decision carrying both means the client meant one of
+    /// them and the adapter would have to guess which to drop.
+    AnswersWithRewrite,
+    /// Answers on a decision whose outcome is not ALLOW: a refusal answers
+    /// nothing, and reading answers off it would run a question the human
+    /// declined.
+    AnswersWithoutAllow,
 }
 
 impl core::fmt::Display for ConversionError {
@@ -58,6 +73,12 @@ impl core::fmt::Display for ConversionError {
             Self::UnusableOutcome(v) => write!(f, "unusable PermissionOutcome {v}"),
             Self::RewriteUnsupported => {
                 write!(f, "decision rewrites tool input but the adapter cannot")
+            }
+            Self::AnswersWithRewrite => {
+                write!(f, "decision carries both answers and replacement arguments")
+            }
+            Self::AnswersWithoutAllow => {
+                write!(f, "decision carries answers without outcome ALLOW")
             }
         }
     }
@@ -191,7 +212,81 @@ pub fn proposed_tool_call_to_wire(
         tool_name: call.tool_name.clone(),
         input: Some(input),
         rendered: format!("{} {}", call.tool_name, call.input),
+        questions: questions_to_wire(&call.questions),
     })
+}
+
+/// Domain questions → wire, field for field.
+#[must_use]
+pub fn questions_to_wire(questions: &[Question]) -> Vec<WireQuestion> {
+    questions
+        .iter()
+        .map(|question| WireQuestion {
+            id: question.id.clone(),
+            header: question.header.clone(),
+            question: question.question.clone(),
+            options: question
+                .options
+                .iter()
+                .map(|option| WireQuestionOption {
+                    label: option.label.clone(),
+                    description: option.description.clone(),
+                })
+                .collect(),
+            multi_select: question.multi_select,
+            allows_free_text: question.allows_free_text,
+            secret: question.secret,
+        })
+        .collect()
+}
+
+/// Wire questions → domain, field for field — what a client renders.
+#[must_use]
+pub fn questions_from_wire(questions: &[WireQuestion]) -> Vec<Question> {
+    questions
+        .iter()
+        .map(|question| Question {
+            id: question.id.clone(),
+            header: question.header.clone(),
+            question: question.question.clone(),
+            options: question
+                .options
+                .iter()
+                .map(|option| QuestionOption {
+                    label: option.label.clone(),
+                    description: option.description.clone(),
+                })
+                .collect(),
+            multi_select: question.multi_select,
+            allows_free_text: question.allows_free_text,
+            secret: question.secret,
+        })
+        .collect()
+}
+
+/// Domain answers → the wire map.
+#[must_use]
+pub fn answers_to_wire(answers: &Answers) -> HashMap<String, WireAnswer> {
+    answers
+        .iter()
+        .map(|(id, values)| {
+            (
+                id.clone(),
+                WireAnswer {
+                    values: values.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The wire map → domain answers, ordered.
+#[must_use]
+pub fn answers_from_wire(answers: &HashMap<String, WireAnswer>) -> Answers {
+    answers
+        .iter()
+        .map(|(id, answer)| (id.clone(), answer.values.clone()))
+        .collect()
 }
 
 /// Domain → wire.
@@ -213,6 +308,7 @@ pub fn permission_decision_to_wire(
             (PermissionOutcome::Allow, String::new(), rewritten)
         }
         PermissionDecision::Deny { message } => (PermissionOutcome::Deny, message.clone(), None),
+        PermissionDecision::Answer { .. } => (PermissionOutcome::Allow, String::new(), None),
     };
 
     Ok(WirePermissionDecision {
@@ -220,6 +316,7 @@ pub fn permission_decision_to_wire(
         reason,
         updated_input,
         remember_for_session: decision.remembers_for_session(),
+        answers: decision.answers().map(answers_to_wire).unwrap_or_default(),
         ..WirePermissionDecision::default()
     })
 }
@@ -236,6 +333,19 @@ pub fn permission_decision_from_wire(
 ) -> Result<PermissionDecision, ConversionError> {
     let outcome = PermissionOutcome::try_from(decision.outcome)
         .map_err(|_| ConversionError::UnusableOutcome(decision.outcome))?;
+
+    if !decision.answers.is_empty() {
+        // Answers settle a question; they mean nothing beside a refusal or a
+        // narrowing, and guessing which half the client meant is how a
+        // declined question would run anyway.
+        return match (outcome, &decision.updated_input) {
+            (PermissionOutcome::Allow, None) => {
+                Ok(PermissionDecision::answer(answers_from_wire(&decision.answers)))
+            }
+            (PermissionOutcome::Allow, Some(_)) => Err(ConversionError::AnswersWithRewrite),
+            _ => Err(ConversionError::AnswersWithoutAllow),
+        };
+    }
 
     match outcome {
         PermissionOutcome::Allow => {
@@ -364,6 +474,102 @@ mod tests {
             permission_decision_from_wire(&wire, false),
             Err(ConversionError::RewriteUnsupported)
         );
+    }
+
+    /// Answers cross both directions intact, and a question's ALLOW without
+    /// them stays a plain allow (the Server is where that is refused).
+    #[test]
+    fn answers_round_trip_and_never_ride_a_refusal_or_a_narrowing() {
+        use horde_adapter::permission::Answers;
+
+        let answers = Answers::from([
+            ("colour".to_owned(), vec!["Red".to_owned()]),
+            ("sizes".to_owned(), vec!["S".to_owned(), "M".to_owned()]),
+        ]);
+        let answered = PermissionDecision::answer(answers.clone());
+        let wire = permission_decision_to_wire(&answered).expect("converts");
+        assert_eq!(wire.outcome, i32::from(PermissionOutcome::Allow));
+        assert_eq!(wire.updated_input, None);
+        assert!(!wire.remember_for_session, "an answer is never remembered");
+        assert_eq!(wire.answers.len(), 2);
+        assert_eq!(
+            permission_decision_from_wire(&wire, false),
+            Ok(answered),
+            "answering needs no rewrite capability"
+        );
+
+        let refusal = WirePermissionDecision {
+            outcome: PermissionOutcome::Deny.into(),
+            ..wire.clone()
+        };
+        assert_eq!(
+            permission_decision_from_wire(&refusal, true),
+            Err(ConversionError::AnswersWithoutAllow)
+        );
+        let unspecified = WirePermissionDecision {
+            outcome: PermissionOutcome::Unspecified.into(),
+            ..wire.clone()
+        };
+        assert_eq!(
+            permission_decision_from_wire(&unspecified, true),
+            Err(ConversionError::AnswersWithoutAllow)
+        );
+        let both = WirePermissionDecision {
+            updated_input: Some(Struct::default()),
+            ..wire
+        };
+        assert_eq!(
+            permission_decision_from_wire(&both, true),
+            Err(ConversionError::AnswersWithRewrite)
+        );
+    }
+
+    #[test]
+    fn questions_cross_the_seam_field_for_field() {
+        use horde_adapter::permission::{Question, QuestionOption};
+
+        let questions = vec![Question {
+            id: "colour".to_owned(),
+            header: "Colour".to_owned(),
+            question: "Which?".to_owned(),
+            options: vec![QuestionOption {
+                label: "Red".to_owned(),
+                description: "warm".to_owned(),
+            }],
+            multi_select: true,
+            allows_free_text: true,
+            secret: true,
+        }];
+        let wire = horde_wire_self::permission::questions_to_wire(&questions);
+        assert_eq!(wire[0].options[0].description, "warm");
+        assert!(wire[0].multi_select && wire[0].allows_free_text && wire[0].secret);
+        assert_eq!(
+            horde_wire_self::permission::questions_from_wire(&wire),
+            questions
+        );
+
+        let call = horde_adapter::ProposedToolCall::new(
+            horde_adapter::ToolCallId::new("t"),
+            "AskUserQuestion",
+            json!({}),
+        )
+        .asking(questions.clone());
+        let on_wire =
+            horde_wire_self::permission::proposed_tool_call_to_wire(&call).expect("converts");
+        assert_eq!(
+            horde_wire_self::permission::questions_from_wire(&on_wire.questions),
+            questions
+        );
+    }
+
+    #[test]
+    fn every_conversion_error_explains_itself() {
+        for (error, needle) in [
+            (ConversionError::AnswersWithRewrite, "both answers"),
+            (ConversionError::AnswersWithoutAllow, "without outcome ALLOW"),
+        ] {
+            assert!(error.to_string().contains(needle), "{error}");
+        }
     }
 
     #[test]
@@ -505,11 +711,7 @@ mod proposed_tool_call_tests {
     use super::{ConversionError, proposed_tool_call_to_wire, struct_to_json};
 
     fn call(input: serde_json::Value) -> ProposedToolCall {
-        ProposedToolCall {
-            tool_call_id: ToolCallId::new("toolu_01"),
-            tool_name: "Bash".to_owned(),
-            input,
-        }
+        ProposedToolCall::new(ToolCallId::new("toolu_01"), "Bash", input)
     }
 
     #[test]

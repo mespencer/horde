@@ -64,6 +64,7 @@ pub fn capability_to_wire(capability: Capability) -> Option<AdapterCapability> {
         // seam), not before.
         Capability::PreAuthorizeMcpToolCalls
         | Capability::PreAuthorizeExecCommands
+        | Capability::PreAuthorizeFileChanges
         | Capability::SandboxTierAtSpawn
         | Capability::ReportsHeadroom
         | Capability::SystemPromptOverlay
@@ -136,7 +137,7 @@ mod tests {
         for capability in Capability::ALL {
             let _ = capability_to_wire(capability);
         }
-        assert_eq!(Capability::ALL.len(), 12);
+        assert_eq!(Capability::ALL.len(), 13);
     }
 
     /// The scoped per-kind gating claims must never widen into the wire's
@@ -150,6 +151,10 @@ mod tests {
         );
         assert_eq!(
             capability_to_wire(Capability::PreAuthorizeExecCommands),
+            None
+        );
+        assert_eq!(
+            capability_to_wire(Capability::PreAuthorizeFileChanges),
             None
         );
     }

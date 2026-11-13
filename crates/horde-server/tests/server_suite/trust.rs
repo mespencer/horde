@@ -296,6 +296,7 @@ async fn raise(
                     tool_name: "Write".to_owned(),
                     input: Some(input),
                     rendered: String::new(),
+                    questions: Vec::new(),
                 }),
                 ..PermissionRequest::default()
             }),

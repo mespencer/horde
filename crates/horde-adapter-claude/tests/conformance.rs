@@ -335,3 +335,146 @@ async fn a_replayed_session_ends_cleanly() {
         "a drained session yields nothing further"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W12c — claude 2.1.323, the stdio permission route (transcripts 12a–17).
+// ---------------------------------------------------------------------------
+
+/// Replays a transcript under `policy`, returning every event the adapter
+/// produced and each turn's record.
+async fn replay_with(
+    name: &str,
+    policy: horde_testkit::conformance::Policy<'_>,
+) -> Result<Vec<TurnRecord>, String> {
+    let turns = load(name)?.turns();
+    let messages: Vec<&str> = turns.iter().map(|_| "replayed").collect();
+    let mut session = replay_session(turns);
+    horde_testkit::conformance::check_session_with(&mut session, &messages, policy)
+        .await
+        .map_err(|error| format!("transcript {name} violated the adapter contract: {error}"))
+}
+
+/// The prompts a transcript's stdout carries, lifted by the codec.
+fn prompts_in(name: &str) -> Vec<horde_adapter::ProposedToolCall> {
+    let mut assembler = horde_adapter_claude::TurnAssembler::new();
+    load(name)
+        .expect("fixture must load")
+        .outbound
+        .iter()
+        .filter_map(|line| decode_line(line).ok())
+        .flat_map(|envelope| assembler.feed(&envelope))
+        .filter_map(|event| match event {
+            AgentEvent::PermissionRequested { request, .. } => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `12a`: the Write the model proposed reaches Horde on stdout, before it
+/// runs, with the arguments the chain judges.
+#[test]
+fn a_stdio_prompt_surfaces_the_proposed_call_before_it_runs() {
+    let prompts = prompts_in("12a-stdio-perm-allow.jsonl");
+    let [prompt] = prompts.as_slice() else {
+        panic!("one prompt, got {prompts:?}");
+    };
+    assert_eq!(prompt.tool_name, "Write");
+    assert_eq!(prompt.tool_call_id.as_str(), "toolu_01KPip6d4uHLM3smJUQAPZNz");
+    assert_eq!(prompt.input["content"], "hello");
+    assert!(!prompt.is_question());
+}
+
+/// `12b`: a denial on stdout lands in the turn's denials exactly as the MCP
+/// route's did (`04a`) — the harness reports it in the result envelope.
+#[tokio::test]
+async fn a_stdio_denial_is_the_turns_refusal() {
+    let records = replay_with("12b-stdio-perm-deny.jsonl", &|_| {
+        horde_adapter::PermissionDecision::deny("denied by the W12c probe")
+    })
+    .await
+    .expect("must conform");
+    let outcome = &records.last().expect("a turn").outcome;
+    assert_eq!(outcome.denials.len(), 1);
+    assert_eq!(outcome.denials[0].tool_name, "Write");
+    assert!(!outcome.is_clean_success());
+}
+
+/// `12d`: a session-scoped grant made the second write ask nothing — one
+/// prompt across two turns.
+#[test]
+fn a_session_grant_was_honoured_by_the_harness() {
+    assert_eq!(prompts_in("12d-stdio-perm-remember-session.jsonl").len(), 1);
+}
+
+/// `13`: AskUserQuestion is a question only a human can answer, keyed by
+/// its text, and the model read the recorded answer back.
+#[tokio::test]
+async fn ask_user_question_surfaces_as_a_question_and_its_answer_reaches_the_model() {
+    let prompts = prompts_in("13-ask-user-question.jsonl");
+    let [prompt] = prompts.as_slice() else {
+        panic!("one prompt, got {prompts:?}");
+    };
+    assert_eq!(prompt.tool_name, "AskUserQuestion");
+    let [question] = prompt.questions.as_slice() else {
+        panic!("one question, got {:?}", prompt.questions);
+    };
+    assert_eq!(question.id, "Which colour do you prefer?");
+    assert_eq!(question.header, "Colour");
+    assert_eq!(question.options.len(), 2);
+
+    let records = replay_with("13-ask-user-question.jsonl", &|_| {
+        horde_adapter::PermissionDecision::answer(horde_adapter::Answers::from([(
+            "Which colour do you prefer?".to_owned(),
+            vec!["Red".to_owned()],
+        )]))
+    })
+    .await
+    .expect("must conform");
+    assert_eq!(
+        records.last().and_then(|record| record.outcome.text.as_deref()),
+        Some("Red")
+    );
+}
+
+/// `14`–`16`: multi-turn, resume and interrupt are unchanged at 2.1.323.
+#[tokio::test]
+async fn the_2_1_323_baselines_match_the_2_1_226_findings() {
+    let multi = replay("14-multi-turn-2.1.323.jsonl").await.expect("conforms");
+    assert_eq!(multi.len(), 3, "three results on one process");
+
+    let interrupted = replay("16-interrupt-control-2.1.323.jsonl")
+        .await
+        .expect("conforms");
+    assert_eq!(interrupted[0].outcome.status, TurnStatus::Interrupted);
+    assert!(
+        interrupted[1].outcome.status.is_completed(),
+        "the process stayed usable after the control interrupt"
+    );
+
+    let resumed = replay("15-resume-2.1.323.jsonl").await.expect("conforms");
+    assert_eq!(resumed[0].outcome.text.as_deref(), Some("\"One.\""));
+}
+
+/// Every 2.1.323 init names its version, and it is the supported one.
+#[test]
+fn the_recorded_inits_name_a_supported_version() {
+    for name in ["12a-stdio-perm-allow.jsonl", "14-multi-turn-2.1.323.jsonl"] {
+        let version = load(name)
+            .expect("fixture must load")
+            .outbound
+            .iter()
+            .filter_map(|line| decode_line(line).ok())
+            .find_map(|envelope| match envelope.event {
+                Event::Init(init) => init.claude_code_version,
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: the init names its version"));
+        assert_eq!(version, "2.1.323");
+        assert_eq!(
+            horde_adapter_claude::version::SUPPORT
+                .classify(&version)
+                .verdict,
+            horde_adapter::SupportVerdict::Supported
+        );
+    }
+}

@@ -67,6 +67,7 @@ pub mod permission;
 pub mod replay;
 pub mod spec;
 pub mod usage;
+pub mod version;
 
 pub use capability::{Capabilities, Capability, PermissionEnforcement, ToolCallKind};
 pub use error::AdapterError;
@@ -74,9 +75,12 @@ pub use event::{AgentEvent, ChunkCounters, OutputChannel, TurnOutcome, TurnStatu
 pub use identity::RevivalIdentity;
 pub use ids::{ProviderAccount, ProviderSessionId, ToolCallId, TurnId, account_dir};
 pub use login::LoginRecipe;
-pub use permission::{PermissionDecision, PermissionDenial, ProposedToolCall};
+pub use permission::{
+    Answers, PermissionDecision, PermissionDenial, ProposedToolCall, Question, QuestionOption,
+};
 pub use replay::{LineDecoder, ReplaySession};
 pub use spec::{AgentSpec, Delivery, McpEndpoint, TURNS_TAKEN_OPTION, TurnInput};
+pub use version::{HarnessVersion, SupportTable, SupportVerdict, VersionReport};
 pub use usage::{
     HeadroomSource, RateWindow, TokenUsage, UsageAccumulator, UsageDelta, Utilization,
 };

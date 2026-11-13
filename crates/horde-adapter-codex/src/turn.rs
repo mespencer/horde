@@ -16,8 +16,10 @@ use horde_adapter::{
 };
 
 use crate::wire::{
-    EXEC_APPROVAL_METHOD, ErrorBody, ExecApprovalRequest, Frame, Item, MCP_ELICITATION_METHOD,
-    McpElicitation, Notification, TokenCounts,
+    EXEC_APPROVAL_METHOD, ErrorBody, ExecApprovalRequest, FILE_CHANGE_APPROVAL_METHOD,
+    FileChange, FileChangeApprovalRequest, Frame, Item, MCP_ELICITATION_METHOD, McpElicitation,
+    Notification, PERMISSIONS_APPROVAL_METHOD, PermissionsApprovalRequest, TokenCounts,
+    USER_INPUT_METHOD, UserInputRequest,
 };
 
 /// The tool name an exec approval surfaces under.
@@ -26,6 +28,16 @@ use crate::wire::{
 /// command, a cwd, and an item id — so the chain needs one to write rules
 /// against: `Rule::tool("exec").where_input_starts_with("command", "git ")`.
 pub const EXEC_TOOL_NAME: &str = "exec";
+
+/// The tool name a file-change approval surfaces under — codex's own name
+/// for the tool that writes the patch, so a rule reads the way codex does.
+pub const FILE_CHANGE_TOOL_NAME: &str = "apply_patch";
+
+/// The tool name a sandbox-widening request surfaces under.
+pub const PERMISSIONS_TOOL_NAME: &str = "request_permissions";
+
+/// The tool name a codex question surfaces under.
+pub const USER_INPUT_TOOL_NAME: &str = "request_user_input";
 
 /// Turns a stream of frames into agent events.
 #[derive(Debug, Default)]
@@ -91,6 +103,18 @@ pub enum ApprovalKind {
         /// than inventing one (transcript 30's honored shape).
         proposed_amendment: Option<Vec<String>>,
     },
+    /// `item/fileChange/requestApproval`: answered with `{"decision": …}`,
+    /// the exec vocabulary minus the amendment (transcripts 36–37).
+    FileChange,
+    /// `item/permissions/requestApproval`: answered by granting a profile —
+    /// the one requested on allow, an empty one on refusal (transcript 39).
+    Permissions {
+        /// What was asked for, which is exactly what an allow grants back.
+        requested: serde_json::Value,
+    },
+    /// `item/tool/requestUserInput`: answered with `{"answers": …}` keyed by
+    /// question id (transcript 38).
+    UserInput,
 }
 
 /// An answered approval: what the caller needs to put the reply on the wire.
@@ -129,6 +153,9 @@ struct OpenTurn {
     duration: Duration,
     /// MCP tool calls that have started and not yet elicited, oldest first.
     started_mcp_calls: VecDeque<StartedMcpCall>,
+    /// `fileChange` items that have started, by item id: the patch a
+    /// file-change approval for that item is judged on (transcript 36).
+    started_file_changes: BTreeMap<String, Vec<FileChange>>,
     /// Calls the permission chain refused during this turn.
     denials: Vec<PermissionDenial>,
 }
@@ -143,6 +170,7 @@ impl OpenTurn {
             interrupt_requested: false,
             duration: Duration::ZERO,
             started_mcp_calls: VecDeque::new(),
+            started_file_changes: BTreeMap::new(),
             denials: Vec::new(),
         }
     }
@@ -210,6 +238,15 @@ impl TurnAssembler {
             }
             Frame::ServerRequest { id, method, params } if method == EXEC_APPROVAL_METHOD => {
                 self.feed_exec_approval(*id, params)
+            }
+            Frame::ServerRequest { id, method, params } if method == FILE_CHANGE_APPROVAL_METHOD => {
+                self.feed_file_change_approval(*id, params)
+            }
+            Frame::ServerRequest { id, method, params } if method == PERMISSIONS_APPROVAL_METHOD => {
+                self.feed_permissions_approval(*id, params)
+            }
+            Frame::ServerRequest { id, method, params } if method == USER_INPUT_METHOD => {
+                self.feed_user_input(*id, params)
             }
             // Responses correlate to requests the Worker made and carry nothing
             // the event stream needs; other server requests are the caller's to
@@ -327,23 +364,12 @@ impl TurnAssembler {
             return Vec::new();
         };
 
-        let turn_id = self
-            .turn
-            .as_ref()
-            .map(|turn| turn.id.clone())
-            .or_else(|| request.turn_id.as_deref().map(TurnId::new));
-        let Some(turn_id) = turn_id else {
+        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
             // No turn to attribute the request to — nothing downstream could
             // journal or answer it coherently. The caller declines it.
             return Vec::new();
         };
-
-        let tool_call_id = match &request.item_id {
-            Some(item_id) if !item_id.is_empty() => ToolCallId::new(item_id.clone()),
-            // Shape drift tolerated the same way the elicitation path does:
-            // an approval the chain can act on beats a dropped frame.
-            _ => ToolCallId::new(format!("exec-approval-{rpc_id}")),
-        };
+        let tool_call_id = Self::item_identity(request.item_id.as_ref(), "exec-approval", rpc_id);
 
         let mut fields = serde_json::Map::new();
         if let Some(command) = request.effective_command() {
@@ -371,25 +397,207 @@ impl TurnAssembler {
         }
         let input = serde_json::Value::Object(fields);
 
+        self.raise(
+            rpc_id,
+            turn_id,
+            ProposedToolCall::new(tool_call_id, EXEC_TOOL_NAME, input),
+            ApprovalKind::ExecCommand {
+                proposed_amendment: request.proposed_execpolicy_amendment.clone(),
+            },
+        )
+    }
+
+    /// Records an approval as outstanding and surfaces it as an event — the
+    /// one place every server request becomes a permission request.
+    fn raise(
+        &mut self,
+        rpc_id: u64,
+        turn_id: TurnId,
+        request: ProposedToolCall,
+        kind: ApprovalKind,
+    ) -> Vec<AgentEvent> {
         self.outstanding.insert(
-            tool_call_id.clone(),
+            request.tool_call_id.clone(),
             OutstandingApproval {
                 rpc_id,
-                tool_name: EXEC_TOOL_NAME.to_owned(),
-                input: input.clone(),
-                kind: ApprovalKind::ExecCommand {
-                    proposed_amendment: request.proposed_execpolicy_amendment.clone(),
-                },
+                tool_name: request.tool_name.clone(),
+                input: request.input.clone(),
+                kind,
             },
         );
-        vec![AgentEvent::PermissionRequested {
+        vec![AgentEvent::PermissionRequested { turn_id, request }]
+    }
+
+    /// The turn a request belongs to: the open one, else the request's own
+    /// `turnId`. `None` means nothing downstream could journal or answer it
+    /// coherently, and the caller refuses the request.
+    fn turn_for(&self, turn_id: Option<&str>) -> Option<TurnId> {
+        self.turn
+            .as_ref()
+            .map(|turn| turn.id.clone())
+            .or_else(|| turn_id.map(TurnId::new))
+    }
+
+    /// The item id a request names, or one minted from its RPC id — shape
+    /// drift is tolerated the way the elicitation path tolerates it: an
+    /// approval the chain can act on beats a dropped frame.
+    fn item_identity(item_id: Option<&String>, prefix: &str, rpc_id: u64) -> ToolCallId {
+        match item_id {
+            Some(item_id) if !item_id.is_empty() => ToolCallId::new(item_id.clone()),
+            _ => ToolCallId::new(format!("{prefix}-{rpc_id}")),
+        }
+    }
+
+    /// A file-change approval (0.167): the patch, joined from the started
+    /// `fileChange` item, surfaced under [`FILE_CHANGE_TOOL_NAME`] so rules
+    /// can match the paths it touches.
+    fn feed_file_change_approval(
+        &mut self,
+        rpc_id: u64,
+        params: &serde_json::Value,
+    ) -> Vec<AgentEvent> {
+        let Ok(request) = serde_json::from_value::<FileChangeApprovalRequest>(params.clone())
+        else {
+            return Vec::new();
+        };
+        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
+            return Vec::new();
+        };
+        let tool_call_id =
+            Self::item_identity(request.item_id.as_ref(), "file-change-approval", rpc_id);
+        let changes = self
+            .turn
+            .as_mut()
+            .and_then(|turn| turn.started_file_changes.remove(tool_call_id.as_str()))
+            .unwrap_or_default();
+
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "changes".to_owned(),
+            serde_json::Value::Array(
+                changes
+                    .into_iter()
+                    .map(|change| {
+                        serde_json::json!({
+                            "path": change.path,
+                            "kind": change.kind,
+                            "diff": change.diff,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(reason) = request.reason {
+            fields.insert("reason".to_owned(), serde_json::Value::String(reason));
+        }
+        if let Some(root) = request.grant_root {
+            fields.insert("grant_root".to_owned(), serde_json::Value::String(root));
+        }
+
+        self.raise(
+            rpc_id,
             turn_id,
-            request: ProposedToolCall {
+            ProposedToolCall::new(
                 tool_call_id,
-                tool_name: EXEC_TOOL_NAME.to_owned(),
-                input,
+                FILE_CHANGE_TOOL_NAME,
+                serde_json::Value::Object(fields),
+            ),
+            ApprovalKind::FileChange,
+        )
+    }
+
+    /// A sandbox-widening request (0.167, behind `request_permissions_tool`).
+    fn feed_permissions_approval(
+        &mut self,
+        rpc_id: u64,
+        params: &serde_json::Value,
+    ) -> Vec<AgentEvent> {
+        let Ok(request) = serde_json::from_value::<PermissionsApprovalRequest>(params.clone())
+        else {
+            return Vec::new();
+        };
+        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
+            return Vec::new();
+        };
+        let tool_call_id =
+            Self::item_identity(request.item_id.as_ref(), "permissions-approval", rpc_id);
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("permissions".to_owned(), request.permissions.clone());
+        if let Some(cwd) = request.cwd {
+            fields.insert("cwd".to_owned(), serde_json::Value::String(cwd));
+        }
+        if let Some(reason) = request.reason {
+            fields.insert("reason".to_owned(), serde_json::Value::String(reason));
+        }
+
+        self.raise(
+            rpc_id,
+            turn_id,
+            ProposedToolCall::new(
+                tool_call_id,
+                PERMISSIONS_TOOL_NAME,
+                serde_json::Value::Object(fields),
+            ),
+            ApprovalKind::Permissions {
+                requested: request.permissions,
             },
-        }]
+        )
+    }
+
+    /// A codex question (0.167): surfaced as a question only a human can
+    /// answer, keyed by codex's own question ids.
+    fn feed_user_input(&mut self, rpc_id: u64, params: &serde_json::Value) -> Vec<AgentEvent> {
+        let Ok(request) = serde_json::from_value::<UserInputRequest>(params.clone()) else {
+            return Vec::new();
+        };
+        if request.questions.is_empty() {
+            // Nothing to ask: the caller refuses it rather than raise a
+            // "question" no human could answer.
+            return Vec::new();
+        }
+        let Some(turn_id) = self.turn_for(request.turn_id.as_deref()) else {
+            return Vec::new();
+        };
+        let tool_call_id = Self::item_identity(request.item_id.as_ref(), "user-input", rpc_id);
+        let questions = request
+            .questions
+            .iter()
+            .map(|question| horde_adapter::Question {
+                id: question.id.clone(),
+                header: question.header.clone(),
+                question: question.question.clone(),
+                options: question
+                    .options
+                    .iter()
+                    .flatten()
+                    .map(|option| horde_adapter::QuestionOption {
+                        label: option.label.clone(),
+                        description: option.description.clone(),
+                    })
+                    .collect(),
+                multi_select: false,
+                allows_free_text: question.is_other,
+                secret: question.is_secret,
+            })
+            .collect();
+        let input = serde_json::json!({
+            "questions": params.get("questions").cloned().unwrap_or(serde_json::Value::Null),
+        });
+
+        self.raise(
+            rpc_id,
+            turn_id,
+            ProposedToolCall::new(tool_call_id, USER_INPUT_TOOL_NAME, input).asking(questions),
+            ApprovalKind::UserInput,
+        )
+    }
+
+    /// Drops any approval still held for a request codex says is settled —
+    /// an answer from Horde already removed it, so what is left here was
+    /// resolved by codex itself and can no longer be answered.
+    fn request_resolved(&mut self, rpc_id: u64) {
+        self.outstanding.retain(|_, approval| approval.rpc_id != rpc_id);
     }
 
     /// An MCP tool-call elicitation: the interception point, as an event.
@@ -426,34 +634,18 @@ impl TurnAssembler {
             ),
         };
 
-        let turn_id = self
-            .turn
-            .as_ref()
-            .map(|turn| turn.id.clone())
-            .or_else(|| elicitation.turn_id.as_deref().map(TurnId::new));
-        let Some(turn_id) = turn_id else {
+        let Some(turn_id) = self.turn_for(elicitation.turn_id.as_deref()) else {
             // No turn to attribute the request to — nothing downstream could
             // journal or answer it coherently.
             return Vec::new();
         };
 
-        self.outstanding.insert(
-            tool_call_id.clone(),
-            OutstandingApproval {
-                rpc_id,
-                tool_name: tool_name.clone(),
-                input: input.clone(),
-                kind: ApprovalKind::McpElicitation,
-            },
-        );
-        vec![AgentEvent::PermissionRequested {
+        self.raise(
+            rpc_id,
             turn_id,
-            request: ProposedToolCall {
-                tool_call_id,
-                tool_name,
-                input,
-            },
-        }]
+            ProposedToolCall::new(tool_call_id, tool_name, input),
+            ApprovalKind::McpElicitation,
+        )
     }
 
     fn feed_notification(&mut self, notification: &Notification) -> Vec<AgentEvent> {
@@ -464,6 +656,10 @@ impl TurnAssembler {
             Notification::ItemStarted(started) => self.item_started(&started.item),
             Notification::ItemCompleted(completed) => self.item_completed(&completed.item),
             Notification::Error(error) => self.error_notified(error),
+            Notification::ServerRequestResolved(resolved) => {
+                self.request_resolved(resolved.request_id);
+                Vec::new()
+            }
             Notification::TokenUsageUpdated(update) => {
                 self.record_usage(update);
                 Vec::new()
@@ -529,9 +725,18 @@ impl TurnAssembler {
         }]
     }
 
-    /// Only mcpToolCall starts matter: they carry the tool identity the
-    /// elicitation that follows will not repeat.
+    /// Two kinds of start matter: an mcpToolCall carries the tool identity
+    /// the elicitation that follows will not repeat, and a fileChange carries
+    /// the patch its approval will not repeat.
     fn item_started(&mut self, item: &Item) -> Vec<AgentEvent> {
+        if item.is_file_change()
+            && let Some(turn) = self.turn.as_mut()
+        {
+            turn.started_file_changes.insert(
+                item.id.clone().unwrap_or_default(),
+                item.changes.clone().unwrap_or_default(),
+            );
+        }
         if item.is_mcp_tool_call()
             && let Some(turn) = self.turn.as_mut()
         {
@@ -599,19 +804,23 @@ impl TurnAssembler {
             return Vec::new();
         }
 
-        if item.is_command_execution() || item.is_mcp_tool_call() {
+        if item.is_command_execution() || item.is_mcp_tool_call() || item.is_file_change() {
             let turn_id = turn.id.clone();
             // An mcpToolCall can fail without an exit code — a declined
             // elicitation reads `status: "failed"` with an error message and
-            // nothing else (transcript 18) — so all three signals count.
+            // nothing else (transcript 18) — so all three signals count. A
+            // declined file change reads `status: "declined"` (transcript 36):
+            // from the agent's side a refusal is a failed tool.
             let is_error = item.exit_code.is_some_and(|code| code != 0)
                 || item.status.as_deref() == Some("failed")
+                || (item.is_file_change() && item.status.as_deref() == Some("declined"))
                 || item.error.is_some();
             // A call that completed without ever eliciting must not linger as
             // a candidate join for the *next* elicitation.
             let item_id = item.id.clone().unwrap_or_default();
             turn.started_mcp_calls
                 .retain(|started| started.item_id != item_id);
+            turn.started_file_changes.remove(&item_id);
             return vec![AgentEvent::ToolCompleted {
                 turn_id,
                 // Codex numbers its own items; there is no separate tool-call

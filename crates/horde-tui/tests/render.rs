@@ -85,6 +85,7 @@ fn escalation(request_id: &str, rendered: &str, tree_path: &[&str]) -> Kind {
                 tool_name: String::new(),
                 input: None,
                 rendered: rendered.to_owned(),
+                questions: Vec::new(),
             }),
             tree_path: tree_path.iter().map(ToString::to_string).collect(),
             permission_mode: "cautious".to_owned(),
