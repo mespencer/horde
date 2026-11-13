@@ -148,9 +148,9 @@ Native subagent tools (CC Task, etc.) are suppressed and substituted — not yet
 
 ## 7. Workspaces
 
-Split: **definition** (portable) vs **instance** (per-worker materialization). See also ADR-0002.
+Split: **definition** (portable) vs **instance** (per-worker materialization). See also ADR-0002. Freshness at spawn, lazy checkout, shared branch names, two-tier cleanup and the finished `unmanaged`/progress/report pieces: ADR-0014.
 
-- **Definition:** name + 1..N repos (remote URL, default branch) + layout + optional `unmanaged` paths. Lives in server SQLite, managed by CLI (`horde workspace create/add-repo/update/...`). Repo set is fixed at definition; additions are explicit (a permission-style event). Auto-registering a single-repo definition from cwd in `horde new` is not built yet; today `new` takes `--workspace` explicitly.
+- **Definition:** name + 1..N repos (remote URL, default branch) + layout + optional `unmanaged` paths. Lives in server SQLite, managed by CLI (`horde workspace create/add-repo/update/...`). Repo set is fixed at definition; additions are explicit (a permission-style event). Definitions are deliberate: nothing auto-registers one from cwd; bare `horde` may offer to create one on a TTY (ADR-0014).
 - **Instance:** checkouts on a worker's disk. Worker-local state file is the truth; reported to the server on connect (server treats it as cache; reconciliation handles wiped disks / out-of-band deletion). Created by server command at placement time; never self-initiated.
 - **Per-agent checkout policy:** `shared` (parent's instance — rare but real), `worktree` (default for mutating agents; one worktree per repo composed under an agent-private root), `fresh-clone` (full isolation).
 - **`unmanaged` paths** (datasets, weights, build caches): per-instance, never synced, not covered by payloads. Cross-worker artifact passing is the blob store's job, not git's.
