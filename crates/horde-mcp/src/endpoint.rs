@@ -1300,6 +1300,27 @@ mod tests {
         );
     }
 
+    /// `checkout_mode` takes the two modes or nothing; anything else is the
+    /// caller's mistake, named, never a guess.
+    #[test]
+    fn a_checkout_mode_argument_is_all_lazy_or_absent() {
+        use horde_proto::v1::CheckoutMode;
+        assert_eq!(
+            super::checkout_mode_named(None).ok(),
+            Some(CheckoutMode::Unspecified)
+        );
+        assert_eq!(
+            super::checkout_mode_named(Some("all")).ok(),
+            Some(CheckoutMode::All)
+        );
+        assert_eq!(
+            super::checkout_mode_named(Some("lazy")).ok(),
+            Some(CheckoutMode::Lazy)
+        );
+        let refused = super::checkout_mode_named(Some("some")).expect_err("refused");
+        assert!(refused.message.contains("\"some\""), "{refused:?}");
+    }
+
     #[tokio::test]
     async fn the_tool_names_are_the_ones_agents_are_told_about() {
         let names = endpoint().tool_names_for("agent-42");
