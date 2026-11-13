@@ -140,6 +140,7 @@ impl FakeAdapter {
             misbehaviour: self.script.misbehaviour,
             stall: None,
             stall_deadline: None,
+            stderr: horde_adapter::stderr::current(),
         }
     }
 }
@@ -290,6 +291,9 @@ pub struct FakeSession {
     /// When the standing stall ends, fixed by the first wait on it, so a
     /// dropped `next_event` neither loses nor restarts it.
     stall_deadline: Option<tokio::time::Instant>,
+    /// Where [`Step::Stderr`] lines go: the sink the spawn was scoped with,
+    /// exactly as a real harness's supervisor captures it.
+    stderr: Option<std::sync::Arc<dyn horde_adapter::stderr::StderrSink>>,
 }
 
 impl FakeSession {
@@ -329,6 +333,11 @@ impl FakeSession {
                 Step::Think(text) => self.emit_output(OutputChannel::Reasoning, text),
                 Step::Stall(duration) => self.stall = Some(duration),
                 Step::Exit => self.finished = true,
+                Step::Stderr(line) => {
+                    if let Some(sink) = &self.stderr {
+                        sink.line(&line);
+                    }
+                }
                 Step::UseHordeTool {
                     tool_call_id,
                     tool_name,

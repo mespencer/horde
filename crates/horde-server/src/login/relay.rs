@@ -466,6 +466,8 @@ mod tests {
     /// frames flow both ways until the worker leg ends as an exit.
     #[tokio::test]
     async fn two_login_legs_pair_and_carry_frames_both_ways() {
+        // PTY bytes are never logged at any level (ADR-0015).
+        let capture = crate::diagnostics::testfix::Capture::everything();
         let logins = LoginRegistry::new();
         let (_epoch, mut lane) = logins.register_worker("w1");
 
@@ -542,6 +544,7 @@ mod tests {
             .await
             .expect("the tunnel ends with its leg")
             .expect("no panic");
+        capture.assert_never_logged(&[b"hunter2\r", b"welcome"]);
     }
 
     /// A tunnel attaching to nothing is refused with the coded reason, and a

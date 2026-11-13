@@ -213,6 +213,7 @@ Modes are named, user-definable (the plain-text-instructions-as-a-mode idea), an
 - Usage events per agent (tokens, rate-window state where providers expose it), aggregated by tree path and by provider account.
 - **Reporting + soft alerts:** clients surface per-agent/per-tree usage; threshold alerts fire as ordinary events (phone-visible). Not yet landed — reporting shipped first (`horde usage`, CLI only), with no alert event kind or threshold config yet.
 - **Hard budgets (end state, sequenced later):** a spawn may carry a budget; at the cap the subtree pauses pending human approval (an ordinary permission-style event). The accounting schema is designed for this from day one.
+- **Diagnostic logs (ADR-0015):** each daemon writes bounded, rotating JSON-lines files under `<state>/logs`, and a worker also keeps each harness's stderr per agent. `horde logs` and the agents' `horde/logs` verb read them through the server over the existing mTLS streams, redacted before they leave their machine. Logs are never session events: nothing decides from them, and losing them loses no state.
 - **OTLP tracing:** the agent tree maps onto the span tree (agents = spans, tool calls = events), giving flame-graph views of an orchestration. As built: the export pipeline is real but carries RPC-handler spans only — the agent-tree-to-span mapping is still to build, so the flame graph is not yet obtainable — and export is plaintext gRPC (no TLS), an open inconsistency with §3's mTLS-everywhere posture.
 
 ## 13. Configuration layering

@@ -20,6 +20,7 @@
 //! Those asymmetries are named at each conversion rather than smoothed over.
 
 pub mod capability;
+pub mod logs;
 pub mod permission;
 pub mod usage;
 

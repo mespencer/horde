@@ -1285,6 +1285,7 @@ dependencies = [
  "horde-adapter-claude",
  "horde-cli",
  "horde-identity",
+ "horde-observe",
  "horde-proto",
  "horde-server",
  "horde-server-testkit",
@@ -1313,11 +1314,17 @@ dependencies = [
 name = "horde-observe"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
+ "hex",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "regex",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -1371,6 +1378,7 @@ dependencies = [
  "horde-proto",
  "horde-relay",
  "horde-server-testkit",
+ "horde-wire",
  "hyper-util",
  "nix 0.31.3",
  "proptest",
@@ -1431,8 +1439,12 @@ name = "horde-wire"
 version = "0.1.0"
 dependencies = [
  "horde-adapter",
+ "horde-observe",
  "horde-proto",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

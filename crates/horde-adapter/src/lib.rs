@@ -66,6 +66,7 @@ pub mod login;
 pub mod permission;
 pub mod replay;
 pub mod spec;
+pub mod stderr;
 pub mod usage;
 
 pub use capability::{Capabilities, Capability, PermissionEnforcement, ToolCallKind};

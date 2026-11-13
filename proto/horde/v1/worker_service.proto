@@ -19,6 +19,7 @@ import "horde/v1/forward.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
 import "horde/v1/login.proto";
+import "horde/v1/logs.proto";
 import "horde/v1/mcp.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/worker.proto";
@@ -94,6 +95,22 @@ service WorkerService {
   // gated it at the Agent's endpoint (DESIGN §10); the Server re-checks
   // visibility (fails closed) and routes it to the configured upstream.
   rpc CallHubTool(CallHubToolRequest) returns (CallHubToolResponse);
+
+  // -- Diagnostic logs (ADR-0015) ---------------------------------------------
+  //
+  // Deliberately NOT the command stream: everything there is a fold over the
+  // session log, resumed by position and journaled before its ack, and a log
+  // read is neither a fact nor something to replay after a reconnect. The
+  // login relay's shape instead: a dispatch stream, and one tunnel per read.
+
+  // Subscribe to log reads. The Server pushes one LogQuery per ReadLogs aimed
+  // at this Worker. Advertise `logs.v1` in Hello before subscribing.
+  rpc StreamLogRequests(StreamLogRequestsRequest) returns (stream StreamLogRequestsResponse);
+
+  // One read's records, Worker leg. The first frame echoes the request id;
+  // then record batches, gap notices, and an end frame. Either side dropping
+  // the stream cancels the read.
+  rpc WorkerLogTunnel(stream WorkerLogTunnelRequest) returns (stream WorkerLogTunnelResponse);
 }
 
 // ---------------------------------------------------------------------------

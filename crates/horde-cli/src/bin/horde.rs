@@ -33,27 +33,31 @@ async fn main() -> ExitCode {
     // stdout is the TUI, stderr the refusal channel — so the subscriber is
     // export-only, stamped with the enrolled principal when `--identity`
     // holds one.
-    let identity = horde_observe::ServiceIdentity::new("horde")
-        .with_principal(horde_cli::cli::enrolled_principal(cli.identity.as_deref()));
-    let telemetry = match horde_observe::init_from_env(identity, |name| std::env::var(name).ok()) {
-        Ok(telemetry) => telemetry,
+    let (telemetry, file) = match horde_cli::logs::observability(
+        cli.log_file,
+        horde_cli::cli::enrolled_principal(cli.identity.as_deref()),
+        |name| std::env::var(name).ok(),
+        std::env::var_os("HOME").map(Into::into),
+    ) {
+        Ok(installed) => installed,
         Err(refusal) => {
             eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
     };
-    if let Some(telemetry) = &telemetry {
-        let installed =
-            tracing::dispatcher::set_global_default(horde_observe::silent_subscriber(telemetry));
-        if installed.is_err() {
-            eprintln!("could not install the telemetry subscriber: one is already set");
-            return ExitCode::FAILURE;
-        }
+    if let Some(dispatch) = horde_observe::silent_subscriber(telemetry.as_ref(), file.as_ref())
+        && tracing::dispatcher::set_global_default(dispatch).is_err()
+    {
+        eprintln!("could not install the telemetry subscriber: one is already set");
+        return ExitCode::FAILURE;
     }
 
+    // Never the arguments: a join token rides argv.
+    tracing::info!(target: "horde_cli", version = env!("CARGO_PKG_VERSION"), "invocation started");
     let code = match run(&cli, format).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            tracing::warn!(target: "horde_cli", %error, "invocation refused");
             // Decided in the library (`ClientError::report`), where it is
             // tested: the refusal, and the diagnosed cause beneath it.
             eprintln!("{}", error.report_for(format));
@@ -61,11 +65,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Some(telemetry) = telemetry {
-        // The flush blocks, so it runs off the runtime's worker threads. The
-        // verdict is discarded deliberately: a collector that is down must
-        // not change an exit code.
-        let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
-    }
+    // Off the runtime's worker threads: both flushes block.
+    let _ = tokio::task::spawn_blocking(move || {
+        horde_cli::logs::finish_observability(
+            telemetry,
+            file.as_ref(),
+            std::time::Duration::from_secs(2),
+        );
+    })
+    .await;
     code
 }

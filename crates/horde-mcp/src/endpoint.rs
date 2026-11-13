@@ -306,6 +306,9 @@ pub struct HordeEndpoint {
     /// Ordinal for minted permission-request ids, when a caller's `_meta`
     /// carries no correlation id of its own.
     minted: Arc<AtomicU64>,
+    /// The `logs` verb's files and limits (ADR-0015). `None` reads every
+    /// target through the server, under default limits.
+    logs: Option<crate::logs::SharedLogAccess>,
 }
 
 impl std::fmt::Debug for HordeEndpoint {
@@ -325,7 +328,15 @@ impl HordeEndpoint {
             tool_router: Self::tool_router(),
             proxies: Arc::new(AgentProxies::new()),
             minted: Arc::new(AtomicU64::new(0)),
+            logs: None,
         }
+    }
+
+    /// Serves `logs` from this worker's files, under these limits.
+    #[must_use]
+    pub fn with_logs(mut self, logs: crate::logs::SharedLogAccess) -> Self {
+        self.logs = Some(logs);
+        self
     }
 
     /// Attaches the per-Agent proxied toolsets. The registry stays shared
@@ -610,6 +621,47 @@ impl HordeEndpoint {
             status: status_name(result.status).to_owned(),
             summary: result.summary,
         }))
+    }
+
+    #[tool(
+        name = "logs",
+        description = "Read Horde's own diagnostic logs when you suspect the system, not your task, is the problem: your harness's stderr and your records on your worker (target self, the default), the server (server), a worker (worker:<name>), or an agent of your session (agent:<id>). Filter with since (10m or a timestamp), level, and grep. Returns redacted JSON-lines records, newest first fitting max_bytes; page forward by passing next_cursor back as cursor. Rate-limited; a refusal says when to retry."
+    )]
+    async fn logs(
+        &self,
+        Parameters(params): Parameters<crate::logs::LogsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let identity = Self::caller(&context)?;
+        let fallback;
+        let access = match &self.logs {
+            Some(access) => access,
+            None => {
+                fallback = crate::logs::LogAccess::new(
+                    None,
+                    "",
+                    horde_observe::settings::AgentReadLimits::default(),
+                );
+                &fallback
+            }
+        };
+        let mut client = self.context.client();
+        match access
+            .call(
+                &mut client,
+                identity.agent_id(),
+                self.context.session_id(),
+                &params,
+            )
+            .await
+        {
+            Ok(view) => Ok(CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text(serde_json::to_string(&view).map_err(internal)?),
+            ])),
+            Err(refusal) => Ok(CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(format!("logs: {refusal}")),
+            ])),
+        }
     }
 
     /// The chain's decision on one proxied call — reached exactly once.
@@ -1232,6 +1284,7 @@ mod tests {
             "wait_for_agent",
             "expose",
             "inject",
+            "logs",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

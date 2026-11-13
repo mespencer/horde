@@ -154,7 +154,7 @@ pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<WorkerC
 /// The [`Script`] type is test vocabulary; this is its operator form, kept
 /// deliberately small: an array of turns, each either a bare string (a turn
 /// that says it and finishes) or an object `{"steps": […], "text": …}` whose
-/// steps are `{"say": …}`, `{"think": …}` or
+/// steps are `{"say": …}`, `{"think": …}`, `{"stderr": …}` or
 /// `{"ask_permission": {"id": …, "tool": …, "input": …}}`. After the scripted
 /// turns run out the agent echoes, which is what the revival and steering
 /// scenarios need from a conversation of unknowable length.
@@ -246,7 +246,14 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
             input,
         });
     }
-    Err("a step must be one of say, think, ask_permission, use_horde".to_owned())
+    if let Some(line) = object.get("stderr") {
+        // A line the "harness" writes to stderr (ADR-0015): what the log
+        // suites read back through the agent's stderr file.
+        return Ok(Step::Stderr(
+            line.as_str().ok_or("stderr must be a string")?.to_owned(),
+        ));
+    }
+    Err("a step must be one of say, think, ask_permission, use_horde, stderr".to_owned())
 }
 
 /// The `{id, tool, input}` triple both tool-shaped steps share.
@@ -476,6 +483,9 @@ pub struct PreparedWorker {
     pub login_announce: crate::login::Announce,
     /// This daemon's hold on its state directory, for as long as it runs.
     pub state_lock: horde_identity::StateLock,
+    /// The diagnostic logs it keeps and serves (ADR-0015); `None` serves no
+    /// log reads and advertises no `logs.v1`.
+    pub logs: Option<Arc<crate::logs::LogServing>>,
 }
 
 impl std::fmt::Debug for PreparedWorker {
@@ -527,7 +537,10 @@ pub async fn prepare(
         ));
     }
 
-    let runtime = build_runtime(config, &server, identity.as_ref(), &name, journal.clone()).await?;
+    let logs = Arc::new(crate::logs::LogServing::for_daemon(&config.state_dir));
+    let runtime = build_runtime(config, &server, identity.as_ref(), &name, journal.clone())
+        .await?
+        .with_logs(Arc::clone(&logs));
     Ok(PreparedWorker {
         runtime,
         journal,
@@ -540,6 +553,7 @@ pub async fn prepare(
         name,
         login_announce: Arc::new(|line| println!("{line}")),
         state_lock,
+        logs: Some(logs),
     })
 }
 
@@ -692,7 +706,7 @@ async fn fresh_dial_config(
     DialConfig {
         endpoint: prepared.server.clone(),
         worker_id: prepared.name.clone(),
-        hello: capabilities::hello(&prepared.name),
+        hello: capabilities::hello_serving_logs(&prepared.name, prepared.logs.is_some()),
         capabilities: advertised,
         identity: prepared.identity.clone(),
         // An unreadable head reports nothing rather than zero: zero would
@@ -769,13 +783,20 @@ pub fn with_observability(
     drop(entered);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,horde_worker=debug"));
+    // Bounded JSON-lines logs under the state directory (ADR-0015), filtered
+    // by `HORDE_LOG`; a typo there is a refusal like any other.
+    let file = file_logging(state_dir, |name| std::env::var(name).ok())?;
     tracing::dispatcher::set_global_default(horde_observe::stderr_subscriber(
         filter,
         telemetry.as_ref(),
+        Some(&file),
     ))
     .map_err(|error| format!("could not install the subscriber: {error}"))?;
+    file.register_process();
 
     let code = main_loop(&runtime);
+    // What is still queued reaches the file before the process exits.
+    file.flush(std::time::Duration::from_secs(2));
 
     if let Some(telemetry) = telemetry {
         // With the runtime still alive for the flush to travel its channel.
@@ -784,6 +805,26 @@ pub fn with_observability(
         let _ = telemetry.shutdown();
     }
     Ok(code)
+}
+
+/// The daemon's file logging under `<state>/logs`, stamped with the
+/// enrolled principal.
+///
+/// # Errors
+///
+/// An unparseable `HORDE_LOG`, or a writer thread that cannot start.
+pub fn file_logging(
+    state_dir: &Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<horde_observe::FileLogging, String> {
+    let settings = horde_observe::settings::LogSettings::daemon().with_env(lookup)?;
+    horde_observe::FileLogging::start(
+        &crate::logs::log_dir(state_dir),
+        crate::logs::BINARY,
+        &settings,
+        &horde_observe::ServiceIdentity::new(crate::logs::BINARY)
+            .with_principal(enrolled_principal(state_dir)),
+    )
 }
 
 /// Resolves when either future does — the daemon's two-signal wait
@@ -887,7 +928,12 @@ async fn connection_loop(
 
         let ended = tokio::select! {
             () = shutdown.as_mut() => return None,
-            ended = connection.run(&prepared.journal, &mut prepared.runtime, logins) => ended,
+            ended = connection.run_with_logs(
+                &prepared.journal,
+                &mut prepared.runtime,
+                logins,
+                prepared.logs.clone(),
+            ) => ended,
         };
         match fate_of(&ended) {
             Fate::Fatal(reason) => return Some(reason),

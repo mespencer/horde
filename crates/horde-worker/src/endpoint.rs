@@ -72,6 +72,9 @@ pub struct EndpointManager {
     /// The tokens the serving gate accepts; shared with every endpoint this
     /// manager serves.
     registry: Arc<AgentRegistry>,
+    /// The `logs` verb's local files and per-agent limits (ADR-0015), one
+    /// set shared by every endpoint, so an agent's limits hold across them.
+    logs: std::sync::OnceLock<horde_mcp::logs::SharedLogAccess>,
     /// Each Agent's proxied toolset — hub link plus `local` children —
     /// shared with every endpoint this manager serves, resolved per request
     /// by caller identity.
@@ -109,9 +112,20 @@ impl std::fmt::Debug for EndpointManager {
 }
 
 impl EndpointManager {
+    /// Serves the agents' `logs` verb from this Worker's own files
+    /// (ADR-0015). Set once; endpoints bound after it carry it.
+    pub fn serve_logs(&self, local: horde_observe::reader::LocalLogs) {
+        let _ = self.logs.set(Arc::new(horde_mcp::logs::LogAccess::new(
+            Some(local),
+            &self.worker_id,
+            horde_observe::settings::AgentReadLimits::default(),
+        )));
+    }
+
     #[must_use]
     pub fn new(channel: tonic::transport::Channel, worker_id: &str) -> Self {
         Self {
+            logs: std::sync::OnceLock::new(),
             channel,
             worker_id: worker_id.to_owned(),
             registry: Arc::new(AgentRegistry::new()),
@@ -300,8 +314,11 @@ impl EndpointManager {
             horde_cli::client::Client::with_channel(self.channel.clone()),
             session_id,
         );
-        let endpoint = horde_mcp::endpoint::HordeEndpoint::new(context)
+        let mut endpoint = horde_mcp::endpoint::HordeEndpoint::new(context)
             .with_agent_proxies(Arc::clone(&self.proxies));
+        if let Some(logs) = self.logs.get() {
+            endpoint = endpoint.with_logs(Arc::clone(logs));
+        }
         let (bound, serving) = horde_mcp::server::serve(
             &EndpointConfig::loopback(0),
             Arc::clone(&self.registry),
@@ -410,6 +427,24 @@ mod tests {
     fn sink() -> StampingSink {
         let journal = crate::journal::Journal::in_memory().expect("an in-memory journal");
         StampingSink::new(journal.sink(), std::sync::Arc::new(ShareBroker::new(None)))
+    }
+
+    /// `agent-1`'s endpoint in `s1`: its URL and bearer token.
+    async fn minted(manager: &EndpointManager) -> (String, String) {
+        let endpoint = manager
+            .endpoint_for("s1", "agent-1", sink(), &bare())
+            .await
+            .expect("the endpoint serves");
+        let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
+            panic!("the worker serves HTTP");
+        };
+        let token = headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .and_then(|(_, value)| value.strip_prefix("Bearer "))
+            .expect("a bearer token")
+            .to_owned();
+        (url, token)
     }
 
     /// The empty-surface shortcut's truth table: only a surface with neither
@@ -580,19 +615,7 @@ mod tests {
     #[tokio::test]
     async fn minted_credentials_dial_until_forgotten_and_the_socket_dies_at_shutdown() {
         let manager = manager();
-        let endpoint = manager
-            .endpoint_for("s1", "agent-1", sink(), &bare())
-            .await
-            .expect("the endpoint serves");
-        let horde_adapter::McpEndpoint::Http { url, headers } = endpoint else {
-            panic!("the worker serves HTTP");
-        };
-        let token = headers
-            .iter()
-            .find(|(name, _)| name == "Authorization")
-            .and_then(|(_, value)| value.strip_prefix("Bearer "))
-            .expect("a bearer token")
-            .to_owned();
+        let (url, token) = minted(&manager).await;
 
         let dial = |token: String, url: String| async move {
             horde_mcp::hub::Upstream::dial(
@@ -643,6 +666,41 @@ mod tests {
                 .is_err(),
             "a shut-down manager must refuse to serve new endpoints"
         );
+    }
+
+    /// An agent's `logs` verb reads this Worker's own files once the manager
+    /// serves them: its harness's stderr comes back, with no server asked.
+    /// Without them the read would go to the server, which here is a dead
+    /// address, and be refused.
+    #[tokio::test]
+    async fn the_logs_verb_reads_the_workers_own_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let serving = crate::logs::LogServing::new(dir.path(), "boot", None);
+        serving
+            .agent_stderr("agent-1", "s1")
+            .line("harness says hello");
+        let manager = manager();
+        manager.serve_logs(serving.local().clone());
+        let (url, token) = minted(&manager).await;
+        let upstream = horde_mcp::hub::Upstream::dial(
+            "horde",
+            &url,
+            Some(&token),
+            &[("x-horde-agent", "agent-1")],
+        )
+        .await
+        .expect("dial");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            upstream.call("logs", None),
+        )
+        .await
+        .expect("the read returns")
+        .expect("the call");
+        let text = format!("{:?}", result.content);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        assert!(text.contains("harness says hello"), "{text}");
+        manager.shutdown().await;
     }
 
     /// The Debug form reaches logs; it must say what it is (the credential

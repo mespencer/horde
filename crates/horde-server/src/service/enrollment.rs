@@ -203,6 +203,14 @@ impl EnrollmentAuthority {
         )
         .await?;
 
+        // Scrubbed from every log record this server serves until it is
+        // redeemed or expires (ADR-0015's registered values).
+        horde_observe::redact::register_secret(
+            &secret,
+            u64::try_from(expires_at_unix_ms)
+                .ok()
+                .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+        );
         Ok(MintedCode {
             secret,
             server_fingerprint: self.credential.fingerprint().map_err(identity_internal)?,
@@ -280,6 +288,9 @@ impl EnrollmentAuthority {
         {
             tracing::warn!(%error, file = %file.display(), "could not retire the bootstrap token");
         }
+        // Spent: a redeemed secret opens nothing, so it no longer needs
+        // scrubbing.
+        horde_observe::redact::forget_secret(secret);
 
         Ok((principal, issued))
     }
@@ -451,6 +462,25 @@ pub(crate) mod tests {
         let debugged = format!("{authority:?}");
         assert!(debugged.contains("EnrollmentAuthority"), "{debugged}");
         assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
+    }
+
+    /// A minted secret is scrubbed from every log record this server serves
+    /// until it expires (ADR-0015's registered values).
+    #[tokio::test]
+    async fn a_minted_secret_is_redacted_from_served_logs_until_it_expires() {
+        let authority = bare_authority().await;
+        let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w1")
+            .expect("a valid name");
+        let minted = authority
+            .mint(&principal, 60_000, super::wall_clock_ms())
+            .await
+            .expect("mints");
+        let (line, touched) = horde_observe::redact::redact_line(&format!(
+            "{{\"msg\":\"joined with {}\"}}",
+            minted.secret
+        ));
+        assert!(touched, "{line}");
+        assert!(!line.contains(&minted.secret), "{line}");
     }
 
     #[test]

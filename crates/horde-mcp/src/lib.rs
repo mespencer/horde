@@ -43,6 +43,7 @@ pub mod forwards;
 pub mod hub;
 pub mod identity;
 pub mod journal;
+pub mod logs;
 pub mod permission;
 pub mod server;
 

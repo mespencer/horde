@@ -1738,6 +1738,19 @@ impl ControlPlaneService for ControlPlane {
         ))
     }
 
+    type ReadLogsStream = super::diagnostics::ReadLogsStream;
+
+    /// Diagnostic logs (ADR-0015): the server's, a worker's, or an agent's
+    /// records, redacted at egress. See [`crate::diagnostics`] for who may
+    /// read what.
+    #[instrument(skip_all)]
+    async fn read_logs(
+        &self,
+        request: Request<horde_proto::v1::ReadLogsRequest>,
+    ) -> Result<Response<Self::ReadLogsStream>, Status> {
+        super::diagnostics::read_logs(&self.core, request).await
+    }
+
     type WorkerLoginStream =
         Pin<Box<dyn Stream<Item = Result<horde_proto::v1::WorkerLoginResponse, Status>> + Send>>;
 
@@ -2265,7 +2278,7 @@ mod tests {
 
 /// The ADR-0011 verbs and refusals, through the production handlers.
 #[cfg(test)]
-mod delivery_tests {
+pub(crate) mod delivery_tests {
     use horde_identity::{PeerIdentity, Principal, PrincipalRole};
     use horde_proto::v1::control_plane_service_server::ControlPlaneService;
     use horde_proto::v1::{
@@ -2576,7 +2589,7 @@ mod delivery_tests {
         assert_eq!(refused.code(), Code::FailedPrecondition);
     }
 
-    fn as_worker<T>(name: &str, mut request: Request<T>) -> Request<T> {
+    pub(crate) fn as_worker<T>(name: &str, mut request: Request<T>) -> Request<T> {
         request.extensions_mut().insert(PeerIdentity {
             principal: Principal::new(PrincipalRole::Worker, name).expect("a valid name"),
             serial_hex: "aa".to_owned(),
@@ -2664,7 +2677,7 @@ mod delivery_tests {
 }
 
 #[cfg(test)]
-mod list_tests {
+pub(crate) mod list_tests {
     use horde_proto::v1::control_plane_service_server::ControlPlaneService;
     use horde_proto::v1::{
         ArchiveSessionRequest, CreateSessionRequest, ListSessionsRequest, SessionId,
@@ -2676,7 +2689,7 @@ mod list_tests {
     use crate::service::shared::ServerCore;
 
     /// A session titled `title`, created under `key`; its id.
-    async fn titled(plane: &ControlPlane, title: &str, key: &str) -> String {
+    pub(crate) async fn titled(plane: &ControlPlane, title: &str, key: &str) -> String {
         plane
             .create_session(Request::new(CreateSessionRequest {
                 title: title.to_owned(),

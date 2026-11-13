@@ -24,6 +24,9 @@ horde-relay = { workspace = true }
 # export pipeline both live there, where they are testable.
 horde-observe = { workspace = true }
 horde-proto = { workspace = true }
+# The diagnostic-log serving loop and wire translations it shares with the
+# worker (ADR-0015).
+horde-wire = { workspace = true }
 # `--remint`'s SIGHUP, sent by syscall to a vetted pid (src/remint.rs).
 nix = { version = "0.31.3", features = ["process", "signal"] }
 prost = "0.14.4"

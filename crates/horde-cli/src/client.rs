@@ -240,6 +240,11 @@ pub enum ClientError {
     /// `horde doctor` found something to fix; the report above says what.
     #[error("doctor found {failures} problem(s); each FAIL line above names its fix")]
     Unhealthy { failures: usize },
+
+    /// `horde logs` was asked for something it cannot read: no target, an
+    /// unknown one, or a filter that does not parse.
+    #[error("{0}")]
+    Logs(String),
 }
 
 impl ClientError {
@@ -964,6 +969,15 @@ impl Client {
                 inbound.map(|message| message.map(|reply| reply.frame.unwrap_or_default())),
             ),
         })
+    }
+
+    /// Opens a diagnostic-log read (ADR-0015): the server's, a worker's, or
+    /// an agent's records, then — with `follow` — new ones as they come.
+    pub async fn read_logs(
+        &mut self,
+        request: horde_proto::v1::ReadLogsRequest,
+    ) -> Result<tonic::Streaming<horde_proto::v1::ReadLogsResponse>, ClientError> {
+        Ok(self.inner.read_logs(request).await?.into_inner())
     }
 
     /// Opens one tunnel leg, stripped to bare frames for the pump.
