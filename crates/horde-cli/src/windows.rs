@@ -17,6 +17,13 @@ pub(crate) fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<std:
         .find(|candidate| std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file()))
 }
 
+/// An absent state directory's report on Windows: it will be created
+/// plainly and inherit its parent's ACL — owner-only only because the
+/// profile's ACL is, never by a mode (ADR-0017).
+#[cfg(windows)]
+pub(crate) const ABSENT_STATE_DIR: &str =
+    "absent; created on first use, inheriting its parent's ACL (no mode bits on this platform)";
+
 /// A state directory's privacy on Windows: there are no mode bits, only the
 /// ACL it inherits — the user's profile grants the user, SYSTEM and
 /// Administrators alone. Reported as such, with the command that shows it.

@@ -395,6 +395,9 @@ pub(crate) fn windows_program(name: &str) -> String {
 pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
     let label = format!("dir {}", dir.display());
     let Ok(meta) = std::fs::metadata(dir) else {
+        #[cfg(windows)]
+        return vec![Check::ok(&label, crate::windows::ABSENT_STATE_DIR)];
+        #[cfg(unix)]
         return vec![Check::ok(&label, "absent; created owner-only on first use")];
     };
     vec![permission_check(&label, dir, &meta), disk_check(dir)]
