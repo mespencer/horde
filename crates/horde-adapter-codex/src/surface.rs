@@ -288,21 +288,18 @@ pub const MISSING: &str = "MISSING";
 /// missing method is drift too, but it is reported rather than summarized,
 /// since there is no schema to read paths from.
 pub fn extract(schema_dir: &Path) -> Result<Extracted, String> {
+    extract_from(schema_dir, SURFACE)
+}
+
+/// [`extract`] over an explicit surface.
+///
+/// # Errors
+///
+/// As for [`extract`].
+pub fn extract_from(schema_dir: &Path, surface: &[Used]) -> Result<Extracted, String> {
     let mut extracted = Extracted::new();
-    for used in SURFACE {
-        let (root, start) = match used.source {
-            Source::Method { file, method } => {
-                let root = load(schema_dir, file)?;
-                let params = method_params(&root, method)
-                    .ok_or_else(|| format!("{file} has no method {method:?}"))?;
-                (root, params)
-            }
-            Source::File { file } => {
-                let root = load(schema_dir, file)?;
-                let start = root.clone();
-                (root, start)
-            }
-        };
+    for used in surface {
+        let (root, start) = starting_point(schema_dir, used.source)?;
         let paths = used
             .paths
             .iter()
@@ -311,6 +308,22 @@ pub fn extract(schema_dir: &Path) -> Result<Extracted, String> {
         extracted.insert(used.source.key(), paths);
     }
     Ok(extracted)
+}
+
+/// The schema file a source lives in, and the schema its paths start at.
+fn starting_point(schema_dir: &Path, source: Source) -> Result<(Value, Value), String> {
+    match source {
+        Source::Method { file, method } => {
+            let root = load(schema_dir, file)?;
+            let params = method_params(&root, method)
+                .ok_or_else(|| format!("{file} has no method {method:?}"))?;
+            Ok((root, params))
+        }
+        Source::File { file } => {
+            let root = load(schema_dir, file)?;
+            Ok((root.clone(), root))
+        }
+    }
 }
 
 fn load(schema_dir: &Path, file: &str) -> Result<Value, String> {
@@ -493,6 +506,77 @@ mod tests {
                 "Loop": {"$ref": "#/definitions/Loop"}
             }
         })
+    }
+
+    /// The whole extraction over a bundle on disk: a method source, a file
+    /// source, and the refusals for a method or file that is not there.
+    #[test]
+    fn extraction_reads_a_bundle_and_names_what_is_missing() {
+        use super::{Source, Used, extract_from};
+
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        std::fs::write(dir.path().join("Union.json"), root().to_string()).expect("writes");
+        std::fs::write(
+            dir.path().join("Reply.json"),
+            json!({"type": "object", "properties": {"decision": {"enum": ["accept", "decline"]}}})
+                .to_string(),
+        )
+        .expect("writes");
+        std::fs::write(dir.path().join("Broken.json"), "{").expect("writes");
+
+        let surface = [
+            Used {
+                source: Source::Method {
+                    file: "Union.json",
+                    method: "a/b",
+                },
+                paths: &["id", "nope"],
+            },
+            Used {
+                source: Source::File { file: "Reply.json" },
+                paths: &["decision"],
+            },
+        ];
+        let extracted = extract_from(dir.path(), &surface).expect("extracts");
+        assert_eq!(extracted["Union.json a/b"]["id"], "string");
+        assert_eq!(extracted["Union.json a/b"]["nope"], MISSING);
+        assert_eq!(extracted["Reply.json"]["decision"], "enum:accept,decline");
+
+        let unknown_method = [Used {
+            source: Source::Method {
+                file: "Union.json",
+                method: "z/z",
+            },
+            paths: &[],
+        }];
+        let error = extract_from(dir.path(), &unknown_method).expect_err("no such method");
+        assert!(error.contains("has no method \"z/z\""), "{error}");
+        let missing_file = [Used {
+            source: Source::File {
+                file: "Absent.json",
+            },
+            paths: &[],
+        }];
+        assert!(
+            extract_from(dir.path(), &missing_file)
+                .expect_err("no such file")
+                .contains("could not read")
+        );
+        let broken = [Used {
+            source: Source::File {
+                file: "Broken.json",
+            },
+            paths: &[],
+        }];
+        assert!(
+            extract_from(dir.path(), &broken)
+                .expect_err("not JSON")
+                .contains("is not JSON")
+        );
+        assert!(
+            super::extract(dir.path()).is_err(),
+            "the real surface is not in a toy bundle"
+        );
     }
 
     #[test]

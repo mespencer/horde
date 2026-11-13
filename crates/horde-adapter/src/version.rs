@@ -380,13 +380,19 @@ mod tests {
     }
 
     /// The bounded probe: what a binary prints is read and classified, one
-    /// that cannot run says why, and neither is ever refused for being
-    /// unreadable.
+    /// that cannot run says why, one that hangs is cut off at the ceiling, and
+    /// none is ever refused for being unreadable.
+    ///
+    /// One test, both scripts written before anything is spawned: a fork
+    /// from a parallel test while a script is still open for writing makes
+    /// exec fail with ETXTBSY.
     #[cfg(feature = "probe")]
     #[tokio::test]
     async fn the_probe_reads_what_runs_and_explains_what_does_not() {
-        let ceiling = std::time::Duration::from_secs(10);
         let banner = script("banner", "echo \"toy 1.5.0 ($1)\"");
+        let hang = script("hang", "exec sleep 30");
+        let ceiling = std::time::Duration::from_secs(10);
+
         assert_eq!(
             super::run_version(&banner, ceiling).await,
             Ok("toy 1.5.0 (--version)\n".to_owned()),
@@ -406,13 +412,7 @@ mod tests {
         let report = super::probe_version("/nonexistent/horde-probe", TABLE, ceiling).await;
         assert_eq!(report.verdict, SupportVerdict::Untested);
         assert_eq!(report.raw, missing);
-    }
 
-    /// A binary that answers nothing in time is cut off at the ceiling.
-    #[cfg(feature = "probe")]
-    #[tokio::test]
-    async fn a_silent_binary_is_cut_off_at_the_ceiling() {
-        let hang = script("hang", "exec sleep 30");
         let started = std::time::Instant::now();
         let silent = super::run_version(&hang, std::time::Duration::from_millis(300))
             .await

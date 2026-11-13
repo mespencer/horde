@@ -175,6 +175,35 @@ impl CodexAdapter {
         })
     }
 
+    /// The enforcement audit trail, owed to the first turn: the sandbox tier
+    /// and why, which call kinds are chain-gated on this binary — and an
+    /// untested version's warning, on the record where its failures land.
+    fn note_enforcement(
+        &self,
+        session: &mut LiveCodexSession,
+        tier: &horde_adapter_codex::TierChoice,
+    ) {
+        session.assembler.note_startup_diagnostic(format!(
+            "codex sandbox {}: {}",
+            tier.tier.wire_name(),
+            tier.reason
+        ));
+        for line in enforcement_diagnostics(&self.version) {
+            session.assembler.note_startup_diagnostic(line);
+        }
+    }
+
+    /// A binary below the floor never starts (W12c).
+    fn refuse_a_refused_version(&self) -> Result<()> {
+        if self.version.is_refused() {
+            return Err(AdapterError::RefusedVersion {
+                provider: horde_adapter_codex::PROVIDER.to_owned(),
+                detail: self.version.describe(),
+            });
+        }
+        Ok(())
+    }
+
     /// Starts a supervised `codex app-server` and drives the handshake.
     ///
     /// Spawning and reviving differ only in the thread request, so they share
@@ -184,12 +213,7 @@ impl CodexAdapter {
         spec: &AgentSpec,
         resume_thread: Option<&ProviderSessionId>,
     ) -> Result<Box<dyn AgentSession>> {
-        if self.version.is_refused() {
-            return Err(AdapterError::RefusedVersion {
-                provider: horde_adapter_codex::PROVIDER.to_owned(),
-                detail: self.version.describe(),
-            });
-        }
+        self.refuse_a_refused_version()?;
         let launch = self.harness_spec(spec).map_err(launch_failure)?;
         let harness = SupervisedHarness::spawn(&launch)
             .await
@@ -209,17 +233,7 @@ impl CodexAdapter {
 
         let mut session = LiveCodexSession::new(harness);
         session.response_ceiling = self.response_ceiling;
-        session.assembler.note_startup_diagnostic(format!(
-            "codex sandbox {}: {}",
-            tier.tier.wire_name(),
-            tier.reason
-        ));
-        // The other half of the enforcement audit trail: which call kinds are
-        // chain-gated on this binary, or the tier is all there is — and an
-        // untested version's warning, on the record where its failures land.
-        for line in enforcement_diagnostics(&self.version) {
-            session.assembler.note_startup_diagnostic(line);
-        }
+        self.note_enforcement(&mut session, &tier);
 
         // initialize → initialized → thread/start|thread/resume. Awaiting is
         // safe here: no turn is running, so nothing the pump must answer can
@@ -926,66 +940,89 @@ fn reply_for(
     let rewrites = decision
         .updated_input()
         .is_some_and(|updated| updated != proposal);
-    let answered = decision.answers().is_some();
+    // Answers settle only a question; any other kind declines them.
+    let refused = rewrites || decision.answers().is_some();
     match kind {
-        ApprovalKind::McpElicitation => {
-            if decision.updated_input().is_some() || answered {
-                Mapped::declined(Reply::Elicitation { accept: false })
-            } else {
-                Mapped::expressed(Reply::Elicitation {
-                    accept: decision.is_allow(),
-                })
-            }
+        ApprovalKind::McpElicitation => elicitation_reply(decision),
+        ApprovalKind::ExecCommand { proposed_amendment } => {
+            exec_reply(decision, proposal, proposed_amendment.as_deref())
         }
-        ApprovalKind::ExecCommand { proposed_amendment } if !answered => {
-            match exec_decision_for(decision, proposal, proposed_amendment.as_deref()) {
-                Ok(exec) => Mapped::expressed(Reply::Decision(exec)),
-                Err(InexpressibleNarrowing) => {
-                    Mapped::declined(Reply::Decision(ExecDecision::Decline))
-                }
-            }
+        ApprovalKind::FileChange => file_change_reply(decision, refused),
+        ApprovalKind::Permissions { requested } => permissions_reply(decision, refused, requested),
+        ApprovalKind::UserInput => user_input_reply(decision),
+    }
+}
+
+/// Accept or decline: any narrowing or answer is inexpressible.
+fn elicitation_reply(decision: &PermissionDecision) -> Mapped {
+    if decision.updated_input().is_some() || decision.answers().is_some() {
+        Mapped::declined(Reply::Elicitation { accept: false })
+    } else {
+        Mapped::expressed(Reply::Elicitation {
+            accept: decision.is_allow(),
+        })
+    }
+}
+
+fn exec_reply(
+    decision: &PermissionDecision,
+    proposal: &serde_json::Value,
+    proposed_amendment: Option<&[String]>,
+) -> Mapped {
+    if decision.answers().is_some() {
+        return Mapped::declined(Reply::Decision(ExecDecision::Decline));
+    }
+    match exec_decision_for(decision, proposal, proposed_amendment) {
+        Ok(exec) => Mapped::expressed(Reply::Decision(exec)),
+        Err(InexpressibleNarrowing) => Mapped::declined(Reply::Decision(ExecDecision::Decline)),
+    }
+}
+
+fn file_change_reply(decision: &PermissionDecision, refused: bool) -> Mapped {
+    let reply = |exec| Reply::Decision(exec);
+    if refused {
+        Mapped::declined(reply(ExecDecision::Decline))
+    } else if !decision.is_allow() {
+        Mapped::expressed(reply(ExecDecision::Decline))
+    } else if decision.remembers_for_session() {
+        Mapped::expressed(reply(ExecDecision::AcceptForSession))
+    } else {
+        Mapped::expressed(reply(ExecDecision::Accept))
+    }
+}
+
+fn permissions_reply(
+    decision: &PermissionDecision,
+    refused: bool,
+    requested: &serde_json::Value,
+) -> Mapped {
+    let nothing = Reply::Permissions {
+        granted: serde_json::json!({}),
+        for_session: false,
+    };
+    if refused {
+        Mapped::declined(nothing)
+    } else if decision.is_allow() {
+        Mapped::expressed(Reply::Permissions {
+            granted: requested.clone(),
+            for_session: decision.remembers_for_session(),
+        })
+    } else {
+        Mapped::expressed(nothing)
+    }
+}
+
+fn user_input_reply(decision: &PermissionDecision) -> Mapped {
+    match decision {
+        PermissionDecision::Answer { answers } => {
+            Mapped::expressed(Reply::Answers(answers.clone()))
         }
-        ApprovalKind::ExecCommand { .. } => {
-            Mapped::declined(Reply::Decision(ExecDecision::Decline))
+        PermissionDecision::Deny { .. } => {
+            Mapped::expressed(Reply::Answers(horde_adapter::Answers::new()))
         }
-        ApprovalKind::FileChange => {
-            if rewrites || answered {
-                Mapped::declined(Reply::Decision(ExecDecision::Decline))
-            } else if !decision.is_allow() {
-                Mapped::expressed(Reply::Decision(ExecDecision::Decline))
-            } else if decision.remembers_for_session() {
-                Mapped::expressed(Reply::Decision(ExecDecision::AcceptForSession))
-            } else {
-                Mapped::expressed(Reply::Decision(ExecDecision::Accept))
-            }
+        PermissionDecision::Allow { .. } => {
+            Mapped::declined(Reply::Answers(horde_adapter::Answers::new()))
         }
-        ApprovalKind::Permissions { requested } => {
-            let nothing = || Reply::Permissions {
-                granted: serde_json::json!({}),
-                for_session: false,
-            };
-            if rewrites || answered {
-                Mapped::declined(nothing())
-            } else if decision.is_allow() {
-                Mapped::expressed(Reply::Permissions {
-                    granted: requested.clone(),
-                    for_session: decision.remembers_for_session(),
-                })
-            } else {
-                Mapped::expressed(nothing())
-            }
-        }
-        ApprovalKind::UserInput => match decision {
-            PermissionDecision::Answer { answers } => {
-                Mapped::expressed(Reply::Answers(answers.clone()))
-            }
-            PermissionDecision::Deny { .. } => {
-                Mapped::expressed(Reply::Answers(horde_adapter::Answers::new()))
-            }
-            PermissionDecision::Allow { .. } => {
-                Mapped::declined(Reply::Answers(horde_adapter::Answers::new()))
-            }
-        },
     }
 }
 
