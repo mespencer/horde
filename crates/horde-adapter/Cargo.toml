@@ -23,4 +23,4 @@ tokio = { workspace = true, features = ["rt"] }
 probe = ["tokio/process", "tokio/time"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time"] }
