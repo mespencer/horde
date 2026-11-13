@@ -580,8 +580,10 @@ async fn a_workspace_spawn_is_materialize_then_spawn_and_warmth_is_reused() {
                 remote_url: "https://example.com/atlas.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: String::new(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
             unmanaged_paths: Vec::new(),
+            ..horde_proto::v1::CreateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect("create")

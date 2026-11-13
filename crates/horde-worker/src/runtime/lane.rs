@@ -516,7 +516,7 @@ impl Lane {
         // The checkout lock is held from the checkout to the registration: a
         // scan must never read a half-made checkout as an orphan.
         let lock = self.shared.checkout_locks.of(&agent_id);
-        let _held = lock.lock().await;
+        let held = lock.lock().await;
         // A spawn that cannot start is the *agent* failing: the command still
         // completes, with the failure as its journaled effect.
         let composed = match self.shared.agent_checkout(&spawn).await {
@@ -542,6 +542,8 @@ impl Lane {
         let (session, can_rewrite) = match started {
             Ok(started) => started,
             Err(error) => {
+                // The abandon takes the checkout lock itself.
+                drop(held);
                 self.shared
                     .abandon_spawn(&agent_id, checkout.as_ref())
                     .await;
@@ -554,6 +556,7 @@ impl Lane {
         if let Some(checkout) = checkout {
             self.shared.broker.register(&agent_id, checkout);
         }
+        drop(held);
 
         let inputs = spawn
             .spec
@@ -877,6 +880,14 @@ impl Lane {
                     None
                 }
             };
+            // The remembered spawn carries the policy its Instance last
+            // had: a restarted Worker has seen no other command for it.
+            if let Some(record) = record.as_ref()
+                && let Some(definition) = super::shared::workspace_of(&record.spawn)
+            {
+                self.shared
+                    .remember_policy(&definition, record.spawn.workspace_policy.as_ref());
+            }
             let checkout = record
                 .as_ref()
                 .and_then(|record: &RevivableAgent| self.shared.remembered_checkout(record));

@@ -113,6 +113,7 @@ mod suite {
             remote_url: origin.display().to_string(),
             default_branch: "main".to_owned(),
             layout_path: String::new(),
+            ..horde_proto::v1::WorkspaceRepo::default()
         });
         definition
     }
@@ -146,6 +147,7 @@ mod suite {
             Command::MaterializeWorkspace(horde_proto::v1::MaterializeWorkspaceCommand {
                 definition: Some(definition(origin)),
                 session_id: Some(SessionId::new("s1")),
+                ..horde_proto::v1::MaterializeWorkspaceCommand::default()
             }),
         )
     }

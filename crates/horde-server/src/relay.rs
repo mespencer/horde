@@ -265,6 +265,7 @@ mod tests {
                 remote_url: format!("https://git.example/{name}.git"),
                 default_branch: "main".to_owned(),
                 layout_path: String::new(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             })
             .collect()
     }
@@ -352,6 +353,7 @@ mod tests {
             remote_url: origin.display().to_string(),
             default_branch: "main".to_owned(),
             layout_path: String::new(),
+            ..horde_proto::v1::WorkspaceRepo::default()
         };
         let definition = horde_proto::v1::WorkspaceDefinition {
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
@@ -406,6 +408,7 @@ mod tests {
                 remote_url: origin.display().to_string(),
                 default_branch: "main".to_owned(),
                 layout_path: String::new(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
             ..horde_proto::v1::WorkspaceDefinition::default()
         };

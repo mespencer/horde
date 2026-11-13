@@ -129,6 +129,13 @@ pub struct CommandProjection {
     /// place a fold can get one is the `WorkspaceDefinitionChanged` events
     /// that precede every prewarm request in append order.
     definitions: BTreeMap<String, WorkspaceDefinition>,
+    /// Definitions deleted since: a purge's gc commands still carry the last
+    /// Definition, so its cleanup policy applies to the Instances it removes
+    /// (ADR-0014).
+    deleted_definitions: BTreeMap<String, WorkspaceDefinition>,
+    /// The Server's workspace defaults, resolved with each Definition into
+    /// the policy every spawn, materialize and gc command carries.
+    workspace_policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
     /// The MCP Hub catalog as this fold has seen it, for the same reason:
     /// a `SpawnAgentCommand` carries the agent's `local` server configs and
     /// its visible hub server names in full, and the only place a fold can
@@ -153,6 +160,26 @@ impl CommandProjection {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Resolves command policies against these Server defaults.
+    #[must_use]
+    pub fn with_workspace_policy(
+        mut self,
+        policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
+    ) -> Self {
+        self.workspace_policy = policy;
+        self
+    }
+
+    /// The policy one Definition's commands carry.
+    fn policy_for(&self, definition_id: Option<&str>) -> horde_proto::v1::ResolvedWorkspacePolicy {
+        let definition = definition_id.and_then(|id| {
+            self.definitions
+                .get(id)
+                .or_else(|| self.deleted_definitions.get(id))
+        });
+        crate::workspace_policy::resolve(&self.workspace_policy, definition)
     }
 
     /// How many commands this worker has been issued so far.
@@ -197,6 +224,9 @@ impl CommandProjection {
             }
             (Some(Kind::WorkspacePrewarmRequested(prewarm)), _) => {
                 self.materialize_command(global, &prewarm)
+            }
+            (Some(Kind::WorkspaceGcRequested(requested)), _) => {
+                self.gc_commands(global, &requested)
             }
             (Some(Kind::AgentSpawned(spawned)), Some(agent_id)) => {
                 self.spawned.insert(
@@ -335,9 +365,46 @@ impl CommandProjection {
         };
         if changed.deleted {
             self.definitions.remove(&id);
+            self.deleted_definitions.insert(id, definition);
         } else {
+            self.deleted_definitions.remove(&id);
             self.definitions.insert(id, definition);
         }
+    }
+
+    /// A gc request is one `WorkspaceGcCommand` per Worker it names, each
+    /// carrying the resolved policy; its id is the request's position
+    /// suffixed with the Worker, so a refold issues the same ids (ADR-0014).
+    fn gc_commands(
+        &mut self,
+        global: &GlobalEvent,
+        requested: &horde_proto::v1::WorkspaceGcRequested,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        let definition_id = requested
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let policy = self.policy_for(definition_id.as_deref());
+        let mut commands = Vec::new();
+        for worker in &requested.worker_ids {
+            let worker_id = worker.to_string();
+            let command = Command::WorkspaceGc(horde_proto::v1::WorkspaceGcCommand {
+                request_id: requested.request_id.clone(),
+                workspace_definition_id: requested.workspace_definition_id.clone(),
+                agent_ids: requested.agent_ids.clone(),
+                level: requested.level,
+                force: requested.force,
+                dry_run: requested.dry_run,
+                remove_instance: requested.remove_instance,
+                include_pins: requested.include_pins,
+                policy: Some(policy.clone()),
+                carrying_stream: Some(SessionId::new(global.event.session_id.clone())),
+            });
+            let issued = self.issue(&worker_id, global, command, &format!(":gc:{worker_id}"));
+            commands.push((worker_id, issued));
+        }
+        commands
     }
 
     /// A prewarm request for a known definition is a materialize command.
@@ -362,9 +429,11 @@ impl CommandProjection {
             return Vec::new();
         };
 
+        let policy = crate::workspace_policy::resolve(&self.workspace_policy, Some(&definition));
         let command = Command::MaterializeWorkspace(MaterializeWorkspaceCommand {
             definition: Some(definition),
             session_id: Some(SessionId::new(global.event.session_id.clone())),
+            policy: Some(policy),
         });
         let issued = self.issue(&worker_id, global, command, MAIN);
         vec![(worker_id, issued)]
@@ -480,6 +549,11 @@ impl CommandProjection {
                         visible_hub_mcp_servers: self
                             .mcp_servers
                             .visible_hub_servers_for(agent_type),
+                        workspace_policy: details
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.workspace_definition_id.as_ref())
+                            .map(|id| self.policy_for(Some(&id.to_string()))),
                     });
                     let issued = self.issue(&worker_id, global, spawn, MAIN);
                     commands.push((worker_id.clone(), issued));
@@ -776,6 +850,16 @@ impl CommandStream {
 
     /// [`Self::open`], resuming wherever the worker said — by position when
     /// it knows one (ADR-0011).
+    /// Stamps commands with policies resolved against these defaults.
+    #[must_use]
+    pub fn with_workspace_policy(
+        mut self,
+        policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
+    ) -> Self {
+        self.projection = std::mem::take(&mut self.projection).with_workspace_policy(policy);
+        self
+    }
+
     #[must_use]
     pub fn resuming(log: &EventLog, worker_id: &str, resume: Resume) -> Self {
         Self {

@@ -66,26 +66,9 @@ fn invalid(message: String) -> ClientError {
 ///
 /// # Errors
 ///
-/// Anything else, naming the accepted forms.
+/// Anything else, naming the flag and the accepted forms.
 pub fn parse_duration(flag: &str, value: &str) -> Result<Duration, ClientError> {
-    let refuse = || invalid(format!("{flag} takes a duration such as 90s, 10m, 4h or 1d, got {value:?}"));
-    let value = value.trim();
-    let (digits, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
-        Some(split) => value.split_at(split),
-        None => (value, "s"),
-    };
-    let amount: u64 = digits.parse().map_err(|_| refuse())?;
-    let seconds = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => return Err(refuse()),
-    };
-    amount
-        .checked_mul(seconds)
-        .map(Duration::from_secs)
-        .ok_or_else(refuse)
+    horde_proto::units::parse_duration(value).map_err(|why| invalid(format!("{flag}: {why}")))
 }
 
 /// A std duration on the wire.

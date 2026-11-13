@@ -41,6 +41,14 @@ pub fn is_catalog_stream(session_id: &str) -> bool {
     session_id == CATALOG_STREAM
 }
 
+/// Whether a log stream is workspace housekeeping (ADR-0014): cleanup
+/// events, gc requests and answers, disk pressure. Reserved like the
+/// catalog — never a session, never in the all-sessions net.
+#[must_use]
+pub fn is_housekeeping_stream(session_id: &str) -> bool {
+    session_id == horde_proto::WORKSPACE_HOUSEKEEPING_STREAM
+}
+
 /// One Definition as the catalog fold currently sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DefinitionRecord {
@@ -321,6 +329,52 @@ impl InstanceCache {
             .unwrap_or_default()
     }
 
+    /// Every cached report, optionally filtered by worker and definition.
+    #[must_use]
+    pub fn filtered(
+        &self,
+        worker_id: Option<&str>,
+        workspace_definition_id: Option<&str>,
+    ) -> Vec<WorkspaceInstanceReport> {
+        self.reports
+            .lock()
+            .map(|reports| {
+                reports
+                    .iter()
+                    .filter(|((worker, definition), _)| {
+                        worker_id.is_none_or(|wanted| wanted == worker)
+                            && workspace_definition_id.is_none_or(|wanted| wanted == definition)
+                    })
+                    .map(|(_, report)| report.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The Workers holding an Instance — of one definition, or of any.
+    #[must_use]
+    pub fn holders(&self, workspace_definition_id: Option<&str>) -> Vec<String> {
+        let mut workers: Vec<String> = self
+            .filtered(None, workspace_definition_id)
+            .into_iter()
+            .filter_map(|report| report.worker_id.map(|id| id.to_string()))
+            .collect();
+        workers.sort();
+        workers.dedup();
+        workers
+    }
+
+    /// The freshest free/total disk facts a worker's reports carry, if any
+    /// report carried them.
+    #[must_use]
+    pub fn filesystem_of(&self, worker_id: &str) -> Option<(u64, u64)> {
+        self.filtered(Some(worker_id), None)
+            .into_iter()
+            .filter(|report| report.filesystem_total_bytes > 0)
+            .max_by_key(|report| report.sized_at.map(|at| (at.seconds, at.nanos)))
+            .map(|report| (report.filesystem_free_bytes, report.filesystem_total_bytes))
+    }
+
     /// Whether a worker already holds (or is building) an instance of a
     /// definition. Materializing counts: placement colocates onto it rather
     /// than starting a second materialization elsewhere.
@@ -393,10 +447,12 @@ mod tests {
                 remote_url: "https://example.com/atlas.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: "atlas".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
             unmanaged_paths: Vec::new(),
             created_at: None,
             etag: String::new(),
+            ..horde_proto::v1::WorkspaceDefinition::default()
         }
     }
 
@@ -425,6 +481,7 @@ mod tests {
             remote_url: remote.to_owned(),
             default_branch: "main".to_owned(),
             layout_path: String::new(),
+            ..horde_proto::v1::WorkspaceRepo::default()
         }
     }
 
@@ -629,6 +686,7 @@ mod tests {
             repos: Vec::new(),
             detail: String::new(),
             observed_at: None,
+            ..horde_proto::v1::WorkspaceInstanceReport::default()
         }
     }
 
