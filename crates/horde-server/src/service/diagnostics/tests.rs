@@ -62,14 +62,22 @@ fn server_read(on_behalf_of: Option<&str>) -> ReadLogsRequest {
     }
 }
 
+/// Every response of a read, bounded: a relay that kept going past its end
+/// would never close the stream, so it fails here instead of hanging.
+async fn collected<S: tokio_stream::Stream + Unpin>(stream: S) -> Vec<S::Item> {
+    tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+        .await
+        .expect("the read's stream closes once its end is sent")
+}
+
 async fn messages(plane: &ControlPlane, request: Request<ReadLogsRequest>) -> Vec<String> {
     let stream = plane
         .read_logs(request)
         .await
         .expect("admitted")
         .into_inner();
-    let responses: Vec<_> = stream.collect().await;
-    responses
+    collected(stream)
+        .await
         .into_iter()
         .filter_map(|response| match response.ok()?.body? {
             read_logs_response::Body::Records(records) => Some(records.lines),
@@ -436,8 +444,7 @@ async fn a_worker_read_is_dispatched_and_relayed_unbounded_for_a_client_capped_f
         .await
         .expect("admitted")
         .into_inner();
-    let ends: Vec<i32> = capped
-        .collect::<Vec<_>>()
+    let ends: Vec<i32> = collected(capped)
         .await
         .into_iter()
         .filter_map(|response| match response.ok()?.body? {
