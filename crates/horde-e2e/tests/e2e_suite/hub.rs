@@ -18,7 +18,10 @@ use crate::support::{System, has_kind, outputs};
 /// unroutable, with no second escalation.
 #[tokio::test]
 async fn an_agent_calls_a_hub_tool_through_the_deployed_stack() {
-    let system = System::launch().await;
+    // `ask`: the rule chain that escalates what it does not allow, so the
+    // call stops for a human the test plays (ADR-0016's default, bypass,
+    // would allow it with no one asked).
+    let system = System::launch_with(&["--permission-mode", "ask"]).await;
 
     // The operator authors the catalog first, through the CLI's own verb:
     // one hub-placed stdio server the *server* will spawn and own.
@@ -56,7 +59,7 @@ async fn an_agent_calls_a_hub_tool_through_the_deployed_stack() {
     system.cli_json(&["send", &root, "go"]).await;
 
     // The chain is in the path: the proxied call surfaces as an ordinary
-    // escalation (the deployed server's default mode escalates everything),
+    // escalation (the `ask` mode escalates everything it does not allow),
     // and the agent is blocked on it — not past it.
     let events = system
         .sync_until(&session_id, "the hub call's escalation", |events| {

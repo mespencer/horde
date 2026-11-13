@@ -27,10 +27,10 @@ citations are for `9218ac2`.
 | §7 Workspaces | CONFORMS (W12d, ADR-0014) | Fresh bases, lazy checkout, shared branch names, two-tier cleanup, `horde workspace gc/instance/log`, `delete --purge`; `unmanaged_paths` real; the worker reports and journals `MaterializationProgress`. Repo additions still raise no permission event; see "§7 at W12d" below. |
 | §8 Git backbone, relay, blob store | CONFORMS (as built) | Relay mounted by `--relay-bind`; dirty trees refused on the stamp path (`horde-worker/src/share.rs:139-144`); blob GC absent by design. |
 | §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. MCP-spawned children carry their parent's agent type, so allowlists resolve for them (`horde-server/src/lineage.rs:28`; `hub.rs:152,194`) — checked at `9218ac2`. |
-| §10 Permissions | PARTIAL | Chain driver runs in `serve()` with `PermissionModes::shipped()` (`horde-server/src/startup.rs:443-451`); the judge is still a seam with no production implementation. |
+| §10 Permissions | CONFORMS (as amended by ADR-0016) | Chain driver runs in `serve()` over the configured registry (`horde-server/src/startup.rs`, `core.permission_modes`); the default mode is `bypass`, the rule chain is the built-in `ask` mode or any authored one, and questions (`AskUserQuestion`) always escalate (`permission/chain.rs` `is_question`). No judge, by decision: no key can author judge instructions. See "§10 and §13 at W12e" below. |
 | §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. Archive and workspace/MCP edits stay unattributed. |
 | §12 Usage and observability | PARTIAL | Usage folds conform; threshold alerts absent; OTLP plaintext only; hard budgets shape-only. |
-| §13 Configuration layering | ABSENT | No config file is loaded anywhere; tiers are `TierCatalog::shipped_defaults()` (`service/commands.rs:646`). |
+| §13 Configuration layering | PARTIAL (W12e, ADR-0016) | One strict TOML file per role under `~/.horde`, layered defaults → file → workspace → session → flags with provenance (`horde config show --origin`, `--show-config`); tiers, modes, ADR-0014's and ADR-0015's keys are configuration. The repo `.horde/` layer and prompt overlays are not built. See "§10 and §13 at W12e" below. |
 | §14–§15 | CONFORMS | Unchanged. |
 | §16 Development quality | CONFORMS | Ten blocking gates; coverage has a 95.0 floor (`horde-gauntlet/src/gates/coverage.rs:20`). |
 
@@ -59,6 +59,25 @@ Still open in §7: a repo addition raises no permission event (unchanged,
 ADR-0014 does not touch it); the front door's create-from-cwd offer is not
 built; `HORDE_WORKSPACE_MANIFEST` is not exported to harnesses (the lazy
 overlay names the manifest path instead).
+
+### §10 and §13 at W12e (ADR-0016, checked on `mespencer/w12e-config`)
+
+| ADR-0016 piece | Implementation | Proving test |
+|---|---|---|
+| Strict reader: unknown keys by path with siblings, type errors explained, another role's key named | `horde-config/src/reader.rs` (`Section`, `finish`, `foreign`) | `reader.rs` unit tests; each role's refusal table (`horde-server/src/config/settings.rs`, `horde-worker/src/config.rs`, `horde-cli/src/config.rs`) |
+| Provenance and `config show` | `horde-config/src/provenance.rs`; `horde-server --show-config`, `horde-worker --show-config`, `horde config show [--server --workspace --session] [--origin]` | `startup.rs` show-config test; `worker_suite/daemon.rs` binary test; `cli_suite/config.rs` |
+| Server keys: modes, tiers (replace the shipped catalog wholesale), `workspace.*`, `placement.*`, `logs.*` | `horde-server/src/config/{permissions,tiers,workspace,settings}.rs`; `ServerCore::with_settings` | unit tests per file; `server_suite/configuration.rs` tier catalog test |
+| Worker keys: `worker.workspace.*`, `codex.sandbox.*` (built-in `bypass = "workspace-write"`), `logs.*` with `logs.agents.*` | `horde-worker/src/config.rs`; wired in `flags.rs` and `startup.rs` (codex `sandbox_policy`) | `config.rs` and `flags.rs` tests |
+| Client keys: `session.permission_mode`, `logs.*` | `horde-cli/src/config.rs`; `front_door::create` moves `--permission-mode` to the session layer | `cli_suite/config.rs` |
+| Per-agent mode: spawn → session → workspace → server → `bypass`, stamped into `AgentSpawned`; agent-originated spawns still inherit (ADR-0009) | `horde-server/src/config/agent.rs` `agent_mode`; `control_plane.rs` `stamped_mode`; `SessionSettings` on `CreateSessionRequest`/`AgentSpawned`; `WorkspaceDefinition.permission_mode` | `agent.rs` truth table; `server_suite/configuration.rs` (each layer in order, stamped and reported alike) |
+| Bypass default with questions escalated | `permission/modes.rs` (`BYPASS`, `ASK`, `shipped`); `chain.rs` (`ChainRuling::Bypass`, `is_question`); `driver.rs` (`BYPASS_REASON`) | `chain.rs` bypass/question tests; `driver.rs` `the_bypass_default_still_escalates_a_question_to_a_human` |
+| `logs.*` defined for W12h | `horde-config/src/logs.rs` (`LogKeys`, names match ADR-0015's `SETTING_*`) | `logs.rs` tests; nothing on this branch consumes them yet |
+
+Still open in §13: the repo `.horde/` layer (deliberately not built: a repo
+is content agents write), prompt overlays, hot reload, and
+`worker.workspace.reclaim_concurrency` (ADR-0014 lists it; W12d built no
+concurrent reclaim). Codex's `item/tool/requestUserInput` reaches the chain
+only with W12c; until then the adapter answers it with an error.
 
 ### Surfaces added in waves 8–11
 
@@ -132,6 +151,7 @@ overlay names the manifest path instead).
 | 0011 delivery and liveness | CONFORMS | Lease, boot reconcile, reset, position resume. |
 | 0012 worker inbox | CONFORMS | Inbox, lanes, replay. |
 | 0013 read path and ingest | CONFORMS | Projection, read pool, batch ingest, name filter. |
+| 0016 configuration and permission defaults | CONFORMS (W12e) | See "§10 and §13 at W12e". |
 
 ### Deferred by design (supersedes Part 2 (c))
 
@@ -145,9 +165,9 @@ overlay names the manifest path instead).
 | Blob GC and deletion | §8/§15 | Absent by design (`horde-server/src/blob.rs:24-37`). |
 | Orchestrator-level sandbox profiles | §10/§14 | Absent; the harnesses' own sandboxes carry it. |
 | Credential-less workers (relay-only git) | §8/§14 | Absent: workers clone remotes with ambient credentials (`horde-worker/src/workspace.rs:458`). |
-| Configuration layering | §13 | Absent. |
+| Configuration layering: repo `.horde/` layer, prompt overlays | §13 | Absent; the role files, workspace and session layers exist (ADR-0016). |
 | Multi-user server | §1/§15 | Deferred; single-user assumptions remain load-bearing. |
-| Policy judge (production implementation) | §10 | A seam; a missing judge escalates to the human (`startup.rs:446`). |
+| Policy judge (production implementation) | §10 | Dropped (docs/WAVE12.md); the seam remains, nothing configures it, and a mode that wanted one escalates. |
 
 Delivered since W7d and removed from this list: port forwards (wave 8), the interactive-auth relay (W9a), the hub wire (W9b, worker-forwarded calls), the codex re-probe (ADR-0005 amendment), and Gherkin, fault injection and e2e hardening (wave 7).
 
@@ -910,6 +930,8 @@ concurrency, and `tools/list_changed` remain open.
   mTLS-for-every-principal posture.
 
 ## §13 Configuration layering — ABSENT (the seed flag holds in full)
+
+*Superseded at W12e: see Part 1, "§10 and §13 at W12e".*
 
 No layer of the four exists:
 

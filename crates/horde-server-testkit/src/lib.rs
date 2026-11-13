@@ -107,8 +107,16 @@ pub async fn serve_with_permissions(
     modes: horde_server::permission::PermissionModes,
     judge: Option<std::sync::Arc<dyn horde_server::permission::PolicyJudge>>,
 ) -> Setup<String> {
-    let core = ServerCore::new(EventLog::in_memory()?);
-    let _chain = horde_server::permission::spawn(&core.log, std::sync::Arc::new(modes), judge);
+    // One registry for the chain and for the spawns it stamps (ADR-0016),
+    // as the serving path has: a spawn naming no mode is stamped with this
+    // registry's default, which the chain must then recognize.
+    let core =
+        ServerCore::new(EventLog::in_memory()?).with_permission_modes(std::sync::Arc::new(modes));
+    let _chain = horde_server::permission::spawn(
+        &core.log,
+        std::sync::Arc::clone(&core.permission_modes),
+        judge,
+    );
     serve_core(core).await
 }
 
