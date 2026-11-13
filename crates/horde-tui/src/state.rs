@@ -579,10 +579,9 @@ fn joined(state: &str, reason: &str) -> String {
 mod tests {
     use horde_proto::v1::{
         AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
-        AgentResult, AgentSpawned, Assignment, AssignmentSent, Event, EventEnvelope, Note,
-        NoteSent, PermissionDecided, PermissionDecision, PermissionOutcome, PermissionRequest,
-        PermissionRequestId, PermissionRequested, Placement, PlacementChanged, PlacementState,
-        ProposedToolCall, ResultReported, ResultStatus, SessionId, SessionLifecycleChanged,
+        AgentResult, Assignment, AssignmentSent, EventEnvelope, Note, NoteSent,
+        PermissionDecided, PermissionOutcome, PermissionRequested, Placement, PlacementChanged,
+        PlacementState, ResultReported, ResultStatus, SessionId, SessionLifecycleChanged,
         SessionLifecycleState, SessionSummary, TurnInterrupted, UsageRecorded,
         WorkspaceInstanceChanged, WorkspaceInstanceReport, event::Kind,
     };

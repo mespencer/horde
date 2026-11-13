@@ -26,6 +26,10 @@ fn spawn_horde(endpoint: &str, args: &[&str]) -> Setup<PtyProcess> {
     PtyProcess::spawn(command)
 }
 
+/// A word only the attached session view paints: its hint line and compose
+/// placeholder offer "/ commands"; the picker never says it.
+const ATTACHED: &str = "commands";
+
 const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const HIDE_CURSOR: &str = "\x1b[?25l";
@@ -63,7 +67,7 @@ async fn bare_horde_with_one_session_attaches_it_directly() {
     // Needles are single words: the terminal skips blank cells with cursor
     // moves, so a phrase never paints as one contiguous byte run.
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("one live session means the session view, no picker");
     horde
@@ -92,7 +96,7 @@ async fn bare_horde_with_no_sessions_creates_an_auto_named_session_and_attaches(
 
     let mut horde = spawn_horde(&endpoint, &[]).expect("the binary spawns in a pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("an empty server still puts the human in front of a session");
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
@@ -147,7 +151,7 @@ async fn bare_horde_with_several_sessions_opens_the_picker_and_enter_attaches() 
     horde.type_bytes(b"j").expect("j reaches the pty");
     horde.type_bytes(b"\r").expect("enter reaches the pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("enter on a session row attaches it");
 
@@ -177,7 +181,7 @@ async fn the_pickers_top_row_creates_and_attaches_a_new_session() {
     // Enter with the cursor still on the top row: the "new session" create.
     horde.type_bytes(b"\r").expect("enter reaches the pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("the top row creates and attaches");
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
@@ -208,7 +212,7 @@ async fn horde_new_with_a_terminal_creates_and_attaches() {
     let mut horde =
         spawn_horde(&endpoint, &["new", "fresh-start"]).expect("the binary spawns in a pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("new is create-then-attach");
     horde
@@ -257,7 +261,7 @@ async fn leave_the_picker_with(key: &[u8]) -> Setup<()> {
         "a dismissal exits cleanly, got {status:?}"
     );
     assert!(
-        !seen.contains("attached:"),
+        !seen.contains(ATTACHED),
         "nothing may have been attached: {seen:?}"
     );
     Ok(())
@@ -276,7 +280,7 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
     let mut horde =
         spawn_horde(&endpoint, &["attach", "tui-pty-attach"]).expect("the binary spawns in a pty");
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("the session view must reach the real terminal");
     horde
@@ -284,9 +288,9 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
         .await
         .expect("the name resolved to the seeded session's id");
     horde
-        .await_painted("spawned")
+        .await_painted("Queued")
         .await
-        .expect("the replayed root spawn must be painted into the feed");
+        .expect("the replayed root's placement must be painted into its transcript");
 
     horde.type_bytes(&[0x03]).expect("ctrl-c reaches the pty");
     await_restored(&mut horde)
@@ -304,16 +308,20 @@ async fn attach_paints_the_session_view_and_ctrl_c_exits_cleanly() {
 /// drops its sender at birth; `drive` sees the closed channel, requests quit,
 /// and exits cleanly — indistinguishable, from outside, from ctrl-c working.
 /// The tests above type ctrl-c and assert a clean exit, so they pass either
-/// way. Here Esc must swap the attach view for the overview (which paints
-/// "sessions", a word the session view never shows), and `i` must swap that
-/// for the inbox, whose footer paints "allow". The route also pins that the
-/// overview is still reachable behind the front door: attach first, Esc out.
-/// Under a severed input path the process is gone before Esc lands and the
-/// wait fails on the closed pty, without spending its ceiling.
+/// way. Here ctrl-t must swap the attach view for the session/agent tree
+/// (which marks the "(attached)" session, a word the session view never
+/// shows), and `i` must swap that for the inbox, which says nothing "needs"
+/// the human. The session's title shares no cell with that sentence: the
+/// terminal skips unchanged cells, and a shared letter would split the
+/// needle.
+/// The route also pins that the tree is still reachable behind the front
+/// door: attach first, ctrl-t out. Under a severed input path the process is
+/// gone before the key lands and the wait fails on the closed pty, without
+/// spending its ceiling.
 #[tokio::test]
 async fn a_typed_key_reaches_the_loop_and_repaints_the_screen() {
     let endpoint = serve().await.expect("a listening server");
-    seeded(&endpoint, "tui-pty-keys")
+    seeded(&endpoint, "quiet-quorum-quill")
         .await
         .expect("a seeded session");
 
@@ -321,24 +329,21 @@ async fn a_typed_key_reaches_the_loop_and_repaints_the_screen() {
     // Raw mode is on once the attach view has painted, so the keystrokes
     // below arrive at the running loop, not a half-initialised terminal.
     horde
-        .await_painted("attached:")
+        .await_painted(ATTACHED)
         .await
         .expect("one session, so the front door attaches before anything is typed");
 
-    // The needle is the overview footer's "inbox": the header repaints only
-    // the cells that changed under the attach header, so no header word is
-    // guaranteed a contiguous byte run — the footer's new words are.
-    horde.type_bytes(&[0x1b]).expect("esc reaches the pty");
+    horde.type_bytes(&[0x14]).expect("ctrl-t reaches the pty");
     horde
-        .await_painted("inbox")
+        .await_painted("(attached)")
         .await
-        .expect("esc must detach into the overview — typed bytes must reach the loop");
+        .expect("ctrl-t must open the tree — typed bytes must reach the loop");
 
     horde.type_bytes(b"i").expect("i reaches the pty");
     horde
-        .await_painted("allow")
+        .await_painted("needs")
         .await
-        .expect("i must swap the overview for the inbox");
+        .expect("i must swap the tree for the inbox");
 
     horde.type_bytes(b"q").expect("q reaches the pty");
     let status = horde.exit_status().await.expect("the TUI exits");

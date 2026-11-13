@@ -60,10 +60,10 @@ pub(crate) fn note_facts(agents: &mut std::collections::BTreeMap<String, AgentNo
         return;
     };
     match event.kind.as_ref() {
-        Some(Kind::AgentOutputChunk(chunk)) => {
-            if chunk.channel != AgentOutputChannel::HarnessDiagnostic as i32 {
-                node.working = true;
-            }
+        Some(Kind::AgentOutputChunk(chunk))
+            if chunk.channel != AgentOutputChannel::HarnessDiagnostic as i32 =>
+        {
+            node.working = true;
         }
         Some(Kind::AgentLifecycleChanged(changed)) => {
             node.lifecycle = changed.state;

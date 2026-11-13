@@ -275,14 +275,14 @@ async fn composing_in_an_attached_session_sends_a_real_assignment() {
         .await
         .expect("the send must come back as an AssignmentSent event");
 
-    // Esc detaches (the compose line is empty again after the send), then q.
-    harness.press(KeyCode::Esc).await.expect("detach");
+    // Ctrl-T leaves the transcript for the session/agent tree, then q.
+    harness.press_ctrl('t').await.expect("to the tree");
     harness
         .state("the overview to return", |app| {
             app.screen() == Screen::Overview
         })
         .await
-        .expect("esc with an empty compose line detaches");
+        .expect("ctrl-t opens the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
@@ -311,7 +311,7 @@ async fn ctrl_x_interrupts_the_attached_agent_for_real() {
         .await
         .expect("the interrupt must come back as a TurnInterrupted event");
 
-    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
@@ -359,8 +359,7 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
         "a refusal must not end the session view"
     );
 
-    harness.press(KeyCode::Esc).await.expect("clear nothing");
-    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
@@ -418,7 +417,7 @@ async fn attaching_replays_only_the_target_while_the_rest_stays_live() {
         neighbour.feed
     );
 
-    harness.press(KeyCode::Esc).await.expect("detach");
+    harness.press_ctrl('t').await.expect("to the tree");
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
