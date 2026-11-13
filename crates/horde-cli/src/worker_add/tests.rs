@@ -185,7 +185,14 @@ fn the_steps_run_in_order_and_only_start_reads_stdin() -> Outcome {
     for step in &steps {
         let expected = (step.name == "start").then_some("join token");
         assert_eq!(step.stdin, expected, "{}", step.name);
+        let ceiling = if step.name == "copy" {
+            COPY_CEILING
+        } else {
+            STEP_CEILING
+        };
+        assert_eq!(step.limit, ceiling, "{}", step.name);
     }
+    assert_eq!(probe_step(&checked).limit, STEP_CEILING);
     assert_eq!(
         steps[1].invocation.args,
         [
@@ -519,6 +526,7 @@ fn a_plain_step_displays_as_its_command_line() {
         },
         script: None,
         stdin: Some("x"),
+        limit: STEP_CEILING,
     };
     assert_eq!(step.display(), "scp -q a h:b   (stdin: the x)");
 }

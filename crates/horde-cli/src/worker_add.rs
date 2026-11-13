@@ -26,10 +26,10 @@ use plan::{Invocation, Platform, Probe, Remote, RemoteDir, StartMode};
 
 /// How long one ssh step may take — generous, because a password or
 /// host-key prompt waits on a human.
-const STEP_CEILING: Duration = Duration::from_secs(180);
+pub const STEP_CEILING: Duration = Duration::from_secs(180);
 
 /// How long the copy may take: a debug `horde-worker` is large.
-const COPY_CEILING: Duration = Duration::from_secs(900);
+pub const COPY_CEILING: Duration = Duration::from_secs(900);
 
 /// How long `--build-locally`'s cargo build may take.
 const BUILD_CEILING: Duration = Duration::from_secs(3600);
@@ -244,6 +244,8 @@ pub struct Step {
     pub script: Option<String>,
     /// `Some("join token")`: stdin carries the token.
     pub stdin: Option<&'static str>,
+    /// How long the step may take.
+    pub limit: Duration,
 }
 
 impl Step {
@@ -253,6 +255,7 @@ impl Step {
             invocation: remote.ssh(&script),
             script: Some(script),
             stdin: None,
+            limit: STEP_CEILING,
         }
     }
 
@@ -328,6 +331,7 @@ pub fn later_steps(checked: &Checked, context: &Context, binary: &Path) -> Vec<S
             invocation: remote.scp(binary, &staged),
             script: None,
             stdin: None,
+            limit: COPY_CEILING,
         },
         Step::ssh(remote, "install", plan::finalize_script(&checked.dir)),
         Step {
@@ -864,12 +868,7 @@ async fn run_step(steps: &[Step], name: &str, stdin: Option<&str>) -> Result<Str
         .iter()
         .find(|step| step.name == name)
         .ok_or_else(|| refusal(format!("no {name} step was planned")))?;
-    let limit = if name == "copy" {
-        COPY_CEILING
-    } else {
-        STEP_CEILING
-    };
-    execute(name, &step.invocation, stdin, limit).await
+    execute(name, &step.invocation, stdin, step.limit).await
 }
 
 /// Prepare, copy, install: the binary's `--version` line on success.
