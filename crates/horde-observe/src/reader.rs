@@ -417,9 +417,17 @@ pub struct Egress {
 /// through.
 #[must_use]
 pub fn egress<'a>(records: impl IntoIterator<Item = &'a Record>) -> Egress {
+    egress_lines(records.into_iter().map(|record| record.line.as_str()))
+}
+
+/// [`egress`] over raw lines: what a relay runs on records another machine
+/// already redacted, so the relaying process's own registered secrets are
+/// scrubbed too.
+#[must_use]
+pub fn egress_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Egress {
     let mut out = Egress::default();
-    for record in records {
-        let (line, touched) = redact_line(&record.line);
+    for line in lines {
+        let (line, touched) = redact_line(line);
         out.redacted += u32::from(touched);
         out.lines.push(line);
     }

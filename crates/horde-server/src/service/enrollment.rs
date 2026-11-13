@@ -203,6 +203,14 @@ impl EnrollmentAuthority {
         )
         .await?;
 
+        // Scrubbed from every log record this server serves until it is
+        // redeemed or expires (ADR-0015's registered values).
+        horde_observe::redact::register_secret(
+            &secret,
+            u64::try_from(expires_at_unix_ms)
+                .ok()
+                .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+        );
         Ok(MintedCode {
             secret,
             server_fingerprint: self.credential.fingerprint().map_err(identity_internal)?,
@@ -280,6 +288,9 @@ impl EnrollmentAuthority {
         {
             tracing::warn!(%error, file = %file.display(), "could not retire the bootstrap token");
         }
+        // Spent: a redeemed secret opens nothing, so it no longer needs
+        // scrubbing.
+        horde_observe::redact::forget_secret(secret);
 
         Ok((principal, issued))
     }

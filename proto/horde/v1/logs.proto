@@ -1,0 +1,186 @@
+// Diagnostic logs (ADR-0015): bounded local JSON-lines files each process
+// keeps under its state directory, read over the spine.
+//
+// Logs are NOT session facts. Nothing decides from them, nothing here is
+// journaled, and a log fetch is ephemeral intent like a login: it lives
+// exactly as long as its streams. Records travel as opaque, already-redacted
+// JSON lines — like hub tool payloads — so a new field convention never needs
+// a schema change.
+syntax = "proto3";
+
+package horde.v1;
+
+import "horde/v1/id.proto";
+
+// Names the server's own log as a ReadLogs target.
+message ServerTarget {}
+
+// A record's position: resume strictly after it. Ordered by
+// (ts, source, boot, seq); `ts` is RFC 3339 UTC at a fixed width.
+message LogCursor {
+  string ts = 1;
+
+  // "horde" (a process's tracing records) or "stderr" (a harness's stderr).
+  string source = 2;
+
+  // The writing process's boot id.
+  string boot = 3;
+
+  uint64 seq = 4;
+}
+
+// Which records a read keeps.
+message LogFilter {
+  // A duration back from now ("10m") or an RFC 3339 timestamp, evaluated on
+  // the target machine's clock.
+  string since = 1;
+
+  // Minimum level: trace, debug, info, warn, error. Empty keeps all.
+  string level = 2;
+
+  // A regular expression matched against each record's message and fields.
+  string grep = 3;
+
+  // Records about this agent only.
+  AgentId agent = 4;
+
+  // For an agent target: "all" (default), "horde", or "stderr".
+  string source = 5;
+
+  // How many of the newest matching records to return before any follow.
+  // Zero takes the default (200).
+  uint32 tail_records = 6;
+}
+
+// Opens a read of one process's logs.
+message ReadLogsRequest {
+  oneof target {
+    ServerTarget server = 1;
+    // A worker's name.
+    string worker = 2;
+    // An agent: its placement's worker serves the read.
+    AgentId agent = 3;
+  }
+
+  LogFilter filter = 4;
+
+  // Keep the stream open after the initial records.
+  bool follow = 5;
+
+  // Resume a dropped follow, or page forward.
+  optional LogCursor after = 6;
+
+  // Required of a worker caller (the agent conduit): the agent the read is
+  // for. Scopes what the read may return to that agent's session.
+  AgentId on_behalf_of = 7;
+
+  // The caller's byte cap on record lines. Zero is unbounded for a client;
+  // the server clamps it for any worker caller.
+  uint32 max_bytes = 8;
+}
+
+// A batch of records.
+message LogRecords {
+  // Redacted JSON lines, oldest first.
+  repeated string lines = 1;
+
+  // The newest record in this batch.
+  LogCursor cursor = 2;
+
+  // How many of these records redaction touched.
+  uint32 redacted = 3;
+
+  // The initial read left out matching records to respect the byte cap.
+  bool truncated = 4;
+}
+
+// Records that exist but did not arrive.
+message LogGap {
+  // A follow fell behind the producer by this many records.
+  uint64 lagged = 1;
+
+  // A writer dropped this many records before they reached a file.
+  uint64 dropped = 2;
+}
+
+// Why a log stream ended.
+enum LogEndReason {
+  LOG_END_REASON_UNSPECIFIED = 0;
+
+  // Everything asked for was sent.
+  LOG_END_REASON_DONE = 1;
+
+  // The byte cap was reached.
+  LOG_END_REASON_BYTE_CAP = 2;
+
+  // The worker serving the read disconnected.
+  LOG_END_REASON_WORKER_DISCONNECTED = 3;
+
+  // The worker predates log serving (no `logs.v1` capability).
+  LOG_END_REASON_WORKER_UNSUPPORTED = 4;
+}
+
+// The last frame of a log stream.
+message LogEnd {
+  LogEndReason reason = 1;
+
+  string detail = 2;
+}
+
+message ReadLogsResponse {
+  oneof body {
+    LogRecords records = 1;
+    LogGap gap = 2;
+    LogEnd end = 3;
+  }
+}
+
+// One read the server asks a worker to serve, pushed on StreamLogRequests.
+message LogQuery {
+  // Echoed in the worker's tunnel's first frame.
+  string request_id = 1;
+
+  // An agent's records (its log lines merged with its stderr); unset reads
+  // the worker's own log.
+  AgentId agent = 2;
+
+  LogFilter filter = 3;
+
+  bool follow = 4;
+
+  optional LogCursor after = 5;
+
+  // Zero is unbounded.
+  uint32 max_bytes = 6;
+
+  // For an agent caller: records naming another session never leave the
+  // worker.
+  optional string session_scope = 7;
+}
+
+message StreamLogRequestsRequest {
+  WorkerId worker_id = 1;
+}
+
+message StreamLogRequestsResponse {
+  LogQuery query = 1;
+}
+
+// First frame of a worker's log tunnel: which query it answers.
+message LogTunnelOpen {
+  string request_id = 1;
+}
+
+// Worker → server on a log tunnel.
+message WorkerLogTunnelRequest {
+  oneof frame {
+    LogTunnelOpen open = 1;
+    LogRecords records = 2;
+    LogGap gap = 3;
+    LogEnd end = 4;
+  }
+}
+
+// Server → worker on a log tunnel. Nothing is sent; the stream ending is the
+// order to stop.
+message WorkerLogTunnelResponse {}

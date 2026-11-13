@@ -12,6 +12,7 @@
 
 pub mod blob;
 pub mod config;
+pub mod diagnostics;
 pub mod enrollment;
 pub mod error;
 pub mod forward;

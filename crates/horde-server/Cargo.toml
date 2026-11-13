@@ -27,6 +27,9 @@ horde-relay = { workspace = true }
 # export pipeline both live there, where they are testable.
 horde-observe = { workspace = true }
 horde-proto = { workspace = true }
+# The diagnostic-log serving loop and wire translations it shares with the
+# worker (ADR-0015).
+horde-wire = { workspace = true }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rusqlite = { version = "0.37.0", features = ["bundled"] }

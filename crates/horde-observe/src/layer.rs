@@ -295,6 +295,13 @@ impl FileLogging {
         &self.binary
     }
 
+    /// Records this as the running process's file logging — the binaries
+    /// do, once, when they install it — so the process's own serving paths
+    /// can follow its tap. A second registration is ignored.
+    pub fn register_process(&self) {
+        let _ = PROCESS.set(self.clone());
+    }
+
     /// Waits (up to `timeout`) until every record handed over so far is
     /// written. Binaries call it on the way out; tests call it before
     /// reading the files back.
@@ -305,6 +312,16 @@ impl FileLogging {
         }
         wait.recv_timeout(timeout).is_ok()
     }
+}
+
+/// The running process's file logging, once its binary registered it.
+static PROCESS: std::sync::OnceLock<FileLogging> = std::sync::OnceLock::new();
+
+/// The file logging the running binary installed, if it installed one.
+/// `None` in libraries and in tests, whose processes are not daemons.
+#[must_use]
+pub fn process_logging() -> Option<&'static FileLogging> {
+    PROCESS.get()
 }
 
 fn writer_loop(receiver: &Receiver<Message>, mut state: WriterState) {

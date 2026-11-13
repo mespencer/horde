@@ -58,6 +58,10 @@ pub enum Step {
     /// death a Worker only discovers as a broken pipe. A *resumed* session
     /// carries on with the rest of the script, as a real revival would.
     Exit,
+    /// The harness writes this line to its stderr (ADR-0015). Diagnostics,
+    /// never protocol: nothing about the turn changes. Lands wherever the
+    /// spawn's stderr sink sends it — the agent's stderr file on a Worker.
+    Stderr(String),
 }
 
 /// One scripted turn.
