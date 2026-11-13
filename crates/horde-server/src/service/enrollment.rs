@@ -464,6 +464,25 @@ pub(crate) mod tests {
         assert!(!debugged.contains("PRIVATE KEY"), "{debugged}");
     }
 
+    /// A minted secret is scrubbed from every log record this server serves
+    /// until it expires (ADR-0015's registered values).
+    #[tokio::test]
+    async fn a_minted_secret_is_redacted_from_served_logs_until_it_expires() {
+        let authority = bare_authority().await;
+        let principal = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w1")
+            .expect("a valid name");
+        let minted = authority
+            .mint(&principal, 60_000, super::wall_clock_ms())
+            .await
+            .expect("mints");
+        let (line, touched) = horde_observe::redact::redact_line(&format!(
+            "{{\"msg\":\"joined with {}\"}}",
+            minted.secret
+        ));
+        assert!(touched, "{line}");
+        assert!(!line.contains(&minted.secret), "{line}");
+    }
+
     #[test]
     fn the_join_code_is_secret_dot_fingerprint() {
         let minted = MintedCode {
