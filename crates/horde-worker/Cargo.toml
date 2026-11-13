@@ -67,8 +67,9 @@ nix = { version = "0.31.3", features = ["fs", "process", "signal"] }
 [target.'cfg(windows)'.dependencies]
 # A harness's process tree on Windows is a Job Object with
 # KILL_ON_JOB_CLOSE (ADR-0017): the Windows counterpart of a process group,
-# through a safe API, because the workspace forbids `unsafe`.
-process-wrap = { version = "9.1.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+# through a safe API, because the workspace forbids `unsafe`. 10.0 or later:
+# 9.x never set KILL_ON_JOB_CLOSE (the job wrapper could not see KillOnDrop).
+process-wrap = { version = "10.0.1", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
 # Free and total disk space for the workspace pressure check (ADR-0014):
 # `statvfs` on Unix, GetDiskFreeSpaceExW here, again without our own `unsafe`.
 fs4 = { version = "0.13.1", default-features = false }

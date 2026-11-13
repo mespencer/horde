@@ -25,7 +25,9 @@ pub(crate) fn spawn_in_job(
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
     use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
     let mut wrapped = CommandWrap::from(command);
-    // KillOnDrop first: it is what makes the job kill-on-close.
+    // KillOnDrop is what makes the job kill-on-close. process-wrap 10 is
+    // required: 9.x hid the registered wrappers from the job wrapper, which
+    // then made a job that outlived its last handle (ADR-0017).
     wrapped.wrap(KillOnDrop).wrap(JobObject);
     wrapped.spawn()
 }
