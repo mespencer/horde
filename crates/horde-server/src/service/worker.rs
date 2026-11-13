@@ -97,8 +97,18 @@ impl WorkerService for WorkerFacing {
                 .await
                 .map_err(Status::from)?;
         }
+        let serves_logs = request.hello.as_ref().is_some_and(|hello| {
+            hello
+                .capability_flags
+                .iter()
+                .any(|flag| flag == horde_wire::logs::LOGS_CAPABILITY)
+        });
         let capabilities = request.capabilities.unwrap_or_default();
         refuse_foreign_reports(&worker_id, &capabilities.warm_instances)?;
+        self.core
+            .logs
+            .registry
+            .note_registration(&worker_id, serves_logs);
 
         register_and_replace(&self.core, &worker_id, capabilities)
             .await
@@ -393,6 +403,35 @@ impl WorkerService for WorkerFacing {
                 })
             }),
         ))
+    }
+
+    type StreamLogRequestsStream = super::diagnostics::LogRequestsStream;
+
+    /// Log reads aimed at this worker (ADR-0015), one query per read.
+    #[instrument(skip_all)]
+    async fn stream_log_requests(
+        &self,
+        request: Request<horde_proto::v1::StreamLogRequestsRequest>,
+    ) -> Result<Response<Self::StreamLogRequestsStream>, Status> {
+        let serial = super::shared::peer_serial(&request);
+        let worker_id = named_worker(&request, request.get_ref().worker_id.as_ref(), "log")?;
+        Ok(Response::new(super::diagnostics::stream_log_requests(
+            &self.core,
+            worker_id,
+            self.deny.clone(),
+            serial,
+        )))
+    }
+
+    type WorkerLogTunnelStream = super::diagnostics::LogTunnelStream;
+
+    /// One log read's records, worker leg (ADR-0015).
+    #[instrument(skip_all)]
+    async fn worker_log_tunnel(
+        &self,
+        request: Request<Streaming<horde_proto::v1::WorkerLogTunnelRequest>>,
+    ) -> Result<Response<Self::WorkerLogTunnelStream>, Status> {
+        super::diagnostics::worker_log_tunnel(&self.core, request).await
     }
 
     /// The hub tools one Agent may see (ADR-0004's forwarded path): worker

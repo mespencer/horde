@@ -12,6 +12,7 @@
 pub mod blob;
 pub mod commands;
 pub mod control_plane;
+pub mod diagnostics;
 pub mod enrollment;
 pub mod forwards;
 pub mod ingest;

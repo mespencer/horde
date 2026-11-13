@@ -154,7 +154,7 @@ pub fn invocation(arguments: impl IntoIterator<Item = String>) -> Result<WorkerC
 /// The [`Script`] type is test vocabulary; this is its operator form, kept
 /// deliberately small: an array of turns, each either a bare string (a turn
 /// that says it and finishes) or an object `{"steps": […], "text": …}` whose
-/// steps are `{"say": …}`, `{"think": …}` or
+/// steps are `{"say": …}`, `{"think": …}`, `{"stderr": …}` or
 /// `{"ask_permission": {"id": …, "tool": …, "input": …}}`. After the scripted
 /// turns run out the agent echoes, which is what the revival and steering
 /// scenarios need from a conversation of unknowable length.
@@ -246,7 +246,14 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
             input,
         });
     }
-    Err("a step must be one of say, think, ask_permission, use_horde".to_owned())
+    if let Some(line) = object.get("stderr") {
+        // A line the "harness" writes to stderr (ADR-0015): what the log
+        // suites read back through the agent's stderr file.
+        return Ok(Step::Stderr(
+            line.as_str().ok_or("stderr must be a string")?.to_owned(),
+        ));
+    }
+    Err("a step must be one of say, think, ask_permission, use_horde, stderr".to_owned())
 }
 
 /// The `{id, tool, input}` triple both tool-shaped steps share.

@@ -1738,6 +1738,19 @@ impl ControlPlaneService for ControlPlane {
         ))
     }
 
+    type ReadLogsStream = super::diagnostics::ReadLogsStream;
+
+    /// Diagnostic logs (ADR-0015): the server's, a worker's, or an agent's
+    /// records, redacted at egress. See [`crate::diagnostics`] for who may
+    /// read what.
+    #[instrument(skip_all)]
+    async fn read_logs(
+        &self,
+        request: Request<horde_proto::v1::ReadLogsRequest>,
+    ) -> Result<Response<Self::ReadLogsStream>, Status> {
+        super::diagnostics::read_logs(&self.core, request).await
+    }
+
     type WorkerLoginStream =
         Pin<Box<dyn Stream<Item = Result<horde_proto::v1::WorkerLoginResponse, Status>> + Send>>;
 

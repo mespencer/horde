@@ -256,9 +256,15 @@ impl SupervisedHarness {
 
         let stderr: StderrTail = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
         let sink = Arc::clone(&stderr);
+        // The agent's stderr file (ADR-0015), when this spawn was scoped
+        // with one: every line goes there as well as to the death tail.
+        let file = horde_adapter::stderr::current();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr_pipe).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(file) = &file {
+                    file.line(&line);
+                }
                 keep_tail(&mut *sink.lock().await, line);
             }
         });

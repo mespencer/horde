@@ -516,8 +516,48 @@ pub fn advertised_host(bound: IpAddr, subject_names: &[String]) -> String {
 /// # Errors
 ///
 /// The blob store being unusable, or the reconcile failing to read or append.
+/// The server's own log files (ADR-0015): always `<state>/logs`, followable
+/// through the tap when this process is the binary that writes them.
+#[must_use]
+pub fn local_logs(state_dir: &std::path::Path) -> horde_observe::reader::LocalLogs {
+    horde_observe::reader::LocalLogs::new(
+        log_dir(state_dir),
+        crate::diagnostics::BINARY,
+        horde_observe::layer::process_logging().map(|logging| logging.tap().clone()),
+    )
+}
+
+/// Starts the serving binary's file logging under `<state>/logs` and
+/// registers it as this process's, so `ReadLogs` can follow it.
+///
+/// # Errors
+///
+/// An unparseable `HORDE_LOG`, or a writer thread that cannot start.
+pub fn file_logging(
+    state_dir: &std::path::Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<horde_observe::FileLogging, String> {
+    let settings = horde_observe::settings::LogSettings::daemon().with_env(lookup)?;
+    let logging = horde_observe::FileLogging::start(
+        &log_dir(state_dir),
+        crate::diagnostics::BINARY,
+        &settings,
+        &horde_observe::ServiceIdentity::new(crate::diagnostics::BINARY),
+    )?;
+    logging.register_process();
+    Ok(logging)
+}
+
+/// Where the server's log files live: `<state>/logs`, so two servers with
+/// separate state directories never share files.
+#[must_use]
+pub fn log_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("logs")
+}
+
 async fn reconciled_core(config: &ServeConfig, log: EventLog) -> Result<ServerCore, ServerError> {
     let core = ServerCore::new(log)
+        .with_local_logs(local_logs(&config.state_dir))
         .with_blob_store(Arc::new(blob_store(config)?))
         .with_worker_lease(
             config

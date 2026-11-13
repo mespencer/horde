@@ -15,6 +15,7 @@ import "horde/v1/forward.proto";
 import "horde/v1/handshake.proto";
 import "horde/v1/id.proto";
 import "horde/v1/login.proto";
+import "horde/v1/logs.proto";
 import "horde/v1/mcp.proto";
 import "horde/v1/permission.proto";
 import "horde/v1/usage.proto";
@@ -132,6 +133,16 @@ service ControlPlaneService {
   // command exits or either peer's stream ends — the login dies with either.
   // Client channels only: a Worker principal is refused.
   rpc WorkerLogin(stream WorkerLoginRequest) returns (stream WorkerLoginResponse);
+
+  // -- Diagnostic logs (ADR-0015) ---------------------------------------------
+
+  // Read the server's, a worker's, or an agent's logs: the newest matching
+  // records, then (with follow) new ones as they are written. Records are
+  // redacted before they leave their machine. Never journaled: a log read is
+  // ephemeral intent. Clients may read every target; a worker caller (the
+  // agent conduit) must name an agent placed on it and sees only that
+  // agent's session's records, under the agent read limits.
+  rpc ReadLogs(ReadLogsRequest) returns (stream ReadLogsResponse);
 }
 
 // ---------------------------------------------------------------------------

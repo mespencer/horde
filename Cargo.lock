@@ -1377,6 +1377,7 @@ dependencies = [
  "horde-proto",
  "horde-relay",
  "horde-server-testkit",
+ "horde-wire",
  "hyper-util",
  "nix 0.31.3",
  "proptest",
@@ -1437,8 +1438,13 @@ name = "horde-wire"
 version = "0.1.0"
 dependencies = [
  "horde-adapter",
+ "horde-observe",
  "horde-proto",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

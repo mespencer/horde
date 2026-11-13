@@ -14,5 +14,15 @@ workspace = true
 # semantics. The Worker consumes this crate; nothing consumes the Worker.
 [dependencies]
 horde-adapter = { path = "../horde-adapter" }
+# Diagnostic logs (ADR-0015): the reader and redactor on one side, the
+# frames on the other, and the serving loop the server and worker share.
+horde-observe = { workspace = true }
 horde-proto = { path = "../horde-proto" }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "sync"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["registry"] }

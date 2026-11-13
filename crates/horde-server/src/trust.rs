@@ -147,6 +147,11 @@ fn control_plane(method: &str) -> Option<Admits> {
         // spawns, messages, and waits ride the worker's certificate. The
         // handlers scope a worker caller to the agents placed on it.
         "Hello" | "SyncEvents" | "SpawnAgent" | "SendMessage" => Some(Admits::Anyone),
+        // Diagnostic logs (ADR-0015): a client is the operator and reads
+        // everything; a worker reads on behalf of one of its placed agents,
+        // scoped to that agent's session and held to the agent read limits
+        // in `crate::diagnostics`.
+        "ReadLogs" => Some(Admits::Anyone),
         "CreateSession"
         | "ListSessions"
         | "GetSession"
@@ -193,6 +198,8 @@ fn worker_spine(method: &str) -> Option<Admits> {
             | "WorkerLoginTunnel"
             | "ListHubTools"
             | "CallHubTool"
+            | "StreamLogRequests"
+            | "WorkerLogTunnel"
     )
     .then_some(Admits::Workers)
 }
@@ -393,7 +400,13 @@ mod tests {
                 "{method}"
             );
         }
-        for method in ["Hello", "SyncEvents", "SpawnAgent", "SendMessage"] {
+        for method in [
+            "Hello",
+            "SyncEvents",
+            "SpawnAgent",
+            "SendMessage",
+            "ReadLogs",
+        ] {
             assert_eq!(
                 admits(&format!("/horde.v1.ControlPlaneService/{method}")),
                 Some(Admits::Anyone),

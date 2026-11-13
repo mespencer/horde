@@ -13,6 +13,9 @@ workspace = true
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The stderr sink is a task-local (ADR-0015): scoped around a spawn by the
+# Worker, captured by whatever starts the harness inside it.
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -51,9 +51,20 @@ fn run() -> Result<ExitCode, String> {
     // and a log line interleaved into it breaks the scripts that read it.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,horde_server=debug"));
+    // A serving server also keeps bounded JSON-lines logs under its state
+    // directory (ADR-0015); `HORDE_LOG` filters them, and a typo there is a
+    // refusal like any other.
+    let file = match &parsed {
+        Invocation::Serve(config) => Some(horde_server::startup::file_logging(
+            &config.state_dir,
+            |name| std::env::var(name).ok(),
+        )?),
+        _ => None,
+    };
     tracing::dispatcher::set_global_default(horde_observe::stderr_subscriber(
         filter,
         telemetry.as_ref(),
+        file.as_ref(),
     ))
     .map_err(|error| format!("could not install the subscriber: {error}"))?;
 
@@ -64,6 +75,10 @@ fn run() -> Result<ExitCode, String> {
         Invocation::Print(_) => ExitCode::SUCCESS,
     };
 
+    if let Some(file) = &file {
+        // What is still queued reaches the file before the process exits.
+        file.flush(std::time::Duration::from_secs(2));
+    }
     if let Some(telemetry) = telemetry {
         // From main's own thread, with the runtime still alive for the flush
         // to travel its channel. The verdict is discarded deliberately: a

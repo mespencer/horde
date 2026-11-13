@@ -133,18 +133,25 @@ pub fn prune_choice(
         .collect()
 }
 
-/// Creates `dir` (and parents) and makes it owner-only.
+/// Creates `dir` and makes it owner-only. Ancestors it has to create are
+/// owner-only too: the log writer may run before anything else has made the
+/// state directory, and must not leave it world-readable.
 ///
 /// # Errors
 ///
 /// The directory could not be created or restricted.
 pub fn owner_only_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        builder.mode(0o700);
+        builder.create(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    builder.create(dir)?;
     Ok(())
 }
 

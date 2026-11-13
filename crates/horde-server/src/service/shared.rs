@@ -72,6 +72,10 @@ pub struct ServerCore {
     /// declared lost (ADR-0011). A partition shorter than this is ridden
     /// out; one longer is treated as the worker's death.
     pub worker_lease: std::time::Duration,
+    /// Diagnostic logs (ADR-0015): the server's own files, the workers' log
+    /// lanes, and the agent read limits. Ephemeral like `logins`; nothing
+    /// in it is ever journaled.
+    pub logs: crate::diagnostics::LogPlane,
 }
 
 impl ServerCore {
@@ -93,7 +97,17 @@ impl ServerCore {
             logins: crate::login::registry::LoginRegistry::new(),
             hub: Arc::new(crate::hub::HubUpstreams::new()),
             worker_lease: crate::liveness::DEFAULT_WORKER_LEASE,
+            logs: crate::diagnostics::LogPlane::default(),
         }
+    }
+
+    /// Serves the server's own log files (ADR-0015) from `logs` — the
+    /// serving path points it at `<state>/logs`, followable through the
+    /// binary's tap.
+    #[must_use]
+    pub fn with_local_logs(mut self, logs: horde_observe::reader::LocalLogs) -> Self {
+        self.logs.local = Some(logs);
+        self
     }
 
     /// Overrides the worker-lost lease (ADR-0011) — the serving path from
