@@ -186,42 +186,71 @@ fn record_frames(records: &[Record], truncated: bool) -> Vec<LogRecords> {
 pub async fn serve_local(logs: &LocalLogs, read: LocalRead, out: &mpsc::Sender<Frame>) {
     // Subscribed before the files are read, so nothing written between the
     // read and the follow is missed; the cursor removes the overlap.
-    let mut tap = read
+    let tap = read
         .follow
         .then(|| logs.tap().map(horde_observe::tap::LogTap::subscribe))
         .flatten();
+    let Some((used, last)) = send_initial(logs, &read, out).await else {
+        return;
+    };
+    let Some(receiver) = tap else {
+        let _ = out
+            .send(end(LogEndReason::Done, "this process cannot be followed"))
+            .await;
+        return;
+    };
+    follow(receiver, &read, used, last, out).await;
+}
+
+/// The byte-cap end frame.
+fn byte_cap() -> Frame {
+    end(LogEndReason::ByteCap, "the byte cap was reached")
+}
+
+/// Sends the initial records. `None` when the read is over (finished,
+/// capped, or its receiver gone); otherwise the bytes used and the cursor a
+/// follow continues from.
+async fn send_initial(
+    logs: &LocalLogs,
+    read: &LocalRead,
+    out: &mpsc::Sender<Frame>,
+) -> Option<(usize, Option<Cursor>)> {
     let window = Window {
         after: read.after.clone(),
         tail: Some(read.tail.unwrap_or(DEFAULT_TAIL)),
         max_bytes: read.max_bytes,
     };
     let initial = logs.read(&read.target, &read.filter, &window);
-    let mut used: usize = initial.records.iter().map(|record| record.line.len()).sum();
-    let mut last = initial.last().cloned().or(read.after.clone());
     for frame in record_frames(&initial.records, initial.truncated) {
-        if out.send(Frame::Records(frame)).await.is_err() {
-            return;
-        }
+        out.send(Frame::Records(frame)).await.ok()?;
     }
-    if initial.truncated && read.after.is_some() {
-        let _ = out
-            .send(end(LogEndReason::ByteCap, "the byte cap was reached"))
-            .await;
-        return;
-    }
-    if !read.follow {
-        let _ = out.send(end(LogEndReason::Done, "")).await;
-        return;
-    }
-    let Some(receiver) = tap.as_mut() else {
-        let _ = out
-            .send(end(LogEndReason::Done, "this process cannot be followed"))
-            .await;
-        return;
+    let closing = if initial.truncated && read.after.is_some() {
+        Some(byte_cap())
+    } else if read.follow {
+        None
+    } else {
+        Some(end(LogEndReason::Done, ""))
     };
+    if let Some(closing) = closing {
+        let _ = out.send(closing).await;
+        return None;
+    }
+    let used = initial.records.iter().map(|record| record.line.len()).sum();
+    Some((used, initial.last().cloned().or_else(|| read.after.clone())))
+}
+
+/// Follows the tap past `last` until the cap, the tap's end, or the
+/// receiver going away.
+async fn follow(
+    mut receiver: tokio::sync::broadcast::Receiver<std::sync::Arc<str>>,
+    read: &LocalRead,
+    mut used: usize,
+    mut last: Option<Cursor>,
+    out: &mpsc::Sender<Frame>,
+) {
     loop {
         let next = tokio::select! {
-            next = next_followed(receiver, &read.target, &read.filter, &mut last) => next,
+            next = next_followed(&mut receiver, &read.target, &read.filter, &mut last) => next,
             () = out.closed() => return,
         };
         let frame = match next {
@@ -232,17 +261,7 @@ pub async fn serve_local(logs: &LocalLogs, read: LocalRead, out: &mpsc::Sender<F
             }),
             Some(Followed::Record(record)) => {
                 used += record.line.len();
-                if read.max_bytes.is_some_and(|cap| used > cap) {
-                    let _ = out
-                        .send(end(LogEndReason::ByteCap, "the byte cap was reached"))
-                        .await;
-                    return;
-                }
-                let mut frames = record_frames(std::slice::from_ref(&record), false);
-                match frames.pop() {
-                    Some(records) => Frame::Records(records),
-                    None => continue,
-                }
+                followed_frame(&record, used, read.max_bytes)
             }
         };
         let ended = matches!(frame, Frame::End(_));
@@ -250,6 +269,20 @@ pub async fn serve_local(logs: &LocalLogs, read: LocalRead, out: &mpsc::Sender<F
             return;
         }
     }
+}
+
+/// One followed record's frame, or the byte-cap end once `used` passes it.
+fn followed_frame(record: &Record, used: usize, cap: Option<usize>) -> Frame {
+    if cap.is_some_and(|cap| used > cap) {
+        return byte_cap();
+    }
+    let out = egress(std::slice::from_ref(record));
+    Frame::Records(LogRecords {
+        lines: out.lines,
+        cursor: Some(cursor_to_wire(&record.key)),
+        redacted: out.redacted,
+        truncated: false,
+    })
 }
 
 #[cfg(test)]

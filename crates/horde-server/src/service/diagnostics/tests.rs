@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use horde_observe::reader::LocalLogs;
 use horde_observe::settings::LogSettings;
 use horde_proto::v1::{
-    AgentId, LogEndReason, LogFilter, LogRecords, ReadLogsRequest, ReadLogsResponse, ServerTarget,
+    AgentId, LogEndReason, LogFilter, LogRecords, ReadLogsRequest, ServerTarget,
     control_plane_service_server::ControlPlaneService, read_logs_request, read_logs_response,
 };
 use horde_wire::logs::Frame;
@@ -63,21 +63,22 @@ fn server_read(on_behalf_of: Option<&str>) -> ReadLogsRequest {
 }
 
 async fn messages(plane: &ControlPlane, request: Request<ReadLogsRequest>) -> Vec<String> {
-    let mut stream = plane
+    let stream = plane
         .read_logs(request)
         .await
         .expect("admitted")
         .into_inner();
-    let mut messages = Vec::new();
-    while let Some(Ok(ReadLogsResponse { body: Some(body) })) = stream.next().await {
-        if let read_logs_response::Body::Records(records) = body {
-            for line in records.lines {
-                let record = horde_observe::record::Record::parse(&line).expect("one record");
-                messages.push(record.message().to_owned());
-            }
-        }
-    }
-    messages
+    let responses: Vec<_> = stream.collect().await;
+    responses
+        .into_iter()
+        .filter_map(|response| match response.ok()?.body? {
+            read_logs_response::Body::Records(records) => Some(records.lines),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|line| horde_observe::record::Record::parse(&line))
+        .map(|record| record.message().to_owned())
+        .collect()
 }
 
 #[tokio::test]
