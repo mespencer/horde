@@ -149,6 +149,13 @@ pub fn end(reason: LogEndReason, detail: impl Into<String>) -> Frame {
 
 /// Splits records into frames of at most [`FRAME_BYTES`] each, redacted.
 fn record_frames(records: &[Record], truncated: bool) -> Vec<LogRecords> {
+    if records.is_empty() && truncated {
+        // Everything matched was over the cap: say so, with nothing in hand.
+        return vec![LogRecords {
+            truncated: true,
+            ..LogRecords::default()
+        }];
+    }
     let mut frames = Vec::new();
     let mut start = 0;
     while start < records.len() {
@@ -400,7 +407,34 @@ mod tests {
         drop(sender);
         let frames = drain(receiver).await;
         assert!(
-            matches!(frames.as_slice(), [Frame::End(end)] if end.reason == LogEndReason::ByteCap as i32),
+            matches!(
+                frames.as_slice(),
+                [Frame::Records(none), Frame::End(end)]
+                    if none.lines.is_empty() && none.truncated
+                        && end.reason == LogEndReason::ByteCap as i32
+            ),
+            "{frames:?}"
+        );
+    }
+
+    /// A tail read whose newest record is already over the cap still says
+    /// it left records out.
+    #[tokio::test]
+    async fn a_tail_read_with_nothing_under_the_cap_reports_truncation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _logging = written(dir.path(), &["m1"]);
+        let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+        let (sender, receiver) = mpsc::channel(8);
+        serve_local(&logs, read(None, 1, false), &sender).await;
+        drop(sender);
+        let frames = drain(receiver).await;
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [Frame::Records(none), Frame::End(end)]
+                    if none.lines.is_empty() && none.truncated
+                        && end.reason == LogEndReason::Done as i32
+            ),
             "{frames:?}"
         );
     }

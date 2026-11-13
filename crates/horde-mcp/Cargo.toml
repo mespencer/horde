@@ -93,6 +93,8 @@ tokio = { workspace = true, features = [
 tonic = { version = "0.14.6", features = ["channel"] }
 
 [dev-dependencies]
+# The logs round trip writes a real server log through the file layer.
+tracing-subscriber = { version = "0.3.20", features = ["registry"] }
 # The TLS round-trip needs the client half of a rustls connection.
 tokio-rustls = { workspace = true }
 # The tests drive this endpoint against a real ControlPlane over a real socket,

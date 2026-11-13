@@ -139,7 +139,7 @@ pub async fn harness_with_permissions(
 }
 
 /// Seeds one session on an already-running server.
-async fn seeded_on(endpoint: String) -> Setup<Harness> {
+pub async fn seeded_on(endpoint: String) -> Setup<Harness> {
     let (_client, session_id, root) = horde_server_testkit::seeded(&endpoint, "endpoint").await?;
 
     Ok(Harness {

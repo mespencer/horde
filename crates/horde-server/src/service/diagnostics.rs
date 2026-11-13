@@ -66,8 +66,30 @@ pub async fn read_logs(
     .await?;
     let frames = crate::diagnostics::open(core, authorized, &request).await?;
     let (sender, receiver) = mpsc::channel(16);
-    super::shared::lift_frames(frames, sender, to_response);
+    tokio::spawn(lift_until_gone(frames, sender));
     Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+}
+
+/// Lifts a read's frames into the response stream until either side ends.
+///
+/// Unlike the relays' shared lift, this one watches the client too: an idle
+/// follow sends nothing for minutes, and a lift that only notices a departed
+/// client on its next send would keep the read — and the worker's tunnel —
+/// alive for nobody.
+pub async fn lift_until_gone(
+    mut frames: mpsc::Receiver<Frame>,
+    client: mpsc::Sender<Result<ReadLogsResponse, Status>>,
+) {
+    loop {
+        let frame = tokio::select! {
+            frame = frames.recv() => frame,
+            () = client.closed() => return,
+        };
+        let Some(frame) = frame else { return };
+        if client.send(Ok(to_response(frame))).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// The `StreamLogRequests` response stream.

@@ -42,6 +42,17 @@ pub fn log_dir(state_dir: &Path) -> PathBuf {
 pub struct LogServing {
     local: LocalLogs,
     agents: Arc<AgentLogs>,
+    /// Reads being served right now; each ends with its tunnel.
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Counts one read as in flight until dropped.
+struct Serving(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl LogServing {
@@ -52,7 +63,21 @@ impl LogServing {
         Self {
             local: LocalLogs::new(dir, BINARY, tap.clone()),
             agents: AgentLogs::new(dir.join(AGENTS_DIR), AgentLogSettings::default(), boot, tap),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// How many reads this worker is serving right now — zero once every
+    /// tunnel has ended, whichever side ended it.
+    #[must_use]
+    pub fn reads_in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn serving(&self) -> Serving {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Serving(Arc::clone(&self.in_flight))
     }
 
     /// The running daemon's logs: `<state>/logs`, stamped with the boot of
@@ -177,6 +202,7 @@ async fn answer(
     query: LogQuery,
     serving: Arc<LogServing>,
 ) {
+    let _serving = serving.serving();
     let (to_server, outbound) = mpsc::channel(16);
     let open = WorkerLogTunnelRequest {
         frame: Some(worker_log_tunnel_request::Frame::Open(LogTunnelOpen {
