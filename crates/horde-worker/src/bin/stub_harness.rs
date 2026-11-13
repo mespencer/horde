@@ -205,16 +205,14 @@ fn serve(stdout: &mut std::io::Stdout, turn: &[&str]) -> bool {
     stdout.flush().is_ok()
 }
 
-/// Closes a standard descriptor — the hang-ups the supervision suites stage.
-/// Unix only: Windows has no safe way to close a standard handle, and the
-/// suites that stage hang-ups run on Unix alone (ADR-0017).
+/// Closes stdin — the hang-up `HORDE_STUB_HANG_UP` stages. Unix only: no
+/// safe close of a standard handle exists on Windows, and the supervision
+/// tests that stage a hang-up run on Unix alone (ADR-0017).
+#[cfg(unix)]
 fn close_descriptor(descriptor: i32) {
-    #[cfg(unix)]
-    {
-        let _ = nix::unistd::close(descriptor);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = descriptor;
-    }
+    let _ = nix::unistd::close(descriptor);
 }
+
+/// See the Unix twin: on Windows a staged hang-up closes nothing.
+#[cfg(not(unix))]
+fn close_descriptor(_descriptor: i32) {}

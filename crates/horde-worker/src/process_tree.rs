@@ -29,14 +29,7 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-use unix as imp;
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-use windows as imp;
-
-#[cfg(unix)]
-pub(crate) use imp::group_pid;
+pub(crate) use unix::{group_pid, signal_spawned_group};
 
 /// How hard to stop a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +41,24 @@ pub enum Stop {
     Kill,
 }
 
+/// The root's piped standard streams, each taken at most once.
+#[derive(Debug, Default)]
+pub struct Pipes {
+    pub stdin: Option<ChildStdin>,
+    pub stdout: Option<ChildStdout>,
+    pub stderr: Option<ChildStderr>,
+}
+
 /// A spawned child and the tree it roots.
 pub struct ProcessTree {
-    inner: imp::Tree,
+    #[cfg(unix)]
+    child: tokio::process::Child,
+    /// The group the child leads — its pid at spawn.
+    #[cfg(unix)]
+    pgid: Option<u32>,
+    /// The child inside its job; dropping it closes the job's last handle.
+    #[cfg(windows)]
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
 }
 
 impl std::fmt::Debug for ProcessTree {
@@ -71,37 +79,66 @@ impl ProcessTree {
     ///
     /// The spawn failing (a missing binary, most often), or on Windows the
     /// job failing to form — in which case the child is not left running.
+    #[cfg(unix)]
     pub fn spawn(mut command: Command) -> std::io::Result<Self> {
+        // Its own group, so stopping it reaches everything it started.
+        command.kill_on_drop(true).process_group(0);
+        let child = command.spawn()?;
+        let pgid = child.id();
+        Ok(Self { child, pgid })
+    }
+
+    /// Spawns `command` as the root of a new tree: a new process group on
+    /// Unix, a new kill-on-close Job Object on Windows (`process-wrap` does
+    /// the Win32 work — `CREATE_SUSPENDED`, the job, the assignment, the
+    /// resume — because the workspace forbids `unsafe`).
+    ///
+    /// # Errors
+    ///
+    /// The spawn failing (a missing binary, most often), or the job failing
+    /// to form — in which case the child is not left running.
+    #[cfg(windows)]
+    pub fn spawn(mut command: Command) -> std::io::Result<Self> {
+        use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
         command.kill_on_drop(true);
-        imp::Tree::spawn(command).map(|inner| Self { inner })
+        let mut wrapped = CommandWrap::from(command);
+        // KillOnDrop first: it is what makes the job kill-on-close.
+        wrapped.wrap(KillOnDrop).wrap(JobObject);
+        wrapped.spawn().map(|child| Self { child })
     }
 
     /// The root's OS process id while it is unreaped.
     #[must_use]
     pub fn id(&self) -> Option<u32> {
-        self.inner.id()
+        self.child.id()
     }
 
     /// The process group the root leads — its pid at spawn — on Unix;
     /// always `None` on Windows, where the tree is a handle, not an id.
     #[must_use]
     pub fn group(&self) -> Option<u32> {
-        self.inner.group()
+        #[cfg(unix)]
+        return self.pgid;
+        #[cfg(windows)]
+        return None;
     }
 
-    /// Takes the root's piped stdin, once.
-    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.inner.take_stdin()
-    }
-
-    /// Takes the root's piped stdout, once.
-    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.inner.take_stdout()
-    }
-
-    /// Takes the root's piped stderr, once.
-    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.inner.take_stderr()
+    /// Takes the root's piped streams; a stream already taken, or never
+    /// piped, is `None`.
+    pub fn take_pipes(&mut self) -> Pipes {
+        let child = &mut self.child;
+        #[cfg(unix)]
+        return Pipes {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+        };
+        #[cfg(windows)]
+        return Pipes {
+            stdin: child.stdin().take(),
+            stdout: child.stdout().take(),
+            stderr: child.stderr().take(),
+        };
     }
 
     /// Reaps the root, returning its status. The rest of the tree is left to
@@ -111,7 +148,7 @@ impl ProcessTree {
     ///
     /// The wait itself failing.
     pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        self.inner.wait().await
+        self.child.wait().await
     }
 
     /// Kills the root by handle and reaps it.
@@ -120,12 +157,103 @@ impl ProcessTree {
     ///
     /// The kill or the reap failing.
     pub async fn kill_root(&mut self) -> std::io::Result<()> {
-        self.inner.kill_root().await
+        #[cfg(unix)]
+        return self.child.kill().await;
+        #[cfg(windows)]
+        return Box::into_pin(self.child.kill()).await;
     }
 
     /// Stops the tree as hard as `stop` says, returning whether anything was
-    /// sent. Refuses on Unix what [`signal_spawned_group`] refuses.
+    /// sent. On Unix the group is signalled through [`signal_spawned_group`],
+    /// refusing what it refuses; on Windows `Terminate` sends nothing (the
+    /// graceful half of a stop is the caller's) and `Kill` terminates the
+    /// job — every member, at once, by handle.
     pub fn signal(&mut self, stop: Stop) -> bool {
-        self.inner.signal(stop)
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::Signal;
+            let signal = match stop {
+                Stop::Terminate => Signal::SIGTERM,
+                Stop::Kill => Signal::SIGKILL,
+            };
+            self.pgid
+                .is_some_and(|leader| signal_spawned_group(leader, signal))
+        }
+        #[cfg(windows)]
+        match stop {
+            Stop::Terminate => false,
+            Stop::Kill => self.child.start_kill().is_ok(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use horde_server_testkit::process::windows::gone_soon;
+    use tokio::io::AsyncBufReadExt;
+
+    use super::{ProcessTree, Stop};
+
+    /// A command that starts a long-lived grandchild, prints its pid, and
+    /// waits — the shape of a harness whose tool left a server running.
+    fn spawner() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$p = Start-Process -PassThru -WindowStyle Hidden ping.exe \
+                 -ArgumentList '-n','600','127.0.0.1'; Write-Output $p.Id; \
+                 Start-Sleep -Seconds 600",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        command
+    }
+
+    async fn grandchild_of(tree: &mut ProcessTree) -> u32 {
+        let stdout = tree.take_pipes().stdout.expect("piped stdout");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+            .await
+            .expect("the spawner prints in time")
+            .expect("reads")
+            .expect("a line");
+        line.trim().parse().expect("a pid")
+    }
+
+    /// Kill reaches the grandchild: the job holds the whole tree.
+    #[tokio::test]
+    async fn a_kill_reaches_every_member_of_the_job() {
+        let mut tree = ProcessTree::spawn(spawner()).expect("spawns");
+        let grandchild = grandchild_of(&mut tree).await;
+        assert!(tree.signal(Stop::Kill), "TerminateJobObject was sent");
+        let _ = tree.wait().await;
+        assert!(gone_soon(grandchild).await, "{grandchild} outlived its job");
+    }
+
+    /// Dropping the tree closes the job's last handle, which kills it all —
+    /// the property that makes a crashed Worker leave nothing behind.
+    #[tokio::test]
+    async fn dropping_the_tree_kills_the_job() {
+        let mut tree = ProcessTree::spawn(spawner()).expect("spawns");
+        let grandchild = grandchild_of(&mut tree).await;
+        drop(tree);
+        assert!(gone_soon(grandchild).await, "{grandchild} outlived its job");
+    }
+
+    /// Terminate is honest about sending nothing on Windows.
+    #[tokio::test]
+    async fn terminate_sends_nothing_and_says_so() {
+        let mut tree = ProcessTree::spawn(spawner()).expect("spawns");
+        assert!(!tree.signal(Stop::Terminate));
+        assert_eq!(tree.group(), None, "no process groups here");
+        assert!(tree.id().is_some());
+        tree.kill_root().await.expect("kills");
     }
 }

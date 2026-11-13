@@ -369,18 +369,14 @@ fn run(blocks: &[Vec<String>], config: &StubConfig) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Closes a standard descriptor — the hang-ups the supervision suites stage.
-/// Unix only: Windows has no safe way to close a standard handle, and the
-/// suites that stage hang-ups run on Unix alone (ADR-0017).
+/// Closes descriptor 0 or 1 — the mid-handshake hang-up and `!CLOSE_STDOUT`.
+/// On Windows nothing closes (there is no safe close of a std handle), and
+/// the codex supervision suite that scripts these is Unix-only (ADR-0017).
 fn close_descriptor(descriptor: i32) {
     #[cfg(unix)]
-    {
-        let _ = nix::unistd::close(descriptor);
-    }
+    let _ = nix::unistd::close(descriptor);
     #[cfg(not(unix))]
-    {
-        let _ = descriptor;
-    }
+    let _ = descriptor;
 }
 
 #[cfg(test)]

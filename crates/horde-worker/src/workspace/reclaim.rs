@@ -249,13 +249,10 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
         Err(error) => return refused(&format!("could not run {program}: {error}")),
     };
     let tail = Arc::new(Mutex::new(Vec::new()));
+    let pipes = child.take_pipes();
     let readers = [
-        child
-            .take_stdout()
-            .map(|out| collect(out, Arc::clone(&tail))),
-        child
-            .take_stderr()
-            .map(|err| collect(err, Arc::clone(&tail))),
+        pipes.stdout.map(|out| collect(out, Arc::clone(&tail))),
+        pipes.stderr.map(|err| collect(err, Arc::clone(&tail))),
     ];
     let leader = child.id();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
@@ -517,20 +514,10 @@ mod tests {
             .trim()
             .parse()
             .expect("a pid");
-        let mut gone = false;
-        for _ in 0..50 {
-            let listed = tokio::process::Command::new("tasklist.exe")
-                .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-                .output()
-                .await
-                .expect("tasklist runs");
-            if !String::from_utf8_lossy(&listed.stdout).contains(&format!("\"{pid}\"")) {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(gone, "the grandchild {pid} survived its job's termination");
+        assert!(
+            horde_server_testkit::process::windows::gone_soon(pid).await,
+            "the grandchild {pid} survived its job's termination"
+        );
     }
 
     /// On Windows a reclaim command runs in its directory and keeps

@@ -1,12 +1,13 @@
-//! Windows lints: `cargo xwin clippy --target x86_64-pc-windows-msvc
-//! --all-targets --all-features -- -D warnings` (ADR-0017).
+//! Windows lints: `cargo xwin clippy … --target x86_64-pc-windows-msvc --
+//! -D warnings` (ADR-0017).
 //!
 //! Every crate builds for Windows — the Worker above all, so a Windows
 //! machine can run `claude.exe` and `codex.exe` agents — and the platform
 //! seams (`cfg(unix)` / `cfg(windows)`) are exactly where code rots unseen
 //! on a Linux-only gauntlet: a Windows branch nobody compiles stops
 //! compiling. This gate compiles and lints every target for Windows from
-//! Linux, under the same `-D warnings` and the same deny-list as `clippy`.
+//! Linux, with the same arguments, `-D warnings` and deny-list as `clippy`
+//! (one builder, [`lint_args`], makes both commands).
 //!
 //! `cargo-xwin` supplies what a cross-check needs and the host lacks: the
 //! MSVC CRT and Windows SDK headers (downloaded once, to its cache) for the
@@ -14,9 +15,8 @@
 //! It checks; it does not run tests — Windows tests run on a Windows
 //! machine (ADR-0017 lists them).
 
-use crate::gates::clippy::outcome_of;
+use crate::gates::clippy::{lint_args, outcome_of};
 use crate::gates::prelude::*;
-use crate::gates::with_packages;
 
 /// The target every Windows check builds for.
 pub const TARGET: &str = "x86_64-pc-windows-msvc";
@@ -44,34 +44,19 @@ pub fn gate() -> CommandGate {
 
 /// The command this gate runs.
 pub fn spec(ctx: &GateContext) -> CommandSpec {
-    let mut args = vec!["xwin".to_owned()];
-    args.extend(with_packages(
-        &["clippy", "--target", TARGET, "--all-targets", "--all-features"],
-        ctx,
-    ));
-    args.push("--".to_owned());
-    args.push("-D".to_owned());
-    args.push("warnings".to_owned());
-    CommandSpec::owned("cargo", args, &ctx.workspace_root)
+    CommandSpec::owned(
+        "cargo",
+        lint_args(&["xwin"], &["--target", TARGET], ctx),
+        &ctx.workspace_root,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{exited, failed, repo_ctx};
+    use crate::testing::{failed, repo_ctx};
 
     const DIRTY: &str = include_str!("../../fixtures/cargo-xwin-clippy-denied.txt");
-
-    fn read(output: &CommandOutput) -> GateOutcome {
-        (gate_reader())(&spec(&repo_ctx()), output)
-    }
-
-    fn gate_reader() -> fn(&CommandSpec, &CommandOutput) -> GateOutcome {
-        match gate().read {
-            Reader::AnyExit(read) => read,
-            Reader::CleanExitOnly(_) => panic!("clippy reports lints through a non-zero exit"),
-        }
-    }
 
     /// cargo-xwin is an install, so it carries a pin; clippy itself rides
     /// the toolchain's.
@@ -82,39 +67,31 @@ mod tests {
         assert_eq!(wiring.pin.map(|pin| pin.program), Some("cargo-xwin"));
     }
 
+    /// The `clippy` command, run through cargo-xwin for the Windows target;
+    /// a narrowed run names its packages instead of the workspace.
     #[test]
-    fn the_command_lints_every_target_for_windows_and_denies_warnings() {
+    fn the_command_is_clippys_through_xwin_for_the_windows_target() {
         assert_eq!(
             spec(&repo_ctx()).display(),
-            "cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets --all-features \
-             --workspace -- -D warnings"
+            "cargo xwin clippy --all-targets --all-features --workspace \
+             --target x86_64-pc-windows-msvc -- -D warnings"
         );
-    }
-
-    #[test]
-    fn a_narrowed_run_replaces_the_workspace_flag_with_packages() {
-        let ctx = GateContext::new(std::path::Path::new("/repo"), vec!["a".to_owned()]);
-        assert_eq!(
-            spec(&ctx).display(),
-            "cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets --all-features \
-             -p a -- -D warnings"
-        );
-    }
-
-    #[test]
-    fn a_clean_run_passes() {
-        assert_eq!(
-            read(&exited(0, "Finished")),
-            GateOutcome::pass("no clippy or rustc warnings")
-        );
+        let narrowed = GateContext::new(std::path::Path::new("/repo"), vec!["a".to_owned()]);
+        let display = spec(&narrowed).display();
+        assert!(display.contains(" -p a --target "), "{display}");
+        assert!(!display.contains("--workspace"), "{display}");
     }
 
     /// A real Windows cross-check that failed — a Unix-only API reached
-    /// from code Windows compiles — is a failure with its diagnostic count.
+    /// from code Windows compiles — is a failure with its diagnostic count,
+    /// read by the wired reader.
     #[test]
     fn real_cross_check_output_is_read_as_a_failure_with_a_diagnostic_count() {
+        let Reader::AnyExit(read) = gate().read else {
+            panic!("clippy reports lints through a non-zero exit");
+        };
         assert_eq!(
-            read(&failed(101, DIRTY)),
+            read(&spec(&repo_ctx()), &failed(101, DIRTY)),
             GateOutcome::fail("2 clippy/rustc diagnostic(s); see the gate log")
         );
     }
