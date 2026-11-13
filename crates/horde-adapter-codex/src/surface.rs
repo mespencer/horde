@@ -374,17 +374,17 @@ fn resolve(root: &Value, schema: &Value) -> Value {
     current
 }
 
+/// How many schema nodes one path segment may visit.
+const MAX_BRANCH_STEPS: usize = 256;
+
 /// Every concrete schema a node stands for: itself, its union branches
 /// (`anyOf`/`oneOf`/`allOf`), and — arrays being transparent — its items.
 fn branches(root: &Value, schema: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     let mut queue = vec![schema.clone()];
-    let mut steps = 0;
-    while let Some(next) = queue.pop() {
-        steps += 1;
-        if steps > 256 {
-            break;
-        }
+    // Bounded: a union that names itself would otherwise grow forever.
+    for _ in 0..MAX_BRANCH_STEPS {
+        let Some(next) = queue.pop() else { break };
         let node = resolve(root, &next);
         for key in ["anyOf", "oneOf", "allOf"] {
             if let Some(alternatives) = node.get(key).and_then(Value::as_array) {
@@ -500,10 +500,12 @@ mod tests {
                     ]},
                     "list": {"type": "array", "items": {"$ref": "#/definitions/Inner"}},
                     "map": {"type": "object", "additionalProperties": {"$ref": "#/definitions/Inner"}},
-                    "loop": {"$ref": "#/definitions/Loop"}
+                    "loop": {"$ref": "#/definitions/Loop"},
+                    "cycle": {"$ref": "#/definitions/Cycle"}
                 }},
                 "Inner": {"type": "object", "properties": {"v": {"type": ["string", "null"]}}},
-                "Loop": {"$ref": "#/definitions/Loop"}
+                "Loop": {"$ref": "#/definitions/Loop"},
+                "Cycle": {"anyOf": [{"$ref": "#/definitions/Cycle"}, {"type": "string"}]}
             }
         })
     }
@@ -609,5 +611,10 @@ mod tests {
         assert_eq!(at("nope"), MISSING);
         assert_eq!(at("id.deeper"), MISSING);
         assert_eq!(at("loop"), "any", "a self-reference ends, unsummarized");
+        assert_eq!(
+            at("cycle"),
+            "string",
+            "a union that names itself is walked a bounded number of steps"
+        );
     }
 }

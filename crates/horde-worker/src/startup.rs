@@ -1508,6 +1508,79 @@ mod tests {
         assert!(input.is_object(), "the default input is an empty object");
     }
 
+    /// A scripted question parses into the fake's question step, every
+    /// question needing an id and the step needing at least one.
+    #[test]
+    fn a_scripted_question_parses_and_its_ids_are_required() {
+        let script = fake_script(
+            r#"[{"steps": [{"ask_question": {"id": "q-1", "tool": "AskUserQuestion",
+                "questions": [{"id": "colour", "header": "C", "question": "Which?",
+                               "options": ["Red", "Blue"], "multi_select": true}]}}]}]"#,
+        )
+        .expect("a valid question");
+        let horde_adapter_fake::Step::AskQuestion {
+            tool_call_id,
+            tool_name,
+            questions,
+        } = &script.turns[0].steps[0]
+        else {
+            panic!("the step must be the question");
+        };
+        assert_eq!(
+            (tool_call_id.as_str(), tool_name.as_str()),
+            ("q-1", "AskUserQuestion")
+        );
+        let [question] = questions.as_slice() else {
+            panic!("one question, got {questions:?}");
+        };
+        assert_eq!(question.id, "colour");
+        assert_eq!(question.header, "C");
+        assert_eq!(question.question, "Which?");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Red", "Blue"]
+        );
+        assert!(question.multi_select && question.allows_free_text);
+
+        for (json, needle) in [
+            (
+                r#"[{"steps": [{"ask_question": {"id": "q", "tool": "T", "questions": [{"question": "?"}]}}]}]"#,
+                "non-empty id",
+            ),
+            (
+                r#"[{"steps": [{"ask_question": {"id": "q", "tool": "T", "questions": []}}]}]"#,
+                "non-empty questions",
+            ),
+            (r#"[{"steps": [{"ask_question": {"tool": "T"}}]}]"#, "id"),
+        ] {
+            let refused = fake_script(json).expect_err("must refuse");
+            assert!(refused.contains(needle), "{json}: {refused}");
+        }
+    }
+
+    /// A refused harness stops the worker with the version, the floor and
+    /// the fix; untested and supported ones are admitted.
+    #[test]
+    fn only_a_refused_harness_is_turned_away() {
+        let codex = horde_adapter_codex::SUPPORT;
+        let refused = super::admit_harness(&codex.classify("codex-cli 0.145.0"))
+            .expect_err("below the floor");
+        assert!(refused.contains("codex 0.145.0 is refused"), "{refused}");
+        assert!(refused.contains("--adapter codex"), "{refused}");
+        assert_eq!(
+            super::admit_harness(&codex.classify("codex-cli 0.167.0")),
+            Ok(())
+        );
+        assert_eq!(
+            super::admit_harness(&codex.classify("codex-cli 9.0.0")),
+            Ok(())
+        );
+    }
+
     #[test]
     fn malformed_scripts_are_refused_naming_the_turn() {
         for (json, needle) in [

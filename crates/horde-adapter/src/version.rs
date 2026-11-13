@@ -214,7 +214,7 @@ impl VersionReport {
 /// # Errors
 ///
 /// A sentence saying the binary could not run, or answered nothing in time.
-#[cfg(feature = "probe")]
+#[cfg(any(feature = "probe", test))]
 pub async fn run_version(
     program: impl AsRef<std::ffi::OsStr>,
     ceiling: std::time::Duration,
@@ -238,7 +238,7 @@ pub async fn run_version(
 /// [`run_version`], classified against `table`. Every failure reads as an
 /// unreadable version — untested, never supported and never refused — with
 /// the reason kept for the journal and `horde doctor`.
-#[cfg(feature = "probe")]
+#[cfg(any(feature = "probe", test))]
 pub async fn probe_version(
     program: impl AsRef<std::ffi::OsStr>,
     table: SupportTable,
@@ -367,7 +367,7 @@ mod tests {
 
     /// An executable shell script in a fresh temp directory, standing in for
     /// a harness binary.
-    #[cfg(feature = "probe")]
+    #[cfg(any(feature = "probe", test))]
     fn script(name: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -386,7 +386,7 @@ mod tests {
     /// One test, both scripts written before anything is spawned: a fork
     /// from a parallel test while a script is still open for writing makes
     /// exec fail with ETXTBSY.
-    #[cfg(feature = "probe")]
+    #[cfg(any(feature = "probe", test))]
     #[tokio::test]
     async fn the_probe_reads_what_runs_and_explains_what_does_not() {
         let banner = script("banner", "echo \"toy 1.5.0 ($1)\"");

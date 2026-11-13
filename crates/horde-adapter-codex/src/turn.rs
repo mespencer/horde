@@ -1049,6 +1049,86 @@ mod tests {
             })
     }
 
+    /// A declined file change is a failed tool; an applied one is not; and a
+    /// declined *exec* is judged by its own rules, not the file-change one.
+    #[test]
+    fn a_file_change_fails_only_when_declined() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let file_change = |id: &str, status: &str| {
+            json!({"method":"item/completed","params":{"turnId":"turn-1",
+                   "item":{"type":"fileChange","id":id,"status":status,"changes":[]}}})
+        };
+        assert_eq!(
+            tool_error(&mut assembler, file_change("fc-1", "declined")),
+            Some(true)
+        );
+        assert_eq!(
+            tool_error(&mut assembler, file_change("fc-2", "completed")),
+            Some(false)
+        );
+        let declined_exec = json!({"method":"item/completed","params":{"turnId":"turn-1",
+            "item":{"type":"commandExecution","id":"x-1","status":"declined"}}});
+        assert_eq!(
+            tool_error(&mut assembler, declined_exec),
+            Some(false),
+            "an exec's declined status is not read by the file-change rule"
+        );
+    }
+
+    /// Each 0.167 request surfaces under the item id it names, and a request
+    /// on any other method — even one shaped like a question — surfaces
+    /// nothing.
+    #[test]
+    fn scoped_requests_surface_under_their_own_item_ids() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let surfaced = |assembler: &mut TurnAssembler, method: &str, params: serde_json::Value| {
+            requested(
+                &feed(
+                    assembler,
+                    json!({"id": 7, "method": method, "params": params}),
+                ),
+                method,
+            )
+        };
+        let permissions = surfaced(
+            &mut assembler,
+            "item/permissions/requestApproval",
+            json!({"turnId":"turn-1","itemId":"perm-9","permissions":{}}),
+        );
+        assert_eq!(permissions.tool_call_id.as_str(), "perm-9");
+        let question = surfaced(
+            &mut assembler,
+            "item/tool/requestUserInput",
+            json!({"turnId":"turn-1","itemId":"call-9",
+                   "questions":[{"id":"q","header":"h","question":"?"}]}),
+        );
+        assert_eq!(question.tool_call_id.as_str(), "call-9");
+        let patch = surfaced(
+            &mut assembler,
+            "item/fileChange/requestApproval",
+            json!({"turnId":"turn-1","itemId":"fc-9"}),
+        );
+        assert_eq!(patch.tool_call_id.as_str(), "fc-9");
+
+        let lookalike = feed(
+            &mut assembler,
+            json!({"id": 8, "method": "item/tool/somethingElse", "params":
+                {"turnId":"turn-1","itemId":"z","questions":[{"id":"q","header":"h","question":"?"}]}}),
+        );
+        assert!(lookalike.is_empty(), "{lookalike:?}");
+        let empty = feed(
+            &mut assembler,
+            json!({"id": 9, "method": "item/tool/requestUserInput", "params":
+                {"turnId":"turn-1","itemId":"e","questions":[]}}),
+        );
+        assert!(
+            empty.is_empty(),
+            "a question request asking nothing is refused"
+        );
+    }
+
     /// A command is failed if it exited non-zero **or** the harness said so.
     /// Both halves are load-bearing: Codex reports `status: "failed"` for a
     /// sandbox denial that never produced an exit code at all.

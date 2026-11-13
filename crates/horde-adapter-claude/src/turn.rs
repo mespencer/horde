@@ -411,6 +411,158 @@ mod tests {
         value.to_string()
     }
 
+    fn prompt(request_id: &str, tool_use_id: &str) -> String {
+        json!({"type": "control_request", "request_id": request_id, "request": {
+            "subtype": "can_use_tool", "tool_name": "Write", "input": {"a": 1},
+            "tool_use_id": tool_use_id}})
+        .to_string()
+    }
+
+    /// A prompt inside a turn is surfaced and tracked under its tool-call id
+    /// until resolved, withdrawn, or cancelled by the harness — and only the
+    /// cancelled one goes.
+    #[test]
+    fn prompts_are_tracked_until_resolved_withdrawn_or_cancelled() {
+        use horde_adapter::ToolCallId;
+
+        let mut assembler = TurnAssembler::new();
+        assert!(
+            feed(&mut assembler, &prompt("early", "toolu_0")).is_empty(),
+            "no turn, no event: the caller refuses it"
+        );
+        assert_eq!(assembler.awaiting_decision(), None);
+
+        feed(&mut assembler, &init("s1"));
+        let events = feed(&mut assembler, &prompt("r1", "toolu_1"));
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::PermissionRequested { request, .. }] if request.tool_call_id.as_str() == "toolu_1"
+        ));
+        feed(&mut assembler, &prompt("r2", "toolu_2"));
+        feed(&mut assembler, &prompt("r3", ""));
+
+        let one = ToolCallId::new("toolu_1");
+        let outstanding = assembler.outstanding_prompt(&one).cloned();
+        assert_eq!(
+            outstanding
+                .as_ref()
+                .map(|prompt| (prompt.request_id.as_str(), prompt.tool_name.as_str())),
+            Some(("r1", "Write"))
+        );
+        assert_eq!(
+            outstanding.map(|prompt| prompt.input),
+            Some(json!({"a": 1}))
+        );
+        assert!(
+            assembler
+                .outstanding_prompt(&ToolCallId::new("control-r3"))
+                .is_some(),
+            "a prompt with no tool_use_id is minted one from its request id"
+        );
+
+        feed(
+            &mut assembler,
+            &json!({"type": "control_cancel_request", "request_id": "r2"}).to_string(),
+        );
+        assert!(
+            assembler
+                .outstanding_prompt(&ToolCallId::new("toolu_2"))
+                .is_none()
+        );
+        assert!(
+            assembler.outstanding_prompt(&one).is_some(),
+            "a cancel withdraws only the request it names"
+        );
+
+        assert_eq!(
+            assembler.resolve_prompt(&one).map(|p| p.request_id),
+            Some("r1".to_owned())
+        );
+        assert!(assembler.resolve_prompt(&one).is_none(), "answered once");
+        let withdrawn: Vec<String> = assembler
+            .withdraw_prompts()
+            .into_iter()
+            .map(|prompt| prompt.request_id)
+            .collect();
+        assert_eq!(withdrawn, vec!["r3".to_owned()]);
+        assert_eq!(assembler.awaiting_decision(), None);
+    }
+
+    /// Startup facts ride the next turn after its SessionEstablished; a
+    /// diagnostic noted mid-turn is emitted now, one noted between turns
+    /// waits for the next.
+    #[test]
+    fn diagnostics_ride_the_open_turn_or_wait_for_the_next() {
+        let mut assembler = TurnAssembler::new();
+        assembler.note_startup_diagnostic("route: stdio");
+        assert_eq!(
+            assembler.note_diagnostic("early".to_owned()),
+            None,
+            "no turn yet"
+        );
+
+        let opened = feed(&mut assembler, &init("s1"));
+        let texts: Vec<&str> = opened
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Output {
+                    channel: OutputChannel::HarnessDiagnostic,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(
+            opened.first(),
+            Some(AgentEvent::SessionEstablished { .. })
+        ));
+        assert_eq!(texts, vec!["route: stdio", "early"]);
+
+        let now = assembler.note_diagnostic("mid-turn".to_owned());
+        assert!(matches!(
+            now,
+            Some(AgentEvent::Output { channel: OutputChannel::HarnessDiagnostic, ref text, chunk_index: 2, .. })
+                if text == "mid-turn"
+        ));
+        feed(&mut assembler, &result_line("s1", json!({})));
+        assert_eq!(
+            assembler.note_diagnostic("late".to_owned()),
+            None,
+            "the turn closed"
+        );
+        let next = feed(&mut assembler, &init("s1"));
+        assert!(
+            next.iter()
+                .any(|event| matches!(event, AgentEvent::Output { text, .. } if text == "late")),
+            "{next:?}"
+        );
+    }
+
+    /// The init's own version is checked once: a supported one adds nothing,
+    /// an untested one a warning, and only on the first turn.
+    #[test]
+    fn the_init_version_is_checked_once_and_warns_only_when_untested() {
+        let versioned = |version: &str| {
+            json!({"type":"system","subtype":"init","session_id":"s1","model":"m",
+                   "claude_code_version": version})
+            .to_string()
+        };
+        let mut supported = TurnAssembler::new();
+        assert_eq!(feed(&mut supported, &versioned("2.1.323")).len(), 1);
+
+        let mut newer = TurnAssembler::new();
+        let first = feed(&mut newer, &versioned("2.9.0"));
+        assert!(
+            first.iter().any(|event| matches!(event, AgentEvent::Output { text, .. }
+                if text.starts_with("harness version warning (from the init): claude 2.9.0 is untested"))),
+            "{first:?}"
+        );
+        feed(&mut newer, &result_line("s1", json!({})));
+        let second = feed(&mut newer, &versioned("2.9.0"));
+        assert!(second.is_empty(), "checked once: {second:?}");
+    }
+
     #[test]
     fn the_session_is_announced_once_even_though_init_repeats_each_turn() {
         let mut assembler = TurnAssembler::new();
