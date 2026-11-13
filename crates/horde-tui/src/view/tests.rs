@@ -543,17 +543,23 @@ fn an_empty_forward_panel_says_so() {
     insta::assert_snapshot!(drawn(&app));
 }
 
+/// The first question of a question request, to adjust before folding it.
+fn first_question(request: &mut Kind) -> Option<&mut horde_proto::v1::Question> {
+    let Kind::PermissionRequested(requested) = request else {
+        return None;
+    };
+    requested
+        .request
+        .as_mut()
+        .and_then(|request| request.tool_call.as_mut())
+        .and_then(|call| call.questions.first_mut())
+}
+
 #[test]
 fn a_secret_free_text_answer_is_masked() {
     let mut app = attached_conversation();
     let mut request = asked("q-s", &[("Token?", &[])]);
-    if let Kind::PermissionRequested(requested) = &mut request
-        && let Some(question) = requested
-            .request
-            .as_mut()
-            .and_then(|request| request.tool_call.as_mut())
-            .and_then(|call| call.questions.first_mut())
-    {
+    if let Some(question) = first_question(&mut request) {
         question.secret = true;
         question.header = "Credentials".to_owned();
     }
@@ -566,13 +572,7 @@ fn a_secret_free_text_answer_is_masked() {
 fn a_multi_select_question_shows_checkboxes() {
     let mut app = attached_conversation();
     let mut request = asked("q-m", &[("Which checks?", &["fmt", "clippy", "tests"])]);
-    if let Kind::PermissionRequested(requested) = &mut request
-        && let Some(question) = requested
-            .request
-            .as_mut()
-            .and_then(|request| request.tool_call.as_mut())
-            .and_then(|call| call.questions.first_mut())
-    {
+    if let Some(question) = first_question(&mut request) {
         question.multi_select = true;
         question.allows_free_text = true;
         if let Some(option) = question.options.first_mut() {

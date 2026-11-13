@@ -62,6 +62,14 @@ pub(crate) fn requested(request_id: &str, rendered: &str) -> Kind {
     })
 }
 
+/// An offered option with no description.
+fn choice(label: &str) -> QuestionOption {
+    QuestionOption {
+        label: label.to_owned(),
+        ..QuestionOption::default()
+    }
+}
+
 /// A question request: one question per `(id, options)` pair.
 pub(crate) fn asked(request_id: &str, questions: &[(&str, &[&str])]) -> Kind {
     let tool_call = ProposedToolCall {
@@ -72,13 +80,7 @@ pub(crate) fn asked(request_id: &str, questions: &[(&str, &[&str])]) -> Kind {
             .map(|(id, options)| Question {
                 id: (*id).to_owned(),
                 question: format!("{id}?"),
-                options: options
-                    .iter()
-                    .map(|label| QuestionOption {
-                        label: (*label).to_owned(),
-                        description: String::new(),
-                    })
-                    .collect(),
+                options: options.iter().copied().map(choice).collect(),
                 ..Question::default()
             })
             .collect(),

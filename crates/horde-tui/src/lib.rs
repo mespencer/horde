@@ -18,13 +18,17 @@
 //! # Example
 //!
 //! ```
-//! use horde_tui::{App, Screen};
+//! use horde_tui::{App, Directive, Screen};
 //! use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 //!
 //! let mut app = App::overview();
 //! let directives = app.on_input(&Event::Key(KeyEvent::from(KeyCode::Char('i'))));
-//! assert!(directives.is_empty(), "navigation never crosses the wire");
 //! assert_eq!(app.screen(), Screen::Inbox);
+//! // Opening a view only asks the server what to show; nothing is written.
+//! assert_eq!(
+//!     directives,
+//!     vec![Directive::RefreshSessions, Directive::RefreshWorkers]
+//! );
 //! ```
 
 pub mod app;

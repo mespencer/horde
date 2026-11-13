@@ -80,7 +80,15 @@ async fn the_attached_view_shows(world: &mut HordeWorld, needle: String) -> Step
 #[when("the user detaches")]
 async fn the_user_detaches(world: &mut HordeWorld) -> StepResult {
     let tui = world.tui.as_mut().ok_or("nothing is attached")?;
-    press(tui, KeyCode::Esc).await?;
+    // Ctrl-T leaves the transcript for the session/agent tree; Esc belongs
+    // to the conversation (it interrupts a working agent).
+    tui.keys
+        .send(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        )))
+        .await
+        .map_err(|_| "the loop hung up its key channel")?;
     observed(tui, "the overview to return", |app| {
         app.screen() == Screen::Overview
     })

@@ -14,13 +14,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::common::{Setup, journal_event, seeded, serve};
+use crate::common::{Setup, escalation, journal_event, seeded, serve};
 use horde_cli::tui::drive;
 use horde_cli::{Client, ClientError};
-use horde_proto::v1::{
-    AgentId, Event, PermissionRequest, PermissionRequestId, PermissionRequested, ProposedToolCall,
-    event::Kind,
-};
 use horde_tui::{App, Screen};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -110,34 +106,6 @@ impl Harness {
     }
 }
 
-/// What a worker would journal when an agent's tool call escalates to a
-/// human. The control plane cannot author this — observed facts enter through
-/// the worker spine — so the test journals it the way a worker does.
-fn escalation(agent_id: &str, request_id: &str, rendered: &str) -> Event {
-    Event {
-        agent_id: Some(AgentId::new(agent_id)),
-        occurred_at: None,
-        idempotency_key: format!("perm-{request_id}"),
-        kind: Some(Kind::PermissionRequested(PermissionRequested {
-            request: Some(PermissionRequest {
-                request_id: Some(PermissionRequestId::new(request_id)),
-                agent_id: Some(AgentId::new(agent_id)),
-                tool_call: Some(ProposedToolCall {
-                    tool_name: "Bash".to_owned(),
-                    input: None,
-                    rendered: rendered.to_owned(),
-                    questions: Vec::new(),
-                }),
-                tree_path: vec!["tui".to_owned(), "runner".to_owned()],
-                permission_mode: "manual".to_owned(),
-                escalated_from: 0,
-                expires_at: None,
-                forward: None,
-            }),
-        })),
-    }
-}
-
 /// Whether this session's feed carries a line with this label whose text
 /// contains the needle — the shape every round-trip assertion here takes.
 fn feed_has(app: &App, session_id: &str, label: &str, needle: &str) -> bool {
@@ -189,7 +157,7 @@ async fn inbox_with_one_escalation(title: &str, request_id: &str) -> Setup<(Stri
     journal_event(
         &endpoint,
         &session_id,
-        escalation(&root, request_id, "docker rm x"),
+        escalation(&root, request_id, "docker rm x", Vec::new()),
     )
     .await?;
 
@@ -363,6 +331,31 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
     harness.quit_from_list_screen().await.expect("q exits");
 }
 
+/// Two sessions, "the-target" and "the-other": a client, both session ids,
+/// and the neighbour's root agent.
+async fn target_and_neighbour(endpoint: &str) -> Setup<(Client, String, String, String)> {
+    let (mut client, target, _) = seeded(endpoint, "the-target").await?;
+    let (neighbour, other_root) = client.create_session("the-other", "key-2").await?;
+    let other = neighbour
+        .session_id
+        .map(|id| id.to_string())
+        .ok_or("a created session has an id")?;
+    Ok((client, target, other, other_root.to_string()))
+}
+
+/// A loop attached to `target` whose replay has caught up and carried
+/// something.
+async fn attached_and_replayed(endpoint: &str, target: &str) -> Setup<Harness> {
+    let mut harness = start(endpoint, App::attached(target.to_owned(), None)).await?;
+    harness
+        .state("the target's replay to catch up", |app| {
+            app.session(target)
+                .is_some_and(|session| session.caught_up && !session.feed.is_empty())
+        })
+        .await?;
+    Ok(harness)
+}
+
 /// Attaching replays the target session alone: another session's history
 /// stays on the server, while its *live* traffic still arrives — the
 /// all-sessions net — so detaching shows it moving. The live event is the
@@ -372,32 +365,16 @@ async fn a_server_refusal_shows_in_the_status_line_instead_of_killing_the_tui() 
 #[tokio::test]
 async fn attaching_replays_only_the_target_while_the_rest_stays_live() {
     let endpoint = serve().await.expect("a listening server");
-    let (mut client, target, _) = seeded(&endpoint, "the-target")
-        .await
-        .expect("a seeded target");
-    let (neighbour, other_root) = client
-        .create_session("the-other", "key-2")
-        .await
-        .expect("a neighbour session");
-    let other = neighbour
-        .session_id
-        .map(|id| id.to_string())
-        .expect("a created session has an id");
+    let (mut client, target, other, other_root) =
+        target_and_neighbour(&endpoint).await.expect("two sessions");
 
-    let mut harness = start(&endpoint, App::attached(target.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the target's replay to catch up", |app| {
-            app.session(&target)
-                .is_some_and(|session| session.caught_up && !session.feed.is_empty())
-        })
+    let mut harness = attached_and_replayed(&endpoint, &target)
         .await
         .expect("the target replays");
 
     client
         .send_assignment(
-            &other_root.to_string(),
+            &other_root,
             "live next door",
             horde_proto::v1::DeliveryMode::TurnBoundary,
             "",
@@ -532,26 +509,9 @@ async fn slash_new_creates_a_session_and_attaches_to_it() {
 #[tokio::test]
 async fn opening_the_tree_after_an_attach_replays_every_session() {
     let endpoint = serve().await.expect("a listening server");
-    let (mut client, target, _) = seeded(&endpoint, "the-target")
-        .await
-        .expect("a seeded target");
-    let (neighbour, _) = client
-        .create_session("the-other", "key-2")
-        .await
-        .expect("a neighbour session");
-    let other = neighbour
-        .session_id
-        .map(|id| id.to_string())
-        .expect("a created session has an id");
+    let (_, target, other, _) = target_and_neighbour(&endpoint).await.expect("two sessions");
 
-    let mut harness = start(&endpoint, App::attached(target.clone(), None))
-        .await
-        .expect("a running loop");
-    harness
-        .state("the target's replay to catch up", |app| {
-            app.session(&target)
-                .is_some_and(|session| session.caught_up)
-        })
+    let mut harness = attached_and_replayed(&endpoint, &target)
         .await
         .expect("the target replays");
 
