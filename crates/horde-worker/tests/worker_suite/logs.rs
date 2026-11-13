@@ -61,41 +61,56 @@ async fn open(
     endpoint: &str,
     request: ReadLogsRequest,
 ) -> Result<tonic::Streaming<horde_proto::v1::ReadLogsResponse>, tonic::Status> {
-    let mut client = horde_cli::client::Client::connect(endpoint)
-        .await
-        .expect("the client connects");
-    let mut last = None;
-    for _ in 0..100 {
-        match client.read_logs(request.clone()).await {
-            Ok(stream) => return Ok(stream),
-            Err(horde_cli::client::ClientError::Rpc(status))
-                if status.code() == tonic::Code::Unavailable =>
-            {
-                last = Some(status);
-                tokio::time::sleep(Duration::from_millis(50)).await;
+    within("the read opens", async {
+        let mut client = horde_cli::client::Client::connect(endpoint)
+            .await
+            .expect("the client connects");
+        let mut last = None;
+        for _ in 0..100 {
+            match client.read_logs(request.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(horde_cli::client::ClientError::Rpc(status))
+                    if status.code() == tonic::Code::Unavailable =>
+                {
+                    last = Some(status);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(horde_cli::client::ClientError::Rpc(status)) => return Err(status),
+                Err(other) => panic!("the read could not be opened: {other}"),
             }
-            Err(horde_cli::client::ClientError::Rpc(status)) => return Err(status),
-            Err(other) => panic!("the read could not be opened: {other}"),
         }
-    }
-    Err(last.unwrap_or_else(|| tonic::Status::unknown("never answered")))
+        Err(last.unwrap_or_else(|| tonic::Status::unknown("never answered")))
+    })
+    .await
 }
 
 /// Every record line and the end frame's reason, reading to the end.
 async fn drain(
     mut stream: tonic::Streaming<horde_proto::v1::ReadLogsResponse>,
 ) -> (Vec<Record>, Option<i32>) {
-    let mut records = Vec::new();
-    while let Ok(Some(response)) = stream.message().await {
-        match response.body {
-            Some(read_logs_response::Body::Records(batch)) => {
-                records.extend(batch.lines.iter().filter_map(|line| Record::parse(line)));
+    within("the read ends", async {
+        let mut records = Vec::new();
+        while let Ok(Some(response)) = stream.message().await {
+            match response.body {
+                Some(read_logs_response::Body::Records(batch)) => {
+                    records.extend(batch.lines.iter().filter_map(|line| Record::parse(line)));
+                }
+                Some(read_logs_response::Body::End(end)) => return (records, Some(end.reason)),
+                _ => {}
             }
-            Some(read_logs_response::Body::End(end)) => return (records, Some(end.reason)),
-            _ => {}
         }
-    }
-    (records, None)
+        (records, None)
+    })
+    .await
+}
+
+/// `future`, or a failure naming `what` once it has taken too long: every
+/// wait on a stream here is bounded, so a read that never answers fails in
+/// seconds instead of hanging the suite.
+async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(20), future)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: timed out"))
 }
 
 fn agent_read(agent: &str, source: &str) -> ReadLogsRequest {
@@ -224,13 +239,15 @@ async fn a_followed_worker_log_sees_new_records_and_ends_when_the_worker_vanishe
     );
 
     let mut follow = open(&upstream, worker_read(true)).await.expect("follow");
-    let first = follow.message().await.expect("a frame").expect("records");
+    let first = within("the initial records", follow.message())
+        .await
+        .expect("a frame")
+        .expect("records");
     assert!(
         matches!(first.body, Some(read_logs_response::Body::Records(batch)) if batch.lines.len() == 1)
     );
     emit(&logging, "materialized repo after");
-    let next = follow
-        .message()
+    let next = within("the followed record", follow.message())
         .await
         .expect("a frame")
         .expect("the new record");
@@ -265,8 +282,7 @@ async fn a_client_dropping_its_follow_ends_the_workers_read() {
     let (_logging, logs, run) = logging_worker(dir.path(), &endpoint).await;
 
     let mut follow = open(&endpoint, worker_read(true)).await.expect("follow");
-    follow
-        .message()
+    within("the initial records", follow.message())
         .await
         .expect("a frame")
         .expect("the initial records");

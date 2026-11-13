@@ -267,7 +267,72 @@ mod tests {
     use horde_observe::reader::Target;
     use horde_proto::v1::{AgentId, LogFilter, LogQuery};
 
-    use super::{LogServing, read_of, stderr_sink};
+    use super::{LogServing, log_dir, read_of, serve, stderr_sink};
+
+    #[test]
+    fn a_workers_logs_live_under_its_state() {
+        assert_eq!(
+            log_dir(std::path::Path::new("/state")),
+            std::path::PathBuf::from("/state/logs")
+        );
+    }
+
+    fn client(
+        endpoint: &str,
+    ) -> horde_proto::v1::worker_service_client::WorkerServiceClient<tonic::transport::Channel>
+    {
+        horde_proto::v1::worker_service_client::WorkerServiceClient::new(
+            tonic::transport::Endpoint::from_shared(endpoint.to_owned())
+                .expect("an endpoint")
+                .connect_lazy(),
+        )
+    }
+
+    /// A server that predates log serving answers every log RPC
+    /// `Unimplemented`; the plane goes quiet rather than failing the
+    /// connection.
+    #[tokio::test]
+    async fn a_server_without_log_serving_leaves_the_plane_quiet() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let serving = std::sync::Arc::new(LogServing::new(
+            tempfile::tempdir().expect("tempdir").path(),
+            "boot",
+            None,
+        ));
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            serve(client(&format!("http://{address}")), "w1", serving),
+        )
+        .await;
+        assert!(quiet.is_err(), "it should still be waiting: {quiet:?}");
+        server.abort();
+    }
+
+    /// Any other refusal is this connection's failure, for the daemon to
+    /// redial.
+    #[tokio::test]
+    async fn an_unreachable_server_fails_the_plane() {
+        let serving = std::sync::Arc::new(LogServing::new(
+            tempfile::tempdir().expect("tempdir").path(),
+            "boot",
+            None,
+        ));
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            serve(client("http://127.0.0.1:1"), "w1", serving),
+        )
+        .await
+        .expect("a dead server is refused promptly");
+        assert!(failed.is_err());
+    }
 
     #[test]
     fn a_query_reads_the_worker_or_one_agent() {

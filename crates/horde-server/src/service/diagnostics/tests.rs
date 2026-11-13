@@ -284,7 +284,14 @@ async fn relayed(frames: Vec<Frame>, scope: Option<&str>, cap: Option<usize>) ->
         worker.send(frame).await.expect("queued");
     }
     drop(worker);
-    relay(from, to, scope.map(str::to_owned), cap).await;
+    // Bounded: a relay that kept going past its end would fill the client's
+    // channel and wait forever, so it fails here instead of hanging.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        relay(from, to, scope.map(str::to_owned), cap),
+    )
+    .await
+    .expect("the relay returns once the worker's frames end");
     let mut out = Vec::new();
     while let Some(frame) = client.recv().await {
         out.push(frame);

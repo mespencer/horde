@@ -302,13 +302,32 @@ mod tests {
         assert_eq!(MAX_RECORD_BYTES, 16 * 1024);
     }
 
+    /// Runs `work` on its own thread and fails if it has not finished in
+    /// seconds: a cut that stopped backing off would spin forever, and must
+    /// fail rather than hang the suite.
+    fn bounded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the cut finishes")
+    }
+
     #[test]
     fn a_cut_backs_off_to_a_char_boundary() {
-        let mut text = "éé".to_owned();
-        super::cut_on_char_boundary(&mut text, 3);
+        let text = bounded(|| {
+            let mut text = "éé".to_owned();
+            super::cut_on_char_boundary(&mut text, 3);
+            text
+        });
         assert_eq!(text, "é");
-        let mut short = "ab".to_owned();
-        super::cut_on_char_boundary(&mut short, 5);
+        let short = bounded(|| {
+            let mut short = "ab".to_owned();
+            super::cut_on_char_boundary(&mut short, 5);
+            short
+        });
         assert_eq!(short, "ab");
     }
 
@@ -326,7 +345,7 @@ mod tests {
     fn an_oversized_record_is_cut_on_a_char_boundary_and_stays_json() {
         // Multi-byte characters straddle every possible cut point.
         let huge = "é".repeat(MAX_RECORD_BYTES);
-        let line = serialize_bounded(record(&huge));
+        let line = bounded(move || serialize_bounded(record(&huge)));
         assert!(line.len() <= MAX_RECORD_BYTES, "{}", line.len());
         let parsed = Record::parse(&line).expect("still one JSON object");
         assert_eq!(parsed.value.get("truncated"), Some(&Value::Bool(true)));

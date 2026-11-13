@@ -296,9 +296,98 @@ mod tests {
     use horde_proto::v1::{AgentId, LogCursor, LogEndReason, LogFilter};
     use tokio::sync::mpsc;
 
+    use horde_observe::record::Record;
+
     use super::{
-        Frame, LocalRead, cursor_from_wire, cursor_to_wire, filter_from_wire, serve_local,
+        FRAME_BYTES, Frame, LocalRead, cursor_from_wire, cursor_to_wire, filter_from_wire,
+        followed_frame, record_frames, serve_local,
     };
+
+    /// A record whose line is about `bytes` long, the `n`th second's.
+    fn sized(n: u32, bytes: usize) -> Record {
+        let line = format!(
+            r#"{{"ts":"2026-01-01T00:00:{n:02}.000000Z","msg":"{}"}}"#,
+            "x".repeat(bytes)
+        );
+        Record::parse(&line).expect("a record")
+    }
+
+    /// `record_frames` on its own thread, failing in seconds rather than
+    /// spinning forever if its windowing stopped advancing.
+    fn framed(records: Vec<Record>, truncated: bool) -> Vec<horde_proto::v1::LogRecords> {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(record_frames(&records, truncated));
+        });
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the records are framed")
+    }
+
+    /// A frame holds as many records as fit in 1 MiB, the next record
+    /// starts the next frame, and each frame's cursor is its last record.
+    #[test]
+    fn records_are_packed_into_frames_of_at_most_a_mebibyte() {
+        assert_eq!(FRAME_BYTES, 1024 * 1024);
+        let records: Vec<Record> = (0..7).map(|n| sized(n, 300 * 1024)).collect();
+        let frames = framed(records.clone(), false);
+        assert_eq!(
+            frames.iter().map(|f| f.lines.len()).collect::<Vec<_>>(),
+            [3, 3, 1]
+        );
+        assert!(frames.iter().all(|f| !f.truncated), "nothing was left out");
+        assert_eq!(
+            frames[1].cursor,
+            Some(cursor_to_wire(&records[5].key)),
+            "the second frame ends at the sixth record"
+        );
+        let truncated = framed(records, true);
+        assert_eq!(
+            truncated.iter().map(|f| f.truncated).collect::<Vec<_>>(),
+            [false, false, true],
+            "only the last frame says records were left out"
+        );
+    }
+
+    /// A record bigger than a frame still travels, alone.
+    #[test]
+    fn an_oversized_record_gets_a_frame_of_its_own() {
+        let frames = framed(
+            vec![sized(0, 10), sized(1, FRAME_BYTES + 10), sized(2, 10)],
+            false,
+        );
+        assert_eq!(
+            frames.iter().map(|f| f.lines.len()).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+    }
+
+    /// The cap admits a followed record that reaches it exactly, and ends
+    /// the follow on the first byte past it.
+    #[test]
+    fn a_followed_record_exactly_at_the_cap_is_sent() {
+        let record = sized(0, 10);
+        assert!(matches!(
+            followed_frame(&record, 100, Some(100)),
+            Frame::Records(batch) if batch.lines.len() == 1 && batch.cursor.is_some()
+        ));
+        assert!(matches!(
+            followed_frame(&record, 101, Some(100)),
+            Frame::End(end) if end.reason == LogEndReason::ByteCap as i32
+        ));
+        assert!(matches!(
+            followed_frame(&record, usize::MAX, None),
+            Frame::Records(_)
+        ));
+    }
+
+    /// The next frame of a followed read, bounded: a read that never
+    /// produces it fails in seconds instead of hanging.
+    async fn next_frame(receiver: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
+        tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("a frame arrives")
+    }
 
     #[test]
     fn cursors_round_trip_and_bad_ones_are_refused() {
@@ -381,7 +470,15 @@ mod tests {
         logging
     }
 
-    async fn drain(mut receiver: mpsc::Receiver<Frame>) -> Vec<Frame> {
+    /// Serves a read that does not follow, to its end, bounded: a read that
+    /// never finishes, or sends more than its channel holds without being
+    /// read, fails in seconds instead of hanging.
+    async fn served(logs: &LocalLogs, read: LocalRead) -> Vec<Frame> {
+        let (sender, mut receiver) = mpsc::channel(64);
+        tokio::time::timeout(Duration::from_secs(10), serve_local(logs, read, &sender))
+            .await
+            .expect("a read that does not follow returns");
+        drop(sender);
         let mut frames = Vec::new();
         while let Some(frame) = receiver.recv().await {
             frames.push(frame);
@@ -392,10 +489,7 @@ mod tests {
     /// Serves `read` and asserts it said "truncated" with nothing in hand,
     /// then ended for `reason`.
     async fn assert_empty_truncated(logs: &LocalLogs, read: LocalRead, reason: LogEndReason) {
-        let (sender, receiver) = mpsc::channel(8);
-        serve_local(logs, read, &sender).await;
-        drop(sender);
-        let frames = drain(receiver).await;
+        let frames = served(logs, read).await;
         assert!(
             matches!(
                 frames.as_slice(),
@@ -426,10 +520,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _logging = written(dir.path(), &["m1", "m2 horde://join/h:1/a.b"]);
         let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let (sender, receiver) = mpsc::channel(8);
-        serve_local(&logs, read(None, 0, false), &sender).await;
-        drop(sender);
-        let frames = drain(receiver).await;
+        let frames = served(&logs, read(None, 0, false)).await;
         let [Frame::Records(records), Frame::End(end)] = frames.as_slice() else {
             panic!("records then end: {frames:?}");
         };
@@ -472,7 +563,7 @@ mod tests {
         let serving = tokio::spawn(async move {
             serve_local(&logs, read(None, 600, true), &sender).await;
         });
-        let Some(Frame::Records(initial)) = receiver.recv().await else {
+        let Some(Frame::Records(initial)) = next_frame(&mut receiver).await else {
             panic!("the initial records come first");
         };
         assert_eq!(initial.lines.len(), 1);
@@ -480,28 +571,28 @@ mod tests {
             tracing::info!(target: "horde_worker", "not matched");
             tracing::info!(target: "horde_worker", "m-after");
         });
-        let Some(Frame::Records(followed)) = receiver.recv().await else {
+        let Some(Frame::Records(followed)) = next_frame(&mut receiver).await else {
             panic!("the followed record");
         };
         assert!(followed.lines[0].contains("m-after"));
         logging.with_default(|| {
             tracing::info!(target: "horde_worker", "m-{}", "x".repeat(600));
         });
-        let Some(Frame::End(end)) = receiver.recv().await else {
+        let Some(Frame::End(end)) = next_frame(&mut receiver).await else {
             panic!("the cap ends the follow");
         };
         assert_eq!(end.reason, LogEndReason::ByteCap as i32);
-        serving.await.expect("served");
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("the follow returns after its end")
+            .expect("served");
     }
 
     #[tokio::test]
     async fn following_a_process_without_a_tap_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
         let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let (sender, receiver) = mpsc::channel(8);
-        serve_local(&logs, read(None, 0, true), &sender).await;
-        drop(sender);
-        let frames = drain(receiver).await;
+        let frames = served(&logs, read(None, 0, true)).await;
         assert!(
             matches!(frames.as_slice(), [Frame::End(end)] if end.detail.contains("cannot be followed")),
             "{frames:?}"
