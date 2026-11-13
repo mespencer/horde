@@ -57,12 +57,25 @@ fn session_line(app: &App, session: &SessionState, selected: bool) -> Line<'stat
         .is_some_and(|attachment| attachment.session_id == session.session_id);
     let mut spans = vec![
         marker(selected),
-        Span::styled(session.display_name(), if selected { theme::selected() } else { theme::bold() }),
-        Span::styled(format!("  {}", crate::state::short_id(&session.session_id)), theme::dim()),
+        Span::styled(
+            session.display_name(),
+            if selected {
+                theme::selected()
+            } else {
+                theme::bold()
+            },
+        ),
+        Span::styled(
+            format!("  {}", crate::state::short_id(&session.session_id)),
+            theme::dim(),
+        ),
         Span::styled(format!("  {}", session.lifecycle), theme::dim()),
     ];
     if !session.pending.is_empty() {
-        spans.push(Span::styled(format!("  {} waiting", session.pending.len()), theme::needs_you()));
+        spans.push(Span::styled(
+            format!("  {} waiting", session.pending.len()),
+            theme::needs_you(),
+        ));
     }
     if attached {
         spans.push(Span::styled("  (attached)", theme::focus()));
@@ -80,7 +93,10 @@ fn agent_line(
 ) -> Line<'static> {
     let node = session.agents.get(agent_id).cloned().unwrap_or_default();
     let indent = "  ".repeat(depth + 1);
-    let name = fit(&format!("{indent}{}", session.agent_name(agent_id)), 24.min(width / 3));
+    let name = fit(
+        &format!("{indent}{}", session.agent_name(agent_id)),
+        24.min(width / 3),
+    );
     let state = node.state_word();
     let state_style = match state {
         "LOST" | "failed" => theme::error(),
@@ -99,13 +115,23 @@ fn agent_line(
         .count();
     let mut spans = vec![
         marker(selected),
-        Span::styled(name, if selected { theme::selected() } else { theme::plain() }),
+        Span::styled(
+            name,
+            if selected {
+                theme::selected()
+            } else {
+                theme::plain()
+            },
+        ),
         Span::styled(format!(" {}", fit(state, 16)), state_style),
         Span::styled(format!(" {}", fit(&worker, 14)), theme::dim()),
         Span::styled(format!(" {}", clip(&node.model, 20)), theme::dim()),
     ];
     if waiting > 0 {
-        spans.push(Span::styled(format!("  {waiting} waiting"), theme::needs_you()));
+        spans.push(Span::styled(
+            format!("  {waiting} waiting"),
+            theme::needs_you(),
+        ));
     }
     Line::from(spans)
 }
@@ -129,14 +155,23 @@ pub(super) fn inbox(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static str)
                 marker(index == selected),
                 Span::styled(fit(&entry.title, 18), theme::bold()),
                 Span::raw(" "),
-                Span::raw(clip(&prompt_summary(&entry.permission), width.saturating_sub(22))),
+                Span::raw(clip(
+                    &prompt_summary(&entry.permission),
+                    width.saturating_sub(22),
+                )),
             ])
         })
         .collect();
     lines.push(Line::raw(""));
     let entry = &entries[selected];
     let cursor = app.cursor_for(&entry.permission);
-    lines.extend(card::lines(app, &entry.permission, &cursor, app.inbox_card(), area.width));
+    lines.extend(card::lines(
+        app,
+        &entry.permission,
+        &cursor,
+        app.inbox_card(),
+        area.width,
+    ));
     let hints = if app.inbox_card() {
         "answer in the card · esc back to the list"
     } else {
@@ -156,7 +191,9 @@ pub(super) fn prompt_summary(permission: &PendingPermission) -> String {
     match permission.questions.as_slice() {
         [] => format!("{who} wants `{}`", permission.rendered),
         [question] => format!("{who} asks: {}", question.question),
-        [question, rest @ ..] => format!("{who} asks: {} (+{} more)", question.question, rest.len()),
+        [question, rest @ ..] => {
+            format!("{who} asks: {} (+{} more)", question.question, rest.len())
+        }
     }
 }
 
@@ -178,7 +215,12 @@ pub(super) fn forwards(app: &App) -> (Vec<Line<'static>>, &'static str) {
     let lines = forwards
         .iter()
         .enumerate()
-        .map(|(index, status)| Line::from(vec![marker(index == selected), Span::raw(forward_row(app, status))]))
+        .map(|(index, status)| {
+            Line::from(vec![
+                marker(index == selected),
+                Span::raw(forward_row(app, status)),
+            ])
+        })
         .collect();
     (lines, hints)
 }
@@ -230,7 +272,10 @@ mod tests {
 
     #[test]
     fn the_backing_note_always_names_the_backer_it_has() {
-        assert_eq!(backing_note(Some("laptop".to_owned()), true), "  backed by laptop");
+        assert_eq!(
+            backing_note(Some("laptop".to_owned()), true),
+            "  backed by laptop"
+        );
         assert_eq!(
             backing_note(Some("laptop".to_owned()), false),
             "  UNBACKED — laptop is detached"

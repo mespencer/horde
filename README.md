@@ -47,6 +47,29 @@ horde-worker --join-file token.txt --adapter claude
 
 The join stores the server's endpoint, so later starts need only `horde-worker --adapter claude`. To add another client machine instead, mint with `horde enroll client <name>` and redeem with `horde enroll join --token-file token.txt`.
 
+## Using the TUI
+
+`horde` (or `horde attach <session> [--agent <id>]`, or `horde new [title]`) opens the attached agent's transcript: its messages, streamed replies, tool calls with their results (collapsed to a few lines; ctrl-o expands them), errors and notices. A compose box sits under it, and a status line names the session, agent, harness, model, worker, state and connection. The connection reads `stale` when the stream has said nothing, heartbeats included, for 45 s. Permission prompts and questions open as a card above the compose box and are answered in place. A request with several questions steps through them, and a secret answer is masked. Every action is also a `horde <verb>`, so a script can do whatever the TUI does.
+
+| Key | In the session view |
+|---|---|
+| enter | Send the message. It queues for the agent's next turn boundary while a turn is running. |
+| alt-enter, shift-enter, ctrl-j | New line |
+| ctrl-s | Send now: interrupt the turn and deliver at once |
+| esc | Leave a prompt card for the compose box, close the command menu, or interrupt a working agent; otherwise clear the box |
+| ctrl-x | Interrupt the agent's turn |
+| ctrl-o | Show or hide full tool input and output |
+| pgup, pgdn, ctrl-end | Scroll the transcript back, forward, to the end |
+| tab | Complete a command; move focus between a prompt card and the compose box |
+| ? (empty box), f1 | Help, listing every binding |
+| ctrl-t | The session and agent tree |
+| ctrl-c | Clear the box, or quit when it is empty |
+| ctrl-d | Quit |
+
+On a prompt card, ↑↓ and enter choose, y allows a permission, n denies a permission or declines a question, a digit picks an option, space toggles a multi-select option, and ←→ move between questions. Alt-1 to alt-7 switch views anywhere: session, agents, inbox, workspaces, usage, logs and forwards. On a list view, j and k (or ↑↓) move, enter attaches to the selected session or agent (or opens the inbox card), r refreshes, n creates a session, x archives the selected session after a y, esc goes back and q quits. The inbox answers the selected prompt with y, n or a digit, and g goes to the agent that asked.
+
+Type `/` in the compose box for commands: `/attach [session|agent]`, `/new [title]`, `/agents`, `/inbox`, `/workspaces`, `/usage`, `/logs`, `/forwards`, `/interrupt`, `/now <message>`, `/note <message>`, `/details`, `/archive [session]`, `/help` and `/quit`. The agent tree marks LOST agents, the usage view only displays usage, and the logs view is a placeholder until `horde logs` lands.
+
 ## Diagnosing a setup
 
 ```sh

@@ -425,7 +425,10 @@ async fn workspaces(client: &mut Client) -> Result<Vec<WorkspaceEntry>, ClientEr
 
 /// Usage per agent and per tree path, scoped to one session when given, and
 /// the accounts' headroom beside them.
-async fn usage(client: &mut Client, session_id: Option<String>) -> Result<UsageReport, ClientError> {
+async fn usage(
+    client: &mut Client,
+    session_id: Option<String>,
+) -> Result<UsageReport, ClientError> {
     let scoped = |group_by| UsageOptions {
         session_ids: session_id.iter().cloned().collect(),
         subtree_root: None,

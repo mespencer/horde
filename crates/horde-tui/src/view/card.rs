@@ -19,14 +19,21 @@ pub(super) fn lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let inner = usize::from(width).saturating_sub(4).max(8);
-    let border = if focused { theme::needs_you() } else { theme::dim() };
+    let border = if focused {
+        theme::needs_you()
+    } else {
+        theme::dim()
+    };
     let mut body = if request.is_question() {
         question_body(request, cursor, inner)
     } else {
         permission_body(request, cursor, inner)
     };
     if app.is_submitted(&request.request_id) {
-        body.push(Line::styled("sent — waiting for the server to record it…", theme::dim()));
+        body.push(Line::styled(
+            "sent — waiting for the server to record it…",
+            theme::dim(),
+        ));
     }
     let mut rows = vec![edge(&title(request, cursor), inner, border, true)];
     rows.extend(body.into_iter().map(|line| framed(line, inner, border)));
@@ -43,7 +50,11 @@ fn title(request: &PendingPermission, cursor: &PromptCursor) -> String {
     };
     match request.questions.get(cursor.question) {
         Some(question) => {
-            let mut title = format!("Question {}/{}", cursor.question + 1, request.questions.len());
+            let mut title = format!(
+                "Question {}/{}",
+                cursor.question + 1,
+                request.questions.len()
+            );
             if !question.header.is_empty() {
                 title.push_str(&format!(" · {}", question.header));
             }
@@ -61,26 +72,44 @@ fn footer(request: &PendingPermission, focused: bool) -> &'static str {
     }
 }
 
-fn permission_body(request: &PendingPermission, cursor: &PromptCursor, inner: usize) -> Vec<Line<'static>> {
+fn permission_body(
+    request: &PendingPermission,
+    cursor: &PromptCursor,
+    inner: usize,
+) -> Vec<Line<'static>> {
     let tool = if request.tool_name.is_empty() {
         "The agent".to_owned()
     } else {
         request.tool_name.clone()
     };
-    let mut body = vec![Line::styled(format!("{tool} wants to run:"), theme::plain())];
+    let mut body = vec![Line::styled(
+        format!("{tool} wants to run:"),
+        theme::plain(),
+    )];
     for row in wrap(&request.rendered, inner.saturating_sub(2)) {
-        body.push(Line::from(vec![Span::raw("  "), Span::styled(row, theme::bold())]));
+        body.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(row, theme::bold()),
+        ]));
     }
     if !request.mode.is_empty() {
         body.push(Line::styled(format!("mode {}", request.mode), theme::dim()));
     }
     for (index, choice) in PERMISSION_CHOICES.iter().enumerate() {
-        body.push(choice_line(index == cursor.row(), &format!("{}. {choice}", index + 1), None));
+        body.push(choice_line(
+            index == cursor.row(),
+            &format!("{}. {choice}", index + 1),
+            None,
+        ));
     }
     body
 }
 
-fn question_body(request: &PendingPermission, cursor: &PromptCursor, inner: usize) -> Vec<Line<'static>> {
+fn question_body(
+    request: &PendingPermission,
+    cursor: &PromptCursor,
+    inner: usize,
+) -> Vec<Line<'static>> {
     let Some(question) = request.questions.get(cursor.question) else {
         return Vec::new();
     };
@@ -95,7 +124,11 @@ fn question_body(request: &PendingPermission, cursor: &PromptCursor, inner: usiz
         if !option.description.is_empty() {
             label.push_str(&format!(" — {}", option.description));
         }
-        body.push(choice_line(index == cursor.row(), &clip(&label, inner.saturating_sub(6)), check));
+        body.push(choice_line(
+            index == cursor.row(),
+            &clip(&label, inner.saturating_sub(6)),
+            check,
+        ));
     }
     if has_free_text(question) {
         body.push(free_text_line(question, cursor, inner));
@@ -115,12 +148,20 @@ fn choice_line(highlighted: bool, label: &str, check: Option<bool>) -> Line<'sta
         Some(false) => "[ ] ",
         None => "",
     };
-    let style = if highlighted { theme::selected() } else { theme::plain() };
+    let style = if highlighted {
+        theme::selected()
+    } else {
+        theme::plain()
+    };
     Line::from(vec![marker, Span::styled(format!("{box_}{label}"), style)])
 }
 
 /// The free-text row, secrets masked.
-fn free_text_line(question: &PendingQuestion, cursor: &PromptCursor, inner: usize) -> Line<'static> {
+fn free_text_line(
+    question: &PendingQuestion,
+    cursor: &PromptCursor,
+    inner: usize,
+) -> Line<'static> {
     let typed = &cursor.free_text[cursor.question];
     let shown = if question.secret {
         "•".repeat(typed.chars().count())
@@ -128,14 +169,26 @@ fn free_text_line(question: &PendingQuestion, cursor: &PromptCursor, inner: usiz
         typed.clone()
     };
     let highlighted = cursor.row() == question.options.len();
-    let label = if question.options.is_empty() { "Answer" } else { "Other" };
+    let label = if question.options.is_empty() {
+        "Answer"
+    } else {
+        "Other"
+    };
     let caret = if highlighted { "▏" } else { "" };
-    choice_line(highlighted, &clip(&format!("{label}: {shown}{caret}"), inner.saturating_sub(2)), None)
+    choice_line(
+        highlighted,
+        &clip(&format!("{label}: {shown}{caret}"), inner.saturating_sub(2)),
+        None,
+    )
 }
 
 /// A top or bottom border with text set into it.
 fn edge(text: &str, inner: usize, style: Style, top: bool) -> Line<'static> {
-    let (left, right) = if top { ("╭─ ", "╮") } else { ("╰─ ", "╯") };
+    let (left, right) = if top {
+        ("╭─ ", "╮")
+    } else {
+        ("╰─ ", "╯")
+    };
     let text = clip(text, inner.saturating_sub(1));
     let fill = inner.saturating_sub(crate::wrap::width(&text) + 1);
     Line::from(vec![
@@ -147,7 +200,11 @@ fn edge(text: &str, inner: usize, style: Style, top: bool) -> Line<'static> {
 
 /// A body row between the side borders, padded to the card's width.
 fn framed(line: Line<'static>, inner: usize, style: Style) -> Line<'static> {
-    let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
     let pad = inner.saturating_sub(crate::wrap::width(&text));
     let mut spans = vec![Span::styled("│ ", style)];
     spans.extend(line.spans);

@@ -47,7 +47,9 @@ fn summary(session_id: &str, title: &str, root: &str) -> SessionSummary {
 }
 
 fn event(app: &mut App, session: &str, sequence: u64, agent: &str, kind: Kind) {
-    app.apply(Update::Event(Box::new(envelope_in(session, sequence, agent, kind))));
+    app.apply(Update::Event(Box::new(envelope_in(
+        session, sequence, agent, kind,
+    ))));
 }
 
 /// Attached to `s1`, whose root `root-1` ("ci-fix") has a child `kid`
@@ -56,7 +58,13 @@ fn attached() -> App {
     let mut app = App::attached("s1", None);
     app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
     event(&mut app, "s1", 1, "root-1", spawned(None, &["ci-fix"]));
-    event(&mut app, "s1", 2, "kid", spawned(Some("root-1"), &["ci-fix", "reviewer"]));
+    event(
+        &mut app,
+        "s1",
+        2,
+        "kid",
+        spawned(Some("root-1"), &["ci-fix", "reviewer"]),
+    );
     app
 }
 
@@ -110,9 +118,15 @@ fn typing_composes_and_enter_sends_to_the_session_root() {
     press(&mut app, KeyCode::Backspace);
     assert_eq!(press(&mut app, KeyCode::Enter), send("root-1", "fix i"));
     assert_eq!(app.input(), "", "a sent message leaves the box empty");
-    assert!(press(&mut app, KeyCode::Enter).is_empty(), "nothing typed, nothing sent");
+    assert!(
+        press(&mut app, KeyCode::Enter).is_empty(),
+        "nothing typed, nothing sent"
+    );
     chars(&mut app, "  ");
-    assert!(press(&mut app, KeyCode::Enter).is_empty(), "blank is nothing");
+    assert!(
+        press(&mut app, KeyCode::Enter).is_empty(),
+        "blank is nothing"
+    );
 }
 
 #[test]
@@ -137,7 +151,13 @@ fn editing_keys_reach_the_compose_box() {
     app.on_input(&ctrl('e'));
     chars(&mut app, "<");
     assert_eq!(app.input(), ">one <");
-    for code in [KeyCode::Home, KeyCode::Right, KeyCode::Delete, KeyCode::End, KeyCode::Left] {
+    for code in [
+        KeyCode::Home,
+        KeyCode::Right,
+        KeyCode::Delete,
+        KeyCode::End,
+        KeyCode::Left,
+    ] {
         press(&mut app, code);
     }
     assert_eq!(app.input(), ">ne <");
@@ -159,7 +179,10 @@ fn a_send_with_no_known_root_is_refused_with_a_status_line() {
     assert!(app.on_input(&ctrl('x')).is_empty());
     assert!(app.status().contains("no root agent to interrupt"));
     assert!(app.on_input(&ctrl('s')).is_empty());
-    assert!(app.run(crate::slash::Slash::Note("x".to_owned())).is_empty());
+    assert!(
+        app.run(crate::slash::Slash::Note("x".to_owned()))
+            .is_empty()
+    );
 }
 
 #[test]
@@ -168,22 +191,38 @@ fn attachment_to_an_agent_steers_that_agent() {
     app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
     chars(&mut app, "go");
     assert_eq!(press(&mut app, KeyCode::Enter), send("kid", "go"));
-    assert_eq!(app.on_input(&ctrl('x')), vec![Directive::Interrupt { agent_id: "kid".to_owned() }]);
+    assert_eq!(
+        app.on_input(&ctrl('x')),
+        vec![Directive::Interrupt {
+            agent_id: "kid".to_owned()
+        }]
+    );
 }
 
 #[test]
 fn ctrl_s_sends_now_and_ctrl_x_interrupts_without_touching_the_text() {
     let mut app = attached();
     chars(&mut app, "dra");
-    assert_eq!(app.on_input(&ctrl('x')), vec![Directive::Interrupt { agent_id: "root-1".to_owned() }]);
+    assert_eq!(
+        app.on_input(&ctrl('x')),
+        vec![Directive::Interrupt {
+            agent_id: "root-1".to_owned()
+        }]
+    );
     assert_eq!(app.input(), "dra", "an interrupt is not a send");
     assert_eq!(
         app.on_input(&ctrl('s')),
-        vec![Directive::SendNow { agent_id: "root-1".to_owned(), text: "dra".to_owned() }]
+        vec![Directive::SendNow {
+            agent_id: "root-1".to_owned(),
+            text: "dra".to_owned()
+        }]
     );
     assert!(app.on_input(&ctrl('s')).is_empty(), "nothing left to send");
     chars(&mut app, "/help");
-    assert!(app.on_input(&ctrl('s')).is_empty(), "a command is not a message");
+    assert!(
+        app.on_input(&ctrl('s')).is_empty(),
+        "a command is not a message"
+    );
 }
 
 #[test]
@@ -194,16 +233,30 @@ fn escape_interrupts_a_working_agent_and_otherwise_clears() {
     assert_eq!(app.input(), "", "idle: esc clears the box");
     assert_eq!(app.screen(), Screen::Session, "esc never detaches");
 
-    event(&mut app, "s1", 3, "root-1", chunk(AgentOutputChannel::Assistant, "t1", "working"));
+    event(
+        &mut app,
+        "s1",
+        3,
+        "root-1",
+        chunk(AgentOutputChannel::Assistant, "t1", "working"),
+    );
     assert!(app.agent_working());
     chars(&mut app, "queued");
-    assert_eq!(press(&mut app, KeyCode::Esc), vec![Directive::Interrupt { agent_id: "root-1".to_owned() }]);
+    assert_eq!(
+        press(&mut app, KeyCode::Esc),
+        vec![Directive::Interrupt {
+            agent_id: "root-1".to_owned()
+        }]
+    );
     assert_eq!(app.input(), "queued", "interrupting keeps the draft");
 
     chars(&mut app, " /x");
     app.on_input(&ctrl('u'));
     chars(&mut app, "/he");
-    assert!(press(&mut app, KeyCode::Esc).is_empty(), "esc closes a command before interrupting");
+    assert!(
+        press(&mut app, KeyCode::Esc).is_empty(),
+        "esc closes a command before interrupting"
+    );
     assert_eq!(app.input(), "");
 }
 
@@ -249,7 +302,10 @@ fn paste_and_resize_are_absorbed() {
     app.on_input(&TermEvent::Paste("line one\nline two".to_owned()));
     assert_eq!(app.input(), "line one\nline two");
     app.on_input(&TermEvent::Resize(100, 40));
-    app.apply(Update::Resize { width: 90, height: 30 });
+    app.apply(Update::Resize {
+        width: 90,
+        height: 30,
+    });
 
     let mut list = two_sessions();
     list.on_input(&TermEvent::Paste("ignored".to_owned()));
@@ -277,8 +333,15 @@ fn the_command_menu_completes_and_runs_the_highlighted_command() {
     app.on_input(&ctrl('u'));
     chars(&mut app, "/in");
     let directives = press(&mut app, KeyCode::Enter);
-    assert_eq!(app.screen(), Screen::Inbox, "enter on a partial word runs the match");
-    assert_eq!(directives, vec![Directive::RefreshSessions, Directive::RefreshWorkers]);
+    assert_eq!(
+        app.screen(),
+        Screen::Inbox,
+        "enter on a partial word runs the match"
+    );
+    assert_eq!(
+        directives,
+        vec![Directive::RefreshSessions, Directive::RefreshWorkers]
+    );
     assert_eq!(app.input(), "");
 }
 
@@ -287,11 +350,18 @@ fn a_command_needing_an_argument_waits_for_it() {
     let mut app = attached();
     chars(&mut app, "/not");
     assert!(press(&mut app, KeyCode::Enter).is_empty());
-    assert_eq!(app.input(), "/note ", "a partial word completes and waits for its argument");
+    assert_eq!(
+        app.input(),
+        "/note ",
+        "a partial word completes and waits for its argument"
+    );
     chars(&mut app, "fyi");
     assert_eq!(
         press(&mut app, KeyCode::Enter),
-        vec![Directive::SendNote { agent_id: "root-1".to_owned(), text: "fyi".to_owned() }]
+        vec![Directive::SendNote {
+            agent_id: "root-1".to_owned(),
+            text: "fyi".to_owned()
+        }]
     );
     chars(&mut app, "/now");
     press(&mut app, KeyCode::Enter);
@@ -300,7 +370,10 @@ fn a_command_needing_an_argument_waits_for_it() {
     chars(&mut app, " stop");
     assert_eq!(
         press(&mut app, KeyCode::Enter),
-        vec![Directive::SendNow { agent_id: "root-1".to_owned(), text: "stop".to_owned() }]
+        vec![Directive::SendNow {
+            agent_id: "root-1".to_owned(),
+            text: "stop".to_owned()
+        }]
     );
     chars(&mut app, "/bogus");
     press(&mut app, KeyCode::Enter);
@@ -325,8 +398,18 @@ fn commands_open_screens_and_toggle_state() {
         app.run(command);
         assert_eq!(app.screen(), screen);
     }
-    assert_eq!(app.run(Slash::New(Some("t".to_owned()))), vec![Directive::NewSession { title: Some("t".to_owned()) }]);
-    assert_eq!(app.run(Slash::Interrupt), vec![Directive::Interrupt { agent_id: "root-1".to_owned() }]);
+    assert_eq!(
+        app.run(Slash::New(Some("t".to_owned()))),
+        vec![Directive::NewSession {
+            title: Some("t".to_owned())
+        }]
+    );
+    assert_eq!(
+        app.run(Slash::Interrupt),
+        vec![Directive::Interrupt {
+            agent_id: "root-1".to_owned()
+        }]
+    );
     app.run(Slash::Details);
     assert!(app.details());
     app.on_input(&ctrl('o'));
@@ -344,17 +427,39 @@ fn attach_by_name_finds_agents_then_sessions_and_refuses_ambiguity() {
         summary("s3-abd", "docs", "r3"),
     ]));
     app.run(Slash::Attach(Some("reviewer".to_owned())));
-    assert_eq!(app.attachment().and_then(|a| a.agent_id.clone()).as_deref(), Some("kid"));
+    assert_eq!(
+        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
+        Some("kid")
+    );
     app.run(Slash::Attach(Some("ci-fix".to_owned())));
-    assert_eq!(app.attachment().and_then(|a| a.agent_id.clone()), None, "the root's name is the session root");
+    assert_eq!(
+        app.attachment().and_then(|a| a.agent_id.clone()),
+        None,
+        "the root's name is the session root"
+    );
     app.run(Slash::Attach(Some("kid".to_owned())));
-    assert_eq!(app.attachment().and_then(|a| a.agent_id.clone()).as_deref(), Some("kid"), "an id works too");
+    assert_eq!(
+        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
+        Some("kid"),
+        "an id works too"
+    );
 
     app.run(Slash::Attach(Some("docs-work".to_owned())));
-    assert_eq!(app.attachment().map(|a| a.session_id.as_str()), Some("s2-abc"), "a slug names a session");
-    assert!(app.take_resubscribe(), "a newly attached session must be replayed");
+    assert_eq!(
+        app.attachment().map(|a| a.session_id.as_str()),
+        Some("s2-abc"),
+        "a slug names a session"
+    );
+    assert!(
+        app.take_resubscribe(),
+        "a newly attached session must be replayed"
+    );
     app.run(Slash::Attach(Some("s3".to_owned())));
-    assert_eq!(app.attachment().map(|a| a.session_id.as_str()), Some("s3-abd"), "an id prefix names one");
+    assert_eq!(
+        app.attachment().map(|a| a.session_id.as_str()),
+        Some("s3-abd"),
+        "an id prefix names one"
+    );
     app.run(Slash::Attach(Some("s".to_owned())));
     assert!(app.status().contains("ambiguous"), "{}", app.status());
     app.run(Slash::Attach(Some("nope".to_owned())));
@@ -366,8 +471,18 @@ fn archive_asks_first_and_only_y_confirms() {
     use crate::slash::Slash;
     let mut app = attached();
     app.run(Slash::Archive(None));
-    assert_eq!(app.confirm(), Some(&Confirm::Archive { session_id: "s1".to_owned() }));
-    assert_eq!(chars(&mut app, "y"), vec![Directive::Archive { session_id: "s1".to_owned() }]);
+    assert_eq!(
+        app.confirm(),
+        Some(&Confirm::Archive {
+            session_id: "s1".to_owned()
+        })
+    );
+    assert_eq!(
+        chars(&mut app, "y"),
+        vec![Directive::Archive {
+            session_id: "s1".to_owned()
+        }]
+    );
     assert_eq!(app.confirm(), None);
 
     app.run(Slash::Archive(Some("ci-fix".to_owned())));
@@ -394,14 +509,30 @@ fn a_waiting_permission_takes_focus_and_y_approves_it() {
     assert!(chars(&mut app, "y").is_empty(), "answered once is enough");
 
     app.directive_failed(&approve("req-1", false)[0], "someone else answered");
-    assert!(!app.is_submitted("req-1"), "a refusal lets it be answered again");
+    assert!(
+        !app.is_submitted("req-1"),
+        "a refusal lets it be answered again"
+    );
     assert_eq!(app.status(), "someone else answered");
     press(&mut app, KeyCode::Down);
-    assert_eq!(press(&mut app, KeyCode::Enter), approve("req-1", true), "row two remembers");
+    assert_eq!(
+        press(&mut app, KeyCode::Enter),
+        approve("req-1", true),
+        "row two remembers"
+    );
 
-    event(&mut app, "s1", 4, "kid", decided("req-1", PermissionOutcome::Allow, ""));
+    event(
+        &mut app,
+        "s1",
+        4,
+        "kid",
+        decided("req-1", PermissionOutcome::Allow, ""),
+    );
     assert!(!app.is_submitted("req-1"), "the decision settles it");
-    assert!(!app.prompt_focused(), "nothing waits; keys go back to compose");
+    assert!(
+        !app.prompt_focused(),
+        "nothing waits; keys go back to compose"
+    );
 }
 
 #[test]
@@ -411,14 +542,27 @@ fn tab_and_escape_move_focus_between_prompt_and_compose() {
     press(&mut app, KeyCode::Tab);
     assert!(!app.prompt_focused());
     chars(&mut app, "yes but");
-    assert_eq!(app.input(), "yes but", "with compose focused, y is a letter");
+    assert_eq!(
+        app.input(),
+        "yes but",
+        "with compose focused, y is a letter"
+    );
     press(&mut app, KeyCode::Tab);
     assert!(app.prompt_focused());
     press(&mut app, KeyCode::Esc);
-    assert!(!app.prompt_focused(), "esc leaves the card for the compose box");
+    assert!(
+        !app.prompt_focused(),
+        "esc leaves the card for the compose box"
+    );
 
     event(&mut app, "s1", 4, "root-1", requested("req-2", "rm y"));
-    event(&mut app, "s1", 5, "root-1", decided("req-1", PermissionOutcome::Deny, ""));
+    event(
+        &mut app,
+        "s1",
+        5,
+        "root-1",
+        decided("req-1", PermissionOutcome::Deny, ""),
+    );
     assert!(app.prompt_focused(), "the next prompt takes focus again");
     assert_eq!(chars(&mut app, "n"), deny("req-2"));
 }
@@ -426,20 +570,41 @@ fn tab_and_escape_move_focus_between_prompt_and_compose() {
 #[test]
 fn a_question_is_answered_in_place() {
     let mut app = attached();
-    event(&mut app, "s1", 3, "root-1", asked("q-1", &[("colour", &["Red", "Blue"])]));
+    event(
+        &mut app,
+        "s1",
+        3,
+        "root-1",
+        asked("q-1", &[("colour", &["Red", "Blue"])]),
+    );
     press(&mut app, KeyCode::Down);
     assert_eq!(app.cursor().map(|cursor| cursor.row()), Some(1));
-    assert_eq!(press(&mut app, KeyCode::Enter), answer("q-1", "colour", "Blue"));
+    assert_eq!(
+        press(&mut app, KeyCode::Enter),
+        answer("q-1", "colour", "Blue")
+    );
     assert_eq!(app.cursor(), None, "a settled cursor is dropped");
 
     let mut several = attached();
-    event(&mut several, "s1", 3, "root-1", asked("q-2", &[("a", &["x"]), ("b", &["y", "z"])]));
-    assert!(chars(&mut several, "1").is_empty(), "one answered, one to go");
+    event(
+        &mut several,
+        "s1",
+        3,
+        "root-1",
+        asked("q-2", &[("a", &["x"]), ("b", &["y", "z"])]),
+    );
+    assert!(
+        chars(&mut several, "1").is_empty(),
+        "one answered, one to go"
+    );
     assert_eq!(
         chars(&mut several, "2"),
         vec![Directive::Answer {
             request_id: "q-2".to_owned(),
-            answers: BTreeMap::from([("a".to_owned(), vec!["x".to_owned()]), ("b".to_owned(), vec!["z".to_owned()])]),
+            answers: BTreeMap::from([
+                ("a".to_owned(), vec!["x".to_owned()]),
+                ("b".to_owned(), vec!["z".to_owned()])
+            ]),
         }]
     );
 }
@@ -448,16 +613,38 @@ fn a_question_is_answered_in_place() {
 fn prompts_scope_to_the_attached_subtree() {
     let mut app = App::attached("s1", Some("kid".to_owned()));
     event(&mut app, "s1", 1, "root-1", spawned(None, &["ci-fix"]));
-    event(&mut app, "s1", 2, "kid", spawned(Some("root-1"), &["ci-fix", "a"]));
-    event(&mut app, "s1", 3, "other", spawned(Some("root-1"), &["ci-fix", "b"]));
+    event(
+        &mut app,
+        "s1",
+        2,
+        "kid",
+        spawned(Some("root-1"), &["ci-fix", "a"]),
+    );
+    event(
+        &mut app,
+        "s1",
+        3,
+        "other",
+        spawned(Some("root-1"), &["ci-fix", "b"]),
+    );
     event(&mut app, "s1", 4, "kid", requested("req-mine", "ls"));
     event(&mut app, "s1", 5, "other", requested("req-elsewhere", "ls"));
-    let ids: Vec<String> = app.scoped_pending().into_iter().map(|p| p.request_id).collect();
+    let ids: Vec<String> = app
+        .scoped_pending()
+        .into_iter()
+        .map(|p| p.request_id)
+        .collect();
     assert_eq!(ids, vec!["req-mine"]);
     assert_eq!(app.waiting_elsewhere(), 1);
     assert_eq!(app.waiting_total(), 2);
-    assert_eq!(app.front_prompt().map(|p| p.request_id).as_deref(), Some("req-mine"));
-    assert!(App::overview().scoped_pending().is_empty(), "nothing attached, nothing scoped");
+    assert_eq!(
+        app.front_prompt().map(|p| p.request_id).as_deref(),
+        Some("req-mine")
+    );
+    assert!(
+        App::overview().scoped_pending().is_empty(),
+        "nothing attached, nothing scoped"
+    );
 }
 
 // -- The inbox -----------------------------------------------------------------
@@ -466,11 +653,25 @@ fn prompts_scope_to_the_attached_subtree() {
 fn the_inbox_answers_the_selected_row_in_place() {
     let mut app = two_sessions();
     event(&mut app, "s1", 2, "root-1", requested("req-0", "ls"));
-    event(&mut app, "s1", 3, "root-1", asked("q-1", &[("colour", &["Red"])]));
+    event(
+        &mut app,
+        "s1",
+        3,
+        "root-1",
+        asked("q-1", &[("colour", &["Red"])]),
+    );
     press(&mut app, KeyCode::Char('i'));
     assert_eq!(app.screen(), Screen::Inbox);
-    let ids: Vec<String> = app.inbox_entries().into_iter().map(|e| e.permission.request_id).collect();
-    assert_eq!(ids, vec!["req-0", "q-1", "req-1"], "session order, then arrival order");
+    let ids: Vec<String> = app
+        .inbox_entries()
+        .into_iter()
+        .map(|e| e.permission.request_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["req-0", "q-1", "req-1"],
+        "session order, then arrival order"
+    );
     assert_eq!(chars(&mut app, "y"), approve("req-0", false));
     press(&mut app, KeyCode::Down);
     assert_eq!(chars(&mut app, "1"), answer("q-1", "colour", "Red"));
@@ -490,15 +691,27 @@ fn enter_opens_the_inbox_card_and_g_goes_to_the_agent() {
     assert!(app.inbox_card());
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
-    assert_eq!(press(&mut app, KeyCode::Enter), deny("req-1"), "the card's third row is No");
+    assert_eq!(
+        press(&mut app, KeyCode::Enter),
+        deny("req-1"),
+        "the card's third row is No"
+    );
     assert!(!app.inbox_card(), "answering closes the card");
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Esc);
     assert!(!app.inbox_card());
-    assert_eq!(app.screen(), Screen::Inbox, "esc closes the card before leaving");
+    assert_eq!(
+        app.screen(),
+        Screen::Inbox,
+        "esc closes the card before leaving"
+    );
     press(&mut app, KeyCode::Char('g'));
     assert_eq!(app.screen(), Screen::Session);
-    assert_eq!(app.attachment().map(|a| (a.session_id.as_str(), a.agent_id.clone())), Some(("s2", None)));
+    assert_eq!(
+        app.attachment()
+            .map(|a| (a.session_id.as_str(), a.agent_id.clone())),
+        Some(("s2", None))
+    );
 }
 
 #[test]
@@ -518,13 +731,31 @@ fn an_empty_inbox_answers_and_opens_nothing() {
 fn the_tree_lists_sessions_then_agents_depth_first() {
     let app = attached();
     let mut app = app;
-    event(&mut app, "s1", 3, "grandkid", spawned(Some("kid"), &["ci-fix", "reviewer", "runner"]));
-    event(&mut app, "s1", 4, "kid-b", spawned(Some("root-1"), &["ci-fix", "b"]));
-    let agent = |id: &str, depth| TreeRow::Agent { session_id: "s1".to_owned(), agent_id: id.to_owned(), depth };
+    event(
+        &mut app,
+        "s1",
+        3,
+        "grandkid",
+        spawned(Some("kid"), &["ci-fix", "reviewer", "runner"]),
+    );
+    event(
+        &mut app,
+        "s1",
+        4,
+        "kid-b",
+        spawned(Some("root-1"), &["ci-fix", "b"]),
+    );
+    let agent = |id: &str, depth| TreeRow::Agent {
+        session_id: "s1".to_owned(),
+        agent_id: id.to_owned(),
+        depth,
+    };
     assert_eq!(
         app.tree_rows(),
         vec![
-            TreeRow::Session { session_id: "s1".to_owned() },
+            TreeRow::Session {
+                session_id: "s1".to_owned()
+            },
             agent("root-1", 0),
             agent("kid", 1),
             agent("grandkid", 2),
@@ -542,10 +773,16 @@ fn a_parent_cycle_cannot_hang_the_tree() {
         }
         session.agents.insert(
             "x".to_owned(),
-            crate::tree::AgentNode { parent: Some("x".to_owned()), ..Default::default() },
+            crate::tree::AgentNode {
+                parent: Some("x".to_owned()),
+                ..Default::default()
+            },
         );
     }
-    assert!(app.tree_rows().len() < 10, "a self-parented agent is not a root and not walked forever");
+    assert!(
+        app.tree_rows().len() < 10,
+        "a self-parented agent is not a root and not walked forever"
+    );
 }
 
 #[test]
@@ -556,11 +793,18 @@ fn enter_in_the_tree_attaches_to_the_row() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.attachment().and_then(|a| a.agent_id.clone()).as_deref(), Some("kid"));
+    assert_eq!(
+        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
+        Some("kid")
+    );
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.attachment().and_then(|a| a.agent_id.clone()), None, "the root row is the session root");
+    assert_eq!(
+        app.attachment().and_then(|a| a.agent_id.clone()),
+        None,
+        "the root row is the session root"
+    );
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Enter);
@@ -575,13 +819,27 @@ fn enter_in_the_tree_attaches_to_the_row() {
 #[test]
 fn the_tree_starts_and_archives_sessions() {
     let mut app = two_sessions();
-    assert_eq!(press(&mut app, KeyCode::Char('n')), vec![Directive::NewSession { title: None }]);
+    assert_eq!(
+        press(&mut app, KeyCode::Char('n')),
+        vec![Directive::NewSession { title: None }]
+    );
     press(&mut app, KeyCode::Char('x'));
-    assert_eq!(app.confirm(), Some(&Confirm::Archive { session_id: "s1".to_owned() }));
+    assert_eq!(
+        app.confirm(),
+        Some(&Confirm::Archive {
+            session_id: "s1".to_owned()
+        })
+    );
     press(&mut app, KeyCode::Esc);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Char('x'));
-    assert_eq!(app.confirm(), Some(&Confirm::Archive { session_id: "s1".to_owned() }), "an agent row archives its session");
+    assert_eq!(
+        app.confirm(),
+        Some(&Confirm::Archive {
+            session_id: "s1".to_owned()
+        }),
+        "an agent row archives its session"
+    );
     press(&mut app, KeyCode::Esc);
     press(&mut app, KeyCode::Char('w'));
     press(&mut app, KeyCode::Char('x'));
@@ -592,7 +850,10 @@ fn the_tree_starts_and_archives_sessions() {
 fn list_letters_alt_digits_and_f1_navigate() {
     let mut app = attached();
     let cases = [
-        (chord(KeyCode::Char('2'), KeyModifiers::ALT), Screen::Overview),
+        (
+            chord(KeyCode::Char('2'), KeyModifiers::ALT),
+            Screen::Overview,
+        ),
         (key(KeyCode::Char('w')), Screen::Workspaces),
         (key(KeyCode::Char('u')), Screen::Usage),
         (key(KeyCode::Char('l')), Screen::Logs),
@@ -602,11 +863,20 @@ fn list_letters_alt_digits_and_f1_navigate() {
         (key(KeyCode::Char('o')), Screen::Overview),
         (key(KeyCode::Char('s')), Screen::Session),
         (chord(KeyCode::Char('3'), KeyModifiers::ALT), Screen::Inbox),
-        (chord(KeyCode::Char('4'), KeyModifiers::ALT), Screen::Workspaces),
+        (
+            chord(KeyCode::Char('4'), KeyModifiers::ALT),
+            Screen::Workspaces,
+        ),
         (chord(KeyCode::Char('5'), KeyModifiers::ALT), Screen::Usage),
         (chord(KeyCode::Char('6'), KeyModifiers::ALT), Screen::Logs),
-        (chord(KeyCode::Char('7'), KeyModifiers::ALT), Screen::Forwards),
-        (chord(KeyCode::Char('1'), KeyModifiers::ALT), Screen::Session),
+        (
+            chord(KeyCode::Char('7'), KeyModifiers::ALT),
+            Screen::Forwards,
+        ),
+        (
+            chord(KeyCode::Char('1'), KeyModifiers::ALT),
+            Screen::Session,
+        ),
         (key(KeyCode::F(1)), Screen::Help),
     ];
     for (input, screen) in cases {
@@ -619,11 +889,29 @@ fn list_letters_alt_digits_and_f1_navigate() {
 fn entering_a_screen_asks_for_its_data() {
     let mut app = attached();
     let asks = |app: &mut App, screen| app.act(crate::keys::Intent::Goto(screen));
-    assert_eq!(asks(&mut app, Screen::Workspaces), vec![Directive::RefreshWorkspaces, Directive::RefreshWorkers]);
-    assert_eq!(asks(&mut app, Screen::Usage), vec![Directive::RefreshUsage { session_id: Some("s1".to_owned()) }]);
-    assert_eq!(asks(&mut app, Screen::Forwards), vec![Directive::RefreshForwards]);
-    assert_eq!(press(&mut app, KeyCode::Char('r')), vec![Directive::RefreshForwards], "r re-asks");
-    assert!(asks(&mut app, Screen::Logs).is_empty(), "logs have no RPC to ask");
+    assert_eq!(
+        asks(&mut app, Screen::Workspaces),
+        vec![Directive::RefreshWorkspaces, Directive::RefreshWorkers]
+    );
+    assert_eq!(
+        asks(&mut app, Screen::Usage),
+        vec![Directive::RefreshUsage {
+            session_id: Some("s1".to_owned())
+        }]
+    );
+    assert_eq!(
+        asks(&mut app, Screen::Forwards),
+        vec![Directive::RefreshForwards]
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::Char('r')),
+        vec![Directive::RefreshForwards],
+        "r re-asks"
+    );
+    assert!(
+        asks(&mut app, Screen::Logs).is_empty(),
+        "logs have no RPC to ask"
+    );
     assert!(asks(&mut app, Screen::Help).is_empty());
     assert_eq!(
         App::overview().act(crate::keys::Intent::Goto(Screen::Usage)),
@@ -647,7 +935,11 @@ fn escape_on_a_list_goes_back_where_it_came_from() {
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.screen(), Screen::Overview, "back to the tree");
     press(&mut app, KeyCode::Esc);
-    assert_eq!(app.screen(), Screen::Session, "esc from where it came lands on the session");
+    assert_eq!(
+        app.screen(),
+        Screen::Session,
+        "esc from where it came lands on the session"
+    );
 
     let mut detached = App::overview();
     press(&mut detached, KeyCode::Char('u'));
@@ -674,54 +966,98 @@ fn question_mark_on_an_empty_box_opens_help() {
 #[test]
 fn replay_grows_only_when_asked_and_resumes_past_what_was_folded() {
     let mut app = attached();
-    assert!(!app.take_resubscribe(), "the launch subscription already covers s1");
+    assert!(
+        !app.take_resubscribe(),
+        "the launch subscription already covers s1"
+    );
     assert_eq!(app.replay_cursors(), vec![("s1".to_owned(), 3)]);
     app.apply(Update::Sessions(vec![summary("s2", "docs", "r2")]));
-    assert!(!app.take_resubscribe(), "an attach does not replay the others");
+    assert!(
+        !app.take_resubscribe(),
+        "an attach does not replay the others"
+    );
     app.on_input(&ctrl('t'));
     assert!(app.take_resubscribe(), "the tree needs every session");
     assert!(!app.take_resubscribe(), "reading clears it");
-    assert_eq!(app.replay_cursors(), vec![("s1".to_owned(), 3), ("s2".to_owned(), 1)]);
+    assert_eq!(
+        app.replay_cursors(),
+        vec![("s1".to_owned(), 3), ("s2".to_owned(), 1)]
+    );
     app.on_input(&ctrl('t'));
     assert!(!app.take_resubscribe(), "nothing new to replay");
     app.apply(Update::Sessions(vec![summary("s3", "new", "r3")]));
-    assert!(app.take_resubscribe(), "once replaying everything, new sessions join");
+    assert!(
+        app.take_resubscribe(),
+        "once replaying everything, new sessions join"
+    );
 
     let mut overview = App::overview();
     overview.apply(Update::Sessions(vec![summary("s1", "a", "r")]));
     assert!(overview.take_resubscribe());
-    overview.apply(Update::SessionCreated { session_id: "s9".to_owned() });
+    overview.apply(Update::SessionCreated {
+        session_id: "s9".to_owned(),
+    });
     assert_eq!(overview.screen(), Screen::Session);
-    assert_eq!(overview.attachment().map(|a| a.session_id.as_str()), Some("s9"));
+    assert_eq!(
+        overview.attachment().map(|a| a.session_id.as_str()),
+        Some("s9")
+    );
     assert!(overview.take_resubscribe());
 }
 
 #[test]
 fn re_attaching_restores_the_launched_agent_scope() {
     let mut app = App::attached("s1", Some("kid".to_owned()));
-    app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1"), summary("s2", "docs", "root-2")]));
+    app.apply(Update::Sessions(vec![
+        summary("s1", "ci-fix", "root-1"),
+        summary("s2", "docs", "root-2"),
+    ]));
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.attachment().and_then(|a| a.agent_id.clone()).as_deref(), Some("kid"));
+    assert_eq!(
+        app.attachment().and_then(|a| a.agent_id.clone()).as_deref(),
+        Some("kid")
+    );
     app.on_input(&ctrl('t'));
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.attachment().map(|a| (a.session_id.as_str(), a.agent_id.clone())), Some(("s2", None)));
+    assert_eq!(
+        app.attachment()
+            .map(|a| (a.session_id.as_str(), a.agent_id.clone())),
+        Some(("s2", None))
+    );
 }
 
 #[test]
 fn scrolling_pages_back_and_clamps_to_the_transcript() {
     let mut app = attached();
-    app.apply(Update::Resize { width: 80, height: 10 });
+    app.apply(Update::Resize {
+        width: 80,
+        height: 10,
+    });
     for sequence in 3..40 {
-        event(&mut app, "s1", sequence, "root-1", chunk(AgentOutputChannel::Assistant, &format!("t{sequence}"), "line"));
+        event(
+            &mut app,
+            "s1",
+            sequence,
+            "root-1",
+            chunk(
+                AgentOutputChannel::Assistant,
+                &format!("t{sequence}"),
+                "line",
+            ),
+        );
     }
     press(&mut app, KeyCode::PageUp);
     assert_eq!(app.scroll(), 10);
     for _ in 0..20 {
         press(&mut app, KeyCode::PageUp);
     }
-    assert_eq!(app.scroll(), 38 * 2 - 1 - 5, "rows (the spawn notice and 37 replies) less half a screen");
+    assert_eq!(
+        app.scroll(),
+        38 * 2 - 1 - 5,
+        "rows (the spawn notice and 37 replies) less half a screen"
+    );
     press(&mut app, KeyCode::PageDown);
     assert_eq!(app.scroll(), 60);
     app.on_input(&chord(KeyCode::End, KeyModifiers::CONTROL));
@@ -736,7 +1072,10 @@ fn staleness_begins_strictly_past_the_ceiling() {
     let last = std::time::Instant::now();
     assert!(!super::is_stale(None, last + super::STALE_AFTER * 2));
     assert!(!super::is_stale(Some(last), last + super::STALE_AFTER));
-    assert!(super::is_stale(Some(last), last + super::STALE_AFTER + std::time::Duration::from_millis(1)));
+    assert!(super::is_stale(
+        Some(last),
+        last + super::STALE_AFTER + std::time::Duration::from_millis(1)
+    ));
 }
 
 #[test]
@@ -745,39 +1084,69 @@ fn the_connection_word_follows_the_stream() {
     assert_eq!(app.connection_word(), "connecting");
     app.apply(Update::Heartbeat);
     assert_eq!(app.connection_word(), "syncing", "alive but not caught up");
-    app.apply(Update::CaughtUp { session_id: "s1".to_owned(), head: 4 });
+    app.apply(Update::CaughtUp {
+        session_id: "s1".to_owned(),
+        head: 4,
+    });
     assert_eq!(app.connection_word(), "live");
-    assert_eq!(app.session("s1").map(|s| (s.caught_up, s.head)), Some((true, 4)));
-    app.apply(Update::Tick { now: std::time::Instant::now() + super::STALE_AFTER * 2 });
+    assert_eq!(
+        app.session("s1").map(|s| (s.caught_up, s.head)),
+        Some((true, 4))
+    );
+    app.apply(Update::Tick {
+        now: std::time::Instant::now() + super::STALE_AFTER * 2,
+    });
     assert!(app.stream_stale());
     assert_eq!(app.connection_word(), "stale");
     app.apply(Update::Heartbeat);
     assert!(!app.stream_stale(), "life observed clears the badge");
-    app.apply(Update::StreamEnded { reason: "gone".to_owned() });
+    app.apply(Update::StreamEnded {
+        reason: "gone".to_owned(),
+    });
     app.apply(Update::Heartbeat);
     assert_eq!(app.connection_word(), "ended");
-    assert_eq!(app.stream_ended(), Some("gone"), "an ended stream stays ended");
+    assert_eq!(
+        app.stream_ended(),
+        Some("gone"),
+        "an ended stream stays ended"
+    );
 }
 
 #[test]
 fn rpc_answers_land_where_the_views_read_them() {
     let mut app = App::overview();
-    assert!(app.workspaces().is_none() && app.usage().is_none(), "unasked is not empty");
+    assert!(
+        app.workspaces().is_none() && app.usage().is_none(),
+        "unasked is not empty"
+    );
     app.apply(Update::Workspaces(Vec::new()));
     app.apply(Update::Usage(super::UsageReport::default()));
     assert_eq!(app.workspaces().map(<[_]>::len), Some(0));
     assert!(app.usage().is_some());
     app.apply(Update::Workers(vec![
-        WorkerSummary { worker_id: Some(WorkerId::new("w-1")), name: "gpu-box".to_owned(), ..WorkerSummary::default() },
-        WorkerSummary { worker_id: Some(WorkerId::new("w-2")), ..WorkerSummary::default() },
+        WorkerSummary {
+            worker_id: Some(WorkerId::new("w-1")),
+            name: "gpu-box".to_owned(),
+            ..WorkerSummary::default()
+        },
+        WorkerSummary {
+            worker_id: Some(WorkerId::new("w-2")),
+            ..WorkerSummary::default()
+        },
     ]));
     assert_eq!(app.workers().len(), 2);
     assert_eq!(app.worker_name("w-1"), "gpu-box");
-    assert_eq!(app.worker_name("w-2"), "w-2", "a nameless worker is its short id");
+    assert_eq!(
+        app.worker_name("w-2"),
+        "w-2",
+        "a nameless worker is its short id"
+    );
     assert_eq!(app.worker_name("worker-unknown-123"), "worker-u");
 
     let forwards = |count: usize| {
-        (0..count).map(|_| horde_proto::v1::ForwardStatus::default()).collect::<Vec<_>>()
+        (0..count)
+            .map(|_| horde_proto::v1::ForwardStatus::default())
+            .collect::<Vec<_>>()
     };
     app.apply(Update::Forwards(forwards(3)));
     press(&mut app, KeyCode::Char('f'));
@@ -785,14 +1154,21 @@ fn rpc_answers_land_where_the_views_read_them() {
     press(&mut app, KeyCode::Down);
     assert_eq!(app.selected(Screen::Forwards), 2);
     app.apply(Update::Forwards(forwards(1)));
-    assert_eq!(app.selected(Screen::Forwards), 0, "a shrinking list clamps the selection");
+    assert_eq!(
+        app.selected(Screen::Forwards),
+        0,
+        "a shrinking list clamps the selection"
+    );
     assert_eq!(app.forwards().len(), 1);
 }
 
 #[test]
 fn sessions_are_named_and_summaries_without_ids_are_dropped() {
     let mut app = App::attached("0123456789-untitled", None);
-    app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1"), SessionSummary::default()]));
+    app.apply(Update::Sessions(vec![
+        summary("s1", "ci-fix", "root-1"),
+        SessionSummary::default(),
+    ]));
     assert_eq!(app.session_name("s1"), "ci-fix");
     assert_eq!(app.session_name("0123456789-untitled"), "01234567");
     assert_eq!(app.session_name("abcdefghij-unknown"), "abcdefgh");

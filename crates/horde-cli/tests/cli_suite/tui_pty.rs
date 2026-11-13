@@ -385,10 +385,13 @@ async fn logged<T>(
     let mut stream = watcher
         .follow(&horde_cli::client::SyncOptions::new(session_id.to_owned()))
         .await?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), stream.next_matching(matches))
-        .await
-        .map_err(|_| "the expected event never reached the log")??
-        .ok_or_else(|| "the stream ended before the expected event".into())
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.next_matching(matches),
+    )
+    .await
+    .map_err(|_| "the expected event never reached the log")??
+    .ok_or_else(|| "the stream ended before the expected event".into())
 }
 
 /// Attaches a pty to `title`'s session and waits for the view.
@@ -404,7 +407,10 @@ async fn quit(mut horde: PtyProcess) -> Setup<()> {
     horde.type_bytes(&[0x03])?;
     await_restored(&mut horde).await?;
     let status = horde.exit_status().await?;
-    assert!(status.success(), "the TUI must exit cleanly, got {status:?}");
+    assert!(
+        status.success(),
+        "the TUI must exit cleanly, got {status:?}"
+    );
     Ok(())
 }
 
@@ -413,10 +419,15 @@ async fn quit(mut horde: PtyProcess) -> Setup<()> {
 #[tokio::test]
 async fn enter_in_the_compose_box_sends_an_assignment() {
     let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "pty-send").await.expect("a seeded session");
+    let (_, session_id, _) = seeded(&endpoint, "pty-send")
+        .await
+        .expect("a seeded session");
     let mut horde = attached_pty(&endpoint, "pty-send").await.expect("attached");
     // The root must be known before Enter can address it.
-    horde.await_painted("Queued").await.expect("the replay landed");
+    horde
+        .await_painted("Queued")
+        .await
+        .expect("the replay landed");
 
     horde.type_bytes(b"fix the flaky test\r").expect("typed");
     let sent = logged(&endpoint, &session_id, |envelope| {
@@ -437,9 +448,16 @@ async fn enter_in_the_compose_box_sends_an_assignment() {
 #[tokio::test]
 async fn ctrl_x_interrupts_on_the_server() {
     let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, _) = seeded(&endpoint, "pty-interrupt").await.expect("a seeded session");
-    let mut horde = attached_pty(&endpoint, "pty-interrupt").await.expect("attached");
-    horde.await_painted("Queued").await.expect("the replay landed");
+    let (_, session_id, _) = seeded(&endpoint, "pty-interrupt")
+        .await
+        .expect("a seeded session");
+    let mut horde = attached_pty(&endpoint, "pty-interrupt")
+        .await
+        .expect("attached");
+    horde
+        .await_painted("Queued")
+        .await
+        .expect("the replay landed");
 
     horde.type_bytes(&[0x18]).expect("ctrl-x");
     let reason = logged(&endpoint, &session_id, |envelope| {
@@ -475,8 +493,12 @@ fn escalation(
                 request_id: Some(PermissionRequestId::new(request_id)),
                 agent_id: Some(AgentId::new(agent_id)),
                 tool_call: Some(ProposedToolCall {
-                    tool_name: if questions.is_empty() { "Bash" } else { "AskUserQuestion" }
-                        .to_owned(),
+                    tool_name: if questions.is_empty() {
+                        "Bash"
+                    } else {
+                        "AskUserQuestion"
+                    }
+                    .to_owned(),
                     input: None,
                     rendered: "docker rm x".to_owned(),
                     questions,
@@ -518,13 +540,24 @@ async fn decision_for(
 #[tokio::test]
 async fn y_approves_a_permission_inline() {
     let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, root) = seeded(&endpoint, "pty-approve").await.expect("a seeded session");
-    crate::common::journal_event(&endpoint, &session_id, escalation(&root, "req-pty-1", Vec::new()))
+    let (_, session_id, root) = seeded(&endpoint, "pty-approve")
         .await
-        .expect("an escalation");
+        .expect("a seeded session");
+    crate::common::journal_event(
+        &endpoint,
+        &session_id,
+        escalation(&root, "req-pty-1", Vec::new()),
+    )
+    .await
+    .expect("an escalation");
 
-    let mut horde = attached_pty(&endpoint, "pty-approve").await.expect("attached");
-    horde.await_painted("Permission").await.expect("the inline card paints");
+    let mut horde = attached_pty(&endpoint, "pty-approve")
+        .await
+        .expect("attached");
+    horde
+        .await_painted("Permission")
+        .await
+        .expect("the inline card paints");
     horde.type_bytes(b"y").expect("approve");
     let (outcome, answers) = decision_for(&endpoint, &session_id)
         .await
@@ -555,7 +588,9 @@ async fn a_multi_question_request_is_answered_in_place() {
     };
 
     let endpoint = serve().await.expect("a listening server");
-    let (_, session_id, root) = seeded(&endpoint, "pty-answer").await.expect("a seeded session");
+    let (_, session_id, root) = seeded(&endpoint, "pty-answer")
+        .await
+        .expect("a seeded session");
     crate::common::journal_event(
         &endpoint,
         &session_id,
@@ -571,12 +606,20 @@ async fn a_multi_question_request_is_answered_in_place() {
     .await
     .expect("a question escalation");
 
-    let mut horde = attached_pty(&endpoint, "pty-answer").await.expect("attached");
-    horde.await_painted("Question").await.expect("the inline card paints");
+    let mut horde = attached_pty(&endpoint, "pty-answer")
+        .await
+        .expect("attached");
+    horde
+        .await_painted("Question")
+        .await
+        .expect("the inline card paints");
     horde.type_bytes(b"2").expect("pick later");
     // The terminal repaints only changed cells, so the needle is the second
     // question's own option, which shares no cell with the first's.
-    horde.await_painted("docs").await.expect("the card moves to question two");
+    horde
+        .await_painted("docs")
+        .await
+        .expect("the card moves to question two");
     horde.type_bytes(b"\r").expect("take main");
     let (outcome, answers) = decision_for(&endpoint, &session_id)
         .await

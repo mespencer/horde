@@ -17,7 +17,10 @@ use crate::wrap::fit;
 pub(super) fn workspaces(app: &App) -> (Vec<Line<'static>>, &'static str) {
     let hints = "r refresh · esc back · q quit";
     let Some(entries) = app.workspaces() else {
-        return (vec![Line::styled("  loading workspaces…", theme::dim())], hints);
+        return (
+            vec![Line::styled("  loading workspaces…", theme::dim())],
+            hints,
+        );
     };
     if entries.is_empty() {
         return (
@@ -56,22 +59,36 @@ fn workspace_lines(
         .collect();
     lines.push(Line::from(vec![
         marker(selected),
-        Span::styled(definition.name.clone(), if selected { theme::selected() } else { theme::bold() }),
+        Span::styled(
+            definition.name.clone(),
+            if selected {
+                theme::selected()
+            } else {
+                theme::bold()
+            },
+        ),
         Span::styled(format!("  {}", repos.join(", ")), theme::dim()),
     ]));
     if entry.instances.is_empty() {
-        lines.push(Line::styled("      no instances on any worker yet", theme::dim()));
+        lines.push(Line::styled(
+            "      no instances on any worker yet",
+            theme::dim(),
+        ));
     }
     for instance in &entry.instances {
         instance_lines(app, lines, instance);
     }
 }
 
-fn instance_lines(app: &App, lines: &mut Vec<Line<'static>>, instance: &horde_proto::v1::WorkspaceInstanceReport) {
-    let worker = instance
-        .worker_id
-        .as_ref()
-        .map_or_else(|| "unknown worker".to_owned(), |id| app.worker_name(&id.to_string()));
+fn instance_lines(
+    app: &App,
+    lines: &mut Vec<Line<'static>>,
+    instance: &horde_proto::v1::WorkspaceInstanceReport,
+) {
+    let worker = instance.worker_id.as_ref().map_or_else(
+        || "unknown worker".to_owned(),
+        |id| app.worker_name(&id.to_string()),
+    );
     let state = instance_state_name(instance.state);
     let style = match state {
         "ready" => theme::ok(),
@@ -86,14 +103,21 @@ fn instance_lines(app: &App, lines: &mut Vec<Line<'static>>, instance: &horde_pr
         Span::styled(format!(" {}", instance.root_path), theme::dim()),
     ];
     if !instance.detail.is_empty() {
-        spans.push(Span::styled(format!("  {}", instance.detail), theme::warn()));
+        spans.push(Span::styled(
+            format!("  {}", instance.detail),
+            theme::warn(),
+        ));
     }
     lines.push(Line::from(spans));
     for repo in &instance.repos {
         let sha: String = repo.head_commit_sha.chars().take(8).collect();
         let dirty = if repo.dirty { "  dirty" } else { "" };
         lines.push(Line::styled(
-            format!("        {} {sha}{dirty}  {}", fit(&repo.repo_name, 14), repo.path),
+            format!(
+                "        {} {sha}{dirty}  {}",
+                fit(&repo.repo_name, 14),
+                repo.path
+            ),
             theme::dim(),
         ));
     }
@@ -120,9 +144,14 @@ pub(super) fn usage(app: &App) -> (Vec<Line<'static>>, &'static str) {
     };
     let mut lines = vec![Line::styled(format!(" {}", report.scope), theme::dim())];
     section(&mut lines, "by agent", &report.by_agent, |key| {
-        key.agent_id.as_ref().map_or_else(|| "—".to_owned(), |id| crate::state::short_id(&id.to_string()))
+        key.agent_id.as_ref().map_or_else(
+            || "—".to_owned(),
+            |id| crate::state::short_id(&id.to_string()),
+        )
     });
-    section(&mut lines, "by tree", &report.by_tree, |key| key.tree_path.join(" > "));
+    section(&mut lines, "by tree", &report.by_tree, |key| {
+        key.tree_path.join(" > ")
+    });
     lines.push(Line::raw(""));
     lines.push(Line::styled(" by account", theme::bold()));
     if report.accounts.is_empty() {
@@ -222,7 +251,14 @@ pub(super) fn help() -> (Vec<Line<'static>>, &'static str) {
     (lines, "j/k scroll · esc back · q quit")
 }
 
-fn bindings(lines: &mut Vec<Line<'static>>, table: &[(ratatui::crossterm::event::KeyCode, ratatui::crossterm::event::KeyModifiers, keys::Intent)]) {
+fn bindings(
+    lines: &mut Vec<Line<'static>>,
+    table: &[(
+        ratatui::crossterm::event::KeyCode,
+        ratatui::crossterm::event::KeyModifiers,
+        keys::Intent,
+    )],
+) {
     for (code, modifiers, intent) in table {
         lines.push(Line::raw(format!(
             "   {} {}",
@@ -246,7 +282,10 @@ const INTENT_WORDS: &[(keys::Intent, &str)] = {
         (Intent::Escape, "interrupt a working agent · close · back"),
         (Intent::Tab, "complete a command · switch prompt/compose"),
         (Intent::Edit(Edit::DeleteWord), "delete a word"),
-        (Intent::Edit(Edit::DeleteToLineStart), "delete to line start"),
+        (
+            Intent::Edit(Edit::DeleteToLineStart),
+            "delete to line start",
+        ),
         (Intent::Edit(Edit::Up), "move up · older message"),
         (Intent::Edit(Edit::Down), "move down · newer message"),
         (Intent::Edit(Edit::Home), "line start"),

@@ -46,7 +46,9 @@ impl App {
             Screen::Inbox if self.inbox_card => {
                 keys::resolve(&[keys::GLOBAL, keys::PROMPT], key, keys::as_prompt)
             }
-            Screen::Inbox => keys::resolve(&[keys::GLOBAL, keys::INBOX, keys::LIST], key, keys::ignored),
+            Screen::Inbox => {
+                keys::resolve(&[keys::GLOBAL, keys::INBOX, keys::LIST], key, keys::ignored)
+            }
             _ => keys::resolve(&[keys::GLOBAL, keys::LIST], key, keys::ignored),
         };
         intent.map_or_else(Vec::new, |intent| self.act(intent))
@@ -275,7 +277,9 @@ impl App {
     fn submit_command(&mut self, text: &str) -> Vec<Directive> {
         let completions = slash::completions(text);
         let line = match completions.get(self.menu.min(completions.len().saturating_sub(1))) {
-            Some(command) if command.args.starts_with('<') && text != format!("/{}", command.name) => {
+            Some(command)
+                if command.args.starts_with('<') && text != format!("/{}", command.name) =>
+            {
                 // A partly typed command that needs an argument completes
                 // and waits for it rather than refusing.
                 self.compose.set_text(&format!("/{} ", command.name));
@@ -304,8 +308,16 @@ impl App {
             Slash::Attach(target) => return self.attach_named(target),
             Slash::New(title) => return vec![Directive::NewSession { title }],
             Slash::Interrupt => return self.interrupt(),
-            Slash::Now(text) => return self.message_with(text, |agent_id, text| Directive::SendNow { agent_id, text }),
-            Slash::Note(text) => return self.message_with(text, |agent_id, text| Directive::SendNote { agent_id, text }),
+            Slash::Now(text) => {
+                return self
+                    .message_with(text, |agent_id, text| Directive::SendNow { agent_id, text });
+            }
+            Slash::Note(text) => {
+                return self.message_with(text, |agent_id, text| Directive::SendNote {
+                    agent_id,
+                    text,
+                });
+            }
             Slash::Details => self.details = !self.details,
             Slash::Archive(target) => self.ask_archive(target),
             Slash::Quit => self.request_quit(),
@@ -314,7 +326,11 @@ impl App {
         Vec::new()
     }
 
-    fn message_with(&mut self, text: String, directive: fn(String, String) -> Directive) -> Vec<Directive> {
+    fn message_with(
+        &mut self,
+        text: String,
+        directive: fn(String, String) -> Directive,
+    ) -> Vec<Directive> {
         match self.steer_target() {
             Some(agent_id) => vec![directive(agent_id, text)],
             None => {
@@ -331,7 +347,11 @@ impl App {
             return self.goto(Screen::Overview);
         };
         if let Some(agent_id) = self.agent_named(&target) {
-            let session_id = self.attachment.as_ref().map(|a| a.session_id.clone()).unwrap_or_default();
+            let session_id = self
+                .attachment
+                .as_ref()
+                .map(|a| a.session_id.clone())
+                .unwrap_or_default();
             self.attach_agent(session_id, agent_id);
             return Vec::new();
         }
@@ -430,7 +450,9 @@ impl App {
             Screen::Overview => match self.selected_tree_row() {
                 Some(TreeRow::Session { session_id }) => self.attach_to(session_id, None),
                 Some(TreeRow::Agent {
-                    session_id, agent_id, ..
+                    session_id,
+                    agent_id,
+                    ..
                 }) => self.attach_agent(session_id, agent_id),
                 None => {}
             },
@@ -442,7 +464,9 @@ impl App {
 
     fn selected_inbox(&self) -> Option<super::InboxEntry> {
         let entries = self.inbox_entries();
-        let index = self.selected(Screen::Inbox).min(entries.len().saturating_sub(1));
+        let index = self
+            .selected(Screen::Inbox)
+            .min(entries.len().saturating_sub(1));
         entries.into_iter().nth(index)
     }
 

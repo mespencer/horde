@@ -19,7 +19,13 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
     let width = area.width;
     let card = app.front_prompt().map(|request| {
-        card::lines(app, &request, &app.cursor_for(&request), app.prompt_focused(), width)
+        card::lines(
+            app,
+            &request,
+            &app.cursor_for(&request),
+            app.prompt_focused(),
+            width,
+        )
     });
     let menu = menu_lines(app);
     let compose_rows = compose_rows(app, width.saturating_sub(4));
@@ -117,7 +123,11 @@ fn compose_rows(app: &App, width: u16) -> Vec<String> {
 
 fn render_compose(app: &App, frame: &mut Frame<'_>, area: Rect, rows: &[String]) {
     let focused = !app.prompt_focused();
-    let border = if focused { theme::plain() } else { theme::dim() };
+    let border = if focused {
+        theme::plain()
+    } else {
+        theme::dim()
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border);

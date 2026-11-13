@@ -261,12 +261,7 @@ impl SessionState {
                             questions: request
                                 .tool_call
                                 .as_ref()
-                                .map(|call| {
-                                    call.questions
-                                        .iter()
-                                        .map(pending_question)
-                                        .collect()
-                                })
+                                .map(|call| call.questions.iter().map(pending_question).collect())
                                 .unwrap_or_default(),
                         },
                     );
@@ -579,11 +574,11 @@ fn joined(state: &str, reason: &str) -> String {
 mod tests {
     use horde_proto::v1::{
         AgentId, AgentLifecycleChanged, AgentLifecycleState, AgentOutputChannel, AgentOutputChunk,
-        AgentResult, Assignment, AssignmentSent, EventEnvelope, Note, NoteSent,
-        PermissionDecided, PermissionOutcome, PermissionRequested, Placement, PlacementChanged,
-        PlacementState, ResultReported, ResultStatus, SessionId, SessionLifecycleChanged,
-        SessionLifecycleState, SessionSummary, TurnInterrupted, UsageRecorded,
-        WorkspaceInstanceChanged, WorkspaceInstanceReport, event::Kind,
+        AgentResult, Assignment, AssignmentSent, EventEnvelope, Note, NoteSent, PermissionDecided,
+        PermissionOutcome, PermissionRequested, Placement, PlacementChanged, PlacementState,
+        ResultReported, ResultStatus, SessionId, SessionLifecycleChanged, SessionLifecycleState,
+        SessionSummary, TurnInterrupted, UsageRecorded, WorkspaceInstanceChanged,
+        WorkspaceInstanceReport, event::Kind,
     };
 
     use super::{AgentNode, FEED_CAPACITY, SessionState, short_id};
@@ -667,10 +662,6 @@ mod tests {
         assert_eq!(short_id("session-18f3a2b4c5d6-0"), "18f3a2b4");
         assert_eq!(short_id("session-key-1-root"), "key-1-ro");
     }
-
-
-
-
 
     #[test]
     fn every_event_kind_renders_a_feed_line_with_its_text() {
