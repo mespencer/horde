@@ -120,7 +120,7 @@ fn agent_line(
             if selected {
                 theme::selected()
             } else {
-                theme::plain()
+                theme::PLAIN
             },
         ),
         Span::styled(format!(" {}", fit(state, 16)), state_style),

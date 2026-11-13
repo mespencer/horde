@@ -595,3 +595,271 @@ fn an_unfocused_card_steps_aside_for_the_compose_box() {
     typed(&mut app, "wait, why?");
     insta::assert_snapshot!(drawn(&app));
 }
+
+/// Draws the app once at `width`×`height`, handing back the terminal so a
+/// test can read the cursor or the cells' styles.
+fn terminal_at(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("a test terminal always constructs");
+    terminal
+        .draw(|frame| render(app, frame))
+        .expect("drawing on a TestBackend cannot fail");
+    terminal
+}
+
+/// The buffer as text with each change of style marked inline as
+/// `‹colour+modifiers›` — what a plain snapshot cannot see, since the
+/// palette spends colour on state. The markers describe the cells; they
+/// encode nothing about which style the renderer was meant to pick.
+fn styled_at(app: &App, width: u16, height: u16) -> String {
+    use ratatui::style::Modifier;
+    let terminal = terminal_at(app, width, height);
+    let buffer = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..height {
+        let mut current = String::new();
+        let mut row = String::new();
+        for x in 0..width {
+            let cell = &buffer[(x, y)];
+            let mut tag = format!("{:?}", cell.fg);
+            for (flag, name) in [(Modifier::BOLD, "+b"), (Modifier::ITALIC, "+i")] {
+                if cell.modifier.contains(flag) {
+                    tag.push_str(name);
+                }
+            }
+            if tag != current {
+                row.push_str(&format!("‹{tag}›"));
+                current = tag;
+            }
+            row.push_str(cell.symbol());
+        }
+        out.push_str(row.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn alt_enter(app: &mut App) {
+    app.on_input(&TermEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::ALT,
+    )));
+}
+
+fn cursor_after(app: &App) -> (u16, u16) {
+    let mut terminal = terminal_at(app, 80, 24);
+    let position = terminal
+        .get_cursor_position()
+        .expect("a TestBackend always reports its cursor");
+    (position.x, position.y)
+}
+
+/// The terminal cursor follows the compose cursor: three cells in (border,
+/// prompt mark, space), one row under the box's top border, across hard
+/// wraps at the box's inner width (76 at 80 columns), and pinned to the
+/// last of the six rows the box grows to.
+#[test]
+fn the_terminal_cursor_follows_the_compose_cursor() {
+    let mut app = attached_conversation();
+    assert_eq!(cursor_after(&app), (3, 20), "an empty box");
+    typed(&mut app, "abc");
+    assert_eq!(cursor_after(&app), (6, 20), "after three characters");
+
+    let mut app = attached_conversation();
+    typed(&mut app, "ab");
+    alt_enter(&mut app);
+    typed(&mut app, "cd");
+    assert_eq!(cursor_after(&app), (5, 20), "second line of a two-row box");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(cursor_after(&app), (5, 19), "up a line");
+
+    let mut app = attached_conversation();
+    typed(&mut app, &"x".repeat(80));
+    assert_eq!(cursor_after(&app), (7, 20), "wrapped onto the second row");
+    alt_enter(&mut app);
+    typed(&mut app, "y");
+    assert_eq!(
+        cursor_after(&app),
+        (4, 20),
+        "below a wrapped line, which counts two rows"
+    );
+
+    let mut app = attached_conversation();
+    for _ in 0..7 {
+        typed(&mut app, "a");
+        alt_enter(&mut app);
+    }
+    typed(&mut app, "b");
+    assert_eq!(
+        cursor_after(&app),
+        (4, 20),
+        "the box stops growing at six rows"
+    );
+}
+
+/// Each state wears its colour: LOST and failed red, working and queued
+/// yellow, running and idle green, the rest dim; the current tab and the
+/// selected row highlighted, the waiting count magenta.
+#[test]
+fn the_tree_colours_states_and_selection() {
+    use horde_proto::v1::{AgentLifecycleChanged, AgentLifecycleState};
+    let lifecycle = |state: AgentLifecycleState| {
+        Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+            previous_state: 0,
+            state: state as i32,
+            reason: String::new(),
+        })
+    };
+    let mut app = tree();
+    app.apply(Update::Sessions(vec![summary("s3", "states", "a-run")]));
+    let agents: [(&str, Vec<Kind>); 5] = [
+        ("a-run", vec![lifecycle(AgentLifecycleState::Running)]),
+        ("a-idle", vec![lifecycle(AgentLifecycleState::Idle)]),
+        (
+            "a-busy",
+            vec![chunk(AgentOutputChannel::Assistant, "t", "hi")],
+        ),
+        ("a-wait", vec![placement(PlacementState::Queued, None)]),
+        ("a-dead", vec![lifecycle(AgentLifecycleState::Failed)]),
+    ];
+    for (agent, kinds) in agents {
+        let parent = (agent != "a-run").then_some("a-run");
+        fold(
+            &mut app,
+            "s3",
+            agent,
+            vec![spawned(parent, &["states", agent])],
+        );
+        fold(&mut app, "s3", agent, kinds);
+    }
+    insta::assert_snapshot!(styled_at(&app, 80, 16));
+}
+
+/// The transcript's colours: thinking dim italic, a child's spawn cyan,
+/// success green and any other result yellow, an interrupt yellow, a
+/// failure red, an archive dim.
+#[test]
+fn the_transcript_colours_its_blocks() {
+    use horde_proto::v1::{
+        AgentLifecycleChanged, AgentLifecycleState, AgentResult, ResultReported, ResultStatus,
+        TurnInterrupted,
+    };
+    let reported = |status: ResultStatus, summary: &str| {
+        Kind::ResultReported(ResultReported {
+            result: Some(AgentResult {
+                status: status as i32,
+                summary: summary.to_owned(),
+                ..AgentResult::default()
+            }),
+        })
+    };
+    let lifecycle = |state: AgentLifecycleState| {
+        Kind::AgentLifecycleChanged(AgentLifecycleChanged {
+            previous_state: 0,
+            state: state as i32,
+            reason: String::new(),
+        })
+    };
+    let mut app = attached_conversation();
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![
+            Kind::TurnInterrupted(TurnInterrupted {
+                reason: "stop".to_owned(),
+                ..TurnInterrupted::default()
+            }),
+            reported(ResultStatus::Success, "all green"),
+            reported(ResultStatus::Blocked, "still red"),
+            lifecycle(AgentLifecycleState::Failed),
+            lifecycle(AgentLifecycleState::Archived),
+        ],
+    );
+    insta::assert_snapshot!(styled_at(&app, 80, 36));
+}
+
+/// The command menu highlights the row enter would run and leaves the rest
+/// plain.
+#[test]
+fn the_command_menu_highlights_one_row() {
+    let mut app = attached_conversation();
+    typed(&mut app, "/a");
+    press(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(styled_at(&app, 80, 24));
+}
+
+/// Instance states by name and colour: ready green, degraded and
+/// materializing yellow, missing red, anything unknown dim.
+#[test]
+fn workspace_instances_show_every_state() {
+    let mut app = App::overview();
+    workers(&mut app);
+    let instance = |state: WorkspaceInstanceState, path: &str| WorkspaceInstanceReport {
+        worker_id: Some(WorkerId::new("worker-1")),
+        state: state as i32,
+        root_path: path.to_owned(),
+        ..WorkspaceInstanceReport::default()
+    };
+    app.apply(Update::Workspaces(vec![WorkspaceEntry {
+        definition: WorkspaceDefinition {
+            name: "horde".to_owned(),
+            ..WorkspaceDefinition::default()
+        },
+        instances: vec![
+            instance(WorkspaceInstanceState::Ready, "/a"),
+            instance(WorkspaceInstanceState::Degraded, "/b"),
+            instance(WorkspaceInstanceState::Materializing, "/c"),
+            instance(WorkspaceInstanceState::Missing, "/d"),
+            instance(WorkspaceInstanceState::Unspecified, "/e"),
+        ],
+    }]));
+    press(&mut app, KeyCode::Char('w'));
+    insta::assert_snapshot!(styled_at(&app, 80, 12));
+}
+
+/// The whole help screen, every table, on a screen tall enough to hold it.
+#[test]
+fn help_lists_every_binding_on_a_tall_screen() {
+    let mut app = App::overview();
+    press(&mut app, KeyCode::Char('?'));
+    insta::assert_snapshot!(terminal_at(&app, 80, 120).backend().to_string());
+}
+
+/// On a narrow screen agent names take a third of the width.
+#[test]
+fn the_tree_fits_names_to_a_narrow_screen() {
+    let app = tree();
+    insta::assert_snapshot!(terminal_at(&app, 60, 12).backend().to_string());
+}
+
+/// When the inbox shrinks under its selection, the last entry takes the
+/// highlight and the card.
+#[test]
+fn a_shrinking_inbox_keeps_a_selected_entry() {
+    let mut app = tree();
+    fold(
+        &mut app,
+        "s2",
+        "root-2",
+        vec![requested("req-2", "rm -rf docs")],
+    );
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.selected(crate::keys::Screen::Inbox), 1);
+    fold(
+        &mut app,
+        "s2",
+        "root-2",
+        vec![crate::fixtures::decided(
+            "req-2",
+            horde_proto::v1::PermissionOutcome::Allow,
+            "",
+        )],
+    );
+    let screen = terminal_at(&app, 80, 24).backend().to_string();
+    assert!(
+        screen.contains("❯ ci-fix"),
+        "the remaining entry is selected: {screen}"
+    );
+}

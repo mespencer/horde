@@ -158,9 +158,12 @@ impl PromptCursor {
         request: &PendingPermission,
         question: &PendingQuestion,
     ) -> Option<Decision> {
+        // Enter on an option takes it; on a multi-select question that
+        // already has choices it only confirms them, and on the free-text
+        // row it confirms the typed text.
         let row = self.row();
-        let multi = question.multi_select && row < question.options.len();
-        if row < question.options.len() && (!multi || self.chosen_here().is_empty()) {
+        if row < question.options.len() && (!question.multi_select || self.chosen_here().is_empty())
+        {
             self.choose(row, question.multi_select);
         }
         self.advance(request)
@@ -530,5 +533,64 @@ mod tests {
         cursor.question = 5;
         assert_eq!(cursor.press(&asking, PromptKey::Enter), None);
         assert_eq!(cursor.row(), 0);
+    }
+
+    /// Going back to an answered single-select question and pressing Enter
+    /// on another option replaces the answer.
+    #[test]
+    fn enter_on_a_revisited_question_replaces_its_answer() {
+        let asked = request(vec![
+            question("when", &["now", "later"]),
+            question("where", &["main", "docs"]),
+        ]);
+        let mut cursor = PromptCursor::new(&asked);
+        let keys = [
+            PromptKey::Char('1'),
+            PromptKey::Left,
+            PromptKey::Down,
+            PromptKey::Enter,
+            PromptKey::Char('2'),
+        ];
+        assert_eq!(
+            press_all(&mut cursor, &asked, &keys),
+            answer(&[("when", &["later"]), ("where", &["docs"])])
+        );
+    }
+
+    /// Enter on an empty free-text row confirms the option already chosen
+    /// rather than clearing it.
+    #[test]
+    fn enter_on_an_empty_free_text_row_keeps_the_chosen_option() {
+        let mut open = question("when", &["now", "later"]);
+        open.allows_free_text = true;
+        let asked = request(vec![open, question("where", &["main", "docs"])]);
+        let mut cursor = PromptCursor::new(&asked);
+        let keys = [
+            PromptKey::Char('1'),
+            PromptKey::Left,
+            PromptKey::Down,
+            PromptKey::Down,
+            PromptKey::Enter,
+            PromptKey::Char('1'),
+        ];
+        assert_eq!(
+            press_all(&mut cursor, &asked, &keys),
+            answer(&[("when", &["now"]), ("where", &["main"])])
+        );
+    }
+
+    /// A digit past the last option is noise: nothing is chosen and the
+    /// highlight stays where it was.
+    #[test]
+    fn a_digit_past_the_options_changes_nothing() {
+        let asked = request(vec![question("when", &["now", "later"])]);
+        let mut cursor = PromptCursor::new(&asked);
+        assert_eq!(cursor.press(&asked, PromptKey::Char('3')), None);
+        assert_eq!(cursor.row(), 0);
+        assert!(cursor.answers(&asked).is_empty());
+        assert_eq!(
+            cursor.press(&asked, PromptKey::Char('2')),
+            answer(&[("when", &["later"])])
+        );
     }
 }

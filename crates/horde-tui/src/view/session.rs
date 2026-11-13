@@ -123,11 +123,7 @@ fn compose_rows(app: &App, width: u16) -> Vec<String> {
 
 fn render_compose(app: &App, frame: &mut Frame<'_>, area: Rect, rows: &[String]) {
     let focused = !app.prompt_focused();
-    let border = if focused {
-        theme::plain()
-    } else {
-        theme::dim()
-    };
+    let border = if focused { theme::PLAIN } else { theme::dim() };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border);
@@ -188,7 +184,7 @@ fn menu_lines(app: &App) -> Vec<Line<'static>> {
             let style = if index == highlighted {
                 theme::selected()
             } else {
-                theme::plain()
+                theme::PLAIN
             };
             Line::from(vec![
                 Span::styled(format!("  /{:<11}", command.name), style),

@@ -163,11 +163,11 @@ impl App {
         }
     }
 
-    /// Where Esc leaves a list screen for: the screen it came from, unless
-    /// that is the session screen with nothing attached.
+    /// Where Esc leaves a list screen for: the screen it came from. The
+    /// session screen is only ever left with something attached (nothing
+    /// clears an attachment), so it is always a valid way back.
     fn back_target(&self) -> Screen {
         match (self.previous, self.attachment.is_some()) {
-            (Screen::Session, false) => Screen::Overview,
             (previous, _) if previous != self.screen => previous,
             _ if self.attachment.is_some() => Screen::Session,
             _ => Screen::Overview,
