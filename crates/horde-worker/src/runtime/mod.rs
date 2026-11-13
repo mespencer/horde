@@ -122,12 +122,6 @@ impl Runtime {
         self
     }
 
-    /// The logs this Worker keeps and serves, when it keeps any.
-    #[must_use]
-    pub fn logs(&self) -> Option<&Arc<crate::logs::LogServing>> {
-        self.shared.logs.as_ref()
-    }
-
     /// Points attachment transfer at the Server's blob store, over the
     /// Worker's own authenticated channel. Without one, inline attachments
     /// still work in both directions and anything needing the store refuses

@@ -968,6 +968,36 @@ mod tests {
         assert_eq!(unversioned.code(), tonic::Code::FailedPrecondition);
     }
 
+    /// A registration records whether its Hello advertised log serving: a
+    /// worker whose flags name only other capabilities predates it, and a
+    /// read for it is refused rather than waited on.
+    #[tokio::test]
+    async fn registration_notes_whether_the_worker_serves_logs() {
+        use crate::diagnostics::registry::LaneState;
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+
+        let core = core();
+        let facing = super::WorkerFacing::new(core.clone());
+        for (worker, flag) in [
+            ("worker-old", "other.v1"),
+            ("worker-new", horde_wire::logs::LOGS_CAPABILITY),
+        ] {
+            let mut request = register_request(Some("0.1.0"), Some(worker), None);
+            if let Some(hello) = request.get_mut().hello.as_mut() {
+                hello.capability_flags.push(flag.to_owned());
+            }
+            facing.register_worker(request).await.expect("registers");
+        }
+        assert!(matches!(
+            core.logs.registry.lane("worker-old"),
+            LaneState::Unsupported
+        ));
+        assert!(matches!(
+            core.logs.registry.lane("worker-new"),
+            LaneState::Away(None)
+        ));
+    }
+
     /// A registration as a worker sends it: its hello's semver, its claimed
     /// name, and the journal head it reports, each optional.
     fn register_request(

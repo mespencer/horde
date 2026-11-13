@@ -34,13 +34,19 @@ mod harness {
             .expect("the server binds")
     }
 
+    /// Runs the binary to its exit, bounded: a `logs` invocation that never
+    /// returns fails here in seconds (and is killed) instead of hanging.
     pub(crate) async fn horde(args: &[&str], home: &std::path::Path) -> std::process::Output {
-        horde_server_testkit::otlp_scrubbed_run(
-            env!("CARGO_BIN_EXE_horde"),
-            args,
-            &[("HOME", home.to_str().expect("utf-8 home"))],
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            horde_server_testkit::otlp_scrubbed_run(
+                env!("CARGO_BIN_EXE_horde"),
+                args,
+                &[("HOME", home.to_str().expect("utf-8 home"))],
+            ),
         )
         .await
+        .expect("the binary exits")
         .expect("the binary runs")
     }
 }

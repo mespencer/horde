@@ -563,6 +563,8 @@ pub async fn otlp_scrubbed_run(
 ) -> Setup<std::process::Output> {
     let mut command = tokio::process::Command::new(program);
     command.args(arguments);
+    // A caller that bounds the run and gives up must not leave the child.
+    command.kill_on_drop(true);
     command.env_remove(horde_observe::ENDPOINT_VAR);
     command.env_remove(horde_observe::SAMPLE_VAR);
     for (name, value) in environment {
