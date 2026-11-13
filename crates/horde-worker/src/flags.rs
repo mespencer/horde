@@ -117,6 +117,9 @@ pub struct WorkerConfig {
     pub workspace_root: Option<PathBuf>,
     /// The git Relay payload shares stage to and fetch through.
     pub relay: Option<String>,
+    /// The workspace scan's machine-local settings (ADR-0014's
+    /// `worker.workspace.*`; flags until W12e's config file).
+    pub housekeeping: crate::runtime::HousekeepingConfig,
     /// Placement tags this Worker advertises (`--tag`, repeatable).
     pub tags: Vec<String>,
     /// Remote URLs this machine's credentials can reach
@@ -282,6 +285,28 @@ struct WorkerArgs {
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     relay: Option<String>,
 
+    /// How often the workspace scan runs (idle and orphan reclaim, grace
+    /// expiry, disk pressure), e.g. 60s.
+    #[arg(long, value_parser = seconds, default_value = "60s")]
+    workspace_scan_interval: std::time::Duration,
+
+    /// How often archive pins are checked against origin and the Relay.
+    #[arg(long, value_parser = seconds, default_value = "6h")]
+    workspace_pin_scan_interval: std::time::Duration,
+
+    /// How often the whole Instance set is re-reported to the Server.
+    #[arg(long, value_parser = seconds, default_value = "5m")]
+    workspace_report_interval: std::time::Duration,
+
+    /// Free space below which disk-pressure reclaim starts: a percentage,
+    /// a size, or both (the larger wins), e.g. "10%,20GiB".
+    #[arg(long, value_parser = watermark, default_value = "10%,20GiB")]
+    workspace_disk_low_watermark: crate::runtime::Watermark,
+
+    /// Free space disk-pressure reclaim stops at; above the low mark.
+    #[arg(long, value_parser = watermark, default_value = "15%")]
+    workspace_disk_high_watermark: crate::runtime::Watermark,
+
     /// A placement tag this worker advertises; repeatable.
     #[arg(long = "tag", value_parser = NonEmptyStringValueParser::new())]
     tags: Vec<String>,
@@ -297,6 +322,56 @@ struct WorkerArgs {
     /// The codex `approvalsReviewer`; only `user` is admitted.
     #[arg(long, value_parser = reviewer)]
     codex_approvals_reviewer: Option<String>,
+}
+
+/// A duration flag: `90s`, `10m`, `6h`, `1d`, or bare seconds; never zero.
+fn seconds(value: &str) -> Result<std::time::Duration, String> {
+    let refuse = || format!("{value:?} is not a duration such as 60s, 5m or 6h");
+    let (digits, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
+        Some(split) => value.split_at(split),
+        None => (value, "s"),
+    };
+    let amount: u64 = digits.parse().map_err(|_| refuse())?;
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(refuse()),
+    };
+    let seconds = amount.checked_mul(scale).filter(|seconds| *seconds > 0).ok_or_else(refuse)?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+/// A watermark flag: `10%`, `20GiB`, or both comma-separated.
+fn watermark(value: &str) -> Result<crate::runtime::Watermark, String> {
+    let refuse = || format!("{value:?} is not a watermark such as 10%, 20GiB or 10%,20GiB");
+    let mut mark = crate::runtime::Watermark {
+        basis_points: 0,
+        bytes: 0,
+    };
+    for part in value.split(',').map(str::trim) {
+        if let Some(percent) = part.strip_suffix('%') {
+            let percent: u64 = percent.parse().map_err(|_| refuse())?;
+            if percent > 100 {
+                return Err(refuse());
+            }
+            mark.basis_points = percent * 100;
+        } else {
+            let (digits, unit) = part.split_at(part.find(|c: char| !c.is_ascii_digit()).unwrap_or(part.len()));
+            let amount: u64 = digits.parse().map_err(|_| refuse())?;
+            let scale: u64 = match unit {
+                "" | "B" => 1,
+                "KiB" => 1 << 10,
+                "MiB" => 1 << 20,
+                "GiB" => 1 << 30,
+                "TiB" => 1 << 40,
+                _ => return Err(refuse()),
+            };
+            mark.bytes = amount.checked_mul(scale).ok_or_else(refuse)?;
+        }
+    }
+    Ok(mark)
 }
 
 /// Rejected at parse, not at spawn: `auto_review` had codex's own subagent
@@ -342,6 +417,13 @@ pub fn parse(
         fake_login_listen_port: args.fake_login_listen_port,
         workspace_root: args.workspace_root,
         relay: args.relay,
+        housekeeping: crate::runtime::HousekeepingConfig {
+            scan_interval: args.workspace_scan_interval,
+            pin_scan_interval: args.workspace_pin_scan_interval,
+            report_interval: args.workspace_report_interval,
+            disk_low_watermark: args.workspace_disk_low_watermark,
+            disk_high_watermark: args.workspace_disk_high_watermark,
+        },
         tags: args.tags,
         advertised_remotes: args.advertised_remotes,
         insecure: args.insecure,

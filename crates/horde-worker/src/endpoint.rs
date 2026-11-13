@@ -77,6 +77,8 @@ pub struct EndpointManager {
     /// by caller identity.
     proxies: Arc<AgentProxies>,
     served: tokio::sync::Mutex<Served>,
+    /// The workspace verbs' backend, set once the Runtime has workspaces.
+    workspace: std::sync::OnceLock<Arc<dyn horde_mcp::workspace::WorkspaceAccess>>,
 }
 
 /// The manager's serving state. One lock guards both fields, so "may a new
@@ -120,7 +122,15 @@ impl EndpointManager {
                 accepting: true,
                 endpoints: BTreeMap::new(),
             }),
+            workspace: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Puts the Worker's workspaces behind every endpoint served from now
+    /// on (`workspace_checkout`, parent bases). Set once; a second call is
+    /// ignored.
+    pub fn set_workspace_access(&self, access: Arc<dyn horde_mcp::workspace::WorkspaceAccess>) {
+        let _ = self.workspace.set(access);
     }
 
     /// The endpoint one Agent's harness is pointed at: the Session's served
@@ -295,11 +305,14 @@ impl EndpointManager {
             return Ok(endpoint.url.clone());
         }
 
-        let context = horde_mcp::context::AgentContext::new(
+        let mut context = horde_mcp::context::AgentContext::new(
             Arc::new(EndpointJournal { sink }),
             horde_cli::client::Client::with_channel(self.channel.clone()),
             session_id,
         );
+        if let Some(workspace) = self.workspace.get() {
+            context = context.with_workspace(Arc::clone(workspace));
+        }
         let endpoint = horde_mcp::endpoint::HordeEndpoint::new(context)
             .with_agent_proxies(Arc::clone(&self.proxies));
         let (bound, serving) = horde_mcp::server::serve(

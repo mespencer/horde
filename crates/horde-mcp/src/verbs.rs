@@ -116,13 +116,21 @@ pub struct SpawnOutcome {
 
 /// What a spawning agent may change about its child. Anything unset is the
 /// parent's — inherited by the Server from the log, not restated here.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChildOverrides {
     /// Another agent type; the Server refuses one that sees an MCP server
     /// the parent's type cannot.
     pub agent_type: Option<String>,
     /// Another tier from the catalog, e.g. `fast`.
     pub tier: Option<String>,
+    /// The repos checked out at start (implies lazy) — ADR-0014.
+    pub repos: Vec<String>,
+    /// Where each repo starts: explicit bases merged over the parent's
+    /// committed HEADs.
+    pub bases: Vec<horde_proto::v1::RepoBase>,
+    /// The branch the child creates in every repo it checks out.
+    pub branch: Option<String>,
+    pub checkout_mode: horde_proto::v1::CheckoutMode,
 }
 
 /// The orchestrator verbs for one Agent's endpoint.
@@ -176,6 +184,10 @@ impl Verbs {
                 .map(|tier| horde_proto::v1::ModelSelection {
                     selection: Some(horde_proto::v1::model_selection::Selection::Tier(tier)),
                 }),
+            checkout_mode: overrides.checkout_mode.into(),
+            checkout_repos: overrides.repos.clone(),
+            repo_bases: overrides.bases.clone(),
+            branch: overrides.branch.clone().unwrap_or_default(),
             ..horde_proto::v1::AgentSpec::default()
         };
         // The parent is the authenticated caller, never a value the Agent

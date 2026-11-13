@@ -349,6 +349,7 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
             &horde_mcp::verbs::ChildOverrides {
                 agent_type: None,
                 tier: Some(String::new()),
+                ..horde_mcp::verbs::ChildOverrides::default()
             },
             "spawn-inherit",
         )
@@ -370,6 +371,7 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
             &horde_mcp::verbs::ChildOverrides {
                 agent_type: Some("fixer".to_owned()),
                 tier: Some("fast".to_owned()),
+                ..horde_mcp::verbs::ChildOverrides::default()
             },
             "spawn-faster",
         )
