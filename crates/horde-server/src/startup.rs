@@ -548,6 +548,28 @@ pub fn file_logging(
     Ok(logging)
 }
 
+/// The file logging an invocation wants: a serving server keeps its logs
+/// under its state directory; `--check` and `--remint` keep none.
+///
+/// # Errors
+///
+/// As [`file_logging`].
+pub fn file_logging_for(
+    invocation: &Invocation,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<horde_observe::FileLogging>, String> {
+    match invocation {
+        Invocation::Serve(config) => file_logging(&config.state_dir, lookup).map(Some),
+        Invocation::CheckOnly { .. } | Invocation::Remint { .. } | Invocation::Print(_) => Ok(None),
+    }
+}
+
+/// Writes out what is still queued for the file, bounded, on the way out.
+/// Returns whether everything reached it (`true` with no file at all).
+pub fn flush_file_logging(file: Option<&horde_observe::FileLogging>) -> bool {
+    file.is_none_or(|file| file.flush(std::time::Duration::from_secs(2)))
+}
+
 /// Where the server's log files live: `<state>/logs`, so two servers with
 /// separate state directories never share files.
 #[must_use]
@@ -798,6 +820,48 @@ mod tests {
         let path = directory.path().to_string_lossy().into_owned();
 
         open_log(&path).expect_err("a directory is not a database");
+    }
+
+    /// Only a serving server keeps log files; a typo in `HORDE_LOG` is a
+    /// refusal; the files land under the state directory, and the exit
+    /// flush reports whether everything reached them.
+    #[test]
+    fn only_serving_keeps_log_files_and_they_live_under_the_state_dir() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let check = super::Invocation::CheckOnly {
+            database: "x".to_owned(),
+        };
+        assert!(
+            super::file_logging_for(&check, |_| None)
+                .expect("ok")
+                .is_none()
+        );
+        let remint = super::Invocation::Remint {
+            state_dir: state.path().to_path_buf(),
+        };
+        assert!(
+            super::file_logging_for(&remint, |_| None)
+                .expect("ok")
+                .is_none()
+        );
+        assert!(
+            super::flush_file_logging(None),
+            "nothing to flush is flushed"
+        );
+
+        let serve = parsed(&["--serve", "--state-dir", &state.path().to_string_lossy()])
+            .expect("a serve invocation");
+        let refused = super::file_logging_for(&serve, |_| Some("=[".to_owned()));
+        assert!(refused.is_err(), "a HORDE_LOG typo refuses startup");
+        let file = super::file_logging_for(&serve, |_| None)
+            .expect("ok")
+            .expect("serving keeps files");
+        assert_eq!(file.dir(), super::log_dir(state.path()));
+        assert_eq!(file.dir(), state.path().join("logs"));
+        assert_eq!(file.binary(), "horde-server");
+        file.with_default(|| tracing::info!("served"));
+        assert!(super::flush_file_logging(Some(&file)));
+        assert!(horde_observe::files::list(file.dir(), Some("horde-server")).len() == 1);
     }
 
     fn parsed(arguments: &[&str]) -> Result<super::Invocation, String> {

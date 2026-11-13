@@ -98,6 +98,50 @@ pub fn client_file_logging(
     .map(Some)
 }
 
+/// Everything the `horde` binary installs for its own diagnostics: OTLP
+/// export when the environment asks for it, and the opt-in log file.
+///
+/// # Errors
+///
+/// A refusal to print before any verb runs: unusable OTLP settings or an
+/// unparseable `HORDE_LOG`.
+pub fn observability(
+    log_file: bool,
+    principal: Option<String>,
+    lookup: impl Fn(&str) -> Option<String>,
+    home: Option<PathBuf>,
+) -> Result<
+    (
+        Option<horde_observe::Telemetry>,
+        Option<horde_observe::FileLogging>,
+    ),
+    String,
+> {
+    let identity = horde_observe::ServiceIdentity::new("horde").with_principal(principal.clone());
+    let telemetry = horde_observe::init_from_env(identity, &lookup).map_err(|e| e.to_string())?;
+    let wanted = wants_log_file(
+        log_file,
+        lookup(horde_observe::settings::CLIENT_FILE_VAR).as_deref(),
+    );
+    let file = client_file_logging(wanted, home, principal, lookup)?;
+    Ok((telemetry, file))
+}
+
+/// The binary's last act: what the file still holds queued is written, and
+/// export is flushed. Blocks; run it off the async runtime. Verdicts are
+/// discarded on purpose — a dead collector must not change an exit code.
+pub fn finish_observability(
+    telemetry: Option<horde_observe::Telemetry>,
+    file: Option<horde_observe::FileLogging>,
+) {
+    if let Some(file) = file {
+        file.flush(Duration::from_secs(2));
+    }
+    if let Some(telemetry) = telemetry {
+        let _ = telemetry.shutdown();
+    }
+}
+
 /// What a remote read targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTarget {
@@ -342,23 +386,32 @@ async fn pump(
             Ok(None) => return Ok(Ended::Lost("the stream closed".to_owned())),
             Err(status) => return Ok(Ended::Lost(status.message().to_owned())),
         };
-        match message.body {
-            Some(read_logs_response::Body::Records(batch)) => {
-                for line in &batch.lines {
-                    if let Some(record) = Record::parse(line) {
-                        printer.record(&record)?;
-                        *last = Some(record.key);
-                    }
-                }
-            }
-            Some(read_logs_response::Body::Gap(gap)) => {
-                printer.notice(&format!("{} records missed", gap.lagged + gap.dropped))?;
-            }
-            Some(read_logs_response::Body::End(end)) => {
-                return Ok(ended_by(end.reason, &end.detail));
-            }
-            None => {}
+        if let Some(ended) = show(message.body, printer, last)? {
+            return Ok(ended);
         }
+    }
+}
+
+/// Shows one response; `Some` when it was the stream's end.
+fn show(
+    body: Option<read_logs_response::Body>,
+    printer: &mut Printer<'_>,
+    last: &mut Option<Cursor>,
+) -> Result<Option<Ended>, ClientError> {
+    match body {
+        Some(read_logs_response::Body::Records(batch)) => {
+            for record in batch.lines.iter().filter_map(|line| Record::parse(line)) {
+                printer.record(&record)?;
+                *last = Some(record.key);
+            }
+            Ok(None)
+        }
+        Some(read_logs_response::Body::Gap(gap)) => {
+            printer.notice(&format!("{} records missed", gap.lagged + gap.dropped))?;
+            Ok(None)
+        }
+        Some(read_logs_response::Body::End(end)) => Ok(Some(ended_by(end.reason, &end.detail))),
+        None => Ok(None),
     }
 }
 
@@ -397,7 +450,6 @@ pub async fn run_remote(
     };
     let mut last: Option<Cursor> = None;
     let mut stream = client.read_logs(request(target, args, None)).await?;
-    let mut attempt = 0;
     loop {
         match pump(&mut stream, &mut printer, &mut last).await? {
             Ended::Finished => return Ok(()),
@@ -408,14 +460,23 @@ pub async fn run_remote(
                 printer.notice(&format!("lost the stream ({reason}); redialing"))?;
             }
         }
-        loop {
-            tokio::time::sleep(redial_delay(attempt)).await;
-            attempt = attempt.saturating_add(1);
-            if let Ok(next) = client.read_logs(request(target, args, last.as_ref())).await {
-                stream = next;
-                attempt = 0;
-                break;
-            }
+        stream = redial(client, target, args, last.as_ref()).await;
+    }
+}
+
+/// Redials a lost follow from `last`, backing off until a read opens.
+async fn redial(
+    client: &mut Client,
+    target: &RemoteTarget,
+    args: &LogsArgs,
+    last: Option<&Cursor>,
+) -> tonic::Streaming<horde_proto::v1::ReadLogsResponse> {
+    let mut attempt = 0;
+    loop {
+        tokio::time::sleep(redial_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
+        if let Ok(next) = client.read_logs(request(target, args, last)).await {
+            return next;
         }
     }
 }
@@ -480,6 +541,41 @@ mod tests {
         assert_eq!(on.dir(), home.path().join(".horde/client/logs"));
         assert_eq!(on.binary(), "horde");
         assert!(client_file_logging(true, None, None, |_| Some("=[".to_owned())).is_err());
+    }
+
+    #[test]
+    fn the_binarys_observability_is_assembled_from_flags_and_environment() {
+        use super::{finish_observability, observability};
+        let home = tempfile::tempdir().expect("home");
+        let (telemetry, file) =
+            observability(false, None, |_| None, Some(home.path().to_path_buf())).expect("off");
+        assert!(telemetry.is_none() && file.is_none());
+        finish_observability(None, None);
+        let (_, file) = observability(
+            false,
+            None,
+            |name| (name == "HORDE_LOG_FILE").then(|| "1".to_owned()),
+            Some(home.path().to_path_buf()),
+        )
+        .expect("on");
+        let file = file.expect("the environment asked for a file");
+        file.with_default(|| tracing::info!(target: "horde_cli", "noted"));
+        finish_observability(None, Some(file));
+        assert!(home.path().join(".horde/client/logs").is_dir());
+        let refused = observability(
+            true,
+            None,
+            |name| (name == "HORDE_LOG").then(|| "=[".to_owned()),
+            Some(home.path().to_path_buf()),
+        );
+        assert!(refused.is_err());
+        let otlp = observability(
+            false,
+            None,
+            |name| (name == "HORDE_OTLP_SAMPLE").then(|| "0.5".to_owned()),
+            None,
+        );
+        assert!(otlp.is_err(), "an OTLP refusal still refuses");
     }
 
     #[test]
