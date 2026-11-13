@@ -1831,20 +1831,33 @@ fn workspace_support_is_what_the_builder_installed() {
 /// A spawn command whose spec names `workspace`, under the worktree
 /// policy — the shape the server sends once placement chose this worker.
 fn workspace_spawn(sequence: u64, agent: &str, workspace: &str) -> StreamCommandsResponse {
-    let mut spawn = spawn_command(sequence, agent, "hello");
-    if let Some(Command::SpawnAgent(command)) = &mut spawn.command
-        && let Some(spec) = &mut command.spec
-    {
-        spec.workspace_definition_id = Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace));
-        spec.checkout_policy = horde_proto::v1::CheckoutPolicy::Worktree as i32;
+    StreamCommandsResponse {
+        command_sequence: sequence,
+        command_id: format!("s1:{sequence}"),
+        log_position: sequence,
+        command: Some(Command::SpawnAgent(SpawnAgentCommand {
+            session_id: Some(SessionId::new("s1")),
+            agent_id: Some(AgentId::new(agent)),
+            spec: Some(horde_proto::v1::AgentSpec {
+                initial_assignment: Some(Assignment {
+                    assignment_id: None,
+                    text: "hello".to_owned(),
+                    payload: None,
+                }),
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
+                    workspace,
+                )),
+                checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
+                ..horde_proto::v1::AgentSpec::default()
+            }),
+            // No grace: a lossless archived checkout goes at archive.
+            workspace_policy: Some(horde_proto::v1::ResolvedWorkspacePolicy {
+                archived_grace: Some(horde_proto::prost_types::Duration::default()),
+                ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+            }),
+            ..SpawnAgentCommand::default()
+        })),
     }
-    if let Some(Command::SpawnAgent(command)) = &mut spawn.command {
-        command.workspace_policy = Some(horde_proto::v1::ResolvedWorkspacePolicy {
-            archived_grace: Some(horde_proto::prost_types::Duration::default()),
-            ..horde_proto::v1::ResolvedWorkspacePolicy::default()
-        });
-    }
-    spawn
 }
 
 /// Applies a spawn that must fail the *agent* and not the command loop,
@@ -2334,4 +2347,73 @@ async fn an_event_with_nothing_to_journal_leaves_the_journal_untouched() {
     );
     let events = journal.read_from(1, 100).await.expect("a readable journal");
     assert!(events.is_empty(), "nothing may be appended: {events:?}");
+}
+
+/// The endpoint's `workspace_checkout`, served by the Runtime: a repo the
+/// agent has answers with its path (`reused`), an unknown repo names the
+/// valid ones, an agent with no live checkout is refused, and a Runtime
+/// without workspaces says so. Parent bases name the agent's committed HEAD.
+#[tokio::test]
+async fn the_workspace_verbs_answer_from_the_live_checkout() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let (_temp, workspaces_root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    };
+
+    let answer = access
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect("a repo the agent has");
+    assert_eq!(answer.resolution, "reused");
+    assert_eq!(answer.branch, "horde/agent-1");
+    assert!(answer.path.ends_with("agent-1/atlas"), "{}", answer.path);
+
+    let unknown = access
+        .checkout("agent-1", "ghost", None)
+        .await
+        .expect_err("ghost is no repo");
+    assert!(unknown.contains("valid repos: atlas"), "{unknown}");
+    let stranger = access
+        .checkout("agent-9", "atlas", None)
+        .await
+        .expect_err("no such agent here");
+    assert!(stranger.contains("no live checkout"), "{stranger}");
+
+    let bases = access.parent_bases("agent-1").await.expect("bases");
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspaces_root.join("ws-1/.horde-agents/agent-1/atlas"))
+        .output()
+        .expect("git runs");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0].r#ref, String::from_utf8_lossy(&head.stdout).trim());
+    assert_eq!(
+        bases[0].source,
+        i32::from(horde_proto::v1::RepoBaseSource::Parent)
+    );
+    assert!(
+        access
+            .parent_bases("agent-9")
+            .await
+            .expect("none")
+            .is_empty()
+    );
+
+    let bare = super::access::WorkerWorkspaceAccess {
+        shared: super::shared::Shared::new(Journal::in_memory().expect("a journal")),
+    };
+    let refused = bare
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect_err("no workspaces");
+    assert!(refused.contains("no workspaces"), "{refused}");
+    runtime.shutdown().await;
 }

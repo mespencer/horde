@@ -296,16 +296,7 @@ impl WorkspaceManager {
         let agent_root = agents_dir.join(agent_id);
         let mut record = match super::ledger::read(&agents_dir, agent_id).await {
             Some(record) => record,
-            None => LedgerRecord {
-                agent_id: agent_id.clone(),
-                session_id: request.session_id.clone(),
-                policy: policy_name(request.policy).to_owned(),
-                mode: mode_name(mode).to_owned(),
-                branch: branch.clone(),
-                created_at_ms: now_ms(),
-                last_active_at_ms: now_ms(),
-                ..LedgerRecord::default()
-            },
+            None => new_record(request, mode, &branch),
         };
         let reused: Vec<String> = record
             .repos
@@ -313,18 +304,7 @@ impl WorkspaceManager {
             .filter(|repo| !repo.pending)
             .map(|repo| repo.name.clone())
             .collect();
-        let wanted: Vec<String> = if record.repos.is_empty() {
-            match mode {
-                CheckoutMode::Lazy => request.checkout_repos.clone(),
-                _ => definition
-                    .repos
-                    .iter()
-                    .map(|repo| repo.name.clone())
-                    .collect(),
-            }
-        } else {
-            record.repos.iter().map(|repo| repo.name.clone()).collect()
-        };
+        let wanted = wanted_repos(&record, &definition, request, mode);
 
         let mut prepared = Vec::new();
         for repo in definition
@@ -361,25 +341,13 @@ impl WorkspaceManager {
         let manifest = self
             .rewrite_manifest(&agent_root, &definition, &record)
             .await?;
-        let overlay = (record.mode == mode_name(CheckoutMode::Lazy)).then(|| {
-            super::manifest::lazy_overlay(&manifest, &super::manifest::manifest_path(&agent_root))
-        });
-
-        Ok(PreparedCheckout {
-            repos: checked_out_repos(&definition, &record),
-            root: agent_root,
-            prepared: CheckoutPrepared {
-                repos: prepared,
-                mode: if record.mode == mode_name(CheckoutMode::Lazy) {
-                    CheckoutMode::Lazy
-                } else {
-                    CheckoutMode::All
-                }
-                .into(),
-                available_repos: definition.repos.iter().map(|r| r.name.clone()).collect(),
-            },
-            overlay,
-        })
+        Ok(composed(
+            &definition,
+            &record,
+            agent_root,
+            prepared,
+            &manifest,
+        ))
     }
 
     /// Adds one repo to a live agent's checkout: `workspace_checkout`.
@@ -516,39 +484,12 @@ impl WorkspaceManager {
         // composed before the ledger existed — is adopted as it is, never
         // stacked on or re-based under its agent.
         if known.is_none() && destination.join(".git").exists() {
-            let head = commit_of(&destination, "HEAD").await.unwrap_or_default();
-            record.repos.push(LedgerRepo {
-                name: repo.name.clone(),
-                base_commit_sha: head.clone(),
-                resolution: resolution_name(BaseResolution::Reused).to_owned(),
-                created_branch: true,
-                ..LedgerRepo::default()
-            });
-            super::ledger::write(agents_dir, record)
-                .await
-                .map_err(WorkerError::Workspace)?;
-            return Ok(PreparedRepo {
-                repo_name: repo.name.clone(),
-                branch: record.branch.clone(),
-                base_commit_sha: head,
-                resolution: BaseResolution::Reused.into(),
-                ..PreparedRepo::default()
-            });
+            return adopt_existing(agents_dir, record, repo, &destination).await;
         }
         // A crash mid-`worktree add` leaves a pending record and maybe a
         // half-built directory: prune, remove, and redo.
         if known.is_some_and(|known| known.pending) {
-            let _ = git(&instance_repo, &["worktree", "prune"]).await;
-            if destination.exists() {
-                tokio::fs::remove_dir_all(&destination)
-                    .await
-                    .map_err(|error| {
-                        workspace_error(format!(
-                            "could not clear {}: {error}",
-                            destination.display()
-                        ))
-                    })?;
-            }
+            clear_half_built(&instance_repo, &destination).await?;
         }
         let resolved = super::base::prepare_base(
             &instance_repo,
@@ -561,34 +502,15 @@ impl WorkspaceManager {
         )
         .await
         .map_err(WorkerError::Workspace)?;
-
-        record.repos.retain(|r| r.name != repo.name);
-        record.repos.push(LedgerRepo {
-            name: repo.name.clone(),
-            base_commit_sha: resolved.sha.clone(),
-            resolution: resolution_name(resolved.resolution).to_owned(),
-            requested_ref: resolved.requested_ref.clone(),
-            created_branch: false,
-            pending: true,
-        });
-        super::ledger::write(agents_dir, record)
-            .await
-            .map_err(WorkerError::Workspace)?;
-
-        let created_branch = if record.is_fresh_clone() {
-            clone_repo(&instance_repo, &destination, &record.branch, &resolved.sha).await?;
-            true
-        } else {
-            worktree_repo(&instance_repo, &destination, &record.branch, &resolved.sha).await?
-        };
-
-        if let Some(entry) = record.repos.iter_mut().find(|r| r.name == repo.name) {
-            entry.pending = false;
-            entry.created_branch = created_branch;
-        }
-        super::ledger::write(agents_dir, record)
-            .await
-            .map_err(WorkerError::Workspace)?;
+        place_repo(
+            agents_dir,
+            record,
+            repo,
+            &instance_repo,
+            &destination,
+            &resolved,
+        )
+        .await?;
         Ok(prepared_repo(&repo.name, &record.branch, &resolved))
     }
 
@@ -807,6 +729,146 @@ impl WorkspaceManager {
             ..WorkspaceInstanceReport::default()
         }
     }
+}
+
+/// The ledger record a first checkout starts.
+fn new_record(request: &CheckoutRequest, mode: CheckoutMode, branch: &str) -> LedgerRecord {
+    LedgerRecord {
+        agent_id: request.agent_id.clone(),
+        session_id: request.session_id.clone(),
+        policy: policy_name(request.policy).to_owned(),
+        mode: mode_name(mode).to_owned(),
+        branch: branch.to_owned(),
+        created_at_ms: now_ms(),
+        last_active_at_ms: now_ms(),
+        ..LedgerRecord::default()
+    }
+}
+
+/// The repos a checkout composes: the ledger's when it has any (a revival
+/// recomposes the same subset), else every repo under ALL and the initial
+/// repos under LAZY.
+fn wanted_repos(
+    record: &LedgerRecord,
+    definition: &WorkspaceDefinition,
+    request: &CheckoutRequest,
+    mode: CheckoutMode,
+) -> Vec<String> {
+    if !record.repos.is_empty() {
+        return record.repos.iter().map(|repo| repo.name.clone()).collect();
+    }
+    match mode {
+        CheckoutMode::Lazy => request.checkout_repos.clone(),
+        _ => repo_names(definition),
+    }
+}
+
+/// The composed checkout a spawn gets back.
+fn composed(
+    definition: &WorkspaceDefinition,
+    record: &LedgerRecord,
+    agent_root: PathBuf,
+    prepared: Vec<PreparedRepo>,
+    manifest: &super::manifest::Manifest,
+) -> PreparedCheckout {
+    let lazy = record.mode == mode_name(CheckoutMode::Lazy);
+    let overlay = lazy.then(|| {
+        super::manifest::lazy_overlay(manifest, &super::manifest::manifest_path(&agent_root))
+    });
+    PreparedCheckout {
+        repos: checked_out_repos(definition, record),
+        root: agent_root,
+        prepared: CheckoutPrepared {
+            repos: prepared,
+            mode: if lazy {
+                CheckoutMode::Lazy
+            } else {
+                CheckoutMode::All
+            }
+            .into(),
+            available_repos: repo_names(definition),
+        },
+        overlay,
+    }
+}
+
+/// Adopts a checkout already on disk that the ledger does not know, as it
+/// is: `REUSED` at its current HEAD.
+async fn adopt_existing(
+    agents_dir: &Path,
+    record: &mut LedgerRecord,
+    repo: &WorkspaceRepo,
+    destination: &Path,
+) -> Result<PreparedRepo, WorkerError> {
+    let head = commit_of(destination, "HEAD").await.unwrap_or_default();
+    record.repos.push(LedgerRepo {
+        name: repo.name.clone(),
+        base_commit_sha: head.clone(),
+        resolution: resolution_name(BaseResolution::Reused).to_owned(),
+        created_branch: true,
+        ..LedgerRepo::default()
+    });
+    super::ledger::write(agents_dir, record)
+        .await
+        .map_err(WorkerError::Workspace)?;
+    Ok(PreparedRepo {
+        repo_name: repo.name.clone(),
+        branch: record.branch.clone(),
+        base_commit_sha: head,
+        resolution: BaseResolution::Reused.into(),
+        ..PreparedRepo::default()
+    })
+}
+
+/// Clears what a crash mid-`worktree add` left: git's stale entry, then
+/// the half-built directory.
+async fn clear_half_built(instance_repo: &Path, destination: &Path) -> Result<(), WorkerError> {
+    let _ = git(instance_repo, &["worktree", "prune"]).await;
+    match tokio::fs::remove_dir_all(destination).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(workspace_error(format!(
+            "could not clear {}: {error}",
+            destination.display()
+        ))),
+    }
+}
+
+/// Puts one repo in place at its resolved base: the ledger marks it pending
+/// first, the worktree or clone is made, then the ledger records it done.
+async fn place_repo(
+    agents_dir: &Path,
+    record: &mut LedgerRecord,
+    repo: &WorkspaceRepo,
+    instance_repo: &Path,
+    destination: &Path,
+    resolved: &ResolvedBase,
+) -> Result<(), WorkerError> {
+    record.repos.retain(|r| r.name != repo.name);
+    record.repos.push(LedgerRepo {
+        name: repo.name.clone(),
+        base_commit_sha: resolved.sha.clone(),
+        resolution: resolution_name(resolved.resolution).to_owned(),
+        requested_ref: resolved.requested_ref.clone(),
+        created_branch: false,
+        pending: true,
+    });
+    super::ledger::write(agents_dir, record)
+        .await
+        .map_err(WorkerError::Workspace)?;
+    let created_branch = if record.is_fresh_clone() {
+        clone_repo(instance_repo, destination, &record.branch, &resolved.sha).await?;
+        true
+    } else {
+        worktree_repo(instance_repo, destination, &record.branch, &resolved.sha).await?
+    };
+    if let Some(entry) = record.repos.iter_mut().find(|r| r.name == repo.name) {
+        entry.pending = false;
+        entry.created_branch = created_branch;
+    }
+    super::ledger::write(agents_dir, record)
+        .await
+        .map_err(WorkerError::Workspace)
 }
 
 /// A record for an agent directory the ledger does not know: its repos are

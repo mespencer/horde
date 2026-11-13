@@ -548,34 +548,11 @@ pub async fn remove_instance(
             None,
         );
     }
-    let mut events = Vec::new();
-    let mut blocked = Vec::new();
-    for record in manager.records(definition_id).await {
-        let (event, removed) = hard_remove(manager, definition_id, &record, pass, force).await;
-        let refused = event.repos.iter().any(|action| {
-            action.outcome != i32::from(Outcome::Done)
-                && action.outcome != i32::from(Outcome::WouldDo)
-        });
-        if (!removed && !pass.dry_run) || refused {
-            blocked.push(format!("checkout of agent {}", record.agent_id));
-        }
-        events.push(event);
-    }
-    let mut unrecoverable = Vec::new();
+    let (mut events, mut blocked) = remove_checkouts(manager, definition_id, pass, force).await;
     if !force {
         blocked.extend(instance_blockers(manager, &definition, relay_repo_url, pass).await);
     }
-    for path in &definition.unmanaged_paths {
-        let bytes = reclaim::dir_size(&instance_root.join(path))
-            .await
-            .unwrap_or_default();
-        if bytes > 0 || has_entries(&instance_root.join(path)) {
-            unrecoverable.push(RetainedFile {
-                path: path.clone(),
-                bytes,
-            });
-        }
-    }
+    let unrecoverable = unmanaged_data(&instance_root, &definition.unmanaged_paths).await;
     if !unrecoverable.is_empty() && !force {
         blocked.push("non-empty unmanaged data cannot be proven recoverable".to_owned());
     }
@@ -583,29 +560,7 @@ pub async fn remove_instance(
         events.extend(refuse(blocked.join("; "), unrecoverable));
         return (events, None);
     }
-    let freed = reclaim::dir_size(&instance_root).await.unwrap_or_default();
-    let action = if pass.dry_run {
-        RepoAction {
-            outcome: Outcome::WouldDo.into(),
-            bytes_freed: freed,
-            unrecoverable_files: unrecoverable,
-            ..RepoAction::default()
-        }
-    } else {
-        match tokio::fs::remove_dir_all(&instance_root).await {
-            Ok(()) => RepoAction {
-                outcome: Outcome::Done.into(),
-                bytes_freed: freed,
-                unrecoverable_files: unrecoverable,
-                ..RepoAction::default()
-            },
-            Err(error) => RepoAction {
-                outcome: Outcome::Failed.into(),
-                reason: format!("could not remove {}: {error}", instance_root.display()),
-                ..RepoAction::default()
-            },
-        }
-    };
+    let action = delete_instance_root(&instance_root, unrecoverable, pass.dry_run).await;
     let gone = action.outcome == i32::from(Outcome::Done);
     events.push(event(
         manager,
@@ -669,6 +624,73 @@ async fn instance_blockers(
         }
     }
     blocked
+}
+
+/// Hard-removes every checkout of an Instance, returning the events and
+/// which checkouts block the Instance's removal.
+async fn remove_checkouts(
+    manager: &WorkspaceManager,
+    definition_id: &str,
+    pass: Pass<'_>,
+    force: bool,
+) -> (Vec<WorkspaceCleanup>, Vec<String>) {
+    let mut events = Vec::new();
+    let mut blocked = Vec::new();
+    for record in manager.records(definition_id).await {
+        let (event, removed) = hard_remove(manager, definition_id, &record, pass, force).await;
+        let refused = event.repos.iter().any(|action| {
+            action.outcome != i32::from(Outcome::Done)
+                && action.outcome != i32::from(Outcome::WouldDo)
+        });
+        if (!removed && !pass.dry_run) || refused {
+            blocked.push(format!("checkout of agent {}", record.agent_id));
+        }
+        events.push(event);
+    }
+    (events, blocked)
+}
+
+/// The unmanaged paths that hold anything, with their sizes: data nothing
+/// can recover once the Instance goes.
+async fn unmanaged_data(instance_root: &Path, paths: &[String]) -> Vec<RetainedFile> {
+    let mut held = Vec::new();
+    for path in paths {
+        let dir = instance_root.join(path);
+        let bytes = reclaim::dir_size(&dir).await.unwrap_or_default();
+        if bytes > 0 || has_entries(&dir) {
+            held.push(RetainedFile {
+                path: path.clone(),
+                bytes,
+            });
+        }
+    }
+    held
+}
+
+/// Deletes the Instance root, or says a dry run would.
+async fn delete_instance_root(
+    instance_root: &Path,
+    unrecoverable: Vec<RetainedFile>,
+    dry_run: bool,
+) -> RepoAction {
+    let freed = reclaim::dir_size(instance_root).await.unwrap_or_default();
+    let outcome = if dry_run {
+        Outcome::WouldDo
+    } else if let Err(error) = tokio::fs::remove_dir_all(instance_root).await {
+        return RepoAction {
+            outcome: Outcome::Failed.into(),
+            reason: format!("could not remove {}: {error}", instance_root.display()),
+            ..RepoAction::default()
+        };
+    } else {
+        Outcome::Done
+    };
+    RepoAction {
+        outcome: outcome.into(),
+        bytes_freed: freed,
+        unrecoverable_files: unrecoverable,
+        ..RepoAction::default()
+    }
 }
 
 /// What a dry run says one repo's soft reclaim would do.

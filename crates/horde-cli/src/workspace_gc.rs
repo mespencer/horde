@@ -273,18 +273,7 @@ pub async fn run_instance(
 ) -> Result<(), ClientError> {
     match command {
         InstanceCommand::List { workspace, worker } => {
-            let workspace = match workspace {
-                Some(reference) => Some(definition_id(client, reference).await?),
-                None => None,
-            };
-            let instances = client
-                .list_workspace_instances(ListWorkspaceInstancesRequest {
-                    worker_id: worker.as_ref().map(WorkerId::new),
-                    workspace_definition_id: workspace.map(WorkspaceDefinitionId::new),
-                })
-                .await?;
-            println!("{}", render_instances(&instances, format));
-            Ok(())
+            list_instances(client, workspace.as_deref(), worker.as_deref(), format).await
         }
         InstanceCommand::Remove {
             workspace,
@@ -293,30 +282,84 @@ pub async fn run_instance(
             dry_run,
             wait,
         } => {
-            let wait = parse_duration("--wait", wait)?;
-            let id = definition_id(client, workspace).await?;
-            let response = client
-                .remove_workspace_instance(RemoveWorkspaceInstanceRequest {
-                    workspace_definition_id: Some(WorkspaceDefinitionId::new(id)),
-                    worker_id: Some(WorkerId::new(worker)),
-                    force: *force,
-                    dry_run: *dry_run,
-                })
-                .await?;
-            let (targeted, offline) = if response.targeted {
-                (vec![worker.clone()], Vec::new())
-            } else {
-                (Vec::new(), vec![worker.clone()])
+            let removal = Removal {
+                workspace,
+                worker,
+                force: *force,
+                dry_run: *dry_run,
+                wait,
             };
-            let expected = Expected {
-                request_id: response.request_id,
-                targeted,
-                offline,
-                unsupported: Vec::new(),
-            };
-            await_answers(client, &expected, response.sequence, wait, *dry_run, format).await
+            remove_instance(client, removal, format).await
         }
     }
+}
+
+/// What `instance remove` was asked.
+#[derive(Debug, Clone, Copy)]
+struct Removal<'a> {
+    workspace: &'a str,
+    worker: &'a str,
+    force: bool,
+    dry_run: bool,
+    wait: &'a str,
+}
+
+async fn list_instances(
+    client: &mut Client,
+    workspace: Option<&str>,
+    worker: Option<&str>,
+    format: Format,
+) -> Result<(), ClientError> {
+    let workspace = match workspace {
+        Some(reference) => Some(definition_id(client, reference).await?),
+        None => None,
+    };
+    let instances = client
+        .list_workspace_instances(ListWorkspaceInstancesRequest {
+            worker_id: worker.map(WorkerId::new),
+            workspace_definition_id: workspace.map(WorkspaceDefinitionId::new),
+        })
+        .await?;
+    println!("{}", render_instances(&instances, format));
+    Ok(())
+}
+
+async fn remove_instance(
+    client: &mut Client,
+    removal: Removal<'_>,
+    format: Format,
+) -> Result<(), ClientError> {
+    let wait = parse_duration("--wait", removal.wait)?;
+    let id = definition_id(client, removal.workspace).await?;
+    let response = client
+        .remove_workspace_instance(RemoveWorkspaceInstanceRequest {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new(id)),
+            worker_id: Some(WorkerId::new(removal.worker)),
+            force: removal.force,
+            dry_run: removal.dry_run,
+        })
+        .await?;
+    let worker = vec![removal.worker.to_owned()];
+    let (targeted, offline) = if response.targeted {
+        (worker, Vec::new())
+    } else {
+        (Vec::new(), worker)
+    };
+    let expected = Expected {
+        request_id: response.request_id,
+        targeted,
+        offline,
+        unsupported: Vec::new(),
+    };
+    await_answers(
+        client,
+        &expected,
+        response.sequence,
+        wait,
+        removal.dry_run,
+        format,
+    )
+    .await
 }
 
 /// Runs `workspace delete`, with or without `--purge`.

@@ -70,67 +70,82 @@ pub async fn removable(target: Target<'_>) -> Proof {
 }
 
 async fn checks(target: Target<'_>) -> Result<Proof, String> {
-    if let Some(reason) = dirty(target.checkout).await? {
+    if let Some(reason) = tree_refusal(target).await? {
         return Ok(Proof::not(reason));
     }
+    if let Some(reason) = history_refusal(target).await? {
+        return Ok(Proof::not(reason));
+    }
+    let unrecoverable = unrecoverable_ignored(target.checkout, target.output_paths).await?;
+    match unrecoverable.first() {
+        None => Ok(Proof::Lossless),
+        Some(first) => Ok(Proof::NotProvable {
+            reason: format!(
+                "{} ignored path(s) outside the reclaim command's outputs, e.g. {}",
+                unrecoverable.len(),
+                first.path
+            ),
+            unrecoverable: unrecoverable.clone(),
+        }),
+    }
+}
+
+/// Rules 1–3: the working tree is clean, no operation is in progress, and
+/// the worktree is not locked.
+async fn tree_refusal(target: Target<'_>) -> Result<Option<String>, String> {
+    if let Some(reason) = dirty(target.checkout).await? {
+        return Ok(Some(reason));
+    }
     if let Some(operation) = operation_in_progress(target.checkout).await? {
-        return Ok(Proof::not(format!("a {operation} is in progress")));
+        return Ok(Some(format!("a {operation} is in progress")));
     }
     if !target.fresh_clone && is_locked(target.instance_repo, target.checkout).await? {
-        return Ok(Proof::not("the worktree is locked"));
+        return Ok(Some("the worktree is locked".to_owned()));
     }
+    Ok(None)
+}
+
+/// Rules 4–5: the pin of HEAD covers the branch, and a fresh clone holds
+/// nothing outside HEAD's history.
+async fn history_refusal(target: Target<'_>) -> Result<Option<String>, String> {
     let head = commit_of(target.checkout, "HEAD")
         .await
         .ok_or_else(|| "HEAD names no commit".to_owned())?;
-    let branch_ref = format!("refs/heads/{}", target.branch);
     let branch_holder = if target.fresh_clone {
         target.checkout
     } else {
         target.instance_repo
     };
-    if let Some(tip) = commit_of(branch_holder, &branch_ref).await
+    if let Some(tip) = commit_of(branch_holder, &format!("refs/heads/{}", target.branch)).await
         && tip != head
         && !git_check(branch_holder, &["merge-base", "--is-ancestor", &tip, &head]).await?
     {
-        return Ok(Proof::not(format!(
+        return Ok(Some(format!(
             "branch {} holds commits HEAD does not",
             target.branch
         )));
     }
-    if target.fresh_clone {
-        // Every local ref — branches, tags, the stash — minus HEAD's
-        // history. Remote-tracking refs are the Instance's own branches,
-        // which survive the clone's removal, so they are not this clone's.
-        let extra = git(
-            target.checkout,
-            &[
-                "rev-list",
-                "--branches",
-                "--tags",
-                "--glob=refs/stash",
-                "--not",
-                &head,
-            ],
-        )
-        .await?;
-        if !extra.trim().is_empty() {
-            return Ok(Proof::not(
-                "the clone holds commits outside HEAD's history (another branch or a stash)",
-            ));
-        }
+    if !target.fresh_clone {
+        return Ok(None);
     }
-    let unrecoverable = unrecoverable_ignored(target.checkout, target.output_paths).await?;
-    if !unrecoverable.is_empty() {
-        let count = unrecoverable.len();
-        return Ok(Proof::NotProvable {
-            reason: format!(
-                "{count} ignored path(s) outside the reclaim command's outputs, e.g. {}",
-                unrecoverable[0].path
-            ),
-            unrecoverable,
-        });
-    }
-    Ok(Proof::Lossless)
+    // Every local ref — branches, tags, the stash — minus HEAD's history.
+    // Remote-tracking refs are the Instance's own branches, which survive
+    // the clone's removal, so they are not this clone's.
+    let extra = git(
+        target.checkout,
+        &[
+            "rev-list",
+            "--branches",
+            "--tags",
+            "--glob=refs/stash",
+            "--not",
+            &head,
+        ],
+    )
+    .await?;
+    Ok((!extra.trim().is_empty()).then(|| {
+        "the clone holds commits outside HEAD's history (another branch or a stash)".to_owned()
+    }))
 }
 
 /// Why the tree is dirty, or `None`: tracked changes and untracked
@@ -288,31 +303,32 @@ pub async fn remove_repo(
     .await?;
     if !force {
         // Closes the window between the check and the pin.
-        if let Some(reason) = dirty(target.checkout).await? {
+        if let Some(reason) = tree_refusal(target).await? {
             return Err(format!("changed after the check: {reason}"));
         }
-        if let Some(operation) = operation_in_progress(target.checkout).await? {
-            return Err(format!("a {operation} started after the check"));
-        }
     }
-    if target.fresh_clone {
-        tokio::fs::remove_dir_all(target.checkout)
-            .await
-            .map_err(|error| format!("could not remove {}: {error}", target.checkout.display()))?;
-    } else {
-        let destination = path_str(target.checkout);
-        let mut arguments = vec!["worktree", "remove"];
-        if force {
-            // Twice: also through a lock.
-            arguments.extend(["--force", "--force"]);
-        }
-        arguments.push(&destination);
-        git(target.instance_repo, &arguments).await?;
-    }
+    delete_checkout(target, force).await?;
     delete_branch(target, created_branch).await?;
     Ok(Removed {
         pinned_commit_sha: head,
     })
+}
+
+/// Deletes the checkout itself: a clone's directory, or the worktree
+/// through git (forced, twice, also through a lock).
+async fn delete_checkout(target: Target<'_>, force: bool) -> Result<(), String> {
+    if target.fresh_clone {
+        return tokio::fs::remove_dir_all(target.checkout)
+            .await
+            .map_err(|error| format!("could not remove {}: {error}", target.checkout.display()));
+    }
+    let destination = path_str(target.checkout);
+    let mut arguments = vec!["worktree", "remove"];
+    if force {
+        arguments.extend(["--force", "--force"]);
+    }
+    arguments.push(&destination);
+    git(target.instance_repo, &arguments).await.map(|_| ())
 }
 
 /// Deletes the agent's branch in the Instance repo when the Worker created

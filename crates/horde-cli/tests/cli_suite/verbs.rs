@@ -495,3 +495,108 @@ async fn a_verb_against_a_missing_session_fails_rather_than_printing_nothing() {
     .expect_err("usage against a missing session must fail");
     assert!(error.to_string().contains("session-that-never-existed"));
 }
+
+/// The workspace verbs ADR-0014 adds, in-process against a real server with
+/// no workers: a create with every policy flag, an instance listing, a gc
+/// that has no holder to wait for, a log read, an instance removal whose
+/// worker is away (exit status 3, the command waiting for it), and a purge
+/// that is only a dry run (the definition stays).
+#[tokio::test]
+async fn the_workspace_cleanup_verbs_round_trip() {
+    let endpoint = serve().await.expect("a listening server");
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "create",
+            "suite",
+            "--repo",
+            "atlas=https://example.com/atlas.git",
+            "--checkout-mode",
+            "lazy",
+            "--reclaim",
+            r#"atlas=["make","clean"]"#,
+            "--reclaim-timeout",
+            "atlas=20m",
+            "--idle-reclaim-after",
+            "0",
+            "--archived-grace",
+            "24h",
+        ],
+    )
+    .await
+    .expect("the create applies");
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("a client");
+    let definition = client
+        .get_workspace_definition("suite")
+        .await
+        .expect("defined")
+        .definition
+        .expect("a definition");
+    assert_eq!(
+        definition.checkout_mode,
+        i32::from(horde_proto::v1::CheckoutMode::Lazy)
+    );
+    assert_eq!(
+        definition
+            .cleanup
+            .and_then(|cleanup| cleanup.archived_grace)
+            .map(|grace| grace.seconds),
+        Some(86_400)
+    );
+    assert!(definition.repos[0].reclaim.is_some());
+
+    invoke(&endpoint, &["workspace", "instance", "list", "suite"])
+        .await
+        .expect("an empty listing");
+    invoke(
+        &endpoint,
+        &["workspace", "gc", "suite", "--soft", "--wait", "1s"],
+    )
+    .await
+    .expect("nothing holds an instance, so nothing is pending");
+    invoke(&endpoint, &["--json", "workspace", "log"])
+        .await
+        .expect("the log reads");
+
+    let away = invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "instance",
+            "remove",
+            "suite",
+            "--worker",
+            "away",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect_err("the worker is away");
+    assert!(away.to_string().contains("offline"), "{away}");
+
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "delete",
+            &definition
+                .workspace_definition_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            "--etag",
+            &definition.etag,
+            "--purge",
+            "--dry-run",
+        ],
+    )
+    .await
+    .expect("a dry-run purge applies");
+    assert!(
+        client.get_workspace_definition("suite").await.is_ok(),
+        "a dry-run purge keeps the definition"
+    );
+}

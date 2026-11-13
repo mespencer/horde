@@ -5,7 +5,6 @@
 //! Pure functions over wire types, so each rule is a truth table here and
 //! the RPC handlers stay thin.
 
-use std::collections::BTreeSet;
 use std::path::{Component, Path};
 use std::time::Duration;
 
@@ -300,10 +299,7 @@ pub fn validated_spawn(
     definition: Option<&WorkspaceDefinition>,
     agent_id: &str,
 ) -> Result<AgentSpec, ServerError> {
-    let asks = !spec.branch.is_empty()
-        || !spec.repo_bases.is_empty()
-        || !spec.checkout_repos.is_empty()
-        || spec.checkout_mode == i32::from(CheckoutMode::Lazy);
+    let asks = needs_workspace_protocol(&spec);
     let Some(definition) = definition else {
         if asks {
             return Err(ServerError::Invalid(
@@ -320,51 +316,55 @@ pub fn validated_spawn(
         ));
     }
     validate_branch(&spec.branch, agent_id)?;
-    let names: BTreeSet<&str> = definition
+    for repo in &spec.checkout_repos {
+        known_repo(definition, repo, "no repo")?;
+    }
+    for base in &mut spec.repo_bases {
+        validate_base(definition, base)?;
+    }
+    Ok(spec)
+}
+
+/// Refuses a repo name the Definition does not hold, listing the ones it
+/// does.
+fn known_repo(definition: &WorkspaceDefinition, name: &str, what: &str) -> Result<(), ServerError> {
+    if definition.repos.iter().any(|repo| repo.name == name) {
+        return Ok(());
+    }
+    let listed: Vec<&str> = definition
         .repos
         .iter()
         .map(|repo| repo.name.as_str())
         .collect();
-    let listed = || names.iter().copied().collect::<Vec<_>>().join(", ");
-    for repo in &spec.checkout_repos {
-        if !names.contains(repo.as_str()) {
-            return Err(ServerError::Invalid(format!(
-                "no repo {repo:?} in workspace {}; valid repos: {}",
-                definition.name,
-                listed()
-            )));
-        }
+    Err(ServerError::Invalid(format!(
+        "{what} {name:?} in workspace {}; valid repos: {}",
+        definition.name,
+        listed.join(", ")
+    )))
+}
+
+/// Refuses an option-shaped or empty ref, fills a bare base's repo in a
+/// one-repo workspace, and refuses one naming no repo of the Definition.
+fn validate_base(
+    definition: &WorkspaceDefinition,
+    base: &mut horde_proto::v1::RepoBase,
+) -> Result<(), ServerError> {
+    if base.r#ref.is_empty() || base.r#ref.starts_with('-') {
+        return Err(ServerError::Invalid(format!(
+            "base {:?} is not a commit, branch or tag",
+            base.r#ref
+        )));
     }
-    for base in &mut spec.repo_bases {
-        if base.r#ref.is_empty() || base.r#ref.starts_with('-') {
+    if base.repo_name.is_empty() {
+        let [only] = definition.repos.as_slice() else {
             return Err(ServerError::Invalid(format!(
-                "base {:?} is not a commit, branch or tag",
-                base.r#ref
+                "a bare base names no repo, and workspace {} has several: name it as REPO=REF",
+                definition.name
             )));
-        }
-        if base.repo_name.is_empty() {
-            match definition.repos.as_slice() {
-                [only] => base.repo_name = only.name.clone(),
-                _ => {
-                    return Err(ServerError::Invalid(format!(
-                        "a bare base names no repo, and workspace {} has several: name it as \
-                         REPO=REF ({})",
-                        definition.name,
-                        listed()
-                    )));
-                }
-            }
-        }
-        if !names.contains(base.repo_name.as_str()) {
-            return Err(ServerError::Invalid(format!(
-                "a base names repo {:?}, not one of workspace {}'s: {}",
-                base.repo_name,
-                definition.name,
-                listed()
-            )));
-        }
+        };
+        base.repo_name = only.name.clone();
     }
-    Ok(spec)
+    known_repo(definition, &base.repo_name, "a base names repo")
 }
 
 /// Whether a spawn uses any ADR-0014 field, and so needs a Worker of
