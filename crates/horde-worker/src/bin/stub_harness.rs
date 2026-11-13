@@ -44,9 +44,19 @@ fn main() -> std::process::ExitCode {
 /// Starts a SIGTERM-ignoring sleeper in this harness's process group and
 /// records its pid — written after the spawn, so a test that reads the file
 /// knows the child exists.
+///
+/// On Windows the sleeper is `ping -n 600` — there is no SIGTERM to ignore
+/// there, and a job's members die however they feel about it.
 fn start_grandchild(pidfile: &str) {
-    let spawned = std::process::Command::new("/bin/sh")
-        .args(["-c", "trap '' TERM; exec sleep 600"])
+    #[cfg(unix)]
+    let mut command = std::process::Command::new("/bin/sh");
+    #[cfg(unix)]
+    command.args(["-c", "trap '' TERM; exec sleep 600"]);
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new("ping.exe");
+    #[cfg(not(unix))]
+    command.args(["-n", "600", "127.0.0.1"]);
+    let spawned = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn();

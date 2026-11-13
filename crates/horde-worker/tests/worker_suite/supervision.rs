@@ -826,6 +826,9 @@ mod process_identity {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// Process groups are Unix; Windows trees are jobs (ADR-0017, and the
+// Windows tests beside `horde_worker::process_tree`).
+#[cfg(unix)]
 mod process_groups {
     use std::sync::Arc;
 

@@ -712,7 +712,6 @@ mod tests {
     /// an account that is not a directory name are each refused by name.
     #[test]
     fn an_account_login_targets_that_accounts_profile_directory() {
-        use std::os::unix::fs::PermissionsExt;
         let scratch = tempfile::tempdir().expect("a tempdir");
         let profile = scratch.path().join("claude");
         let per_account = LoginRecipe::terminal_only("claude", vec!["login".to_owned()])
@@ -749,11 +748,16 @@ mod tests {
                 ("CLAUDE_CONFIG_DIR".to_owned(), dir.display().to_string()),
             ]
         );
-        let mode = std::fs::metadata(&dir)
-            .expect("the directory is prepared")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700);
+        assert!(dir.is_dir(), "the directory is prepared");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir)
+                .expect("the directory is prepared")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
 
         // Prepared is not signed in; once the login writes there, the
         // account is advertised under the provider whose recipe signs it in.
@@ -816,6 +820,7 @@ mod tests {
     /// A real PTY session end to end without any relay: spawn a prompt
     /// script, type at it, read its output, and see the reap deliver the
     /// exit code — the supervision half the e2e drives remotely.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_pty_session_carries_prompts_input_and_its_exit_code() {
         let recipe = LoginRecipe::terminal_only(
@@ -878,6 +883,7 @@ mod tests {
 
     /// The kill path: a command that would run forever is killed by handle
     /// and provably reaped — the wait returns — with no orphan left behind.
+    #[cfg(unix)]
     #[tokio::test]
     async fn killing_a_login_reaps_it_provably() {
         let recipe = LoginRecipe::terminal_only(
@@ -902,6 +908,75 @@ mod tests {
             session.reaped.is_finished(),
             "the wait thread is done: the child was reaped, not abandoned"
         );
+    }
+
+    /// A ConPTY session reaches EOF once its command exits: the reaping wait
+    /// closes the pseudoconsole, without which a ConPTY's output never ends
+    /// (ADR-0017) — and the code is the command's own.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_conpty_session_reaches_eof_when_its_command_exits() {
+        let recipe = LoginRecipe::terminal_only(
+            "cmd.exe",
+            vec![
+                "/C".to_owned(),
+                "echo hello %HORDE_LOGIN_TARGET% & exit 7".to_owned(),
+            ],
+        )
+        .with_env(vec![(
+            "HORDE_LOGIN_TARGET".to_owned(),
+            "default".to_owned(),
+        )]);
+        let mut session = spawn_login_pty(
+            &recipe,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("cmd spawns in a ConPTY");
+
+        let mut seen = String::new();
+        within("the output reaches EOF", async {
+            while let Some(chunk) = session.output.recv().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await;
+        assert!(seen.contains("hello default"), "{seen:?}");
+        let code = within("the reap returns", &mut session.reaped)
+            .await
+            .expect("the wait thread must not panic");
+        assert_eq!(code, Some(7), "the exit code is the command's own");
+    }
+
+    /// The ConPTY kill path: a command that would run forever is killed by
+    /// handle and reaped, and the closed pseudoconsole ends its output.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn killing_a_conpty_login_reaps_it_and_ends_its_output() {
+        let recipe = LoginRecipe::terminal_only(
+            "cmd.exe",
+            vec!["/C".to_owned(), "ping -n 600 127.0.0.1 >NUL".to_owned()],
+        );
+        let mut session = spawn_login_pty(
+            &recipe,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("cmd spawns in a ConPTY");
+        let _code = within("kill and reap", super::kill_and_reap(&mut session)).await;
+        assert!(session.reaped.is_finished());
+        within("the output ends", async {
+            while session.output.recv().await.is_some() {}
+        })
+        .await;
     }
 
     /// A scripted tunnel: the test plays the relay side, feeding
