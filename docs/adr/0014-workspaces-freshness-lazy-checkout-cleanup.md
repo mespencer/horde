@@ -19,7 +19,7 @@ nothing reacts when the disk fills. Three wire pieces are half-built:
 producer, and the Worker never calls `ReportWorkspaceInstances` (registration
 carries `warm_instances`, so the RPC has no caller at all).
 
-The operator settled the shape on 2026-11-12/13 (docs/WAVE12.md, W12d). This
+The operator settled the shape on 2026-11-12/13. This
 ADR turns those decisions into a design concrete enough to implement. It
 keeps everything DESIGN §7 and ADR-0002 already say: Definition versus
 Instance, the Worker's state file as the truth, Instances never
@@ -1050,7 +1050,7 @@ ground rules, no test re-implements a predicate to check it.
   Workers is refused; `delete --purge` removes the Instances on both
   Workers.
 - Mutation testing runs scoped to the diff at the item's final handoff
-  (WAVE12 ground rules).
+  (the wave's ground rules).
 
 ## Considered options
 
