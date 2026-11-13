@@ -437,14 +437,11 @@ fn the_foreground_start_joins_with_the_token_off_argv_and_removes_it() -> Outcom
 
 /// Runs the foreground start script against a stand-in worker that does
 /// `then` instead of joining, waiting at most `wait_secs`.
-fn foreground_start_of(
-    then: &str,
-    wait_secs: u64,
-) -> Result<(tempfile::TempDir, std::process::Output), Box<dyn std::error::Error>> {
-    let home = tempfile::tempdir()?;
-    let record = tempfile::tempdir()?;
+fn foreground_start_of(then: &str, wait_secs: u64) -> (tempfile::TempDir, std::process::Output) {
+    let home = tempfile::tempdir().expect("a home");
+    let record = tempfile::tempdir().expect("a record dir");
     let dir = RemoteDir::Home("b".to_owned());
-    std::fs::create_dir_all(home.path().join("b"))?;
+    std::fs::create_dir_all(home.path().join("b")).expect("the bin dir");
     fake_worker(&home.path().join("b"), record.path(), then);
     let script = start_script(
         &dir,
@@ -453,12 +450,12 @@ fn foreground_start_of(
         wait_secs,
     );
     let out = run_sh(&script, home.path(), None, "tok\n");
-    Ok((home, out))
+    (home, out)
 }
 
 #[test]
 fn a_worker_that_dies_before_joining_ends_the_wait_with_its_log() -> Outcome {
-    let (home, out) = foreground_start_of("exit 1", 20)?;
+    let (home, out) = foreground_start_of("exit 1", 20);
     assert_eq!(out.status.code(), Some(3), "{out:?}");
     let started = parse_started(&String::from_utf8_lossy(&out.stdout));
     assert!(!started.joined);
@@ -473,7 +470,7 @@ fn a_worker_that_dies_before_joining_ends_the_wait_with_its_log() -> Outcome {
 
 #[test]
 fn a_join_that_never_lands_times_out_and_still_removes_the_token() -> Outcome {
-    let (home, out) = foreground_start_of("sleep 3", 1)?;
+    let (home, out) = foreground_start_of("sleep 3", 1);
     assert_eq!(out.status.code(), Some(4), "{out:?}");
     let started = parse_started(&String::from_utf8_lossy(&out.stdout));
     assert_eq!(started.failure.as_deref(), Some("timeout"));

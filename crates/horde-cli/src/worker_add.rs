@@ -561,6 +561,18 @@ pub fn harness_warnings(adapters: &[String], harnesses: &[plan::Harness]) -> Vec
         .collect()
 }
 
+/// The warning a systemd machine without lingering earns: its user
+/// services stop at logout, the worker with them.
+#[must_use]
+pub fn linger_warning(started: &plan::Started, target: &str) -> Option<String> {
+    (started.linger == Some(false)).then(|| {
+        format!(
+            "systemd stops this user's services at logout; run `loginctl enable-linger` on \
+             {target} to keep the worker running"
+        )
+    })
+}
+
 /// The finished report in either format.
 #[must_use]
 pub fn render(added: &Added, format: Format) -> String {
@@ -799,13 +811,7 @@ pub async fn run(
     .await?;
     let harnesses = plan::parse_harnesses(&run_step(&steps, "harnesses", None).await?);
     warnings.extend(harness_warnings(&checked.adapters, &harnesses));
-    if started.linger == Some(false) {
-        warnings.push(format!(
-            "systemd stops this user's services at logout; run `loginctl enable-linger` on {} \
-             to keep the worker running",
-            checked.remote.target
-        ));
-    }
+    warnings.extend(linger_warning(&started, &checked.remote.target));
     let mode = start_mode(&checked, &context);
     let added = Added {
         name: checked.name.clone(),
