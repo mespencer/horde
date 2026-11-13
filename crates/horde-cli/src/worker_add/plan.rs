@@ -320,7 +320,11 @@ pub fn sh_word(text: &str) -> String {
         && text
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-/:@=,+".contains(&b));
-    if bare { text.to_owned() } else { sh_quote(text) }
+    if bare {
+        text.to_owned()
+    } else {
+        sh_quote(text)
+    }
 }
 
 /// One local command line: the program and its arguments.
@@ -588,7 +592,12 @@ fn write_file(path_expr: &str, content: &str) -> String {
 /// Prints `pid <n>` (foreground), `linger <yes|no>` (systemd), then
 /// `joined`, or `exited`/`timeout` followed by `log …` lines.
 #[must_use]
-pub fn start_script(dir: &RemoteDir, adapters: &[String], mode: &StartMode, wait_secs: u64) -> String {
+pub fn start_script(
+    dir: &RemoteDir,
+    adapters: &[String],
+    mode: &StartMode,
+    wait_secs: u64,
+) -> String {
     let launcher_expr = format!("{}/{LAUNCHER}", dir.shell());
     let mut script = format!(
         "set -eu\n\
@@ -599,10 +608,7 @@ pub fn start_script(dir: &RemoteDir, adapters: &[String], mode: &StartMode, wait
          trap 'rm -f \"$tok\"' EXIT\n\
          cat > \"$tok\"\n"
     );
-    script.push_str(&write_file(
-        &launcher_expr,
-        &launcher_script(adapters),
-    ));
+    script.push_str(&write_file(&launcher_expr, &launcher_script(adapters)));
     script.push_str(&format!("chmod 700 {launcher_expr}\n"));
     script.push_str(&launch_lines(mode, &launcher_expr));
     script.push_str(&wait_lines(mode, wait_secs));

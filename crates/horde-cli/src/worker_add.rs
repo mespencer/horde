@@ -364,7 +364,12 @@ pub fn dry_run(args: &AddArgs, format: Format) -> Result<(), ClientError> {
 
 /// The dry-run plan in either format.
 #[must_use]
-pub fn render_plan(checked: &Checked, source: &Source, context: &Context, format: Format) -> String {
+pub fn render_plan(
+    checked: &Checked,
+    source: &Source,
+    context: &Context,
+    format: Format,
+) -> String {
     let mut steps = Vec::new();
     let build = source.build(context.platform);
     steps.push(probe_step(checked));
@@ -475,7 +480,7 @@ pub async fn execute(
     }
     let output = tokio::time::timeout(limit, child.wait_with_output())
         .await
-        .map_err(|_| refusal(format!("{step}: no answer within {}s", limit.as_secs())))?
+        .map_err(|_| refusal(format!("{step}: no answer within {limit:?}")))?
         .map_err(|error| refusal(format!("{step}: {error}")))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if output.status.success() {
@@ -770,7 +775,13 @@ pub async fn run(
     let checked = checked(args)?;
     let source = Source::of(args, exe_dir(), cargo_target_dir())?;
     progress(format, &format!("probing {}", checked.remote.target));
-    let probed = execute("probe", &probe_step(&checked).invocation, None, STEP_CEILING).await?;
+    let probed = execute(
+        "probe",
+        &probe_step(&checked).invocation,
+        None,
+        STEP_CEILING,
+    )
+    .await?;
     let probe = plan::parse_probe(&probed).map_err(refusal)?;
     let context = context_of(&checked.remote.target, &probe)?;
     let binary = local_binary(&source, &checked, &context, format).await?;
@@ -780,7 +791,12 @@ pub async fn run(
     let token = mint(client, &checked, endpoint, args.ttl_minutes, &mut warnings).await?;
     let started = start(&steps, &token, format).await?;
     progress(format, &format!("waiting for {} to register", checked.name));
-    await_registration(client, &checked.name, Duration::from_secs(checked.wait_secs)).await?;
+    await_registration(
+        client,
+        &checked.name,
+        Duration::from_secs(checked.wait_secs),
+    )
+    .await?;
     let harnesses = plan::parse_harnesses(&run_step(&steps, "harnesses", None).await?);
     warnings.extend(harness_warnings(&checked.adapters, &harnesses));
     if started.linger == Some(false) {
@@ -795,13 +811,17 @@ pub async fn run(
         name: checked.name.clone(),
         target: checked.remote.target.clone(),
         platform: context.platform,
-        binary: format!("{}/{}", checked.dir.absolute(&context.home), plan::WORKER_BINARY),
+        binary: format!(
+            "{}/{}",
+            checked.dir.absolute(&context.home),
+            plan::WORKER_BINARY
+        ),
         version,
         mode: mode_word(&mode),
         pid: started.pid,
-        log: started.pid.map(|_| {
-            format!("{}/{}/{}", context.home, plan::STATE_ROOT, plan::LOG_FILE)
-        }),
+        log: started
+            .pid
+            .map(|_| format!("{}/{}/{}", context.home, plan::STATE_ROOT, plan::LOG_FILE)),
         harnesses,
         adapters: checked.adapters.clone(),
         warnings,
@@ -848,7 +868,10 @@ async fn run_step(steps: &[Step], name: &str, stdin: Option<&str>) -> Result<Str
 
 /// Prepare, copy, install: the binary's `--version` line on success.
 async fn install(steps: &[Step], checked: &Checked, format: Format) -> Result<String, ClientError> {
-    progress(format, &format!("installing into {}", checked.dir.scp_path()));
+    progress(
+        format,
+        &format!("installing into {}", checked.dir.scp_path()),
+    );
     run_step(steps, "prepare", None).await?;
     run_step(steps, "copy", None).await?;
     let version = run_step(steps, "install", None).await?;
