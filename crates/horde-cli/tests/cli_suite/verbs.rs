@@ -327,6 +327,7 @@ async fn the_workspace_verbs_round_trip_through_the_dispatch() {
             name: "atlas-renamed".to_owned(),
             unmanaged_paths: definition.unmanaged_paths.clone(),
             repos: definition.repos.clone(),
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect("a same-repo-set update applies");

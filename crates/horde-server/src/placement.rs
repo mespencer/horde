@@ -302,10 +302,8 @@ pub async fn ensure_instance(
         workspace_definition_id: Some(WorkspaceDefinitionId::new(definition_id)),
         worker_id: Some(WorkerId::new(worker_id)),
         state: WorkspaceInstanceState::Materializing as i32,
-        root_path: String::new(),
-        repos: Vec::new(),
         detail: "materialization requested".to_owned(),
-        observed_at: None,
+        ..WorkspaceInstanceReport::default()
     });
     Ok(())
 }
@@ -369,6 +367,7 @@ pub async fn place_queued(core: &ServerCore) -> Result<(), ServerError> {
                 harness: harness.as_deref(),
                 load: &load,
                 now_unix_ms: now,
+                needs_workspace_protocol: crate::workspace_policy::needs_workspace_protocol(&spec),
             });
 
             match disposition(agent, placement, now) {

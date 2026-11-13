@@ -297,16 +297,16 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
     let endpoint = horde_server_testkit::serve().await?;
     let mut client = horde_cli::client::Client::connect(&endpoint).await?;
     let definition = client
-        .create_workspace_definition(
-            "atlas-ws",
-            vec![horde_proto::v1::WorkspaceRepo {
+        .create_workspace_definition(horde_proto::v1::CreateWorkspaceDefinitionRequest {
+            name: "atlas-ws".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
                 name: "atlas".to_owned(),
                 remote_url: "https://example.invalid/atlas.git".to_owned(),
                 default_branch: "main".to_owned(),
-                layout_path: String::new(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
-            Vec::new(),
-        )
+            ..horde_proto::v1::CreateWorkspaceDefinitionRequest::default()
+        })
         .await?;
     let tier = |name: &str| {
         Some(horde_proto::v1::ModelSelection {

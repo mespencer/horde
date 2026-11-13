@@ -490,15 +490,24 @@ async fn spawned_awaiting_permission(runtime: &mut Runtime) {
 
 /// The first journaled event, which must be a workspace instance report.
 async fn first_instance_report(runtime: &Runtime) -> horde_proto::v1::WorkspaceInstanceReport {
-    let events = journal_at_least(runtime, 1).await;
-    match events[0]
-        .event
-        .as_ref()
-        .and_then(|event| event.kind.as_ref())
-    {
-        Some(Kind::WorkspaceInstanceChanged(changed)) => changed.report.clone().expect("a report"),
-        other => panic!("expected a workspace instance report, got {other:?}"),
-    }
+    let events = journal_satisfying(runtime, "the materialize's final report", |events| {
+        final_report(events).is_some()
+    })
+    .await;
+    final_report(&events).expect("a final report")
+}
+
+/// The first instance report that is not a progress step: what a
+/// materialize ends with (ADR-0014 journals its steps before it).
+fn final_report(
+    events: &[horde_proto::v1::JournaledEvent],
+) -> Option<horde_proto::v1::WorkspaceInstanceReport> {
+    events.iter().find_map(|journaled| match journaled.event.as_ref()?.kind.as_ref()? {
+        Kind::WorkspaceInstanceChanged(changed) if changed.progress.is_none() => {
+            changed.report.clone()
+        }
+        _ => None,
+    })
 }
 
 /// A decision missing its request id cannot be applied, and is journaled
@@ -1593,12 +1602,20 @@ fn materialize_command(sequence: u64, origin: &std::path::Path) -> StreamCommand
                     remote_url: origin.display().to_string(),
                     default_branch: "main".to_owned(),
                     layout_path: String::new(),
+                    ..horde_proto::v1::WorkspaceRepo::default()
                 }],
                 unmanaged_paths: Vec::new(),
                 created_at: None,
                 etag: "1".to_owned(),
+                ..horde_proto::v1::WorkspaceDefinition::default()
             }),
             session_id: Some(SessionId::new("s1")),
+            // No grace: a lossless archived checkout goes at archive, which
+            // is what the archive tests here observe (ADR-0014).
+            policy: Some(horde_proto::v1::ResolvedWorkspacePolicy {
+                archived_grace: Some(horde_proto::prost_types::Duration::default()),
+                ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+            }),
         })),
     }
 }
@@ -1820,6 +1837,12 @@ fn workspace_spawn(sequence: u64, agent: &str, workspace: &str) -> StreamCommand
         spec.workspace_definition_id = Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace));
         spec.checkout_policy = horde_proto::v1::CheckoutPolicy::Worktree as i32;
     }
+    if let Some(Command::SpawnAgent(command)) = &mut spawn.command {
+        command.workspace_policy = Some(horde_proto::v1::ResolvedWorkspacePolicy {
+            archived_grace: Some(horde_proto::prost_types::Duration::default()),
+            ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+        });
+    }
     spawn
 }
 
@@ -1917,17 +1940,26 @@ async fn a_spawn_that_cannot_start_releases_what_it_minted() {
         .expect("the command applies; the agent is what failed");
     settle(&runtime).await;
     assert_eq!(runtime.running_agents(), 0);
-    // events[0] is the materialize report; the spawn's failure follows.
-    let events = journal_at_least(&runtime, 2).await;
+    // The materialize's progress and report come first; the spawn's
+    // failure follows.
+    let events = journal_satisfying(&runtime, "the spawn's failure", |events| {
+        events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+            )
+        })
+    })
+    .await;
     assert!(
-        matches!(
-            events[1].event.as_ref().and_then(|event| event.kind.as_ref()),
+        events.iter().any(|journaled| matches!(
+            journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
             Some(Kind::AgentLifecycleChanged(changed))
                 if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
                     && changed.reason.contains("codex")
-        ),
-        "the spawn failed the agent: {:?}",
-        events[1]
+        )),
+        "the spawn failed the agent: {events:?}"
     );
 
     assert!(
@@ -2075,9 +2107,9 @@ async fn a_slow_materialize_blocks_only_what_depends_on_it() {
                 .event
                 .as_ref()
                 .and_then(|event| event.kind.as_ref()),
-            Some(Kind::WorkspaceInstanceChanged(_))
+            Some(Kind::WorkspaceInstanceChanged(changed)) if changed.progress.is_none()
         )),
-        "the materialize is still stuck while agent-b runs"
+        "the materialize is still stuck while agent-b runs (its progress may show, its report not)"
     );
 
     release.send(()).expect("the remote is holding");

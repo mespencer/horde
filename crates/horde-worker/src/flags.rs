@@ -324,54 +324,20 @@ struct WorkerArgs {
     codex_approvals_reviewer: Option<String>,
 }
 
-/// A duration flag: `90s`, `10m`, `6h`, `1d`, or bare seconds; never zero.
+/// A duration flag (`60s`, `5m`, `6h`); never zero, since a zero interval
+/// would spin.
 fn seconds(value: &str) -> Result<std::time::Duration, String> {
-    let refuse = || format!("{value:?} is not a duration such as 60s, 5m or 6h");
-    let (digits, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
-        Some(split) => value.split_at(split),
-        None => (value, "s"),
-    };
-    let amount: u64 = digits.parse().map_err(|_| refuse())?;
-    let scale = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3_600,
-        "d" => 86_400,
-        _ => return Err(refuse()),
-    };
-    let seconds = amount.checked_mul(scale).filter(|seconds| *seconds > 0).ok_or_else(refuse)?;
-    Ok(std::time::Duration::from_secs(seconds))
+    let duration = horde_proto::units::parse_duration(value)?;
+    if duration.is_zero() {
+        return Err(format!("{value:?} must be longer than zero"));
+    }
+    Ok(duration)
 }
 
 /// A watermark flag: `10%`, `20GiB`, or both comma-separated.
 fn watermark(value: &str) -> Result<crate::runtime::Watermark, String> {
-    let refuse = || format!("{value:?} is not a watermark such as 10%, 20GiB or 10%,20GiB");
-    let mut mark = crate::runtime::Watermark {
-        basis_points: 0,
-        bytes: 0,
-    };
-    for part in value.split(',').map(str::trim) {
-        if let Some(percent) = part.strip_suffix('%') {
-            let percent: u64 = percent.parse().map_err(|_| refuse())?;
-            if percent > 100 {
-                return Err(refuse());
-            }
-            mark.basis_points = percent * 100;
-        } else {
-            let (digits, unit) = part.split_at(part.find(|c: char| !c.is_ascii_digit()).unwrap_or(part.len()));
-            let amount: u64 = digits.parse().map_err(|_| refuse())?;
-            let scale: u64 = match unit {
-                "" | "B" => 1,
-                "KiB" => 1 << 10,
-                "MiB" => 1 << 20,
-                "GiB" => 1 << 30,
-                "TiB" => 1 << 40,
-                _ => return Err(refuse()),
-            };
-            mark.bytes = amount.checked_mul(scale).ok_or_else(refuse)?;
-        }
-    }
-    Ok(mark)
+    let (basis_points, bytes) = horde_proto::units::parse_threshold(value)?;
+    Ok(crate::runtime::Watermark { basis_points, bytes })
 }
 
 /// Rejected at parse, not at spawn: `auto_review` had codex's own subagent

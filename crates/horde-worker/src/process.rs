@@ -704,7 +704,7 @@ mod tests {
         let own_pid = std::process::id();
         for refused in [0, 1, own_group, own_pid] {
             assert!(
-                !super::signal_spawned_group(refused, Signal::SIGCONT),
+                !super::signal_spawned_group(refused, nix::sys::signal::Signal::SIGCONT),
                 "{refused} must be refused"
             );
         }

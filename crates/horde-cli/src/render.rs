@@ -1700,6 +1700,7 @@ mod tests {
                 remote_url: "https://git.example/atlas.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: "src".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
             ..horde_proto::v1::WorkspaceDefinition::default()
         }

@@ -63,6 +63,7 @@ mod harness {
             remote_url: remote.display().to_string(),
             default_branch: "main".to_owned(),
             layout_path: String::new(),
+            ..horde_proto::v1::WorkspaceRepo::default()
         }
     }
 
@@ -74,7 +75,65 @@ mod harness {
             unmanaged_paths: Vec::new(),
             created_at: None,
             etag: String::new(),
+            ..WorkspaceDefinition::default()
         }
+    }
+
+    /// One agent's checkout, as a spawn with no ADR-0014 fields asks for it:
+    /// the root the agent works in.
+    pub(crate) async fn checkout(
+        manager: &super::WorkspaceManager,
+        definition_id: &str,
+        agent_id: &str,
+        policy: horde_proto::v1::CheckoutPolicy,
+    ) -> Result<PathBuf, horde_worker::WorkerError> {
+        checkout_request(manager, &request(definition_id, agent_id, policy)).await
+    }
+
+    /// One agent's checkout starting each named repo at a parent's commit.
+    pub(crate) async fn checkout_from(
+        manager: &super::WorkspaceManager,
+        definition_id: &str,
+        agent_id: &str,
+        policy: horde_proto::v1::CheckoutPolicy,
+        parent_heads: &std::collections::BTreeMap<String, String>,
+    ) -> Result<PathBuf, horde_worker::WorkerError> {
+        let mut request = request(definition_id, agent_id, policy);
+        request.bases = parent_heads
+            .iter()
+            .map(|(repo, sha)| horde_proto::v1::RepoBase {
+                repo_name: repo.clone(),
+                r#ref: sha.clone(),
+                source: horde_proto::v1::RepoBaseSource::Parent.into(),
+            })
+            .collect();
+        checkout_request(manager, &request).await
+    }
+
+    /// The plain request for one agent.
+    pub(crate) fn request(
+        definition_id: &str,
+        agent_id: &str,
+        policy: horde_proto::v1::CheckoutPolicy,
+    ) -> horde_worker::workspace::CheckoutRequest {
+        horde_worker::workspace::CheckoutRequest {
+            definition_id: definition_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            session_id: "s1".to_owned(),
+            policy,
+            ..horde_worker::workspace::CheckoutRequest::default()
+        }
+    }
+
+    /// A checkout as the request says, returning its root.
+    pub(crate) async fn checkout_request(
+        manager: &super::WorkspaceManager,
+        request: &horde_worker::workspace::CheckoutRequest,
+    ) -> Result<PathBuf, horde_worker::WorkerError> {
+        manager
+            .checkout_agent(request, &horde_worker::workspace::base::NoSource)
+            .await
+            .map(|prepared| prepared.root)
     }
 
     /// A manager whose root lives under this test's tempdir.
@@ -135,12 +194,12 @@ mod harness {
     }
 }
 
-/// The Runtime's half of fix a8: a spawn command naming a parent observes
-/// that parent's committed HEAD per repo and starts the child's checkout
-/// there — through the whole apply path, with real git underneath. A
-/// `parent_start_points` that answered nothing (or invented repos) would
-/// leave the child at the instance's HEAD, and the head comparison here is
-/// exactly what notices.
+/// The Runtime's half of "children start from the parent's committed HEAD"
+/// (fix a8, ADR-0014): the parent's endpoint names that commit as the
+/// child's `PARENT` base, and a spawn carrying it starts the child's
+/// checkout there — through the whole apply path, with real git underneath.
+/// A base the worker ignored would leave the child at the fresh default,
+/// and the head comparison here is exactly what notices.
 #[tokio::test]
 async fn a_spawned_child_starts_at_its_parents_committed_head() {
     use horde_worker::ApplyCommand as _;
@@ -187,6 +246,7 @@ async fn a_spawned_child_starts_at_its_parents_committed_head() {
                 horde_proto::v1::MaterializeWorkspaceCommand {
                     definition: Some(definition),
                     session_id: Some(horde_proto::v1::SessionId::new("s1")),
+                    ..horde_proto::v1::MaterializeWorkspaceCommand::default()
                 },
             ),
         ))
@@ -210,8 +270,18 @@ async fn a_spawned_child_starts_at_its_parents_committed_head() {
     };
     let parent_head = harness::parents_commit(&checkout_of("parent-1"));
 
+    let mut child = spawn("child-1", Some("parent-1"));
+    if let horde_proto::v1::stream_commands_response::Command::SpawnAgent(spawn) = &mut child
+        && let Some(spec) = spawn.spec.as_mut()
+    {
+        spec.repo_bases = vec![horde_proto::v1::RepoBase {
+            repo_name: "atlas".to_owned(),
+            r#ref: parent_head.clone(),
+            source: horde_proto::v1::RepoBaseSource::Parent.into(),
+        }];
+    }
     runtime
-        .apply(command(3, spawn("child-1", Some("parent-1"))))
+        .apply(command(3, child))
         .await
         .expect("the child spawns");
     crate::support::within("the child's spawn", runtime.settled()).await;
@@ -236,13 +306,7 @@ async fn a_start_point_makes_the_child_begin_at_the_parents_commit() {
     let (manager, _definition, _report) = harness::materialized_atlas(temp.path()).await;
 
     // The parent works in its own worktree and commits.
-    let parent_root = manager
-        .checkout(
-            "ws-1",
-            "parent-1",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let parent_root = harness::checkout(&manager, "ws-1", "parent-1", CheckoutPolicy::Worktree)
         .await
         .expect("the parent checks out");
     let parent_head = harness::parents_commit(&parent_root.join("atlas"));
@@ -254,8 +318,7 @@ async fn a_start_point_makes_the_child_begin_at_the_parents_commit() {
         ("child-wt", CheckoutPolicy::Worktree),
         ("child-fc", CheckoutPolicy::FreshClone),
     ] {
-        let child_root = manager
-            .checkout("ws-1", child, policy, &inherit)
+        let child_root = harness::checkout_from(&manager, "ws-1", child, policy, &inherit)
             .await
             .expect("the child checks out");
         let child_head = harness::git(&child_root.join("atlas"), &["rev-parse", "HEAD"])
@@ -269,13 +332,7 @@ async fn a_start_point_makes_the_child_begin_at_the_parents_commit() {
 
     // A parentless checkout keeps the old meaning: the instance's HEAD,
     // which does not carry the parent's commit.
-    let orphan_root = manager
-        .checkout(
-            "ws-1",
-            "orphan-1",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let orphan_root = harness::checkout(&manager, "ws-1", "orphan-1", CheckoutPolicy::Worktree)
         .await
         .expect("the orphan checks out");
     let orphan_head = harness::git(&orphan_root.join("atlas"), &["rev-parse", "HEAD"])
@@ -396,13 +453,7 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
     assert_eq!(instance.state, WorkspaceInstanceState::Ready as i32);
 
     // Unspecified is the worktree default (DESIGN §7), so this exercises both.
-    let checkout = manager
-        .checkout(
-            "ws-1",
-            "agent-1",
-            CheckoutPolicy::Unspecified,
-            &std::collections::BTreeMap::new(),
-        )
+    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Unspecified)
         .await
         .expect("a worktree checkout");
 
@@ -420,54 +471,60 @@ async fn a_worktree_checkout_composes_an_agent_private_root() {
     }
 
     // A second agent composes beside the first, not inside it.
-    let second = manager
-        .checkout(
-            "ws-1",
-            "agent-2",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let second = harness::checkout(&manager, "ws-1", "agent-2", CheckoutPolicy::Worktree)
         .await
         .expect("a second checkout");
     assert_ne!(second, checkout, "agents must not share a worktree");
 
     // A redelivered spawn reuses the checkout instead of stacking another.
-    let redelivered = manager
-        .checkout(
-            "ws-1",
-            "agent-1",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let redelivered = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Worktree)
         .await
         .expect("a redelivered checkout");
     assert_eq!(redelivered, checkout);
 }
 
-/// Archive gives the checkout back: the worktree is unregistered, the
-/// `horde/<agent>` branch deleted, the directory gone — and the agent's last
-/// commit stays reachable under `refs/horde/archived/<agent>`, because a
-/// result may still name it. A sibling's checkout is untouched.
+/// The cleanup pass an explicit, non-dry-run removal runs under.
+fn explicit_pass(policy: &horde_worker::workspace::policy::WorkspacePolicy) -> horde_worker::workspace::cleanup::Pass<'_> {
+    horde_worker::workspace::cleanup::Pass {
+        trigger: horde_proto::v1::CleanupTrigger::Explicit,
+        gc_request_id: "gc-test",
+        dry_run: false,
+        policy,
+    }
+}
+
+/// One agent's ledger record, archived.
+async fn archived(manager: &WorkspaceManager, agent: &str) -> horde_worker::workspace::ledger::LedgerRecord {
+    manager
+        .mark_archived("ws-1", agent)
+        .await
+        .expect("the agent has a ledgered checkout")
+}
+
+/// A lossless hard removal gives the checkout back: the worktree is
+/// unregistered, the branch the Worker created deleted, the directory and
+/// ledger record gone — and the agent's last commit stays reachable under
+/// `refs/horde/archived/<agent>`. A sibling's checkout is untouched.
 #[tokio::test]
-async fn releasing_a_worktree_checkout_removes_it_and_pins_its_head() {
+async fn a_lossless_hard_removal_removes_the_worktree_and_pins_its_head() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
-    let none = std::collections::BTreeMap::new();
-    let checkout = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::Worktree, &none)
+    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Worktree)
         .await
         .expect("a worktree checkout");
-    let sibling = manager
-        .checkout("ws-1", "agent-2", CheckoutPolicy::Worktree, &none)
+    let sibling = harness::checkout(&manager, "ws-1", "agent-2", CheckoutPolicy::Worktree)
         .await
         .expect("a sibling checkout");
     let work = harness::parents_commit(&checkout.join("atlas"));
     let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
+    let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
 
-    manager
-        .release_checkout(&checkout)
-        .await
-        .expect("the checkout is released");
+    let record = archived(&manager, "agent-1").await;
+    let (event, removed) = manager
+        .hard_remove("ws-1", &record, explicit_pass(&policy), false)
+        .await;
+    assert!(removed, "{event:?}");
+    assert_eq!(event.repos[0].pinned_commit_sha, work);
 
     assert!(!checkout.exists(), "the agent's directory is gone");
     let worktrees = harness::git(&instance_repo, &["worktree", "list"]);
@@ -481,83 +538,85 @@ async fn releasing_a_worktree_checkout_removes_it_and_pins_its_head() {
         "only the archived agent's branch is deleted: {branches}"
     );
     assert_eq!(
-        harness::git(
-            &instance_repo,
-            &["rev-parse", "refs/horde/archived/agent-1"]
-        )
-        .trim(),
+        harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-1"]).trim(),
         work,
         "the agent's last commit stays reachable"
     );
+    assert!(sibling.join("atlas").join(".git").is_file(), "the sibling is untouched");
     assert!(
-        sibling.join("atlas").join(".git").is_file(),
-        "the sibling is untouched"
+        manager.records("ws-1").await.iter().all(|r| r.agent_id != "agent-1"),
+        "the ledger record goes last"
     );
-
-    // Idempotent: a second release finds nothing and is not an error.
-    manager
-        .release_checkout(&checkout)
-        .await
-        .expect("releasing twice is fine");
 }
 
-/// A fresh clone is released the same way — its HEAD pinned in the
-/// instance's repo (the clone was the only place it lived) — and the shared
-/// policy's root, the instance itself, is never the agent's to remove.
+/// A fresh clone holding only its HEAD's history is removed the same way,
+/// its HEAD pinned in the Instance repo (the clone was the only place it
+/// lived); the shared policy's root has no ledger and is never removed.
 #[tokio::test]
-async fn releasing_a_fresh_clone_pins_its_head_and_shared_roots_are_left_alone() {
+async fn a_fresh_clone_is_pinned_then_removed_and_shared_roots_are_left_alone() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
-    let none = std::collections::BTreeMap::new();
-    let clone = manager
-        .checkout("ws-1", "agent-1", CheckoutPolicy::FreshClone, &none)
+    let clone = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::FreshClone)
         .await
         .expect("a fresh clone");
     let work = harness::parents_commit(&clone.join("atlas"));
+    let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
 
-    manager.release_checkout(&clone).await.expect("released");
+    let record = archived(&manager, "agent-1").await;
+    let (event, removed) = manager
+        .hard_remove("ws-1", &record, explicit_pass(&policy), false)
+        .await;
+    assert!(removed, "{event:?}");
     assert!(!clone.exists());
     let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
     assert_eq!(
-        harness::git(
-            &instance_repo,
-            &["rev-parse", "refs/horde/archived/agent-1"]
-        )
-        .trim(),
+        harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-1"]).trim(),
         work
     );
 
-    let shared = manager
-        .checkout("ws-1", "agent-2", CheckoutPolicy::Shared, &none)
+    let shared = harness::checkout(&manager, "ws-1", "agent-2", CheckoutPolicy::Shared)
         .await
         .expect("the shared checkout");
-    manager.release_checkout(&shared).await.expect("a no-op");
-    assert!(
-        shared.join("atlas").join(".git").is_dir(),
-        "the instance survives an agent that worked in it"
-    );
+    assert!(manager.mark_archived("ws-1", "agent-2").await.is_none(), "no ledger, nothing to remove");
+    assert!(shared.join("atlas").join(".git").is_dir(), "the instance survives");
 }
 
-/// A release that cannot remove the checkout says so: only "already gone"
-/// counts as released, and any other failure is reported, not swallowed —
-/// a silently surviving checkout is exactly the leak release exists to end.
+/// A dirty checkout is retained, its reason recorded in the ledger; only a
+/// forced removal takes it, and even then its committed HEAD is pinned.
 #[tokio::test]
-async fn a_checkout_that_cannot_be_removed_is_reported_not_swallowed() {
+async fn a_dirty_checkout_is_retained_unless_forced() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
-    // A file where the agent's directory should be: removing it as a
-    // directory fails with something other than NotFound.
-    let agents = std::path::Path::new(&instance.root_path).join(".horde-agents");
-    std::fs::create_dir_all(&agents).expect("the agents dir");
-    let not_a_dir = agents.join("agent-1");
-    std::fs::write(&not_a_dir, "not a checkout").expect("writes");
+    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Worktree)
+        .await
+        .expect("a worktree checkout");
+    std::fs::write(checkout.join("atlas").join("scratch.txt"), "wip").expect("writes");
+    let policy = horde_worker::workspace::policy::WorkspacePolicy::default();
 
-    let refused = manager.release_checkout(&not_a_dir).await;
-    assert!(
-        refused
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("could not remove")),
-        "got {refused:?}"
+    let record = archived(&manager, "agent-1").await;
+    let (event, removed) = manager
+        .hard_remove("ws-1", &record, explicit_pass(&policy), false)
+        .await;
+    assert!(!removed);
+    assert_eq!(
+        event.repos[0].outcome,
+        i32::from(horde_proto::v1::workspace_cleanup::repo_action::Outcome::Refused)
+    );
+    assert_eq!(event.repos[0].reason, "untracked files: 1");
+    assert!(checkout.join("atlas").join("scratch.txt").exists(), "nothing was lost");
+    let retained = manager.records("ws-1").await;
+    assert_eq!(retained[0].retained_reason, "untracked files: 1");
+
+    let head = harness::git(&checkout.join("atlas"), &["rev-parse", "HEAD"]).trim().to_owned();
+    let (event, removed) = manager
+        .hard_remove("ws-1", &retained[0], explicit_pass(&policy), true)
+        .await;
+    assert!(removed, "{event:?}");
+    assert!(event.repos[0].reason.starts_with("forced:"), "{event:?}");
+    let instance_repo = std::path::Path::new(&instance.root_path).join("atlas");
+    assert_eq!(
+        harness::git(&instance_repo, &["rev-parse", "refs/horde/archived/agent-1"]).trim(),
+        head
     );
 }
 
@@ -616,13 +675,7 @@ async fn a_fresh_clone_checkout_is_a_full_clone() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
-    let checkout = manager
-        .checkout(
-            "ws-1",
-            "agent-1",
-            CheckoutPolicy::FreshClone,
-            &std::collections::BTreeMap::new(),
-        )
+    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::FreshClone)
         .await
         .expect("a fresh clone");
 
@@ -673,13 +726,7 @@ async fn a_fresh_clone_survives_maintenance_in_the_instance() {
     let instance_atlas = std::path::PathBuf::from(&instance.repos[0].path);
     harness::plant_stray_lock(&instance_atlas);
 
-    let checkout = manager
-        .checkout(
-            "ws-1",
-            "agent-1",
-            CheckoutPolicy::FreshClone,
-            &std::collections::BTreeMap::new(),
-        )
+    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::FreshClone)
         .await
         .expect("a fresh clone despite the maintained instance");
 
@@ -695,13 +742,7 @@ async fn a_shared_checkout_is_the_instance_itself() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, instance) = harness::materialized_atlas(temp.path()).await;
 
-    let checkout = manager
-        .checkout(
-            "ws-1",
-            "agent-1",
-            CheckoutPolicy::Shared,
-            &std::collections::BTreeMap::new(),
-        )
+    let checkout = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Shared)
         .await
         .expect("the shared checkout");
     assert_eq!(checkout.display().to_string(), instance.root_path);
@@ -759,13 +800,7 @@ async fn a_checkout_for_a_path_hostile_agent_id_is_refused() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
-    let refused = manager
-        .checkout(
-            "ws-1",
-            "agent/../escape",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let refused = harness::checkout(&manager, "ws-1", "agent/../escape", CheckoutPolicy::Worktree)
         .await
         .expect_err("a separator in an agent id is an escape, not a name");
     assert!(
@@ -781,13 +816,7 @@ async fn a_checkout_without_a_materialized_instance_is_refused() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let manager = harness::manager_under(temp.path());
 
-    let refused = manager
-        .checkout(
-            "ws-none",
-            "agent-1",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let refused = harness::checkout(&manager, "ws-none", "agent-1", CheckoutPolicy::Worktree)
         .await
         .expect_err("nothing was materialized");
     assert!(
@@ -844,22 +873,10 @@ async fn worktree_agents_share_history_but_not_working_trees() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let (manager, _definition, _instance) = harness::materialized_atlas(temp.path()).await;
 
-    let first = manager
-        .checkout(
-            "ws-1",
-            "agent-1",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let first = harness::checkout(&manager, "ws-1", "agent-1", CheckoutPolicy::Worktree)
         .await
         .expect("first checkout");
-    let second = manager
-        .checkout(
-            "ws-1",
-            "agent-2",
-            CheckoutPolicy::Worktree,
-            &std::collections::BTreeMap::new(),
-        )
+    let second = harness::checkout(&manager, "ws-1", "agent-2", CheckoutPolicy::Worktree)
         .await
         .expect("second checkout");
 

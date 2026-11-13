@@ -34,6 +34,7 @@ pub mod transport;
 pub mod trust;
 pub mod usage;
 pub mod workspace;
+pub mod workspace_policy;
 
 pub use blob::{BlobError, BlobStore};
 pub use enrollment::EnrollmentRoster;

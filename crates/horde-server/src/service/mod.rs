@@ -19,6 +19,7 @@ pub mod logins;
 pub mod shared;
 pub mod sync;
 pub mod worker;
+pub mod workspace_gc;
 
 pub use blob::Blobs;
 pub use commands::{CommandProjection, CommandStream};
