@@ -564,10 +564,14 @@ pub fn file_logging_for(
     }
 }
 
-/// Writes out what is still queued for the file, bounded, on the way out.
-/// Returns whether everything reached it (`true` with no file at all).
-pub fn flush_file_logging(file: Option<&horde_observe::FileLogging>) -> bool {
-    file.is_none_or(|file| file.flush(std::time::Duration::from_secs(2)))
+/// Writes out what is still queued for the file, waiting at most
+/// `deadline`, on the way out. Returns whether everything reached it
+/// (`true` with no file at all).
+pub fn flush_file_logging(
+    file: Option<&horde_observe::FileLogging>,
+    deadline: std::time::Duration,
+) -> bool {
+    file.is_none_or(|file| file.flush(deadline))
 }
 
 /// Where the server's log files live: `<state>/logs`, so two servers with
@@ -845,7 +849,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            super::flush_file_logging(None),
+            super::flush_file_logging(None, std::time::Duration::ZERO),
             "nothing to flush is flushed"
         );
 
@@ -859,8 +863,19 @@ mod tests {
         assert_eq!(file.dir(), super::log_dir(state.path()));
         assert_eq!(file.dir(), state.path().join("logs"));
         assert_eq!(file.binary(), "horde-server");
-        file.with_default(|| tracing::info!("served"));
-        assert!(super::flush_file_logging(Some(&file)));
+        tracing::dispatcher::with_default(&file.dispatch(), || {
+            for n in 0..4000 {
+                tracing::info!(padding = %"p".repeat(512), "served {n}");
+            }
+        });
+        assert!(
+            !super::flush_file_logging(Some(&file), std::time::Duration::ZERO),
+            "a backlog is not written in no time"
+        );
+        assert!(super::flush_file_logging(
+            Some(&file),
+            std::time::Duration::from_secs(10)
+        ));
         assert!(horde_observe::files::list(file.dir(), Some("horde-server")).len() == 1);
     }
 

@@ -337,3 +337,110 @@ async fn the_relay_reapplies_scope_and_redaction_and_reports_a_vanished_worker()
     .await;
     assert_eq!(finished.len(), 1, "nothing is relayed past an end");
 }
+
+#[tokio::test]
+async fn a_batch_exactly_at_the_cap_is_relayed() {
+    let mine = r#"{"ts":"t1","msg":"ok","session":"s1"}"#;
+    let out = relayed(vec![records(&[mine])], None, Some(mine.len())).await;
+    assert!(
+        matches!(out.first(), Some(Frame::Records(batch)) if batch.lines.len() == 1),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn tunnel_frames_become_read_frames_and_a_late_open_is_dropped() {
+    use horde_proto::v1::{
+        LogEnd, LogGap, LogTunnelOpen, WorkerLogTunnelRequest,
+        worker_log_tunnel_request::Frame as T,
+    };
+    let wrap = |frame| WorkerLogTunnelRequest { frame: Some(frame) };
+    assert!(matches!(
+        super::from_tunnel(wrap(T::Records(LogRecords::default()))),
+        Some(Frame::Records(_))
+    ));
+    assert!(matches!(
+        super::from_tunnel(wrap(T::Gap(LogGap::default()))),
+        Some(Frame::Gap(_))
+    ));
+    assert!(matches!(
+        super::from_tunnel(wrap(T::End(LogEnd::default()))),
+        Some(Frame::End(_))
+    ));
+    assert!(super::from_tunnel(wrap(T::Open(LogTunnelOpen::default()))).is_none());
+    assert!(super::from_tunnel(WorkerLogTunnelRequest { frame: None }).is_none());
+}
+
+/// A worker that answers each query on the registry with one record and an
+/// end — the server half of the tunnel, without the transport.
+fn answering_worker(core: &ServerCore, worker_id: &'static str) {
+    let registry = core.logs.registry.clone();
+    let (_epoch, mut lane) = registry.register_worker(worker_id);
+    tokio::spawn(async move {
+        while let Some(query) = lane.recv().await {
+            let crate::diagnostics::registry::Claim::Matched(pair) =
+                registry.claim(&query.request_id, Some(worker_id))
+            else {
+                continue;
+            };
+            let (frames, reader) = mpsc::channel(4);
+            if pair.send(reader).is_err() {
+                continue;
+            }
+            let line = format!(
+                r#"{{"ts":"t1","msg":"from {worker_id} capped at {}","boot":"b","seq":1}}"#,
+                query.max_bytes
+            );
+            let _ = frames.send(records(&[&line])).await;
+            let _ = frames
+                .send(horde_wire::logs::end(LogEndReason::Done, ""))
+                .await;
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_worker_read_is_dispatched_and_relayed_unbounded_for_a_client_capped_for_an_agent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (plane, core, _mine, _theirs) = core_with_logs(dir.path()).await;
+    answering_worker(&core, "w9");
+    let read = |behalf: Option<&str>, max_bytes| ReadLogsRequest {
+        target: Some(read_logs_request::Target::Worker("w9".to_owned())),
+        on_behalf_of: behalf.map(AgentId::new),
+        max_bytes,
+        ..ReadLogsRequest::default()
+    };
+    assert_eq!(
+        messages(&plane, Request::new(read(None, 0))).await,
+        ["from w9 capped at 0"],
+        "a client's read is unbounded"
+    );
+    assert_eq!(
+        messages(
+            &plane,
+            as_worker("w1", Request::new(read(Some("agent-mine"), 0)))
+        )
+        .await,
+        [format!("from w9 capped at {}", 16 * 1024)],
+        "an agent's read carries the default cap to the worker"
+    );
+    let capped = plane
+        .read_logs(as_worker("w1", Request::new(read(Some("agent-mine"), 10))))
+        .await
+        .expect("admitted")
+        .into_inner();
+    let ends: Vec<i32> = capped
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(|response| match response.ok()?.body? {
+            read_logs_response::Body::End(end) => Some(end.reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [LogEndReason::ByteCap as i32],
+        "the relay holds the cap too"
+    );
+}

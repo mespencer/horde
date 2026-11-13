@@ -70,7 +70,7 @@ fn run() -> Result<ExitCode, String> {
     };
 
     // What is still queued reaches the file before the process exits.
-    horde_server::startup::flush_file_logging(file.as_ref());
+    horde_server::startup::flush_file_logging(file.as_ref(), std::time::Duration::from_secs(2));
     if let Some(telemetry) = telemetry {
         // From main's own thread, with the runtime still alive for the flush
         // to travel its channel. The verdict is discarded deliberately: a

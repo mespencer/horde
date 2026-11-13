@@ -368,6 +368,39 @@ mod tests {
     }
 
     #[test]
+    fn a_value_exactly_the_minimum_length_is_held() {
+        let registry = SecretRegistry::new();
+        registry.register("12345678", None);
+        registry.register("1234567", None);
+        assert_eq!(registry.live(SystemTime::now()), ["12345678"]);
+    }
+
+    /// A value too short to register is never scrubbed, even when a caller
+    /// hands one over directly.
+    #[test]
+    fn a_short_value_is_never_scrubbed() {
+        assert_eq!(
+            redact_text("abc and abcdefgh", &["abc".to_owned()]),
+            "abc and abcdefgh"
+        );
+    }
+
+    /// The process registry is the one `redact_line` consults.
+    #[test]
+    fn the_process_registry_scrubs_until_its_secret_is_forgotten() {
+        let secret = "process-registry-probe-7f3e2a";
+        let line = format!("{{\"msg\":\"{secret}\"}}");
+        super::register_secret(secret, None);
+        assert!(super::redact_line(&line).1, "registered");
+        super::forget_secret(secret);
+        assert_eq!(
+            super::redact_line(&line),
+            (line.clone(), false),
+            "forgotten"
+        );
+    }
+
+    #[test]
     fn the_registry_is_bounded_and_re_registering_does_not_duplicate() {
         let registry = SecretRegistry::new();
         for n in 0..MAX_REGISTERED + 5 {
