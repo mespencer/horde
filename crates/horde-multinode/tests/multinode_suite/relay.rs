@@ -197,12 +197,13 @@ async fn an_agents_commit_reaches_another_worker_through_the_mtls_relay() {
         )
         .await;
     assert!(!refused.ok, "no certificate, no Relay: {}", refused.stdout);
-    let reason = refused.stderr.to_lowercase();
+    // Refused at the transport, never answered: TLS 1.3 rejects the missing
+    // certificate after the client's half of the handshake, so git reports
+    // an alert or a reset depending on timing — but never an HTTP status,
+    // which would mean the door had let the request through.
     assert!(
-        ["ssl", "tls", "handshake", "certificate"]
-            .iter()
-            .any(|word| reason.contains(word)),
-        "the refusal is the TLS handshake, not a missing repo: {}",
+        refused.stderr.contains("unable to access") && !refused.stderr.contains("returned error"),
+        "the refusal is at the TLS door, not an HTTP answer: {}",
         refused.stderr
     );
 }
