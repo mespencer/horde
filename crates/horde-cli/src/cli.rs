@@ -281,18 +281,27 @@ pub struct McpAddArgs {
 pub enum WorkspaceCommand {
     /// Define a workspace from one or more repos.
     Create {
-        name: String,
+        /// The workspace's name; with --from-cwd, defaults to the repo's
+        /// directory name.
+        #[arg(required_unless_present = "from_cwd")]
+        name: Option<String>,
         /// One repo, as name=URL with optional ,branch= and ,path= parts;
         /// repeatable. Example: --repo atlas=https://…/atlas.git,branch=main
         #[arg(
             long = "repo",
             value_name = "NAME=URL[,branch=B][,path=P]",
-            required = true
+            required_unless_present = "from_cwd"
         )]
         repos: Vec<String>,
+        /// Define a one-repo workspace from the git repo the shell is in:
+        /// its origin URL, origin's default branch, its directory name.
+        #[arg(long, conflicts_with = "repos")]
+        from_cwd: bool,
         /// A path agents may use but Horde never syncs; repeatable.
         #[arg(long = "unmanaged")]
         unmanaged_paths: Vec<String>,
+        #[command(flatten)]
+        policy: crate::workspace_flags::WorkspacePolicyArgs,
     },
     /// List every live definition.
     List,
@@ -312,12 +321,34 @@ pub enum WorkspaceCommand {
     /// Rename a definition, re-lay its repos, or replace its unmanaged
     /// paths, at the version `--etag` names.
     Update(crate::workspace_update::UpdateArgs),
-    /// Remove a definition at the version `--etag` names.
+    /// Remove a definition at the version `--etag` names. Its Instances stay
+    /// on their Workers unless --purge removes them too.
     Delete {
         workspace_definition_id: String,
         #[arg(long)]
         etag: String,
+        /// Also remove every Instance of it, on every Worker.
+        #[arg(long)]
+        purge: bool,
+        /// With --purge: remove what cannot be proven recoverable.
+        #[arg(long, requires = "purge")]
+        force: bool,
+        /// With --purge: show what would be removed and change nothing,
+        /// keeping the definition.
+        #[arg(long, requires = "purge")]
+        dry_run: bool,
+        /// How long --purge waits for the Workers' answers, e.g. 2m.
+        #[arg(long, default_value = "120s", value_name = "DUR")]
+        wait: String,
     },
+    /// Reclaim disk: soft (reclaim commands), automatic (plus lossless
+    /// removal of archived checkouts, the default) or hard.
+    Gc(crate::workspace_gc::GcArgs),
+    /// The Instances Workers hold, and removing one.
+    #[command(subcommand)]
+    Instance(crate::workspace_gc::InstanceCommand),
+    /// The workspace-housekeeping log: every reclaim, removal and refusal.
+    Log(crate::workspace_gc::LogArgs),
 }
 
 #[derive(Args, Debug)]
@@ -437,8 +468,9 @@ pub enum SessionCommand {
         /// The session's title; omitted draws a thematic name.
         title: Option<String>,
         /// What the root agent is: type, tier, workspace, mode, first task.
+        /// Boxed: the spec flags dwarf every other variant.
         #[command(flatten)]
-        spec: SpecArgs,
+        spec: Box<SpecArgs>,
         /// Makes a retry after a lost response safe.
         #[arg(long, default_value = "")]
         idempotency_key: String,
@@ -709,6 +741,10 @@ pub struct SpecArgs {
     /// the moment it is placed. Absent spawns an idle agent.
     #[arg(long)]
     pub task: Option<String>,
+    /// Which repos the agent checks out, from where, on which branch
+    /// (ADR-0014).
+    #[command(flatten)]
+    pub checkout_args: crate::workspace_flags::CheckoutArgs,
 }
 
 /// The checkout policies, in CLI words.
@@ -770,7 +806,13 @@ pub fn spec_from(args: &SpecArgs) -> Result<horde_proto::v1::AgentSpec, ClientEr
         (None, None) => None,
     };
 
+    let (checkout_mode, checkout_repos, repo_bases, branch) =
+        crate::workspace_flags::checkout_fields(&args.checkout_args)?;
     Ok(horde_proto::v1::AgentSpec {
+        checkout_mode: checkout_mode.into(),
+        checkout_repos,
+        repo_bases,
+        branch,
         agent_type: args.agent_type.clone().unwrap_or_default(),
         model,
         workspace_definition_id: args
@@ -1331,6 +1373,7 @@ pub fn repo_from(value: &str) -> Result<horde_proto::v1::WorkspaceRepo, ClientEr
         remote_url: url.to_owned(),
         default_branch: branch,
         layout_path: path,
+        reclaim: None,
     })
 }
 
@@ -1343,15 +1386,19 @@ async fn run_workspace(
         WorkspaceCommand::Create {
             name,
             repos,
+            from_cwd,
             unmanaged_paths,
+            policy,
         } => {
-            let repos = repos
-                .iter()
-                .map(|value| repo_from(value))
-                .collect::<Result<Vec<_>, _>>()?;
-            let definition = client
-                .create_workspace_definition(name, repos, unmanaged_paths.clone())
-                .await?;
+            let request = crate::workspace_gc::create_request(
+                name.as_deref(),
+                repos,
+                *from_cwd,
+                unmanaged_paths,
+                policy,
+            )
+            .await?;
+            let definition = client.create_workspace_definition(request).await?;
             println!("{}", render::workspace(&definition, format));
         }
         WorkspaceCommand::List => {
@@ -1375,20 +1422,52 @@ async fn run_workspace(
         WorkspaceCommand::Update(args) => {
             crate::workspace_update::run(client, args, format).await?;
         }
+        WorkspaceCommand::Delete { .. }
+        | WorkspaceCommand::Gc(_)
+        | WorkspaceCommand::Instance(_)
+        | WorkspaceCommand::Log(_) => run_workspace_cleanup(client, command, format).await?,
+    }
+    Ok(())
+}
+
+/// The cleanup half of `workspace` (ADR-0014): delete (with `--purge`),
+/// gc, instance list/remove, and the housekeeping log.
+async fn run_workspace_cleanup(
+    client: &mut Client,
+    command: &WorkspaceCommand,
+    format: Format,
+) -> Result<(), ClientError> {
+    match command {
         WorkspaceCommand::Delete {
             workspace_definition_id,
             etag,
+            purge,
+            force,
+            dry_run,
+            wait,
         } => {
-            client
-                .delete_workspace_definition(workspace_definition_id, etag)
-                .await?;
-            println!(
-                "{}",
-                render::workspace_deleted(workspace_definition_id, format)
-            );
+            crate::workspace_gc::run_delete(
+                client,
+                crate::workspace_gc::DeleteArgs {
+                    workspace_definition_id,
+                    etag,
+                    purge: *purge,
+                    force: *force,
+                    dry_run: *dry_run,
+                    wait,
+                },
+                format,
+            )
+            .await
         }
+        WorkspaceCommand::Gc(args) => crate::workspace_gc::run_gc(client, args, format).await,
+        WorkspaceCommand::Instance(command) => {
+            crate::workspace_gc::run_instance(client, command, format).await
+        }
+        WorkspaceCommand::Log(args) => crate::workspace_gc::run_log(client, args, format).await,
+        // The definition verbs are `run_workspace`'s own.
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 async fn run_prewarm(

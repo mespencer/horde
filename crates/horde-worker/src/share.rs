@@ -96,6 +96,56 @@ impl ShareBroker {
         self.lock().get(agent_id).cloned()
     }
 
+    /// Every Agent with a registered checkout.
+    #[must_use]
+    pub fn agents(&self) -> Vec<String> {
+        self.lock().keys().cloned().collect()
+    }
+
+    /// Adds one repo to a registered Agent's checked-out set — what a
+    /// `workspace_checkout` makes stampable and dirty-checkable (ADR-0014).
+    /// Returns whether the Agent was registered.
+    pub fn add_repo(&self, agent_id: &str, repo_name: &str, relative: PathBuf) -> bool {
+        let mut checkouts = self.lock();
+        let Some(checkout) = checkouts.get_mut(agent_id) else {
+            return false;
+        };
+        if !checkout.repos.iter().any(|(name, _)| name == repo_name) {
+            checkout.repos.push((repo_name.to_owned(), relative));
+        }
+        true
+    }
+
+    /// The Relay this broker shares through, if any.
+    #[must_use]
+    pub fn relay(&self) -> Option<&RelayLocation> {
+        self.relay.as_ref()
+    }
+
+    /// Makes a commit present in an Instance repo rather than an Agent's
+    /// checkout: already there, then a peer checkout of the same repo on
+    /// this Worker, then the Relay. What a lazy receiver's payload and a
+    /// `PARENT` base missing after the fetch resolve through (ADR-0014).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerError::Share`] when no route can deliver the commit,
+    /// including `NoRelay` when it is nowhere here and no Relay is set.
+    pub async fn obtain_into(
+        &self,
+        instance_repo: &std::path::Path,
+        repo_name: &str,
+        commit_sha: &str,
+    ) -> Result<(), WorkerError> {
+        let git_ref = GitRef {
+            repo_name: repo_name.to_owned(),
+            commit_sha: commit_sha.to_owned(),
+            branch: String::new(),
+        };
+        // No agent is excluded: every peer is a candidate source.
+        self.obtain_one("", &git_ref, instance_repo).await
+    }
+
     /// Every other Agent's path for `repo_name` — the peer candidates a
     /// receiver may fetch from without leaving this Worker.
     fn peer_paths(&self, repo_name: &str, excluding_agent: &str) -> Vec<PathBuf> {
@@ -249,6 +299,20 @@ impl ShareBroker {
         };
         obtain_share(receiver, &route, self.relay.as_ref(), &git_ref.commit_sha).await?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::workspace::base::CommitSource for ShareBroker {
+    async fn obtain_into(
+        &self,
+        instance_repo: &std::path::Path,
+        repo_name: &str,
+        sha: &str,
+    ) -> Result<(), String> {
+        ShareBroker::obtain_into(self, instance_repo, repo_name, sha)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -440,5 +504,74 @@ mod tests {
     async fn stamping_an_agent_without_a_checkout_is_none() {
         let broker = ShareBroker::new(None);
         assert_eq!(broker.stamp("agent-1").await.expect("no checkout"), None);
+    }
+
+    /// `add_repo` grows only a registered agent's checked-out set, once per
+    /// repo name, and says whether the agent was there to grow.
+    #[test]
+    fn adding_a_repo_needs_a_registered_agent_and_happens_once() {
+        let broker = ShareBroker::new(None);
+        assert!(
+            !broker.add_repo("agent-1", "docs", "docs".into()),
+            "no checkout to add to"
+        );
+        assert!(broker.checkout_of("agent-1").is_none());
+        broker.register(
+            "agent-1",
+            AgentCheckout {
+                root: "/w/agents/agent-1".into(),
+                repos: vec![("atlas".to_owned(), "atlas".into())],
+            },
+        );
+        assert!(broker.add_repo("agent-1", "docs", "docs".into()));
+        assert!(broker.add_repo("agent-1", "docs", "docs".into()));
+        let repos: Vec<String> = broker
+            .checkout_of("agent-1")
+            .expect("registered")
+            .repos
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(repos, vec!["atlas", "docs"]);
+    }
+
+    /// The broker answers with the Relay it was built over, or none.
+    #[test]
+    fn the_broker_names_its_relay() {
+        let relay = super::RelayLocation::new("http://relay.example:7779/");
+        let broker = ShareBroker::new(Some(relay));
+        assert_eq!(
+            broker.relay().map(|relay| relay.repo_url("atlas")),
+            Some("http://relay.example:7779/atlas".to_owned())
+        );
+        assert!(ShareBroker::new(None).relay().is_none());
+    }
+
+    /// A commit that is nowhere on this Worker, with no Relay configured,
+    /// cannot be obtained into an Instance repo: both the inherent call and
+    /// the `CommitSource` face refuse rather than pretend.
+    #[tokio::test]
+    async fn obtaining_an_absent_commit_without_a_relay_is_refused() {
+        let temp = tempfile::tempdir().expect("a tempdir");
+        let repo = temp.path().join("atlas");
+        std::fs::create_dir_all(&repo).expect("the repo dir");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        let broker = ShareBroker::new(None);
+        assert!(
+            broker.obtain_into(&repo, "atlas", absent).await.is_err(),
+            "nowhere to obtain it from"
+        );
+        let source: &dyn crate::workspace::base::CommitSource = &broker;
+        let refused = source
+            .obtain_into(&repo, "atlas", absent)
+            .await
+            .expect_err("the commit source refuses too");
+        assert!(!refused.is_empty(), "with a reason");
     }
 }

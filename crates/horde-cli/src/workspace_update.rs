@@ -36,6 +36,10 @@ pub struct UpdateArgs {
     /// through `add-repo`. Omitted, the layout is unchanged.
     #[arg(long = "repo", value_name = "NAME=URL[,branch=B][,path=P]")]
     pub repos: Vec<String>,
+    /// Checkout mode, reclaim commands and cleanup overrides (ADR-0014).
+    /// A `--reclaim` applies to the current repo set (or the re-laid one).
+    #[command(flatten)]
+    pub policy: crate::workspace_flags::WorkspacePolicyArgs,
 }
 
 /// The update request these flags make of `current`.
@@ -47,12 +51,21 @@ pub fn request_from(
     args: &UpdateArgs,
     current: &WorkspaceDefinition,
 ) -> Result<UpdateWorkspaceDefinitionRequest, ClientError> {
-    let repos = args
+    let mut repos = args
         .repos
         .iter()
         .map(|value| crate::cli::repo_from(value))
         .collect::<Result<Vec<_>, _>>()?;
+    let reclaims = !args.policy.reclaim.is_empty() || !args.policy.reclaim_timeout.is_empty();
+    if repos.is_empty() && reclaims {
+        // A reclaim change rides the repos field, so it carries the current
+        // set with only the reclaim edited.
+        repos = current.repos.clone();
+    }
+    crate::workspace_flags::apply_reclaim(&mut repos, &args.policy)?;
     Ok(UpdateWorkspaceDefinitionRequest {
+        checkout_mode: crate::workspace_flags::mode_for(args.policy.checkout_mode).into(),
+        cleanup: crate::workspace_flags::cleanup_from(&args.policy)?,
         workspace_definition_id: current.workspace_definition_id.clone(),
         // The caller's etag, never the one just read: the read is only for
         // the id and the kept paths, and substituting its etag would turn
@@ -120,8 +133,39 @@ mod tests {
             name: "atlas".to_owned(),
             unmanaged_paths: vec!["datasets".to_owned()],
             etag: "read-etag".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
+                name: "atlas".to_owned(),
+                remote_url: "https://git.example/atlas.git".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
+            }],
             ..WorkspaceDefinition::default()
         }
+    }
+
+    /// A reclaim change with no `--repo` carries the current repo set with
+    /// only its reclaim edited; a timeout alone needs a command, so it is
+    /// checked against that same current set.
+    #[test]
+    fn a_reclaim_alone_rides_the_current_repos() {
+        let request = request_from(
+            &parsed(&["atlas", "--etag", "e", "--reclaim", "atlas=auto"]),
+            &current(),
+        )
+        .expect("a request");
+        assert_eq!(request.repos.len(), 1);
+        assert_eq!(request.repos[0].remote_url, "https://git.example/atlas.git");
+        assert!(request.repos[0].reclaim.is_some(), "the reclaim landed");
+
+        let timeout_only = request_from(
+            &parsed(&["atlas", "--etag", "e", "--reclaim-timeout", "atlas=5m"]),
+            &current(),
+        )
+        .expect_err("a timeout needs a command");
+        assert!(
+            !timeout_only.report().contains("not one of"),
+            "the timeout was checked against the current repos: {}",
+            timeout_only.report()
+        );
     }
 
     #[test]

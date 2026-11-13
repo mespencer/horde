@@ -41,6 +41,14 @@ pub fn is_catalog_stream(session_id: &str) -> bool {
     session_id == CATALOG_STREAM
 }
 
+/// Whether a log stream is workspace housekeeping (ADR-0014): cleanup
+/// events, gc requests and answers, disk pressure. Reserved like the
+/// catalog — never a session, never in the all-sessions net.
+#[must_use]
+pub fn is_housekeeping_stream(session_id: &str) -> bool {
+    session_id == horde_proto::WORKSPACE_HOUSEKEEPING_STREAM
+}
+
 /// One Definition as the catalog fold currently sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DefinitionRecord {
@@ -321,6 +329,52 @@ impl InstanceCache {
             .unwrap_or_default()
     }
 
+    /// Every cached report, optionally filtered by worker and definition.
+    #[must_use]
+    pub fn filtered(
+        &self,
+        worker_id: Option<&str>,
+        workspace_definition_id: Option<&str>,
+    ) -> Vec<WorkspaceInstanceReport> {
+        self.reports
+            .lock()
+            .map(|reports| {
+                reports
+                    .iter()
+                    .filter(|((worker, definition), _)| {
+                        worker_id.is_none_or(|wanted| wanted == worker)
+                            && workspace_definition_id.is_none_or(|wanted| wanted == definition)
+                    })
+                    .map(|(_, report)| report.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The Workers holding an Instance — of one definition, or of any.
+    #[must_use]
+    pub fn holders(&self, workspace_definition_id: Option<&str>) -> Vec<String> {
+        let mut workers: Vec<String> = self
+            .filtered(None, workspace_definition_id)
+            .into_iter()
+            .filter_map(|report| report.worker_id.map(|id| id.to_string()))
+            .collect();
+        workers.sort();
+        workers.dedup();
+        workers
+    }
+
+    /// The freshest free/total disk facts a worker's reports carry, if any
+    /// report carried them.
+    #[must_use]
+    pub fn filesystem_of(&self, worker_id: &str) -> Option<(u64, u64)> {
+        self.filtered(Some(worker_id), None)
+            .into_iter()
+            .filter(|report| report.filesystem_total_bytes > 0)
+            .max_by_key(|report| report.sized_at.map(|at| (at.seconds, at.nanos)))
+            .map(|report| (report.filesystem_free_bytes, report.filesystem_total_bytes))
+    }
+
     /// Whether a worker already holds (or is building) an instance of a
     /// definition. Materializing counts: placement colocates onto it rather
     /// than starting a second materialization elsewhere.
@@ -393,10 +447,12 @@ mod tests {
                 remote_url: "https://example.com/atlas.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: "atlas".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
             unmanaged_paths: Vec::new(),
             created_at: None,
             etag: String::new(),
+            ..horde_proto::v1::WorkspaceDefinition::default()
         }
     }
 
@@ -425,6 +481,7 @@ mod tests {
             remote_url: remote.to_owned(),
             default_branch: "main".to_owned(),
             layout_path: String::new(),
+            ..horde_proto::v1::WorkspaceRepo::default()
         }
     }
 
@@ -629,6 +686,7 @@ mod tests {
             repos: Vec::new(),
             detail: String::new(),
             observed_at: None,
+            ..horde_proto::v1::WorkspaceInstanceReport::default()
         }
     }
 
@@ -653,6 +711,86 @@ mod tests {
         assert!(!is_warm(WorkspaceInstanceState::Degraded as i32));
         assert!(!is_warm(WorkspaceInstanceState::Missing as i32));
         assert!(!is_warm(WorkspaceInstanceState::Unspecified as i32));
+    }
+
+    /// The filter narrows by worker and by definition independently, and
+    /// the holders of a definition are exactly the workers reporting it,
+    /// sorted and once each.
+    #[test]
+    fn instances_filter_by_worker_and_definition_and_name_their_holders() {
+        let cache = InstanceCache::new();
+        cache.record(&report("worker-b", "ws-1", WorkspaceInstanceState::Ready));
+        cache.record(&report("worker-a", "ws-1", WorkspaceInstanceState::Ready));
+        cache.record(&report("worker-a", "ws-2", WorkspaceInstanceState::Ready));
+        cache.record(&report("worker-c", "ws-3", WorkspaceInstanceState::Ready));
+
+        let pairs = |reports: Vec<WorkspaceInstanceReport>| {
+            reports
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.worker_id.map(|id| id.to_string()).unwrap_or_default(),
+                        r.workspace_definition_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let owned = |items: &[(&str, &str)]| {
+            items
+                .iter()
+                .map(|(w, d)| ((*w).to_owned(), (*d).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(cache.filtered(Some("worker-a"), None)),
+            owned(&[("worker-a", "ws-1"), ("worker-a", "ws-2")])
+        );
+        assert_eq!(
+            pairs(cache.filtered(None, Some("ws-1"))),
+            owned(&[("worker-a", "ws-1"), ("worker-b", "ws-1")])
+        );
+        assert_eq!(
+            pairs(cache.filtered(Some("worker-a"), Some("ws-2"))),
+            owned(&[("worker-a", "ws-2")])
+        );
+        assert_eq!(cache.filtered(None, None).len(), 4);
+
+        assert_eq!(cache.holders(Some("ws-1")), vec!["worker-a", "worker-b"]);
+        assert_eq!(
+            cache.holders(None),
+            vec!["worker-a", "worker-b", "worker-c"]
+        );
+        assert!(cache.holders(Some("ws-9")).is_empty());
+    }
+
+    /// A worker's disk facts come from its most recently sized report that
+    /// carried any; an unsized report and other workers' reports do not count.
+    #[test]
+    fn a_workers_filesystem_is_its_freshest_sized_report() {
+        let sized = |worker: &str, definition: &str, free: u64, total: u64, at: i64| {
+            WorkspaceInstanceReport {
+                filesystem_free_bytes: free,
+                filesystem_total_bytes: total,
+                sized_at: Some(prost_types::Timestamp {
+                    seconds: at,
+                    nanos: 0,
+                }),
+                ..report(worker, definition, WorkspaceInstanceState::Ready)
+            }
+        };
+        let cache = InstanceCache::new();
+        assert_eq!(cache.filesystem_of("worker-a"), None);
+        cache.record(&sized("worker-a", "ws-1", 10, 100, 1));
+        cache.record(&sized("worker-a", "ws-2", 20, 100, 5));
+        // Newer, but carries no filesystem facts.
+        cache.record(&sized("worker-a", "ws-3", 0, 0, 9));
+        cache.record(&sized("worker-b", "ws-1", 70, 900, 50));
+
+        assert_eq!(cache.filesystem_of("worker-a"), Some((20, 100)));
+        assert_eq!(cache.filesystem_of("worker-b"), Some((70, 900)));
+        assert_eq!(cache.filesystem_of("worker-c"), None);
     }
 
     #[test]

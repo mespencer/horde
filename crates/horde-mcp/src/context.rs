@@ -31,6 +31,9 @@ pub struct AgentContext {
     /// The Session's log as the blocking verbs read it — shared by every clone,
     /// so each wait starts where the last one's fold left off.
     watch: SessionWatch,
+    /// The Worker's workspaces, for `workspace_checkout` and parent bases;
+    /// `None` on an endpoint with no workspaces behind it.
+    workspace: Option<std::sync::Arc<dyn crate::workspace::WorkspaceAccess>>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -54,7 +57,24 @@ impl AgentContext {
             watch: SessionWatch::new(client.clone(), session_id.clone()),
             client,
             session_id,
+            workspace: None,
         }
+    }
+
+    /// Puts the Worker's workspaces behind the workspace verbs.
+    #[must_use]
+    pub fn with_workspace(
+        mut self,
+        workspace: std::sync::Arc<dyn crate::workspace::WorkspaceAccess>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// The Worker's workspaces, when this endpoint has them.
+    #[must_use]
+    pub fn workspace(&self) -> Option<&std::sync::Arc<dyn crate::workspace::WorkspaceAccess>> {
+        self.workspace.as_ref()
     }
 
     /// The Session every event here belongs to.

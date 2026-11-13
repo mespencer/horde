@@ -58,33 +58,11 @@ async fn a_worker_joins_asking(
 /// Dials the scenario's server as a real worker running `script`, then waits
 /// for the registration's effect: the queued root agent placed on it.
 async fn join_with(world: &mut HordeWorld, script: Script) -> StepResult {
-    let endpoint = world.endpoint()?.to_owned();
     let journal_dir = tempfile::tempdir()?;
     let journal = horde_worker::Journal::open(&journal_dir.path().join("journal.sqlite"))?;
     let runtime = horde_worker::Runtime::new(journal.clone())
         .with_adapter(Arc::new(FakeAdapter::new(script)));
-
-    let config = horde_worker::DialConfig {
-        endpoint,
-        worker_id: "scripted-box".to_owned(),
-        hello: horde_worker::capabilities::hello("scripted-box"),
-        capabilities: horde_worker::capabilities::advertise(
-            runtime.adapters(),
-            None,
-            &horde_worker::capabilities::DeclaredFacts::default(),
-        ),
-        identity: None,
-        last_local_journal_sequence: None,
-    };
-    let (mut connection, _registration) = horde_worker::Connection::dial(&config).await?;
-    // Built before the spawn: the scripted worker's login plane is static
-    // data, and nothing in a feature scenario reads its operator lines.
-    let logins = horde_worker::login::LoginPlane::discarding(runtime.adapters());
-    let task = tokio::spawn(async move {
-        let mut runtime = runtime;
-        connection.run(&journal, &mut runtime, logins).await
-    });
-    world.worker = Some(RunningWorker::new(task, journal_dir));
+    dial(world, runtime, journal, journal_dir, "scripted-box", None).await?;
 
     // Registration is what places the queued root agent; nothing later in the
     // scenario is meaningful until the log says that happened.
@@ -97,4 +75,39 @@ async fn join_with(world: &mut HordeWorld, script: Script) -> StepResult {
             (placement.state == PlacementState::Placed as i32).then_some(())
         })
         .await
+}
+
+/// Dials the scenario's server as worker `name` running `runtime`, keeping
+/// the connection in the world. `warm` is the workspace advertisement:
+/// `None` for a worker without workspaces.
+pub(crate) async fn dial(
+    world: &mut HordeWorld,
+    runtime: horde_worker::Runtime,
+    journal: horde_worker::Journal,
+    journal_dir: tempfile::TempDir,
+    name: &str,
+    warm: Option<Vec<horde_proto::v1::WorkspaceInstanceReport>>,
+) -> StepResult {
+    let config = horde_worker::DialConfig {
+        endpoint: world.endpoint()?.to_owned(),
+        worker_id: name.to_owned(),
+        hello: horde_worker::capabilities::hello(name),
+        capabilities: horde_worker::capabilities::advertise(
+            runtime.adapters(),
+            warm,
+            &horde_worker::capabilities::DeclaredFacts::default(),
+        ),
+        identity: None,
+        last_local_journal_sequence: None,
+    };
+    let (mut connection, _registration) = horde_worker::Connection::dial(&config).await?;
+    // Built before the spawn: a scenario worker's login plane is static
+    // data, and nothing in a feature scenario reads its operator lines.
+    let logins = horde_worker::login::LoginPlane::discarding(runtime.adapters());
+    let task = tokio::spawn(async move {
+        let mut runtime = runtime;
+        connection.run(&journal, &mut runtime, logins).await
+    });
+    world.worker = Some(RunningWorker::new(task, journal_dir));
+    Ok(())
 }

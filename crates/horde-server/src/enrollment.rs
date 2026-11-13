@@ -40,6 +40,7 @@ pub fn is_enrollment_stream(session_id: &str) -> bool {
 #[must_use]
 pub fn is_reserved_stream(session_id: &str) -> bool {
     crate::workspace::is_catalog_stream(session_id)
+        || crate::workspace::is_housekeeping_stream(session_id)
         || is_enrollment_stream(session_id)
         || crate::mcp::is_mcp_catalog_stream(session_id)
         || crate::login::is_login_stream(session_id)
@@ -496,5 +497,16 @@ mod tests {
             roster.active_serials(&worker("mac-studio")),
             Vec::<String>::new()
         );
+    }
+
+    /// Both workspace streams are reserved on their own: neither is a
+    /// session, while an ordinary session id is one.
+    #[test]
+    fn the_workspace_catalog_and_housekeeping_streams_are_each_reserved() {
+        assert!(super::is_reserved_stream(crate::workspace::CATALOG_STREAM));
+        assert!(super::is_reserved_stream(
+            horde_proto::WORKSPACE_HOUSEKEEPING_STREAM
+        ));
+        assert!(!super::is_reserved_stream("session-1"));
     }
 }

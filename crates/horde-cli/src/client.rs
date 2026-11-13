@@ -240,6 +240,30 @@ pub enum ClientError {
     /// `horde doctor` found something to fix; the report above says what.
     #[error("doctor found {failures} problem(s); each FAIL line above names its fix")]
     Unhealthy { failures: usize },
+
+    /// A workspace cleanup was refused or failed somewhere; the rows above
+    /// say where and why (ADR-0014). Exit status 1.
+    #[error("workspace cleanup: {0}")]
+    CleanupRefused(String),
+
+    /// A workspace cleanup is not finished everywhere: Workers that were
+    /// offline (they act on reconnect), unsupported, or still pending at the
+    /// deadline (ADR-0014). Exit status 3, so a script can tell "not yet"
+    /// from "no".
+    #[error("workspace cleanup incomplete: {0}")]
+    CleanupPending(String),
+}
+
+impl ClientError {
+    /// The process exit status this refusal ends `horde` with: 3 for a
+    /// cleanup that is merely incomplete, 1 for everything else.
+    #[must_use]
+    pub fn exit_status(&self) -> u8 {
+        match self {
+            Self::CleanupPending(_) => 3,
+            _ => 1,
+        }
+    }
 }
 
 impl ClientError {
@@ -1023,16 +1047,10 @@ impl Client {
     /// Defines a workspace: the fixed repo set agents check out (DESIGN §7).
     pub async fn create_workspace_definition(
         &mut self,
-        name: &str,
-        repos: Vec<horde_proto::v1::WorkspaceRepo>,
-        unmanaged_paths: Vec<String>,
+        request: horde_proto::v1::CreateWorkspaceDefinitionRequest,
     ) -> Result<horde_proto::v1::WorkspaceDefinition, ClientError> {
         self.inner
-            .create_workspace_definition(horde_proto::v1::CreateWorkspaceDefinitionRequest {
-                name: name.to_owned(),
-                repos,
-                unmanaged_paths,
-            })
+            .create_workspace_definition(request)
             .await?
             .into_inner()
             .definition
@@ -1128,21 +1146,54 @@ impl Client {
             .ok_or_else(|| ClientError::Rpc(tonic::Status::internal("no definition came back")))
     }
 
-    /// Removes a definition at the version `etag` names.
+    /// Removes a definition at the version `etag` names — and, with
+    /// `purge`, every Instance of it (ADR-0014).
     pub async fn delete_workspace_definition(
         &mut self,
-        workspace_definition_id: &str,
-        etag: &str,
-    ) -> Result<(), ClientError> {
-        self.inner
-            .delete_workspace_definition(horde_proto::v1::DeleteWorkspaceDefinitionRequest {
-                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
-                    workspace_definition_id,
-                )),
-                etag: etag.to_owned(),
-            })
-            .await?;
-        Ok(())
+        request: horde_proto::v1::DeleteWorkspaceDefinitionRequest,
+    ) -> Result<horde_proto::v1::DeleteWorkspaceDefinitionResponse, ClientError> {
+        Ok(self
+            .inner
+            .delete_workspace_definition(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Asks the Workers holding Instances to reclaim disk (ADR-0014).
+    pub async fn collect_workspace_garbage(
+        &mut self,
+        request: horde_proto::v1::CollectWorkspaceGarbageRequest,
+    ) -> Result<horde_proto::v1::CollectWorkspaceGarbageResponse, ClientError> {
+        Ok(self
+            .inner
+            .collect_workspace_garbage(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Asks one Worker to remove one Instance (ADR-0014).
+    pub async fn remove_workspace_instance(
+        &mut self,
+        request: horde_proto::v1::RemoveWorkspaceInstanceRequest,
+    ) -> Result<horde_proto::v1::RemoveWorkspaceInstanceResponse, ClientError> {
+        Ok(self
+            .inner
+            .remove_workspace_instance(request)
+            .await?
+            .into_inner())
+    }
+
+    /// The cached Instance reports, optionally filtered.
+    pub async fn list_workspace_instances(
+        &mut self,
+        request: horde_proto::v1::ListWorkspaceInstancesRequest,
+    ) -> Result<Vec<horde_proto::v1::WorkspaceInstanceReport>, ClientError> {
+        Ok(self
+            .inner
+            .list_workspace_instances(request)
+            .await?
+            .into_inner()
+            .instances)
     }
 
     /// Asks a worker to materialize a workspace instance ahead of any spawn.

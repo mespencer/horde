@@ -72,6 +72,49 @@ pub struct SpawnParams {
     /// Another model tier for the child, e.g. "fast". Omitted, it is yours.
     #[serde(default)]
     pub tier: Option<String>,
+    /// The repos the child checks out at start (the rest on demand with
+    /// workspace_checkout). Naming any implies a lazy checkout.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Where a repo's checkout starts: {repo: commit, origin branch or tag}.
+    /// Repos you have checked out and do not name start from your latest
+    /// commit.
+    #[serde(default)]
+    pub bases: std::collections::BTreeMap<String, String>,
+    /// The branch the child creates in every repo it checks out; one that
+    /// exists on origin is continued. Omitted: horde/<child-id>.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// "all" or "lazy"; omitted, the workspace's mode.
+    #[serde(default)]
+    pub checkout_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceCheckoutParams {
+    /// The repo, by its workspace name.
+    pub repo: String,
+    /// Where to start: a commit, an origin branch or a tag. Omitted, the
+    /// latest origin default branch.
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// The wire mode a `checkout_mode` argument names.
+///
+/// # Errors
+///
+/// Anything but `all` or `lazy`.
+pub fn checkout_mode_named(name: Option<&str>) -> Result<horde_proto::v1::CheckoutMode, ErrorData> {
+    match name {
+        None => Ok(horde_proto::v1::CheckoutMode::Unspecified),
+        Some("all") => Ok(horde_proto::v1::CheckoutMode::All),
+        Some("lazy") => Ok(horde_proto::v1::CheckoutMode::Lazy),
+        Some(other) => Err(ErrorData::invalid_params(
+            format!("checkout_mode is \"all\" or \"lazy\", not {other:?}"),
+            None,
+        )),
+    }
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -429,9 +472,23 @@ impl HordeEndpoint {
         // text would silently collapse them into one (the audit's collision
         // #1). The task itself rides the spec as the initial assignment.
         let key = self.minted_request_id(&identity);
+        let checkout_mode = checkout_mode_named(params.checkout_mode.as_deref())?;
+        // The parent's committed HEADs, staged to the Relay, unless the
+        // caller named the repo's base itself (ADR-0014).
+        let parent_bases = match self.context.workspace() {
+            Some(workspace) => workspace
+                .parent_bases(identity.agent_id())
+                .await
+                .map_err(|error| ErrorData::internal_error(error, None))?,
+            None => Vec::new(),
+        };
         let overrides = crate::verbs::ChildOverrides {
             agent_type: params.agent_type,
             tier: params.tier,
+            repos: params.repos,
+            bases: crate::workspace::merged_bases(&params.bases, parent_bases),
+            branch: params.branch.filter(|branch| !branch.is_empty()),
+            checkout_mode,
         };
         let outcome = self
             .verbs()
@@ -444,6 +501,29 @@ impl HordeEndpoint {
             placed: outcome.placed,
             reason: outcome.reason,
         }))
+    }
+
+    #[tool(
+        name = "workspace_checkout",
+        description = "Check out one more repo of your workspace, on your branch, and get its path. Call it before reading or changing a repo your workspace manifest lists as not checked out. Calling it again for a repo you have is harmless."
+    )]
+    async fn workspace_checkout(
+        &self,
+        Parameters(params): Parameters<WorkspaceCheckoutParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<crate::workspace::CheckoutAnswer>, ErrorData> {
+        let identity = Self::caller(&context)?;
+        let workspace = self.context.workspace().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "this agent runs without a workspace; there is nothing to check out",
+                None,
+            )
+        })?;
+        workspace
+            .checkout(identity.agent_id(), &params.repo, params.base.as_deref())
+            .await
+            .map(Json)
+            .map_err(|reason| ErrorData::invalid_params(reason, None))
     }
 
     #[tool(
@@ -1220,6 +1300,27 @@ mod tests {
         );
     }
 
+    /// `checkout_mode` takes the two modes or nothing; anything else is the
+    /// caller's mistake, named, never a guess.
+    #[test]
+    fn a_checkout_mode_argument_is_all_lazy_or_absent() {
+        use horde_proto::v1::CheckoutMode;
+        assert_eq!(
+            super::checkout_mode_named(None).ok(),
+            Some(CheckoutMode::Unspecified)
+        );
+        assert_eq!(
+            super::checkout_mode_named(Some("all")).ok(),
+            Some(CheckoutMode::All)
+        );
+        assert_eq!(
+            super::checkout_mode_named(Some("lazy")).ok(),
+            Some(CheckoutMode::Lazy)
+        );
+        let refused = super::checkout_mode_named(Some("some")).expect_err("refused");
+        assert!(refused.message.contains("\"some\""), "{refused:?}");
+    }
+
     #[tokio::test]
     async fn the_tool_names_are_the_ones_agents_are_told_about() {
         let names = endpoint().tool_names_for("agent-42");
@@ -1232,6 +1333,7 @@ mod tests {
             "wait_for_agent",
             "expose",
             "inject",
+            "workspace_checkout",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

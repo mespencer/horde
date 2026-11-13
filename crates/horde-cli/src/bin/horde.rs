@@ -57,7 +57,7 @@ async fn main() -> ExitCode {
             // Decided in the library (`ClientError::report`), where it is
             // tested: the refusal, and the diagnosed cause beneath it.
             eprintln!("{}", error.report_for(format));
-            ExitCode::FAILURE
+            ExitCode::from(error.exit_status())
         }
     };
 

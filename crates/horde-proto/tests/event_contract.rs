@@ -70,6 +70,11 @@ const EVENT_VOCABULARY: &[&str] = &[
     "journal_event_refused",
     "stale_journal_event",
     "worker_journal_reset",
+    "checkout_prepared",
+    "workspace_cleanup",
+    "workspace_gc_requested",
+    "workspace_gc_completed",
+    "workspace_disk_pressure",
 ];
 
 /// Maps a generated variant back to its proto field name.
@@ -104,6 +109,11 @@ fn kind_field_name(kind: &event::Kind) -> &'static str {
         event::Kind::JournalEventRefused(_) => "journal_event_refused",
         event::Kind::StaleJournalEvent(_) => "stale_journal_event",
         event::Kind::WorkerJournalReset(_) => "worker_journal_reset",
+        event::Kind::CheckoutPrepared(_) => "checkout_prepared",
+        event::Kind::WorkspaceCleanup(_) => "workspace_cleanup",
+        event::Kind::WorkspaceGcRequested(_) => "workspace_gc_requested",
+        event::Kind::WorkspaceGcCompleted(_) => "workspace_gc_completed",
+        event::Kind::WorkspaceDiskPressure(_) => "workspace_disk_pressure",
     }
 }
 
@@ -292,6 +302,53 @@ fn every_kind() -> Vec<event::Kind> {
             reset_by: None,
             reason: "disk replaced".to_owned(),
         }),
+        event::Kind::CheckoutPrepared(horde_proto::v1::CheckoutPrepared {
+            repos: vec![horde_proto::v1::checkout_prepared::Repo {
+                repo_name: "atlas".to_owned(),
+                branch: "horde/agent-1".to_owned(),
+                base_commit_sha: "9c1e".to_owned(),
+                resolution: horde_proto::v1::checkout_prepared::BaseResolution::Cached.into(),
+                requested_ref: String::new(),
+                fetched_at: None,
+                stale_reason: "fetch timed out".to_owned(),
+            }],
+            mode: horde_proto::v1::CheckoutMode::Lazy.into(),
+            available_repos: vec!["atlas".to_owned(), "proto".to_owned()],
+        }),
+        event::Kind::WorkspaceCleanup(horde_proto::v1::WorkspaceCleanup {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            tier: horde_proto::v1::CleanupTier::Soft.into(),
+            trigger: horde_proto::v1::CleanupTrigger::Archive.into(),
+            repos: vec![horde_proto::v1::workspace_cleanup::RepoAction {
+                repo_name: "atlas".to_owned(),
+                outcome: horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done.into(),
+                argv: vec!["cargo".to_owned(), "clean".to_owned()],
+                bytes_freed: 4_096,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        event::Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested {
+            request_id: "gc-1".to_owned(),
+            worker_ids: vec![WorkerId::new("mac-studio")],
+            level: horde_proto::v1::GcLevel::Hard.into(),
+            dry_run: true,
+            ..Default::default()
+        }),
+        event::Kind::WorkspaceGcCompleted(horde_proto::v1::WorkspaceGcCompleted {
+            request_id: "gc-1".to_owned(),
+            worker_id: Some(WorkerId::new("mac-studio")),
+            actions_done: 2,
+            actions_refused: 1,
+            bytes_freed: 4_096,
+            error: String::new(),
+        }),
+        event::Kind::WorkspaceDiskPressure(horde_proto::v1::WorkspaceDiskPressure {
+            worker_id: Some(WorkerId::new("mac-studio")),
+            free_bytes: 1,
+            low_watermark_bytes: 2,
+            exhausted: true,
+        }),
     ]
 }
 
@@ -402,7 +459,7 @@ fn event_kind_tags_are_stable() {
     // Field numbers are the contract. Renumbering a shipped kind silently
     // reinterprets every event already in a Session log or a Worker journal, so
     // pin the assignment here as well as in buf's breaking check.
-    let expected: [(&str, i32); 26] = [
+    let expected: [(&str, i32); 31] = [
         ("agent_output_chunk", 10),
         ("agent_spawned", 11),
         ("assignment_sent", 12),
@@ -429,6 +486,11 @@ fn event_kind_tags_are_stable() {
         ("journal_event_refused", 33),
         ("stale_journal_event", 34),
         ("worker_journal_reset", 35),
+        ("checkout_prepared", 36),
+        ("workspace_cleanup", 37),
+        ("workspace_gc_requested", 38),
+        ("workspace_gc_completed", 39),
+        ("workspace_disk_pressure", 40),
     ];
 
     let expected: Vec<(String, i32)> = expected

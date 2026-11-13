@@ -87,6 +87,12 @@ impl System {
     /// on OS-chosen loopback ports, and enrolls the operator through the
     /// bootstrap code — the exact first-run ceremony DESIGN §3 describes.
     pub(crate) async fn launch() -> System {
+        Self::launch_with(&[]).await
+    }
+
+    /// [`Self::launch`], with extra `horde-server` flags — a scenario that
+    /// needs a shorter fetch throttle, say.
+    pub(crate) async fn launch_with(server_flags: &[&str]) -> System {
         let server_bin = product_binary("horde-server", "horde-server")
             .await
             .expect("the server binary exists");
@@ -107,24 +113,23 @@ impl System {
         let state = tempfile::tempdir().expect("a state directory");
         let db = state.path().join("horde.db");
         let server_state = state.path().join("server-state");
-        let server = SpawnedProcess::spawn(
-            "horde-server",
-            &server_bin,
-            &[
-                &db.to_string_lossy(),
-                "--serve",
-                "--bind",
-                "127.0.0.1:0",
-                "--enrollment-bind",
-                "127.0.0.1:0",
-                "--relay-bind",
-                "127.0.0.1:0",
-                "--state-dir",
-                &server_state.to_string_lossy(),
-            ],
-            &[],
-        )
-        .expect("the server spawns");
+        let db = db.to_string_lossy().into_owned();
+        let server_state = server_state.to_string_lossy().into_owned();
+        let mut args = vec![
+            db.as_str(),
+            "--serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--enrollment-bind",
+            "127.0.0.1:0",
+            "--relay-bind",
+            "127.0.0.1:0",
+            "--state-dir",
+            server_state.as_str(),
+        ];
+        args.extend_from_slice(server_flags);
+        let server = SpawnedProcess::spawn("horde-server", &server_bin, &args, &[])
+            .expect("the server spawns");
 
         // A fresh server has no client, so it must mint the bootstrap
         // token; its stdout is the root of trust for everything that

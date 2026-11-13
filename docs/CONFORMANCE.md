@@ -23,8 +23,8 @@ citations are for `9218ac2`.
 | §3 Identity and security | CONFORMS | Role table per RPC, worker identity from its certificate, mint/revoke Client-only, revocation severs streams, journal reset, `--remint` (ADR-0009). Rotation is still manual re-enrollment. |
 | §4 Providers and adapters | CONFORMS | Both adapters run under worker-owned profiles (ADR-0010); interactive-auth relay built with `--account`. Held provider accounts are advertised on every dial and re-advertised after a sign-in (`horde-worker/src/login.rs:100,248`; `startup.rs:691`) — checked at `9218ac2`. |
 | §5 Agent model | PARTIAL | The endpoint is wired and agents spawn agents; an MCP-spawned child inherits its parent's spec — workspace, agent type, model, permission mode — and may not exceed it (`horde-server/src/lineage.rs:28,54`, applied at `service/control_plane.rs:318,321`) — checked at `9218ac2`. Reaper and native-tool suppression not built. |
-| §6 Sessions, placement, scheduling | CONFORMS | Placement skips workers lacking the harness; messages to unplaced agents buffer; idempotent retries. `MaterializationProgress` still has no producer. |
-| §7 Workspaces | PARTIAL | `horde workspace create/list/get/add-repo/update/delete`; `unmanaged_paths` stored but read by no worker code; no cwd auto-registration. |
+| §6 Sessions, placement, scheduling | CONFORMS | Placement skips workers lacking the harness; messages to unplaced agents buffer; idempotent retries. Disk facts now shape placement (ADR-0014 resolution 7): a worker under pressure is ranked last, one below the floor refused (`horde-server/src/scheduler.rs:218,516`). |
+| §7 Workspaces | CONFORMS (W12d, ADR-0014) | Fresh bases, lazy checkout, shared branch names, two-tier cleanup, `horde workspace gc/instance/log`, `delete --purge`; `unmanaged_paths` real; the worker reports and journals `MaterializationProgress`. Repo additions still raise no permission event; see "§7 at W12d" below. |
 | §8 Git backbone, relay, blob store | CONFORMS (as built) | Relay mounted by `--relay-bind`; dirty trees refused on the stamp path (`horde-worker/src/share.rs:139-144`); blob GC absent by design. |
 | §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. MCP-spawned children carry their parent's agent type, so allowlists resolve for them (`horde-server/src/lineage.rs:28`; `hub.rs:152,194`) — checked at `9218ac2`. |
 | §10 Permissions | PARTIAL | Chain driver runs in `serve()` with `PermissionModes::shipped()` (`horde-server/src/startup.rs:443-451`); the judge is still a seam with no production implementation. |
@@ -33,6 +33,32 @@ citations are for `9218ac2`.
 | §13 Configuration layering | ABSENT | No config file is loaded anywhere; tiers are `TierCatalog::shipped_defaults()` (`service/commands.rs:646`). |
 | §14–§15 | CONFORMS | Unchanged. |
 | §16 Development quality | CONFORMS | Ten blocking gates; coverage has a 95.0 floor (`horde-gauntlet/src/gates/coverage.rs:20`). |
+
+### §7 at W12d (ADR-0014, checked on `mespencer/w12d-workspaces`)
+
+| ADR-0014 piece | Implementation | Proving test |
+|---|---|---|
+| Fresh base: throttled single-flight fetch, `origin/<default>`, fallback recorded | `horde-worker/src/workspace/base.rs:129,170`; journaled as `CheckoutPrepared` at spawn (`runtime/lane.rs`, `checkout_prepared_entry` in `runtime/shared.rs`) | `worker_suite/workspace_lifecycle.rs` freshness, throttle (one upload-pack via a wrapper), cached fallback; e2e `workspaces::agents_start_fresh_share_a_branch_and_check_out_lazily`; `features/workspaces.feature` |
+| Named and parent bases; a child starts from its parent's commit on any worker | `base.rs:170` (SHA, origin branch, tag, one targeted fetch, `ShareBroker::obtain_into`); the endpoint fills `PARENT` bases (`horde-worker/src/runtime/access.rs:88`, `horde-mcp/src/workspace.rs` `merged_bases`) | `workspace_lifecycle.rs` named bases; e2e `lineage.rs` (MCP spawn, parent's commit) |
+| Lazy checkout, manifest, `workspace_checkout` | `workspace/mod.rs:309,429`, `workspace/manifest.rs`; tool `horde-mcp/src/endpoint.rs:510` served by `runtime/access.rs:19` | `workspace_lifecycle.rs` lazy and stamping tests; e2e lazy checkout through the agent's own tool call |
+| One branch across repos; claims; adoption | `base.rs:354` (create / adopt / refuse); Server claim from the projection `service/workspace_gc.rs:145`, checked in `control_plane.rs:303` | `workspace_lifecycle.rs` branch test; `server_suite/workspaces.rs` held-branch refusal; e2e shared branch |
+| Ledger beside each checkout | `workspace/ledger.rs` (JSON; implementation note in the ADR) | `ledger.rs` unit tests; orphan tests |
+| Soft reclaim (no shell, cleared env, own group, bounded; cargo guard) | `workspace/reclaim.rs:140,193`; per checkout `workspace/cleanup.rs:108` | `reclaim.rs` unit tests (group kill, env, guard); `workspace_lifecycle.rs` real `cargo clean`; e2e `gc_reclaims_softly_…` |
+| Hard removal and reachability (resolution 2: ignored files) | `workspace/removal.rs:65,209,266,387`; `cleanup.rs:170,375,497` | `workspace_lifecycle.rs` ignored `.env`, gc levels, pins, instance removal; `worker_suite/workspaces.rs` lossless/forced removal |
+| Triggers: archive (24 h grace, resolution 1), idle, disk pressure, orphans, pins | `runtime/housekeeping.rs:272,471,607` | `workspace_lifecycle.rs` grace, idle, disk pressure (steered `FsStats`), orphans after reset; e2e orphans after `horde worker reset` |
+| gc / instance removal / purge, events in the housekeeping stream | Server `service/workspace_gc.rs:105`, RPCs `control_plane.rs:1314,1370,1420,1470`, fold `service/commands.rs:378`, admission `service/ingest.rs:358`; Worker `runtime/housekeeping.rs:314` | `commands.rs` gc fold tests; `ingest.rs` housekeeping admission; `server_suite/workspaces.rs`; CLI `workspace_gc.rs` verdict and render tests |
+| Policy resolution (defaults → server flags → Definition) | `horde-server/src/workspace_policy.rs:68`; stamped by `commands.rs:176` | `workspace_policy.rs` layering test; gc fold test (policy rides the command) |
+| Validation (branch, bases, repos, reclaim argv, unmanaged, lazy layouts) | `workspace_policy.rs:95,298` | `workspace_policy.rs` tables; `server_suite/workspaces.rs` create refusals |
+| Protocol fence (`workspace_protocol = 2`) | `scheduler.rs:516`; advertised in `horde-worker/src/capabilities.rs` | `scheduler.rs` fence test; `server_suite/workspaces.rs` |
+| `unmanaged_paths` real | `workspace/mod.rs:1176,1194` | `workspace_lifecycle.rs` instance removal (data via the link, kept by checkout removal, needs `--force`) |
+| `MaterializationProgress` produced | `workspace/mod.rs:216`, journaled as it happens in `runtime/lane.rs` `materialize_workspace` | `workspace_lifecycle.rs` three-repo progress sequence |
+| `ReportWorkspaceInstances` called (materialize, cleanup, timer) | `runtime/housekeeping.rs:777`, reporter `startup.rs:619`; checkouts and disk facts in `WorkspaceInstanceReport` (`workspace/mod.rs:721`) | `workspace_lifecycle.rs` recording reporter; e2e `workspace instance list` shows orphans |
+| No auto-registration | `horde workspace create --from-cwd` only; `control_plane.proto` comment corrected | — (the front door's offer is not built; ADR implementation notes) |
+
+Still open in §7: a repo addition raises no permission event (unchanged,
+ADR-0014 does not touch it); the front door's create-from-cwd offer is not
+built; `HORDE_WORKSPACE_MANIFEST` is not exported to harnesses (the lazy
+overlay names the manifest path instead).
 
 ### Surfaces added in waves 8–11
 

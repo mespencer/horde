@@ -58,17 +58,37 @@ pub fn advertise<'a>(
     warm_instances: Option<Vec<WorkspaceInstanceReport>>,
     declared: &DeclaredFacts,
 ) -> WorkerCapabilities {
+    let supports_workspaces = warm_instances.is_some();
+    let warm_instances = warm_instances.unwrap_or_default();
+    // Disk facts ride the instance reports; a Worker holding none yet
+    // advertises unknown (zero), which placement reads as no pressure.
+    let (workspace_free_bytes, workspace_total_bytes) = warm_instances
+        .first()
+        .map(|report| (report.filesystem_free_bytes, report.filesystem_total_bytes))
+        .unwrap_or_default();
     WorkerCapabilities {
         tags: declared.tags.clone(),
         platform: Some(platform()),
         provider_accounts: Vec::new(),
         reachable_remotes: declared.reachable_remotes.clone(),
-        supports_workspaces: warm_instances.is_some(),
-        warm_instances: warm_instances.unwrap_or_default(),
+        supports_workspaces,
+        warm_instances,
         harnesses: adapters.into_iter().map(harness).collect(),
         max_concurrent_agents: 0,
+        // ADR-0014's protocol: fresh bases, lazy checkout, branches, two-tier
+        // cleanup. Only a Worker with workspaces implements any of it.
+        workspace_protocol: if supports_workspaces {
+            WORKSPACE_PROTOCOL
+        } else {
+            0
+        },
+        workspace_free_bytes,
+        workspace_total_bytes,
     }
 }
+
+/// The workspace protocol this Worker implements (ADR-0014).
+pub const WORKSPACE_PROTOCOL: u32 = 2;
 
 /// One registered adapter, as the wire advertises it.
 fn harness(adapter: &dyn Adapter) -> HarnessCapability {

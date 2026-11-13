@@ -139,6 +139,14 @@ pub(super) fn lane_key(command: &StreamCommandsResponse) -> String {
                 .map(ToString::to_string)
                 .unwrap_or_default(),
         )),
+        // A gc on one Instance runs behind that Instance's materializations;
+        // a gc on every Instance gets a lane of its own.
+        Some(Command::WorkspaceGc(gc)) => Some(workspace_lane(
+            &gc.workspace_definition_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        )),
         None => None,
     };
     key.unwrap_or_default()
@@ -218,6 +226,8 @@ enum AfterCommit {
         agent_id: String,
         checkout: Option<std::path::PathBuf>,
     },
+    /// The Instance set changed: re-report it.
+    Report,
 }
 
 /// What one lane iteration is about to handle.
@@ -380,9 +390,38 @@ impl Lane {
                 self.deliver_permission_decision(decision)
             }
             Command::MaterializeWorkspace(materialize) => {
-                self.materialize_workspace(materialize).await
+                self.materialize_workspace(materialize, command_id).await
             }
+            Command::WorkspaceGc(gc) => Ok(self.workspace_gc(&gc).await),
         }
+    }
+
+    /// Carries out a gc command, or answers that this Worker cannot: one
+    /// with no workspace support completes the request with the error
+    /// rather than leaving the Client waiting.
+    async fn workspace_gc(&self, gc: &horde_proto::v1::WorkspaceGcCommand) -> Applied {
+        let effects = match super::housekeeping::of(&self.shared) {
+            Some(housekeeper) => {
+                if let Some(definition) = gc.workspace_definition_id.as_ref() {
+                    self.shared
+                        .remember_policy(&definition.to_string(), gc.policy.as_ref());
+                }
+                let entries = housekeeper.gc(gc).await;
+                housekeeper.report().await;
+                entries
+            }
+            None => vec![JournalEntry {
+                session_id: horde_proto::WORKSPACE_HOUSEKEEPING_STREAM.to_owned(),
+                agent_id: None,
+                idempotency_key: format!("gc:{}:completed", gc.request_id),
+                kind: Kind::WorkspaceGcCompleted(horde_proto::v1::WorkspaceGcCompleted {
+                    request_id: gc.request_id.clone(),
+                    error: WorkerError::UnsupportedCommand("workspace gc").to_string(),
+                    ..horde_proto::v1::WorkspaceGcCompleted::default()
+                }),
+            }],
+        };
+        Applied::effects(effects)
     }
 
     /// Creates or repairs an Instance and journals what is now on disk.
@@ -395,13 +434,58 @@ impl Lane {
     async fn materialize_workspace(
         &self,
         materialize: MaterializeWorkspaceCommand,
+        command_id: &str,
     ) -> Result<Applied, WorkerError> {
         let session_id = required_id(materialize.session_id.as_ref(), "session id")?;
         let definition = materialize
             .definition
             .ok_or(WorkerError::Incomplete("workspace definition"))?;
+        if let Some(id) = definition.workspace_definition_id.as_ref() {
+            self.shared
+                .remember_policy(&id.to_string(), materialize.policy.as_ref());
+        }
         let report = match &self.shared.workspaces {
-            Some(workspaces) => workspaces.materialize(&definition).await,
+            Some(workspaces) => {
+                // Progress is journaled as it happens, not at completion: a
+                // prewarm being watched shows each repo it is on (ADR-0014).
+                let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+                let journal = self.shared.journal.clone();
+                let stream = session_id.clone();
+                let key = command_id.to_owned();
+                let progress_definition = definition.clone();
+                let writer = tokio::spawn(async move {
+                    let mut step = 0_usize;
+                    while let Some(progress) = receiver.recv().await {
+                        let entry = JournalEntry {
+                            session_id: stream.clone(),
+                            agent_id: None,
+                            idempotency_key: format!("{key}:progress:{step}"),
+                            kind: Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged {
+                                report: Some(WorkspaceInstanceReport {
+                                    workspace_definition_id: progress_definition
+                                        .workspace_definition_id
+                                        .clone(),
+                                    state: WorkspaceInstanceState::Materializing.into(),
+                                    ..WorkspaceInstanceReport::default()
+                                }),
+                                progress: Some(progress),
+                            }),
+                        };
+                        step += 1;
+                        if let Err(error) = journal.record(entry).await {
+                            tracing::warn!(%error, "materialization progress could not be journaled");
+                        }
+                    }
+                });
+                let report = workspaces
+                    .materialize_with(&definition, &mut |progress| {
+                        let _ = sender.send(progress);
+                    })
+                    .await;
+                drop(sender);
+                let _ = writer.await;
+                report
+            }
             None => WorkspaceInstanceReport {
                 workspace_definition_id: definition.workspace_definition_id,
                 state: WorkspaceInstanceState::Degraded.into(),
@@ -409,7 +493,7 @@ impl Lane {
                 ..WorkspaceInstanceReport::default()
             },
         };
-        Ok(Applied::effects(vec![JournalEntry {
+        let applied = Applied::effects(vec![JournalEntry {
             session_id,
             agent_id: None,
             idempotency_key: String::new(),
@@ -417,7 +501,11 @@ impl Lane {
                 report: Some(report),
                 progress: None,
             }),
-        }]))
+        }]);
+        Ok(Applied {
+            then: AfterCommit::Report,
+            ..applied
+        })
     }
 
     async fn spawn_agent(&mut self, spawn: SpawnAgentCommand) -> Result<Applied, WorkerError> {
@@ -425,12 +513,19 @@ impl Lane {
         let session_id = required_id(spawn.session_id.as_ref(), "session id")?;
         let context = context_of(&spawn, &session_id, &agent_id);
 
+        // The checkout lock is held from the checkout to the registration: a
+        // scan must never read a half-made checkout as an orphan.
+        let lock = self.shared.checkout_locks.of(&agent_id);
+        let held = lock.lock().await;
         // A spawn that cannot start is the *agent* failing: the command still
         // completes, with the failure as its journaled effect.
-        let checkout = match self.shared.agent_checkout(&spawn).await {
-            Ok(checkout) => checkout,
+        let composed = match self.shared.agent_checkout(&spawn).await {
+            Ok(composed) => composed,
             Err(error) => return Ok(spawn_failed(&context, &agent_id, &error)),
         };
+        let launched = super::shared::with_overlay(&spawn, composed.as_ref());
+        let prepared = composed.as_ref().map(|composed| composed.prepared.clone());
+        let checkout = composed.map(|composed| composed.checkout);
         let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
         // The endpoint before the harness: an agent launched without its
         // verbs and permission prompt tool is not degraded, it is a different
@@ -441,15 +536,20 @@ impl Lane {
             .agent_endpoint(&session_id, &agent_id, &spawn)
             .await
         {
-            Ok(endpoint) => self.shared.start_session(&spawn, cwd, endpoint).await,
+            Ok(endpoint) => self.shared.start_session(&launched, cwd, endpoint).await,
             Err(error) => Err(error),
         };
         let (session, can_rewrite) = match started {
             Ok(started) => started,
             Err(error) => {
-                self.shared
-                    .abandon_spawn(&agent_id, checkout.as_ref())
-                    .await;
+                // The abandon takes the checkout lock itself.
+                drop(held);
+                super::housekeeping::abandon_spawn(
+                    &self.shared,
+                    &agent_id,
+                    checkout.as_ref().map(|checkout| checkout.root.as_path()),
+                )
+                .await;
                 return Ok(spawn_failed(&context, &agent_id, &error));
             }
         };
@@ -459,6 +559,7 @@ impl Lane {
         if let Some(checkout) = checkout {
             self.shared.broker.register(&agent_id, checkout);
         }
+        drop(held);
 
         let inputs = spawn
             .spec
@@ -470,14 +571,26 @@ impl Lane {
             .into_iter()
             .collect();
 
+        let mut effects: Vec<JournalEntry> = prepared
+            .map(|prepared| {
+                super::shared::checkout_prepared_entry(
+                    &session_id,
+                    &agent_id,
+                    format!("{agent_id}:checkout-prepared"),
+                    prepared,
+                )
+            })
+            .into_iter()
+            .collect();
+        effects.push(lifecycle_entry(
+            &context,
+            format!("{agent_id}:starting"),
+            AgentLifecycleState::Queued,
+            AgentLifecycleState::Starting,
+            "placed on this worker".to_owned(),
+        ));
         Ok(Applied {
-            effects: vec![lifecycle_entry(
-                &context,
-                format!("{agent_id}:starting"),
-                AgentLifecycleState::Queued,
-                AgentLifecycleState::Starting,
-                "placed on this worker".to_owned(),
-            )],
+            effects,
             // Remembered in the same transaction as the completion: a spawn
             // this Worker completed but cannot rebuild is an agent the Server
             // believes in and nobody can ever revive.
@@ -595,11 +708,18 @@ impl Lane {
         }
 
         match self.shared.resume_session(&record).await {
-            Ok((session, can_rewrite, checkout)) => {
+            Ok((session, can_rewrite, composed)) => {
+                let mut effects = Vec::new();
                 // Re-registered before the payload is obtained: the broker
                 // routes the obtain through the receiver's own checkout.
-                if let Some(checkout) = checkout {
-                    self.shared.broker.register(agent_id, checkout);
+                if let Some(composed) = composed {
+                    effects.push(super::shared::checkout_prepared_entry(
+                        &record.session_id,
+                        agent_id,
+                        String::new(),
+                        composed.prepared,
+                    ));
+                    self.shared.broker.register(agent_id, composed.checkout);
                 }
                 if let Some(Pending {
                     payload: Some(payload),
@@ -616,17 +736,18 @@ impl Lane {
                     return Ok(payload_failed(&record.session_id, agent_id, &error));
                 }
                 inputs.extend(current.map(|pending| (pending.input, Some(pending.command_id))));
+                effects.push(lifecycle_entry(
+                    &context,
+                    // Revivals can repeat; the journal mints each key.
+                    String::new(),
+                    // The Worker does not track how the last incarnation
+                    // ended; claiming one would be invention.
+                    AgentLifecycleState::Unspecified,
+                    AgentLifecycleState::Starting,
+                    "revived to deliver a message".to_owned(),
+                ));
                 Ok(Applied {
-                    effects: vec![lifecycle_entry(
-                        &context,
-                        // Revivals can repeat; the journal mints each key.
-                        String::new(),
-                        // The Worker does not track how the last incarnation
-                        // ended; claiming one would be invention.
-                        AgentLifecycleState::Unspecified,
-                        AgentLifecycleState::Starting,
-                        "revived to deliver a message".to_owned(),
-                    )],
+                    effects,
                     bookkeeping: AgentBookkeeping::None,
                     inbox: InboxDisposition::Hand,
                     then: AfterCommit::Start {
@@ -762,6 +883,14 @@ impl Lane {
                     None
                 }
             };
+            // The remembered spawn carries the policy its Instance last
+            // had: a restarted Worker has seen no other command for it.
+            if let Some(record) = record.as_ref()
+                && let Some(definition) = super::shared::workspace_of(&record.spawn)
+            {
+                self.shared
+                    .remember_policy(&definition, record.spawn.workspace_policy.as_ref());
+            }
             let checkout = record
                 .as_ref()
                 .and_then(|record: &RevivableAgent| self.shared.remembered_checkout(record));
@@ -854,11 +983,16 @@ impl Lane {
                 }
             }
             AfterCommit::Retire { agent_id } => self.retire(&agent_id).await,
+            AfterCommit::Report => {
+                if let Some(housekeeper) = super::housekeeping::of(&self.shared) {
+                    housekeeper.report().await;
+                }
+            }
             AfterCommit::Release { agent_id, checkout } => {
                 self.shared.forget_endpoint(&agent_id).await;
                 self.shared.broker.forget(&agent_id);
                 if let Some(checkout) = checkout {
-                    self.shared.release_checkout(&agent_id, &checkout).await;
+                    super::housekeeping::release_checkout(&self.shared, &agent_id, &checkout).await;
                 }
             }
         }
@@ -879,6 +1013,7 @@ impl Lane {
             self.shared.journal.clone(),
             context,
             control_receiver,
+            std::sync::Arc::clone(&self.shared.activity),
         ));
         for (input, command_id) in inputs {
             let _ = control
@@ -931,7 +1066,7 @@ impl Lane {
                     let _ = pump.await;
                 }
                 if let Some(checkout) = checkout {
-                    shared.release_checkout(&agent_id, &checkout.root).await;
+                    super::housekeeping::release_checkout(&shared, &agent_id, &checkout.root).await;
                 }
             }),
         );

@@ -327,6 +327,7 @@ async fn the_workspace_verbs_round_trip_through_the_dispatch() {
             name: "atlas-renamed".to_owned(),
             unmanaged_paths: definition.unmanaged_paths.clone(),
             repos: definition.repos.clone(),
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect("a same-repo-set update applies");
@@ -493,4 +494,232 @@ async fn a_verb_against_a_missing_session_fails_rather_than_printing_nothing() {
     .await
     .expect_err("usage against a missing session must fail");
     assert!(error.to_string().contains("session-that-never-existed"));
+}
+
+/// The workspace verbs ADR-0014 adds, in-process against a real server with
+/// no workers: a create with every policy flag, an instance listing, a gc
+/// that has no holder to wait for, a log read, an instance removal whose
+/// worker is away (exit status 3, the command waiting for it), and a purge
+/// that is only a dry run (the definition stays).
+#[tokio::test]
+async fn the_workspace_cleanup_verbs_round_trip() {
+    let endpoint = serve().await.expect("a listening server");
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "create",
+            "suite",
+            "--repo",
+            "atlas=https://example.com/atlas.git",
+            "--checkout-mode",
+            "lazy",
+            "--reclaim",
+            r#"atlas=["make","clean"]"#,
+            "--reclaim-timeout",
+            "atlas=20m",
+            "--idle-reclaim-after",
+            "0",
+            "--archived-grace",
+            "24h",
+        ],
+    )
+    .await
+    .expect("the create applies");
+    let mut client = horde_cli::Client::connect(&endpoint)
+        .await
+        .expect("a client");
+    let definition = client
+        .get_workspace_definition("suite")
+        .await
+        .expect("defined")
+        .definition
+        .expect("a definition");
+    assert_eq!(
+        definition.checkout_mode,
+        i32::from(horde_proto::v1::CheckoutMode::Lazy)
+    );
+    assert_eq!(
+        definition
+            .cleanup
+            .and_then(|cleanup| cleanup.archived_grace)
+            .map(|grace| grace.seconds),
+        Some(86_400)
+    );
+    assert!(definition.repos[0].reclaim.is_some());
+
+    invoke(&endpoint, &["workspace", "instance", "list", "suite"])
+        .await
+        .expect("an empty listing");
+    invoke(
+        &endpoint,
+        &["workspace", "gc", "suite", "--soft", "--wait", "1s"],
+    )
+    .await
+    .expect("nothing holds an instance, so nothing is pending");
+    // Bounded: a log without --follow stops at the end of the stream, and
+    // one that did not would hang this whole binary rather than fail it.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        invoke(&endpoint, &["--json", "workspace", "log"]),
+    )
+    .await
+    .expect("a log without --follow stops once it has caught up")
+    .expect("the log reads");
+
+    let away = invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "instance",
+            "remove",
+            "suite",
+            "--worker",
+            "away",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect_err("the worker is away");
+    assert!(away.to_string().contains("offline"), "{away}");
+
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "delete",
+            &definition
+                .workspace_definition_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            "--etag",
+            &definition.etag,
+            "--purge",
+            "--dry-run",
+        ],
+    )
+    .await
+    .expect("a dry-run purge applies");
+    assert!(
+        client.get_workspace_definition("suite").await.is_ok(),
+        "a dry-run purge keeps the definition"
+    );
+}
+
+/// A gc names its workspace by the definition's id, resolved from the name
+/// the operator typed, and the request is really on the housekeeping
+/// stream — a verb that returned without calling the Server, or with the
+/// name unresolved, leaves no such request.
+#[tokio::test]
+async fn a_gc_reaches_the_log_with_the_resolved_definition() {
+    let endpoint = serve().await.expect("a listening server");
+    let definition = common::define_workspace(&endpoint, "suite")
+        .await
+        .expect("defined");
+    invoke(
+        &endpoint,
+        &["workspace", "gc", "suite", "--hard", "--wait", "1s"],
+    )
+    .await
+    .expect("nothing holds an instance, so nothing is pending");
+    let requests = common::gc_requests(&endpoint).await.expect("the log reads");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(
+        requests[0]
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string),
+        Some(common::definition_id(&definition))
+    );
+    assert_eq!(requests[0].level, i32::from(horde_proto::v1::GcLevel::Hard));
+}
+
+/// A gc naming a worker that is not connected is not done: the worker is
+/// reported offline (it acts on reconnect) and the exit status is 3.
+#[tokio::test]
+async fn a_gc_of_an_offline_worker_says_so_and_is_incomplete() {
+    let endpoint = serve().await.expect("a listening server");
+    common::define_workspace(&endpoint, "suite")
+        .await
+        .expect("defined");
+    let error = invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "gc",
+            "suite",
+            "--worker",
+            "away",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect_err("an offline worker has not answered");
+    assert!(
+        error
+            .to_string()
+            .contains("offline (they act on reconnect): away"),
+        "{error}"
+    );
+}
+
+/// An instance removal appends a hard gc that removes the Instance, aimed
+/// at the named worker.
+#[tokio::test]
+async fn an_instance_removal_reaches_the_log() {
+    let endpoint = serve().await.expect("a listening server");
+    let definition = common::define_workspace(&endpoint, "suite")
+        .await
+        .expect("defined");
+    invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "instance",
+            "remove",
+            "suite",
+            "--worker",
+            "away",
+            "--force",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect_err("the worker is away");
+    let requests = common::gc_requests(&endpoint).await.expect("the log reads");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let removal = &requests[0];
+    assert!(removal.remove_instance && removal.force, "{removal:?}");
+    assert_eq!(
+        removal
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string),
+        Some(common::definition_id(&definition))
+    );
+    assert_eq!(
+        removal
+            .worker_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["away".to_owned()]
+    );
+}
+
+/// `workspace log` for a workspace that does not exist fails rather than
+/// printing an empty log.
+#[tokio::test]
+async fn a_log_of_an_unknown_workspace_fails() {
+    let endpoint = serve().await.expect("a listening server");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        invoke(&endpoint, &["workspace", "log", "no-such-workspace"]),
+    )
+    .await
+    .expect("bounded")
+    .expect_err("an unknown workspace is refused");
 }

@@ -76,6 +76,57 @@ pub struct ServeConfig {
     /// The worker-lost lease (ADR-0011); `None` takes
     /// [`crate::liveness::DEFAULT_WORKER_LEASE`].
     pub worker_lease: Option<std::time::Duration>,
+    /// The workspace defaults and disk-aware placement (ADR-0014).
+    pub workspace: WorkspaceFlags,
+}
+
+/// ADR-0014's server-side `workspace.*` keys, as flags until W12e's config
+/// file. Each `None` takes the built-in default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceFlags {
+    pub fetch_throttle: Option<std::time::Duration>,
+    pub fetch_timeout: Option<std::time::Duration>,
+    pub idle_reclaim_after: Option<std::time::Duration>,
+    pub archived_grace: Option<std::time::Duration>,
+    pub reclaim_timeout: Option<std::time::Duration>,
+    pub archived_pin_ttl: Option<std::time::Duration>,
+    /// `(basis points, bytes)`: below it a Worker is placed last.
+    pub disk_pressure: Option<(u64, u64)>,
+    /// Below it a Worker takes no workspace spawns.
+    pub disk_floor: Option<u64>,
+}
+
+impl WorkspaceFlags {
+    /// The workspace policy these flags configure.
+    #[must_use]
+    pub fn policy(&self) -> crate::workspace_policy::WorkspacePolicyConfig {
+        let defaults = crate::workspace_policy::WorkspacePolicyConfig::default();
+        crate::workspace_policy::WorkspacePolicyConfig {
+            fetch_throttle: self.fetch_throttle.unwrap_or(defaults.fetch_throttle),
+            fetch_timeout: self.fetch_timeout.unwrap_or(defaults.fetch_timeout),
+            idle_reclaim_after: self
+                .idle_reclaim_after
+                .unwrap_or(defaults.idle_reclaim_after),
+            archived_grace: self.archived_grace.unwrap_or(defaults.archived_grace),
+            reclaim_timeout: self.reclaim_timeout.unwrap_or(defaults.reclaim_timeout),
+            archived_pin_ttl: self.archived_pin_ttl.or(defaults.archived_pin_ttl),
+            auto_rules: defaults.auto_rules,
+        }
+    }
+
+    /// The disk-aware placement these flags configure.
+    #[must_use]
+    pub fn disk_placement(&self) -> crate::scheduler::DiskPlacement {
+        let defaults = crate::scheduler::DiskPlacement::default();
+        let (pressure_basis_points, pressure_bytes) = self
+            .disk_pressure
+            .unwrap_or((defaults.pressure_basis_points, defaults.pressure_bytes));
+        crate::scheduler::DiskPlacement {
+            pressure_basis_points,
+            pressure_bytes,
+            floor_bytes: self.disk_floor.unwrap_or(defaults.floor_bytes),
+        }
+    }
 }
 
 /// What one command line asks for.
@@ -159,6 +210,40 @@ struct ServerArgs {
     /// declared lost.
     #[arg(long, requires = "serve", value_parser = clap::value_parser!(u64).range(1..))]
     worker_lease: Option<u64>,
+
+    /// How long a successful fetch of an Instance repo stays fresh (60s).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    workspace_fetch_throttle: Option<std::time::Duration>,
+
+    /// The ceiling on one fetch before a spawn falls back to the cached base (30s).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    workspace_fetch_timeout: Option<std::time::Duration>,
+
+    /// Soft-reclaim a live agent idle this long; 0 is never (4h).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    workspace_idle_reclaim_after: Option<std::time::Duration>,
+
+    /// How long an archived agent's clean checkout is kept; 0 removes it at
+    /// archive (24h).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    workspace_archived_grace: Option<std::time::Duration>,
+
+    /// The ceiling on one reclaim command (10m).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    workspace_reclaim_timeout: Option<std::time::Duration>,
+
+    /// Let `gc --hard --include-pins --force` drop archive pins older than
+    /// this; unset, pins never expire.
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_duration)]
+    workspace_archived_pin_ttl: Option<std::time::Duration>,
+
+    /// Free disk below which a Worker is placed last: "10%,20GiB" (the default).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_threshold)]
+    placement_disk_pressure: Option<(u64, u64)>,
+
+    /// Free disk below which a Worker takes no workspace spawns (2GiB).
+    #[arg(long, requires = "serve", value_parser = horde_proto::units::parse_size)]
+    placement_disk_floor: Option<u64>,
 }
 
 /// `--san`'s parser: the name, once it passes the certificate-name checks.
@@ -226,6 +311,16 @@ pub fn invocation_in(
         blob_max_bytes: args.blob_max_bytes,
         relay_bind: args.relay_bind,
         worker_lease: args.worker_lease.map(std::time::Duration::from_secs),
+        workspace: WorkspaceFlags {
+            fetch_throttle: args.workspace_fetch_throttle,
+            fetch_timeout: args.workspace_fetch_timeout,
+            idle_reclaim_after: args.workspace_idle_reclaim_after,
+            archived_grace: args.workspace_archived_grace,
+            reclaim_timeout: args.workspace_reclaim_timeout,
+            archived_pin_ttl: args.workspace_archived_pin_ttl,
+            disk_pressure: args.placement_disk_pressure,
+            disk_floor: args.placement_disk_floor,
+        },
     })))
 }
 
@@ -523,7 +618,12 @@ async fn reconciled_core(config: &ServeConfig, log: EventLog) -> Result<ServerCo
             config
                 .worker_lease
                 .unwrap_or(crate::liveness::DEFAULT_WORKER_LEASE),
-        );
+        )
+        .with_workspace_policy(config.workspace.policy());
+    let core = core.clone().with_scheduler(Arc::new(
+        crate::scheduler::CapabilityScheduler::new(core.workers.clone(), core.instances.clone())
+            .with_disk_placement(config.workspace.disk_placement()),
+    ));
     // The one cold fold of the whole log (ADR-0013); every read after it
     // folds only what was appended since.
     core.sessions.rebuild().await?;
@@ -730,7 +830,50 @@ fn identity_startup(error: horde_identity::IdentityError) -> ServerError {
 
 #[cfg(test)]
 mod tests {
-    use super::open_log;
+    use std::time::Duration;
+
+    use super::{WorkspaceFlags, open_log};
+    use crate::scheduler::DiskPlacement;
+    use crate::workspace_policy::WorkspacePolicyConfig;
+
+    /// Unset flags take the built-in defaults; each set flag replaces
+    /// exactly its own value.
+    #[test]
+    fn workspace_flags_override_only_what_they_set() {
+        let unset = WorkspaceFlags::default();
+        assert_eq!(unset.policy(), WorkspacePolicyConfig::default());
+        assert_eq!(unset.disk_placement(), DiskPlacement::default());
+
+        let flags = WorkspaceFlags {
+            fetch_throttle: Some(Duration::from_secs(7)),
+            fetch_timeout: Some(Duration::from_secs(8)),
+            idle_reclaim_after: Some(Duration::from_secs(9)),
+            archived_grace: Some(Duration::from_secs(10)),
+            reclaim_timeout: Some(Duration::from_secs(11)),
+            archived_pin_ttl: Some(Duration::from_secs(12)),
+            disk_pressure: Some((250, 5)),
+            disk_floor: Some(3),
+        };
+        let policy = flags.policy();
+        assert_eq!(policy.fetch_throttle, Duration::from_secs(7));
+        assert_eq!(policy.fetch_timeout, Duration::from_secs(8));
+        assert_eq!(policy.idle_reclaim_after, Duration::from_secs(9));
+        assert_eq!(policy.archived_grace, Duration::from_secs(10));
+        assert_eq!(policy.reclaim_timeout, Duration::from_secs(11));
+        assert_eq!(policy.archived_pin_ttl, Some(Duration::from_secs(12)));
+        assert_eq!(
+            policy.auto_rules,
+            WorkspacePolicyConfig::default().auto_rules
+        );
+        assert_eq!(
+            flags.disk_placement(),
+            DiskPlacement {
+                pressure_basis_points: 250,
+                pressure_bytes: 5,
+                floor_bytes: 3,
+            }
+        );
+    }
 
     #[test]
     fn opening_creates_a_usable_log() {
@@ -1003,6 +1146,7 @@ mod tests {
             blob_max_bytes: None,
             relay_bind,
             worker_lease: None,
+            workspace: super::WorkspaceFlags::default(),
         }
     }
 

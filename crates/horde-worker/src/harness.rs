@@ -111,7 +111,7 @@ impl HarnessProfile {
     pub fn config_dir(&self, account: Option<&ProviderAccount>) -> Result<PathBuf, String> {
         let dir = match account {
             None => self.root.join(DEFAULT_DIR),
-            Some(account) if crate::workspace::is_path_safe(account.as_str()) => {
+            Some(account) if crate::workspace::paths::is_path_safe(account.as_str()) => {
                 self.root.join(ACCOUNTS_DIR).join(account.as_str())
             }
             Some(account) => {
@@ -141,7 +141,7 @@ impl HarnessProfile {
                 std::fs::read_dir(entry.path()).is_ok_and(|mut inside| inside.next().is_some())
             })
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| crate::workspace::is_path_safe(name))
+            .filter(|name| crate::workspace::paths::is_path_safe(name))
             .collect();
         accounts.sort();
         accounts

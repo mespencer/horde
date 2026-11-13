@@ -117,6 +117,9 @@ pub struct WorkerConfig {
     pub workspace_root: Option<PathBuf>,
     /// The git Relay payload shares stage to and fetch through.
     pub relay: Option<String>,
+    /// The workspace scan's machine-local settings (ADR-0014's
+    /// `worker.workspace.*`; flags until W12e's config file).
+    pub housekeeping: crate::runtime::HousekeepingConfig,
     /// Placement tags this Worker advertises (`--tag`, repeatable).
     pub tags: Vec<String>,
     /// Remote URLs this machine's credentials can reach
@@ -282,6 +285,28 @@ struct WorkerArgs {
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     relay: Option<String>,
 
+    /// How often the workspace scan runs (idle and orphan reclaim, grace
+    /// expiry, disk pressure), e.g. 60s.
+    #[arg(long, value_parser = seconds, default_value = "60s")]
+    workspace_scan_interval: std::time::Duration,
+
+    /// How often archive pins are checked against origin and the Relay.
+    #[arg(long, value_parser = seconds, default_value = "6h")]
+    workspace_pin_scan_interval: std::time::Duration,
+
+    /// How often the whole Instance set is re-reported to the Server.
+    #[arg(long, value_parser = seconds, default_value = "5m")]
+    workspace_report_interval: std::time::Duration,
+
+    /// Free space below which disk-pressure reclaim starts: a percentage,
+    /// a size, or both (the larger wins), e.g. "10%,20GiB".
+    #[arg(long, value_parser = watermark, default_value = "10%,20GiB")]
+    workspace_disk_low_watermark: crate::runtime::Watermark,
+
+    /// Free space disk-pressure reclaim stops at; above the low mark.
+    #[arg(long, value_parser = watermark, default_value = "15%")]
+    workspace_disk_high_watermark: crate::runtime::Watermark,
+
     /// A placement tag this worker advertises; repeatable.
     #[arg(long = "tag", value_parser = NonEmptyStringValueParser::new())]
     tags: Vec<String>,
@@ -297,6 +322,25 @@ struct WorkerArgs {
     /// The codex `approvalsReviewer`; only `user` is admitted.
     #[arg(long, value_parser = reviewer)]
     codex_approvals_reviewer: Option<String>,
+}
+
+/// A duration flag (`60s`, `5m`, `6h`); never zero, since a zero interval
+/// would spin.
+fn seconds(value: &str) -> Result<std::time::Duration, String> {
+    let duration = horde_proto::units::parse_duration(value)?;
+    if duration.is_zero() {
+        return Err(format!("{value:?} must be longer than zero"));
+    }
+    Ok(duration)
+}
+
+/// A watermark flag: `10%`, `20GiB`, or both comma-separated.
+fn watermark(value: &str) -> Result<crate::runtime::Watermark, String> {
+    let (basis_points, bytes) = horde_proto::units::parse_threshold(value)?;
+    Ok(crate::runtime::Watermark {
+        basis_points,
+        bytes,
+    })
 }
 
 /// Rejected at parse, not at spawn: `auto_review` had codex's own subagent
@@ -342,6 +386,13 @@ pub fn parse(
         fake_login_listen_port: args.fake_login_listen_port,
         workspace_root: args.workspace_root,
         relay: args.relay,
+        housekeeping: crate::runtime::HousekeepingConfig {
+            scan_interval: args.workspace_scan_interval,
+            pin_scan_interval: args.workspace_pin_scan_interval,
+            report_interval: args.workspace_report_interval,
+            disk_low_watermark: args.workspace_disk_low_watermark,
+            disk_high_watermark: args.workspace_disk_high_watermark,
+        },
         tags: args.tags,
         advertised_remotes: args.advertised_remotes,
         insecure: args.insecure,
@@ -404,6 +455,44 @@ mod tests {
             Parsed::Run(config) => Ok(*config),
             Parsed::Print(text) => Err(format!("printed: {text}")),
         }
+    }
+
+    /// The workspace intervals parse as durations, default to the ADR's
+    /// values, and a zero interval — which would spin the scan — is refused.
+    #[test]
+    fn workspace_intervals_parse_default_and_refuse_zero() {
+        let defaults = parsed_with(&[], &[]).expect("parses");
+        assert_eq!(
+            defaults.housekeeping,
+            crate::runtime::HousekeepingConfig::default()
+        );
+        let set = parsed_with(
+            &[
+                "--workspace-scan-interval",
+                "90s",
+                "--workspace-pin-scan-interval",
+                "2h",
+                "--workspace-report-interval",
+                "5m",
+            ],
+            &[],
+        )
+        .expect("parses");
+        assert_eq!(
+            set.housekeeping.scan_interval,
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            set.housekeeping.pin_scan_interval,
+            std::time::Duration::from_secs(7_200)
+        );
+        assert_eq!(
+            set.housekeeping.report_interval,
+            std::time::Duration::from_secs(300)
+        );
+        let zero = parsed_with(&["--workspace-scan-interval", "0s"], &[])
+            .expect_err("a zero interval would spin");
+        assert!(zero.contains("longer than zero"), "{zero}");
     }
 
     /// Where to dial, by precedence: the flag over the variable; neither

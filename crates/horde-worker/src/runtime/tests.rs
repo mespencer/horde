@@ -40,6 +40,28 @@ fn preauthorize_only_runtime(script: Script) -> Runtime {
 }
 
 fn spawn_command(sequence: u64, agent: &str, first_message: &str) -> StreamCommandsResponse {
+    spawn_of(sequence, agent, first_turn(first_message), None)
+}
+
+/// A spec whose only content is its initial assignment.
+fn first_turn(first_message: &str) -> horde_proto::v1::AgentSpec {
+    horde_proto::v1::AgentSpec {
+        initial_assignment: Some(Assignment {
+            assignment_id: None,
+            text: first_message.to_owned(),
+            payload: None,
+        }),
+        ..horde_proto::v1::AgentSpec::default()
+    }
+}
+
+/// One spawn command in session `s1`.
+fn spawn_of(
+    sequence: u64,
+    agent: &str,
+    spec: horde_proto::v1::AgentSpec,
+    workspace_policy: Option<horde_proto::v1::ResolvedWorkspacePolicy>,
+) -> StreamCommandsResponse {
     StreamCommandsResponse {
         command_sequence: sequence,
         command_id: format!("s1:{sequence}"),
@@ -47,14 +69,8 @@ fn spawn_command(sequence: u64, agent: &str, first_message: &str) -> StreamComma
         command: Some(Command::SpawnAgent(SpawnAgentCommand {
             session_id: Some(SessionId::new("s1")),
             agent_id: Some(AgentId::new(agent)),
-            spec: Some(horde_proto::v1::AgentSpec {
-                initial_assignment: Some(Assignment {
-                    assignment_id: None,
-                    text: first_message.to_owned(),
-                    payload: None,
-                }),
-                ..horde_proto::v1::AgentSpec::default()
-            }),
+            spec: Some(spec),
+            workspace_policy,
             ..SpawnAgentCommand::default()
         })),
     }
@@ -490,15 +506,26 @@ async fn spawned_awaiting_permission(runtime: &mut Runtime) {
 
 /// The first journaled event, which must be a workspace instance report.
 async fn first_instance_report(runtime: &Runtime) -> horde_proto::v1::WorkspaceInstanceReport {
-    let events = journal_at_least(runtime, 1).await;
-    match events[0]
-        .event
-        .as_ref()
-        .and_then(|event| event.kind.as_ref())
-    {
-        Some(Kind::WorkspaceInstanceChanged(changed)) => changed.report.clone().expect("a report"),
-        other => panic!("expected a workspace instance report, got {other:?}"),
-    }
+    let events = journal_satisfying(runtime, "the materialize's final report", |events| {
+        final_report(events).is_some()
+    })
+    .await;
+    final_report(&events).expect("a final report")
+}
+
+/// The first instance report that is not a progress step: what a
+/// materialize ends with (ADR-0014 journals its steps before it).
+fn final_report(
+    events: &[horde_proto::v1::JournaledEvent],
+) -> Option<horde_proto::v1::WorkspaceInstanceReport> {
+    events
+        .iter()
+        .find_map(|journaled| match journaled.event.as_ref()?.kind.as_ref()? {
+            Kind::WorkspaceInstanceChanged(changed) if changed.progress.is_none() => {
+                changed.report.clone()
+            }
+            _ => None,
+        })
 }
 
 /// A decision missing its request id cannot be applied, and is journaled
@@ -1592,13 +1619,20 @@ fn materialize_command(sequence: u64, origin: &std::path::Path) -> StreamCommand
                     name: "atlas".to_owned(),
                     remote_url: origin.display().to_string(),
                     default_branch: "main".to_owned(),
-                    layout_path: String::new(),
+                    ..horde_proto::v1::WorkspaceRepo::default()
                 }],
                 unmanaged_paths: Vec::new(),
                 created_at: None,
                 etag: "1".to_owned(),
+                ..horde_proto::v1::WorkspaceDefinition::default()
             }),
             session_id: Some(SessionId::new("s1")),
+            // No grace: a lossless archived checkout goes at archive, which
+            // is what the archive tests here observe (ADR-0014).
+            policy: Some(horde_proto::v1::ResolvedWorkspacePolicy {
+                archived_grace: Some(horde_proto::prost_types::Duration::default()),
+                ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+            }),
         })),
     }
 }
@@ -1813,14 +1847,17 @@ fn workspace_support_is_what_the_builder_installed() {
 /// A spawn command whose spec names `workspace`, under the worktree
 /// policy — the shape the server sends once placement chose this worker.
 fn workspace_spawn(sequence: u64, agent: &str, workspace: &str) -> StreamCommandsResponse {
-    let mut spawn = spawn_command(sequence, agent, "hello");
-    if let Some(Command::SpawnAgent(command)) = &mut spawn.command
-        && let Some(spec) = &mut command.spec
-    {
-        spec.workspace_definition_id = Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace));
-        spec.checkout_policy = horde_proto::v1::CheckoutPolicy::Worktree as i32;
-    }
-    spawn
+    let spec = horde_proto::v1::AgentSpec {
+        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace)),
+        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
+        ..first_turn("hello")
+    };
+    // No grace: a lossless archived checkout goes at archive.
+    let policy = horde_proto::v1::ResolvedWorkspacePolicy {
+        archived_grace: Some(horde_proto::prost_types::Duration::default()),
+        ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+    };
+    spawn_of(sequence, agent, spec, Some(policy))
 }
 
 /// Applies a spawn that must fail the *agent* and not the command loop,
@@ -1917,17 +1954,26 @@ async fn a_spawn_that_cannot_start_releases_what_it_minted() {
         .expect("the command applies; the agent is what failed");
     settle(&runtime).await;
     assert_eq!(runtime.running_agents(), 0);
-    // events[0] is the materialize report; the spawn's failure follows.
-    let events = journal_at_least(&runtime, 2).await;
+    // The materialize's progress and report come first; the spawn's
+    // failure follows.
+    let events = journal_satisfying(&runtime, "the spawn's failure", |events| {
+        events.iter().any(|journaled| {
+            matches!(
+                journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
+                Some(Kind::AgentLifecycleChanged(changed))
+                    if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
+            )
+        })
+    })
+    .await;
     assert!(
-        matches!(
-            events[1].event.as_ref().and_then(|event| event.kind.as_ref()),
+        events.iter().any(|journaled| matches!(
+            journaled.event.as_ref().and_then(|event| event.kind.as_ref()),
             Some(Kind::AgentLifecycleChanged(changed))
                 if changed.state == i32::from(horde_proto::v1::AgentLifecycleState::Failed)
                     && changed.reason.contains("codex")
-        ),
-        "the spawn failed the agent: {:?}",
-        events[1]
+        )),
+        "the spawn failed the agent: {events:?}"
     );
 
     assert!(
@@ -2075,9 +2121,9 @@ async fn a_slow_materialize_blocks_only_what_depends_on_it() {
                 .event
                 .as_ref()
                 .and_then(|event| event.kind.as_ref()),
-            Some(Kind::WorkspaceInstanceChanged(_))
+            Some(Kind::WorkspaceInstanceChanged(changed)) if changed.progress.is_none()
         )),
-        "the materialize is still stuck while agent-b runs"
+        "the materialize is still stuck while agent-b runs (its progress may show, its report not)"
     );
 
     release.send(()).expect("the remote is holding");
@@ -2151,13 +2197,7 @@ async fn a_command_with_no_body_is_acked_and_dropped() {
 /// its harness group) has stopped — and shutdown joins that release.
 #[tokio::test]
 async fn archiving_a_workspace_agent_gives_its_checkout_back() {
-    let (_temp, workspaces_root, mut runtime) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    runtime
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
-    settle(&runtime).await;
+    let (_temp, workspaces_root, mut runtime) = spawned_in_workspace().await;
     let checkout = workspaces_root
         .join("ws-1")
         .join(".horde-agents")
@@ -2301,4 +2341,79 @@ async fn an_event_with_nothing_to_journal_leaves_the_journal_untouched() {
     );
     let events = journal.read_from(1, 100).await.expect("a readable journal");
     assert!(events.is_empty(), "nothing may be appended: {events:?}");
+}
+
+/// The endpoint's `workspace_checkout`, served by the Runtime: a repo the
+/// agent has answers with its path (`reused`), an unknown repo names the
+/// valid ones, an agent with no live checkout is refused, and a Runtime
+/// without workspaces says so. Parent bases name the agent's committed HEAD.
+#[tokio::test]
+async fn the_workspace_verbs_answer_from_the_live_checkout() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let (_temp, workspaces_root, runtime) = spawned_in_workspace().await;
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    };
+
+    let answer = access
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect("a repo the agent has");
+    assert_eq!(answer.resolution, "reused");
+    assert_eq!(answer.branch, "horde/agent-1");
+    assert!(answer.path.ends_with("agent-1/atlas"), "{}", answer.path);
+
+    let unknown = access
+        .checkout("agent-1", "ghost", None)
+        .await
+        .expect_err("ghost is no repo");
+    assert!(unknown.contains("valid repos: atlas"), "{unknown}");
+    let stranger = access
+        .checkout("agent-9", "atlas", None)
+        .await
+        .expect_err("no such agent here");
+    assert!(stranger.contains("no live checkout"), "{stranger}");
+
+    let bases = access.parent_bases("agent-1").await.expect("bases");
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspaces_root.join("ws-1/.horde-agents/agent-1/atlas"))
+        .output()
+        .expect("git runs");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0].r#ref, String::from_utf8_lossy(&head.stdout).trim());
+    assert_eq!(
+        bases[0].source,
+        i32::from(horde_proto::v1::RepoBaseSource::Parent)
+    );
+    assert!(
+        access
+            .parent_bases("agent-9")
+            .await
+            .expect("none")
+            .is_empty()
+    );
+
+    let bare = super::access::WorkerWorkspaceAccess {
+        shared: super::shared::Shared::new(Journal::in_memory().expect("a journal")),
+    };
+    let refused = bare
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect_err("no workspaces");
+    assert!(refused.contains("no workspaces"), "{refused}");
+    runtime.shutdown().await;
+}
+
+/// A materialized runtime with `agent-1` spawned into `ws-1` and settled.
+async fn spawned_in_workspace() -> (tempfile::TempDir, std::path::PathBuf, Runtime) {
+    let (temp, root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    (temp, root, runtime)
 }

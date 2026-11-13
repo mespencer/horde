@@ -44,8 +44,10 @@ horde-wire = { workspace = true }
 portable-pty = "0.9.0"
 # Signalling harness process groups (ADR-0010): killpg through a safe API,
 # because the workspace forbids `unsafe`.
-nix = { version = "0.31.3", features = ["process", "signal"] }
+nix = { version = "0.31.3", features = ["fs", "process", "signal"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+# The checkout ledger and the workspace manifest (ADR-0014) are JSON files.
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Owner-only secret files (ADR-0010): an MCP config carrying a bearer token
 # lives exactly as long as the harness that reads it.

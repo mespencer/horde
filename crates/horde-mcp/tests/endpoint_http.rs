@@ -223,3 +223,105 @@ async fn approve_answers_with_the_decision_that_was_made() {
         .expect("the answerer must not panic")
         .expect("the answer must have been sendable");
 }
+
+/// The Worker's half of the workspace verbs, answering from a fixed
+/// checkout: a real alternate backend of the seam, so the endpoint's
+/// routing is what is under test.
+struct FixedCheckout;
+
+const PARENT_HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[async_trait::async_trait]
+impl horde_mcp::workspace::WorkspaceAccess for FixedCheckout {
+    async fn checkout(
+        &self,
+        agent_id: &str,
+        repo: &str,
+        base: Option<&str>,
+    ) -> Result<horde_mcp::workspace::CheckoutAnswer, String> {
+        Ok(horde_mcp::workspace::CheckoutAnswer {
+            path: format!("/checkouts/{agent_id}/{repo}"),
+            branch: format!("horde/{agent_id}"),
+            base_commit_sha: base.unwrap_or(PARENT_HEAD).to_owned(),
+            resolution: "fresh".to_owned(),
+            stale_reason: String::new(),
+        })
+    }
+
+    async fn parent_bases(
+        &self,
+        _agent_id: &str,
+    ) -> Result<Vec<horde_proto::v1::RepoBase>, String> {
+        Ok(vec![horde_proto::v1::RepoBase {
+            repo_name: "atlas".to_owned(),
+            r#ref: PARENT_HEAD.to_owned(),
+            source: horde_proto::v1::RepoBaseSource::Parent.into(),
+        }])
+    }
+}
+
+/// With the Worker's workspaces behind it, `workspace_checkout` answers
+/// with the checkout the Worker made, and `spawn_agent` hands the child the
+/// caller's committed HEAD as its base and the branch the caller named.
+#[tokio::test]
+async fn the_workspace_verbs_reach_the_workers_checkout() {
+    let session = common::workspace_session(horde_proto::v1::AgentSpec::default())
+        .await
+        .expect("a session in a workspace");
+    let registry = AgentRegistry::new();
+    registry.insert(&session.root, TOKEN);
+    let context = horde_mcp::context::AgentContext::new(
+        std::sync::Arc::new(common::ServerJournal::new(&session.endpoint)),
+        horde_cli::client::Client::connect(&session.endpoint)
+            .await
+            .expect("a client"),
+        session.session_id.clone(),
+    )
+    .with_workspace(std::sync::Arc::new(FixedCheckout));
+    let (address, _serving) = serve(
+        &EndpointConfig::loopback(0),
+        std::sync::Arc::new(registry),
+        HordeEndpoint::new(context),
+    )
+    .await
+    .expect("the endpoint serves");
+    let mcp = McpClient::connect(address, &session.root, TOKEN)
+        .await
+        .expect("the legacy flow must initialize");
+
+    let answer = mcp
+        .call_tool("workspace_checkout", serde_json::json!({ "repo": "atlas" }))
+        .await
+        .expect("a workspace answers the checkout");
+    let answer: serde_json::Value = serde_json::from_str(&answer).expect("a json answer");
+    assert_eq!(
+        answer["path"],
+        format!("/checkouts/{}/atlas", session.root),
+        "{answer}"
+    );
+
+    let spawned = mcp
+        .call_tool(
+            "spawn_agent",
+            serde_json::json!({ "task": "", "branch": "feat/endpoint" }),
+        )
+        .await
+        .expect("the spawn succeeds");
+    let spawned: serde_json::Value = serde_json::from_str(&spawned).expect("a json answer");
+    let child = spawned["agent_id"].as_str().expect("a child id").to_owned();
+    let spec = within(
+        "the child's spawn",
+        common::recorded_spec(&session.endpoint, &session.session_id, &child),
+    )
+    .await
+    .expect("replay")
+    .expect("the child's spawn is recorded");
+    assert_eq!(spec.branch, "feat/endpoint", "the named branch stands");
+    assert!(
+        spec.repo_bases
+            .iter()
+            .any(|base| base.repo_name == "atlas" && base.r#ref == PARENT_HEAD),
+        "the parent's HEAD is the child's base: {:?}",
+        spec.repo_bases
+    );
+}

@@ -1,7 +1,9 @@
 //! Which calls are an agent driving its own subtree (ADR-0009).
 //!
 //! An agent's orchestrator verbs — `spawn_agent`, `report_result`,
-//! `send_message`, `wait_for_agent` — are how it does the job Horde exists
+//! `send_message`, `wait_for_agent`, and ADR-0014's `workspace_checkout`,
+//! which only adds a worktree inside the caller's own root — are how it does
+//! the job Horde exists
 //! for. Escalating every one of them to a human, as the escalate-everything
 //! default did, turned "agents orchestrating agents" into "a human approving
 //! each delegation". The shipped default mode allows them, scoped by the
@@ -25,7 +27,7 @@ pub fn orchestrator_verb(tool_name: &str) -> Option<&str> {
     let verb = horde_mcp::endpoint::horde_tool(tool_name)?;
     matches!(
         verb,
-        "spawn_agent" | "report_result" | "send_message" | "wait_for_agent"
+        "spawn_agent" | "report_result" | "send_message" | "wait_for_agent" | "workspace_checkout"
     )
     .then_some(verb)
 }
@@ -35,7 +37,7 @@ pub fn orchestrator_verb(tool_name: &str) -> Option<&str> {
 #[must_use]
 pub fn own_orchestrator_verb(call: &ProposedToolCall, caller: &str, state: &SessionState) -> bool {
     match orchestrator_verb(&call.tool_name) {
-        Some("spawn_agent" | "report_result") => true,
+        Some("spawn_agent" | "report_result" | "workspace_checkout") => true,
         Some("send_message") => string_argument(call, "to_agent_id").is_some_and(|target| {
             is_descendant(state, caller, target) || is_parent(state, caller, target)
         }),
@@ -137,12 +139,13 @@ mod tests {
     }
 
     #[test]
-    fn both_harness_spellings_name_the_four_verbs_and_nothing_else() {
+    fn both_harness_spellings_name_the_five_verbs_and_nothing_else() {
         for verb in [
             "spawn_agent",
             "report_result",
             "send_message",
             "wait_for_agent",
+            "workspace_checkout",
         ] {
             assert_eq!(orchestrator_verb(&format!("horde/{verb}")), Some(verb));
             assert_eq!(
@@ -168,6 +171,11 @@ mod tests {
         let state = tree();
         assert!(own_orchestrator_verb(
             &call("horde/spawn_agent", "task", None),
+            "grandchild",
+            &state
+        ));
+        assert!(own_orchestrator_verb(
+            &call("mcp__horde__workspace_checkout", "repo", None),
             "grandchild",
             &state
         ));
