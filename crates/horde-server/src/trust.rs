@@ -160,6 +160,9 @@ fn control_plane(method: &str) -> Option<Admits> {
         | "AddWorkspaceRepo"
         | "DeleteWorkspaceDefinition"
         | "PrewarmWorkspace"
+        | "CollectWorkspaceGarbage"
+        | "RemoveWorkspaceInstance"
+        | "ListWorkspaceInstances"
         | "ConfigureMcpServer"
         | "ListMcpServers"
         | "DeleteMcpServer"
@@ -381,6 +384,8 @@ mod tests {
             "AddWorkspaceRepo",
             "DeleteWorkspaceDefinition",
             "PrewarmWorkspace",
+            "CollectWorkspaceGarbage",
+            "RemoveWorkspaceInstance",
             "MintEnrollmentCode",
             "RevokeEnrollment",
             "ResetWorkerJournal",

@@ -594,7 +594,7 @@ impl Housekeeper {
             self.journal_cleanups(vec![event]).await;
             changed = true;
         }
-        for (definition_id, record) in candidates.iter().filter(|(_, r)| r.archived_at_ms.is_some()) {
+        for (definition_id, record) in self.archived_oldest_first().await {
             if self.workspaces.filesystem().is_some_and(|(free, _)| free >= high) {
                 return changed;
             }
@@ -602,14 +602,14 @@ impl Housekeeper {
             let Ok(_held) = lock.try_lock() else {
                 continue;
             };
-            let policy = self.policy(definition_id);
+            let policy = self.policy(&definition_id);
             let pass = Pass {
                 trigger: CleanupTrigger::DiskPressure,
                 gc_request_id: "",
                 dry_run: false,
                 policy: &policy,
             };
-            let (event, removed) = self.workspaces.hard_remove(definition_id, record, pass, false).await;
+            let (event, removed) = self.workspaces.hard_remove(&definition_id, &record, pass, false).await;
             if removed {
                 self.journal_cleanups(vec![event]).await;
                 changed = true;
@@ -658,6 +658,23 @@ impl Housekeeper {
         orphans.sort_by_key(|(_, record)| record.last_active_at_ms);
         idle.sort_by_key(|(_, record)| record.last_active_at_ms);
         archived.into_iter().chain(orphans).chain(idle).collect()
+    }
+
+    /// Every archived checkout, oldest archive first: what disk pressure
+    /// removes when lossless, after its soft reclaims.
+    async fn archived_oldest_first(&self) -> Vec<(String, LedgerRecord)> {
+        let mut archived = Vec::new();
+        for (definition_id, _) in self.workspaces.instances().await {
+            for record in self.workspaces.records(&definition_id).await {
+                if record.archived_at_ms.is_some()
+                    && self.shared.broker.checkout_of(&record.agent_id).is_none()
+                {
+                    archived.push((definition_id.clone(), record));
+                }
+            }
+        }
+        archived.sort_by_key(|(_, record)| record.archived_at_ms.unwrap_or(0));
+        archived
     }
 
     /// Drops every pin provably safe elsewhere (lossless only).
@@ -755,15 +772,21 @@ fn housekeeping_entry(idempotency_key: String, kind: Kind) -> JournalEntry {
 /// Runs the scan loop until the Runtime drops its handle: every
 /// `scan_interval` a scan, every `pin_scan_interval` a pin pass, and a
 /// report after any change or every `report_interval`.
-pub(super) async fn run(housekeeper: Housekeeper, config: HousekeepingConfig) {
-    let mut episode = Episode::default();
+pub(super) async fn run(
+    housekeeper: Housekeeper,
+    config: HousekeepingConfig,
+    episode: Arc<tokio::sync::Mutex<Episode>>,
+) {
     let mut last_pins = tokio::time::Instant::now();
     let mut last_report = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(config.scan_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        let mut changed = housekeeper.scan(&config, &mut episode).await;
+        let mut changed = {
+            let mut episode = episode.lock().await;
+            housekeeper.scan(&config, &mut episode).await
+        };
         if last_pins.elapsed() >= config.pin_scan_interval {
             last_pins = tokio::time::Instant::now();
             changed |= housekeeper.unpin_pass().await;

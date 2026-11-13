@@ -14,7 +14,7 @@ use horde_proto::v1::{
 use horde_worker::WorkspaceManager;
 
 #[cfg(test)]
-mod harness {
+pub(crate) mod harness {
     use std::path::{Path, PathBuf};
 
     use super::{WorkspaceDefinition, WorkspaceDefinitionId, WorkspaceRepo};

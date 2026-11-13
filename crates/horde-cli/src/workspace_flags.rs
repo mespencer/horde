@@ -216,7 +216,7 @@ pub struct CheckoutArgs {
 pub fn base_from(value: &str) -> Result<RepoBase, ClientError> {
     let (repo, reference) = match value.split_once('=') {
         Some((repo, reference)) => {
-            if repo.is_empty() {
+            if repo.is_empty() || repo.starts_with('-') {
                 return Err(invalid(format!("--base takes [REPO=]REF, got {value:?}")));
             }
             (repo, reference)
