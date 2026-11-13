@@ -717,6 +717,23 @@ async fn cleanups(journal: &Journal) -> Vec<WorkspaceCleanup> {
         .collect()
 }
 
+/// Waits for an archive's release to finish: it runs once the pump has
+/// stopped, after the archive command itself completed, and journals the
+/// archive's soft reclaim when done.
+async fn released(rig: &Rig, agent: &str) {
+    crate::support::within("the archive's release", async {
+        while !cleanups(&rig.journal).await.iter().any(|c| {
+            c.trigger == i32::from(CleanupTrigger::Archive)
+                && c.agent_id
+                    .as_ref()
+                    .is_some_and(|id| id.to_string() == agent)
+        }) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
 fn agent_root(rig: &Rig, agent: &str) -> PathBuf {
     rig.root.join("ws-1").join(".horde-agents").join(agent)
 }
@@ -825,6 +842,7 @@ async fn disk_pressure_reclaims_oldest_first_and_reports_exhaustion_once() {
     materialize(&mut rig, &definition, policy(86_400, 0)).await;
     spawn(&mut rig, "agent-old").await;
     archive(&mut rig, "agent-old").await;
+    released(&rig, "agent-old").await;
     spawn(&mut rig, "agent-live").await;
     let before = cleanups(&rig.journal).await.len();
 
@@ -955,6 +973,7 @@ async fn gc_dry_runs_refuses_forces_and_drops_only_safe_pins() {
     spawn(&mut rig, "agent-dirty").await;
     std::fs::write(agent_root(&rig, "agent-dirty").join("atlas/wip.txt"), "wip").expect("dirty");
     archive(&mut rig, "agent-dirty").await;
+    released(&rig, "agent-dirty").await;
 
     let listing = |root: &Path| {
         let mut files: Vec<String> = walk(root);
