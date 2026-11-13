@@ -615,6 +615,47 @@ mod tests {
     }
 
     #[test]
+    fn sequences_start_at_one_and_count_up() {
+        let stamp = Stamp::new("b".to_owned());
+        assert_eq!((stamp.next(), stamp.next(), stamp.next()), (1, 2, 3));
+        assert_eq!(stamp.boot(), "b");
+    }
+
+    /// Every field type keeps its JSON type.
+    #[test]
+    fn numbers_floats_and_booleans_keep_their_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logging = logging(dir.path(), "info");
+        logging.with_default(|| {
+            tracing::info!(signed = -3_i64, ratio = 0.5_f64, ok = true, "typed");
+        });
+        let records = records_in(dir.path());
+        let typed = records
+            .iter()
+            .find(|r| r.message() == "typed")
+            .expect("typed");
+        assert_eq!(typed.value["fields"]["signed"], -3);
+        assert_eq!(typed.value["fields"]["ratio"], 0.5);
+        assert_eq!(typed.value["fields"]["ok"], true);
+        assert_eq!(logging.binary(), "horde-test");
+        assert_eq!(logging.dir(), dir.path());
+    }
+
+    /// The binary's registration is what its serving paths follow; only the
+    /// first registration counts.
+    #[test]
+    fn the_process_logging_is_the_first_registered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = logging(dir.path(), "info");
+        let second = logging(dir.path(), "info");
+        first.register_process();
+        second.register_process();
+        let registered = super::process_logging().expect("registered");
+        assert_eq!(registered.boot(), first.boot());
+        assert_ne!(registered.boot(), second.boot());
+    }
+
+    #[test]
     fn an_unparseable_level_is_refused_at_start() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = LogSettings {
