@@ -20,8 +20,9 @@
 //! * **A test process that never drops.** On timeout cargo-mutants
 //!   SIGTERMs the process group of the test run, and an uncaught SIGTERM
 //!   runs no destructor — and the products, in groups of their own, are not
-//!   in that group. They are adopted by init. The first spawn in each test
-//!   process sweeps for those ([`reap_orphans_once`]).
+//!   in that group. They are adopted by init, or by the nearest subreaper
+//!   above the test run ([`crate::ps::adopter`]). The first spawn in each
+//!   test process sweeps for those ([`reap_orphans_once`]).
 //!
 //! # Every signal is guarded
 //!
@@ -36,7 +37,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgid, getpgrp, getpid, getppid, getsid};
 
-use crate::ps::{ProcessRow, process_table};
+use crate::ps::{ProcessRow, adopter, process_table};
 
 /// The product binaries a sweep may reap.
 pub const PRODUCTS: &[&str] = &["horde-server", "horde-worker", "horde"];
@@ -130,8 +131,12 @@ pub fn signal_group(pgid: u32, signal: Option<Signal>) -> Result<(), Unsent> {
 
 /// The orphans a sweep reaps. Every condition must hold:
 ///
-/// * adopted by init (`ppid` 1) — a live test process's own children have it
-///   as their parent, so a sibling suite's daemons are never chosen;
+/// * adopted: its parent is init (`ppid` 1) or `adopter`, the process
+///   this host re-parents our orphans to ([`crate::ps::adopter`] — a
+///   subreaper such as `systemd --user`, where there is one). A live test
+///   process's own children have it as their parent, so a sibling suite's
+///   daemons are never chosen, and an `adopter` that is this very process
+///   is ignored, so neither are ours;
 /// * a group leader (`pgid == pid`) — the shape
 ///   [`crate::process::SpawnedProcess`] gives each product it starts. A
 ///   product `horde up` started shares `up`'s group, so even when a test
@@ -139,13 +144,22 @@ pub fn signal_group(pgid: u32, signal: Option<Signal>) -> Result<(), Unsent> {
 ///   is never chosen;
 /// * running one of `names` from under `root`, an absolute path below `/`.
 #[must_use]
-pub fn orphans_matching(table: &[ProcessRow], root: &Path, names: &[&str]) -> Vec<u32> {
+pub fn orphans_matching(
+    table: &[ProcessRow],
+    adopter: Option<u32>,
+    root: &Path,
+    names: &[&str],
+) -> Vec<u32> {
     if !root.is_absolute() || root.parent().is_none() {
         return Vec::new();
     }
+    let adopter = adopter.filter(|&pid| pid != std::process::id());
+    let adopted = |ppid: u32| ppid == 1 || Some(ppid) == adopter;
     table
         .iter()
-        .filter(|row| row.ppid == 1 && row.pgid == row.pid && runs_from(&row.command, root, names))
+        .filter(|row| {
+            adopted(row.ppid) && row.pgid == row.pid && runs_from(&row.command, root, names)
+        })
         .map(|row| row.pid)
         .collect()
 }
@@ -165,7 +179,8 @@ fn runs_from(command: &str, root: &Path, names: &[&str]) -> bool {
 /// SIGKILLs the group of each orphan [`orphans_matching`] finds, returning
 /// the groups the signal reached.
 pub fn reap_orphans(root: &Path, names: &[&str]) -> Vec<u32> {
-    orphans_matching(&process_table(), root, names)
+    let adopter = adopter();
+    orphans_matching(&process_table(), adopter, root, names)
         .into_iter()
         .filter(|&leader| signal_group(leader, Some(Signal::SIGKILL)).is_ok())
         .collect()
@@ -263,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn only_init_adopted_group_leaders_from_this_target_are_orphans() {
+    fn only_adopted_group_leaders_from_this_target_are_orphans() {
         let root = Path::new("/w/target");
         let table = [
             row(1, 0, 1, "/sbin/launchd"),
@@ -280,14 +295,43 @@ mod tests {
             row(35, 1, 35, "/w/target/debug/horde"),
             row(36, 1, 35, "/w/target/debug/horde-server --serve"),
             row(37, 1, 37, ""),
+            row(38, 2009, 38, "/w/target/debug/horde-worker --join x"),
+            row(39, 2009, 35, "/w/target/debug/horde-server --serve"),
+            row(40, 2009, 40, "/other/target/debug/horde"),
         ];
-        assert_eq!(orphans_matching(&table, root, PRODUCTS), vec![30, 31, 35]);
+        // Where init adopts, a subreaper's children are no orphans.
+        assert_eq!(
+            orphans_matching(&table, None, root, PRODUCTS),
+            vec![30, 31, 35]
+        );
+        assert_eq!(
+            orphans_matching(&table, Some(1), root, PRODUCTS),
+            vec![30, 31, 35]
+        );
+        // Where a subreaper adopts, its leaders from this target are too.
+        assert_eq!(
+            orphans_matching(&table, Some(2009), root, PRODUCTS),
+            vec![30, 31, 35, 38]
+        );
         for unscoped in ["", "target", "/"] {
             assert!(
-                orphans_matching(&table, Path::new(unscoped), PRODUCTS).is_empty(),
+                orphans_matching(&table, Some(2009), Path::new(unscoped), PRODUCTS).is_empty(),
                 "{unscoped:?} scopes nothing"
             );
         }
+    }
+
+    /// This process's own products are never orphans, even handed this
+    /// process as the adopter.
+    #[test]
+    fn our_own_children_are_never_orphans() {
+        let me = std::process::id();
+        let root = Path::new("/w/target");
+        let table = [
+            row(50, me, 50, "/w/target/debug/horde-server --serve"),
+            row(51, 1, 51, "/w/target/debug/horde-server --serve"),
+        ];
+        assert_eq!(orphans_matching(&table, Some(me), root, PRODUCTS), vec![51]);
     }
 
     #[test]
@@ -325,47 +369,80 @@ mod tests {
         false
     }
 
+    /// Set in a re-run of this test binary: the product it starts and
+    /// abandons.
+    const ABANDON: &str = "HORDE_TESTKIT_ABANDON";
+
     /// The one real kill: `sleep` named like a product, under a scratch
-    /// `target`, started as its own group leader and abandoned to init by
-    /// its shell — reaped by a sweep over that root, and nothing else is.
+    /// `target`, started as its own group leader by a test process that
+    /// then exits without reaping it — this test binary, re-run for just
+    /// this test with [`ABANDON`] set — and so adopted by init or this
+    /// host's subreaper. Reaped by a sweep over that root, and nothing else
+    /// is.
+    ///
+    /// The re-run abandons it exactly as a killed test process abandons a
+    /// [`crate::process::SpawnedProcess`]: a leader of its own group, needing
+    /// no tty or job control. Its adopter must be the one
+    /// [`crate::ps::adopter`] learned, which is what makes the test mean
+    /// the same on a host where init adopts and on one with a subreaper.
     ///
     /// A symlink, not a copy: macOS kills a copied platform binary at exec,
     /// and `ps` reports the path as invoked either way.
     #[tokio::test]
     async fn a_real_orphaned_leader_is_reaped_by_its_directory() {
+        if let Some(product) = std::env::var_os(ABANDON) {
+            use std::os::unix::process::CommandExt as _;
+            #[expect(
+                clippy::zombie_processes,
+                reason = "abandoning it unreaped is the point: this process exits and its adopter takes it"
+            )]
+            let orphan = std::process::Command::new(product)
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("the product starts");
+            // stderr: libtest's own progress shares stdout's lines.
+            eprintln!("orphan={}", orphan.id());
+            return;
+        }
         let scratch = tempfile::tempdir().expect("scratch");
         let root = scratch.path().join("target");
         let profile = root.join("debug");
         std::fs::create_dir_all(&profile).expect("a profile dir");
         let product = profile.join("horde-server");
         std::os::unix::fs::symlink("/bin/sleep", &product).expect("a product-named sleep");
-        // `set -m` gives the background job a group of its own, as
-        // `SpawnedProcess` gives each product.
-        let shell = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(format!(
-                    "set -m; '{}' 60 </dev/null >/dev/null 2>&1 & echo $!",
-                    product.display()
-                ))
+        let this_test = module_path!()
+            .split_once("::")
+            .map(|(_, tests)| format!("{tests}::a_real_orphaned_leader_is_reaped_by_its_directory"))
+            .expect("a module path below the crate");
+        let rerun = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::process::Command::new(std::env::current_exe().expect("this test binary"))
+                .args(["--exact", &this_test, "--nocapture", "--test-threads=1"])
+                .env(ABANDON, &product)
+                .stdin(std::process::Stdio::null())
                 .output(),
         )
         .await
-        .expect("the shell returns")
-        .expect("the shell runs");
-        let orphan: u32 = String::from_utf8_lossy(&shell.stdout)
-            .trim()
-            .parse()
-            .expect("the orphan's pid");
+        .expect("the re-run returns")
+        .expect("the re-run runs");
+        let said = String::from_utf8_lossy(&rerun.stderr);
+        let orphan: u32 = crate::process::value_after(&said, "orphan=")
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("the orphan's pid in {said:?}"));
+        let adopter = adopter().expect("this host's adopter");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while !process_table()
             .iter()
-            .any(|row| row.pid == orphan && row.ppid == 1 && row.pgid == orphan)
+            .any(|row| row.pid == orphan && row.ppid == adopter && row.pgid == orphan)
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "init never adopted a leader {orphan}"
+                "{adopter} never adopted a leader {orphan}: {:?}",
+                process_table().iter().find(|row| row.pid == orphan)
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
