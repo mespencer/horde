@@ -1,0 +1,188 @@
+# Horde's multi-node topology (docs/TESTING.md, "Multi-node over Docker"):
+# one server, three workers, two clients and a git origin, each its own
+# container with its own hostname and address on one bridge network.
+#
+# Nothing here bootstraps trust by itself. The server mints its bootstrap
+# token on first start; the scenario runner (crates/horde-multinode) enrolls
+# `client` with it, mints worker join tokens with `horde worker enroll`, and
+# hands each to its worker over `docker compose exec` stdin — the real
+# flows, mTLS throughout, no --insecure anywhere.
+#
+#   docker compose -f docker/multinode/compose.yaml build server
+#   docker compose -f docker/multinode/compose.yaml up -d
+#
+# The `real` profile adds `worker-real`, which runs the host's real `claude`
+# and `codex` against mounted profile directories (see the variables below).
+
+name: horde-multinode
+
+x-node: &node
+  image: ${HORDE_MULTINODE_IMAGE:-horde-multinode:local}
+  pull_policy: never
+  # Reaps whatever a harness leaves behind and forwards SIGTERM to the
+  # product binary, which is never PID 1 itself.
+  init: true
+  networks: [horde]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: "no"
+
+x-worker: &worker
+  <<: *node
+  entrypoint: ["horde-node", "worker"]
+  depends_on:
+    server:
+      condition: service_healthy
+
+services:
+  server:
+    <<: *node
+    pull_policy: build
+    build:
+      context: ../..
+      dockerfile: docker/multinode/Dockerfile
+    hostname: server
+    command:
+      - horde-server
+      - --serve
+      - --state-dir
+      - /state
+      - --bind
+      - 0.0.0.0:7777
+      - --enrollment-bind
+      - 0.0.0.0:7778
+      # The Relay's mTLS door: workers on other hosts push and fetch shares
+      # here, presenting their enrolled identity.
+      - --relay-mtls-bind
+      - 0.0.0.0:7779
+      # The name every other container dials; join tokens carry it.
+      - --san
+      - server
+      - --worker-lease
+      - ${HORDE_WORKER_LEASE:-15}
+    volumes:
+      - server-state:/state
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7777"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  # worker-1 runs the report script: an agent's first turn reports its
+  # result through its MCP endpoint, so the worker stamps (and stages to the
+  # Relay) whatever its checkout committed. Later turns echo.
+  worker-1:
+    <<: *worker
+    hostname: worker-1
+    command: &worker-flags-report
+      - --adapter
+      - fake
+      - --fake-script
+      - /etc/horde-fixtures/report.json
+      - --workspace-root
+      - /work
+      - --relay
+      - https://server:7779
+    volumes:
+      - worker-1-state:/state
+      - ./fixtures:/etc/horde-fixtures:ro
+
+  worker-2:
+    <<: *worker
+    hostname: worker-2
+    command: &worker-flags
+      - --adapter
+      - fake
+      - --workspace-root
+      - /work
+      - --relay
+      - https://server:7779
+    volumes:
+      - worker-2-state:/state
+
+  worker-3:
+    <<: *worker
+    hostname: worker-3
+    command: *worker-flags
+    volumes:
+      - worker-3-state:/state
+
+  # Clients idle; the runner drives `horde` inside them with exec. `client`
+  # enrolls through the server's bootstrap token, `client-2` through a code
+  # `client` mints with `horde enroll client`.
+  client:
+    <<: *node
+    hostname: client
+    command: ["sleep", "infinity"]
+    volumes:
+      - client-id:/home/horde/.horde
+
+  client-2:
+    <<: *node
+    hostname: client-2
+    command: ["sleep", "infinity"]
+    volumes:
+      - client-2-id:/home/horde/.horde
+
+  # The upstream every workspace clones from: git://origin/atlas.git.
+  origin:
+    <<: *node
+    hostname: origin
+    entrypoint: ["horde-node", "origin"]
+    volumes:
+      - origin-git:/srv/git
+    healthcheck:
+      test: ["CMD", "git", "ls-remote", "git://127.0.0.1/atlas.git"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  # Opt-in (`--profile real`): the host's real harnesses. Binaries and
+  # profile directories are bind-mounted, never baked into the image, and
+  # the profiles are where credentials live:
+  #
+  #   HORDE_CLAUDE_BIN      the claude executable (native build)
+  #   HORDE_CODEX_BIN_DIR   the directory holding codex's native binaries
+  #   HORDE_CLAUDE_PROFILE  a CLAUDE_CONFIG_DIR that is signed in
+  #   HORDE_CODEX_PROFILE   a CODEX_HOME that is signed in
+  #   HORDE_UID/HORDE_GID   the owner of those profile directories
+  #
+  # It runs as the profiles' owner so it can read them; its state is a tmpfs
+  # that owner holds, because the image's /state belongs to uid 10001.
+  worker-real:
+    <<: *worker
+    profiles: [real]
+    hostname: worker-real
+    user: "${HORDE_UID:-1000}:${HORDE_GID:-1000}"
+    environment:
+      HOME: /state
+      PATH: /opt/codex/bin:/usr/local/bin:/usr/bin:/bin
+    command:
+      - --adapter
+      - claude
+      - --adapter
+      - codex
+      - --workspace-root
+      - /state/work
+      - --relay
+      - https://server:7779
+    tmpfs:
+      - /state:uid=${HORDE_UID:-1000},gid=${HORDE_GID:-1000},mode=0700
+      - /join:uid=${HORDE_UID:-1000},gid=${HORDE_GID:-1000},mode=0700
+    volumes:
+      - ${HORDE_CLAUDE_BIN:-/nonexistent/claude}:/usr/local/bin/claude:ro
+      - ${HORDE_CODEX_BIN_DIR:-/nonexistent/codex}:/opt/codex/bin:ro
+      - ${HORDE_CLAUDE_PROFILE:-/nonexistent/claude-profile}:/state/harness/claude/default
+      - ${HORDE_CODEX_PROFILE:-/nonexistent/codex-profile}:/state/harness/codex/default
+
+networks:
+  horde: {}
+
+volumes:
+  server-state:
+  worker-1-state:
+  worker-2-state:
+  worker-3-state:
+  client-id:
+  client-2-id:
+  origin-git:
