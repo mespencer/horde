@@ -122,27 +122,7 @@ impl LogKeys {
             section: logs,
         };
         let (bytes, files, age) = family_defaults(role);
-        let file_level = layer.read(|section| {
-            let level = section.string("level")?;
-            level
-                .map(|level| checked_filter(&level).map_err(|error| section.refuse("level", error)))
-                .transpose()
-        })?;
-        let env_level = env(LEVEL_VAR)
-            .filter(|level| !level.trim().is_empty())
-            .map(|level| {
-                checked_filter(&level).map_err(|error| format!("{LEVEL_VAR}={level:?}: {error}"))
-            })
-            .transpose()?;
-        let level = provenance.pick(
-            "logs.level",
-            DEFAULT_LEVEL.to_owned(),
-            vec![
-                (file_level, layer.origin.clone()),
-                (env_level, Origin::Env(LEVEL_VAR.to_owned())),
-            ],
-            show_string,
-        );
+        let level = level(&mut layer, env, provenance)?;
         let max_file_bytes = pick(
             provenance,
             &mut layer,
@@ -201,6 +181,36 @@ impl LogKeys {
             agent_reads,
         })
     }
+}
+
+/// `logs.level`: the default, then the file, then `HORDE_LOG`; each filter
+/// is checked.
+fn level(
+    layer: &mut Layer<'_>,
+    env: impl Fn(&str) -> Option<String>,
+    provenance: &mut Provenance,
+) -> Result<String, String> {
+    let file_level = layer.read(|section| {
+        section
+            .string("level")?
+            .map(|level| checked_filter(&level).map_err(|error| section.refuse("level", error)))
+            .transpose()
+    })?;
+    let env_level = env(LEVEL_VAR)
+        .filter(|level| !level.trim().is_empty())
+        .map(|level| {
+            checked_filter(&level).map_err(|error| format!("{LEVEL_VAR}={level:?}: {error}"))
+        })
+        .transpose()?;
+    Ok(provenance.pick(
+        "logs.level",
+        DEFAULT_LEVEL.to_owned(),
+        vec![
+            (file_level, layer.origin.clone()),
+            (env_level, Origin::Env(LEVEL_VAR.to_owned())),
+        ],
+        show_string,
+    ))
 }
 
 /// Picks one key: the default, then the file layer's value.
