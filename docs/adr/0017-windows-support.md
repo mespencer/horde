@@ -173,7 +173,7 @@ Windows-only (`cfg(windows)`), to run on a Windows machine:
 
 | test | what it pins |
 |---|---|
-| `horde-worker` `process_tree::windows::tests::*` | `TerminateJobObject` and a dropped tree each kill a grandchild; `Terminate` sends nothing |
+| `horde-worker` `process_tree::windows_tests::*` | `TerminateJobObject` and a dropped tree each kill a grandchild; `Terminate` sends nothing |
 | `horde-worker` `worker_suite windows_supervision::*` | the real stub harness: stop ends it by EOF and sweeps the job; kill and a dropped handle kill the job; a write after stop is a hang-up |
 | `horde-worker` `login::tests::a_conpty_session_reaches_eof_when_its_command_exits`, `killing_a_conpty_login_reaps_it_and_ends_its_output` | the ConPTY close-on-reap fix |
 | `horde-worker` `workspace::reclaim::tests::a_timed_out_command_is_killed_with_its_job`, `a_windows_command_keeps_what_windows_needs` | reclaim's job and its kept environment |

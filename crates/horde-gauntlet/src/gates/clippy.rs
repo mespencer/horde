@@ -22,11 +22,22 @@ pub fn gate() -> CommandGate {
 
 /// The command this gate runs.
 pub fn spec(ctx: &GateContext) -> CommandSpec {
-    let mut args = with_packages(&["clippy", "--all-targets", "--all-features"], ctx);
-    args.push("--".to_owned());
-    args.push("-D".to_owned());
-    args.push("warnings".to_owned());
-    CommandSpec::owned("cargo", args, &ctx.workspace_root)
+    CommandSpec::owned("cargo", lint_args(&[], &[], ctx), &ctx.workspace_root)
+}
+
+/// `cargo`'s arguments for a lint run: `[leading…] clippy --all-targets
+/// --all-features <packages> [trailing…] -- -D warnings`. One shape for
+/// this gate and `clippy-windows`, so the two can never lint different
+/// targets or tolerate different warnings.
+pub fn lint_args(leading: &[&str], trailing: &[&str], ctx: &GateContext) -> Vec<String> {
+    let mut args: Vec<String> = leading.iter().map(|arg| (*arg).to_owned()).collect();
+    args.extend(with_packages(
+        &["clippy", "--all-targets", "--all-features"],
+        ctx,
+    ));
+    args.extend(trailing.iter().map(|arg| (*arg).to_owned()));
+    args.extend(["--", "-D", "warnings"].map(str::to_owned));
+    args
 }
 
 /// Reads a clippy run.

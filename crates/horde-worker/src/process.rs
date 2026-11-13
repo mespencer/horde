@@ -250,15 +250,10 @@ impl SupervisedHarness {
         })?;
         let pgid = child.group();
 
-        let stdin = child
-            .take_stdin()
-            .ok_or(SupervisorError::MissingPipe("stdin"))?;
-        let stdout = child
-            .take_stdout()
-            .ok_or(SupervisorError::MissingPipe("stdout"))?;
-        let stderr_pipe = child
-            .take_stderr()
-            .ok_or(SupervisorError::MissingPipe("stderr"))?;
+        let pipes = child.take_pipes();
+        let stdin = pipes.stdin.ok_or(SupervisorError::MissingPipe("stdin"))?;
+        let stdout = pipes.stdout.ok_or(SupervisorError::MissingPipe("stdout"))?;
+        let stderr_pipe = pipes.stderr.ok_or(SupervisorError::MissingPipe("stderr"))?;
 
         let stderr: StderrTail = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
         let sink = Arc::clone(&stderr);
