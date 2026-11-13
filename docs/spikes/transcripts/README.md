@@ -51,6 +51,24 @@ JSON-RPC each received and the allow/deny decision it returned.
 | `09-config-isolation.jsonl` | Fresh `CLAUDE_CONFIG_DIR` | Hard auth failure — credentials do not leak from the ambient config |
 | `10-partial-messages.jsonl` | `--include-partial-messages` | Token-level `stream_event` deltas for the TUI |
 | `11-probe-run.txt` | Console output of `spikes/claude-probe` | The Rust driver doing all of the above |
+| `12a-stdio-perm-allow.jsonl` | **W12c, 2.1.323.** `--permission-prompt-tool stdio`, allow | `control_request`/`can_use_tool` on stdout before the Write; `control_response` with `updatedInput` on stdin; file written |
+| `12b-stdio-perm-deny.jsonl` | Same, deny with a message | The message is the agent's tool error; `permission_denials` populated |
+| `12c-stdio-perm-mutate.jsonl` | Same, allow with a rewritten `updatedInput` | The harness wrote `REWRITTEN_BY_HORDE`, not the model's content |
+| `12d-stdio-perm-remember-session.jsonl` | Allow with a session `addRules` `updatedPermissions`, then a second Write | One prompt across two turns: the grant was honoured (Horde does not send these — see ADR-0003's 2026-11-13 amendment) |
+| `12e-stdio-perm-slow-90s.jsonl` | The answer stalls 90 s | No timeout; the turn completes |
+| `13-ask-user-question.jsonl` | `AskUserQuestion` on the stdio route | The question arrives as a prompt; an allow whose `updatedInput` adds `answers` keyed by question text reaches the model |
+| `14-multi-turn-2.1.323.jsonl` | Three turns on one process | Unchanged from `02`; `system/init` now carries `claude_code_version` |
+| `15-resume-2.1.323.jsonl` | `--resume` of `14` | Unchanged from `05` |
+| `16-interrupt-control-2.1.323.jsonl` | Control interrupt mid-turn, then a follow-up | Unchanged from `07a`: `aborted_streaming`, process usable |
+| `17-mcp-perm-deny-2.1.323.jsonl` | The W1c MCP route at 2.1.323, deny | The fallback route still works; `perm-mcp-2.1.323.jsonl` is its server log |
+
+## W12c recordings (2026-11-13)
+
+Files `12a`–`17` and `perm-mcp-2.1.323.jsonl` were recorded against **Claude
+Code 2.1.323** on Linux with `--model haiku` (bound as `claude-haiku-5-5`),
+by `spikes/harness/drive_stdio.py` (stdio route), `drive.py` and
+`interrupt.py`. Scratch paths are rewritten to `/tmp/horde-w12c/…` and the
+home directory to `/home/USER`; nothing else was changed.
 
 ## Reproducing
 
