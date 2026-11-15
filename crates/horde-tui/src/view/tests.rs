@@ -571,6 +571,46 @@ fn a_secret_free_text_answer_is_masked() {
     insta::assert_snapshot!(drawn(&app));
 }
 
+/// The masked case's twin: an ordinary free-text answer shows as typed.
+#[test]
+fn an_ordinary_free_text_answer_shows_as_typed() {
+    let mut app = attached_conversation();
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![asked("q-o", &[("Branch", &[])])],
+    );
+    typed(&mut app, "hunter2");
+    let screen = drawn(&app);
+    assert!(screen.contains("Answer: hunter2"), "{screen}");
+}
+
+/// A permission card names the tool when the request carries one, and
+/// shows a mode line only for a request that has a mode.
+#[test]
+fn a_permission_card_names_its_tool_and_omits_an_empty_mode() {
+    let mut app = attached_conversation();
+    let mut request = requested("req-t", "cargo test");
+    if let Kind::PermissionRequested(requested) = &mut request
+        && let Some(inner) = requested.request.as_mut()
+    {
+        inner.permission_mode = String::new();
+        if let Some(call) = inner.tool_call.as_mut() {
+            call.tool_name = "Bash".to_owned();
+        }
+    }
+    fold(&mut app, "s1", "root-1", vec![request]);
+    let screen = drawn(&app);
+    assert!(screen.contains("Bash wants to run:"), "{screen}");
+    assert!(
+        !screen
+            .lines()
+            .any(|line| line.trim_matches(|c: char| !c.is_alphanumeric()) == "mode"),
+        "{screen}"
+    );
+}
+
 #[test]
 fn a_multi_select_question_shows_checkboxes() {
     let mut app = attached_conversation();
