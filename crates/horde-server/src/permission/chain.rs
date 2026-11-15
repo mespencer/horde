@@ -315,6 +315,49 @@ mod tests {
         );
     }
 
+    /// Either half of the question rule is enough on its own: a call that
+    /// carries structured questions escalates whatever tool it names (codex
+    /// asks through `request_user_input`), even under bypass, and a call
+    /// naming a question tool escalates with no structured questions at all.
+    #[test]
+    fn carrying_questions_or_naming_a_question_tool_each_make_a_question() {
+        let ancestry = Vec::new();
+        let mut asking = call("request_user_input", "/w");
+        assert!(!super::is_question(&asking));
+        asking.questions = vec![horde_proto::v1::Question {
+            id: "q".to_owned(),
+            ..horde_proto::v1::Question::default()
+        }];
+        assert!(super::is_question(&asking));
+        let bypass = PermissionMode::bypassing();
+        let escalated = ChainRuling::Escalate {
+            from: PermissionLayer::DeterministicDeny,
+        };
+        assert_eq!(
+            evaluate(&bypass, &asking, &at(&ancestry), &BTreeMap::new()),
+            escalated
+        );
+        assert_eq!(
+            evaluate(
+                &bypass,
+                &call("AskUserQuestion", "/w"),
+                &at(&ancestry),
+                &BTreeMap::new()
+            ),
+            escalated
+        );
+        assert_ne!(
+            evaluate(
+                &bypass,
+                &call("Bash", "/w"),
+                &at(&ancestry),
+                &BTreeMap::new()
+            ),
+            escalated,
+            "an ordinary call under bypass is not escalated"
+        );
+    }
+
     #[test]
     fn an_empty_mode_escalates_from_the_allow_layer() {
         let ruling = evaluate(
