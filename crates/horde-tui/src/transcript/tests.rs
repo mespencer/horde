@@ -218,6 +218,7 @@ fn a_spawn_shows_in_the_parent_and_opens_the_child_with_its_assignment() {
             ..AgentSpec::default()
         }),
         tree_path: vec!["lead".to_owned(), "reviewer".to_owned()],
+        session: None,
     });
     state.apply(&envelope(2, "kid", born));
     let empty_brief = Kind::AgentSpawned(AgentSpawned {

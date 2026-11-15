@@ -530,16 +530,17 @@ async fn the_workspaces_and_usage_views_fill_from_the_server() {
 
     let mut client = Client::connect(&endpoint).await.expect("a client");
     client
-        .create_workspace_definition(
-            "tui-ws",
-            vec![horde_proto::v1::WorkspaceRepo {
+        .create_workspace_definition(horde_proto::v1::CreateWorkspaceDefinitionRequest {
+            name: "tui-ws".to_owned(),
+            repos: vec![horde_proto::v1::WorkspaceRepo {
                 name: "horde".to_owned(),
                 remote_url: "https://example.invalid/horde.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: "horde".to_owned(),
+                reclaim: None,
             }],
-            Vec::new(),
-        )
+            ..horde_proto::v1::CreateWorkspaceDefinitionRequest::default()
+        })
         .await
         .expect("a workspace definition");
 
