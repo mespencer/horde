@@ -871,57 +871,9 @@ pub fn spec_from(args: &SpecArgs) -> Result<horde_proto::v1::AgentSpec, ClientEr
 /// alone already carries one branch per verb, and anything else in the same
 /// function walks the whole thing back over the complexity ceiling.
 pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
-    // The one verb that must work *before* any identity exists: joining is
-    // how this machine gets one, so it dials the enrollment listener rather
-    // than the control plane.
-    if let Some(Command::Enroll(EnrollCommand::Join {
-        token,
-        token_file,
-        force,
-    })) = &cli.command
-    {
-        let text = join_token_text(
-            token.as_deref(),
-            token_file.as_deref(),
-            std::env::var(JOIN_TOKEN_VAR).ok(),
-        )?;
-        return run_join(cli, &text, *force, format).await;
+    if run_unconnected(cli, format).await? {
+        return Ok(());
     }
-    // `up` orchestrates its own enrollments and connections, starting from
-    // a machine that may hold nothing yet.
-    if let Some(Command::Up(args)) = &cli.command {
-        return crate::up::run(args, cli.identity.as_deref()).await;
-    }
-    // A dry run of `worker add` prints its plan and connects to nothing —
-    // not even the server it would mint through.
-    if let Some(Command::Worker(WorkerCommand::Add(args))) = &cli.command
-        && args.dry_run
-    {
-        return crate::worker_add::dry_run(args, format);
-    }
-    // `logs --dir` reads local files, for exactly the machine that cannot
-    // reach a server.
-    if let Some(Command::Logs(args)) = &cli.command {
-        if let Some(dir) = &args.dir {
-            return crate::logs::run_dir(dir, args, format, &mut std::io::stdout()).await;
-        }
-        // A target mistake is refused before any dial: it is the user's to
-        // fix whether or not a server is up.
-        crate::logs::remote_target(args.target.as_deref(), args.name.as_deref())
-            .map_err(ClientError::Logs)?;
-    }
-    // `doctor` diagnoses the very connection the other verbs need, so it
-    // must run whether or not one can be made.
-    if let Some(Command::Doctor(args)) = &cli.command {
-        return crate::doctor::run(
-            cli.endpoint.as_deref(),
-            cli.identity.as_deref(),
-            args,
-            format,
-        )
-        .await;
-    }
-
     let settings = crate::config::ClientSettings::load(
         cli.config.as_deref(),
         horde_identity::home_dir(),
@@ -946,6 +898,69 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
         .await?
         .with_session_defaults(settings.session);
     dispatch(&mut client, cli, &resolved, format).await
+}
+
+/// The verbs that run before, or instead of, a connection to the server:
+/// `enroll join`, `up`, a dry-run `worker add`, `logs --dir` (and a remote
+/// `logs` target's local validation), and `doctor`. `true` means the verb
+/// ran here and nothing should connect.
+async fn run_unconnected(cli: &Cli, format: Format) -> Result<bool, ClientError> {
+    // The one verb that must work *before* any identity exists: joining is
+    // how this machine gets one, so it dials the enrollment listener rather
+    // than the control plane.
+    if let Some(Command::Enroll(EnrollCommand::Join {
+        token,
+        token_file,
+        force,
+    })) = &cli.command
+    {
+        let text = join_token_text(
+            token.as_deref(),
+            token_file.as_deref(),
+            std::env::var(JOIN_TOKEN_VAR).ok(),
+        )?;
+        run_join(cli, &text, *force, format).await?;
+        return Ok(true);
+    }
+    // `up` orchestrates its own enrollments and connections, starting from
+    // a machine that may hold nothing yet.
+    if let Some(Command::Up(args)) = &cli.command {
+        crate::up::run(args, cli.identity.as_deref()).await?;
+        return Ok(true);
+    }
+    // A dry run of `worker add` prints its plan and connects to nothing —
+    // not even the server it would mint through.
+    if let Some(Command::Worker(WorkerCommand::Add(args))) = &cli.command
+        && args.dry_run
+    {
+        crate::worker_add::dry_run(args, format)?;
+        return Ok(true);
+    }
+    // `logs --dir` reads local files, for exactly the machine that cannot
+    // reach a server.
+    if let Some(Command::Logs(args)) = &cli.command {
+        if let Some(dir) = &args.dir {
+            crate::logs::run_dir(dir, args, format, &mut std::io::stdout()).await?;
+            return Ok(true);
+        }
+        // A target mistake is refused before any dial: it is the user's to
+        // fix whether or not a server is up.
+        crate::logs::remote_target(args.target.as_deref(), args.name.as_deref())
+            .map_err(ClientError::Logs)?;
+    }
+    // `doctor` diagnoses the very connection the other verbs need, so it
+    // must run whether or not one can be made.
+    if let Some(Command::Doctor(args)) = &cli.command {
+        crate::doctor::run(
+            cli.endpoint.as_deref(),
+            cli.identity.as_deref(),
+            args,
+            format,
+        )
+        .await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Dispatches to one handler per verb.
