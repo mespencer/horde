@@ -1255,6 +1255,7 @@ mod tests {
                                 remote_url: origin_path.clone(),
                                 default_branch: "main".to_owned(),
                                 layout_path: String::new(),
+                                reclaim: None,
                             }],
                             ..horde_proto::v1::WorkspaceDefinition::default()
                         }),
