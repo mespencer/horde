@@ -919,29 +919,29 @@ async fn run_unconnected(cli: &Cli, format: Format) -> Result<bool, ClientError>
             token_file.as_deref(),
             std::env::var(JOIN_TOKEN_VAR).ok(),
         )?;
-        run_join(cli, &text, *force, format).await?;
-        return Ok(true);
+        return run_join(cli, &text, *force, format).await.map(|()| true);
     }
     // `up` orchestrates its own enrollments and connections, starting from
     // a machine that may hold nothing yet.
     if let Some(Command::Up(args)) = &cli.command {
-        crate::up::run(args, cli.identity.as_deref()).await?;
-        return Ok(true);
+        return crate::up::run(args, cli.identity.as_deref())
+            .await
+            .map(|()| true);
     }
     // A dry run of `worker add` prints its plan and connects to nothing —
     // not even the server it would mint through.
     if let Some(Command::Worker(WorkerCommand::Add(args))) = &cli.command
         && args.dry_run
     {
-        crate::worker_add::dry_run(args, format)?;
-        return Ok(true);
+        return crate::worker_add::dry_run(args, format).map(|()| true);
     }
     // `logs --dir` reads local files, for exactly the machine that cannot
     // reach a server.
     if let Some(Command::Logs(args)) = &cli.command {
         if let Some(dir) = &args.dir {
-            crate::logs::run_dir(dir, args, format, &mut std::io::stdout()).await?;
-            return Ok(true);
+            return crate::logs::run_dir(dir, args, format, &mut std::io::stdout())
+                .await
+                .map(|()| true);
         }
         // A target mistake is refused before any dial: it is the user's to
         // fix whether or not a server is up.
@@ -951,14 +951,14 @@ async fn run_unconnected(cli: &Cli, format: Format) -> Result<bool, ClientError>
     // `doctor` diagnoses the very connection the other verbs need, so it
     // must run whether or not one can be made.
     if let Some(Command::Doctor(args)) = &cli.command {
-        crate::doctor::run(
+        return crate::doctor::run(
             cli.endpoint.as_deref(),
             cli.identity.as_deref(),
             args,
             format,
         )
-        .await?;
-        return Ok(true);
+        .await
+        .map(|()| true);
     }
     Ok(false)
 }
