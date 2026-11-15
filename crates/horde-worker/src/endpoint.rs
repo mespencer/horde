@@ -442,6 +442,15 @@ mod tests {
         StampingSink::new(journal.sink(), std::sync::Arc::new(ShareBroker::new(None)))
     }
 
+    /// `agent-1`'s endpoint in `s1`, dialled as `agent-1` with its minted
+    /// token by a real MCP client.
+    async fn dialled(manager: &EndpointManager) -> horde_mcp::hub::Upstream {
+        let (url, token) = minted(manager).await;
+        horde_mcp::hub::Upstream::dial("horde", &url, Some(&token), &[("x-horde-agent", "agent-1")])
+            .await
+            .expect("the minted pair dials")
+    }
+
     /// `agent-1`'s endpoint in `s1`: its URL and bearer token.
     async fn minted(manager: &EndpointManager) -> (String, String) {
         let endpoint = manager
@@ -717,15 +726,7 @@ mod tests {
     async fn the_workspace_access_backs_the_served_checkout_verb() {
         let manager = manager();
         manager.set_workspace_access(std::sync::Arc::new(FixedWorkspace));
-        let (url, token) = minted(&manager).await;
-        let upstream = horde_mcp::hub::Upstream::dial(
-            "horde",
-            &url,
-            Some(&token),
-            &[("x-horde-agent", "agent-1")],
-        )
-        .await
-        .expect("the minted pair dials");
+        let upstream = dialled(&manager).await;
         let mut arguments = serde_json::Map::new();
         arguments.insert("repo".to_owned(), serde_json::Value::from("docs"));
         let answered = upstream
@@ -751,15 +752,7 @@ mod tests {
             .line("harness says hello");
         let manager = manager();
         manager.serve_logs(serving.local().clone());
-        let (url, token) = minted(&manager).await;
-        let upstream = horde_mcp::hub::Upstream::dial(
-            "horde",
-            &url,
-            Some(&token),
-            &[("x-horde-agent", "agent-1")],
-        )
-        .await
-        .expect("dial");
+        let upstream = dialled(&manager).await;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             upstream.call("logs", None),
