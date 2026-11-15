@@ -352,10 +352,19 @@ fn measured(
     check_patch(ctx, runner).map_err(GateOutcome::error)?;
     check_disk(ctx, runner).map_err(GateOutcome::error)?;
     let mutable = audited(ctx, runner)?;
-    let scope = match scope(ctx, runner, &mutable)? {
-        Scoped::Measure(scope) => scope,
-        Scoped::Nothing(reason) => return Ok(GateOutcome::skipped(reason)),
-    };
+    match scope(ctx, runner, &mutable)? {
+        Scoped::Measure(scope) => measure_scope(ctx, runner, settings, &scope),
+        Scoped::Nothing(reason) => Ok(GateOutcome::skipped(reason)),
+    }
+}
+
+/// Lists, runs and judges the mutants of one decided scope.
+fn measure_scope(
+    ctx: &GateContext,
+    runner: &dyn CommandRunner,
+    settings: &Settings,
+    scope: &Scope,
+) -> Result<GateOutcome, GateOutcome> {
     let listed = listing(
         runner,
         &list_spec(ctx, &selection(&ctx.packages), scope.diff(), Config::Read),
@@ -375,10 +384,10 @@ fn measured(
     let tally = run(
         ctx,
         runner,
-        &run_spec(ctx, &selection(&packages), &scope, settings),
+        &run_spec(ctx, &selection(&packages), scope, settings),
     )?;
-    let outcome = outcome_of(&scope, &tally);
-    if scope == Scope::FullTree && ctx.packages.is_empty() && outcome.label() == "pass" {
+    let outcome = outcome_of(scope, &tally);
+    if *scope == Scope::FullTree && ctx.packages.is_empty() && outcome.label() == "pass" {
         return Ok(record_full_sweep(ctx, runner, outcome));
     }
     Ok(outcome)
@@ -774,19 +783,8 @@ fn scope(
     runner: &dyn CommandRunner,
     mutable: &BTreeSet<String>,
 ) -> Result<Scoped, GateOutcome> {
-    if ctx.full {
+    let Some((base, since)) = diff_base(ctx, runner)? else {
         return Ok(Scoped::Measure(Scope::FullTree));
-    }
-    let (base, since) = if ctx.incremental {
-        match last_full_sweep(ctx) {
-            Some(commit) => (commit.clone(), Since::LastFullSweep(commit)),
-            None => return Ok(Scoped::Measure(Scope::FullTree)),
-        }
-    } else {
-        match baseline(runner, &ctx.workspace_root)? {
-            Some(base) => (base, Since::BranchPoint),
-            None => return Ok(Scoped::Measure(Scope::FullTree)),
-        }
     };
     let spec = diff_spec(&ctx.workspace_root, &base);
     let raw = invoke(runner, &spec)?;
@@ -817,6 +815,24 @@ fn scope(
     }
     write_diff(&path, &narrowed)?;
     Ok(Scoped::Measure(scope))
+}
+
+/// The commit a diff-scoped run compares against, and why; `None` means the
+/// whole tree: `--full`, `--incremental` with no recorded sweep, or no
+/// baseline at all.
+fn diff_base(
+    ctx: &GateContext,
+    runner: &dyn CommandRunner,
+) -> Result<Option<(String, Since)>, GateOutcome> {
+    if ctx.full {
+        return Ok(None);
+    }
+    if ctx.incremental {
+        return Ok(
+            last_full_sweep(ctx).map(|commit| (commit.clone(), Since::LastFullSweep(commit)))
+        );
+    }
+    Ok(baseline(runner, &ctx.workspace_root)?.map(|base| (base, Since::BranchPoint)))
 }
 
 /// What the change under test is measured against.
