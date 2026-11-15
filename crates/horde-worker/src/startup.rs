@@ -671,41 +671,7 @@ async fn build_runtime(
         .with_agent_endpoints(channel, name);
 
     for adapter in &config.adapters {
-        runtime = match adapter {
-            AdapterChoice::Fake => {
-                let mut fake = FakeAdapter::new(configured_script(config)?);
-                if let Some(recipe) = configured_fake_login(config) {
-                    fake = fake.with_login_recipe(recipe);
-                }
-                runtime.with_adapter(Arc::new(fake))
-            }
-            AdapterChoice::Claude => {
-                // Probed, not assumed: the version picks the permission route
-                // (stdio from 2.1.323) and a refused version stops the Worker
-                // here, loudly, rather than failing every spawn (W12c).
-                let adapter =
-                    crate::ClaudeAdapter::new(harness_profile(config, "claude", &journal))
-                        .probe_version()
-                        .await;
-                admit_harness(&adapter.version)?;
-                runtime.with_adapter(Arc::new(adapter))
-            }
-            AdapterChoice::Codex => {
-                // Belt and braces on the transcript-23 hazard: the flag was
-                // validated at parse, and the value is re-validated here so a
-                // config constructed programmatically gets the same gate. The
-                // codec pins the wire value regardless.
-                horde_adapter_codex::approvals_reviewer_from_config(
-                    config.codex_approvals_reviewer.as_deref(),
-                )?;
-                // Probed, not assumed: the per-kind gating claims are
-                // version-gated (ADR-0005, 2026-08-19 and 2026-11-13
-                // amendments), and a refused version stops the Worker here.
-                let adapter = codex_adapter(config, &journal).probe_version().await;
-                admit_harness(&adapter.version)?;
-                runtime.with_adapter(Arc::new(adapter))
-            }
-        };
+        runtime = runtime.with_adapter(adapter_for(*adapter, config, &journal).await?);
     }
 
     if let Some(root) = &config.workspace_root {
@@ -721,6 +687,49 @@ async fn build_runtime(
         runtime = runtime.with_relay(relay_location(relay, identity, &config.identity_dir()));
     }
     Ok(runtime)
+}
+
+/// The adapter one `--adapter` choice runs. Claude and codex are probed for
+/// their versions first, and a refused version stops the Worker here (W12c).
+async fn adapter_for(
+    choice: AdapterChoice,
+    config: &WorkerConfig,
+    journal: &Journal,
+) -> Result<Arc<dyn horde_adapter::Adapter>, String> {
+    Ok(match choice {
+        AdapterChoice::Fake => {
+            let mut fake = FakeAdapter::new(configured_script(config)?);
+            if let Some(recipe) = configured_fake_login(config) {
+                fake = fake.with_login_recipe(recipe);
+            }
+            Arc::new(fake)
+        }
+        AdapterChoice::Claude => {
+            // Probed, not assumed: the version picks the permission route
+            // (stdio from 2.1.323) and a refused version stops the Worker
+            // here, loudly, rather than failing every spawn (W12c).
+            let adapter = crate::ClaudeAdapter::new(harness_profile(config, "claude", journal))
+                .probe_version()
+                .await;
+            admit_harness(&adapter.version)?;
+            Arc::new(adapter)
+        }
+        AdapterChoice::Codex => {
+            // Belt and braces on the transcript-23 hazard: the flag was
+            // validated at parse, and the value is re-validated here so a
+            // config constructed programmatically gets the same gate. The
+            // codec pins the wire value regardless.
+            horde_adapter_codex::approvals_reviewer_from_config(
+                config.codex_approvals_reviewer.as_deref(),
+            )?;
+            // Probed, not assumed: the per-kind gating claims are
+            // version-gated (ADR-0005, 2026-08-19 and 2026-11-13
+            // amendments), and a refused version stops the Worker here.
+            let adapter = codex_adapter(config, journal).probe_version().await;
+            admit_harness(&adapter.version)?;
+            Arc::new(adapter)
+        }
+    })
 }
 
 /// Where this Worker's git reaches the Relay. An `https://` Relay is the
