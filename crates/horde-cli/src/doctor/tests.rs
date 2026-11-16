@@ -467,7 +467,10 @@ fn windows_harnesses_are_exes_on_the_given_path() {
     std::fs::write(bin.path().join("codex.cmd"), "@echo off\r\n").expect("writes");
     let path = std::env::join_paths([bin.path()]).expect("a path");
 
-    let checks = harness_checks(&[], Some(&path));
+    let checks: Vec<Check> = harness_checks(&[], Some(&path))
+        .into_iter()
+        .map(|(check, _)| check)
+        .collect();
     let found = verdict_named(&checks, "harness claude");
     assert_eq!(found.verdict, Verdict::Ok);
     assert_eq!(found.detail, claude.display().to_string());

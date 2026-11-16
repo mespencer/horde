@@ -366,8 +366,8 @@ mod tests {
     }
 
     /// An executable shell script in a fresh temp directory, standing in for
-    /// a harness binary.
-    #[cfg(any(feature = "probe", test))]
+    /// a harness binary. Unix only: the stand-in is a `#!/bin/sh` script.
+    #[cfg(all(unix, any(feature = "probe", test)))]
     fn script(name: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -386,7 +386,7 @@ mod tests {
     /// One test, both scripts written before anything is spawned: a fork
     /// from a parallel test while a script is still open for writing makes
     /// exec fail with ETXTBSY.
-    #[cfg(any(feature = "probe", test))]
+    #[cfg(all(unix, any(feature = "probe", test)))]
     #[tokio::test]
     async fn the_probe_reads_what_runs_and_explains_what_does_not() {
         let banner = script("banner", "echo \"toy 1.5.0 ($1)\"");
