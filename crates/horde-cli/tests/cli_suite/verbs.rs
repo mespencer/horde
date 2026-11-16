@@ -723,3 +723,163 @@ async fn a_log_of_an_unknown_workspace_fails() {
     .expect("bounded")
     .expect_err("an unknown workspace is refused");
 }
+
+/// Each cleanup verb's `--wait` refusal names the flag.
+#[tokio::test]
+async fn a_bad_wait_is_refused_by_name() {
+    let endpoint = serve().await.expect("a listening server");
+    let definition = common::define_workspace(&endpoint, "suite")
+        .await
+        .expect("defined");
+    let id = common::definition_id(&definition);
+    for args in [
+        &["workspace", "gc", "suite", "--wait", "soon"][..],
+        &[
+            "workspace",
+            "instance",
+            "remove",
+            "suite",
+            "--worker",
+            "w1",
+            "--wait",
+            "soon",
+        ][..],
+        &[
+            "workspace",
+            "delete",
+            &id,
+            "--etag",
+            &definition.etag,
+            "--purge",
+            "--wait",
+            "soon",
+        ][..],
+    ] {
+        let error = invoke(&endpoint, args).await.expect_err("refused");
+        assert!(error.to_string().contains("--wait: "), "{args:?}: {error}");
+    }
+}
+
+/// Two workspaces, each held by its own connected Worker: `ws-a` by
+/// `worker-a`, `ws-b` by `worker-b`.
+async fn two_held_workspaces(
+    endpoint: &str,
+) -> Setup<(
+    horde_proto::v1::WorkspaceDefinition,
+    horde_proto::v1::WorkspaceDefinition,
+)> {
+    let a = common::define_workspace(endpoint, "ws-a").await?;
+    let b = common::define_workspace(endpoint, "ws-b").await?;
+    for (worker, definition) in [("worker-a", &a), ("worker-b", &b)] {
+        common::register_workspace_worker(endpoint, worker).await?;
+        common::report_instance(endpoint, worker, &common::definition_id(definition)).await?;
+    }
+    Ok((a, b))
+}
+
+/// A purge waits for the Workers holding *that* workspace's Instances, and
+/// is incomplete until they answer.
+#[tokio::test]
+async fn a_purge_waits_only_for_its_own_workspaces_holders() {
+    let endpoint = serve().await.expect("a listening server");
+    let (a, _) = two_held_workspaces(&endpoint).await.expect("held");
+    let error = invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "delete",
+            &common::definition_id(&a),
+            "--etag",
+            &a.etag,
+            "--purge",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect_err("worker-a has not answered");
+    assert_eq!(
+        error.to_string(),
+        "workspace cleanup incomplete: no answer yet from worker-a",
+        "{error}"
+    );
+}
+
+/// Removing an Instance from a connected Worker waits for that Worker's
+/// answer: it is pending, not offline.
+#[tokio::test]
+async fn an_instance_removal_from_a_connected_worker_awaits_its_answer() {
+    let endpoint = serve().await.expect("a listening server");
+    two_held_workspaces(&endpoint).await.expect("held");
+    let error = invoke(
+        &endpoint,
+        &[
+            "workspace",
+            "instance",
+            "remove",
+            "ws-a",
+            "--worker",
+            "worker-a",
+            "--wait",
+            "1s",
+        ],
+    )
+    .await
+    .expect_err("worker-a has not answered");
+    assert_eq!(
+        error.to_string(),
+        "workspace cleanup incomplete: no answer yet from worker-a",
+        "{error}"
+    );
+}
+
+/// A gc targeting two Workers waits for both answers, however close
+/// together they land, and is done only when both have answered.
+#[tokio::test]
+async fn a_gc_waits_for_every_targeted_worker() {
+    let endpoint = serve().await.expect("a listening server");
+    two_held_workspaces(&endpoint).await.expect("held");
+    let answer = async {
+        let request = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let requests = common::gc_requests(&endpoint).await.expect("the log reads");
+                if let Some(request) = requests.last() {
+                    return request.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the request lands");
+        let mut targeted: Vec<String> =
+            request.worker_ids.iter().map(ToString::to_string).collect();
+        targeted.sort();
+        assert_eq!(targeted, ["worker-a", "worker-b"]);
+        for (sequence, worker) in (1_u64..).zip(["worker-a", "worker-b"]) {
+            common::journal_event_at(
+                &endpoint,
+                horde_proto::WORKSPACE_HOUSEKEEPING_STREAM,
+                sequence,
+                horde_proto::v1::Event {
+                    kind: Some(horde_proto::v1::event::Kind::WorkspaceGcCompleted(
+                        horde_proto::v1::WorkspaceGcCompleted {
+                            request_id: request.request_id.clone(),
+                            worker_id: Some(horde_proto::v1::WorkerId::new(worker)),
+                            ..horde_proto::v1::WorkspaceGcCompleted::default()
+                        },
+                    )),
+                    ..horde_proto::v1::Event::default()
+                },
+            )
+            .await
+            .expect("the answer lands");
+        }
+    };
+    let gc = invoke(&endpoint, &["workspace", "gc", "--hard", "--wait", "25s"]);
+    let (gc, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(gc, answer)
+    })
+    .await
+    .expect("the gc finishes once both answered");
+    gc.expect("both answered cleanly");
+}

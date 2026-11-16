@@ -325,3 +325,102 @@ async fn the_workspace_verbs_reach_the_workers_checkout() {
         spec.repo_bases
     );
 }
+
+/// Asserts a JSON-RPC refusal: its code, its message, and no `data` — the
+/// endpoint's refusals carry nothing beyond the message.
+fn assert_refused(rpc: &serde_json::Value, code: i64, message: &str) {
+    assert!(rpc.get("error").is_some(), "refused: {rpc}");
+    let error = &rpc["error"];
+    assert_eq!(error["code"], code, "{rpc}");
+    assert_eq!(error["message"], message, "{rpc}");
+    assert!(error.get("data").is_none(), "no data: {rpc}");
+}
+
+/// Without a workspace, `workspace_checkout` refuses with why; a checkout
+/// mode that is neither `all` nor `lazy` is refused by name.
+#[tokio::test]
+async fn the_workspace_verbs_refuse_without_a_workspace() {
+    let served = served().await.expect("the endpoint must serve");
+    let mcp = McpClient::connect(served.address, &served.horde.agent_id, TOKEN)
+        .await
+        .expect("the legacy flow must initialize");
+    let rpc = mcp
+        .call_tool_raw("workspace_checkout", serde_json::json!({ "repo": "atlas" }))
+        .await
+        .expect("an answer");
+    assert_refused(
+        &rpc,
+        -32602,
+        "this agent runs without a workspace; there is nothing to check out",
+    );
+    let rpc = mcp
+        .call_tool_raw(
+            "spawn_agent",
+            serde_json::json!({ "task": "", "checkout_mode": "eager" }),
+        )
+        .await
+        .expect("an answer");
+    assert_refused(
+        &rpc,
+        -32602,
+        "checkout_mode is \"all\" or \"lazy\", not \"eager\"",
+    );
+}
+
+/// The Worker's half of the workspace verbs, refusing both: what a Worker
+/// that cannot check out or stage answers.
+struct RefusingCheckout;
+
+#[async_trait::async_trait]
+impl horde_mcp::workspace::WorkspaceAccess for RefusingCheckout {
+    async fn checkout(
+        &self,
+        _agent_id: &str,
+        repo: &str,
+        _base: Option<&str>,
+    ) -> Result<horde_mcp::workspace::CheckoutAnswer, String> {
+        Err(format!("no repo {repo} in this workspace"))
+    }
+
+    async fn parent_bases(
+        &self,
+        _agent_id: &str,
+    ) -> Result<Vec<horde_proto::v1::RepoBase>, String> {
+        Err("the relay is unreachable".to_owned())
+    }
+}
+
+/// A Worker's refusal reaches the caller as its reason: a checkout it
+/// cannot make is the caller's to fix (invalid params), a parent base it
+/// cannot stage is the Worker's (internal error).
+#[tokio::test]
+async fn a_workers_workspace_refusal_reaches_the_caller() {
+    let horde = harness().await.expect("a harness");
+    let registry = AgentRegistry::new();
+    registry.insert(&horde.agent_id, TOKEN);
+    let context = horde
+        .context()
+        .await
+        .expect("a context")
+        .with_workspace(std::sync::Arc::new(RefusingCheckout));
+    let (address, _serving) = serve(
+        &EndpointConfig::loopback(0),
+        std::sync::Arc::new(registry),
+        HordeEndpoint::new(context),
+    )
+    .await
+    .expect("the endpoint serves");
+    let mcp = McpClient::connect(address, &horde.agent_id, TOKEN)
+        .await
+        .expect("the legacy flow must initialize");
+    let rpc = mcp
+        .call_tool_raw("workspace_checkout", serde_json::json!({ "repo": "ghost" }))
+        .await
+        .expect("an answer");
+    assert_refused(&rpc, -32602, "no repo ghost in this workspace");
+    let rpc = mcp
+        .call_tool_raw("spawn_agent", serde_json::json!({ "task": "" }))
+        .await
+        .expect("an answer");
+    assert_refused(&rpc, -32603, "the relay is unreachable");
+}

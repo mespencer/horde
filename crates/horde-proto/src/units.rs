@@ -123,6 +123,8 @@ mod tests {
         assert_eq!(parse_threshold("10%"), Ok((1_000, 0)));
         assert_eq!(parse_threshold("20GiB"), Ok((0, 20 << 30)));
         assert_eq!(parse_threshold("10%,20GiB"), Ok((1_000, 20 << 30)));
+        // 100% is the whole filesystem, the largest share there is.
+        assert_eq!(parse_threshold("100%"), Ok((10_000, 0)));
         assert!(parse_threshold("101%").is_err());
         assert!(parse_threshold("ten%").is_err());
     }

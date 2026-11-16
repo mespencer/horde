@@ -320,6 +320,99 @@ mod tests {
         }
     }
 
+    /// Each refusal says which part of the grammar the value missed.
+    #[test]
+    fn a_reclaim_refusal_says_what_is_wrong() {
+        for (wrong, why) in [
+            ("atlas", "(no '=')"),
+            ("=auto", "(no repo name)"),
+            ("atlas=make clean", "(not a JSON array of strings)"),
+            ("atlas=[]", "(an empty argv)"),
+        ] {
+            let report = reclaim_from(wrong).expect_err(wrong).report();
+            assert!(report.contains(why), "{wrong}: {report}");
+        }
+        let (_, command) = reclaim_from(r#"atlas=["make"]"#).expect("argv");
+        let Some(reclaim_policy::Policy::Command(command)) = command.policy else {
+            panic!("a command");
+        };
+        assert_eq!(command.timeout, None, "no timeout until --reclaim-timeout");
+    }
+
+    /// A whole number of seconds on the wire, saturating at the wire's
+    /// largest.
+    #[test]
+    fn a_duration_goes_on_the_wire_in_whole_seconds() {
+        assert_eq!(
+            wire(Duration::from_millis(90_500)),
+            horde_proto::prost_types::Duration {
+                seconds: 90,
+                nanos: 0
+            }
+        );
+        assert_eq!(
+            wire(Duration::MAX),
+            horde_proto::prost_types::Duration {
+                seconds: i64::MAX,
+                nanos: 0
+            }
+        );
+    }
+
+    /// Every policy flag's refusal names that flag.
+    #[test]
+    fn each_policy_flag_refusal_names_its_flag() {
+        let refused = |args: WorkspacePolicyArgs| {
+            let mut list = repos();
+            let applied = apply_reclaim(&mut list, &args).err();
+            applied
+                .or_else(|| cleanup_from(&args).err())
+                .expect("refused")
+                .report()
+        };
+        let cases = [
+            (
+                WorkspacePolicyArgs {
+                    reclaim: vec!["ghost=auto".to_owned()],
+                    ..WorkspacePolicyArgs::default()
+                },
+                "--reclaim names repo \"ghost\"",
+            ),
+            (
+                WorkspacePolicyArgs {
+                    reclaim_timeout: vec!["atlas=4w".to_owned()],
+                    ..WorkspacePolicyArgs::default()
+                },
+                "--reclaim-timeout: ",
+            ),
+            (
+                WorkspacePolicyArgs {
+                    reclaim_timeout: vec!["ghost=1m".to_owned()],
+                    ..WorkspacePolicyArgs::default()
+                },
+                "--reclaim-timeout names repo \"ghost\"",
+            ),
+            (
+                WorkspacePolicyArgs {
+                    idle_reclaim_after: Some("4w".to_owned()),
+                    ..WorkspacePolicyArgs::default()
+                },
+                "--idle-reclaim-after: ",
+            ),
+            (
+                WorkspacePolicyArgs {
+                    archived_grace: Some("4w".to_owned()),
+                    ..WorkspacePolicyArgs::default()
+                },
+                "--archived-grace: ",
+            ),
+        ];
+        for (args, flag) in cases {
+            let report = refused(args);
+            assert!(report.contains(flag), "{flag}: {report}");
+        }
+    }
+
     fn repos() -> Vec<WorkspaceRepo> {
         vec![WorkspaceRepo {
             name: "atlas".to_owned(),
@@ -410,9 +503,11 @@ mod tests {
         let bare = base_from("9c1e").expect("bare");
         assert!(bare.repo_name.is_empty());
         assert_eq!(bare.r#ref, "9c1e");
-        for wrong in ["", "=main", "atlas=", "--upload-pack=x"] {
+        for wrong in ["", "=main", "atlas=", "--upload-pack=x", "-x", "atlas=-x"] {
             assert!(base_from(wrong).is_err(), "{wrong}");
         }
+        // Only a leading dash is an option's; a ref may end in one.
+        assert_eq!(base_from("main-").expect("trailing dash").r#ref, "main-");
     }
 
     #[test]

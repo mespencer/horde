@@ -25,7 +25,7 @@ Feature: Workspaces start fresh, check out what they need, and give disk back
     Then the user eventually sees the checkout start "fresh" on "feat/login"
 
   Scenario: A dry run says so and changes nothing
-    When the user runs "workspace gc --hard --dry-run"
+    When the user runs "workspace gc --hard --dry-run --wait 20s"
     Then the command succeeds
     And stdout contains "DRY RUN — nothing was changed"
 

@@ -908,6 +908,63 @@ async fn create_from_cwd_reads_the_repo_the_shell_is_in() {
         "https://example.invalid/cwd-atlas.git"
     );
     assert_eq!(definition.repos[0].default_branch, "trunk");
+    assert_eq!(definition.repos[0].reclaim, None, "no reclaim policy named");
+}
+
+/// `workspace create --from-cwd` outside a git work tree is refused with
+/// git's own reason, and defines nothing.
+#[tokio::test]
+async fn create_from_cwd_outside_a_repo_says_why() {
+    let endpoint = serve().await.expect("a listening server");
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let created = tokio::time::timeout(
+        CEILING,
+        Command::new(env!("CARGO_BIN_EXE_horde"))
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .args(["workspace", "create", "--from-cwd"])
+            .current_dir(temp.path())
+            .env("GIT_CEILING_DIRECTORIES", temp.path())
+            .output(),
+    )
+    .await
+    .expect("bounded")
+    .expect("the binary runs");
+    assert!(!created.status.success());
+    let stderr = String::from_utf8_lossy(&created.stderr);
+    assert!(
+        stderr.contains("--from-cwd needs a git work tree with an origin remote: ")
+            && stderr.contains("not a git repository"),
+        "{stderr}"
+    );
+}
+
+/// `instance list <workspace>` shows that workspace's Instances only.
+#[tokio::test]
+async fn an_instance_list_filters_by_workspace() {
+    let endpoint = serve().await.expect("a listening server");
+    let a = common::define_workspace(&endpoint, "ws-a")
+        .await
+        .expect("defined");
+    let b = common::define_workspace(&endpoint, "ws-b")
+        .await
+        .expect("defined");
+    let (a, b) = (common::definition_id(&a), common::definition_id(&b));
+    for (worker, id) in [("worker-a", &a), ("worker-b", &b)] {
+        common::report_instance(&endpoint, worker, id)
+            .await
+            .expect("reported");
+    }
+    let listed = bounded(&endpoint, &["workspace", "instance", "list", "ws-a"])
+        .await
+        .expect("the binary must run");
+    assert!(listed.success, "stderr was: {}", listed.stderr);
+    assert!(
+        listed.stdout.contains(&format!("{a} on worker-a")),
+        "{:?}",
+        listed.stdout
+    );
+    assert!(!listed.stdout.contains("worker-b"), "{:?}", listed.stdout);
 }
 
 /// A gc waits for the targeted worker's answer and prints it: its cleanup

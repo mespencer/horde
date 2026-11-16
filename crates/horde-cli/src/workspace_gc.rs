@@ -175,10 +175,11 @@ async fn repo_from_cwd() -> Result<(String, horde_proto::v1::WorkspaceRepo), Cli
         .await
         .map(|head| head.trim_start_matches("origin/").to_owned())
         .unwrap_or_default();
-    let dir_name = std::path::Path::new(&root)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace")
+    // Git names a work tree's top level with forward slashes on every
+    // platform; the last component is the directory's name.
+    let dir_name = root
+        .rsplit_once('/')
+        .map_or(root.as_str(), |(_, name)| name)
         .to_owned();
     Ok((
         dir_name.clone(),
@@ -227,6 +228,7 @@ pub async fn run_gc(client: &mut Client, args: &GcArgs, format: Format) -> Resul
     let wait = parse_duration("--wait", &args.wait)?;
     let workspace = match &args.workspace {
         Some(reference) => Some(definition_id(client, reference).await?),
+        // #[gamma::skip(option.none_to_some, reason = "the Server reads an empty workspace id as none (collect_workspace_garbage filters empty ids out), so `None` and `Some(\"\")` ask for the same gc")]
         None => None,
     };
     let response = client
@@ -312,6 +314,7 @@ async fn list_instances(
 ) -> Result<(), ClientError> {
     let workspace = match workspace {
         Some(reference) => Some(definition_id(client, reference).await?),
+        // #[gamma::skip(option.none_to_some, reason = "the Server reads an empty workspace id as none (list_workspace_instances filters empty ids out), so `None` and `Some(\"\")` list the same Instances")]
         None => None,
     };
     let instances = client
@@ -394,17 +397,18 @@ pub async fn run_delete(
     // Who holds Instances is the Server's to say; the completions name them.
     let instances = client
         .list_workspace_instances(ListWorkspaceInstancesRequest {
+            // #[gamma::skip(option.none_to_some, reason = "the Server reads an empty worker id as none (list_workspace_instances filters empty ids out), so `None` and `Some(\"\")` list the same Instances")]
             worker_id: None,
             workspace_definition_id: Some(WorkspaceDefinitionId::new(args.workspace_definition_id)),
         })
         .await
         .unwrap_or_default();
-    let mut targeted: Vec<String> = instances
+    // The Server's Instance cache is keyed (worker, definition), so filtered
+    // to one definition it names each Worker once, in order.
+    let targeted: Vec<String> = instances
         .iter()
         .filter_map(|report| report.worker_id.as_ref().map(ToString::to_string))
         .collect();
-    targeted.sort();
-    targeted.dedup();
     let expected = Expected {
         request_id: response.purge_request_id,
         targeted,
@@ -588,33 +592,36 @@ async fn await_answers(
         println!("{DRY_RUN_HEADING}");
     }
     let mut answers = Answers::default();
-    if !expected.targeted.is_empty() {
-        let mut stream = client
-            .follow(
-                &SyncOptions::new(horde_proto::WORKSPACE_HOUSEKEEPING_STREAM)
-                    .from_sequence(sequence)
-                    .following(true),
-            )
-            .await?;
-        let deadline = tokio::time::Instant::now() + wait;
-        while expected
-            .targeted
-            .iter()
-            .any(|worker| !answers.completed.contains(worker))
+    // The answers are read from the request's own position: every one of
+    // them lands after it, and `fold` keeps only this request's events. The
+    // request's log is never empty (the request itself is on it), so the
+    // stream opens whether or not anyone was targeted.
+    let mut stream = client
+        .follow(
+            &SyncOptions::new(horde_proto::WORKSPACE_HOUSEKEEPING_STREAM)
+                // #[gamma::skip(expr.increment, reason = "the event at `sequence` is the request itself, which `fold` ignores, and every answer lands after it, so starting one later reads the same answers")]
+                // #[gamma::skip(expr.decrement, reason = "the event before `sequence` predates the request and `fold` matches only this request's id, so starting one earlier reads the same answers")]
+                .from_sequence(sequence),
+        )
+        .await?;
+    let deadline = tokio::time::Instant::now() + wait;
+    while expected
+        .targeted
+        .iter()
+        .any(|worker| !answers.completed.contains(worker))
+    {
+        let next = tokio::time::timeout_at(deadline, stream.next_update()).await;
+        let Ok(update) = next else {
+            break;
+        };
+        let Some(update) = update? else {
+            break;
+        };
+        if let StreamUpdate::Event(envelope) = update
+            && let Some(kind) = envelope.event.and_then(|event| event.kind)
+            && let Some(rows) = answers.fold(&expected.request_id, &kind, format)
         {
-            let next = tokio::time::timeout_at(deadline, stream.next_update()).await;
-            let Ok(update) = next else {
-                break;
-            };
-            let Some(update) = update? else {
-                break;
-            };
-            if let StreamUpdate::Event(envelope) = update
-                && let Some(kind) = envelope.event.and_then(|event| event.kind)
-                && let Some(rows) = answers.fold(&expected.request_id, &kind, format)
-            {
-                println!("{rows}");
-            }
+            println!("{rows}");
         }
     }
     println!("{}", summary(expected, &answers, dry_run, format));
@@ -952,13 +959,16 @@ pub fn instance_lines(report: &WorkspaceInstanceReport) -> String {
 #[must_use]
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let [mut name, larger @ ..] = UNITS;
     let mut value = bytes;
-    let mut unit = 0;
-    while value >= 1024 && unit + 1 < UNITS.len() {
+    for unit in larger {
+        if value < 1024 {
+            break;
+        }
         value /= 1024;
-        unit += 1;
+        name = unit;
     }
-    format!("{value} {}", UNITS[unit])
+    format!("{value} {name}")
 }
 
 #[must_use]
@@ -1394,6 +1404,171 @@ mod tests {
         ] {
             assert_eq!(resolution_name(resolution.into()), name);
         }
+    }
+
+    /// Every unit up to TiB, each entered at exactly 1024 of the one below.
+    #[test]
+    fn bytes_take_the_largest_unit_that_keeps_a_whole_number() {
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1 KiB");
+        assert_eq!(human_bytes((1 << 20) - 1), "1023 KiB");
+        assert_eq!(human_bytes(1 << 20), "1 MiB");
+        assert_eq!(human_bytes(1 << 30), "1 GiB");
+        assert_eq!(human_bytes(1 << 40), "1 TiB");
+        assert_eq!(human_bytes(1 << 50), "1024 TiB");
+    }
+
+    /// The verdict's message, exactly: kinds joined by "; ", workers by ", ".
+    #[test]
+    fn a_verdict_message_joins_its_parts() {
+        let mut refused = Answers::default();
+        refused.fold("gc-1", &cleanup("gc-1", Outcome::Refused), Format::Human);
+        let mut errored = refused.clone();
+        errored.errors.push("w1: no workspace support".to_owned());
+        assert_eq!(
+            errored
+                .verdict(&expected(&[]))
+                .expect_err("refused")
+                .to_string(),
+            ClientError::CleanupRefused("1 action(s) refused; w1: no workspace support".to_owned())
+                .to_string()
+        );
+        let incomplete = Expected {
+            offline: vec!["w3".to_owned(), "w4".to_owned()],
+            unsupported: vec!["w5".to_owned(), "w6".to_owned()],
+            ..expected(&["w1", "w2"])
+        };
+        assert_eq!(
+            Answers::default()
+                .verdict(&incomplete)
+                .expect_err("pending")
+                .to_string(),
+            ClientError::CleanupPending(
+                "no answer yet from w1, w2; offline (they act on reconnect): w3, w4; \
+                 cannot clean up (an older worker): w5, w6"
+                    .to_owned()
+            )
+            .to_string()
+        );
+    }
+
+    /// A Worker-wide action (no repo) shows `-` for the repo; each action is
+    /// its own line.
+    #[test]
+    fn each_repo_action_is_its_own_row() {
+        let event = WorkspaceCleanup {
+            worker_id: Some(WorkerId::new("w1")),
+            tier: CleanupTier::Unpin.into(),
+            repos: vec![
+                RepoAction {
+                    outcome: Outcome::Done.into(),
+                    ..RepoAction::default()
+                },
+                RepoAction {
+                    repo_name: "atlas".to_owned(),
+                    outcome: Outcome::Skipped.into(),
+                    ..RepoAction::default()
+                },
+            ],
+            ..WorkspaceCleanup::default()
+        };
+        assert_eq!(
+            cleanup_rows(&event, Format::Human),
+            "w1  -  -  unpin done  0 B\nw1  -  atlas  unpin skipped  0 B"
+        );
+    }
+
+    /// A gc request is a Worker's line when it names that Worker first.
+    #[test]
+    fn a_gc_request_is_filtered_by_its_first_worker() {
+        let requested = Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested {
+            request_id: "gc-9".to_owned(),
+            worker_ids: vec![WorkerId::new("w1"), WorkerId::new("w2")],
+            ..horde_proto::v1::WorkspaceGcRequested::default()
+        });
+        assert!(log_line(&requested, None, Some("w1"), Format::Human).is_some());
+        assert!(log_line(&requested, None, Some("w2"), Format::Human).is_none());
+    }
+
+    /// Instances are blocks of lines, one per checkout; a checkout is marked
+    /// reclaimed or retained only when it is.
+    #[test]
+    fn each_instance_and_checkout_is_its_own_line() {
+        let checkout = |agent: &str| horde_proto::v1::CheckoutReport {
+            agent_id: Some(horde_proto::v1::AgentId::new(agent)),
+            repos: vec!["atlas".to_owned()],
+            branch: format!("horde/{agent}"),
+            state: horde_proto::v1::CheckoutState::Active.into(),
+            ..horde_proto::v1::CheckoutReport::default()
+        };
+        let report = |worker: &str, checkouts| WorkspaceInstanceReport {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new("ws-1")),
+            worker_id: Some(WorkerId::new(worker)),
+            state: horde_proto::v1::WorkspaceInstanceState::Ready.into(),
+            checkouts,
+            ..WorkspaceInstanceReport::default()
+        };
+        let reclaimed = horde_proto::v1::CheckoutReport {
+            soft_reclaimed_at: Some(horde_proto::prost_types::Timestamp::default()),
+            ..checkout("agent-2")
+        };
+        let rendered = render_instances(
+            &[
+                report("w1", vec![checkout("agent-1"), reclaimed]),
+                report("w2", Vec::new()),
+            ],
+            Format::Human,
+        );
+        assert_eq!(
+            rendered.lines().collect::<Vec<_>>(),
+            [
+                "ws-1 on w1: ready  0 B (0 B free of 0 B)",
+                "  agent-1  active  horde/agent-1  [atlas]  0 B",
+                "  agent-2  active  horde/agent-2  [atlas]  0 B  reclaimed",
+                "ws-1 on w2: ready  0 B (0 B free of 0 B)",
+            ]
+        );
+    }
+
+    /// The event renderer's JSON detail for the workspace kinds is their
+    /// structured form, not the generic fallback.
+    #[test]
+    fn the_workspace_kinds_render_their_structured_detail() {
+        let envelope = |kind| horde_proto::v1::EventEnvelope {
+            sequence: 7,
+            event: Some(horde_proto::v1::Event {
+                kind: Some(kind),
+                ..horde_proto::v1::Event::default()
+            }),
+            ..horde_proto::v1::EventEnvelope::default()
+        };
+        let detail = |kind| {
+            let line: serde_json::Value =
+                serde_json::from_str(&crate::render::event(&envelope(kind), Format::Json))
+                    .expect("json");
+            line["detail"].clone()
+        };
+        let prepared = detail(Kind::CheckoutPrepared(horde_proto::v1::CheckoutPrepared {
+            mode: horde_proto::v1::CheckoutMode::Lazy.into(),
+            available_repos: vec!["atlas".to_owned()],
+            ..horde_proto::v1::CheckoutPrepared::default()
+        }));
+        assert_eq!(prepared["mode"], "lazy", "{prepared}");
+        assert_eq!(prepared["available_repos"][0], "atlas", "{prepared}");
+        let Kind::WorkspaceCleanup(event) = cleanup("gc-1", Outcome::Refused) else {
+            panic!("a cleanup");
+        };
+        let cleanup = detail(Kind::WorkspaceCleanup(event));
+        assert_eq!(cleanup["type"], "cleanup", "{cleanup}");
+        assert_eq!(cleanup["repos"][0]["outcome"], "refused", "{cleanup}");
+    }
+
+    /// A `--repo` names no reclaim policy; `--reclaim` sets one.
+    #[test]
+    fn a_repo_flag_sets_no_reclaim_policy() {
+        let repo =
+            crate::cli::repo_from("atlas=https://example.invalid/atlas.git").expect("parses");
+        assert_eq!(repo.reclaim, None);
     }
 
     #[test]
