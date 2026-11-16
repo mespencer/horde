@@ -278,6 +278,37 @@ mod tests {
         assert_eq!(capabilities.reachable_remotes, declared.reachable_remotes);
     }
 
+    /// A Worker with workspaces advertises the protocol and its disk, read
+    /// off its first Instance; one without advertises neither.
+    #[test]
+    fn workspace_support_advertises_the_protocol_and_the_first_instances_disk() {
+        let instance = |free, total| horde_proto::v1::WorkspaceInstanceReport {
+            filesystem_free_bytes: free,
+            filesystem_total_bytes: total,
+            ..horde_proto::v1::WorkspaceInstanceReport::default()
+        };
+        let warm = advertise(
+            [],
+            Some(vec![instance(10, 100), instance(20, 200)]),
+            &DeclaredFacts::default(),
+        );
+        assert!(warm.supports_workspaces);
+        assert_eq!(warm.workspace_protocol, super::WORKSPACE_PROTOCOL);
+        assert_eq!(
+            (warm.workspace_free_bytes, warm.workspace_total_bytes),
+            (10, 100)
+        );
+        let cold = advertise([], Some(Vec::new()), &DeclaredFacts::default());
+        assert_eq!(
+            cold.workspace_protocol,
+            super::WORKSPACE_PROTOCOL,
+            "none yet"
+        );
+        let none = advertise([], None, &DeclaredFacts::default());
+        assert!(!none.supports_workspaces);
+        assert_eq!(none.workspace_protocol, 0);
+    }
+
     /// The advertised platform is this machine's, through the vocabulary
     /// mapping — a defaulted (empty) platform would have the scheduler
     /// matching placement constraints against a machine that runs nothing.

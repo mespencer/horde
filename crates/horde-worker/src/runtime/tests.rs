@@ -2417,3 +2417,464 @@ async fn spawned_in_workspace() -> (tempfile::TempDir, std::path::PathBuf, Runti
     settle(&runtime).await;
     (temp, root, runtime)
 }
+
+// ADR-0014 housekeeping and workspace access at the Runtime's own seams:
+// the checkout lock, the activity table, the remembered policies, the
+// endpoint's workspace verbs and the revival's re-registration.
+
+/// A day's grace, nothing else set.
+fn graceful_policy() -> horde_proto::v1::ResolvedWorkspacePolicy {
+    horde_proto::v1::ResolvedWorkspacePolicy {
+        archived_grace: Some(horde_proto::prost_types::Duration {
+            seconds: 86_400,
+            nanos: 0,
+        }),
+        ..horde_proto::v1::ResolvedWorkspacePolicy::default()
+    }
+}
+
+/// A worktree spec in `workspace` whose first turn says hello.
+fn worktree_spec(workspace: &str) -> horde_proto::v1::AgentSpec {
+    horde_proto::v1::AgentSpec {
+        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(workspace)),
+        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
+        ..first_turn("hello")
+    }
+}
+
+/// A materialize of `ws-1` cloning each `(name, origin)`.
+fn materialize_repos(sequence: u64, repos: &[(&str, &std::path::Path)]) -> StreamCommandsResponse {
+    let mut command = materialize_command(sequence, std::path::Path::new("/unused"));
+    if let Some(Command::MaterializeWorkspace(materialize)) = &mut command.command
+        && let Some(definition) = materialize.definition.as_mut()
+    {
+        definition.repos = repos
+            .iter()
+            .map(|(name, origin)| horde_proto::v1::WorkspaceRepo {
+                name: (*name).to_owned(),
+                remote_url: origin.display().to_string(),
+                default_branch: "main".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
+            })
+            .collect();
+    }
+    command
+}
+
+/// A spawn whose harness never starts gives its checkout back at once,
+/// whatever the grace its spawn carried — and that grace is what the
+/// Runtime remembers for the workspace.
+#[tokio::test]
+async fn an_abandoned_spawn_is_removed_at_once_whatever_the_grace() {
+    let (_temp, workspaces_root, mut runtime) = materialized_runtime(Script::echoing()).await;
+    let command = bound_to_codex(spawn_of(
+        2,
+        "agent-1",
+        worktree_spec("ws-1"),
+        Some(graceful_policy()),
+    ));
+    runtime.apply(command).await.expect("the command applies");
+    settle(&runtime).await;
+    assert_eq!(
+        runtime.shared.policy_for("ws-1").archived_grace,
+        core::time::Duration::from_secs(86_400),
+        "the spawn's policy is remembered"
+    );
+    assert!(
+        !workspaces_root.join("ws-1/.horde-agents/agent-1").exists(),
+        "nothing ran there, so the grace does not apply"
+    );
+    runtime.shutdown().await;
+}
+
+/// An archive forgets the agent's activity: nothing about it is left to
+/// keep a later scan or gc away from its checkout.
+#[tokio::test]
+async fn archiving_forgets_the_agents_activity() {
+    let (_temp, workspaces_root, mut first) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    first
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&first).await;
+    let journal = first.shared.journal.clone();
+    first.shutdown().await;
+
+    // A restarted Worker: no pump will ever touch this agent's activity.
+    let mut second = Runtime::new(journal)
+        .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())))
+        .with_workspaces(crate::workspace::WorkspaceManager::new(
+            "worker-a",
+            workspaces_root,
+        ));
+    second.activity().set_busy("agent-1", true);
+    second
+        .apply(archive_command(3, "s1:3", "agent-1"))
+        .await
+        .expect("the archive applies");
+    settle(&second).await;
+    assert!(!second.activity().is_busy("agent-1"), "forgotten");
+    assert!(second.shared.activity.snapshot("agent-1").is_none());
+    second.shutdown().await;
+}
+
+/// A scan skips a checkout whose lock is held, and skipping is no change.
+#[tokio::test]
+async fn a_scan_passes_over_a_locked_checkout_as_no_change() {
+    let (_temp, _root, runtime) = spawned_in_workspace().await;
+    let lock = runtime.shared.checkout_locks.of("agent-1");
+    let held = lock.lock().await;
+    assert!(!runtime.scan_workspaces().await);
+    drop(held);
+    runtime.shutdown().await;
+}
+
+/// A Runtime without workspaces has nothing to scan.
+#[tokio::test]
+async fn a_scan_without_workspaces_changes_nothing() {
+    let runtime = runtime_with(Script::echoing());
+    assert!(!runtime.scan_workspaces().await);
+}
+
+/// A turn in flight is what the activity table calls busy.
+#[tokio::test]
+async fn an_agent_mid_turn_is_busy() {
+    let (runtime, _) = blocked_agent().await;
+    assert!(runtime.activity().is_busy("agent-1"));
+    runtime.shutdown().await;
+}
+
+/// A gc naming a workspace carries its policy, and the Runtime remembers
+/// it for that workspace's later triggers.
+#[tokio::test]
+async fn a_gc_remembers_the_policy_it_carries() {
+    let (_temp, _root, mut runtime) = materialized_runtime(Script::echoing()).await;
+    runtime
+        .apply(StreamCommandsResponse {
+            command_sequence: 2,
+            command_id: "s1:2".to_owned(),
+            log_position: 0,
+            command: Some(Command::WorkspaceGc(horde_proto::v1::WorkspaceGcCommand {
+                request_id: "gc-1".to_owned(),
+                workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+                level: horde_proto::v1::GcLevel::Soft.into(),
+                policy: Some(graceful_policy()),
+                ..horde_proto::v1::WorkspaceGcCommand::default()
+            })),
+        })
+        .await
+        .expect("the gc applies");
+    settle(&runtime).await;
+    assert_eq!(
+        runtime.shared.policy_for("ws-1").archived_grace,
+        core::time::Duration::from_secs(86_400)
+    );
+    runtime.shutdown().await;
+}
+
+/// A gc runs on its workspace's lane, behind that workspace's
+/// materializations; one for every workspace gets the unnamed one.
+#[test]
+fn a_gc_runs_on_its_workspaces_lane() {
+    let gc = |definition: Option<&str>| StreamCommandsResponse {
+        command_sequence: 1,
+        command_id: "gc".to_owned(),
+        log_position: 0,
+        command: Some(Command::WorkspaceGc(horde_proto::v1::WorkspaceGcCommand {
+            workspace_definition_id: definition.map(horde_proto::v1::WorkspaceDefinitionId::new),
+            ..horde_proto::v1::WorkspaceGcCommand::default()
+        })),
+    };
+    assert_eq!(super::lane::lane_key(&gc(Some("ws-1"))), "workspace:ws-1");
+    assert_eq!(super::lane::lane_key(&gc(None)), "workspace:");
+}
+
+/// A materialization's progress is the workspace's, not any agent's; a
+/// spawn's checkout is journaled against its agent.
+#[tokio::test]
+async fn progress_names_no_agent_and_a_checkout_names_its_own() {
+    let (_temp, _root, runtime) = spawned_in_workspace().await;
+    let events = journal_satisfying(&runtime, "the spawn's checkout", |events| {
+        events.iter().any(|journaled| {
+            matches!(
+                journaled
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.kind.as_ref()),
+                Some(Kind::CheckoutPrepared(_))
+            )
+        })
+    })
+    .await;
+    let mut progress = 0;
+    for event in events
+        .iter()
+        .filter_map(|journaled| journaled.event.as_ref())
+    {
+        match event.kind.as_ref() {
+            Some(Kind::WorkspaceInstanceChanged(changed)) if changed.progress.is_some() => {
+                progress += 1;
+                assert_eq!(event.agent_id, None, "{event:?}");
+            }
+            Some(Kind::CheckoutPrepared(_)) => assert_eq!(
+                event.agent_id.as_ref().map(ToString::to_string).as_deref(),
+                Some("agent-1")
+            ),
+            _ => {}
+        }
+    }
+    assert!(progress > 0, "the materialize journaled its progress");
+    runtime.shutdown().await;
+}
+
+/// The agent's own MCP endpoint answers `workspace_checkout` from the
+/// Runtime's workspaces: the repo it already has comes back reused.
+#[tokio::test]
+async fn the_agents_endpoint_checks_out_through_the_runtimes_workspaces() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let origin = tiny_origin(temp.path());
+    let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let mut runtime = runtime_with(Script::of(vec![
+        ScriptedTurn::saying("checking out").with_step(Step::UseHordeTool {
+            tool_call_id: "call-c".to_owned(),
+            tool_name: "workspace_checkout".to_owned(),
+            input: json!({ "repo": "atlas" }),
+        }),
+    ]))
+    .with_workspaces(crate::workspace::WorkspaceManager::new(
+        "worker-a",
+        temp.path().join("workspaces"),
+    ))
+    .with_agent_endpoints(channel, "w-test");
+    runtime
+        .apply(materialize_command(1, &origin))
+        .await
+        .expect("the materialize applies");
+    settle(&runtime).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    journal_satisfying(&runtime, "the checkout's answer", |events| {
+        any_kind(
+            events,
+            |kind| matches!(kind, Kind::AgentOutputChunk(chunk) if chunk.text.contains("reused")),
+        )
+    })
+    .await;
+    runtime.shutdown().await;
+}
+
+/// An agent working in the shared Instance itself cannot check repos out,
+/// and is told why.
+#[tokio::test]
+async fn a_shared_policy_agent_is_told_it_cannot_check_out() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let (_temp, _root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    let spec = horde_proto::v1::AgentSpec {
+        checkout_policy: horde_proto::v1::CheckoutPolicy::Shared as i32,
+        ..worktree_spec("ws-1")
+    };
+    runtime
+        .apply(spawn_of(2, "agent-1", spec, None))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    };
+    let refused = access
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect_err("a shared agent has no private checkout");
+    assert!(
+        refused.contains("works in the shared instance itself"),
+        "{refused}"
+    );
+    runtime.shutdown().await;
+}
+
+/// A lazily checked-out repo joins the agent's live checkout: its HEAD is
+/// a parent base from then on.
+#[tokio::test]
+async fn a_lazy_checkout_joins_the_agents_bases() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let (_temp, _root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    let spec = horde_proto::v1::AgentSpec {
+        checkout_mode: horde_proto::v1::CheckoutMode::Lazy as i32,
+        ..worktree_spec("ws-1")
+    };
+    runtime
+        .apply(spawn_of(2, "agent-1", spec, None))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    };
+    assert!(
+        access
+            .parent_bases("agent-1")
+            .await
+            .expect("bases")
+            .is_empty(),
+        "nothing checked out yet"
+    );
+    access
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect("the lazy checkout");
+    let bases = access.parent_bases("agent-1").await.expect("bases");
+    assert_eq!(
+        bases
+            .iter()
+            .map(|base| base.repo_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["atlas"]
+    );
+    runtime.shutdown().await;
+}
+
+/// A repo whose HEAD cannot be observed contributes no base; the repos
+/// after it still do.
+#[tokio::test]
+async fn an_unobservable_repo_does_not_cost_the_others_their_bases() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let first = tiny_origin(&temp.path().join("a"));
+    let second = tiny_origin(&temp.path().join("b"));
+    let root = temp.path().join("workspaces");
+    let mut runtime = runtime_with(Script::of(vec![ScriptedTurn::saying("hi")])).with_workspaces(
+        crate::workspace::WorkspaceManager::new("worker-a", root.clone()),
+    );
+    runtime
+        .apply(materialize_repos(1, &[("a", &first), ("b", &second)]))
+        .await
+        .expect("the materialize applies");
+    settle(&runtime).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    std::fs::remove_dir_all(root.join("ws-1/.horde-agents/agent-1/a")).expect("breaks a");
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    };
+    let bases = access.parent_bases("agent-1").await.expect("bases");
+    assert_eq!(
+        bases
+            .iter()
+            .map(|base| base.repo_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b"]
+    );
+    runtime.shutdown().await;
+}
+
+/// With a Relay, a parent base is staged there, so a child elsewhere can
+/// obtain it.
+#[tokio::test]
+async fn a_parent_base_is_staged_on_the_relay() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let origin = tiny_origin(temp.path());
+    let relay = temp.path().join("relay");
+    std::fs::create_dir_all(&relay).expect("the relay dir");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q", "--bare", "atlas"])
+        .current_dir(&relay)
+        .status()
+        .expect("git runs");
+    assert!(status.success());
+    let mut runtime = runtime_with(Script::of(vec![ScriptedTurn::saying("hi")]))
+        .with_workspaces(crate::workspace::WorkspaceManager::new(
+            "worker-a",
+            temp.path().join("workspaces"),
+        ))
+        .with_relay(horde_relay::RelayLocation::new(
+            &relay.display().to_string(),
+        ));
+    runtime
+        .apply(materialize_command(1, &origin))
+        .await
+        .expect("the materialize applies");
+    settle(&runtime).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    };
+    let bases = access.parent_bases("agent-1").await.expect("staged");
+    let shared = std::process::Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/horde/share"])
+        .current_dir(relay.join("atlas"))
+        .output()
+        .expect("git runs");
+    assert!(
+        String::from_utf8_lossy(&shared.stdout).contains(&bases[0].r#ref),
+        "the base's commit is on the Relay"
+    );
+    runtime.shutdown().await;
+}
+
+/// A revived workspace agent journals its checkout again and is registered
+/// with it: the workspace verbs find it live.
+#[tokio::test]
+async fn a_revived_workspace_agent_is_registered_with_its_checkout() {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+
+    let (_temp, workspaces_root, first) = spawned_in_workspace().await;
+    let journal = first.shared.journal.clone();
+    first.shutdown().await;
+    let prepared = |events: &[horde_proto::v1::JournaledEvent]| {
+        events
+            .iter()
+            .filter(|journaled| {
+                matches!(
+                    journaled
+                        .event
+                        .as_ref()
+                        .and_then(|event| event.kind.as_ref()),
+                    Some(Kind::CheckoutPrepared(_))
+                )
+            })
+            .count()
+    };
+    let before = prepared(&journal.read_from(1, 1_000).await.expect("readable"));
+
+    let mut second = Runtime::new(journal.clone())
+        .with_adapter(Arc::new(FakeAdapter::new(Script::echoing())))
+        .with_workspaces(crate::workspace::WorkspaceManager::new(
+            "worker-a",
+            workspaces_root,
+        ));
+    second
+        .apply(note_command(3, "still there?"))
+        .await
+        .expect("the delivery applies by reviving");
+    settle(&second).await;
+    assert_eq!(second.running_agents(), 1, "revived");
+    journal_satisfying(&second, "the revival's checkout", |events| {
+        prepared(events) > before
+    })
+    .await;
+    let access = super::access::WorkerWorkspaceAccess {
+        shared: second.shared.clone(),
+    };
+    access
+        .checkout("agent-1", "atlas", None)
+        .await
+        .expect("the revived agent's checkout is live");
+    second.shutdown().await;
+}

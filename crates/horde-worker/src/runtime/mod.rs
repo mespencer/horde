@@ -121,11 +121,9 @@ impl Runtime {
     }
 
     /// Wires what needs the whole Runtime built: the endpoint's workspace
-    /// verbs and the scan loop. Idempotent; run before the first command.
+    /// verbs and the scan loop. Run once, by the first replay that reads
+    /// the inbox, before any command is dispatched.
     fn finalize(&mut self) {
-        if self.scan.is_some() {
-            return;
-        }
         let Some(housekeeper) = housekeeping::of(&self.shared) else {
             return;
         };
@@ -148,9 +146,10 @@ impl Runtime {
         let Some(housekeeper) = housekeeping::of(&self.shared) else {
             return false;
         };
-        let mut episode = self.episode.lock().await;
-        let changed = housekeeper.scan(&self.housekeeping, &mut episode).await;
-        drop(episode);
+        let changed = {
+            let mut episode = self.episode.lock().await;
+            housekeeper.scan(&self.housekeeping, &mut episode).await
+        };
         housekeeper.report().await;
         changed
     }
@@ -277,9 +276,9 @@ impl Runtime {
         if self.replayed {
             return Ok(0);
         }
-        self.finalize();
         let entries = self.shared.journal.replay_inbox().await?;
         self.replayed = true;
+        self.finalize();
         let replayed = entries.len();
         for entry in entries {
             self.dispatch(entry.lane, entry.command);

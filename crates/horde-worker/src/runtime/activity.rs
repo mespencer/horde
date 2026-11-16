@@ -40,9 +40,8 @@ impl Activity {
     pub fn set_busy(&self, agent_id: &str, busy: bool) {
         let mut agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = agents.entry(agent_id.to_owned()).or_default();
-        if busy && !entry.busy {
-            entry.idle_reclaimed = false;
-        }
+        let turn_starting = busy && !entry.busy;
+        entry.idle_reclaimed &= !turn_starting;
         if busy || entry.busy {
             entry.last_active_ms = now_ms();
         }
@@ -76,30 +75,35 @@ impl Activity {
             .copied()
     }
 
+    /// Marks the agent soft-reclaimed for idleness. An agent never seen
+    /// before (a revival's checkout, a restarted Worker's) is remembered
+    /// from here on as idle, between turns.
     pub(super) fn mark_idle_reclaimed(&self, agent_id: &str) {
-        if let Some(agent) = self
-            .agents
+        self.agents
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(agent_id)
-        {
-            agent.idle_reclaimed = true;
-        }
+            .entry(agent_id.to_owned())
+            .or_default()
+            .idle_reclaimed = true;
     }
 
-    /// Whether the agent's activity should be written through now (at most
-    /// once a minute), marking it written.
-    pub(super) fn due_for_write(&self, agent_id: &str) -> Option<i64> {
+    /// Whether the agent's activity should be written through at `now_ms`
+    /// (at most once a minute), marking it written.
+    pub(super) fn due_for_write(&self, agent_id: &str, now_ms: i64) -> Option<i64> {
         let mut agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
         let agent = agents.get_mut(agent_id)?;
         let due = agent.last_active_ms > agent.written_ms
-            && now_ms().saturating_sub(agent.written_ms) >= 60_000;
+            && now_ms.saturating_sub(agent.written_ms) >= WRITE_THROUGH_EVERY_MS;
         due.then(|| {
-            agent.written_ms = now_ms();
+            agent.written_ms = now_ms;
             agent.last_active_ms
         })
     }
 }
+
+/// How often, at most, an agent's activity is written through to its
+/// ledger record.
+const WRITE_THROUGH_EVERY_MS: i64 = 60_000;
 
 /// Per-agent checkout locks: one async mutex per agent id.
 #[derive(Debug, Default)]
@@ -132,8 +136,12 @@ mod tests {
         assert!(!seen.busy && seen.idle_reclaimed && seen.last_active_ms > 0);
         activity.set_busy("a", true);
         assert!(!activity.snapshot("a").expect("seen").idle_reclaimed);
-        assert!(activity.due_for_write("a").is_some());
-        assert_eq!(activity.due_for_write("a"), None, "at most once a minute");
+        assert!(activity.due_for_write("a", now_ms()).is_some());
+        assert_eq!(
+            activity.due_for_write("a", now_ms()),
+            None,
+            "at most once a minute"
+        );
         activity.forget("a");
         assert!(activity.snapshot("a").is_none());
     }
@@ -156,21 +164,73 @@ mod tests {
         let activity = Activity::default();
         activity.set_busy("idle", false);
         assert_eq!(
-            activity.due_for_write("idle"),
+            activity.due_for_write("idle", now_ms()),
             None,
             "never active: nothing newer than the last write"
         );
 
         activity.set_busy("a", true);
-        assert!(activity.due_for_write("a").is_some());
+        assert!(activity.due_for_write("a", now_ms()).is_some());
         std::thread::sleep(std::time::Duration::from_millis(5));
         activity.set_busy("a", false);
         activity.set_busy("a", true);
         assert_eq!(
-            activity.due_for_write("a"),
+            activity.due_for_write("a", now_ms()),
             None,
             "newer activity, but inside the minute"
         );
+    }
+
+    /// The minute is reached, not exceeded: a write 59 999 ms after the last
+    /// one is too soon, one 60 000 ms after it is due.
+    #[test]
+    fn activity_is_written_through_exactly_a_minute_after_the_last_write() {
+        let activity = Activity::default();
+        activity.set_busy("a", true);
+        // Activity is dated by the wall clock, long after these instants.
+        assert!(activity.due_for_write("a", 100_000).is_some());
+        assert_eq!(
+            activity.due_for_write("a", 159_999),
+            None,
+            "a millisecond early"
+        );
+        assert!(
+            activity.due_for_write("a", 160_000).is_some(),
+            "a minute on"
+        );
+        assert_eq!(
+            activity.due_for_write("a", 160_000),
+            None,
+            "and marked written at that instant"
+        );
+    }
+
+    /// An agent first seen already idle is remembered as reclaimed, and as
+    /// between turns.
+    #[test]
+    fn marking_an_unseen_agent_idle_remembers_it() {
+        let activity = Activity::default();
+        activity.mark_idle_reclaimed("new");
+        let seen = activity.snapshot("new").expect("remembered");
+        assert!(seen.idle_reclaimed && !seen.busy);
+        assert_eq!(seen.last_active_ms, 0, "no activity was ever seen");
+    }
+
+    /// A turn starting clears the idle flag, whatever it was; one already
+    /// running keeps it as it is.
+    #[test]
+    fn only_a_starting_turn_clears_a_set_idle_flag() {
+        let activity = Activity::default();
+        activity.set_busy("a", true);
+        activity.mark_idle_reclaimed("a");
+        activity.set_busy("a", true);
+        assert!(
+            activity.snapshot("a").expect("seen").idle_reclaimed,
+            "the turn was already running"
+        );
+        activity.set_busy("a", false);
+        activity.set_busy("a", true);
+        assert!(!activity.snapshot("a").expect("seen").idle_reclaimed);
     }
 
     #[tokio::test]

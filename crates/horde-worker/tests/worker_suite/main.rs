@@ -30,6 +30,9 @@ mod daemon;
 mod forwards;
 // Gated like `forwards`, for the same free-helper reason.
 #[cfg(test)]
+mod housekeeping_edges;
+// Gated like `forwards`, for the same free-helper reason.
+#[cfg(test)]
 mod hub_link;
 // Gated like `forwards`, for the same free-helper reason.
 #[cfg(test)]

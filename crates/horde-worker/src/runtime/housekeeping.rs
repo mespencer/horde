@@ -117,7 +117,8 @@ pub(super) enum Standing {
     Live,
     /// Remembered (revivable) but not running: nothing removes it.
     Remembered,
-    Archived,
+    /// Archived at this instant (ms since the epoch).
+    Archived(i64),
     /// Neither running, remembered nor archived: left by a reset.
     Orphan,
 }
@@ -174,8 +175,8 @@ impl Housekeeper {
         if self.shared.broker.checkout_of(&record.agent_id).is_some() {
             return Standing::Live;
         }
-        if record.archived_at_ms.is_some() {
-            return Standing::Archived;
+        if let Some(archived_at) = record.archived_at_ms {
+            return Standing::Archived(archived_at);
         }
         match self.shared.journal.revivable_agent(&record.agent_id).await {
             Ok(Some(_)) => Standing::Remembered,
@@ -444,7 +445,10 @@ impl Housekeeper {
         let policy = self.policy(definition_id);
         match self.standing(record).await {
             Standing::Live => self.scan_live(definition_id, record, &policy).await,
-            Standing::Archived => self.scan_archived(definition_id, record, &policy).await,
+            Standing::Archived(archived_at) => {
+                self.scan_archived(definition_id, record, archived_at, &policy)
+                    .await
+            }
             Standing::Orphan if !record.orphan_reported => {
                 self.soft(definition_id, record, CleanupTrigger::Scan).await;
                 true
@@ -462,7 +466,7 @@ impl Housekeeper {
         policy: &WorkspacePolicy,
     ) -> bool {
         let activity = &self.shared.activity;
-        if let Some(at) = activity.due_for_write(&record.agent_id) {
+        if let Some(at) = activity.due_for_write(&record.agent_id, now_ms()) {
             crate::workspace::cleanup::note_activity(
                 &self.workspaces,
                 definition_id,
@@ -482,17 +486,12 @@ impl Housekeeper {
             .map(|seen| seen.last_active_ms)
             .unwrap_or(record.last_active_at_ms)
             .max(record.last_active_at_ms);
-        let idle_for = now_ms().saturating_sub(last_active);
-        if u128::try_from(idle_for).unwrap_or(0) < after.as_millis() {
+        if !idle_reached(last_active, now_ms(), after) {
             return false;
         }
+        // Seen for the first time already idle (a revival's checkout, a
+        // restarted Worker), the flag is remembered from here on too.
         activity.mark_idle_reclaimed(&record.agent_id);
-        if seen.is_none() {
-            // Seen for the first time already idle (a revival's checkout,
-            // a restarted Worker): remember the flag from here on.
-            activity.set_busy(&record.agent_id, false);
-            activity.mark_idle_reclaimed(&record.agent_id);
-        }
         let pass = Pass {
             trigger: CleanupTrigger::Idle,
             gc_request_id: "",
@@ -513,13 +512,10 @@ impl Housekeeper {
         &self,
         definition_id: &str,
         record: &LedgerRecord,
+        archived_at: i64,
         policy: &WorkspacePolicy,
     ) -> bool {
-        let Some(archived_at) = record.archived_at_ms else {
-            return false;
-        };
-        let grace_ms = i64::try_from(policy.archived_grace.as_millis()).unwrap_or(i64::MAX);
-        if now_ms().saturating_sub(archived_at) < grace_ms {
+        if !grace_over(archived_at, now_ms(), policy.archived_grace) {
             return false;
         }
         let pass = Pass {
@@ -578,6 +574,8 @@ impl Housekeeper {
             let Ok(_held) = lock.try_lock() else {
                 continue;
             };
+            // Checked under the lock, not when the candidates were listed:
+            // a turn may have started since.
             if self.shared.activity.is_busy(&record.agent_id) {
                 continue;
             }
@@ -632,32 +630,40 @@ impl Housekeeper {
     }
 
     /// The checkouts disk pressure may soft-reclaim, oldest first: archived
-    /// by archive time, then orphans, then idle live agents by last
-    /// activity. Busy agents and checkouts already reclaimed since their
-    /// last activity are not candidates.
-    pub(super) async fn pressure_candidates(&self) -> Vec<(String, LedgerRecord)> {
+    /// by archive time, then orphans, then live agents by last activity.
+    /// Checkouts already reclaimed since their last activity are not
+    /// candidates; a busy agent is skipped when its turn comes, under its
+    /// lock.
+    async fn pressure_candidates(&self) -> Vec<(String, LedgerRecord)> {
         let mut archived = Vec::new();
         let mut orphans = Vec::new();
-        let mut idle = Vec::new();
+        let mut live = Vec::new();
         for (definition_id, _) in self.workspaces.instances().await {
             for record in self.workspaces.records(&definition_id).await {
-                if record.soft_reclaimed_at_ms.is_some()
-                    || self.shared.activity.is_busy(&record.agent_id)
-                {
+                if record.soft_reclaimed_at_ms.is_some() {
                     continue;
                 }
                 match self.standing(&record).await {
-                    Standing::Archived => archived.push((definition_id.clone(), record)),
-                    Standing::Orphan => orphans.push((definition_id.clone(), record)),
-                    Standing::Live => idle.push((definition_id.clone(), record)),
+                    Standing::Archived(at) => archived.push((at, definition_id.clone(), record)),
+                    Standing::Orphan => {
+                        orphans.push((record.last_active_at_ms, definition_id.clone(), record));
+                    }
+                    Standing::Live => {
+                        live.push((record.last_active_at_ms, definition_id.clone(), record));
+                    }
                     Standing::Remembered => {}
                 }
             }
         }
-        archived.sort_by_key(|(_, record)| record.archived_at_ms.unwrap_or(0));
-        orphans.sort_by_key(|(_, record)| record.last_active_at_ms);
-        idle.sort_by_key(|(_, record)| record.last_active_at_ms);
-        archived.into_iter().chain(orphans).chain(idle).collect()
+        for group in [&mut archived, &mut orphans, &mut live] {
+            group.sort_by_key(|(at, _, _)| *at);
+        }
+        archived
+            .into_iter()
+            .chain(orphans)
+            .chain(live)
+            .map(|(_, definition_id, record)| (definition_id, record))
+            .collect()
     }
 
     /// Whether free space has reached `high` bytes.
@@ -688,15 +694,18 @@ impl Housekeeper {
         let mut archived = Vec::new();
         for (definition_id, _) in self.workspaces.instances().await {
             for record in self.workspaces.records(&definition_id).await {
-                if record.archived_at_ms.is_some()
+                if let Some(at) = record.archived_at_ms
                     && self.shared.broker.checkout_of(&record.agent_id).is_none()
                 {
-                    archived.push((definition_id.clone(), record));
+                    archived.push((at, definition_id.clone(), record));
                 }
             }
         }
-        archived.sort_by_key(|(_, record)| record.archived_at_ms.unwrap_or(0));
+        archived.sort_by_key(|(at, _, _)| *at);
         archived
+            .into_iter()
+            .map(|(_, definition_id, record)| (definition_id, record))
+            .collect()
     }
 
     /// Drops every pin provably safe elsewhere (lossless only).
@@ -722,13 +731,15 @@ impl Housekeeper {
                 .await
                 .into_iter()
                 .filter(|event| event.tier == i32::from(CleanupTier::Unpin))
+                // An unpin event carries the one pin it is about.
                 .filter(|event| {
-                    event.repos.iter().any(|action| {
-                        action.outcome
+                    matches!(
+                        event.repos.as_slice(),
+                        [action] if action.outcome
                             == i32::from(
                                 horde_proto::v1::workspace_cleanup::repo_action::Outcome::Done,
                             )
-                    })
+                    )
                 }),
             );
         }
@@ -791,8 +802,22 @@ fn removable_at(level: GcLevel, standing: Standing) -> bool {
     match (level, standing) {
         (GcLevel::Soft, _) | (_, Standing::Live | Standing::Remembered) => false,
         (GcLevel::Hard, _) => true,
-        (_, standing) => standing == Standing::Archived,
+        (_, standing) => matches!(standing, Standing::Archived(_)),
     }
+}
+
+/// Whether an agent last active at `last_active` (ms) is, at `now`, idle
+/// for at least `after`. Activity dated after `now` is not idle at all.
+fn idle_reached(last_active: i64, now: i64, after: Duration) -> bool {
+    let idle_for = now.saturating_sub(last_active);
+    u128::try_from(idle_for).unwrap_or(0) >= after.as_millis()
+}
+
+/// Whether a checkout archived at `archived_at` (ms) is, at `now`, at least
+/// `grace` past its archive. A grace too long for the clock saturates.
+fn grace_over(archived_at: i64, now: i64, grace: Duration) -> bool {
+    let grace_ms = i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
+    now.saturating_sub(archived_at) >= grace_ms
 }
 
 /// One disk-pressure episode's state across scans.
@@ -805,7 +830,44 @@ pub(super) struct Episode {
 
 impl Episode {
     fn end(&mut self) {
-        *self = Self::default();
+        self.active = false;
+        self.reported = false;
+    }
+}
+
+/// When the scan loop's pin pass and report are next due.
+#[derive(Debug, Clone, Copy)]
+struct Cadence {
+    last_pins: tokio::time::Instant,
+    last_report: tokio::time::Instant,
+}
+
+impl Cadence {
+    fn starting(at: tokio::time::Instant) -> Self {
+        Self {
+            last_pins: at,
+            last_report: at,
+        }
+    }
+
+    /// Whether a pin pass is due at `now`, `every` after the last; a due
+    /// pass counts as run.
+    fn pins_due(&mut self, now: tokio::time::Instant, every: Duration) -> bool {
+        let due = now.duration_since(self.last_pins) >= every;
+        if due {
+            self.last_pins = now;
+        }
+        due
+    }
+
+    /// Whether a report is due at `now`: after any change, else `every`
+    /// after the last; a due report counts as sent.
+    fn report_due(&mut self, now: tokio::time::Instant, changed: bool, every: Duration) -> bool {
+        let due = changed || now.duration_since(self.last_report) >= every;
+        if due {
+            self.last_report = now;
+        }
+        due
     }
 }
 
@@ -826,8 +888,7 @@ pub(super) async fn run(
     config: HousekeepingConfig,
     episode: Arc<tokio::sync::Mutex<Episode>>,
 ) {
-    let mut last_pins = tokio::time::Instant::now();
-    let mut last_report = tokio::time::Instant::now();
+    let mut cadence = Cadence::starting(tokio::time::Instant::now());
     let mut ticker = tokio::time::interval(config.scan_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -836,12 +897,10 @@ pub(super) async fn run(
             let mut episode = episode.lock().await;
             housekeeper.scan(&config, &mut episode).await
         };
-        if last_pins.elapsed() >= config.pin_scan_interval {
-            last_pins = tokio::time::Instant::now();
+        if cadence.pins_due(tokio::time::Instant::now(), config.pin_scan_interval) {
             changed |= housekeeper.unpin_pass().await;
         }
-        if changed || last_report.elapsed() >= config.report_interval {
-            last_report = tokio::time::Instant::now();
+        if cadence.report_due(tokio::time::Instant::now(), changed, config.report_interval) {
             housekeeper.report().await;
         }
     }
@@ -872,6 +931,86 @@ mod tests {
             bytes: 0,
         };
         assert_eq!(share_only.bytes_of(1_000), 150);
+        let one_point = Watermark {
+            basis_points: 1,
+            bytes: 0,
+        };
+        assert_eq!(
+            one_point.bytes_of(9_999),
+            0,
+            "the share rounds down, of the total itself"
+        );
+        let over_whole = Watermark {
+            basis_points: 20_000,
+            bytes: 0,
+        };
+        assert_eq!(
+            over_whole.bytes_of(u64::MAX),
+            u64::MAX,
+            "a share past what a size can hold saturates"
+        );
+    }
+
+    /// Idle is reached exactly at the idle time, and activity dated after
+    /// the clock is not idle at all.
+    #[test]
+    fn idleness_is_reached_at_exactly_the_idle_time() {
+        let after = Duration::from_millis(5);
+        assert!(idle_reached(5, 10, after), "5 ms idle");
+        assert!(!idle_reached(6, 10, after), "4 ms idle");
+        assert!(
+            !idle_reached(10, 0, Duration::from_millis(1)),
+            "active in the future"
+        );
+        assert!(
+            idle_reached(i64::MIN, 0, Duration::from_millis(i64::MAX.unsigned_abs())),
+            "the longest idleness saturates rather than overflowing"
+        );
+    }
+
+    /// The grace is over exactly at its end; one too long for the clock
+    /// saturates to the longest elapsed time there is.
+    #[test]
+    fn the_grace_is_over_at_exactly_its_end() {
+        let grace = Duration::from_millis(5);
+        assert!(grace_over(5, 10, grace), "5 ms after the archive");
+        assert!(!grace_over(6, 10, grace), "4 ms after it");
+        assert!(
+            !grace_over(i64::MIN, -2, Duration::MAX),
+            "one millisecond short of the saturated grace"
+        );
+        assert!(grace_over(i64::MIN, -1, Duration::MAX));
+    }
+
+    /// The pin pass is due every interval from the last one, reached
+    /// exactly; a report after any change, or every interval from the last.
+    #[test]
+    fn the_scan_loop_cadence_counts_from_the_last_pass_and_report() {
+        let start = tokio::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let every = Duration::from_millis(100);
+        let mut cadence = Cadence::starting(start);
+        assert!(!cadence.pins_due(at(99), every));
+        assert!(cadence.pins_due(at(100), every), "reached exactly");
+        assert!(
+            !cadence.pins_due(at(150), every),
+            "counted from the pass just run"
+        );
+        assert!(cadence.pins_due(at(200), every));
+
+        let mut cadence = Cadence::starting(start);
+        assert!(!cadence.report_due(at(99), false, every));
+        assert!(cadence.report_due(at(100), false, every), "reached exactly");
+        assert!(
+            !cadence.report_due(at(150), false, every),
+            "counted from the report just sent"
+        );
+        assert!(cadence.report_due(at(160), true, every), "a change reports");
+        assert!(
+            !cadence.report_due(at(200), false, every),
+            "and restarts the interval"
+        );
+        assert!(cadence.report_due(at(260), false, every));
     }
 
     #[test]
@@ -890,13 +1029,14 @@ mod tests {
     /// under HARD.
     #[test]
     fn gc_removes_by_level_and_standing() {
-        use Standing::{Archived, Live, Orphan, Remembered};
-        for standing in [Live, Remembered, Archived, Orphan] {
+        use Standing::{Live, Orphan, Remembered};
+        let archived = Standing::Archived(0);
+        for standing in [Live, Remembered, archived, Orphan] {
             assert!(!removable_at(GcLevel::Soft, standing), "{standing:?}");
         }
         for level in [GcLevel::Automatic, GcLevel::Hard] {
             assert!(!removable_at(level, Live) && !removable_at(level, Remembered));
-            assert!(removable_at(level, Archived));
+            assert!(removable_at(level, archived));
         }
         assert!(!removable_at(GcLevel::Automatic, Orphan));
         assert!(removable_at(GcLevel::Hard, Orphan));
@@ -908,11 +1048,16 @@ mod tests {
 
     #[test]
     fn an_episode_ends_whole() {
-        let mut episode = Episode {
-            active: true,
-            reported: true,
-        };
-        episode.end();
-        assert_eq!(episode, Episode::default());
+        for (active, reported) in [(true, true), (true, false), (false, true)] {
+            let mut episode = Episode { active, reported };
+            episode.end();
+            assert_eq!(
+                episode,
+                Episode {
+                    active: false,
+                    reported: false
+                }
+            );
+        }
     }
 }

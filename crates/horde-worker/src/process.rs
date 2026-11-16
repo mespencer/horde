@@ -710,6 +710,39 @@ mod tests {
         }
     }
 
+    /// The group this process merely belongs to — led by someone else — is
+    /// refused too. Run in a child of this test binary, which shares its
+    /// parent's group without leading it; there a refusal-free mutant would
+    /// send the (harmless) SIGCONT and say it had.
+    #[test]
+    fn a_reclaim_signal_never_reaches_a_group_this_process_only_belongs_to() {
+        const PROBE: &str = "HORDE_TEST_SIGNAL_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let group = nix::unistd::getpgrp();
+            assert_ne!(group, nix::unistd::getpid(), "the probe leads no group");
+            let group = u32::try_from(group.as_raw()).expect("a pid fits");
+            assert!(!super::signal_spawned_group(
+                group,
+                nix::sys::signal::Signal::SIGCONT
+            ));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "--exact",
+                "process::tests::a_reclaim_signal_never_reaches_a_group_this_process_only_belongs_to",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .expect("the probe runs");
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && printed.contains("1 passed"),
+            "the probe ran and refused: {printed}"
+        );
+    }
+
     /// Every row of the startup classification: a dead group is forgotten,
     /// orphans and a still-matching leader are ours, and a leader whose start
     /// time differs — or that was never fingerprinted — is a stranger.

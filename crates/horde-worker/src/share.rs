@@ -547,6 +547,57 @@ mod tests {
         assert!(ShareBroker::new(None).relay().is_none());
     }
 
+    /// Obtaining into an Instance repo excludes no agent: any peer holding
+    /// the commit is a source, whatever its id — here one that a
+    /// placeholder exclusion would happen to name.
+    #[tokio::test]
+    async fn obtaining_into_an_instance_considers_every_peer() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let temp = tempfile::tempdir().expect("a tempdir");
+        let peer = temp.path().join("peer/atlas");
+        let instance = temp.path().join("instance");
+        for repo in [&peer, &instance] {
+            std::fs::create_dir_all(repo).expect("the repo dir");
+            git(repo, &["init", "-q"]);
+        }
+        git(
+            &peer,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "the peer's work",
+            ],
+        );
+        let sha = git(&peer, &["rev-parse", "HEAD"]);
+        let broker = ShareBroker::new(None);
+        broker.register(
+            "xyzzy",
+            AgentCheckout {
+                root: temp.path().join("peer"),
+                repos: vec![("atlas".to_owned(), "atlas".into())],
+            },
+        );
+        broker
+            .obtain_into(&instance, "atlas", &sha)
+            .await
+            .expect("fetched from the peer");
+        git(&instance, &["cat-file", "-e", &format!("{sha}^{{commit}}")]);
+    }
+
     /// A commit that is nowhere on this Worker, with no Relay configured,
     /// cannot be obtained into an Instance repo: both the inherent call and
     /// the `CommitSource` face refuse rather than pretend.
