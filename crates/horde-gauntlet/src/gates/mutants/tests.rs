@@ -499,45 +499,51 @@ fn a_narrowed_run_is_judged_by_its_packages_and_the_owners_of_what_they_spawn() 
     );
 }
 
+/// Every `.rs` file under `dir`.
+fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("a readable directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .flat_map(|path| {
+            if path.is_dir() {
+                rust_files(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect()
+}
+
+/// The packages named as the first argument of each `product_binary(` call
+/// in `text` that names one literally.
+fn owners_named(text: &str) -> Vec<String> {
+    text.split("product_binary(")
+        .skip(1)
+        .filter_map(|after| after.trim_start().strip_prefix('"')?.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Every `product_binary("<owner>", ...)` call in a workspace crate, as
 /// (calling crate, owner), where the owner is another workspace crate.
 fn cross_package_spawns(root: &Path) -> BTreeSet<(String, String)> {
-    const CALL: &str = "product_binary(";
-    let mut found = BTreeSet::new();
     let crates = root.join("crates");
-    let mut pending = vec![crates.clone()];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("a readable directory") {
-            let path = entry.expect("a directory entry").path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
-            let caller = path
-                .strip_prefix(&crates)
-                .expect("under crates/")
-                .components()
-                .next()
-                .expect("a crate directory")
-                .as_os_str()
-                .to_string_lossy()
-                .into_owned();
+    let is_crate = |name: &str| crates.join(name).join("Cargo.toml").is_file();
+    rust_files(&crates)
+        .into_iter()
+        .flat_map(|path| {
+            let relative = path.strip_prefix(&crates).expect("under crates/");
+            let caller = relative.iter().next().expect("a crate directory");
+            let caller = caller.to_string_lossy().into_owned();
             let text = std::fs::read_to_string(&path).expect("a readable source file");
-            for (at, _) in text.match_indices(CALL) {
-                let Some(quoted) = text[at + CALL.len()..].trim_start().strip_prefix('"') else {
-                    continue;
-                };
-                let owner = quoted.split('"').next().unwrap_or_default().to_owned();
-                if owner != caller && crates.join(&owner).join("Cargo.toml").is_file() {
-                    found.insert((caller.clone(), owner));
-                }
-            }
-        }
-    }
-    found
+            owners_named(&text)
+                .into_iter()
+                .filter(|owner| *owner != caller && is_crate(owner))
+                .map(|owner| (caller.clone(), owner))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[test]

@@ -520,8 +520,8 @@ diff-scoped run that touches a line with an old survivor on it reds for that sur
 Of the three mutants known to time out under cargo-mutants, `Folded::fold`'s are all
 killed under gamma (its per-test selection runs the projection's own tests, which fail
 fast), and `split_full`'s three (`cut -= 1` deleted, or its literal changed) were the
-backwards scan for a character boundary; the cut is now `str::floor_char_boundary` of the
-limit, so there is no scan of ours left for a mutation to spin. The
+backwards scan for a character boundary; the cut is now found over the bounded range from
+the limit down to 0, walked once, so no mutation of it can spin. The
 other 27 timeouts and out-of-memory mutants are in the backlog.
 
 *The baseline is the fragile part.* Every verdict compares against an unmutated run of

@@ -112,10 +112,13 @@ impl OutputShaper {
         {
             // The last character start at or under the limit: the last cut
             // that fits. Never 0 — the limit is at least 4 and no character
-            // is longer — so every pass shortens the held text. The standard
-            // library finds it, so there is no scan here for a mutant to
-            // keep from terminating.
-            let cut = held.text.floor_char_boundary(self.max_chunk_bytes);
+            // is longer — so every pass shortens the held text. A bounded
+            // range, walked once from the limit down, so no mutation of the
+            // walk can keep it from terminating.
+            let cut = (0..=self.max_chunk_bytes)
+                .rev()
+                .find(|at| held.text.is_char_boundary(*at))
+                .unwrap_or_default();
             let rest = held.text.split_off(cut);
             let chunk = std::mem::replace(&mut held.text, rest);
             let (turn_id, channel) = (held.turn_id.clone(), held.channel);
