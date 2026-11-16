@@ -117,8 +117,8 @@ impl EndpointManager {
     /// Serves the agents' `logs` verb from this Worker's own files
     /// (ADR-0015). Set once; endpoints bound after it carry it.
     pub fn serve_logs(&self, local: horde_observe::reader::LocalLogs) {
-        let _ = self.logs.set(Arc::new(horde_mcp::logs::LogAccess::new(
-            Some(local),
+        let _ = self.logs.set(Arc::new(horde_mcp::logs::LogAccess::serving(
+            local,
             &self.worker_id,
             horde_observe::settings::AgentReadLimits::default(),
         )));

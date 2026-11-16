@@ -66,32 +66,31 @@ pub struct LogsView {
 }
 
 /// Where one call reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogsTarget {
+#[derive(Debug, Clone)]
+pub enum LogsTarget<'a> {
     /// Read here, from the worker's own files.
-    Local(Target),
+    Local(&'a LocalLogs, Target),
     /// Read through the server.
     Remote(read_logs_request::Target),
 }
 
-/// Parses a `target` for an agent on `own_worker`; `local` says whether
-/// this endpoint has the worker's files to read.
+/// Parses a `target` for an agent on `own_worker`; `local` is the worker's
+/// files, when this endpoint has them to read.
 ///
 /// # Errors
 ///
 /// A target that is none of the four shapes.
-pub fn parse_target(
+pub fn parse_target<'a>(
     target: Option<&str>,
     agent: &str,
     own_worker: &str,
-    local: bool,
-) -> Result<LogsTarget, String> {
-    let target = target.unwrap_or("self").trim();
+    local: Option<&'a LocalLogs>,
+) -> Result<LogsTarget<'a>, String> {
+    let target = target.unwrap_or_default().trim();
     if target.is_empty() || target == "self" {
-        return Ok(if local {
-            LogsTarget::Local(Target::Agent(agent.to_owned()))
-        } else {
-            LogsTarget::Remote(read_logs_request::Target::Agent(AgentId::new(agent)))
+        return Ok(match local {
+            Some(local) => LogsTarget::Local(local, Target::Agent(agent.to_owned())),
+            None => LogsTarget::Remote(read_logs_request::Target::Agent(AgentId::new(agent))),
         });
     }
     if target == "server" {
@@ -100,17 +99,15 @@ pub fn parse_target(
         )));
     }
     if let Some(worker) = target.strip_prefix("worker:").filter(|w| !w.is_empty()) {
-        return Ok(if local && worker == own_worker {
-            LogsTarget::Local(Target::Process)
-        } else {
-            LogsTarget::Remote(read_logs_request::Target::Worker(worker.to_owned()))
+        return Ok(match local.filter(|_| worker == own_worker) {
+            Some(local) => LogsTarget::Local(local, Target::Process),
+            None => LogsTarget::Remote(read_logs_request::Target::Worker(worker.to_owned())),
         });
     }
     if let Some(other) = target.strip_prefix("agent:").filter(|a| !a.is_empty()) {
-        return Ok(if local && other == agent {
-            LogsTarget::Local(Target::Agent(agent.to_owned()))
-        } else {
-            LogsTarget::Remote(read_logs_request::Target::Agent(AgentId::new(other)))
+        return Ok(match local.filter(|_| other == agent) {
+            Some(local) => LogsTarget::Local(local, Target::Agent(agent.to_owned())),
+            None => LogsTarget::Remote(read_logs_request::Target::Agent(AgentId::new(other))),
         });
     }
     Err(format!(
@@ -122,8 +119,9 @@ pub fn parse_target(
 /// and the per-agent limits.
 #[derive(Debug)]
 pub struct LogAccess {
-    local: Option<LocalLogs>,
-    worker_id: String,
+    /// The worker's own files, and the worker's name: the reads they serve
+    /// without asking the server.
+    local: Option<(LocalLogs, String)>,
     buckets: RateBuckets,
     in_flight: Mutex<BTreeSet<String>>,
 }
@@ -141,13 +139,23 @@ impl Drop for InFlight<'_> {
 }
 
 impl LogAccess {
-    /// Log access for agents on `worker_id`, reading `local` files when the
-    /// worker keeps them.
+    /// Log access for agents on `worker_id`, reading its `local` files for
+    /// the targets they hold.
     #[must_use]
-    pub fn new(local: Option<LocalLogs>, worker_id: &str, limits: AgentReadLimits) -> Self {
+    pub fn serving(local: LocalLogs, worker_id: &str, limits: AgentReadLimits) -> Self {
+        Self::with(Some((local, worker_id.to_owned())), limits)
+    }
+
+    /// Log access with no files of its own: every target is read through
+    /// the server.
+    #[must_use]
+    pub fn remote_only(limits: AgentReadLimits) -> Self {
+        Self::with(None, limits)
+    }
+
+    fn with(local: Option<(LocalLogs, String)>, limits: AgentReadLimits) -> Self {
         Self {
             local,
-            worker_id: worker_id.to_owned(),
             buckets: RateBuckets::new(limits),
             in_flight: Mutex::new(BTreeSet::new()),
         }
@@ -194,12 +202,11 @@ impl LogAccess {
         params: &LogsParams,
     ) -> Result<LogsView, String> {
         let _slot = self.admit(agent, Instant::now())?;
-        let target = parse_target(
-            params.target.as_deref(),
-            agent,
-            &self.worker_id,
-            self.local.is_some(),
-        )?;
+        let (local, own_worker) = match &self.local {
+            Some((local, worker_id)) => (Some(local), worker_id.as_str()),
+            None => (None, ""),
+        };
+        let target = parse_target(params.target.as_deref(), agent, own_worker, local)?;
         let max_bytes = self
             .buckets
             .limits()
@@ -211,13 +218,13 @@ impl LogAccess {
             .map(|text| Cursor::decode(text).ok_or_else(|| format!("{text:?} is not a cursor")))
             .transpose()?;
         let filter = wire_filter(params);
-        match (target, &self.local) {
-            (LogsTarget::Local(target), Some(local)) => {
+        match target {
+            LogsTarget::Local(local, target) => {
                 read_local(local, &target, &filter, session, cursor, max_bytes)
             }
-            (LogsTarget::Local(_), None) => Err("this worker keeps no log files".to_owned()),
-            (LogsTarget::Remote(target), _) => {
-                read_remote(client, target, filter, agent, cursor, max_bytes).await
+            LogsTarget::Remote(target) => {
+                let request = remote_request(target, filter, agent, cursor.as_ref(), max_bytes);
+                read_remote(client, request, cursor).await
             }
         }
     }
@@ -258,23 +265,31 @@ fn read_local(
     })
 }
 
-/// A remote read through `ReadLogs`, on the agent's behalf.
-async fn read_remote(
-    client: &mut horde_cli::client::Client,
+/// The `ReadLogs` request a remote read sends: on the agent's behalf, never
+/// following (MCP is request/response).
+fn remote_request(
     target: read_logs_request::Target,
     filter: LogFilter,
     agent: &str,
-    cursor: Option<Cursor>,
+    cursor: Option<&Cursor>,
     max_bytes: u32,
-) -> Result<LogsView, String> {
-    let request = ReadLogsRequest {
+) -> ReadLogsRequest {
+    ReadLogsRequest {
         target: Some(target),
         filter: Some(filter),
         follow: false,
-        after: cursor.as_ref().map(horde_wire::logs::cursor_to_wire),
+        after: cursor.map(horde_wire::logs::cursor_to_wire),
         on_behalf_of: Some(AgentId::new(agent)),
         max_bytes,
-    };
+    }
+}
+
+/// A remote read through `ReadLogs`, read until the server closes it.
+async fn read_remote(
+    client: &mut horde_cli::client::Client,
+    request: ReadLogsRequest,
+    cursor: Option<Cursor>,
+) -> Result<LogsView, String> {
     let mut stream = client
         .read_logs(request)
         .await
@@ -288,30 +303,36 @@ async fn read_remote(
         .await
         .map_err(|status| status.message().to_owned())?
     {
-        match response.body {
-            Some(read_logs_response::Body::Records(records)) => {
-                view.truncated |= records.truncated;
-                view.redacted += records.redacted;
-                view.records.extend(records.lines);
-                if let Some(next) = records
-                    .cursor
-                    .as_ref()
-                    .and_then(|cursor| horde_wire::logs::cursor_from_wire(cursor).ok())
-                {
-                    view.next_cursor = Some(next.encode());
-                }
-            }
-            Some(read_logs_response::Body::End(end)) => {
-                view.truncated |= end.reason == LogEndReason::ByteCap as i32;
-                if end.reason == LogEndReason::WorkerDisconnected as i32 {
-                    return Err(format!("the read ended early: {}", end.detail));
-                }
-                break;
-            }
-            Some(read_logs_response::Body::Gap(_)) | None => {}
-        }
+        absorb(&mut view, response.body)?;
     }
     Ok(view)
+}
+
+/// Folds one response into the view. A worker that vanished mid-read is an
+/// error: what came before it is not the whole answer.
+fn absorb(view: &mut LogsView, body: Option<read_logs_response::Body>) -> Result<(), String> {
+    match body {
+        Some(read_logs_response::Body::Records(records)) => {
+            view.truncated |= records.truncated;
+            view.redacted += records.redacted;
+            view.records.extend(records.lines);
+            if let Some(next) = records
+                .cursor
+                .as_ref()
+                .and_then(|cursor| horde_wire::logs::cursor_from_wire(cursor).ok())
+            {
+                view.next_cursor = Some(next.encode());
+            }
+        }
+        Some(read_logs_response::Body::End(end)) => {
+            view.truncated |= end.reason == LogEndReason::ByteCap as i32;
+            if end.reason == LogEndReason::WorkerDisconnected as i32 {
+                return Err(format!("the read ended early: {}", end.detail));
+            }
+        }
+        Some(read_logs_response::Body::Gap(_)) | None => {}
+    }
+    Ok(())
 }
 
 /// The shared handle an endpoint serves `logs` through.
@@ -325,27 +346,29 @@ mod tests {
     use horde_observe::settings::AgentReadLimits;
     use horde_proto::v1::read_logs_request;
 
-    use super::{LogAccess, LogsParams, LogsTarget, parse_target};
+    use horde_proto::v1::{LogEndReason, LogFilter, ReadLogsRequest};
+
+    use super::{LogAccess, LogsParams, LogsTarget, LogsView, parse_target};
 
     #[test]
     fn targets_parse_to_local_or_remote() {
-        let local = |target: Option<&str>| parse_target(target, "a1", "w1", true);
-        assert_eq!(
-            local(None),
-            Ok(LogsTarget::Local(Target::Agent("a1".to_owned())))
-        );
-        assert_eq!(local(Some("self")), local(None));
-        assert_eq!(local(Some("agent:a1")), local(None));
-        assert_eq!(
-            local(Some("worker:w1")),
-            Ok(LogsTarget::Local(Target::Process))
-        );
-        assert_eq!(
+        let files = LocalLogs::new("/nowhere", "horde-worker", None);
+        let local = |target: Option<&str>| parse_target(target, "a1", "w1", Some(&files));
+        let reads_here = |parsed: Result<LogsTarget<'_>, String>, expected: &Target| {
+            matches!(parsed, Ok(LogsTarget::Local(logs, target))
+                if std::ptr::eq(logs, &files) && &target == expected)
+        };
+        let own = Target::Agent("a1".to_owned());
+        assert!(reads_here(local(None), &own));
+        assert!(reads_here(local(Some("self")), &own));
+        assert!(reads_here(local(Some(" self ")), &own));
+        assert!(reads_here(local(Some("")), &own));
+        assert!(reads_here(local(Some("agent:a1")), &own));
+        assert!(reads_here(local(Some("worker:w1")), &Target::Process));
+        assert!(matches!(
             local(Some("worker:w2")),
-            Ok(LogsTarget::Remote(read_logs_request::Target::Worker(
-                "w2".to_owned()
-            )))
-        );
+            Ok(LogsTarget::Remote(read_logs_request::Target::Worker(name))) if name == "w2"
+        ));
         assert!(matches!(
             local(Some("server")),
             Ok(LogsTarget::Remote(read_logs_request::Target::Server(_)))
@@ -355,16 +378,100 @@ mod tests {
             Ok(LogsTarget::Remote(read_logs_request::Target::Agent(id))) if id.value == "a2"
         ));
         assert!(matches!(
-            parse_target(None, "a1", "w1", false),
+            parse_target(None, "a1", "w1", None),
             Ok(LogsTarget::Remote(read_logs_request::Target::Agent(id))) if id.value == "a1"
         ));
         assert!(matches!(
-            parse_target(Some("worker:w1"), "a1", "w1", false),
+            parse_target(Some("worker:w1"), "a1", "w1", None),
             Ok(LogsTarget::Remote(_))
+        ));
+        assert!(matches!(
+            parse_target(Some("agent:a1"), "a1", "w1", None),
+            Ok(LogsTarget::Remote(read_logs_request::Target::Agent(id))) if id.value == "a1"
         ));
         for bad in ["worker:", "agent:", "disk", "worker"] {
             assert!(local(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// A remote read asks on the agent's behalf, for its filter, cursor and
+    /// cap, and never follows.
+    #[test]
+    fn a_remote_read_asks_on_the_agents_behalf_without_following() {
+        let cursor = horde_observe::record::Cursor::decode("2026-01-01T00:00:00.000000Z~horde~b~3")
+            .expect("a cursor");
+        let filter = LogFilter {
+            grep: "boom".to_owned(),
+            ..LogFilter::default()
+        };
+        let request = super::remote_request(
+            read_logs_request::Target::Server(horde_proto::v1::ServerTarget {}),
+            filter.clone(),
+            "a1",
+            Some(&cursor),
+            123,
+        );
+        assert_eq!(
+            request,
+            ReadLogsRequest {
+                target: Some(read_logs_request::Target::Server(
+                    horde_proto::v1::ServerTarget {}
+                )),
+                filter: Some(filter),
+                follow: false,
+                after: Some(horde_wire::logs::cursor_to_wire(&cursor)),
+                on_behalf_of: Some(horde_proto::v1::AgentId::new("a1")),
+                max_bytes: 123,
+            }
+        );
+    }
+
+    /// What each response does to the view: records accumulate, a cap or a
+    /// truncated batch marks it, a gap changes nothing, and a vanished
+    /// worker fails the read in words.
+    #[test]
+    fn responses_fold_into_the_view() {
+        use horde_proto::v1::{LogEnd, LogGap, LogRecords, read_logs_response::Body};
+        let mut view = LogsView::default();
+        assert_eq!(
+            super::absorb(
+                &mut view,
+                Some(Body::Records(LogRecords {
+                    lines: vec!["r".to_owned()],
+                    redacted: 2,
+                    ..LogRecords::default()
+                }))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            super::absorb(&mut view, Some(Body::Gap(LogGap::default()))),
+            Ok(())
+        );
+        assert_eq!(super::absorb(&mut view, None), Ok(()));
+        assert_eq!(view.records, ["r"]);
+        assert_eq!(view.redacted, 2);
+        assert!(!view.truncated);
+        let done = Some(Body::End(LogEnd {
+            reason: LogEndReason::Done as i32,
+            detail: String::new(),
+        }));
+        assert_eq!(super::absorb(&mut view, done), Ok(()));
+        assert!(!view.truncated, "a finished read left nothing out");
+        let capped = Some(Body::End(LogEnd {
+            reason: LogEndReason::ByteCap as i32,
+            detail: String::new(),
+        }));
+        assert_eq!(super::absorb(&mut view, capped), Ok(()));
+        assert!(view.truncated, "the cap left records out");
+        let vanished = Some(Body::End(LogEnd {
+            reason: LogEndReason::WorkerDisconnected as i32,
+            detail: "gone".to_owned(),
+        }));
+        assert_eq!(
+            super::absorb(&mut view, vanished),
+            Err("the read ended early: gone".to_owned())
+        );
     }
 
     fn client() -> horde_cli::client::Client {
@@ -393,8 +500,8 @@ mod tests {
 
     /// Access over [`files`] with limits no test here reaches.
     fn generous(dir: &std::path::Path) -> LogAccess {
-        LogAccess::new(
-            Some(files(dir)),
+        LogAccess::serving(
+            files(dir),
             "w1",
             AgentReadLimits {
                 calls_per_minute: 600,
@@ -498,6 +605,32 @@ mod tests {
         assert!(bad.is_err());
     }
 
+    /// The cap is the caller's, exactly: two records' bytes page two
+    /// records, one byte less pages one.
+    #[tokio::test]
+    async fn a_local_page_holds_exactly_its_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let access = generous(dir.path());
+        let mut client = client();
+        let all = access
+            .call(&mut client, "a1", "s1", &LogsParams::default())
+            .await
+            .expect("read");
+        let two = u32::try_from(all.records[0].len() + all.records[1].len()).expect("small");
+        let page = |max_bytes| LogsParams {
+            cursor: Some("1970-01-01T00:00:00.000000Z~horde~~0".to_owned()),
+            max_bytes: Some(max_bytes),
+            ..LogsParams::default()
+        };
+        for (cap, expected) in [(two, 2), (two - 1, 1)] {
+            let read = access
+                .call(&mut client, "a1", "s1", &page(cap))
+                .await
+                .expect("page");
+            assert_eq!(read.records.len(), expected, "{cap} bytes");
+        }
+    }
+
     /// Each filter parameter reaches the read.
     #[tokio::test]
     async fn since_level_and_grep_each_narrow_the_read() {
@@ -546,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn the_rate_and_concurrency_limits_refuse_in_words() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let access = LogAccess::new(Some(files(dir.path())), "w1", AgentReadLimits::default());
+        let access = LogAccess::serving(files(dir.path()), "w1", AgentReadLimits::default());
         let mut client = client();
         for _ in 0..3 {
             assert!(
@@ -586,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_local_files_a_local_target_is_refused() {
-        let access = LogAccess::new(None, "w1", AgentReadLimits::default());
+        let access = LogAccess::remote_only(AgentReadLimits::default());
         let refused = access
             .call(
                 &mut client(),

@@ -717,9 +717,7 @@ impl HordeEndpoint {
         let access = match &self.logs {
             Some(access) => access,
             None => {
-                fallback = crate::logs::LogAccess::new(
-                    None,
-                    "",
+                fallback = crate::logs::LogAccess::remote_only(
                     horde_observe::settings::AgentReadLimits::default(),
                 );
                 &fallback

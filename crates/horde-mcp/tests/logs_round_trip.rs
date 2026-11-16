@@ -55,8 +55,8 @@ async fn served(
 
     let registry = AgentRegistry::new();
     registry.insert(&horde.agent_id, TOKEN);
-    let access = Arc::new(LogAccess::new(
-        Some(LocalLogs::new(worker_logs, "horde-worker", None)),
+    let access = Arc::new(LogAccess::serving(
+        LocalLogs::new(worker_logs, "horde-worker", None),
         "w1",
         // Four calls before the limit, so the fifth meets it.
         AgentReadLimits {
@@ -172,4 +172,41 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
     .expect("an answer");
     assert_eq!(limited["result"]["isError"], true, "{limited}");
     assert!(limited.to_string().contains("retry after"), "{limited}");
+}
+
+/// A server read is held to the agent's cap, exactly: a record one byte
+/// over it is left out.
+#[tokio::test]
+async fn a_server_read_holds_exactly_the_agents_cap() {
+    let (server_logs, worker_logs) = (
+        tempfile::tempdir().expect("dir"),
+        tempfile::tempdir().expect("dir"),
+    );
+    let (mcp, _serving) = served(server_logs.path(), worker_logs.path())
+        .await
+        .expect("served");
+    let minted = horde_observe::reader::read_dir(server_logs.path(), Some("horde-server"))
+        .into_iter()
+        .find(|record| record.message().contains("minted"))
+        .expect("the server's record");
+    let len = minted.line.len();
+    for (cap, expected) in [(len, 1), (len - 1, 0)] {
+        let read = view(
+            &within(
+                "a logs call",
+                mcp.call_tool(
+                    "logs",
+                    serde_json::json!({"target": "server", "grep": "minted", "max_bytes": cap}),
+                ),
+            )
+            .await
+            .expect("read"),
+        )
+        .expect("json");
+        assert_eq!(
+            read["records"].as_array().map(Vec::len),
+            Some(expected),
+            "{cap} bytes: {read}"
+        );
+    }
 }
