@@ -1135,6 +1135,8 @@ impl ControlPlaneService for ControlPlane {
                 occurred_at: None,
                 idempotency_key: request.idempotency_key.clone(),
                 kind: Some(Kind::AgentSpawned(AgentSpawned {
+                    // #[gamma::skip(option.none_to_some, reason = "the projection reads AgentSpawned.session only for a session's first parentless agent, and create_session spawns every session's root, so this event's session is never read: Some(default) and None alike")]
+                    session: None,
                     parent_agent_id: parent.clone().map(AgentId::new),
                     // A client identity, or nothing: an MCP-initiated spawn
                     // arrives over the worker's channel and its true actor is
@@ -1142,9 +1144,6 @@ impl ControlPlaneService for ControlPlane {
                     spawned_by: actor,
                     spec: Some(spec.clone()),
                     tree_path: Vec::new(),
-                    // Session settings ride only the session's root, which
-                    // create_session spawns; a spawn into it carries none.
-                    ..AgentSpawned::default()
                 })),
             },
         )
