@@ -10,6 +10,7 @@
 //! for a busy worker+provider is refused.
 
 use crate::support::System;
+use horde_server_testkit::port::{HeldPort, hold_port};
 use horde_server_testkit::pty::PtyProcess;
 
 /// Spawns the real CLI's login verb in an 80×24 pty.
@@ -24,15 +25,14 @@ fn spawn_pty_login(system: &System, worker: &str, provider: &str) -> PtyProcess 
     PtyProcess::spawn(command).expect("the CLI spawns in a pty")
 }
 
-/// Two distinct free loopback ports, found by binding `:0` twice and
-/// releasing. Both listeners are held until both ports are known, so the
-/// two can never collide with each other.
-fn two_free_ports() -> (u16, u16) {
-    let first = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-    let second = std::net::TcpListener::bind("127.0.0.1:0").expect("a second free port");
+/// Two distinct loopback ports, held for the scenario's whole life: the
+/// client binds the first and the worker's provider the second, each
+/// exactly, long after they were chosen — a port found and released is the
+/// kernel's to hand to any other bind or connection meanwhile.
+fn two_held_ports() -> (HeldPort, HeldPort) {
     (
-        first.local_addr().expect("an addr").port(),
-        second.local_addr().expect("an addr").port(),
+        hold_port().expect("a port is held"),
+        hold_port().expect("a second port is held"),
     )
 }
 
@@ -99,7 +99,8 @@ async fn hit_callback(port: u16) -> String {
 #[tokio::test]
 async fn an_interactive_login_relays_the_pty_and_its_oauth_callback() {
     let system = System::launch().await;
-    let (callback, listen) = two_free_ports();
+    let (callback_port, listen_port) = two_held_ports();
+    let (callback, listen) = (callback_port.port(), listen_port.port());
     let worker = spawn_login_worker(&system, "w-login", callback, listen).await;
 
     let mut login = spawn_pty_login(&system, "w-login", "fake");
@@ -151,7 +152,8 @@ async fn an_interactive_login_relays_the_pty_and_its_oauth_callback() {
 #[tokio::test]
 async fn a_vanished_client_leaves_no_orphan_and_a_busy_provider_refuses() {
     let system = System::launch().await;
-    let (callback, listen) = two_free_ports();
+    let (callback_port, listen_port) = two_held_ports();
+    let (callback, listen) = (callback_port.port(), listen_port.port());
     let worker = spawn_login_worker(&system, "w-login2", callback, listen).await;
 
     // The first login, headless (piped stdio, no pty): it opens, the worker

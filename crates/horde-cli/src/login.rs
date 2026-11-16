@@ -786,15 +786,6 @@ mod tests {
         drop(busy);
     }
 
-    /// One free loopback port, found by binding `:0` and releasing.
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("a free port")
-            .local_addr()
-            .expect("an addr")
-            .port()
-    }
-
     /// Arranges one whole `run_interactive` call against the real relay:
     /// the test plays the worker, attaching with `callback_port` and then
     /// sending `frames` — the shared shape of the interactive-runner tests.
@@ -832,8 +823,11 @@ mod tests {
     /// skipped by the runner itself: a test's stdin is no terminal.)
     #[tokio::test]
     async fn the_interactive_runner_completes_a_clean_login() {
+        // Held until the runner binds it: a port found and released is the
+        // kernel's to hand to any other bind or connection meanwhile.
+        let callback = horde_server_testkit::port::hold_port().expect("a port is held");
         let outcome = run_interactively(
-            u32::from(free_port()),
+            u32::from(callback.port()),
             vec![
                 login_output_frame(b"visit the url\r\n".to_vec()),
                 login_exit_frame(0),
