@@ -404,6 +404,7 @@ mod tests {
             Ok(Some(vec!["a".to_owned(), "b".to_owned()]))
         );
         assert_eq!(root.string("absent"), Ok(None));
+        assert_eq!(root.strings("absent_list"), Ok(None));
         assert_eq!(root.duration("absent_too"), Ok(None));
         assert_eq!(root.finish(), Ok(()));
     }

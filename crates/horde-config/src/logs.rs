@@ -429,6 +429,8 @@ mod tests {
         assert_eq!(worker.level, "warn");
         assert_eq!((worker.max_file_bytes, worker.max_files), (1 << 20, 3));
         assert_eq!(worker.max_age, None, "0 is no age limit");
+        let (aged, _) = resolve(Role::Worker, "[logs]\nmax_age = \"3d\"\n", &[]).expect("resolves");
+        assert_eq!(aged.max_age, Some(Duration::from_secs(3 * 86_400)));
         assert_eq!(
             worker.agents,
             Some(AgentLogKeys {

@@ -287,9 +287,14 @@ async fn show_config_reads_the_file_under_home() {
     std::fs::create_dir_all(file.parent().expect("a parent")).expect("dirs");
     std::fs::write(&file, "[permissions]\ndefault_mode = \"ask\"\n").expect("the file");
     let home_text = home.path().to_string_lossy().into_owned();
-    let shown = horde_server_with_env(&["--show-config", "--origin"], &[("HOME", &home_text)])
-        .await
-        .expect("the binary must run");
+    // Bounded: a binary that ignored --show-config would serve, not exit.
+    let shown = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        horde_server_with_env(&["--show-config", "--origin"], &[("HOME", &home_text)]),
+    )
+    .await
+    .expect("--show-config exits")
+    .expect("the binary must run");
     let stdout = String::from_utf8_lossy(&shown.stdout);
     assert!(
         shown.status.success(),

@@ -395,8 +395,8 @@ async fn a_spawn_requiring_an_account_places_once_its_worker_advertises_it() {
 
 /// A spawn naming a provider demands that harness of its worker, on the
 /// spawn's own placement and again when the queue drains: it queues against
-/// a worker without the harness, naming it, and places once that worker
-/// registers again advertising it installed.
+/// a worker without the harness, naming it, stays queued when another
+/// worker without it arrives, and places on the one that has it installed.
 #[tokio::test]
 async fn a_spawn_naming_a_provider_waits_for_a_worker_with_its_harness() {
     use horde_proto::v1::{
@@ -437,7 +437,7 @@ async fn a_spawn_naming_a_provider_waits_for_a_worker_with_its_harness() {
         .expect("another worker without codex");
     register(
         &mut harness,
-        "plain",
+        "codexed",
         WorkerCapabilities {
             harnesses: vec![HarnessCapability {
                 provider: "codex".to_owned(),
@@ -448,7 +448,7 @@ async fn a_spawn_naming_a_provider_waits_for_a_worker_with_its_harness() {
         },
     )
     .await
-    .expect("re-register with codex");
+    .expect("a worker with codex");
     let mut observed = Vec::new();
     for minimum in 2..8 {
         observed = placements_until(&mut harness, &session_id, minimum)
@@ -470,7 +470,7 @@ async fn a_spawn_naming_a_provider_waits_for_a_worker_with_its_harness() {
         [&Observed {
             agent_id: agent,
             state: PlacementState::Placed,
-            worker_id: Some("plain".to_owned()),
+            worker_id: Some("codexed".to_owned()),
         }],
         "only the worker with the harness takes it: {observed:?}"
     );
