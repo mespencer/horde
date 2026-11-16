@@ -104,6 +104,13 @@ struct Buffered {
     delivery: i32,
 }
 
+/// One Definition as the fold last saw it.
+#[derive(Debug)]
+struct Catalogued {
+    definition: WorkspaceDefinition,
+    deleted: bool,
+}
+
 /// The fold state: everything needed to turn the next log row into commands.
 ///
 /// Deliberately free of any I/O, so the interesting logic is a pure function of
@@ -128,11 +135,11 @@ pub struct CommandProjection {
     /// worker must be able to materialize without a round trip — and the only
     /// place a fold can get one is the `WorkspaceDefinitionChanged` events
     /// that precede every prewarm request in append order.
-    definitions: BTreeMap<String, WorkspaceDefinition>,
-    /// Definitions deleted since: a purge's gc commands still carry the last
-    /// Definition, so its cleanup policy applies to the Instances it removes
-    /// (ADR-0014).
-    deleted_definitions: BTreeMap<String, WorkspaceDefinition>,
+    ///
+    /// A deleted Definition stays, marked deleted: a purge's gc commands
+    /// still carry its last cleanup policy for the Instances it removes,
+    /// but nothing materializes it again (ADR-0014).
+    definitions: BTreeMap<String, Catalogued>,
     /// The Server's workspace defaults, resolved with each Definition into
     /// the policy every spawn, materialize and gc command carries.
     workspace_policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
@@ -174,11 +181,9 @@ impl CommandProjection {
 
     /// The policy one Definition's commands carry.
     fn policy_for(&self, definition_id: Option<&str>) -> horde_proto::v1::ResolvedWorkspacePolicy {
-        let definition = definition_id.and_then(|id| {
-            self.definitions
-                .get(id)
-                .or_else(|| self.deleted_definitions.get(id))
-        });
+        let definition = definition_id
+            .and_then(|id| self.definitions.get(id))
+            .map(|known| &known.definition);
         crate::workspace_policy::resolve(&self.workspace_policy, definition)
     }
 
@@ -363,13 +368,13 @@ impl CommandProjection {
         else {
             return;
         };
-        if changed.deleted {
-            self.definitions.remove(&id);
-            self.deleted_definitions.insert(id, definition);
-        } else {
-            self.deleted_definitions.remove(&id);
-            self.definitions.insert(id, definition);
-        }
+        self.definitions.insert(
+            id,
+            Catalogued {
+                definition,
+                deleted: changed.deleted,
+            },
+        );
     }
 
     /// A gc request is one `WorkspaceGcCommand` per Worker it names, each
@@ -424,7 +429,9 @@ impl CommandProjection {
         let Some(definition) = prewarm
             .workspace_definition_id
             .as_ref()
-            .and_then(|id| self.definitions.get(&id.to_string()).cloned())
+            .and_then(|id| self.definitions.get(&id.to_string()))
+            .filter(|known| !known.deleted)
+            .map(|known| known.definition.clone())
         else {
             return Vec::new();
         };
@@ -848,8 +855,6 @@ impl CommandStream {
         Self::resuming(log, worker_id, Resume::from_sequence(resume_from))
     }
 
-    /// [`Self::open`], resuming wherever the worker said — by position when
-    /// it knows one (ADR-0011).
     /// Stamps commands with policies resolved against these defaults.
     #[must_use]
     pub fn with_workspace_policy(
@@ -860,6 +865,8 @@ impl CommandStream {
         self
     }
 
+    /// [`Self::open`], resuming wherever the worker said — by position when
+    /// it knows one (ADR-0011).
     #[must_use]
     pub fn resuming(log: &EventLog, worker_id: &str, resume: Resume) -> Self {
         Self {
@@ -1834,6 +1841,78 @@ mod tests {
         );
     }
 
+    /// A Definition deleted and created again is materializable again.
+    #[test]
+    fn a_recreated_definition_is_materializable_again() {
+        let rows = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(
+                2,
+                "horde-workspace-catalog",
+                2,
+                definition_event("ws-1", true),
+            ),
+            row(
+                3,
+                "horde-workspace-catalog",
+                3,
+                definition_event("ws-1", false),
+            ),
+            row(4, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued = fold(&rows);
+        assert_eq!(issued.len(), 1);
+        assert!(matches!(
+            issued[0].1.command,
+            Some(Command::MaterializeWorkspace(_))
+        ));
+    }
+
+    /// A materialization carries the Definition's own cleanup overrides,
+    /// layered over the Server's defaults.
+    #[test]
+    fn a_materialization_carries_its_definitions_cleanup_policy() {
+        let changed = Event {
+            kind: Some(Kind::WorkspaceDefinitionChanged(
+                horde_proto::v1::WorkspaceDefinitionChanged {
+                    definition: Some(horde_proto::v1::WorkspaceDefinition {
+                        cleanup: Some(horde_proto::v1::WorkspaceCleanupPolicy {
+                            idle_reclaim_after: None,
+                            archived_grace: Some(horde_proto::prost_types::Duration {
+                                seconds: 42,
+                                nanos: 0,
+                            }),
+                        }),
+                        ..definition("ws-1")
+                    }),
+                    deleted: false,
+                },
+            )),
+            ..definition_event("ws-1", false)
+        };
+        let rows = vec![
+            row(1, "horde-workspace-catalog", 1, changed),
+            row(2, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued = fold(&rows);
+        match issued[0].1.command.as_ref().expect("a command") {
+            Command::MaterializeWorkspace(materialize) => assert_eq!(
+                materialize
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.archived_grace)
+                    .map(|d| d.seconds),
+                Some(42)
+            ),
+            other => panic!("expected a materialize command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn events_that_command_nothing_are_folded_without_issuing() {
         let rows = vec![row(
@@ -2169,6 +2248,44 @@ mod tests {
             1,
             "registration answers the restarted count"
         );
+    }
+
+    /// A stream given the Server's workspace defaults stamps its commands
+    /// with them, not the built-in ones.
+    #[tokio::test]
+    async fn a_stream_stamps_commands_with_its_configured_policy() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for (session, event) in [
+            ("horde-workspace-catalog", definition_event("ws-1", false)),
+            ("s1", prewarm_event("ws-1", "worker-a")),
+        ] {
+            log.append(PendingEvent {
+                session_id: session.to_owned(),
+                payload: event.encode_to_vec(),
+                ..PendingEvent::default()
+            })
+            .await
+            .expect("append");
+        }
+        let config = crate::workspace_policy::WorkspacePolicyConfig {
+            fetch_throttle: std::time::Duration::from_secs(7),
+            ..crate::workspace_policy::WorkspacePolicyConfig::default()
+        };
+        let mut stream =
+            CommandStream::open(&log, "worker-a", 1).with_workspace_policy(Arc::new(config));
+        let batch = next_within(&mut stream).await;
+        let throttles: Vec<_> = batch
+            .iter()
+            .filter_map(|response| match &response.command {
+                Some(Command::MaterializeWorkspace(materialize)) => materialize
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.fetch_throttle)
+                    .map(|d| d.seconds),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(throttles, vec![7]);
     }
 
     /// A stream resumed by position delivers what was caused at or after it,

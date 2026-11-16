@@ -377,6 +377,7 @@ async fn gc_targets_holders_and_commands_them() {
     };
     assert_eq!(gc.request_id, answer.request_id);
     assert!(gc.dry_run);
+    assert!(!gc.remove_instance, "a gc removes no instance");
     assert!(gc.policy.is_some(), "the resolved policy rides it");
 
     let refused = harness
@@ -389,6 +390,7 @@ async fn gc_targets_holders_and_commands_them() {
         .await
         .expect_err("force needs hard");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "force applies only to a hard gc");
 }
 
 /// `delete --purge` removes the Definition and asks every holder to remove
@@ -431,6 +433,10 @@ async fn delete_purge_requests_instance_removal_and_a_dry_run_keeps_the_definiti
         .await
         .expect_err("--force needs --purge");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        refused.message(),
+        "--force and --dry-run apply to --purge; a plain delete removes only the definition"
+    );
 
     let dry = harness
         .control
@@ -496,13 +502,25 @@ async fn instance_removal_targets_one_worker_or_says_why_not() {
         .await
         .expect_err("too old");
     assert_eq!(old.code(), tonic::Code::FailedPrecondition);
-    for (worker, workspace) in [(None, Some(workspace.as_str())), (Some("new-worker"), None)] {
+    for (worker, workspace, why) in [
+        (
+            None,
+            Some(workspace.as_str()),
+            "an instance removal names its worker",
+        ),
+        (
+            Some("new-worker"),
+            None,
+            "an instance removal names its workspace",
+        ),
+    ] {
         let refused = harness
             .control
             .remove_workspace_instance(remove(worker, workspace))
             .await
             .expect_err("both are required");
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert_eq!(refused.message(), why);
     }
 }
 
@@ -738,4 +756,146 @@ async fn a_prewarm_lists_its_instance_as_requested() {
         i32::from(WorkspaceInstanceState::Materializing)
     );
     assert_eq!(listed[0].detail, "materialization requested");
+}
+
+/// A plain delete requests no purge; a purge commands exactly the holders
+/// of the deleted Definition — not a Worker holding only another one — and
+/// its command carries the Server's configured policy.
+#[tokio::test]
+async fn a_purge_commands_only_its_definitions_holders_under_the_configured_policy() {
+    let core = crate::common::core()
+        .expect("a core")
+        .with_workspace_policy(horde_server::workspace_policy::WorkspacePolicyConfig {
+            fetch_throttle: std::time::Duration::from_secs(7),
+            ..horde_server::workspace_policy::WorkspacePolicyConfig::default()
+        });
+    let mut harness = crate::common::connect_to(core).await.expect("a harness");
+    let workspace = plain_workspace(&mut harness).await.expect("a workspace");
+    let other = other_workspace(&mut harness).await.expect("another");
+    register(&mut harness, "holder", 2)
+        .await
+        .expect("registers");
+    report_instance(&mut harness, "holder", &workspace)
+        .await
+        .expect("reports");
+    register(&mut harness, "bystander", 2)
+        .await
+        .expect("registers");
+    report_instance(&mut harness, "bystander", &other)
+        .await
+        .expect("reports");
+    let etag_of = |harness: &mut Harness, id: &str| {
+        let mut control = harness.control.clone();
+        let id = id.to_owned();
+        async move {
+            control
+                .get_workspace_definition(horde_proto::v1::GetWorkspaceDefinitionRequest {
+                    workspace_definition_id: Some(WorkspaceDefinitionId::new(id)),
+                    name: String::new(),
+                })
+                .await
+                .expect("exists")
+                .into_inner()
+                .definition
+                .map(|d| d.etag)
+                .unwrap_or_default()
+        }
+    };
+
+    let etag = etag_of(&mut harness, &other).await;
+    let plain = harness
+        .control
+        .delete_workspace_definition(DeleteWorkspaceDefinitionRequest {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new(&other)),
+            etag,
+            ..DeleteWorkspaceDefinitionRequest::default()
+        })
+        .await
+        .expect("deleted")
+        .into_inner();
+    assert!(
+        plain.purge_request_id.is_empty(),
+        "a plain delete purges nothing"
+    );
+
+    let etag = etag_of(&mut harness, &workspace).await;
+    let purge = harness
+        .control
+        .delete_workspace_definition(DeleteWorkspaceDefinitionRequest {
+            workspace_definition_id: Some(WorkspaceDefinitionId::new(&workspace)),
+            etag,
+            purge: true,
+            ..DeleteWorkspaceDefinitionRequest::default()
+        })
+        .await
+        .expect("purged")
+        .into_inner();
+    let mut holder = commands_of(&mut harness, "holder")
+        .await
+        .expect("the stream opens");
+    let first = next_command(&mut holder).await.expect("a command in time");
+    let Some(Command::WorkspaceGc(gc)) = first.command else {
+        panic!("the purge, got {first:?}");
+    };
+    assert_eq!(gc.request_id, purge.purge_request_id);
+    assert!(gc.remove_instance);
+    assert_eq!(
+        gc.policy
+            .as_ref()
+            .and_then(|p| p.fetch_throttle)
+            .map(|d| d.seconds),
+        Some(7),
+        "the configured policy, not the built-in one"
+    );
+
+    // The bystander's first gc is one asked of it by name: the purge never
+    // reached it.
+    let asked = harness
+        .control
+        .collect_workspace_garbage(CollectWorkspaceGarbageRequest {
+            worker_ids: vec![WorkerId::new("bystander")],
+            level: GcLevel::Soft.into(),
+            ..CollectWorkspaceGarbageRequest::default()
+        })
+        .await
+        .expect("accepted")
+        .into_inner();
+    let mut bystander = commands_of(&mut harness, "bystander")
+        .await
+        .expect("the stream opens");
+    let first = next_command(&mut bystander)
+        .await
+        .expect("a command in time");
+    let Some(Command::WorkspaceGc(gc)) = first.command else {
+        panic!("a gc, got {first:?}");
+    };
+    assert_eq!(gc.request_id, asked.request_id);
+}
+
+/// A spawn naming a branch but no workspace is refused: there is nowhere
+/// to check the branch out.
+#[tokio::test]
+async fn a_branch_without_a_workspace_is_refused() {
+    let mut harness = connect().await.expect("a harness");
+    let (session, _root) = seed(&mut harness, "nowhere", "k-nowhere")
+        .await
+        .expect("a session");
+    let refused = spawn(
+        &mut harness,
+        &session,
+        AgentSpec {
+            branch: "feat/x".to_owned(),
+            ..AgentSpec::default()
+        },
+    )
+    .await
+    .expect_err("no workspace");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .contains("a branch, base, repo list or lazy mode needs a workspace"),
+        "{}",
+        refused.message()
+    );
 }

@@ -54,11 +54,15 @@ impl Default for WorkspacePolicyConfig {
     }
 }
 
+/// A duration on the wire; one past the wire's range saturates to its
+/// largest.
 fn wire(duration: Duration) -> horde_proto::prost_types::Duration {
-    horde_proto::prost_types::Duration {
-        seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-        nanos: i32::try_from(duration.subsec_nanos()).unwrap_or(0),
-    }
+    horde_proto::prost_types::Duration::try_from(duration).unwrap_or(
+        horde_proto::prost_types::Duration {
+            seconds: i64::MAX,
+            nanos: 999_999_999,
+        },
+    )
 }
 
 /// The policy a command carries: built-in defaults, then the Server's
@@ -250,15 +254,12 @@ pub fn validate_definition_fields(
 /// another agent's default name: at most 200 bytes, no leading `-`, no
 /// `..`, no control or space characters, none of `~^:?*[\`, not ending in
 /// `.lock` or `/`, not `HEAD`, and not under `horde/` unless it is
-/// `horde/<this agent>`.
+/// `horde/<this agent>`. An empty branch (none asked for) breaks no rule.
 ///
 /// # Errors
 ///
 /// [`ServerError::Invalid`] saying which rule.
 pub fn validate_branch(branch: &str, agent_id: &str) -> Result<(), ServerError> {
-    if branch.is_empty() {
-        return Ok(());
-    }
     let refuse = |why: &str| Err(ServerError::Invalid(format!("branch {branch:?} {why}")));
     if branch.len() > 200 {
         return refuse("is longer than 200 bytes");
@@ -622,5 +623,141 @@ mod tests {
             ..AgentSpec::default()
         };
         assert!(validated_spawn(shared_plain, Some(&two), "a").is_ok());
+    }
+
+    #[test]
+    fn a_duration_reaches_the_wire_whole_and_saturates_past_its_range() {
+        let exact = wire(Duration::new(7, 5));
+        assert_eq!((exact.seconds, exact.nanos), (7, 5));
+        let largest = wire(Duration::MAX);
+        assert_eq!((largest.seconds, largest.nanos), (i64::MAX, 999_999_999));
+    }
+
+    #[test]
+    fn a_repo_without_a_layout_is_laid_out_at_its_name() {
+        let repos = vec![repo("atlas", "")];
+        assert!(validate_unmanaged_paths(&repos, &["data".to_owned()]).is_ok());
+        assert!(
+            validate_unmanaged_paths(&repos, &["atlas/build".to_owned()]).is_err_and(|e| e
+                .to_string()
+                .contains("overlaps the repo laid out at \"atlas\""))
+        );
+    }
+
+    #[test]
+    fn a_reclaim_argv_says_what_is_wrong_with_it() {
+        let argv = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let why = |argv: &[String]| reclaim_argv_shortfall(argv, &[]);
+        assert_eq!(why(&[]).as_deref(), Some("is empty"));
+        assert_eq!(
+            why(&vec!["x".to_owned(); 65]).as_deref(),
+            Some("has more than 64 entries")
+        );
+        // One byte past 4 KiB: "make" and 4093 more.
+        assert_eq!(
+            why(&argv(&["make", &"a".repeat(4093)])).as_deref(),
+            Some("is longer than 4 KiB")
+        );
+        assert_eq!(
+            why(&argv(&["make", "a\0b"])).as_deref(),
+            Some("contains a NUL byte")
+        );
+        // Only the program must be bare or absolute; its arguments may be
+        // any relative path.
+        assert_eq!(why(&argv(&["make", "./build", "bin/x"])), None);
+    }
+
+    #[test]
+    fn a_refused_branch_says_which_rule() {
+        for (bad, why) in [
+            ("a".repeat(201), "is longer than 200 bytes"),
+            ("-x".to_owned(), "starts with '-' or '/'"),
+            ("a..b".to_owned(), "contains '..', '//' or '@{'"),
+            (
+                "a b".to_owned(),
+                "contains a control character, a space, or one of ~^:?*[\\",
+            ),
+            ("a.lock".to_owned(), "ends with .lock, '/' or '.'"),
+            ("HEAD".to_owned(), "is HEAD"),
+            (
+                "horde/agent-2".to_owned(),
+                "is under horde/, which names other agents' default branches",
+            ),
+        ] {
+            let error = validate_branch(&bad, "agent-1").expect_err(&bad);
+            assert_eq!(
+                error.to_string(),
+                format!("invalid request: branch {bad:?} {why}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_spawn_says_why() {
+        let two = definition(&["atlas", "proto"]);
+        let message = |spec: AgentSpec, definition: Option<&WorkspaceDefinition>| {
+            validated_spawn(spec, definition, "a")
+                .expect_err("refused")
+                .to_string()
+        };
+        assert_eq!(
+            message(
+                AgentSpec {
+                    branch: "feat".to_owned(),
+                    ..AgentSpec::default()
+                },
+                None
+            ),
+            "invalid request: a branch, base, repo list or lazy mode needs a workspace"
+        );
+        assert_eq!(
+            message(
+                AgentSpec {
+                    branch: "feat".to_owned(),
+                    checkout_policy: CheckoutPolicy::Shared.into(),
+                    ..AgentSpec::default()
+                },
+                Some(&two)
+            ),
+            "invalid request: the shared policy works in the instance itself: it takes no \
+             branch, base, repo list or lazy mode"
+        );
+        assert_eq!(
+            message(
+                AgentSpec {
+                    checkout_repos: vec!["ghost".to_owned()],
+                    ..AgentSpec::default()
+                },
+                Some(&two)
+            ),
+            "invalid request: no repo \"ghost\" in workspace suite; valid repos: atlas, proto"
+        );
+        assert_eq!(
+            message(
+                AgentSpec {
+                    repo_bases: vec![base("ghost", "main")],
+                    ..AgentSpec::default()
+                },
+                Some(&two)
+            ),
+            "invalid request: a base names repo \"ghost\" in workspace suite; valid repos: \
+             atlas, proto"
+        );
+    }
+
+    #[test]
+    fn a_spawn_may_name_any_of_its_workspaces_repos() {
+        let two = definition(&["atlas", "proto"]);
+        let spec = AgentSpec {
+            checkout_repos: vec!["proto".to_owned()],
+            repo_bases: vec![base("proto", "main")],
+            ..AgentSpec::default()
+        };
+        let valid = validated_spawn(spec, Some(&two), "a").expect("valid");
+        assert_eq!(valid.checkout_repos, vec!["proto".to_owned()]);
+        assert_eq!(
+            valid.repo_bases[0].repo_name, "proto",
+            "a named base keeps its repo"
+        );
     }
 }

@@ -249,6 +249,86 @@ mod tests {
         assert_eq!(newer.targeted, vec!["v3"]);
     }
 
+    fn core_holding(holders: &[(&str, &str)]) -> ServerCore {
+        let core = ServerCore::new(crate::log::EventLog::in_memory().expect("in-memory log"));
+        for (worker, definition) in holders {
+            core.instances
+                .record(&horde_proto::v1::WorkspaceInstanceReport {
+                    worker_id: Some(WorkerId::new(*worker)),
+                    workspace_definition_id: Some(WorkspaceDefinitionId::new(*definition)),
+                    state: horde_proto::v1::WorkspaceInstanceState::Ready.into(),
+                    ..horde_proto::v1::WorkspaceInstanceReport::default()
+                });
+        }
+        core
+    }
+
+    /// Asked-for Workers are taken as asked, sorted and once each; asking
+    /// for none means every holder of the Definition.
+    #[test]
+    fn a_request_names_its_asked_workers_or_else_the_holders() {
+        let core = core_holding(&[("worker-b", "ws-1"), ("worker-c", "ws-2")]);
+        let asked = [
+            WorkerId::new("worker-z"),
+            WorkerId::new("worker-a"),
+            WorkerId::new("worker-z"),
+        ];
+        assert_eq!(
+            workers_for(&core, &asked, Some("ws-1")),
+            vec!["worker-a", "worker-z"]
+        );
+        assert_eq!(workers_for(&core, &[], Some("ws-1")), vec!["worker-b"]);
+        assert_eq!(workers_for(&core, &[], None), vec!["worker-b", "worker-c"]);
+    }
+
+    /// The request lands in the housekeeping stream as exactly what was
+    /// asked: no agent of its own and no claimed time, only the log's.
+    #[tokio::test]
+    async fn a_gc_request_is_appended_as_asked() {
+        use prost::Message as _;
+        let core = core_holding(&[]);
+        let targets = Targets {
+            targeted: vec!["worker-a".to_owned()],
+            offline: vec!["worker-b".to_owned()],
+            unsupported: vec!["worker-c".to_owned()],
+        };
+        let (request_id, sequence) = request_gc(
+            &core,
+            GcAsk::removal("ws-1".to_owned(), true, false, "alice".to_owned()),
+            &targets,
+        )
+        .await
+        .expect("appends");
+        let stored = core
+            .log
+            .read_all(horde_proto::WORKSPACE_HOUSEKEEPING_STREAM)
+            .await
+            .expect("reads");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sequence, sequence);
+        let event = Event::decode(stored[0].payload.as_slice()).expect("decodes");
+        assert_eq!(
+            event,
+            Event {
+                agent_id: None,
+                occurred_at: None,
+                idempotency_key: String::new(),
+                kind: Some(Kind::WorkspaceGcRequested(WorkspaceGcRequested {
+                    request_id,
+                    worker_ids: vec![WorkerId::new("worker-a"), WorkerId::new("worker-b")],
+                    workspace_definition_id: Some(WorkspaceDefinitionId::new("ws-1")),
+                    agent_ids: Vec::new(),
+                    level: GcLevel::Hard.into(),
+                    force: true,
+                    dry_run: false,
+                    remove_instance: true,
+                    include_pins: false,
+                    requested_by: "alice".to_owned(),
+                })),
+            }
+        );
+    }
+
     fn state_with(agent: &str, branch: &str, definition: &str) -> SessionState {
         let mut state = SessionState {
             session_id: "s1".to_owned(),

@@ -351,7 +351,9 @@ impl InstanceCache {
             .unwrap_or_default()
     }
 
-    /// The Workers holding an Instance — of one definition, or of any.
+    /// The Workers holding an Instance — of one definition, or of any —
+    /// sorted and once each: the cache is keyed worker first, so a worker's
+    /// reports are already adjacent and in order.
     #[must_use]
     pub fn holders(&self, workspace_definition_id: Option<&str>) -> Vec<String> {
         let mut workers: Vec<String> = self
@@ -359,7 +361,6 @@ impl InstanceCache {
             .into_iter()
             .filter_map(|report| report.worker_id.map(|id| id.to_string()))
             .collect();
-        workers.sort();
         workers.dedup();
         workers
     }
@@ -791,6 +792,12 @@ mod tests {
         assert_eq!(cache.filesystem_of("worker-a"), Some((20, 100)));
         assert_eq!(cache.filesystem_of("worker-b"), Some((70, 900)));
         assert_eq!(cache.filesystem_of("worker-c"), None);
+        cache.record(&sized("worker-c", "ws-1", 0, 1, 1));
+        assert_eq!(
+            cache.filesystem_of("worker-c"),
+            Some((0, 1)),
+            "a one-byte filesystem is still a sized report"
+        );
     }
 
     #[test]

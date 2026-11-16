@@ -1120,6 +1120,64 @@ mod tests {
         assert_eq!(defaults.floor_bytes, 2 << 30);
     }
 
+    /// The share is exact at its boundaries: `free` equal to the share is
+    /// not pressured, one byte under is, and a share past `u64` saturates.
+    #[test]
+    fn the_pressure_share_is_exact_at_its_boundaries() {
+        let share = |basis_points| DiskPlacement {
+            pressure_basis_points: basis_points,
+            pressure_bytes: 0,
+            floor_bytes: 0,
+        };
+        assert!(share(1_000).pressured(0, 10), "10% of 10 is 1");
+        assert!(!share(10_000).pressured(9, 9), "all of 9 is 9");
+        assert!(!share(1_000).pressured(1_000, 10_000));
+        assert!(!share(1_000).pressured(999, 9_999), "10% of 9999 is 999");
+        assert!(share(10_000).pressured(9_999, 10_000));
+        assert!(
+            share(20_000).pressured(u64::MAX - 1, u64::MAX),
+            "twice the disk saturates to u64::MAX"
+        );
+    }
+
+    /// A Worker that registered any disk at all is held to the floor by its
+    /// registration until it reports; a whole protocol below 2 is refused,
+    /// 1 included.
+    #[test]
+    fn a_one_byte_disk_counts_and_protocol_one_is_too_old() {
+        let floor = harness();
+        let scheduler = floor.scheduler.clone().with_disk_placement(DiskPlacement {
+            pressure_basis_points: 0,
+            pressure_bytes: 0,
+            floor_bytes: 100,
+        });
+        let mut tiny = capabilities(&[]);
+        tiny.workspace_free_bytes = 0;
+        tiny.workspace_total_bytes = 1;
+        floor.registry.register("tiny", tiny);
+        let constraints = PlacementConstraints::default();
+        let request = PlacementRequest {
+            constraints: &constraints,
+            workspace_definition_id: Some("ws-1"),
+            ..request_defaults()
+        };
+        let reason = queued_reason(scheduler.place(&request));
+        assert!(reason.contains("below the 100-byte floor"), "{reason}");
+
+        let harness = harness();
+        let mut one = capabilities(&[]);
+        one.workspace_protocol = 1;
+        harness.registry.register("one", one);
+        let request = PlacementRequest {
+            constraints: &constraints,
+            workspace_definition_id: Some("ws-1"),
+            needs_workspace_protocol: true,
+            ..request_defaults()
+        };
+        let reason = queued_reason(harness.scheduler.place(&request));
+        assert!(reason.contains("workspace protocol 1"), "{reason}");
+    }
+
     /// A spawn naming a base, branch, lazy mode or repos is placed only on a
     /// worker that speaks workspace protocol 2; the refusal says why.
     #[test]
