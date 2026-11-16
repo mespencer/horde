@@ -557,22 +557,13 @@ async fn stood_up(environment: &UpEnvironment) -> (Result<(), crate::ClientError
     (outcome, lines)
 }
 
-/// The whole first boot, in process: the bootstrap token riding the
-/// filesystem, the client enrolled for real, readiness proven by a Hello,
-/// a worker token minted through the real control plane and handed over
-/// the environment — and it actually redeems. Teardown is proven by the
-/// SIGTERM marks both scripted daemons leave.
-#[tokio::test(flavor = "multi_thread")]
-async fn stand_up_boots_enrolls_mints_and_tears_down_what_it_started() {
-    let harness = horde_server_testkit::secure::serve_secured()
-        .await
-        .expect("a secured server");
-    let main_port = port_of(&harness.main_endpoint());
-    let enrollment_port = port_of(&harness.enrollment_endpoint());
-    let root = tempfile::tempdir().expect("a temp dir");
-    let paths = paths_under(root.path(), None);
+/// Mints the operator's bootstrap code on `harness` and leaves its join
+/// token where a started server would, returning the server's fingerprint.
+async fn planted_bootstrap_token(
+    harness: &horde_server_testkit::secure::SecureHarness,
+    paths: &UpPaths,
+) -> String {
     std::fs::create_dir_all(&paths.server_state).expect("the server state dir");
-
     let operator =
         horde_identity::Principal::new(horde_identity::PrincipalRole::Client, "operator")
             .expect("a valid name");
@@ -590,14 +581,27 @@ async fn stand_up_boots_enrolls_mints_and_tears_down_what_it_started() {
         format!("{}\n", harness.join_token(&minted)),
     )
     .expect("the token files");
+    minted.server_fingerprint
+}
+
+/// The whole first boot, in process: the bootstrap token riding the
+/// filesystem, the client enrolled for real, readiness proven by a Hello,
+/// a worker token minted through the real control plane and handed over
+/// the environment — and it actually redeems. Teardown is proven by the
+/// SIGTERM marks both scripted daemons leave.
+#[tokio::test(flavor = "multi_thread")]
+async fn stand_up_boots_enrolls_mints_and_tears_down_what_it_started() {
+    let harness = horde_server_testkit::secure::serve_secured()
+        .await
+        .expect("a secured server");
+    let main_port = port_of(&harness.main_endpoint());
+    let enrollment_port = port_of(&harness.enrollment_endpoint());
+    let root = tempfile::tempdir().expect("a temp dir");
+    let paths = paths_under(root.path(), None);
+    let fingerprint = planted_bootstrap_token(&harness, &paths).await;
 
     let token_out = root.path().join("worker-token");
-    let server_binary = announcing_server(
-        root.path(),
-        main_port,
-        enrollment_port,
-        &minted.server_fingerprint,
-    );
+    let server_binary = announcing_server(root.path(), main_port, enrollment_port, &fingerprint);
     let worker_binary = fake_daemon(
         root.path(),
         "worker",
@@ -1085,24 +1089,7 @@ async fn a_server_dying_during_the_hello_wait_fails_with_its_output() {
         .port();
     let root = tempfile::tempdir().expect("a temp dir");
     let paths = paths_under(root.path(), None);
-    std::fs::create_dir_all(&paths.server_state).expect("the server state dir");
-    let operator =
-        horde_identity::Principal::new(horde_identity::PrincipalRole::Client, "operator")
-            .expect("a valid name");
-    let minted = harness
-        .authority
-        .mint(
-            &operator,
-            0,
-            horde_server::service::enrollment::wall_clock_ms(),
-        )
-        .await
-        .expect("the bootstrap mint");
-    std::fs::write(
-        paths.server_state.join("bootstrap-token"),
-        format!("{}\n", harness.join_token(&minted)),
-    )
-    .expect("the token files");
+    let fingerprint = planted_bootstrap_token(&harness, &paths).await;
 
     let dies = root.path().join("die-now");
     let server_binary = fake_daemon(
@@ -1112,7 +1099,7 @@ async fn a_server_dying_during_the_hello_wait_fails_with_its_output() {
         &[
             format!("listening main=127.0.0.1:{silent_port}"),
             format!("listening enrollment=127.0.0.1:{enrollment_port}"),
-            format!("server-fingerprint {}", minted.server_fingerprint),
+            format!("server-fingerprint {fingerprint}"),
         ],
         Some(&format!(
             "while [ ! -f {} ]; do sleep 0.05; done; echo 'dying now'; exit 4",

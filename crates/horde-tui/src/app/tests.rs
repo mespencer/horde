@@ -1133,6 +1133,12 @@ fn rpc_answers_land_where_the_views_read_them() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     assert_eq!(app.selected(Screen::Forwards), 2);
+    app.apply(Update::Forwards(forwards(2)));
+    assert_eq!(
+        app.selected(Screen::Forwards),
+        1,
+        "one fewer moves the selection to the new last row"
+    );
     app.apply(Update::Forwards(forwards(1)));
     assert_eq!(
         app.selected(Screen::Forwards),
@@ -1441,22 +1447,6 @@ fn a_created_session_is_known_and_attached_at_its_root() {
     assert!(app.session("s9").is_some());
     assert_eq!(attached_to(&app), Some(("s9", None)));
     assert_eq!(app.replay_cursors(), vec![("s9".to_owned(), 1)]);
-}
-
-/// A list shrinking by one under its last row selects the new last row.
-#[test]
-fn a_list_shrinking_by_one_selects_its_new_last_row() {
-    let mut app = App::overview();
-    let forwards = |count: usize| {
-        (0..count)
-            .map(|_| horde_proto::v1::ForwardStatus::default())
-            .collect::<Vec<_>>()
-    };
-    app.apply(Update::Forwards(forwards(3)));
-    press(&mut app, KeyCode::Char('f'));
-    downs(&mut app, 2);
-    app.apply(Update::Forwards(forwards(2)));
-    assert_eq!(app.selected(Screen::Forwards), 1);
 }
 
 /// The logs screen asks for the server's log on the way in and on `r`, and

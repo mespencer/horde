@@ -826,18 +826,14 @@ mod tests {
         )
         .await
         .expect("a registered worker");
+        let docs = horde_proto::v1::ForwardSpec {
+            name: "docs".to_owned(),
+            worker_port: 3000,
+            direction: horde_proto::v1::ForwardDirection::Expose.into(),
+            ..horde_proto::v1::ForwardSpec::default()
+        };
         client
-            .open_forward(
-                &session_id,
-                &root.to_string(),
-                horde_proto::v1::ForwardSpec {
-                    direction: horde_proto::v1::ForwardDirection::Expose as i32,
-                    name: "vite".to_owned(),
-                    worker_port: 5173,
-                    client_port: 8080,
-                },
-                "open-1",
-            )
+            .open_forward(&session_id, &root.to_string(), docs, "fwd-docs")
             .await
             .expect("a forward");
 
