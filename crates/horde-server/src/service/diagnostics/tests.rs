@@ -554,6 +554,27 @@ async fn the_lift_hands_every_frame_to_the_client() {
     );
 }
 
+/// The next query a dispatch stream carries, bounded.
+async fn next_query(stream: &mut super::LogRequestsStream) -> String {
+    tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("a query arrives")
+        .expect("the stream is open")
+        .expect("ok")
+        .query
+        .expect("the query rides the response")
+        .request_id
+}
+
+/// Waits, bounded, until `worker` is away.
+async fn until_away(registry: &LogRegistry, worker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(registry.lane(worker), LaneState::Away(Some(_))) {
+        assert!(Instant::now() < deadline, "{worker} never went away");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// A worker's dispatch stream carries every query pushed down its lane,
 /// and the worker is away once the stream is dropped.
 #[tokio::test]
@@ -563,31 +584,18 @@ async fn a_dispatch_stream_carries_queries_until_dropped() {
     let LaneState::Connected(lane) = core.logs.registry.lane("w5") else {
         panic!("the stream registers the worker's lane");
     };
-    for id in ["q1", "q2"] {
-        lane.try_send(LogQuery {
-            request_id: id.to_owned(),
-            ..LogQuery::default()
-        })
-        .expect("queued");
-    }
-    for id in ["q1", "q2"] {
-        let query = tokio::time::timeout(Duration::from_secs(10), stream.next())
-            .await
-            .expect("a query arrives")
-            .expect("the stream is open")
-            .expect("ok")
-            .query
-            .expect("the query rides the response");
-        assert_eq!(query.request_id, id);
-    }
+    let query = |id: &str| LogQuery {
+        request_id: id.to_owned(),
+        ..LogQuery::default()
+    };
+    lane.try_send(query("q1")).expect("queued");
+    lane.try_send(query("q2")).expect("queued");
+    assert_eq!(next_query(&mut stream).await, "q1");
+    assert_eq!(next_query(&mut stream).await, "q2");
     drop(stream);
     // One more query wakes the pump, which finds the worker gone.
     let _ = lane.try_send(LogQuery::default());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !matches!(core.logs.registry.lane("w5"), LaneState::Away(Some(_))) {
-        assert!(Instant::now() < deadline, "the worker never went away");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    until_away(&core.logs.registry, "w5").await;
 }
 
 fn open_frame(request_id: &str) -> WorkerLogTunnelRequest {
