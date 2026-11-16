@@ -401,9 +401,10 @@ async fn attached_pty(endpoint: &str, title: &str) -> Setup<PtyProcess> {
     Ok(horde)
 }
 
-/// Ctrl-C twice: the first may only clear a half-typed compose box.
+/// Ctrl-C, once: every caller leaves the compose box empty, so it quits.
+/// (A second one could land after the TUI had restored the terminal, where
+/// the line discipline makes it a real SIGINT to the exiting process.)
 async fn quit(mut horde: PtyProcess) -> Setup<()> {
-    horde.type_bytes(&[0x03])?;
     horde.type_bytes(&[0x03])?;
     await_restored(&mut horde).await?;
     let status = horde.exit_status().await?;
