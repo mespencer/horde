@@ -116,15 +116,16 @@ impl OutputShaper {
             // it from terminating. Never 0 — the limit is at least 4 and no
             // character is longer — so every pass shortens the held text.
             // Never absent either, since the first character starts at 0; a
-            // walk that found no cut would send the whole text, which also
-            // ends the loop, where a cut at 0 would emit empty chunks forever.
+            // walk that found no cut falls back to the limit itself, which
+            // still shortens the text, where a cut at 0 would emit empty
+            // chunks forever.
             let cut = held
                 .text
                 .char_indices()
                 .map(|(at, _)| at)
                 .take_while(|at| *at <= self.max_chunk_bytes)
                 .last()
-                .unwrap_or(held.text.len());
+                .unwrap_or(self.max_chunk_bytes);
             let rest = held.text.split_off(cut);
             let chunk = std::mem::replace(&mut held.text, rest);
             let (turn_id, channel) = (held.turn_id.clone(), held.channel);
