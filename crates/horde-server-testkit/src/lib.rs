@@ -33,6 +33,9 @@ pub mod process;
 pub mod ps;
 pub mod pty;
 pub mod reap;
+// Stand-in scripts go into place through `install`: Unix-only.
+#[cfg(unix)]
+pub mod script;
 pub mod secure;
 
 use horde_cli::Client;

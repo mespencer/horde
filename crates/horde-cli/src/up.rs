@@ -961,6 +961,9 @@ struct WatchedChild {
     name: String,
     child: tokio::process::Child,
     stdout: Arc<Mutex<String>>,
+    /// The task reading `stdout`: finished once the pipe reached its end, so
+    /// everything the child printed is in the buffer.
+    pump: tokio::task::JoinHandle<()>,
     /// Off during bring-up (the server's first lines carry the bootstrap
     /// token, which must not reach a screen), on once the machine is up.
     forwarding: Arc<AtomicBool>,
@@ -994,7 +997,7 @@ impl WatchedChild {
             .ok_or_else(|| spawn_failure(&"no stdout pipe"))?;
         let stdout = Arc::new(Mutex::new(String::new()));
         let forwarding = Arc::new(AtomicBool::new(false));
-        tokio::spawn(pump(
+        let pump = tokio::spawn(pump(
             out,
             name.to_owned(),
             Arc::clone(&stdout),
@@ -1005,6 +1008,7 @@ impl WatchedChild {
             name: name.to_owned(),
             child,
             stdout,
+            pump,
             forwarding,
         })
     }
@@ -1014,8 +1018,15 @@ impl WatchedChild {
     }
 
     /// The refusal for a child that has exited, carrying what it printed —
-    /// `None` while it runs.
+    /// `None` while it runs, and until its stdout has been read to the end:
+    /// the lines a dying child printed last are the ones that say why, and
+    /// they can still be in the pipe when its exit is seen. (A process it
+    /// left behind holding the pipe keeps it unreported; the caller's
+    /// ceiling ends that wait with the output so far.)
     fn exit_report(&mut self) -> Option<ClientError> {
+        if !self.pump.is_finished() {
+            return None;
+        }
         let status = self.child.try_wait().ok().flatten()?;
         Some(ClientError::Up(format!(
             "{} exited ({status}) during bring-up; its output:\n{}",
