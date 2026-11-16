@@ -111,21 +111,11 @@ impl OutputShaper {
             && held.text.len() > self.max_chunk_bytes
         {
             // The last character start at or under the limit: the last cut
-            // that fits. Read off a finite walk of the text rather than a
-            // backwards scan from the limit, so no mutation of it can keep
-            // it from terminating. Never 0 — the limit is at least 4 and no
-            // character is longer — so every pass shortens the held text.
-            // Never absent either, since the first character starts at 0; a
-            // walk that found no cut falls back to the limit itself, which
-            // still shortens the text, where a cut at 0 would emit empty
-            // chunks forever.
-            let cut = held
-                .text
-                .char_indices()
-                .map(|(at, _)| at)
-                .take_while(|at| *at <= self.max_chunk_bytes)
-                .last()
-                .unwrap_or(self.max_chunk_bytes);
+            // that fits. Never 0 — the limit is at least 4 and no character
+            // is longer — so every pass shortens the held text. The standard
+            // library finds it, so there is no scan here for a mutant to
+            // keep from terminating.
+            let cut = held.text.floor_char_boundary(self.max_chunk_bytes);
             let rest = held.text.split_off(cut);
             let chunk = std::mem::replace(&mut held.text, rest);
             let (turn_id, channel) = (held.turn_id.clone(), held.channel);
