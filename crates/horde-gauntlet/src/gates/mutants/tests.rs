@@ -405,6 +405,90 @@ fn selection_names_packages_or_the_whole_workspace() {
     );
 }
 
+#[test]
+fn a_narrowed_run_is_judged_by_its_packages_and_the_owners_of_what_they_spawn() {
+    assert_eq!(run_selection(&[]), vec!["--workspace"]);
+    assert_eq!(
+        run_selection(&["a".to_owned()]),
+        vec!["--package", "a", "--test-package", "a"],
+        "naming any test package replaces gamma's default, so the package itself is named"
+    );
+    assert_eq!(
+        run_selection(&["horde-worker".to_owned(), "a".to_owned()]),
+        vec![
+            "--package",
+            "horde-worker",
+            "--package",
+            "a",
+            "--test-package",
+            "a",
+            "--test-package",
+            "horde-mcp",
+            "--test-package",
+            "horde-worker",
+        ]
+    );
+}
+
+/// Every `product_binary("<owner>", ...)` call in a workspace crate, as
+/// (calling crate, owner), where the owner is another workspace crate.
+fn cross_package_spawns(root: &Path) -> BTreeSet<(String, String)> {
+    const CALL: &str = "product_binary(";
+    let mut found = BTreeSet::new();
+    let crates = root.join("crates");
+    let mut pending = vec![crates.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a readable directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let caller = path
+                .strip_prefix(&crates)
+                .expect("under crates/")
+                .components()
+                .next()
+                .expect("a crate directory")
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(&path).expect("a readable source file");
+            for (at, _) in text.match_indices(CALL) {
+                let Some(quoted) = text[at + CALL.len()..].trim_start().strip_prefix('"') else {
+                    continue;
+                };
+                let owner = quoted.split('"').next().unwrap_or_default().to_owned();
+                if owner != caller && crates.join(&owner).join("Cargo.toml").is_file() {
+                    found.insert((caller.clone(), owner));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_cross_package_spawn_in_the_tree_is_listed_with_its_reason() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let listed: BTreeSet<(String, String)> = SPAWNED_BINARIES
+        .iter()
+        .map(|(spawner, owner, why)| {
+            assert!(!why.is_empty(), "{spawner} -> {owner} needs its reason");
+            ((*spawner).to_owned(), (*owner).to_owned())
+        })
+        .collect();
+    let spawns = cross_package_spawns(&root);
+    assert!(
+        spawns.contains(&("horde-worker".to_owned(), "horde-mcp".to_owned())),
+        "the scan finds the hub link's stub server: {spawns:?}"
+    );
+    assert_eq!(listed, spawns);
+}
+
 /// The responses for a branch whose diff against its merge-base is `diff`.
 fn on_a_branch(diff: &str) -> Vec<CommandOutput> {
     vec![ok("branchpoint\n"), ok("tip\n"), ok(diff)]

@@ -120,6 +120,48 @@ pub const SKIPPED_TESTS: &[(&str, &str)] = &[(
      it tests reap.rs, which is never mutated",
 )];
 
+/// Product binaries a package's suite spawns from another package, as
+/// (spawning package, owning package), each with why.
+///
+/// `horde_server_testkit::process::product_binary` looks for such a binary
+/// beside the test binary. Gamma builds only the packages whose tests decide
+/// its verdicts, so a run narrowed to the spawning package would build no copy
+/// of the binary, and the suite would fail its baseline before any mutant was
+/// judged. A narrowed run therefore names each owner as a test package too. A
+/// test holds this list to every cross-package `product_binary` call in the tree.
+pub const SPAWNED_BINARIES: &[(&str, &str, &str)] = &[
+    (
+        "horde-e2e",
+        "horde-cli",
+        "the end-to-end suite drives the real `horde` CLI",
+    ),
+    (
+        "horde-e2e",
+        "horde-mcp",
+        "the end-to-end hub scenarios connect the server to the stub MCP server",
+    ),
+    (
+        "horde-e2e",
+        "horde-server",
+        "the end-to-end suite runs the real server",
+    ),
+    (
+        "horde-e2e",
+        "horde-worker",
+        "the end-to-end suite runs real workers",
+    ),
+    (
+        "horde-server",
+        "horde-mcp",
+        "the hub's upstream tests spawn the stub MCP server",
+    ),
+    (
+        "horde-worker",
+        "horde-mcp",
+        "the forwarded hub link tests reach the stub MCP server through a real server",
+    ),
+];
+
 /// What a diff-scoped run is measured against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Since {
@@ -384,7 +426,7 @@ fn measure_scope(
     let tally = run(
         ctx,
         runner,
-        &run_spec(ctx, &selection(&packages), scope, settings),
+        &run_spec(ctx, &run_selection(&packages), scope, settings),
     )?;
     let outcome = outcome_of(scope, &tally);
     if *scope == Scope::FullTree && ctx.packages.is_empty() && outcome.label() == "pass" {
@@ -462,6 +504,31 @@ pub fn selection(packages: &[String]) -> Vec<String> {
         .iter()
         .flat_map(|package| ["--package".to_owned(), package.clone()])
         .collect()
+}
+
+/// A run's package selection: [`selection`], and when that names packages,
+/// the packages whose tests judge the mutants.
+///
+/// Those are the selected packages themselves — gamma's own default, which
+/// naming any test package replaces — and the owners of every binary their
+/// suites spawn ([`SPAWNED_BINARIES`]), so that gamma builds those binaries.
+pub fn run_selection(packages: &[String]) -> Vec<String> {
+    let mut args = selection(packages);
+    let judges: BTreeSet<&str> = packages
+        .iter()
+        .map(String::as_str)
+        .chain(
+            SPAWNED_BINARIES
+                .iter()
+                .filter(|(spawner, ..)| packages.iter().any(|package| package == spawner))
+                .map(|(_, owner, _)| *owner),
+        )
+        .collect();
+    for judge in judges {
+        args.push("--test-package".to_owned());
+        args.push(judge.to_owned());
+    }
+    args
 }
 
 /// The arguments a listing and a run share, so a listing describes exactly

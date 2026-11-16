@@ -530,9 +530,22 @@ each test binary, and a binary that fails it stops the whole run. Two causes are
 an orphan, and inside gamma's systemd scope a subreaper adopts it instead, so the gate
 skips that one test (`SKIPPED_TESTS`; it judges only `reap.rs`, which is never mutated);
 and horde-worker's `worker_suite` has been seen, on a heavily loaded machine, to breach
-the 2 GiB baseline guard (half the default cap) and to fail a hub-link test in narrowed
-runs, while passing in the full sweep. If a run stops on a `worker_suite` baseline,
-rerun on a quieter machine or raise `HORDE_MUTANTS_MEMORY_MIB`.
+the 2 GiB baseline guard (half the default cap). If a run stops on a `worker_suite`
+baseline for memory, rerun on a quieter machine or raise `HORDE_MUTANTS_MEMORY_MIB`.
+
+*A narrowed run names its judges.* Gamma builds only the packages whose tests decide
+verdicts, and some suites spawn another package's binary (`product_binary` looks for it
+beside the test binary): horde-worker's hub-link tests reach `mcp_stub_server` through a
+real server. A diff that selected horde-worker alone built no stub server, so every
+narrowed run that touched horde-worker failed its baseline on
+`hub_link::a_forwarded_hub_call_round_trips_and_visibility_fails_closed` ("built but not
+found beside the test binary") while the full sweep, which builds everything, passed. So a
+run that selects packages also passes `--test-package` for each of them and for the owner
+of every binary their suites spawn (`SPAWNED_BINARIES`, which a test holds to every
+cross-package `product_binary` call in the tree). Naming a test package replaces gamma's
+own-package default, so the selected packages are named too; a mutant may then be killed
+by another selected package's suite that reaches it, which only makes the oracle
+stricter.
 
 **Do not edit the tree during a run.** Gamma copies the workspace into its cache at the
 start and re-reads sources while it instruments them. The first pilot sweep died after
