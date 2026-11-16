@@ -533,6 +533,25 @@ mod tests {
         assert!(zero.contains("longer than zero"), "{zero}");
     }
 
+    /// The disk watermark flags parse their percentage and byte halves and
+    /// reach the housekeeping config.
+    #[test]
+    fn disk_watermark_flags_reach_housekeeping() {
+        let set = parsed_with(
+            &[
+                "--workspace-disk-low-watermark",
+                "5%,1GiB",
+                "--workspace-disk-high-watermark",
+                "7%",
+            ],
+            &[],
+        )
+        .expect("parses");
+        let low = set.housekeeping.disk_low_watermark;
+        assert_eq!((low.basis_points, low.bytes), (500, 1 << 30));
+        assert_eq!(set.housekeeping.disk_high_watermark.basis_points, 700);
+    }
+
     /// Where to dial, by precedence: the flag over the variable; neither
     /// leaves it to the stored endpoint at startup. The state dir defaults
     /// under HOME, never the working directory.
