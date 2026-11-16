@@ -1129,6 +1129,48 @@ mod tests {
         );
     }
 
+    /// A request naming no item surfaces under its kind and rpc id, and
+    /// carries every field the request gave: a file change its reason and
+    /// grant root, a permissions request its cwd, a question its words —
+    /// single-choice, since codex has no multi-select.
+    #[test]
+    fn itemless_requests_surface_under_their_kind_and_carry_their_fields() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let mut surfaced = |id: u64, method: &str, params: serde_json::Value| {
+            requested(
+                &feed(
+                    &mut assembler,
+                    json!({"id": id, "method": method, "params": params}),
+                ),
+                method,
+            )
+        };
+        let patch = surfaced(
+            7,
+            "item/fileChange/requestApproval",
+            json!({"turnId":"turn-1","reason":"tidy","grantRoot":"/srv"}),
+        );
+        assert_eq!(patch.tool_call_id.as_str(), "file-change-approval-7");
+        assert_eq!(patch.input["reason"], "tidy");
+        assert_eq!(patch.input["grant_root"], "/srv");
+        let widen = surfaced(
+            8,
+            "item/permissions/requestApproval",
+            json!({"turnId":"turn-1","cwd":"/w","reason":"net","permissions":{}}),
+        );
+        assert_eq!(widen.tool_call_id.as_str(), "permissions-approval-8");
+        assert_eq!(widen.input["cwd"], "/w");
+        assert_eq!(widen.input["reason"], "net");
+        let asked = surfaced(
+            9,
+            "item/tool/requestUserInput",
+            json!({"turnId":"turn-1","questions":[{"id":"q","header":"h","question":"?"}]}),
+        );
+        assert_eq!(asked.tool_call_id.as_str(), "user-input-9");
+        assert!(!asked.questions[0].multi_select, "{asked:?}");
+    }
+
     /// A command is failed if it exited non-zero **or** the harness said so.
     /// Both halves are load-bearing: Codex reports `status: "failed"` for a
     /// sandbox denial that never produced an exit code at all.

@@ -377,18 +377,37 @@ async fn the_sandbox_tier_choice_is_journaled_on_the_first_turn() {
     session.send(TurnInput::queued("go")).await.expect("sends");
 
     let (events, _) = events_through_turn_end(&mut session).await;
-    let diagnostic = events.iter().find_map(|event| match event {
-        AgentEvent::Output {
-            channel: OutputChannel::HarnessDiagnostic,
-            text,
-            ..
-        } => Some(text.clone()),
-        _ => None,
-    });
-    let text = diagnostic.expect("the tier choice must be journaled");
+    let diagnostics: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Output {
+                channel: OutputChannel::HarnessDiagnostic,
+                text,
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let text = diagnostics
+        .first()
+        .expect("the tier choice must be journaled");
     assert!(
         text.contains("workspace-write") && text.contains("builder"),
         "the reason names the tier and the mode that chose it: {text}"
+    );
+    // The exec-approval enforcement is journaled beside it, with why: this
+    // adapter's version was never probed.
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("(\"codex version not probed\")")),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.starts_with("codex exec approvals: sandbox tier only")),
+        "{diagnostics:?}"
     );
 
     session.shutdown().await.expect("shuts down");
@@ -560,7 +579,12 @@ async fn a_denied_exec_approval_declines_on_the_wire_and_records_the_denial() {
         control_log_shows(&log_path, |log| log.contains("\"decision\":\"decline\"")).await;
     assert!(recorded.contains("\"decision\":\"decline\""), "{recorded}");
 
-    let (_, outcome) = events_through_turn_end(&mut session).await;
+    let (events, outcome) = events_through_turn_end(&mut session).await;
+    assert!(
+        events.iter().any(|event| matches!(event,
+            AgentEvent::Output { text, .. } if text.contains(": chain deny → "))),
+        "the journal names what the chain said: {events:?}"
+    );
     let outcome = outcome.expect("the turn finishes after the decline");
     assert_eq!(outcome.denials.len(), 1, "the refusal is the audit record");
     assert_eq!(outcome.denials[0].tool_name, "exec");
@@ -1606,7 +1630,12 @@ mod codex_0167_requests {
             recorded.contains(r#""answers":{"colour":{"answers":["Red"]}}"#),
             "{recorded}"
         );
-        let (_, outcome) = events_through_turn_end(&mut session).await;
+        let (events, outcome) = events_through_turn_end(&mut session).await;
+        assert!(
+            events.iter().any(|event| matches!(event,
+                AgentEvent::Output { text, .. } if text.contains(": chain answer → "))),
+            "the journal names what the chain said: {events:?}"
+        );
         assert!(outcome.is_some());
         session.shutdown().await.expect("shuts down");
     }

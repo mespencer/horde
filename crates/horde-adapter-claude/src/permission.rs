@@ -337,15 +337,29 @@ mod tests {
         assert_eq!(over_mcp.to_proposed_call().questions, call.questions);
     }
 
+    /// Only `AskUserQuestion` asks: another tool whose input happens to
+    /// hold a `questions` array is an ordinary call.
+    #[test]
+    fn only_ask_user_question_is_a_question() {
+        let lookalike = PromptRequest {
+            tool_name: "Write".to_owned(),
+            input: json!({"questions": [{"question": "Overwrite?"}]}),
+            tool_use_id: "t".to_owned(),
+        };
+        assert!(!lookalike.to_proposed_call().is_question());
+    }
+
     #[test]
     fn malformed_questions_are_skipped_not_invented() {
         assert!(ask_user_questions(&json!({})).is_empty());
         assert!(ask_user_questions(&json!({"questions": "nope"})).is_empty());
         let lifted = ask_user_questions(&json!({"questions": [
             {"header": "no text"},
-            {"question": "Bare?", "multiSelect": true}
+            {"question": "Bare?", "multiSelect": true},
+            {"question": "Unsaid?"}
         ]}));
-        assert_eq!(lifted.len(), 1, "a question with no text cannot be keyed");
+        assert_eq!(lifted.len(), 2, "a question with no text cannot be keyed");
+        assert!(!lifted[1].multi_select, "unsaid is single-choice");
         assert_eq!(lifted[0].id, "Bare?");
         assert!(lifted[0].multi_select);
         assert!(lifted[0].options.is_empty());

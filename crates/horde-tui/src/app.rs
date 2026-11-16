@@ -692,8 +692,9 @@ fn choose(permission: Option<&PendingPermission>, digit: char) -> Vec<Directive>
     let [question] = permission.questions.as_slice() else {
         return Vec::new();
     };
-    let label = digit
-        .to_digit(10)
+    // #[gamma::skip(literal.int_increment, reason = "only ASCII digits reach here (both callers check is_ascii_digit), and radix 11 reads 0-9 exactly as radix 10 does")]
+    let number = digit.to_digit(10);
+    let label = number
         .and_then(|number| usize::try_from(number).ok())
         .and_then(|number| number.checked_sub(1))
         .and_then(|index| question.options.get(index));
@@ -892,6 +893,62 @@ mod tests {
         assert!(
             several.on_input(&key(KeyCode::Char('1'))).is_empty(),
             "several questions are answered with `horde answer`"
+        );
+    }
+
+    /// The inbox answers the selected row's question, not its neighbour's,
+    /// and any digit 1-9 names its option.
+    #[test]
+    fn a_digit_answers_the_selected_rows_question() {
+        let nine: [&str; 9] = ["o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8", "o9"];
+        let mut app = App::overview();
+        app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+        app.apply(event_in(
+            "s1",
+            1,
+            "root-1",
+            question_kind("q-1", &[("first", &nine)]),
+        ));
+        app.apply(event_in(
+            "s1",
+            2,
+            "root-1",
+            question_kind("q-2", &[("second", &nine)]),
+        ));
+        app.on_input(&key(KeyCode::Char('i')));
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('9'))),
+            vec![Directive::Answer {
+                request_id: "q-1".to_owned(),
+                answers: std::collections::BTreeMap::from([(
+                    "first".to_owned(),
+                    vec!["o9".to_owned()]
+                )]),
+            }]
+        );
+    }
+
+    /// Attached, the front prompt is the one a digit answers, even when a
+    /// later one is not a question.
+    #[test]
+    fn attached_digits_answer_the_front_prompt() {
+        let mut app = App::attached("s1", None);
+        app.apply(event_in(
+            "s1",
+            1,
+            "root-1",
+            question_kind("q-1", &[("colour", &["Red"])]),
+        ));
+        app.apply(event_in("s1", 2, "root-1", request_kind("req-2")));
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('1'))),
+            vec![Directive::Answer {
+                request_id: "q-1".to_owned(),
+                answers: std::collections::BTreeMap::from([(
+                    "colour".to_owned(),
+                    vec!["Red".to_owned()]
+                )]),
+            }]
         );
     }
 

@@ -708,9 +708,7 @@ async fn adapter_for(
             // Probed, not assumed: the version picks the permission route
             // (stdio from 2.1.323) and a refused version stops the Worker
             // here, loudly, rather than failing every spawn (W12c).
-            let adapter = crate::ClaudeAdapter::new(harness_profile(config, "claude", journal))
-                .probe_version()
-                .await;
+            let adapter = claude_adapter(config, journal).probe_version().await;
             admit_harness(&adapter.version)?;
             Arc::new(adapter)
         }
@@ -730,6 +728,12 @@ async fn adapter_for(
             Arc::new(adapter)
         }
     })
+}
+
+/// The claude adapter a configuration asks for, before its version probe:
+/// launched under the Worker's own claude profile.
+fn claude_adapter(config: &WorkerConfig, journal: &Journal) -> crate::ClaudeAdapter {
+    crate::ClaudeAdapter::new(harness_profile(config, "claude", journal))
 }
 
 /// Where this Worker's git reaches the Relay. An `https://` Relay is the
@@ -1706,6 +1710,18 @@ mod tests {
             vec!["Red", "Blue"]
         );
         assert!(question.multi_select && question.allows_free_text);
+        assert!(!question.secret, "a scripted question is never secret");
+
+        let plain = fake_script(
+            r#"[{"steps": [{"ask_question": {"id": "q-2", "tool": "T",
+                "questions": [{"id": "size", "question": "How big?"}]}}]}]"#,
+        )
+        .expect("a valid question");
+        let horde_adapter_fake::Step::AskQuestion { questions, .. } = &plain.turns[0].steps[0]
+        else {
+            panic!("the step must be the question");
+        };
+        assert!(!questions[0].multi_select, "unsaid is single-choice");
 
         for (json, needle) in [
             (
@@ -1716,11 +1732,52 @@ mod tests {
                 r#"[{"steps": [{"ask_question": {"id": "q", "tool": "T", "questions": []}}]}]"#,
                 "non-empty questions",
             ),
-            (r#"[{"steps": [{"ask_question": {"tool": "T"}}]}]"#, "id"),
+            (
+                r#"[{"steps": [{"ask_question": {"tool": "T"}}]}]"#,
+                "ask_question needs a non-empty id",
+            ),
         ] {
             let refused = fake_script(json).expect_err("must refuse");
             assert!(refused.contains(needle), "{json}: {refused}");
         }
+    }
+
+    /// Each adapter runs under the Worker's own profile for its provider,
+    /// and codex under the configured sandbox tiers.
+    #[test]
+    fn each_adapter_takes_its_own_profile_and_codex_the_configured_sandbox() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
+        config.sandbox = horde_adapter_codex::SandboxPolicy::default()
+            .with_mode("careful", horde_adapter_codex::SandboxTier::ReadOnly);
+        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
+        let codex = super::codex_adapter(&config, &journal);
+        assert_eq!(codex.sandbox_policy, config.sandbox);
+        assert_eq!(
+            codex.profile.root(),
+            crate::harness::HarnessProfile::in_state_dir(state.path(), "codex").root()
+        );
+        let claude = super::claude_adapter(&config, &journal);
+        assert_eq!(
+            claude.profile.root(),
+            crate::harness::HarnessProfile::in_state_dir(state.path(), "claude").root()
+        );
+    }
+
+    /// The fake adapter carries the configured login recipe.
+    #[tokio::test]
+    async fn the_fake_adapter_carries_the_configured_login() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
+        config.fake_login = Some(std::path::PathBuf::from("/bin/fake-login"));
+        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
+        let fake = super::adapter_for(super::AdapterChoice::Fake, &config, &journal)
+            .await
+            .expect("the fake needs no probe");
+        assert_eq!(
+            fake.login_recipe().map(|recipe| recipe.program),
+            Some("/bin/fake-login".to_owned())
+        );
     }
 
     /// A refused harness stops the worker with the version, the floor and

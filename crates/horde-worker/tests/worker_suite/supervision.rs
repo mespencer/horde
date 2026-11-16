@@ -223,7 +223,7 @@ async fn the_account_directory_reaches_the_child() {
 
 #[cfg(test)]
 mod live_session {
-    use super::harness::{spec_for, turn_end};
+    use super::harness::{spec_for, within};
     use horde_adapter::{Adapter, AgentSpec, TurnInput, TurnStatus};
 
     /// A whole turn, from spawn to `TurnEnded`, against a real child.
@@ -253,8 +253,30 @@ mod live_session {
             .await
             .expect("sends");
 
-        let ended = turn_end(&mut session).await.expect("the turn must end");
+        let mut events = Vec::new();
+        let ended = within("the turn ends", async {
+            while let Ok(Some(event)) = session.next_event().await {
+                if let horde_adapter::AgentEvent::TurnEnded(outcome) = event {
+                    return Some(outcome);
+                }
+                events.push(event);
+            }
+            None
+        })
+        .await
+        .expect("the turn must end");
         assert_eq!(ended.status, TurnStatus::Completed);
+        // An adapter whose version was never probed says so on the first
+        // turn, where the agent's log keeps it.
+        assert!(
+            events.iter().any(|event| matches!(event,
+                horde_adapter::AgentEvent::Output {
+                    channel: horde_adapter::OutputChannel::HarnessDiagnostic,
+                    text,
+                    ..
+                } if text.contains("claude version not probed"))),
+            "{events:?}"
+        );
         assert_eq!(
             session.provider_session_id().map(ToString::to_string),
             Some("sess-1".to_owned()),
@@ -1223,6 +1245,30 @@ mod stdio_prompts {
             .find(|line| line.contains("control_response"))
             .unwrap_or_else(|| panic!("no control_response reached the child: {recorded:?}"));
         serde_json::from_str(line).expect("the response is JSON")
+    }
+
+    /// A prompt still outstanding when its session ended cannot be answered:
+    /// the refusal names the dead harness, not an unknown request.
+    #[tokio::test]
+    async fn an_ended_session_refuses_an_answer_to_its_outstanding_prompt() {
+        let Prompted {
+            mut session,
+            request,
+            _dirs,
+            ..
+        } = prompted("r9", "Bash", &json!({"command": "ls"})).await;
+        session.shutdown().await.expect("shuts down");
+        let refused = session
+            .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+            .await
+            .expect_err("nothing is left to answer");
+        assert!(
+            matches!(
+                refused,
+                horde_adapter::AdapterError::HarnessExited { exit_code: None }
+            ),
+            "{refused:?}"
+        );
     }
 
     /// A narrowing allow reaches the harness as `updatedInput`, correlated by

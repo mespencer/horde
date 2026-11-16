@@ -2019,13 +2019,14 @@ pub fn delivery_for(interrupt: bool) -> DeliveryMode {
     }
 }
 
-/// The outcome an `approve` records, and the word used to report it.
+/// The outcome an `approve` records, and the word used to report it: an
+/// allow that carries answers reports itself as answered.
 #[must_use]
-pub fn outcome_for(deny: bool) -> (PermissionOutcome, &'static str) {
-    if deny {
-        (PermissionOutcome::Deny, "denied")
-    } else {
-        (PermissionOutcome::Allow, "allowed")
+pub fn outcome_for(deny: bool, answered: bool) -> (PermissionOutcome, &'static str) {
+    match (deny, answered) {
+        (true, _) => (PermissionOutcome::Deny, "denied"),
+        (false, true) => (PermissionOutcome::Allow, "answered"),
+        (false, false) => (PermissionOutcome::Allow, "allowed"),
     }
 }
 
@@ -2166,8 +2167,6 @@ async fn run_approve(
     args: &ApproveArgs,
     format: Format,
 ) -> Result<(), ClientError> {
-    let (outcome, verb) = outcome_for(args.deny);
-
     // Parsed before the RPC so a typo in the JSON is a local complaint rather
     // than a round trip that comes back as a server-side refusal.
     let narrowing: Option<serde_json::Value> = match &args.update_input {
@@ -2178,12 +2177,13 @@ async fn run_approve(
     };
 
     let answers = parse_answers(&args.answers)?;
-    if args.deny && !answers.is_empty() {
+    let answered = !answers.is_empty();
+    if args.deny && answered {
         return Err(ClientError::Answers(
             "--answer and --deny contradict each other: a refusal answers nothing".to_owned(),
         ));
     }
-    let verb = if answers.is_empty() { verb } else { "answered" };
+    let (outcome, verb) = outcome_for(args.deny, answered);
 
     let sequence = client
         .answer_permission(PermissionAnswer {
@@ -2643,8 +2643,18 @@ mod tests {
 
     #[test]
     fn approving_allows_and_denying_denies() {
-        assert_eq!(outcome_for(false), (PermissionOutcome::Allow, "allowed"));
-        assert_eq!(outcome_for(true), (PermissionOutcome::Deny, "denied"));
+        assert_eq!(
+            outcome_for(false, false),
+            (PermissionOutcome::Allow, "allowed")
+        );
+        assert_eq!(
+            outcome_for(false, true),
+            (PermissionOutcome::Allow, "answered")
+        );
+        assert_eq!(
+            outcome_for(true, false),
+            (PermissionOutcome::Deny, "denied")
+        );
     }
 
     /// The arguments a script depends on must survive parsing. Each of these

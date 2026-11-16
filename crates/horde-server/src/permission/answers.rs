@@ -214,5 +214,16 @@ mod tests {
         assert!(refuse(&[("a", &["x", "y"]), ("b", &["t"])]).contains("takes one answer, got 2"));
         assert!(refuse(&[("a", &[]), ("b", &["t"])]).contains("empty answer"));
         assert!(refuse(&[("a", &["x"]), ("1", &["y"]), ("b", &["t"])]).contains("answered twice"));
+
+        // Of many unknown keys, the one named is the first in order, every
+        // time — not whichever the map happened to yield.
+        let unknown: Vec<String> = (10..60).map(|n| format!("k{n}")).collect();
+        let pairs: Vec<(&str, &[&str])> = unknown
+            .iter()
+            .map(|key| (key.as_str(), &["x"][..]))
+            .collect();
+        for _ in 0..5 {
+            assert!(refuse(&pairs).contains("no question matches \"k10\""));
+        }
     }
 }

@@ -1783,6 +1783,16 @@ impl SyncOptions {
 mod tests {
     use super::{ClientError, SyncOptions};
 
+    /// An answering decision is an allow that carries its answers.
+    #[test]
+    fn an_answering_decision_carries_its_answers() {
+        let answers = horde_adapter::Answers::from([("colour".to_owned(), vec!["Red".to_owned()])]);
+        let answering = super::PermissionAnswer::answering("r-1", answers.clone());
+        assert_eq!(answering.answers, answers);
+        assert_eq!(answering.request_id, "r-1");
+        assert_eq!(answering.outcome, horde_proto::v1::PermissionOutcome::Allow);
+    }
+
     /// The name filter asks the server for exactly the sessions titled so —
     /// not everything, and not nothing.
     #[tokio::test]

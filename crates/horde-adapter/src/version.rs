@@ -390,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn the_probe_reads_what_runs_and_explains_what_does_not() {
         let banner = script("banner", "echo \"toy 1.5.0 ($1)\"");
-        let hang = script("hang", "exec sleep 30");
+        let hang = script("hang", "echo $$ > \"$0.pid\"; exec sleep 30");
         let ceiling = std::time::Duration::from_secs(10);
 
         assert_eq!(
@@ -419,6 +419,26 @@ mod tests {
             .expect_err("a hung binary is cut off");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(silent.contains("answered nothing within 300ms"), "{silent}");
+        // Cut off means killed, not abandoned: the hung binary is gone (or a
+        // zombie the runtime has yet to reap) soon after.
+        let mut pid_file = hang.as_os_str().to_owned();
+        pid_file.push(".pid");
+        let pid = std::fs::read_to_string(&pid_file).expect("the script wrote its pid");
+        let stat = format!("/proc/{}/stat", pid.trim());
+        let mut running = true;
+        for _ in 0..100 {
+            running = std::fs::read_to_string(&stat)
+                .is_ok_and(|text| text.split_whitespace().nth(2) != Some("Z"));
+            if !running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !running,
+            "the hung probe {} outlived its ceiling",
+            pid.trim()
+        );
     }
 
     #[test]

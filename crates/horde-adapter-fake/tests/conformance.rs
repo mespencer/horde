@@ -549,6 +549,26 @@ async fn a_scripted_question_takes_answers_and_a_plain_ask_refuses_them() {
     let events = answered(question, PermissionDecision::answer(answers.clone())).await;
     assert!(events.iter().any(|event| matches!(event,
         AgentEvent::Output { text, .. } if text == "answered colour=Red|Blue")));
+    let two = Step::AskQuestion {
+        tool_call_id: "q-2".to_owned(),
+        tool_name: "AskUserQuestion".to_owned(),
+        questions: ["colour", "size"]
+            .map(|id| horde_adapter::Question {
+                id: id.to_owned(),
+                ..horde_adapter::Question::default()
+            })
+            .to_vec(),
+    };
+    let both = horde_adapter::Answers::from([
+        ("colour".to_owned(), vec!["Red".to_owned()]),
+        ("size".to_owned(), vec!["L".to_owned()]),
+    ]);
+    let events = answered(two, PermissionDecision::answer(both)).await;
+    assert!(
+        events.iter().any(|event| matches!(event,
+            AgentEvent::Output { text, .. } if text == "answered colour=Red, size=L")),
+        "{events:?}"
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolCompleted {

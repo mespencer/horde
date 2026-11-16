@@ -464,6 +464,11 @@ mod tests {
                 .starts_with("[1-9] answer  [n] deny")
         );
         assert!(super::session_footer(&[pending("p")]).starts_with("[y] allow  [n] deny"));
+        assert!(
+            super::session_footer(&[pending("p"), asking.clone()])
+                .starts_with("[y] allow  [n] deny"),
+            "the front prompt decides the keys, not the last"
+        );
         assert!(super::session_footer(&[]).starts_with("[enter] send"));
 
         asking.questions.push(PendingQuestion {

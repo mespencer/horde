@@ -268,6 +268,27 @@ fn the_report_renders_and_fails_only_on_failures() {
     assert_eq!(json["healthy"], true);
 }
 
+/// A harness found on the path has its version checked too, by running it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_found_harness_has_its_version_checked() {
+    let dir = tempfile::tempdir().expect("a dir");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    let claude = bin.join("claude");
+    std::fs::write(&claude, "#!/bin/sh\necho '2.1.323 (Claude Code)'\n").expect("writes");
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmods");
+    let mut inputs = inputs(&dir.path().join("id"), None);
+    inputs.path = Some(std::env::join_paths([&bin]).expect("a path"));
+    let checks = report(&inputs).await;
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "harness claude version"),
+        "{checks:?}"
+    );
+}
+
 fn inputs(identity: &std::path::Path, endpoint: Option<String>) -> Inputs {
     Inputs {
         endpoint,

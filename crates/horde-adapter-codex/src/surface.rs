@@ -383,8 +383,7 @@ fn branches(root: &Value, schema: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     let mut queue = vec![schema.clone()];
     // Bounded: a union that names itself would otherwise grow forever.
-    for _ in 0..MAX_BRANCH_STEPS {
-        let Some(next) = queue.pop() else { break };
+    while let Some(next) = queue.pop().filter(|_| out.len() < MAX_BRANCH_STEPS) {
         let node = resolve(root, &next);
         for key in ["anyOf", "oneOf", "allOf"] {
             if let Some(alternatives) = node.get(key).and_then(Value::as_array) {
@@ -486,7 +485,7 @@ mod tests {
     fn root() -> serde_json::Value {
         json!({
             "oneOf": [
-                {"properties": {"method": {"enum": ["a/b"]},
+                {"properties": {"method": {"enum": ["a/b", "a/alias"]},
                                 "params": {"$ref": "#/definitions/AB"}}},
                 {"properties": {"method": {"const": "c/d"}, "params": {"type": "object"}}}
             ],
@@ -575,10 +574,57 @@ mod tests {
                 .expect_err("not JSON")
                 .contains("is not JSON")
         );
-        assert!(
-            super::extract(dir.path()).is_err(),
-            "the real surface is not in a toy bundle"
+        let refused =
+            super::extract(dir.path()).expect_err("the real surface is not in a toy bundle");
+        assert!(refused.contains("could not read"), "{refused}");
+    }
+
+    /// A root whose definitions chain `follows` `$ref`s from the returned
+    /// start to a string.
+    fn chain(follows: usize) -> (serde_json::Value, serde_json::Value) {
+        let mut definitions = serde_json::Map::new();
+        for at in 1..follows {
+            definitions.insert(
+                format!("R{at}"),
+                json!({"$ref": format!("#/definitions/R{}", at + 1)}),
+            );
+        }
+        definitions.insert(format!("R{follows}"), json!({"type": "string"}));
+        (
+            json!({"definitions": definitions}),
+            json!({"$ref": "#/definitions/R1"}),
+        )
+    }
+
+    /// `$ref`s are followed 32 deep and no deeper.
+    #[test]
+    fn references_are_followed_thirty_two_deep() {
+        let (root, start) = chain(32);
+        assert_eq!(super::resolve(&root, &start), json!({"type": "string"}));
+        let (root, start) = chain(33);
+        assert_eq!(
+            super::resolve(&root, &start),
+            json!({"$ref": "#/definitions/R33"})
         );
+    }
+
+    /// One node's branches are walked to the step bound exactly; `allOf`
+    /// is a union like the others, and a `const` is an enum of one.
+    #[test]
+    fn a_node_s_branches_stop_at_the_bound_and_every_union_counts() {
+        let wide = json!({"anyOf": vec![json!({"type": "string"}); 300]});
+        assert_eq!(
+            super::branches(&json!({}), &wide).len(),
+            super::MAX_BRANCH_STEPS
+        );
+        let narrow = json!({"anyOf": vec![json!({"type": "string"}); 3]});
+        assert_eq!(super::branches(&json!({}), &narrow).len(), 4);
+        let root = json!({"properties": {
+            "all": {"allOf": [{"type": "integer"}]},
+            "fixed": {"const": "only"}
+        }});
+        assert_eq!(summarize_path(&root, &root, "all"), "integer");
+        assert_eq!(summarize_path(&root, &root, "fixed"), "enum:only");
     }
 
     #[test]
@@ -587,6 +633,11 @@ mod tests {
         assert_eq!(
             method_params(&root, "a/b"),
             Some(json!({"$ref": "#/definitions/AB"}))
+        );
+        assert_eq!(
+            method_params(&root, "a/alias"),
+            method_params(&root, "a/b"),
+            "any name in the enum finds the variant"
         );
         assert_eq!(method_params(&root, "c/d"), Some(json!({"type": "object"})));
         assert_eq!(method_params(&root, "e/f"), None);

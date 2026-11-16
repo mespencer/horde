@@ -261,6 +261,18 @@ pub fn declared_result(
     }
 }
 
+/// Why a proxied call that was not allowed did not run: the denial's
+/// reason, or — a proxied tool asking no question — that answers cannot
+/// run it.
+fn refusal_text(name: &str, decision: &horde_adapter::PermissionDecision) -> String {
+    match decision {
+        horde_adapter::PermissionDecision::Deny { message } => {
+            format!("permission denied: {message}")
+        }
+        _ => format!("permission denied: {name} asked no question, so answers cannot apply"),
+    }
+}
+
 /// The verb name a forward proposal is judged under — the tool name modes
 /// write rules against.
 #[must_use]
@@ -811,22 +823,6 @@ impl HordeEndpoint {
         decision: horde_adapter::PermissionDecision,
     ) -> Result<CallToolResult, ErrorData> {
         match decision {
-            horde_adapter::PermissionDecision::Deny { message } => {
-                // A denial the model reads, not a protocol error it cannot:
-                // the model must know the call was refused (and why) to plan
-                // around it rather than retry it.
-                Ok(CallToolResult::error(vec![
-                    rmcp::model::ContentBlock::text(format!("permission denied: {message}")),
-                ]))
-            }
-            horde_adapter::PermissionDecision::Answer { .. } => {
-                // A proxied tool asks no question, so answers cannot run it.
-                Ok(CallToolResult::error(vec![
-                    rmcp::model::ContentBlock::text(format!(
-                        "permission denied: {name} asked no question, so answers cannot apply"
-                    )),
-                ]))
-            }
             horde_adapter::PermissionDecision::Allow { updated_input, .. } => {
                 let forwarded = match narrowed_arguments(arguments, updated_input) {
                     Ok(forwarded) => forwarded,
@@ -844,6 +840,12 @@ impl HordeEndpoint {
                     .await
                     .map_or_else(crate::hub::endpoint::render_failure, Ok)
             }
+            // A denial the model reads, not a protocol error it cannot: the
+            // model must know the call was refused (and why) to plan around
+            // it rather than retry it.
+            refused => Ok(CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(refusal_text(name, &refused)),
+            ])),
         }
     }
 
@@ -1342,6 +1344,42 @@ mod tests {
         assert!(!denied.granted);
         assert!(denied.forward_id.is_empty(), "a denial names no intent");
         assert!(denied.message.contains("not on this session"));
+
+        let answered = super::declared_result(
+            &horde_adapter::PermissionDecision::answer(horde_adapter::Answers::new()),
+            "expose",
+            "vite",
+            5173,
+            "req-9",
+        );
+        assert!(!answered.granted);
+        assert!(answered.forward_id.is_empty());
+        assert_eq!(
+            answered.message,
+            "denied: a forward cannot be answered, only allowed or denied"
+        );
+    }
+
+    /// A proxied call that is not allowed reads as a refusal the model can
+    /// plan around: the denial's reason, or why answers cannot run it.
+    #[test]
+    fn a_refused_proxied_call_says_why() {
+        assert_eq!(
+            super::refusal_text(
+                "fs__write",
+                &horde_adapter::PermissionDecision::Deny {
+                    message: "no writes".to_owned()
+                }
+            ),
+            "permission denied: no writes"
+        );
+        assert_eq!(
+            super::refusal_text(
+                "fs__write",
+                &horde_adapter::PermissionDecision::answer(horde_adapter::Answers::new())
+            ),
+            "permission denied: fs__write asked no question, so answers cannot apply"
+        );
     }
 
     /// The grant message is what the agent acts on: an inject names the local

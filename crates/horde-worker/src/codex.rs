@@ -1363,6 +1363,14 @@ mod tests {
             refusal(USER_INPUT_METHOD)["result"],
             serde_json::json!({"answers": {}})
         );
+        for method in [
+            MCP_ELICITATION_METHOD,
+            EXEC_APPROVAL_METHOD,
+            PERMISSIONS_APPROVAL_METHOD,
+            USER_INPUT_METHOD,
+        ] {
+            assert_eq!(refusal(method)["id"], 3, "{method} answers its own request");
+        }
 
         for method in [
             MCP_ELICITATION_METHOD,
