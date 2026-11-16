@@ -128,6 +128,12 @@ impl Runtime {
         self
     }
 
+    /// The Relay payload shares go through, when [`Self::with_relay`] set one.
+    #[must_use]
+    pub fn relay(&self) -> Option<&horde_relay::RelayLocation> {
+        self.shared.broker.relay()
+    }
+
     /// The journal sink the Worker hands its MCP endpoint: results reported
     /// without a payload are stamped with the reporting agent's observed
     /// HEAD on their way into the journal ("the Worker's to stamp",
