@@ -45,9 +45,6 @@ horde-wire = { workspace = true }
 # The interactive-auth relay's PTY (DESIGN §4): provider login commands run
 # in a real terminal the client's keystrokes are relayed into.
 portable-pty = "0.9.0"
-# Signalling harness process groups (ADR-0010): killpg through a safe API,
-# because the workspace forbids `unsafe`.
-nix = { version = "0.31.3", features = ["fs", "process", "signal"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 # The checkout ledger and the workspace manifest (ADR-0014) are JSON files.
 serde = { workspace = true }
@@ -61,6 +58,24 @@ tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["channel", "tls-ring"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+# Signalling harness process groups (ADR-0010): killpg through a safe API,
+# because the workspace forbids `unsafe`.
+nix = { version = "0.31.3", features = ["fs", "process", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+# A harness's process tree on Windows is a Job Object with
+# KILL_ON_JOB_CLOSE (ADR-0017): the Windows counterpart of a process group,
+# through a safe API, because the workspace forbids `unsafe`. 10.0 or later:
+# 9.x never set KILL_ON_JOB_CLOSE (the job wrapper could not see KillOnDrop).
+process-wrap = { version = "10.0.1", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+# Free and total disk space for the workspace pressure check (ADR-0014):
+# `statvfs` on Unix, GetDiskFreeSpaceExW here, again without our own `unsafe`.
+fs4 = { version = "0.13.1", default-features = false }
+# Unmanaged workspace paths are directory links (ADR-0014); without the
+# symlink privilege, Windows links them as NTFS junctions (ADR-0017).
+junction = { version = "1.2.0", default-features = false }
 
 [dev-dependencies]
 # The connection suite's partitions are injected through the promoted fault

@@ -40,9 +40,11 @@ pub fn binary_candidates(test_executable: &Path, name: &str) -> Vec<PathBuf> {
     if profile_dir.ends_with("deps") {
         profile_dir.pop();
     }
-    let mut candidates = vec![profile_dir.join(name)];
+    // `horde-server.exe` on Windows; the bare name everywhere else.
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates = vec![profile_dir.join(&name)];
     if let Some(target_root) = profile_dir.parent() {
-        let debug = target_root.join("debug").join(name);
+        let debug = target_root.join("debug").join(&name);
         if !candidates.contains(&debug) {
             candidates.push(debug);
         }
@@ -191,7 +193,8 @@ pub struct SpawnedProcess {
     name: String,
     child: tokio::process::Child,
     /// The group the child leads, recorded at spawn: `process_group(0)`
-    /// makes it the child's own pid.
+    /// makes it the child's own pid. Unix only: Windows has no groups.
+    #[cfg(unix)]
     pgid: u32,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
@@ -226,19 +229,25 @@ impl SpawnedProcess {
     /// # Errors
     ///
     /// The spawn failing, or a pipe missing.
+    ///
+    /// On Windows (ADR-0017) there is no group and no orphan sweep: the
+    /// child alone is killed, and [`crate::reap`] does not exist there.
     pub fn spawn(name: &str, program: &Path, args: &[&str], envs: &[(&str, &str)]) -> Setup<Self> {
+        #[cfg(unix)]
         crate::reap::reap_orphans_once();
         let mut command = tokio::process::Command::new(program);
         command
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .process_group(0)
             .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         for (key, value) in envs {
             command.env(key, value);
         }
         let mut child = command.spawn()?;
+        #[cfg(unix)]
         let pgid = child
             .id()
             .ok_or_else(|| format!("{name} has no pid to lead its group"))?;
@@ -259,6 +268,7 @@ impl SpawnedProcess {
         Ok(Self {
             name: name.to_owned(),
             child,
+            #[cfg(unix)]
             pgid,
             stdout,
             stderr,
@@ -267,12 +277,22 @@ impl SpawnedProcess {
 
     /// SIGKILLs the child's group while the child is unreaped. Its pid is
     /// held until it is reaped, so the group id cannot yet name anyone else.
+    #[cfg(unix)]
     fn kill_group(&self) {
         if self.child.id().is_some() {
             let _already_gone =
                 crate::reap::signal_group(self.pgid, Some(nix::sys::signal::Signal::SIGKILL));
         }
     }
+
+    /// No groups on Windows: the child's own kill (on drop, or
+    /// [`Self::kill`]) is all there is.
+    #[cfg(not(unix))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Unix group kill reads self; the call sites are shared"
+    )]
+    fn kill_group(&self) {}
 
     /// Everything the process has written to stdout so far.
     #[must_use]
@@ -323,8 +343,16 @@ impl SpawnedProcess {
             .child
             .id()
             .ok_or_else(|| format!("{} has already exited", self.name))?;
+        #[cfg(unix)]
         crate::reap::signal_pid(pid, Some(nix::sys::signal::Signal::SIGTERM))
             .map_err(|unsent| format!("SIGTERM to {pid} failed for {}: {unsent}", self.name))?;
+        #[cfg(not(unix))]
+        return Err(format!(
+            "{} (pid {pid}) cannot be asked to stop: Windows has no SIGTERM",
+            self.name
+        )
+        .into());
+        #[cfg(unix)]
         Ok(())
     }
 
@@ -462,12 +490,15 @@ pub fn admit_binary_blocking(binary: &Path, args: &[&str]) -> Setup<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpawnedProcess, admit_binary, binary_candidates, value_after};
+    #[cfg(unix)]
+    use super::{SpawnedProcess, binary_candidates};
+    use super::{admit_binary, value_after};
 
     /// The admission, observed through its probe's own side effect: a
     /// `touch` probe leaves its file, so a warm-up hollowed to nothing
     /// leaves none — and the second call on the same binary is deduplicated,
     /// so its differently-named file must never appear.
+    #[cfg(unix)]
     #[tokio::test]
     async fn admission_executes_the_probe_once_per_binary() {
         let scratch = tempfile::tempdir().expect("a scratch directory");
@@ -502,6 +533,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn candidates_cover_the_profile_dir_and_the_debug_fallback() {
         let exe = std::path::Path::new("/w/target/mutants/deps/suite-abc123");
@@ -617,6 +649,7 @@ mod tests {
 
     /// The whole handle against a real (non-product) process: output arrives
     /// through the watcher, and a clean wait reports the real exit status.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_spawned_process_is_watched_and_reaped() {
         let mut process = SpawnedProcess::spawn(
@@ -644,6 +677,7 @@ mod tests {
 
     /// SIGTERM actually ends a process that ignores nothing — the lever the
     /// clean-shutdown scenarios pull must be shown to work by itself.
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminate_ends_a_parked_process() {
         let mut process = SpawnedProcess::spawn(

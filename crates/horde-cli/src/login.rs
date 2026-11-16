@@ -241,7 +241,7 @@ impl Drop for RawModeGuard {
 }
 
 /// The terminal's size, or the classic default off a pipe.
-fn terminal_size() -> (u16, u16) {
+pub(crate) fn terminal_size() -> (u16, u16) {
     ratatui::crossterm::terminal::size().unwrap_or((80, 24))
 }
 
@@ -355,7 +355,17 @@ fn terminal_feeds() -> TerminalFeeds {
     });
 
     let (resize_tx, resizes) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
-    let winch = tokio::spawn(async move {
+    let winch = tokio::spawn(watch_resizes(resize_tx));
+    (typed, resizes, winch)
+}
+
+/// Sends the terminal's size on every SIGWINCH. Windows has none; there the
+/// size is polled ([`crate::windows::watch_resizes`]).
+async fn watch_resizes(resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>) {
+    #[cfg(windows)]
+    return crate::windows::watch_resizes(resize_tx).await;
+    #[cfg(unix)]
+    {
         let Ok(mut signals) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         else {
@@ -366,8 +376,22 @@ fn terminal_feeds() -> TerminalFeeds {
                 return;
             }
         }
-    });
-    (typed, resizes, winch)
+    }
+}
+
+/// Sends `now` when it differs from `last` (and remembers it), returning
+/// whether the watcher should keep going — `false` once the pump is gone.
+/// The polling watcher's step on Windows, kept here where it is tested.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) async fn send_if_changed(
+    resize_tx: &tokio::sync::mpsc::Sender<(u16, u16)>,
+    last: &mut (u16, u16),
+    now: (u16, u16),
+) -> bool {
+    if std::mem::replace(last, now) == now {
+        return true;
+    }
+    resize_tx.send(now).await.is_ok()
 }
 
 /// The verb's verdict on how the pump ended: the clean exit code to print,
@@ -435,6 +459,54 @@ mod tests {
 
     use super::{LoginEnd, LoginStream, callback_of, pump_login};
     use crate::forward::testing::within;
+
+    /// A SIGWINCH sends the terminal's size. The signal is sent until one
+    /// lands after the watcher registered (count-bounded); SIGWINCH is
+    /// ignored by default, so an early one is harmless.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_window_change_sends_the_terminal_size() {
+        let (resize_tx, mut resizes) = tokio::sync::mpsc::channel(4);
+        let watcher = tokio::spawn(super::watch_resizes(resize_tx));
+        let pid = std::process::id().to_string();
+        let mut sent = None;
+        for _ in 0..50 {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-WINCH", &pid])
+                .status()
+                .await;
+            if let Ok(Some(size)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), resizes.recv()).await
+            {
+                sent = Some(size);
+                break;
+            }
+        }
+        assert_eq!(sent, Some(super::terminal_size()));
+        watcher.abort();
+    }
+
+    /// A polled size is sent only when it changed, and remembered; a gone
+    /// pump stops the watcher, an unchanged size never asks it to.
+    #[tokio::test]
+    async fn a_polled_size_is_sent_only_when_it_changes() {
+        let (resize_tx, mut resizes) = tokio::sync::mpsc::channel(4);
+        let mut last = (80, 24);
+        assert!(super::send_if_changed(&resize_tx, &mut last, (80, 24)).await);
+        assert!(resizes.try_recv().is_err(), "an unchanged size is not sent");
+        assert!(super::send_if_changed(&resize_tx, &mut last, (100, 30)).await);
+        assert_eq!(resizes.try_recv().ok(), Some((100, 30)));
+        assert_eq!(last, (100, 30), "the sent size is remembered");
+        drop(resizes);
+        assert!(
+            super::send_if_changed(&resize_tx, &mut last, (100, 30)).await,
+            "no send, so a gone pump is not noticed yet"
+        );
+        assert!(
+            !super::send_if_changed(&resize_tx, &mut last, (90, 30)).await,
+            "a change to a gone pump stops the watcher"
+        );
+    }
 
     /// The scripted relay: feed frames in, observe what the client sent.
     fn scripted_stream() -> (

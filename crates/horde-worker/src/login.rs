@@ -394,9 +394,21 @@ fn size_of(request: &LoginSessionRequest) -> PtySize {
     }
 }
 
+/// The PTY's controlling side, kept for resizes.
+#[cfg(not(windows))]
+type Master = Box<dyn portable_pty::MasterPty + Send>;
+
+/// The PTY's controlling side on Windows: a ConPTY, shared with the reaping
+/// wait, which closes it the moment the command exits. A ConPTY's output
+/// pipe reports EOF only when the pseudoconsole itself closes — never when
+/// its child exits — so without this the pump would wait for an EOF that
+/// cannot come (ADR-0017).
+#[cfg(windows)]
+type Master = Arc<std::sync::Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
+
 /// A spawned login command and every handle its supervision needs.
 struct PtySession {
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Master,
     /// PTY output chunks, read by a dedicated thread; the channel closing is
     /// the EOF that follows the command's exit.
     output: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -439,8 +451,6 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     drop(pair.slave);
 
     let killer = child.clone_killer();
-    let reaped =
-        tokio::task::spawn_blocking(move || child.wait().ok().map(|status| status.exit_code()));
 
     let mut reader = pair
         .master
@@ -468,6 +478,29 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
         .master
         .take_writer()
         .map_err(|error| error.to_string())?;
+
+    #[cfg(not(windows))]
+    let master = pair.master;
+    #[cfg(not(windows))]
+    let reaped =
+        tokio::task::spawn_blocking(move || child.wait().ok().map(|status| status.exit_code()));
+    #[cfg(windows)]
+    let master: Master = Arc::new(std::sync::Mutex::new(Some(pair.master)));
+    #[cfg(windows)]
+    let reaped = {
+        let closing = Arc::clone(&master);
+        tokio::task::spawn_blocking(move || {
+            let code = child.wait().ok().map(|status| status.exit_code());
+            // Close the pseudoconsole so the output pipe reports EOF.
+            drop(
+                closing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+            code
+        })
+    };
     let (input, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         while let Ok(bytes) = input_rx.recv() {
@@ -484,7 +517,7 @@ fn spawn_login_pty(recipe: &LoginRecipe, size: PtySize) -> Result<PtySession, St
     });
 
     Ok(PtySession {
-        master: pair.master,
+        master,
         output,
         input,
         killer,
@@ -513,7 +546,7 @@ async fn pump_login(
                         }
                     }
                     Some(Ok(LoginFrame { frame: Some(Frame::Resize(resize)) })) => {
-                        let _ = session.master.resize(PtySize {
+                        resize_pty(&session.master, PtySize {
                             rows: u16::try_from(resize.rows).unwrap_or(DEFAULT_ROWS),
                             cols: u16::try_from(resize.cols).unwrap_or(DEFAULT_COLS),
                             pixel_width: 0,
@@ -565,6 +598,16 @@ async fn pump_login(
             }
         }
     }
+}
+
+/// Resizes the PTY, best effort: a PTY already gone has nothing to resize.
+/// On Windows the ConPTY is resized only while it is open
+/// ([`crate::windows::resize_pty`]).
+fn resize_pty(master: &Master, size: PtySize) {
+    #[cfg(windows)]
+    crate::windows::resize_pty(master, size);
+    #[cfg(not(windows))]
+    let _ = master.resize(size);
 }
 
 /// Kills the child by handle and waits for the reap, draining whatever
@@ -660,7 +703,6 @@ mod tests {
     /// an account that is not a directory name are each refused by name.
     #[test]
     fn an_account_login_targets_that_accounts_profile_directory() {
-        use std::os::unix::fs::PermissionsExt;
         let scratch = tempfile::tempdir().expect("a tempdir");
         let profile = scratch.path().join("claude");
         let per_account = LoginRecipe::terminal_only("claude", vec!["login".to_owned()])
@@ -697,11 +739,16 @@ mod tests {
                 ("CLAUDE_CONFIG_DIR".to_owned(), dir.display().to_string()),
             ]
         );
-        let mode = std::fs::metadata(&dir)
-            .expect("the directory is prepared")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700);
+        assert!(dir.is_dir(), "the directory is prepared");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir)
+                .expect("the directory is prepared")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
 
         // Prepared is not signed in; once the login writes there, the
         // account is advertised under the provider whose recipe signs it in.
@@ -764,6 +811,7 @@ mod tests {
     /// A real PTY session end to end without any relay: spawn a prompt
     /// script, type at it, read its output, and see the reap deliver the
     /// exit code — the supervision half the e2e drives remotely.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_pty_session_carries_prompts_input_and_its_exit_code() {
         let recipe = LoginRecipe::terminal_only(
@@ -824,13 +872,127 @@ mod tests {
         assert_eq!(code, Some(7), "the exit code is the command's own");
     }
 
-    /// The kill path: a command that would run forever is killed by handle
-    /// and provably reaped — the wait returns — with no orphan left behind.
-    #[tokio::test]
-    async fn killing_a_login_reaps_it_provably() {
+    /// A shell that would run forever, in an 80x24 PTY.
+    #[cfg(unix)]
+    fn endless_session() -> super::PtySession {
         let recipe = LoginRecipe::terminal_only(
             "/bin/sh",
             vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
+        );
+        spawn_login_pty(
+            &recipe,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("the shell spawns")
+    }
+
+    /// The kill path: a command that would run forever is killed by handle
+    /// and provably reaped — the wait returns — with no orphan left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killing_a_login_reaps_it_provably() {
+        let mut session = endless_session();
+
+        // A signal death has whatever code the platform reports; the reap
+        // returning at all is the witness that matters.
+        let _code = within("kill and reap", super::kill_and_reap(&mut session)).await;
+        assert!(
+            session.reaped.is_finished(),
+            "the wait thread is done: the child was reaped, not abandoned"
+        );
+    }
+
+    /// A resize reaches the PTY: its size afterwards is the one asked for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resize_reaches_the_pty() {
+        let mut session = endless_session();
+        let wanted = PtySize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        super::resize_pty(&session.master, wanted);
+        let size = session.master.get_size().expect("the pty answers its size");
+        assert_eq!((size.rows, size.cols), (40, 132));
+        let _code = within("kill and reap", super::kill_and_reap(&mut session)).await;
+    }
+
+    /// Reads a ConPTY session to EOF the way the client's terminal would:
+    /// answering each cursor-position query. portable-pty opens the
+    /// pseudoconsole with `PSEUDOCONSOLE_INHERIT_CURSOR`, so before the
+    /// command makes progress conhost writes `ESC[6n` and waits for the
+    /// `ESC[row;colR` a real terminal sends back through the relayed input;
+    /// a reader that never answers sees the session stall, not end.
+    #[cfg(windows)]
+    async fn drain_as_a_terminal_would(session: &mut super::PtySession) -> String {
+        let mut seen = String::new();
+        let mut answered = 0;
+        while let Some(chunk) = session.output.recv().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            let asked = seen.matches("\u{1b}[6n").count();
+            for _ in answered..asked {
+                let _ = session.input.send(b"\x1b[1;1R".to_vec());
+            }
+            answered = asked;
+        }
+        seen
+    }
+
+    /// A ConPTY session reaches EOF once its command exits: the reaping wait
+    /// closes the pseudoconsole, without which a ConPTY's output never ends
+    /// (ADR-0017) — and the code is the command's own.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_conpty_session_reaches_eof_when_its_command_exits() {
+        let recipe = LoginRecipe::terminal_only(
+            "cmd.exe",
+            vec![
+                "/C".to_owned(),
+                "echo hello %HORDE_LOGIN_TARGET% & exit 7".to_owned(),
+            ],
+        )
+        .with_env(vec![(
+            "HORDE_LOGIN_TARGET".to_owned(),
+            "default".to_owned(),
+        )]);
+        let mut session = spawn_login_pty(
+            &recipe,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("cmd spawns in a ConPTY");
+
+        let seen = within(
+            "the output reaches EOF",
+            drain_as_a_terminal_would(&mut session),
+        )
+        .await;
+        assert!(seen.contains("hello default"), "{seen:?}");
+        let code = within("the reap returns", &mut session.reaped)
+            .await
+            .expect("the wait thread must not panic");
+        assert_eq!(code, Some(7), "the exit code is the command's own");
+    }
+
+    /// The ConPTY kill path: a command that would run forever is killed by
+    /// handle and reaped, and the closed pseudoconsole ends its output.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn killing_a_conpty_login_reaps_it_and_ends_its_output() {
+        let recipe = LoginRecipe::terminal_only(
+            "cmd.exe",
+            vec!["/C".to_owned(), "ping -n 600 127.0.0.1 >NUL".to_owned()],
         );
         let mut session = spawn_login_pty(
             &recipe,
@@ -841,15 +1003,13 @@ mod tests {
                 pixel_height: 0,
             },
         )
-        .expect("the shell spawns");
-
-        // A signal death has whatever code the platform reports; the reap
-        // returning at all is the witness that matters.
+        .expect("cmd spawns in a ConPTY");
         let _code = within("kill and reap", super::kill_and_reap(&mut session)).await;
-        assert!(
-            session.reaped.is_finished(),
-            "the wait thread is done: the child was reaped, not abandoned"
-        );
+        assert!(session.reaped.is_finished());
+        within("the output ends", async {
+            while session.output.recv().await.is_some() {}
+        })
+        .await;
     }
 
     /// A scripted tunnel: the test plays the relay side, feeding
@@ -969,7 +1129,9 @@ mod tests {
 
     /// One recipe dispatched through the production `answer_dispatch` over
     /// a scripted tunnel, with the attach already read — the arrangement
-    /// the full-relay and fault tests share.
+    /// the full-relay and fault tests share. Unix only, like them: their
+    /// commands are `/bin/sh` scripts (the ConPTY tests cover Windows).
+    #[cfg(unix)]
     async fn dispatched(
         recipe: LoginRecipe,
     ) -> (
@@ -995,6 +1157,7 @@ mod tests {
     /// callback port, the PTY's prompt crosses as output, typed input
     /// reaches the command, the exit frame carries the code, and the exited
     /// announce line lands — the whole worker half without a server.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dispatched_login_relays_prompts_input_and_exit() {
         let recipe = LoginRecipe {
@@ -1063,6 +1226,7 @@ mod tests {
     /// The fault the spec names: the client vanishes mid-login. The relay
     /// leg ending is the order to kill; the announce line lands only after
     /// the wait returned — the owned reap witness, no OS state asserted.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_vanished_client_kills_and_provably_reaps_the_login() {
         let recipe = LoginRecipe::terminal_only(

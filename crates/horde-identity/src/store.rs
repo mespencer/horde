@@ -632,10 +632,23 @@ mod tests {
         );
         let refused = super::StateLock::acquire(&dir, "server.lock").expect_err("one holder");
         assert!(
+            matches!(refused, crate::IdentityError::StateHeld { .. }),
+            "a held lock is refused as held: {refused}"
+        );
+        // Unix locks are advisory, so the refusal reads the holder's pid
+        // from the file; Windows locks are mandatory, so the held file
+        // cannot be read and the refusal names no pid (ADR-0017).
+        #[cfg(unix)]
+        assert!(
             refused
                 .to_string()
                 .contains(&format!("(pid {})", std::process::id())),
             "the refusal names the holder: {refused}"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !refused.to_string().contains("(pid "),
+            "a mandatory lock hides the holder's pid: {refused}"
         );
 
         drop(held);

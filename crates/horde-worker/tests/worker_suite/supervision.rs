@@ -826,6 +826,9 @@ mod process_identity {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// Process groups are Unix; Windows trees are jobs (ADR-0017, and the
+// Windows tests beside `horde_worker::process_tree`).
+#[cfg(unix)]
 mod process_groups {
     use std::sync::Arc;
 
@@ -1028,6 +1031,86 @@ mod process_groups {
             }
         })
         .await;
+    }
+
+    /// A stop asks before it insists: a leader that honours SIGTERM is gone
+    /// long before a generous grace would have run out.
+    #[tokio::test]
+    async fn a_stop_asks_the_group_first() {
+        let spec = HarnessSpec {
+            args: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
+            stop_grace: std::time::Duration::from_secs(120),
+            ..HarnessSpec::new("/bin/sh")
+        };
+        let mut harness = SupervisedHarness::spawn(&spec).await.expect("spawns");
+        within("a stop the leader honours", harness.stop())
+            .await
+            .expect("stops cleanly");
+    }
+
+    /// A process in a group of its own, started outside any harness.
+    fn own_group(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("sh spawns")
+    }
+
+    /// Only this Worker's own leftovers are killed and counted: a refused
+    /// id, a group that is gone and a stranger's reused id are forgotten
+    /// untouched, while a group whose leader died but whose members still
+    /// hold the id is still ours.
+    #[tokio::test]
+    async fn only_a_provably_own_leftover_is_killed() {
+        use horde_worker::process::GroupLedger as _;
+        let journal = Journal::in_memory().expect("journal");
+        let row = |pgid: u32, fingerprint: &str| horde_worker::process::HarnessGroup {
+            pgid,
+            fingerprint: fingerprint.to_owned(),
+        };
+        let mut gone = own_group("exit 0");
+        let gone_pgid = gone.id();
+        gone.wait().expect("reaped");
+        let stranger = own_group("exec sleep 600");
+        let stranger_pid = stranger.id();
+        for group in [
+            row(0, "x"),
+            row(gone_pgid, "x"),
+            row(stranger_pid, "Mon Jan  1 00:00:00 1990"),
+        ] {
+            journal.opened(&group).await.expect("journaled");
+        }
+        assert_eq!(reap_leftover_groups(&journal).await, 0, "nothing of ours");
+        assert!(
+            kill(pid_of(stranger_pid), None).is_ok(),
+            "a stranger is never signalled"
+        );
+        assert!(journal.harness_groups().await.expect("readable").is_empty());
+        let _ = nix::sys::signal::killpg(pid_of(stranger_pid), nix::sys::signal::Signal::SIGKILL);
+        drop(stranger);
+
+        // The leader exits at once; its backgrounded member keeps the id.
+        let mut headless = own_group("sleep 600 >/dev/null & echo $!");
+        let headless_pgid = headless.id();
+        let mut said = String::new();
+        std::io::Read::read_to_string(headless.stdout.as_mut().expect("a pipe"), &mut said)
+            .expect("the member's pid");
+        headless.wait().expect("the leader is reaped");
+        let member = pid_of(said.trim().parse().expect("a pid"));
+        journal
+            .opened(&row(headless_pgid, "whatever it was"))
+            .await
+            .expect("journaled");
+        assert_eq!(
+            reap_leftover_groups(&journal).await,
+            1,
+            "orphans hold our id"
+        );
+        assert!(is_gone(member).await, "the member is dead");
     }
 
     /// The crash path: a group the Worker never stopped (its handle leaked,

@@ -13,8 +13,9 @@ use std::time::Duration;
 use horde_proto::v1::ReclaimPolicy;
 use horde_proto::v1::workspace_cleanup::RepoAction;
 use horde_proto::v1::workspace_cleanup::repo_action::Outcome;
-use nix::sys::signal::Signal;
 use tokio::io::AsyncReadExt;
+
+use crate::process_tree::{ProcessTree, Stop};
 
 use super::policy::{CommandSpec, WorkspacePolicy};
 
@@ -22,6 +23,7 @@ use super::policy::{CommandSpec, WorkspacePolicy};
 pub const OUTPUT_TAIL_BYTES: usize = 4096;
 
 /// How long a timed-out command's group has between SIGTERM and SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a finished command's output pipes may stay open: a process it
@@ -33,7 +35,31 @@ pub const SIZE_WALK_CAP: Duration = Duration::from_secs(30);
 
 /// The environment a reclaim command — and the cargo guard ahead of it —
 /// keeps; `CARGO_TARGET_DIR` is deliberately absent.
+#[cfg(unix)]
 const KEPT_ENVIRONMENT: &[&str] = &["PATH", "HOME", "LANG", "CARGO_HOME", "RUSTUP_HOME"];
+
+/// The environment a reclaim command keeps on Windows: the Unix set, plus
+/// what a Windows program cannot start without (`SystemRoot` above all —
+/// sockets and the CRT fail without it) and where a user's profile and
+/// temporary files are. `CARGO_TARGET_DIR` is deliberately absent.
+#[cfg(windows)]
+const KEPT_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+];
 
 /// What a repo's reclaim resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,7 +242,8 @@ pub struct Ran {
 }
 
 /// Runs `argv` in `cwd` without a shell, bounded by `timeout`; on timeout
-/// the whole process group gets SIGTERM, then SIGKILL after a grace.
+/// the whole process group gets SIGTERM, then SIGKILL after a grace (on
+/// Windows its job is terminated at once — there is no SIGTERM to offer).
 pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
     let Some(program) = argv.first() else {
         return refused("an empty reclaim command");
@@ -230,28 +257,22 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
     command
         .args(&argv[1..])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0);
-    let mut child = match command.spawn() {
+        .stderr(std::process::Stdio::piped());
+    // Its own tree (a process group, or a job), killed on drop.
+    let mut child = match ProcessTree::spawn(command) {
         Ok(child) => child,
         Err(error) => return refused(&format!("could not run {program}: {error}")),
     };
     let tail = Arc::new(Mutex::new(Vec::new()));
+    let pipes = child.take_pipes();
     let readers = [
-        child
-            .stdout
-            .take()
-            .map(|out| collect(out, Arc::clone(&tail))),
-        child
-            .stderr
-            .take()
-            .map(|err| collect(err, Arc::clone(&tail))),
+        pipes.stdout.map(|out| collect(out, Arc::clone(&tail))),
+        pipes.stderr.map(|err| collect(err, Arc::clone(&tail))),
     ];
-    let leader = child.id();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => status.ok(),
         Err(_) => {
-            terminate(leader, &mut child).await;
+            terminate(&mut child).await;
             for reader in readers.into_iter().flatten() {
                 reader.abort();
             }
@@ -263,7 +284,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
             };
         }
     };
-    let output_tail = drain(readers, leader, &tail).await;
+    let output_tail = drain(readers, &mut child, &tail).await;
     let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
     let succeeded = status.is_some_and(|status| status.success());
     Ran {
@@ -283,7 +304,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
 /// command left behind, so its group is killed and the readers dropped.
 async fn drain(
     readers: [Option<tokio::task::JoinHandle<()>>; 2],
-    leader: Option<u32>,
+    tree: &mut ProcessTree,
     tail: &Arc<Mutex<Vec<u8>>>,
 ) -> String {
     let mut readers: Vec<_> = readers.into_iter().flatten().collect();
@@ -294,9 +315,7 @@ async fn drain(
     })
     .await;
     if drained.is_err() {
-        if let Some(leader) = leader {
-            crate::process::signal_spawned_group(leader, Signal::SIGKILL);
-        }
+        tree.signal(Stop::Kill);
         for reader in &readers {
             reader.abort();
         }
@@ -304,16 +323,19 @@ async fn drain(
     tail_text(tail)
 }
 
-/// SIGTERM to the group, a grace for the leader, then SIGKILL to whatever
-/// of the group is left — a member that ignores SIGTERM does not outlive
-/// its leader — then the reap.
-async fn terminate(leader: Option<u32>, child: &mut tokio::process::Child) {
-    if let Some(leader) = leader {
-        crate::process::signal_spawned_group(leader, Signal::SIGTERM);
-        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
-        crate::process::signal_spawned_group(leader, Signal::SIGKILL);
+/// SIGTERM to the group, a grace for the leader, then SIGKILL to the group
+/// whatever the leader did — a member that ignores SIGTERM outlives a
+/// leader that honours it, and still holds the group id — then the reap.
+/// On Windows the job is terminated at once: a console-less command has no
+/// SIGTERM.
+async fn terminate(tree: &mut ProcessTree) {
+    #[cfg(unix)]
+    {
+        tree.signal(Stop::Terminate);
+        let _ = tokio::time::timeout(KILL_GRACE, tree.wait()).await;
     }
-    let _ = child.kill().await;
+    tree.signal(Stop::Kill);
+    let _ = tree.kill_root().await;
 }
 
 fn refused(reason: &str) -> Ran {
@@ -400,8 +422,14 @@ mod tests {
 
     #[test]
     fn only_a_bare_name_or_an_absolute_path_may_run() {
+        // An absolute program as this platform spells one: `/usr/bin/make`
+        // is only rooted on Windows, where absolute needs a drive.
+        #[cfg(unix)]
+        const ABSOLUTE_MAKE: &str = "/usr/bin/make";
+        #[cfg(windows)]
+        const ABSOLUTE_MAKE: &str = r"C:\tools\make.exe";
         assert!(is_runnable_program("cargo"));
-        assert!(is_runnable_program("/usr/bin/make"));
+        assert!(is_runnable_program(ABSOLUTE_MAKE));
         assert!(!is_runnable_program("./clean.sh"));
         assert!(!is_runnable_program("scripts/clean"));
         assert!(!is_runnable_program(""));
@@ -422,6 +450,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_command_runs_in_its_directory_with_a_cleared_environment() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -448,6 +477,7 @@ mod tests {
         assert!(ran.output_tail.contains("[]"), "{ran:?}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failing_command_reports_its_status_and_output() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -466,6 +496,69 @@ mod tests {
         assert_eq!(ran.reason, "sh exited with status 3");
         assert!(ran.reason.contains("status 3"), "{ran:?}");
         assert!(ran.output_tail.contains("boom"), "{ran:?}");
+    }
+
+    /// On Windows a timed-out command's job is terminated: the grandchild
+    /// it started (a `ping` standing in for a build daemon) dies with it,
+    /// and the command keeps the environment a Windows program needs.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_timed_out_command_is_killed_with_its_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("grandchild.pid");
+        let script = format!(
+            "$p = Start-Process -PassThru -WindowStyle Hidden ping.exe \
+             -ArgumentList '-n','600','127.0.0.1'; \
+             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 600",
+            marker.display()
+        );
+        let ran = execute(
+            &[
+                "powershell.exe".to_owned(),
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                script,
+            ],
+            dir.path(),
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(!ran.succeeded);
+        assert_eq!(ran.exit_code, -1, "a killed command has no exit status");
+        assert!(ran.reason.contains("timed out"), "{ran:?}");
+        let pid: u32 = std::fs::read_to_string(&marker)
+            .expect("the command wrote its grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            horde_server_testkit::windows::gone_soon(pid).await,
+            "the grandchild {pid} survived its job's termination"
+        );
+    }
+
+    /// On Windows a reclaim command runs in its directory and keeps
+    /// `SystemRoot` through the cleared environment.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_command_keeps_what_windows_needs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ran = execute(
+            &[
+                "cmd.exe".to_owned(),
+                "/C".to_owned(),
+                "cd & echo root=%SystemRoot%".to_owned(),
+            ],
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(ran.succeeded, "{ran:?}");
+        assert!(!ran.output_tail.contains("root=%SystemRoot%"), "{ran:?}");
+        let canonical = dir.path().canonicalize().expect("canonical");
+        let shown = canonical.display().to_string();
+        let shown = shown.trim_start_matches(r"\\?\");
+        assert!(ran.output_tail.contains(shown), "{ran:?}");
     }
 
     #[tokio::test]
@@ -495,6 +588,7 @@ mod tests {
     }
 
     /// `sh -c script` in `dir` under a one-second timeout, which it outlives.
+    #[cfg(unix)]
     async fn timed_out_sh(dir: &Path, script: String) -> Ran {
         let ran = execute(
             &["sh".to_owned(), "-c".to_owned(), script],
@@ -508,6 +602,7 @@ mod tests {
 
     /// A command past its timeout is killed with its whole group: a child it
     /// forked into the background dies too.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_command_is_killed_with_its_group() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -526,6 +621,7 @@ mod tests {
     }
 
     /// The pid a test's shell wrote to `marker`.
+    #[cfg(unix)]
     fn written_pid(marker: &Path) -> i32 {
         std::fs::read_to_string(marker)
             .expect("the child wrote its pid")
@@ -535,6 +631,7 @@ mod tests {
     }
 
     /// Whether `pid` is gone, or only a zombie, within five seconds.
+    #[cfg(unix)]
     async fn gone_soon(pid: i32) -> bool {
         for _ in 0..50 {
             let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
@@ -547,6 +644,7 @@ mod tests {
         false
     }
 
+    #[cfg(unix)]
     fn is_zombie(pid: i32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .map(|stat| stat.split_whitespace().nth(2) == Some("Z"))
@@ -569,6 +667,7 @@ mod tests {
         assert!(action.argv.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_run_measures_what_it_freed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -587,6 +686,7 @@ mod tests {
     }
 
     /// A failed run records which repo, why, the status and the output.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_run_records_its_repo_status_and_output() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -611,6 +711,7 @@ mod tests {
     }
 
     /// A command killed by a signal has no exit code: it reads as -1.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_command_killed_by_a_signal_reports_no_status() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -626,6 +727,7 @@ mod tests {
     }
 
     /// Output on either stream, or both, is kept whole.
+    #[cfg(unix)]
     #[tokio::test]
     async fn output_on_each_stream_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -651,6 +753,7 @@ mod tests {
     /// A process the command left in the background holding its output
     /// open does not hold the reclaim: it ends shortly after the command,
     /// with what was written, and the leftover is killed with the group.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_background_process_holding_the_output_does_not_hold_the_reclaim() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -741,6 +844,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_size_walk_counts_files_and_not_symlink_targets() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -836,6 +940,47 @@ mod tests {
         );
     }
 
+    /// A guard past its timeout kills the `cargo` it started rather than
+    /// leaving it running. The checkout's toolchain file points the rustup
+    /// proxy at a stand-in `cargo` that records its pid and never answers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_cargo_guard_kills_its_cargo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        cargo_crate(
+            dir.path(),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let marker = dir.path().join("cargo.pid");
+        let toolchain = dir.path().join("toolchain");
+        std::fs::create_dir_all(toolchain.join("bin")).expect("the toolchain's bin");
+        horde_server_testkit::script::install(
+            &toolchain.join("bin/cargo"),
+            &format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 600\n",
+                marker.display()
+            ),
+        )
+        .expect("the stand-in installs");
+        std::fs::write(
+            dir.path().join("rust-toolchain.toml"),
+            format!("[toolchain]\npath = \"{}\"\n", toolchain.display()),
+        )
+        .expect("the toolchain file");
+        let policy = WorkspacePolicy {
+            reclaim_timeout: Duration::from_secs(2),
+            ..WorkspacePolicy::default()
+        };
+        assert_eq!(
+            resolve(dir.path(), None, &policy).await,
+            Resolved::Skip("could not locate target dir: cargo metadata timed out".to_owned())
+        );
+        let pid = written_pid_soon(&marker).await;
+        let gone = gone_soon(pid).await;
+        kill_now(pid);
+        assert!(gone, "the timed-out cargo {pid} outlived its guard");
+    }
+
     #[test]
     fn a_run_frees_what_it_shrank_by_or_nothing_when_unmeasured() {
         assert_eq!(freed(Some(10), Some(4)), 6);
@@ -846,6 +991,7 @@ mod tests {
     }
 
     /// Output past the tail's size keeps exactly its last bytes.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_output_tail_keeps_exactly_the_last_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -866,6 +1012,7 @@ mod tests {
     }
 
     /// A one-byte read is output like any other, not the end of it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn output_after_a_one_byte_read_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -884,6 +1031,7 @@ mod tests {
 
     /// The end of the output ends the read: a command that exits at once
     /// returns well inside the drain grace.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_end_of_the_output_ends_the_reclaim_at_once() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -902,6 +1050,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn kill_now(pid: i32) {
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -909,6 +1058,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     async fn written_pid_soon(marker: &Path) -> i32 {
         for _ in 0..100 {
             if let Ok(text) = std::fs::read_to_string(marker)
@@ -922,6 +1072,7 @@ mod tests {
     }
 
     /// A reclaim dropped unfinished (its task cancelled) kills its command.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dropped_reclaim_kills_its_command() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -945,6 +1096,7 @@ mod tests {
     }
 
     /// A timed-out command gets SIGTERM first: a trap on it runs.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_command_is_asked_to_stop_first() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -962,7 +1114,9 @@ mod tests {
         );
     }
 
-    /// A group member that ignores SIGTERM does not outlive its leader.
+    /// A group member that ignores SIGTERM does not outlive its leader, and
+    /// a leader that honours SIGTERM at once ends the command promptly.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_member_ignoring_sigterm_is_killed_with_its_group() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -971,7 +1125,13 @@ mod tests {
             "sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 600' & wait",
             marker.display()
         );
+        let started = std::time::Instant::now();
         timed_out_sh(dir.path(), script).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the leader was asked first, not left to the grace: {:?}",
+            started.elapsed()
+        );
         let pid = written_pid_soon(&marker).await;
         let gone = gone_soon(pid).await;
         kill_now(pid);
@@ -980,6 +1140,7 @@ mod tests {
 
     /// Whether every task this test's runtime spawned is gone within two
     /// seconds.
+    #[cfg(unix)]
     async fn no_task_left() -> bool {
         let metrics = tokio::runtime::Handle::current().metrics();
         for _ in 0..100 {
@@ -993,6 +1154,7 @@ mod tests {
 
     /// A process outside the command's group holding its output open is
     /// let go: the readers do not linger once the command timed out.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_commands_readers_do_not_outlive_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1015,6 +1177,7 @@ mod tests {
     }
 
     /// The same past the drain grace, for a command that exited.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_exited_commands_readers_do_not_outlive_the_drain() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1038,6 +1201,7 @@ mod tests {
 
     /// A background process that let go of the output is not killed: only
     /// one still holding it past the drain grace is.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_background_process_that_released_the_output_is_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");

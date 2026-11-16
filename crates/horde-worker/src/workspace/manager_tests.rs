@@ -81,6 +81,75 @@ impl FsStats for FixedStats {
 }
 
 #[test]
+fn blocks_count_as_their_fragment_size_and_saturate() {
+    assert_eq!(super::blocks_to_bytes(3, 4096), 12_288);
+    assert_eq!(super::blocks_to_bytes(0, 4096), 0);
+    assert_eq!(super::blocks_to_bytes(u64::MAX, 2), u64::MAX);
+}
+
+/// `df`'s (available, size) for the filesystem holding `path`, in bytes.
+#[cfg(target_os = "linux")]
+fn df_bytes(path: &Path) -> (u64, u64) {
+    let output = std::process::Command::new("df")
+        .args(["-P", "-B1"])
+        .arg(path)
+        .output()
+        .expect("df runs");
+    assert!(output.status.success(), "df failed");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let row: Vec<u64> = text
+        .lines()
+        .nth(1)
+        .expect("df's row")
+        .split_whitespace()
+        .skip(1)
+        .take(3)
+        .map(|field| field.parse().expect("a byte count"))
+        .collect();
+    (row[2], row[0])
+}
+
+/// On a filesystem whose figures cannot move, `StatvfsStats` and `df`
+/// agree to the byte, free space included: Linux's `/proc` holds no blocks
+/// at all, so not one block is miscounted in either direction.
+#[cfg(target_os = "linux")]
+#[test]
+fn statvfs_agrees_with_df_exactly_where_nothing_moves() {
+    let proc = Path::new("/proc");
+    let ours = StatvfsStats.stats(proc).expect("/proc answers");
+    assert_eq!(ours, df_bytes(proc), "(free, total), to the byte");
+}
+
+/// The bytes `StatvfsStats` reports are `df`'s: the filesystem's size to
+/// the byte, and its free space between our readings just before and just
+/// after `df`'s. Other writers move free space all the while (a loaded
+/// machine never holds it still), so `df` is sandwiched rather than matched
+/// at an instant; a miscount — a wrong field, a wrong unit, the halves
+/// swapped — lands outside every sandwich.
+#[cfg(target_os = "linux")]
+#[test]
+fn statvfs_reads_what_df_reads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut last = None;
+    for _ in 0..20 {
+        let before = StatvfsStats
+            .stats(dir.path())
+            .expect("a real filesystem answers");
+        let (free, total) = df_bytes(dir.path());
+        let after = StatvfsStats
+            .stats(dir.path())
+            .expect("a real filesystem answers");
+        assert_eq!((before.1, after.1), (total, total), "the size, to the byte");
+        let (low, high) = (before.0.min(after.0), before.0.max(after.0));
+        if (low..=high).contains(&free) {
+            return;
+        }
+        last = Some((before.0, free, after.0));
+    }
+    panic!("df's free space never fell between ours (before, df, after): {last:?}");
+}
+
+#[test]
 fn statvfs_reports_the_real_filesystem() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (free, total) = StatvfsStats
@@ -89,7 +158,17 @@ fn statvfs_reports_the_real_filesystem() {
     assert!(total > 1, "{total}");
     assert!(free > 1, "{free}");
     assert!(free <= total, "{free} of {total}");
-    assert_eq!(StatvfsStats.stats(&dir.path().join("absent")), None);
+    // An absent path: Unix `statvfs` fails on it, while Windows'
+    // `GetDiskFreeSpaceExW` answers for the volume the path would be on.
+    let absent = StatvfsStats.stats(&dir.path().join("absent"));
+    #[cfg(unix)]
+    assert_eq!(absent, None);
+    #[cfg(windows)]
+    assert_eq!(
+        absent.map(|(_, total)| total),
+        Some(total),
+        "an absent path reports its volume"
+    );
 }
 
 /// The manager reports as its Worker, has fetched nothing yet, and asks
@@ -479,41 +558,6 @@ async fn the_shared_policy_is_the_instance_itself() {
             .to_string();
         assert!(error.contains("shared policy"), "{error}");
     }
-}
-
-/// The bytes `statvfs` reports agree with `df`'s: the filesystem's size
-/// exactly, and its free space to within half a block per free block —
-/// tight enough that miscounting the block size by one is caught. Other
-/// writers can move free space between the two readings, so a reading is
-/// retried a few times; a miscount is off by the same amount every time.
-#[test]
-fn statvfs_agrees_with_df() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut last = None;
-    for _ in 0..10 {
-        let (free, total) = StatvfsStats.stats(dir.path()).expect("a real filesystem");
-        let output = std::process::Command::new("df")
-            .args(["-B1", "--output=size,avail"])
-            .arg(dir.path())
-            .output()
-            .expect("df runs");
-        assert!(output.status.success(), "df failed");
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let numbers: Vec<u64> = text
-            .lines()
-            .nth(1)
-            .expect("df's row")
-            .split_whitespace()
-            .map(|field| field.parse().expect("a byte count"))
-            .collect();
-        let (size, avail) = (numbers[0], numbers[1]);
-        assert_eq!(total, size, "the filesystem's size");
-        if free.abs_diff(avail) <= avail / 8192 {
-            return;
-        }
-        last = Some((free, avail));
-    }
-    panic!("statvfs's free space never agreed with df's: {last:?}");
 }
 
 /// Collects the progress a materialization reports, as `(step, completed,

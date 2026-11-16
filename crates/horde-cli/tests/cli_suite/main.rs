@@ -18,10 +18,17 @@ mod binary;
 mod blob;
 mod cli;
 mod config;
+// Drives a real terminal through the testkit pty (`/bin/sh`): Unix-only.
+#[cfg(unix)]
 mod login_pty;
 mod round_trip;
 mod secure;
 mod tui_drive;
+// Drives a real terminal through the testkit pty (`/bin/sh`): Unix-only.
+#[cfg(unix)]
 mod tui_pty;
 mod verbs;
+// Fakes ssh and scp with `/bin/sh` scripts and reaps their process groups,
+// and the machines `worker add` bootstraps are Unix: Unix-only.
+#[cfg(unix)]
 mod worker_add;

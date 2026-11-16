@@ -70,10 +70,18 @@ fn holder_pid(state_dir: &Path) -> Result<u32, String> {
     if !horde_identity::StateLock::is_held(state_dir, STATE_LOCK_FILE) {
         return Err(not_running());
     }
-    std::fs::read_to_string(state_dir.join(STATE_LOCK_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .ok_or_else(not_running)
+    // A held lock on Windows is a running server whose pid cannot be read
+    // (the lock is mandatory) and which has no SIGHUP to receive anyway:
+    // refused with the restart that works, never as "no server" (ADR-0017).
+    #[cfg(windows)]
+    return Err(crate::windows::remint_refusal(state_dir));
+    #[cfg(unix)]
+    {
+        std::fs::read_to_string(state_dir.join(STATE_LOCK_FILE))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .ok_or_else(not_running)
+    }
 }
 
 /// The token in `file`, trimmed; `None` when there is no file.
@@ -101,15 +109,34 @@ async fn fresh_token(file: &Path, before: &str, deadline: Duration) -> Option<St
 /// Sends SIGHUP to `pid`, the re-mint request a running server listens for.
 ///
 /// The pid comes from a file on disk, not from a process this one spawned,
-/// so [`hangup_target`] vets it first.
+/// so [`hangup_target`] vets it first. Windows has no SIGHUP (ADR-0017), so
+/// there this refuses with [`unsupported_remint`]
+/// ([`crate::windows::send_hangup`]).
 ///
 /// # Errors
 ///
 /// The pid refused, or the signal failing (the pid gone, or not ours).
 pub fn send_hangup(pid: u32) -> std::io::Result<()> {
-    let target = hangup_target(pid)?;
-    nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGHUP)
-        .map_err(|errno| std::io::Error::other(format!("SIGHUP to {pid} failed: {errno}")))
+    #[cfg(windows)]
+    return crate::windows::send_hangup(pid);
+    #[cfg(unix)]
+    {
+        let target = hangup_target(pid)?;
+        nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGHUP)
+            .map_err(|errno| std::io::Error::other(format!("SIGHUP to {pid} failed: {errno}")))
+    }
+}
+
+/// The refusal `--remint` gives on a platform without SIGHUP.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn unsupported_remint(pid: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "this platform has no SIGHUP to ask the server (pid {pid}) for a fresh token; \
+             restart it, and starting mints one"
+        ),
+    )
 }
 
 /// `pid` as a single process this verb may hang up: never 0 (our own group,
@@ -119,6 +146,7 @@ pub fn send_hangup(pid: u32) -> std::io::Result<()> {
 /// # Errors
 ///
 /// A refusal naming the pid.
+#[cfg(unix)]
 fn hangup_target(pid: u32) -> std::io::Result<nix::unistd::Pid> {
     let refused = || {
         std::io::Error::new(
@@ -136,7 +164,26 @@ fn hangup_target(pid: u32) -> std::io::Result<nix::unistd::Pid> {
 
 #[cfg(test)]
 mod tests {
+    /// The refusal a platform without SIGHUP gives names the pid, the
+    /// missing signal, and the restart that works instead.
+    #[test]
+    fn a_remint_without_sighup_says_to_restart() {
+        let error = super::unsupported_remint(4242);
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        let text = error.to_string();
+        assert!(text.contains("4242") && text.contains("SIGHUP") && text.contains("restart"));
+    }
+
+    /// On Windows the binary's hang-up refuses with that same refusal.
+    #[cfg(windows)]
+    #[test]
+    fn send_hangup_refuses_without_sighup() {
+        let error = super::send_hangup(4242).expect_err("no SIGHUP here");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
     /// The guard alone answers: no signal is sent to learn any of this.
+    #[cfg(unix)]
     #[test]
     fn a_hangup_never_targets_reserved_or_own_pids() {
         let own_pid = std::process::id();

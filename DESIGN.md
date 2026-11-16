@@ -26,7 +26,7 @@ Status: design settled 2026-08-09 after initial brainstorm + grill session; buil
 | **Worker** | `horde-worker` | Agent process supervisor. Runs provider harnesses as child processes, materializes workspace instances, applies deterministic permission layers, journals events. Dials the server outbound (NAT-friendly). |
 | **Client** | `horde` | Ratatui TUI + CLI. Top-level session views, per-session attach, enrollment, config authoring. Later: GUI/mobile. |
 
-All Rust. Shipped as three separate binaries — combining them invites designs that break once they're apart. Convenience affordance: `horde up` (ADR-0007) starts a real `horde-server` and a real `horde-worker` as separate processes that connect over gRPC on localhost (the `horde-server --with-local-worker` flag this replaced was never built). Same wire path as remote; no in-process shortcut exists.
+All Rust. Shipped as three separate binaries — combining them invites designs that break once they're apart. All three build for Linux, macOS and Windows (`x86_64-pc-windows-msvc`); on Windows a harness's process tree is a kill-on-close Job Object rather than a process group, and a few Unix-only affordances (`--remint`, mode-bit privacy outside the user profile) are absent (ADR-0017). Convenience affordance: `horde up` (ADR-0007) starts a real `horde-server` and a real `horde-worker` as separate processes that connect over gRPC on localhost (the `horde-server --with-local-worker` flag this replaced was never built). Same wire path as remote; no in-process shortcut exists.
 
 ### Transport and resilience
 
