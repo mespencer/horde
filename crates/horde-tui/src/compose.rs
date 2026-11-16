@@ -69,6 +69,7 @@ impl Compose {
     /// Empties the box without touching the history.
     pub fn clear(&mut self) {
         self.set_text("");
+        // #[gamma::skip(assign_value.default, reason = "`Option::default()` is `None`, the value assigned")]
         self.recalled = None;
     }
 
@@ -82,8 +83,8 @@ impl Compose {
             }
             self.history.push(text.clone());
         }
+        // The draft needs no clearing: browsing saves a fresh one first.
         self.clear();
-        self.draft.clear();
         text
     }
 
@@ -112,7 +113,7 @@ impl Compose {
         let rest = line.split_off(at);
         self.row += 1;
         self.lines.insert(self.row, rest);
-        self.col = 0;
+        self.home();
     }
 
     /// Deletes the character before the cursor, joining lines at a line start.
@@ -144,13 +145,14 @@ impl Compose {
     /// Deletes back to the start of the previous word (Ctrl-W).
     pub fn delete_word(&mut self) {
         let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let before = &chars[..self.col.min(chars.len())];
-        // Past any spaces just behind the cursor to the word's last
-        // character, then back to the space before the word.
-        let start = before
+        let before = &chars[..self.col];
+        // Back past any spaces just behind the cursor to the word's end,
+        // then back to the space before the word.
+        let spaces = before.iter().rev().take_while(|c| **c == ' ').count();
+        let word_end = before.len() - spaces;
+        let start = before[..word_end]
             .iter()
-            .rposition(|c| *c != ' ')
-            .and_then(|last| before[..last].iter().rposition(|c| *c == ' '))
+            .rposition(|c| *c == ' ')
             .map_or(0, |space| space + 1);
         let line = &mut self.lines[self.row];
         let (from, to) = (byte_at(line, start), byte_at(line, self.col));
@@ -163,7 +165,7 @@ impl Compose {
         let line = &mut self.lines[self.row];
         let to = byte_at(line, self.col);
         line.replace_range(..to, "");
-        self.col = 0;
+        self.home();
     }
 
     pub fn left(&mut self) {
@@ -180,11 +182,12 @@ impl Compose {
             self.col += 1;
         } else if self.row + 1 < self.lines.len() {
             self.row += 1;
-            self.col = 0;
+            self.home();
         }
     }
 
     pub fn home(&mut self) {
+        // #[gamma::skip(assign_value.default, reason = "`usize::default()` is `0`, the value assigned")]
         self.col = 0;
     }
 
@@ -227,6 +230,7 @@ impl Compose {
         if target == 0 {
             let draft = std::mem::take(&mut self.draft);
             self.set_text(&draft);
+            // #[gamma::skip(assign_value.default, reason = "`Option::default()` is `None`, the value assigned")]
             self.recalled = None;
         } else {
             let entry = self.history[self.history.len() - target].clone();
@@ -409,5 +413,66 @@ mod tests {
         compose.clear();
         assert!(compose.is_empty());
         assert_eq!(compose.cursor(), (0, 0));
+    }
+
+    /// Down on the last line of fresh text with no history leaves it alone.
+    #[test]
+    fn down_past_fresh_text_keeps_it() {
+        let mut compose = typed("abc");
+        compose.down();
+        assert_eq!(compose.text(), "abc");
+    }
+
+    /// Clearing while browsing ends the browse: the next Up starts again
+    /// from the newest entry and keeps what was typed as the draft.
+    #[test]
+    fn clearing_ends_a_history_browse() {
+        let mut compose = Compose::default();
+        for sent in ["one", "two"] {
+            compose.insert_str(sent);
+            compose.take();
+        }
+        compose.up();
+        assert_eq!(compose.text(), "two");
+        compose.clear();
+        compose.insert_str("x");
+        compose.up();
+        assert_eq!(compose.text(), "two");
+        compose.down();
+        assert_eq!(compose.text(), "x");
+    }
+
+    /// One character in, Left and Backspace act on the line's first
+    /// character.
+    #[test]
+    fn the_first_character_is_reachable() {
+        let mut compose = typed("ab");
+        compose.left();
+        compose.backspace();
+        assert_eq!((compose.text().as_str(), compose.cursor()), ("b", (0, 0)));
+        let mut compose = typed("ab");
+        compose.left();
+        compose.left();
+        compose.insert_char('x');
+        assert_eq!(compose.text(), "xab");
+    }
+
+    /// Ctrl-W takes the spaces behind the cursor with the word before them.
+    #[test]
+    fn delete_word_takes_trailing_spaces_with_the_word() {
+        let mut compose = typed("one two  ");
+        compose.delete_word();
+        assert_eq!(
+            (compose.text().as_str(), compose.cursor()),
+            ("one ", (0, 4))
+        );
+    }
+
+    /// Up onto a shorter line puts the cursor at that line's end.
+    #[test]
+    fn up_onto_a_shorter_line_clamps_the_column() {
+        let mut compose = typed("ab\nwxyz");
+        compose.up();
+        assert_eq!(compose.cursor(), (0, 2));
     }
 }

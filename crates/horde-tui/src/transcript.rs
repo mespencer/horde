@@ -220,17 +220,15 @@ impl Scribe<'_> {
         let Some(kind) = event.kind.as_ref() else {
             return;
         };
-        if !self.transcribe_conversation(&agent_id, kind) {
-            self.transcribe_machinery(&agent_id, kind);
-        }
+        self.transcribe_conversation(&agent_id, kind);
     }
 
     fn transcript_mut(&mut self, agent_id: &str) -> &mut Transcript {
         self.transcripts.entry(agent_id.to_owned()).or_default()
     }
 
-    /// Output, messages, spawns and results. False for any other kind.
-    fn transcribe_conversation(&mut self, agent_id: &str, kind: &Kind) -> bool {
+    /// Output, messages, spawns and results; any other kind is machinery.
+    fn transcribe_conversation(&mut self, agent_id: &str, kind: &Kind) {
         match kind {
             Kind::AgentOutputChunk(chunk) => self.transcribe_output(agent_id, chunk),
             Kind::AssignmentSent(sent) => {
@@ -249,9 +247,8 @@ impl Scribe<'_> {
             }
             Kind::AgentSpawned(spawned) => self.transcribe_spawn(agent_id, spawned),
             Kind::ResultReported(reported) => self.transcribe_result(agent_id, reported),
-            _ => return false,
+            other => self.transcribe_machinery(agent_id, other),
         }
-        true
     }
 
     fn transcribe_output(&mut self, agent_id: &str, chunk: &horde_proto::v1::AgentOutputChunk) {

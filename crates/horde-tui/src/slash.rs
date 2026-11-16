@@ -170,8 +170,10 @@ pub fn is_command(text: &str) -> bool {
     let Some(rest) = text.strip_prefix('/') else {
         return false;
     };
-    let word = rest.split_whitespace().next().unwrap_or("");
-    !word.contains('/')
+    !rest
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.contains('/'))
 }
 
 /// Parses `/word [argument…]`.
@@ -198,9 +200,7 @@ pub fn completions(text: &str) -> Vec<&'static Command> {
     let Some(word) = text.strip_prefix('/') else {
         return Vec::new();
     };
-    if word.contains(char::is_whitespace) {
-        return Vec::new();
-    }
+    // No command name has a space, so a finished word matches none.
     COMMANDS
         .iter()
         .filter(|command| command.name.starts_with(word))

@@ -5,12 +5,19 @@
 //! Wrapping here — rather than handing ratatui a `Wrap` and hoping — keeps
 //! that count and the drawing the same computation.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 /// How many terminal cells `text` occupies.
 #[must_use]
 pub fn width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
+}
+
+/// How many cells one character occupies, counted the way [`width`] counts
+/// it inside a string, so rows built a character at a time measure what
+/// the whole row measures (a control character takes a cell in both).
+fn char_width(c: char) -> usize {
+    width(c.encode_utf8(&mut [0; 4]))
 }
 
 /// Wraps `text` to rows of at most `limit` cells.
@@ -52,7 +59,7 @@ fn place_word(rows: &mut Vec<String>, current: &mut String, word: &str, limit: u
         rows.push(std::mem::take(current));
     }
     for c in word.chars() {
-        let cell = c.width().unwrap_or(0);
+        let cell = char_width(c);
         if width(current) + cell > limit && !current.is_empty() {
             rows.push(std::mem::take(current));
         }
@@ -72,7 +79,7 @@ pub fn clip(text: &str, limit: usize) -> String {
     }
     let mut out = String::new();
     for c in first.chars() {
-        if width(&out) + c.width().unwrap_or(0) + 1 > limit {
+        if width(&out) + char_width(c) + 1 > limit {
             break;
         }
         out.push(c);
@@ -127,5 +134,28 @@ mod tests {
         assert_eq!(clip("one\n", 20), "one", "a trailing newline cuts nothing");
         assert_eq!(fit("ab", 4), "ab  ");
         assert_eq!(fit("abcdef", 4), "abc…");
+    }
+
+    /// A zero limit is one cell, not none: a combining mark stays on its
+    /// letter.
+    #[test]
+    fn a_zero_limit_keeps_a_combining_mark_on_its_letter() {
+        assert_eq!(wrap("e\u{301}", 0), vec!["e\u{301}"]);
+    }
+
+    /// A control character takes the cell a string's width gives it, so a
+    /// split word's rows and a clipped line stay within their limit.
+    #[test]
+    fn a_control_character_takes_a_cell() {
+        assert_eq!(wrap("abcd\u{7}", 2), vec!["ab", "cd", "\u{7}"]);
+        assert_eq!(clip("ab\u{7}cdef", 5), "ab\u{7}c…");
+        assert_eq!(clip("abc\u{7}def", 5), "abc\u{7}…");
+    }
+
+    /// Clipping stops at the first character that does not fit, even when a
+    /// narrower one follows.
+    #[test]
+    fn clipping_stops_at_the_first_character_that_does_not_fit() {
+        assert_eq!(clip("a界bcd", 3), "a…");
     }
 }

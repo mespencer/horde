@@ -443,3 +443,42 @@ fn an_event_without_a_kind_transcribes_nothing() {
     state.apply(&bare);
     assert!(blocks(&state, "kid").is_empty());
 }
+
+/// Answers read in question order however the wire's map iterates them.
+#[test]
+fn answers_are_listed_in_question_order() {
+    let mut state = family();
+    let keys = ["h", "c", "f", "a", "g", "b", "e", "d"];
+    let answered = Kind::PermissionDecided(PermissionDecided {
+        decision: Some(PermissionDecision {
+            request_id: Some(PermissionRequestId::new("q")),
+            answers: keys
+                .iter()
+                .map(|key| {
+                    (
+                        (*key).to_owned(),
+                        Answer {
+                            values: vec![key.to_uppercase()],
+                        },
+                    )
+                })
+                .collect(),
+            ..PermissionDecision::default()
+        }),
+    });
+    fold(
+        &mut state,
+        "kid",
+        vec![requested("q", "AskUserQuestion"), answered],
+    );
+    assert_eq!(
+        blocks(&state, "kid"),
+        vec![Block::Prompt {
+            request_id: "q".to_owned(),
+            summary: "AskUserQuestion".to_owned(),
+            settled: Some(Settled::Answered(
+                "a → A; b → B; c → C; d → D; e → E; f → F; g → G; h → H".to_owned()
+            )),
+        }]
+    );
+}

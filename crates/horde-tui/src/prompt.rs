@@ -63,6 +63,8 @@ impl PromptCursor {
     /// A fresh cursor on `request`, first row of the first question.
     #[must_use]
     pub fn new(request: &PendingPermission) -> Self {
+        // A permission has no questions and still needs one slot.
+        // #[gamma::skip(literal.int_increment, reason = "a second slot is never indexed: the cursor indexes slots by question, and a permission has none past the first")]
         let count = request.questions.len().max(1);
         Self {
             request_id: request.request_id.clone(),
@@ -99,8 +101,8 @@ impl PromptCursor {
 
     fn press_permission(&mut self, key: PromptKey) -> Option<Decision> {
         match key {
-            PromptKey::Up => self.step(-1, PERMISSION_CHOICES.len()),
-            PromptKey::Down => self.step(1, PERMISSION_CHOICES.len()),
+            PromptKey::Up => self.up(),
+            PromptKey::Down => self.down(PERMISSION_CHOICES.len()),
             PromptKey::Enter | PromptKey::Space => return permission_choice(self.row()),
             PromptKey::Char('y') => return permission_choice(0),
             PromptKey::Char('n') => return Some(Decision::Deny),
@@ -117,8 +119,8 @@ impl PromptCursor {
         }
         let rows = row_count(question);
         match key {
-            PromptKey::Up => self.step(-1, rows),
-            PromptKey::Down => self.step(1, rows),
+            PromptKey::Up => self.up(),
+            PromptKey::Down => self.down(rows),
             PromptKey::Left => self.question = self.question.saturating_sub(1),
             PromptKey::Right => return self.advance(request),
             PromptKey::Enter => return self.enter(request, question),
@@ -133,9 +135,7 @@ impl PromptCursor {
     /// On a free-text row, characters and backspace edit the text. Returns
     /// whether the key was consumed as editing.
     fn types_text(&mut self, key: PromptKey) -> bool {
-        let Some(text) = self.free_text.get_mut(self.question) else {
-            return false;
-        };
+        let text = &mut self.free_text[self.question];
         match key {
             PromptKey::Char(c) => text.push(c),
             PromptKey::Space => text.push(' '),
@@ -147,10 +147,14 @@ impl PromptCursor {
         true
     }
 
-    fn step(&mut self, by: isize, rows: usize) {
-        if let Some(row) = self.highlighted.get_mut(self.question) {
-            *row = row.saturating_add_signed(by).min(rows.saturating_sub(1));
-        }
+    fn up(&mut self) {
+        let row = &mut self.highlighted[self.question];
+        *row = row.saturating_sub(1);
+    }
+
+    fn down(&mut self, rows: usize) {
+        let row = &mut self.highlighted[self.question];
+        *row = (*row + 1).min(rows.saturating_sub(1));
     }
 
     fn enter(
@@ -174,11 +178,9 @@ impl PromptCursor {
         request: &PendingPermission,
         question: &PendingQuestion,
     ) -> Option<Decision> {
-        let row = self.row();
-        if row >= question.options.len() {
-            return None;
-        }
-        self.choose(row, question.multi_select);
+        // Space reaches here only off the free-text row (which takes it as
+        // text), so the row is an option.
+        self.choose(self.row(), question.multi_select);
         if question.multi_select {
             return None;
         }
@@ -193,9 +195,7 @@ impl PromptCursor {
         c: char,
     ) -> Option<Decision> {
         let index = digit(c).filter(|index| *index < question.options.len())?;
-        if let Some(row) = self.highlighted.get_mut(self.question) {
-            *row = index;
-        }
+        self.highlighted[self.question] = index;
         self.choose(index, question.multi_select);
         if question.multi_select {
             return None;
@@ -221,9 +221,9 @@ impl PromptCursor {
     /// To the next unanswered question; when there is none, the answers.
     fn advance(&mut self, request: &PendingPermission) -> Option<Decision> {
         let answers = self.answers(request);
-        let count = request.questions.len();
-        let unanswered = (1..=count)
-            .map(|offset| (self.question + offset) % count)
+        // The questions after this one, then from the first round to this.
+        let unanswered = (self.question + 1..request.questions.len())
+            .chain(0..=self.question)
             .find(|index| !answers.contains_key(&request.questions[*index].id));
         match unanswered {
             Some(index) => {
@@ -591,6 +591,63 @@ mod tests {
         assert_eq!(
             cursor.press(&asked, PromptKey::Char('2')),
             answer(&[("when", &["later"])])
+        );
+    }
+
+    /// Left steps back one question at a time.
+    #[test]
+    fn left_steps_back_one_question() {
+        let asking = request(vec![
+            question("a", &["x"]),
+            question("b", &["y"]),
+            question("c", &["z"]),
+        ]);
+        let mut cursor = PromptCursor::new(&asking);
+        press_all(&mut cursor, &asking, &[PromptKey::Right, PromptKey::Right]);
+        assert_eq!(cursor.question, 2);
+        cursor.press(&asking, PromptKey::Left);
+        assert_eq!(cursor.question, 1);
+    }
+
+    /// A digit on a multi-select question highlights the option it toggles.
+    #[test]
+    fn a_digit_moves_the_highlight_to_its_option() {
+        let mut several = question("checks", &["fmt", "clippy", "tests"]);
+        several.multi_select = true;
+        let asking = request(vec![several]);
+        let mut cursor = PromptCursor::new(&asking);
+        assert_eq!(cursor.press(&asking, PromptKey::Char('2')), None);
+        assert_eq!(cursor.row(), 1);
+    }
+
+    /// Moving on from the only unanswered question stays on it rather than
+    /// sending a partial answer.
+    #[test]
+    fn the_last_unanswered_question_is_not_skipped() {
+        let asking = request(vec![question("a", &["x"]), question("b", &["y"])]);
+        let mut cursor = PromptCursor::new(&asking);
+        press_all(&mut cursor, &asking, &[PromptKey::Right]);
+        assert_eq!(cursor.press(&asking, PromptKey::Char('1')), None);
+        assert_eq!(cursor.question, 0, "back to the one left");
+        assert_eq!(cursor.press(&asking, PromptKey::Right), None);
+        assert_eq!(cursor.question, 0);
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Char('1')),
+            answer(&[("a", &["x"]), ("b", &["y"])])
+        );
+    }
+
+    /// Digits are decimal: 9 picks the ninth option, a letter picks none.
+    #[test]
+    fn digits_are_decimal() {
+        let labels: Vec<String> = (1..=10).map(|n| format!("o{n}")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let asking = request(vec![question("pick", &labels)]);
+        let mut cursor = PromptCursor::new(&asking);
+        assert_eq!(cursor.press(&asking, PromptKey::Char('a')), None);
+        assert_eq!(
+            cursor.press(&asking, PromptKey::Char('9')),
+            answer(&[("pick", &["o9"])])
         );
     }
 }

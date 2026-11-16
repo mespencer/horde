@@ -33,6 +33,12 @@ pub struct AgentNode {
 }
 
 impl AgentNode {
+    /// No turn is in flight any more.
+    fn turn_ended(&mut self) {
+        // #[gamma::skip(assign_value.default, reason = "`bool::default()` is `false`, the value assigned")]
+        self.working = false;
+    }
+
     /// The state word a human reads: `LOST` outranks the lifecycle, because
     /// a lost agent's last lifecycle is a claim nobody can still vouch for.
     #[must_use]
@@ -76,7 +82,7 @@ pub(crate) fn note_facts(
         }
         Some(Kind::PlacementChanged(changed)) => note_placement(node, changed.placement.as_ref()),
         Some(Kind::UsageRecorded(recorded)) => note_usage(node, recorded.record.as_ref()),
-        Some(Kind::TurnInterrupted(_)) => node.working = false,
+        Some(Kind::TurnInterrupted(_)) => node.turn_ended(),
         _ => {}
     }
 }
@@ -117,7 +123,7 @@ fn note_placement(node: &mut AgentNode, placement: Option<&horde_proto::v1::Plac
         node.worker_id = Some(worker.to_string());
     }
     if placement.state == PlacementState::Lost as i32 {
-        node.working = false;
+        node.turn_ended();
     }
 }
 
@@ -132,7 +138,7 @@ fn note_usage(node: &mut AgentNode, record: Option<&horde_proto::v1::UsageRecord
         replace_if_set(&mut node.account, &binding.provider_account);
     }
     if !record.turn_id.is_empty() {
-        node.working = false;
+        node.turn_ended();
     }
 }
 
