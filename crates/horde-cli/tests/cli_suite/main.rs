@@ -28,4 +28,7 @@ mod tui_drive;
 #[cfg(unix)]
 mod tui_pty;
 mod verbs;
+// Fakes ssh and scp with `/bin/sh` scripts and reaps their process groups,
+// and the machines `worker add` bootstraps are Unix: Unix-only.
+#[cfg(unix)]
 mod worker_add;
