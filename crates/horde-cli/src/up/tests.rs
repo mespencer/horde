@@ -1039,3 +1039,117 @@ async fn forwarded_daemon_lines_are_tagged_and_clipped() {
     );
     child.stop(TEST_TIMINGS.teardown).await;
 }
+
+/// A child's exit report waits for its output to be read to the end: a
+/// line a grandchild writes after the child exited still reaches it.
+#[tokio::test]
+async fn an_exit_report_waits_for_the_last_output() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let binary = fake_daemon(
+        root.path(),
+        "brief",
+        "",
+        &["first".to_owned()],
+        Some("(sleep 0.3; echo late) & exit 3"),
+    );
+    let mut child =
+        super::WatchedChild::spawn("brief", &binary, &[], &[], no_forward()).expect("spawns");
+    let report = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(report) = child.exit_report() {
+                return report;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the child exits")
+    .to_string();
+    assert!(
+        report.contains("first") && report.contains("late"),
+        "{report}"
+    );
+}
+
+/// A started server that dies while the readiness Hello is still being
+/// retried ends the wait at once, with what it said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_dying_during_the_hello_wait_fails_with_its_output() {
+    let harness = horde_server_testkit::secure::serve_secured()
+        .await
+        .expect("a secured server");
+    let enrollment_port = port_of(&harness.enrollment_endpoint());
+    let silent_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let root = tempfile::tempdir().expect("a temp dir");
+    let paths = paths_under(root.path(), None);
+    std::fs::create_dir_all(&paths.server_state).expect("the server state dir");
+    let operator =
+        horde_identity::Principal::new(horde_identity::PrincipalRole::Client, "operator")
+            .expect("a valid name");
+    let minted = harness
+        .authority
+        .mint(
+            &operator,
+            0,
+            horde_server::service::enrollment::wall_clock_ms(),
+        )
+        .await
+        .expect("the bootstrap mint");
+    std::fs::write(
+        paths.server_state.join("bootstrap-token"),
+        format!("{}\n", harness.join_token(&minted)),
+    )
+    .expect("the token files");
+
+    let dies = root.path().join("die-now");
+    let server_binary = fake_daemon(
+        root.path(),
+        "server",
+        "",
+        &[
+            format!("listening main=127.0.0.1:{silent_port}"),
+            format!("listening enrollment=127.0.0.1:{enrollment_port}"),
+            format!("server-fingerprint {}", minted.server_fingerprint),
+        ],
+        Some(&format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; echo 'dying now'; exit 4",
+            dies.display()
+        )),
+    );
+    let worker_binary = fake_daemon(root.path(), "worker", "", &[], None);
+    let environment = environment_under(
+        root.path(),
+        server_binary,
+        worker_binary,
+        "127.0.0.1:1",
+        Vec::new(),
+    );
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        TEST_CEILING,
+        super::stand_up(
+            &environment,
+            &mut |line| {
+                if line.starts_with("client enrolled ") {
+                    std::fs::write(&dies, "").expect("the death cue writes");
+                }
+            },
+            no_forward(),
+            std::future::pending(),
+        ),
+    )
+    .await
+    .expect("stand_up returns within the test ceiling");
+    let refusal = outcome.expect_err("a dead server").to_string();
+    assert!(
+        refusal.contains("horde-server exited") && refusal.contains("dying now"),
+        "{refusal}"
+    );
+    assert!(
+        started.elapsed() < TEST_TIMINGS.hello,
+        "reported on the exit, not the Hello ceiling"
+    );
+}
