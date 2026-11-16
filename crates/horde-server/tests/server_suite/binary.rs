@@ -277,3 +277,28 @@ async fn serve_prints_the_operator_interface_and_stays_up() -> Setup<()> {
     );
     Ok(())
 }
+
+/// With no `--state-dir`, the binary finds its state, and so its config
+/// file, under the `$HOME` it was started with.
+#[tokio::test]
+async fn show_config_reads_the_file_under_home() {
+    let home = tempfile::tempdir().expect("a temp dir");
+    let file = home.path().join(".horde/server/config.toml");
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("dirs");
+    std::fs::write(&file, "[permissions]\ndefault_mode = \"ask\"\n").expect("the file");
+    let home_text = home.path().to_string_lossy().into_owned();
+    let shown = horde_server_with_env(&["--show-config", "--origin"], &[("HOME", &home_text)])
+        .await
+        .expect("the binary must run");
+    let stdout = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let line = format!(
+        "permissions.default_mode = \"ask\"  # file {}",
+        file.display()
+    );
+    assert!(stdout.contains(&line), "{line} in:\n{stdout}");
+}

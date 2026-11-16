@@ -93,7 +93,7 @@ pub fn agent_entries(
     ] {
         let (value, origin) = match (overridden, workspace) {
             (Some(wire), Some(workspace)) => (
-                std::time::Duration::from_secs(u64::try_from(wire.seconds).unwrap_or(0)),
+                std::time::Duration::from_secs(u64::try_from(wire.seconds).unwrap_or_default()),
                 Origin::Workspace(workspace.name.clone()),
             ),
             _ => (server_value, origin_of(key)),

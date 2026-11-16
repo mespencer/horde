@@ -461,6 +461,20 @@ mod tests {
             root.string("x"),
             Err("x: expected a string, found an array".to_owned())
         );
+        let file = table("c = \"7\"\nf = \"0.5\"\ns = 512");
+        let mut root = Section::root(&file);
+        assert_eq!(
+            root.count::<u32>("c"),
+            Err(r#"c: expected a whole number, found string "7""#.to_owned())
+        );
+        assert_eq!(
+            root.number("f"),
+            Err(r#"f: expected a number, found string "0.5""#.to_owned())
+        );
+        assert_eq!(
+            root.size("s"),
+            Err(r#"s: expected a size such as "512MiB" or "20GiB", found integer 512"#.to_owned())
+        );
     }
 
     #[test]

@@ -471,10 +471,9 @@ pub async fn seed_agent(
         agent_id: Some(AgentId::new(agent)),
         occurred_at: None,
         idempotency_key: format!("{agent}:spawned"),
+        // A root agent: no parent, no spawner, no session settings of its
+        // own — the session's defaults.
         kind: Some(Kind::AgentSpawned(AgentSpawned {
-            session: None,
-            parent_agent_id: None,
-            spawned_by: None,
             spec: Some(AgentSpec {
                 initial_assignment: Some(Assignment {
                     assignment_id: None,
@@ -483,7 +482,7 @@ pub async fn seed_agent(
                 }),
                 ..AgentSpec::default()
             }),
-            tree_path: Vec::new(),
+            ..AgentSpawned::default()
         })),
     };
     let state = match worker {

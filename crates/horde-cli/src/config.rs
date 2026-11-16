@@ -204,14 +204,11 @@ pub async fn server_entries(
     args: &ShowArgs,
 ) -> Result<Vec<(String, String, String)>, ClientError> {
     let session_id = match &args.session {
-        Some(reference) => Some(crate::resolve::session_id(client, reference, true).await?),
-        None => None,
+        Some(reference) => crate::resolve::session_id(client, reference, true).await?,
+        None => String::new(),
     };
     let entries = client
-        .effective_config(
-            args.workspace.as_deref().unwrap_or_default(),
-            session_id.as_deref(),
-        )
+        .effective_config(args.workspace.as_deref().unwrap_or_default(), &session_id)
         .await?;
     Ok(entries
         .into_iter()

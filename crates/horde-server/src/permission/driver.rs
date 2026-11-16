@@ -742,18 +742,27 @@ mod tests {
 
         run_chain(&log, PermissionModes::shipped(), None).await;
 
-        let rulings: Vec<(i32, i32, String)> = decisions_in(&log, "s1")
+        let rulings: Vec<(i32, i32, String, bool)> = decisions_in(&log, "s1")
             .await
             .into_iter()
-            .map(|decision| (decision.outcome, decision.decided_by, decision.reason))
+            .map(|decision| {
+                (
+                    decision.outcome,
+                    decision.decided_by,
+                    decision.reason,
+                    decision.updated_input.is_none(),
+                )
+            })
             .collect();
         assert_eq!(
             rulings,
             [(
                 PermissionOutcome::Allow as i32,
                 PermissionLayer::DeterministicAllow as i32,
-                super::BYPASS_REASON.to_owned()
-            )]
+                super::BYPASS_REASON.to_owned(),
+                true
+            )],
+            "bypass allows the call as proposed, with no replacement input"
         );
         assert_eq!(
             requests_in(&log, "s1").await.len(),

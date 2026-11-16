@@ -315,6 +315,7 @@ impl ControlPlane {
             .filter(|id| !id.is_empty())
         {
             Some(id) => Some(self.required_definition(&id).await.map_err(Status::from)?),
+            // #[gamma::skip(option.none_to_some, reason = "a default WorkspaceDefinition has an empty permission_mode, which agent_mode passes over exactly as it passes over no workspace, and the origin it would name is discarded here")]
             None => None,
         };
         let (mode, _) = crate::config::agent_mode(

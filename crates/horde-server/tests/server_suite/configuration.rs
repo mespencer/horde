@@ -320,6 +320,80 @@ async fn a_configured_tier_catalog_replaces_the_shipped_one() -> Setup<()> {
             ..CreateSessionRequest::default()
         })
         .await?;
+
+    // The worker's spawn command is bound through the same configured
+    // catalog: the worker does not re-resolve tiers.
+    use horde_proto::v1::{
+        HarnessCapability, RegisterWorkerRequest, StreamCommandsRequest, WorkerCapabilities,
+        WorkerId, stream_commands_response::Command,
+    };
+    use tokio_stream::StreamExt;
+    harness
+        .worker
+        .register_worker(RegisterWorkerRequest {
+            hello: crate::common::versioned_hello(),
+            worker_id: Some(WorkerId::new("w-tiers")),
+            capabilities: Some(WorkerCapabilities {
+                harnesses: vec![HarnessCapability {
+                    provider: "claude".to_owned(),
+                    installed: true,
+                    ..HarnessCapability::default()
+                }],
+                ..WorkerCapabilities::default()
+            }),
+            last_local_journal_sequence: None,
+        })
+        .await?;
+    let mut commands = harness
+        .worker
+        .stream_commands(StreamCommandsRequest {
+            worker_id: Some(WorkerId::new("w-tiers")),
+            resume_from_command_sequence: 1,
+            resume_after_log_position: 0,
+        })
+        .await?
+        .into_inner();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), commands.next())
+        .await?
+        .ok_or("the stream is open")??;
+    let Some(Command::SpawnAgent(spawn)) = first.command else {
+        return Err(format!("a spawn first: {first:?}").into());
+    };
+    let binding = spawn.binding.ok_or("the spawn carries its binding")?;
+    assert_eq!(
+        (
+            binding.tier.as_str(),
+            binding.provider.as_str(),
+            binding.model.as_str()
+        ),
+        ("only", "claude", "opus")
+    );
+    Ok(())
+}
+
+/// A configured workspace cleanup default is what an agent in a workspace
+/// that does not override it gets, and the file is named as deciding it.
+#[tokio::test]
+async fn a_configured_cleanup_default_reaches_the_agents_entries() -> Setup<()> {
+    let (core, dir) = configured(
+        &format!("{FILE}[workspace]\nidle_reclaim_after = \"7m\"\n"),
+        &ServerFlags::default(),
+    )?;
+    let mut harness = connect_to(core).await?;
+    let plain = workspace(&mut harness, "plain-ws", "").await?;
+    assert_eq!(
+        effective(
+            &mut harness,
+            &plain,
+            None,
+            "agent.workspace.idle_reclaim_after"
+        )
+        .await?,
+        (
+            "7m".to_owned(),
+            format!("file {}", dir.path().join("config.toml").display())
+        )
+    );
     Ok(())
 }
 

@@ -583,17 +583,18 @@ impl Client {
     }
 
     /// The server's effective configuration (ADR-0016), with the per-agent
-    /// keys for an agent created in `workspace` and `session` when named.
+    /// keys for an agent created in `workspace` and `session_id` when named;
+    /// an empty one names none, as the server reads it.
     pub async fn effective_config(
         &mut self,
         workspace: &str,
-        session_id: Option<&str>,
+        session_id: &str,
     ) -> Result<Vec<horde_proto::v1::ConfigEntry>, ClientError> {
         Ok(self
             .inner
             .get_effective_config(horde_proto::v1::GetEffectiveConfigRequest {
                 workspace: workspace.to_owned(),
-                session_id: session_id.map(SessionId::new),
+                session_id: Some(SessionId::new(session_id)),
             })
             .await?
             .into_inner()

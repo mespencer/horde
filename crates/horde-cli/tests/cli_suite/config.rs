@@ -167,7 +167,7 @@ async fn the_client_files_session_default_reaches_a_new_session_and_the_flag_bea
     for title in ["filed", "flagged"] {
         let session = horde_cli::resolve::session_id(&mut client, title, false).await?;
         let entry = client
-            .effective_config("", Some(&session))
+            .effective_config("", &session)
             .await?
             .into_iter()
             .find(|entry| entry.key == "agent.permission_mode")
@@ -176,6 +176,29 @@ async fn the_client_files_session_default_reaches_a_new_session_and_the_flag_bea
         modes.push(entry.value);
     }
     assert_eq!(modes, ["\"ask\"", "\"bypass\""]);
+
+    // `config show --session` resolves the session it names, archived ones
+    // included, and prints the per-agent resolution under it.
+    let flagged = horde_cli::resolve::session_id(&mut client, "flagged", false).await?;
+    client.archive_session(&flagged, "done").await?;
+    let home = tempfile::tempdir()?;
+    let output = horde(
+        home.path(),
+        &[
+            "--endpoint",
+            &endpoint,
+            "config",
+            "show",
+            "--session",
+            "flagged",
+            "--origin",
+        ],
+    )
+    .await?;
+    assert!(output.status.success(), "{output:?}");
+    let shown = String::from_utf8_lossy(&output.stdout);
+    let line = format!("agent.permission_mode = \"bypass\"  # session {flagged}");
+    assert!(shown.contains(&line), "{line} in:\n{shown}");
 
     let missing = invoke(
         &endpoint,
