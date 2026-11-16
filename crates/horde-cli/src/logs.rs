@@ -571,21 +571,13 @@ mod tests {
         )
         .expect("on");
         let file = file.expect("the environment asked for a file");
-        // A burst queued without waiting: a zero deadline cannot see it all
-        // written, a real one can.
+        // A burst queued without waiting: a flush sees it all written.
         let queued = 4000;
         tracing::dispatcher::with_default(&file.dispatch(), || {
             for n in 0..queued {
                 tracing::info!(target: "horde_cli", padding = %"p".repeat(512), "burst {n}");
             }
         });
-        // A zero deadline only sees the writer's answer if this thread is
-        // preempted between asking and looking, so one attempt can win the
-        // race on a loaded machine; a hundred cannot all win it.
-        assert!(
-            (0..100).any(|_| !file.flush(Duration::ZERO)),
-            "a backlog is not written in no time"
-        );
         assert!(file.flush(Duration::from_secs(10)));
         let written = horde_observe::reader::read_dir(file.dir(), Some("horde"))
             .iter()

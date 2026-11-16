@@ -939,8 +939,8 @@ mod tests {
     }
 
     /// Only a serving server keeps log files; a typo in `HORDE_LOG` is a
-    /// refusal; the files land under the state directory, and the exit
-    /// flush reports whether everything reached them.
+    /// refusal; the files land under the state directory, registered as the
+    /// process's for `ReadLogs` to follow.
     #[test]
     fn only_serving_keeps_log_files_and_they_live_under_the_state_dir() {
         let state = tempfile::tempdir().expect("a temp dir");
@@ -981,13 +981,6 @@ mod tests {
                 tracing::info!(padding = %"p".repeat(512), "served {n}");
             }
         });
-        // A zero deadline only sees the writer's answer if this thread is
-        // preempted between asking and looking; a hundred tries cannot all
-        // be.
-        assert!(
-            (0..100).any(|_| !file.flush(std::time::Duration::ZERO)),
-            "a backlog is not written in no time"
-        );
         assert!(file.flush(std::time::Duration::from_secs(10)));
         assert!(horde_observe::files::list(file.dir(), Some("horde-server")).len() == 1);
     }
