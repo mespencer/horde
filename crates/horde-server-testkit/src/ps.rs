@@ -98,24 +98,19 @@ pub fn adopter() -> Option<u32> {
         .spawn()
         .ok()?;
     // Held apart from `shell`, whose `wait` would close it — ending the
-    // sentinel before it can be read.
-    let pipe = shell.stdin.take();
+    // sentinel before it can be read. It closes when this function returns,
+    // on every path, and that ends the sentinel.
+    let _pipe = shell.stdin.take();
     let mut said = String::new();
     let read = shell
         .stdout
         .take()
         .map(|mut out| out.read_to_string(&mut said));
     let waited = shell.wait();
-    let sentinel = said.trim().parse().ok();
-    let found = match (read, waited, sentinel) {
-        (Some(Ok(_)), Ok(_), Some(sentinel)) => {
-            adopted_by(&process_table(), sentinel, shell.id(), std::process::id())
-        }
-        _ => None,
-    };
-    // Closing the pipe ends the sentinel.
-    drop(pipe);
-    found
+    read?.ok()?;
+    waited.ok()?;
+    let sentinel = said.trim().parse().ok()?;
+    adopted_by(&process_table(), sentinel, shell.id(), std::process::id())
 }
 
 #[cfg(test)]
