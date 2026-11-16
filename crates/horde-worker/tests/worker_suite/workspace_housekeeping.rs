@@ -62,19 +62,24 @@ async fn atlas_rig_with(temp: &Path, agent: &str) -> Rig {
     rig
 }
 
-/// A rig whose scan loop ticks every `scan_interval`, runs its pin pass on
-/// every tick and reports hourly, with `ws-1` materialized.
-async fn looping_rig(temp: &Path, scan_interval: Duration) -> Rig {
-    let config = horde_worker::runtime::HousekeepingConfig {
+/// A scan loop that ticks every `scan_interval`, runs its pin pass on every
+/// tick and reports hourly.
+fn looping(scan_interval: Duration) -> horde_worker::runtime::HousekeepingConfig {
+    horde_worker::runtime::HousekeepingConfig {
         scan_interval,
         pin_scan_interval: Duration::ZERO,
         report_interval: Duration::from_secs(3600),
         ..horde_worker::runtime::HousekeepingConfig::default()
-    };
+    }
+}
+
+/// A rig whose scan loop is [`looping`], with `ws-1` materialized. The
+/// loop starts with the materialization, the Runtime's first command.
+async fn looping_rig(temp: &Path, scan_interval: Duration) -> Rig {
     let mut rig = rig_with(
         &temp.join("workspaces"),
         Journal::in_memory().expect("journal"),
-        config,
+        looping(scan_interval),
     );
     materialize(
         &mut rig,
@@ -497,16 +502,16 @@ async fn the_longest_grace_is_reached_by_the_oldest_archive() {
 /// The scan loop, started with the Runtime's first replay, drops a pin
 /// origin holds on its pin pass, journals that, and reports the change at
 /// once — not at the next report interval.
+///
+/// The pin is made under a hand-driven Runtime, and the looping one is a
+/// restart over the same root and journal: a loop already running would
+/// drop the pin on its next tick, racing the test's own reading of it.
 #[tokio::test]
 async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = looping_rig(temp.path(), Duration::from_millis(50)).await;
+    let mut rig = atlas_rig(temp.path(), policy(0, 0)).await;
     spawn_in(&mut rig, "ws-1", "agent-1").await;
-    // Everything up to the spawn has reported; the archive's release
-    // reports once more, after it journals.
-    let before_archive = rig.reporter.count();
-    archive(&mut rig, "agent-1").await;
-    released(&rig, "agent-1", 2).await;
+    archived_and_released(&mut rig, "agent-1", 2).await;
     let instance_repo = rig.root.join("ws-1/atlas");
     let pins = || {
         harness::git(
@@ -515,21 +520,17 @@ async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
         )
     };
     assert!(pins().contains("agent-1"), "the removal pinned HEAD");
-    // The archive's own report, then a quiet baseline: nothing else
-    // reports until the scan loop starts.
-    assert!(
-        eventually(Duration::from_secs(30), || async {
-            rig.reporter.count() > before_archive
-                && rig
-                    .reporter
-                    .last()
-                    .first()
-                    .is_some_and(|r| r.checkouts.is_empty())
-        })
-        .await
-    );
-    let baseline = rig.reporter.count();
+    let journal = rig.journal.clone();
+    rig.runtime.shutdown().await;
+    // Nothing has run the pin pass, and the hand-driven loop never would.
+    assert!(pins().contains("agent-1"), "the pin outlives the Runtime");
 
+    let mut rig = rig_with(
+        &temp.path().join("workspaces"),
+        journal,
+        looping(Duration::from_millis(50)),
+    );
+    assert_eq!(rig.reporter.count(), 0, "the loop has not started");
     rig.runtime.replay_inbox().await.expect("the replay runs");
     let journal = rig.journal.clone();
     assert!(
@@ -554,7 +555,7 @@ async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
     assert!(!pins().contains("agent-1"), "and the pin is gone");
     assert!(
         eventually(Duration::from_secs(10), || async {
-            rig.reporter.count() > baseline
+            rig.reporter.count() > 0
         })
         .await,
         "the change is reported without waiting an hour"
