@@ -2618,11 +2618,11 @@ async fn a_live_checkout_is_reclaimed_the_millisecond_it_turns_idle() {
     // Once its turn is over nothing touches the agent's activity again;
     // forgotten, the ledger's last activity is its whole history.
     tokio::time::timeout(core::time::Duration::from_secs(15), async {
-        while !runtime
+        while runtime
             .shared
             .activity
             .snapshot("agent-1")
-            .is_some_and(|seen| !seen.busy)
+            .is_none_or(|seen| seen.busy)
         {
             tokio::time::sleep(core::time::Duration::from_millis(10)).await;
         }
@@ -2859,24 +2859,39 @@ async fn progress_names_no_agent_and_a_checkout_names_its_own() {
         })
     })
     .await;
-    let mut progress = 0;
-    for event in events
+    let journaled: Vec<&horde_proto::v1::Event> = events
         .iter()
         .filter_map(|journaled| journaled.event.as_ref())
-    {
-        match event.kind.as_ref() {
-            Some(Kind::WorkspaceInstanceChanged(changed)) if changed.progress.is_some() => {
-                progress += 1;
-                assert_eq!(event.agent_id, None, "{event:?}");
-            }
-            Some(Kind::CheckoutPrepared(_)) => assert_eq!(
-                event.agent_id.as_ref().map(ToString::to_string).as_deref(),
-                Some("agent-1")
-            ),
-            _ => {}
-        }
-    }
-    assert!(progress > 0, "the materialize journaled its progress");
+        .collect();
+    let progress_agents: Vec<_> = journaled
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_ref(),
+                Some(Kind::WorkspaceInstanceChanged(changed)) if changed.progress.is_some()
+            )
+        })
+        .map(|event| event.agent_id.clone())
+        .collect();
+    assert!(
+        !progress_agents.is_empty(),
+        "the materialize journaled its progress"
+    );
+    assert!(
+        progress_agents.iter().all(Option::is_none),
+        "{progress_agents:?}"
+    );
+    let checkout_agents: Vec<_> = journaled
+        .iter()
+        .filter(|event| matches!(event.kind.as_ref(), Some(Kind::CheckoutPrepared(_))))
+        .map(|event| event.agent_id.as_ref().map(ToString::to_string))
+        .collect();
+    assert!(
+        checkout_agents
+            .iter()
+            .all(|agent| agent.as_deref() == Some("agent-1")),
+        "{checkout_agents:?}"
+    );
     runtime.shutdown().await;
 }
 
