@@ -1258,17 +1258,21 @@ mod stdio_prompts {
             ..
         } = prompted("r9", "Bash", &json!({"command": "ls"})).await;
         session.shutdown().await.expect("shuts down");
-        let refused = session
-            .answer_permission(&request.tool_call_id, PermissionDecision::allow())
-            .await
-            .expect_err("nothing is left to answer");
-        assert!(
-            matches!(
-                refused,
-                horde_adapter::AdapterError::HarnessExited { exit_code: None }
-            ),
-            "{refused:?}"
-        );
+        // Refused before anything is consumed: asked again, the answer meets
+        // the same refusal, never an unknown request.
+        for _ in 0..2 {
+            let refused = session
+                .answer_permission(&request.tool_call_id, PermissionDecision::allow())
+                .await
+                .expect_err("nothing is left to answer");
+            assert!(
+                matches!(
+                    refused,
+                    horde_adapter::AdapterError::HarnessExited { exit_code: None }
+                ),
+                "{refused:?}"
+            );
+        }
     }
 
     /// A narrowing allow reaches the harness as `updatedInput`, correlated by

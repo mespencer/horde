@@ -1129,6 +1129,32 @@ mod tests {
         );
     }
 
+    /// A file change that completed takes its patch with it: an approval
+    /// that later names the same item finds no patch to show, rather than a
+    /// stale one.
+    #[test]
+    fn a_completed_file_change_leaves_no_patch_behind() {
+        let mut assembler = TurnAssembler::new();
+        open_turn(&mut assembler);
+        let started = json!({"method":"item/started","params":{"item":{
+            "type":"fileChange","id":"fc-1","status":"inProgress",
+            "changes":[{"path":"/w/a.rs","kind":{"type":"add"}}]}}});
+        feed(&mut assembler, started.clone());
+        let approval = json!({"id": 4, "method": "item/fileChange/requestApproval",
+            "params": {"turnId":"turn-1","itemId":"fc-1"}});
+        let while_running = requested(&feed(&mut assembler, approval.clone()), "approval");
+        assert_eq!(while_running.input["changes"][0]["path"], "/w/a.rs");
+
+        feed(&mut assembler, started);
+        feed(
+            &mut assembler,
+            json!({"method":"item/completed","params":{"turnId":"turn-1",
+                "item":{"type":"fileChange","id":"fc-1","status":"completed","changes":[]}}}),
+        );
+        let after = requested(&feed(&mut assembler, approval), "approval");
+        assert_eq!(after.input["changes"], json!([]));
+    }
+
     /// A request naming no item surfaces under its kind and rpc id, and
     /// carries every field the request gave: a file change its reason and
     /// grant root, a permissions request its cwd, a question its words —

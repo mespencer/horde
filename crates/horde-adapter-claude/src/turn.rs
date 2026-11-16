@@ -307,6 +307,7 @@ impl TurnAssembler {
     }
 
     fn end_turn(&mut self, result: &TurnResult) -> AgentEvent {
+        // #[gamma::skip(assign_value.default, reason = "turn_open is a bool, whose Default::default() is false: the mutant assigns the very value written here")]
         self.turn_open = false;
         // Billing truth is `modelUsage`, not `usage`: the latter is per-turn but
         // counts only the requested model, while a turn can bill auxiliary
