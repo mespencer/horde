@@ -145,6 +145,9 @@ impl Transcript {
                     outbound.push(msg.to_string());
                 }
                 (Some(_), Some(msg)) => inbound.push(msg.to_string()),
+                // The probe drivers' own annotations — the binary's version,
+                // the configuration, the finding — are neither direction.
+                (Some("meta"), None) => {}
                 // Unwrapped capture: the line is the harness event itself.
                 _ => outbound.push(line.to_owned()),
             }
@@ -315,6 +318,34 @@ mod tests {
         let transcript = Transcript::load("01-basic-turn.out.jsonl").expect("must load");
         assert!(transcript.inbound.is_empty());
         assert!(!transcript.outbound.is_empty());
+    }
+
+    /// The approval drivers annotate their recordings with `dir: "meta"`
+    /// lines (the binary's version, the configuration); they are neither
+    /// harness output nor driver input, and replaying one as a frame fails.
+    #[test]
+    fn driver_annotations_are_neither_direction() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            directory.path().join("annotated.jsonl"),
+            concat!(
+                r#"{"dir":"meta","t":1,"codex_version":"codex-cli 0.167.0"}"#,
+                "\n",
+                r#"{"dir":"in","t":2,"msg":{"method":"turn/started"}}"#,
+                "\n",
+                r#"{"dir":"out","t":3,"msg":{"id":1}}"#,
+                "\n",
+            ),
+        )
+        .expect("write the fixture");
+        let transcript =
+            Transcript::load_from(directory.path(), "annotated.jsonl", HarnessOutputKey::In)
+                .expect("loads");
+        assert_eq!(
+            transcript.outbound,
+            vec![r#"{"method":"turn/started"}"#.to_owned()]
+        );
+        assert_eq!(transcript.inbound, vec![r#"{"id":1}"#.to_owned()]);
     }
 
     #[test]

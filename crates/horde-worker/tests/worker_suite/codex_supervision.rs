@@ -152,6 +152,23 @@ mod harness {
         .await
     }
 
+    /// Runs the turn to its end, asserting the journal named the chain's
+    /// `verdict` (`deny`, `answer`, ...), and answers the turn's outcome.
+    pub(crate) async fn turn_naming_the_chain(
+        session: &mut Box<dyn AgentSession>,
+        verdict: &str,
+    ) -> Option<TurnOutcome> {
+        let (events, outcome) = events_through_turn_end(session).await;
+        let said = format!(": chain {verdict} → ");
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AgentEvent::Output { text, .. } if text.contains(&said))
+            ),
+            "the journal names what the chain said: {events:?}"
+        );
+        outcome
+    }
+
     /// Drains events until assistant output arrives — the proof the turn is
     /// genuinely open on the session's side, since output can only follow the
     /// `turn/started` frame. A mid-turn send before this point would honestly
@@ -310,7 +327,7 @@ mod harness {
 
 use harness::{
     adapter_for, basic_turn, control_log_shows, events_through_turn_end, exec_approval_params,
-    exec_approval_script, mid_turn, session_on, surfaced_request, within,
+    exec_approval_script, mid_turn, session_on, surfaced_request, turn_naming_the_chain, within,
 };
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSpec, OutputChannel, PermissionDecision,
@@ -377,18 +394,37 @@ async fn the_sandbox_tier_choice_is_journaled_on_the_first_turn() {
     session.send(TurnInput::queued("go")).await.expect("sends");
 
     let (events, _) = events_through_turn_end(&mut session).await;
-    let diagnostic = events.iter().find_map(|event| match event {
-        AgentEvent::Output {
-            channel: OutputChannel::HarnessDiagnostic,
-            text,
-            ..
-        } => Some(text.clone()),
-        _ => None,
-    });
-    let text = diagnostic.expect("the tier choice must be journaled");
+    let diagnostics: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Output {
+                channel: OutputChannel::HarnessDiagnostic,
+                text,
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let text = diagnostics
+        .first()
+        .expect("the tier choice must be journaled");
     assert!(
         text.contains("workspace-write") && text.contains("builder"),
         "the reason names the tier and the mode that chose it: {text}"
+    );
+    // The exec-approval enforcement is journaled beside it, with why: this
+    // adapter's version was never probed.
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("(\"codex version not probed\")")),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.starts_with("codex exec approvals: sandbox tier only")),
+        "{diagnostics:?}"
     );
 
     session.shutdown().await.expect("shuts down");
@@ -560,7 +596,7 @@ async fn a_denied_exec_approval_declines_on_the_wire_and_records_the_denial() {
         control_log_shows(&log_path, |log| log.contains("\"decision\":\"decline\"")).await;
     assert!(recorded.contains("\"decision\":\"decline\""), "{recorded}");
 
-    let (_, outcome) = events_through_turn_end(&mut session).await;
+    let outcome = turn_naming_the_chain(&mut session, "deny").await;
     let outcome = outcome.expect("the turn finishes after the decline");
     assert_eq!(outcome.denials.len(), 1, "the refusal is the audit record");
     assert_eq!(outcome.denials[0].tool_name, "exec");
@@ -1509,4 +1545,163 @@ async fn a_dead_harness_surfaces_instead_of_hanging() {
             .is_none(),
         "and produces nothing further"
     );
+}
+
+/// The 0.167 requests (W12c) end to end over a real process: each surfaces
+/// as a permission event and the chain's answer reaches the child in that
+/// request's own vocabulary.
+mod codex_0167_requests {
+    use horde_adapter::{AgentEvent, PermissionDecision};
+    use serde_json::json;
+
+    use super::harness;
+    use super::{
+        control_log_shows, events_through_turn_end, surfaced_request, turn_naming_the_chain,
+    };
+
+    fn script_with(request: &str) -> String {
+        [
+            harness::thread_started(),
+            harness::turn_started("turn-1"),
+            request.to_owned(),
+            harness::final_answer("turn-1", "i1", "done"),
+            harness::turn_completed("turn-1"),
+        ]
+        .join("\n")
+    }
+
+    /// A file change surfaces with its patch (joined from the started item)
+    /// and an allow reaches the child as `{"decision":"accept"}`.
+    #[tokio::test]
+    async fn a_file_change_surfaces_its_patch_and_the_accept_reaches_the_wire() {
+        let started = json!({"method": "item/started", "params": {"turnId": "turn-1",
+            "item": {"type": "fileChange", "id": "fc-1", "status": "inProgress",
+                     "changes": [{"path": "/w/a.txt", "kind": {"type": "add"}, "diff": "A\n"}]}}})
+        .to_string();
+        let request = format!(
+            "!SERVER_REQUEST item/fileChange/requestApproval {}",
+            json!({"threadId": "t1", "turnId": "turn-1", "itemId": "fc-1",
+                   "startedAtMs": 1, "reason": null, "grantRoot": null})
+        );
+        let script = script_with(&format!("{started}\n{request}"));
+        let (mut session, log_path, _dirs) = harness::approval_session(&script).await;
+
+        let proposal = surfaced_request(&mut session).await;
+        assert_eq!(proposal.tool_name, "apply_patch");
+        assert_eq!(proposal.tool_call_id.as_str(), "fc-1");
+        assert_eq!(proposal.input["changes"][0]["path"], "/w/a.txt");
+        assert_eq!(proposal.input["changes"][0]["diff"], "A\n");
+
+        session
+            .answer_permission(&proposal.tool_call_id, PermissionDecision::allow())
+            .await
+            .expect("answerable");
+        let recorded =
+            control_log_shows(&log_path, |log| log.contains("\"decision\":\"accept\"")).await;
+        assert!(recorded.contains("\"decision\":\"accept\""), "{recorded}");
+        let (events, outcome) = events_through_turn_end(&mut session).await;
+        assert!(outcome.is_some_and(|outcome| outcome.denials.is_empty()));
+        assert!(
+            events.iter().any(|event| matches!(event,
+                AgentEvent::Output { text, .. } if text.contains("chain allow") && text.contains("accept"))),
+            "{events:?}"
+        );
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// A codex question surfaces as a question; the human's answers reach the
+    /// child keyed by codex's question id.
+    #[tokio::test]
+    async fn a_codex_question_takes_answers_on_the_wire() {
+        let request = format!(
+            "!SERVER_REQUEST item/tool/requestUserInput {}",
+            json!({"threadId": "t1", "turnId": "turn-1", "itemId": "call_1", "isBlocking": false,
+                   "questions": [{"id": "colour", "header": "Colour", "question": "Which?",
+                                  "isOther": true, "isSecret": false,
+                                  "options": [{"label": "Red", "description": "r"}]}]})
+        );
+        let (mut session, log_path, _dirs) =
+            harness::approval_session(&script_with(&request)).await;
+
+        let proposal = surfaced_request(&mut session).await;
+        assert_eq!(proposal.tool_name, "request_user_input");
+        assert_eq!(proposal.questions.len(), 1);
+        assert_eq!(proposal.questions[0].id, "colour");
+
+        session
+            .answer_permission(
+                &proposal.tool_call_id,
+                PermissionDecision::answer(horde_adapter::Answers::from([(
+                    "colour".to_owned(),
+                    vec!["Red".to_owned()],
+                )])),
+            )
+            .await
+            .expect("answerable");
+        let recorded =
+            control_log_shows(&log_path, |log| log.contains("\"answers\":{\"colour\"")).await;
+        assert!(
+            recorded.contains(r#""answers":{"colour":{"answers":["Red"]}}"#),
+            "{recorded}"
+        );
+        let outcome = turn_naming_the_chain(&mut session, "answer").await;
+        assert!(outcome.is_some());
+        session.shutdown().await.expect("shuts down");
+    }
+
+    /// A sandbox-widening request is granted exactly what it asked for on an
+    /// allow, for the session when the decision remembers; a denial grants
+    /// nothing and is the turn's refusal.
+    #[tokio::test]
+    async fn a_permissions_request_is_granted_what_it_asked_or_nothing() {
+        let asked = json!({"network": {"enabled": true}, "fileSystem": null});
+        let request = format!(
+            "!SERVER_REQUEST item/permissions/requestApproval {}",
+            json!({"threadId": "t1", "turnId": "turn-1", "itemId": "perm-1", "startedAtMs": 1,
+                   "cwd": "/w", "reason": "needs network", "permissions": asked})
+        );
+
+        let (mut session, log_path, _dirs) =
+            harness::approval_session(&script_with(&request)).await;
+        let proposal = surfaced_request(&mut session).await;
+        assert_eq!(proposal.tool_name, "request_permissions");
+        assert_eq!(proposal.input["permissions"], asked);
+        assert_eq!(proposal.input["reason"], "needs network");
+        session
+            .answer_permission(
+                &proposal.tool_call_id,
+                PermissionDecision::allow().remembered(),
+            )
+            .await
+            .expect("answerable");
+        let recorded = control_log_shows(&log_path, |log| log.contains("\"scope\"")).await;
+        assert!(
+            recorded.contains(
+                r#""permissions":{"fileSystem":null,"network":{"enabled":true}},"scope":"session""#
+            ),
+            "{recorded}"
+        );
+        session.shutdown().await.expect("shuts down");
+
+        let (mut session, log_path, _dirs) =
+            harness::approval_session(&script_with(&request)).await;
+        let proposal = surfaced_request(&mut session).await;
+        session
+            .answer_permission(
+                &proposal.tool_call_id,
+                PermissionDecision::deny("no network"),
+            )
+            .await
+            .expect("answerable");
+        let recorded = control_log_shows(&log_path, |log| log.contains("\"scope\"")).await;
+        assert!(
+            recorded.contains(r#""permissions":{},"scope":"turn""#),
+            "{recorded}"
+        );
+        let (_, outcome) = events_through_turn_end(&mut session).await;
+        let outcome = outcome.expect("the turn ends");
+        assert_eq!(outcome.denials.len(), 1);
+        assert_eq!(outcome.denials[0].tool_name, "request_permissions");
+        session.shutdown().await.expect("shuts down");
+    }
 }

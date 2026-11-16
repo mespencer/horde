@@ -292,6 +292,13 @@ async fn execute(
             .answer_permission(PermissionAnswer::allow(&request_id))
             .await
             .map(drop),
+        Directive::Answer {
+            request_id,
+            answers,
+        } => client
+            .answer_permission(PermissionAnswer::answering(&request_id, answers))
+            .await
+            .map(drop),
         Directive::Deny { request_id } => client
             .answer_permission(PermissionAnswer::deny(&request_id, "denied from the TUI"))
             .await

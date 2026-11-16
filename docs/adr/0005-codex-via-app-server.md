@@ -241,3 +241,60 @@ one still advances the baseline, so it is never billed later either. A reading
 missing `total` (shape drift) falls back to its own `last`, which is one call by
 definition. Conformance tests pin the recorded totals of the multi-reading
 transcripts.
+
+## Amendment, 2026-11-13 (W12c): file changes route at 0.167; every prompt type is surfaced; versions are classified
+
+Re-probed against codex-cli **0.167.0** on Linux (`drive_approvals.py` runs
+34–41, recorded under a fresh `CODEX_HOME` holding only a copy of
+`auth.json`). The transport decision stands.
+
+- **Exec approvals: unchanged.** `item/commandExecution/requestApproval`
+  routes before the command runs under granular and `on-request` alike (34,
+  35, 40); decline blocks it, accept runs it. The request gained a `kind:
+  "command"` field. Every notification gained `emittedAtMs`.
+- **File-change approvals now route.** The park transcripts 28 and 31
+  recorded at 0.148 is gone: `item/fileChange/requestApproval` arrives after
+  `item/started [fileChange]` (which carries the patch in `changes`) and
+  before the patch applies; decline completes the item as `declined`, accept
+  applies it (36, 37). The request names only the item, so the assembler
+  joins the patch from the started item. `Capability::PreAuthorizeFileChanges`
+  is claimed from 0.167 — the first measured version, not a guessed earlier
+  one — and with all three per-kind claims the kind-blind floor of a probed
+  0.167 binary is now `PerCall`. The wire still carries no blanket
+  `TOOL_CALL_GATING` for codex; per-kind claims graduate when placement
+  matches per kind.
+- **Sandbox-widening requests and questions route behind their feature
+  flags.** With `request_permissions_tool` enabled,
+  `item/permissions/requestApproval` asks for a profile (`{"network":
+  {"enabled":true}}`) and granting exactly that let the command run (39);
+  with `default_mode_request_user_input`, `item/tool/requestUserInput` asks
+  questions with options and takes `{"answers":{id:{"answers":[…]}}}` (38).
+  Both flags are still "under development, false" by default, as are
+  `exec_permission_approvals`; Horde handles the requests when they come and
+  does not enable the flags. `thread/start` now sends `request_permissions:
+  true` in the granular policy so such requests reach Horde rather than
+  codex's default refusal.
+- **`serverRequest/resolved`** follows every answered request; one for a
+  request Horde still holds means codex settled it itself, and the session
+  drops it.
+- **A probe-driver bug, not drift.** The 20–33 driver's `select()` +
+  `readline()` reader left buffered frames unread until the next write, which
+  at first read as turns hanging for three minutes (`emittedAtMs` showed the
+  frames were sent on time); it also broke out of each turn at the idle
+  status one frame before `turn/completed`. Both are fixed; 34–41 end with
+  their terminal frames.
+
+What is built on this: all five request kinds become permission events
+(`exec`, `apply_patch`, `request_permissions`, `request_user_input`, and the
+MCP `server/tool`), each answered in its own vocabulary, with a decision a
+vocabulary cannot carry declined and journaled rather than downgraded.
+Questions reach clients as questions (`ProposedToolCall.questions`) and are
+answered with `PermissionDecision.answers`.
+
+**Versions are classified.** Below 0.147.0 is refused (without exec routing
+the chain cannot gate the agent's shell); 0.147.0–0.167.0 is supported;
+newer is untested, journaled per agent and reported by `horde doctor`.
+**Drift is diffable as this ADR promised:** the codec's declared protocol
+surface is resolved against `generate-json-schema` into a committed snapshot
+(`crates/horde-adapter-codex/schema/surface.json`), with an offline coverage
+test and a live regenerate-and-diff test.

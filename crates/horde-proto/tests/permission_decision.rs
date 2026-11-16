@@ -42,6 +42,7 @@ fn narrowed() -> PermissionDecision {
         reason: "clamped to the workspace root".to_owned(),
         remember_for_session: false,
         updated_input: Some(Struct { fields }),
+        answers: std::collections::HashMap::new(),
     }
 }
 
@@ -102,12 +103,13 @@ fn a_denial_round_trips_without_replacement_arguments() {
         reason: "writes outside the workspace".to_owned(),
         remember_for_session: false,
         updated_input: None,
+        answers: std::collections::HashMap::new(),
     });
 }
 
 #[test]
 fn permission_decision_field_numbers_are_stable() {
-    // updated_input is additive; renumbering any of the shipped fields would
+    // updated_input and answers are additive; renumbering any of the shipped fields would
     // reinterpret decisions already sitting in Session logs.
     use horde_proto::prost_types::FileDescriptorSet;
 
@@ -139,6 +141,7 @@ fn permission_decision_field_numbers_are_stable() {
             ("reason".to_owned(), 5),
             ("remember_for_session".to_owned(), 6),
             ("updated_input".to_owned(), 7),
+            ("answers".to_owned(), 8),
         ]
     );
 }

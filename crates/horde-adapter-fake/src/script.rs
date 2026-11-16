@@ -28,6 +28,16 @@ pub enum Step {
         tool_name: String,
         input: Value,
     },
+    /// Put questions to the human and **wait** for the answers (W12c) — the
+    /// shape Claude's `AskUserQuestion` and codex's `requestUserInput` reach
+    /// the seam as: a permission request carrying questions, settled only by
+    /// [`PermissionDecision::Answer`](horde_adapter::PermissionDecision::Answer)
+    /// or a denial.
+    AskQuestion {
+        tool_call_id: String,
+        tool_name: String,
+        questions: Vec<horde_adapter::Question>,
+    },
     /// Invoke one of Horde's own MCP verbs, which need no approval round-trip.
     ///
     /// How a test says "here the agent spawns a child" or "here it reports a

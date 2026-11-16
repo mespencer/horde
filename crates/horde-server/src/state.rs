@@ -905,6 +905,7 @@ mod permission_fold_tests {
             tool_name: "Write".to_owned(),
             input: Some(arguments(path)),
             rendered: format!("Write {path}"),
+            questions: Vec::new(),
         }
     }
 
@@ -1087,11 +1088,13 @@ mod permission_fold_tests {
             tool_name: "Read".to_owned(),
             input: None,
             rendered: String::new(),
+            questions: Vec::new(),
         };
         let empty = ProposedToolCall {
             tool_name: "Read".to_owned(),
             input: Some(Struct::default()),
             rendered: String::new(),
+            questions: Vec::new(),
         };
 
         let state = SessionState::project(

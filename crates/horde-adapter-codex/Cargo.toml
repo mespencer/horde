@@ -16,4 +16,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 horde-testkit = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread"] }

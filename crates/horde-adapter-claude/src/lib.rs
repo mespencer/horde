@@ -13,8 +13,11 @@
 //!   two things Horde ever sends: a user message and an interrupt.
 //! * [`turn`] — a pure state machine assembling envelopes into
 //!   [`horde_adapter::AgentEvent`]s, including usage normalization.
-//! * [`permission`] — the `--permission-prompt-tool` payloads, which arrive on
-//!   the MCP endpoint rather than on stdout.
+//! * [`permission`] — the `--permission-prompt-tool` payloads, on both routes:
+//!   `can_use_tool` control requests on stdout (the default since W12c), and
+//!   the MCP approve tool (the fallback).
+//! * [`version`] — the measured version range and which permission route
+//!   each version gets.
 //! * [`launch`] — the isolation flags every supervised launch carries, shared
 //!   by the Worker's spawn and the live smokes so the two cannot drift.
 //! * [`identity`] — what it takes to find a conversation again. A session id
@@ -44,10 +47,10 @@ pub mod launch;
 pub mod permission;
 pub mod replay;
 pub mod turn;
+pub mod version;
 pub mod wire;
 
 pub use codec::{decode_line, encode_interrupt, encode_user_message};
-pub use identity::RevivalIdentity;
 pub use replay::ReplaySession;
 pub use turn::TurnAssembler;
 

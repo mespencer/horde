@@ -400,6 +400,7 @@ async fn a_permission_server_answers_from_the_configured_mode() {
                         tool_name: "Read".to_owned(),
                         input: None,
                         rendered: "Read".to_owned(),
+                        questions: Vec::new(),
                     }),
                     ..horde_proto::v1::PermissionRequest::default()
                 }),

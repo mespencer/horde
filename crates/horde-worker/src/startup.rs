@@ -235,6 +235,9 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
             input,
         });
     }
+    if let Some(ask) = object.get("ask_question") {
+        return ask_question_step(ask);
+    }
     if let Some(call) = object.get("use_horde") {
         // A real MCP call against the agent's own endpoint — the operator
         // form of "here the agent reports its result" or "here it spawns a
@@ -253,7 +256,67 @@ fn scripted_step(step: &serde_json::Value) -> Result<Step, String> {
             line.as_str().ok_or("stderr must be a string")?.to_owned(),
         ));
     }
-    Err("a step must be one of say, think, ask_permission, use_horde, stderr".to_owned())
+    Err(
+        "a step must be one of say, think, ask_permission, ask_question, use_horde, stderr"
+            .to_owned(),
+    )
+}
+
+/// `{"ask_question": {"id", "tool", "questions": [{"id", "question", "options": [..]}]}}`
+/// — the operator form of a harness question (W12c).
+fn ask_question_step(value: &serde_json::Value) -> Result<Step, String> {
+    let (tool_call_id, tool_name, _) = tool_step_fields("ask_question", value)?;
+    let questions = value
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .filter(|questions| !questions.is_empty())
+        .ok_or("ask_question needs a non-empty questions array")?
+        .iter()
+        .map(|question| {
+            let text = |field: &str| {
+                question
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let id = text("id");
+            if id.is_empty() {
+                return Err("every question needs a non-empty id".to_owned());
+            }
+            let options = question
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(|label| horde_adapter::QuestionOption {
+                            label: label.to_owned(),
+                            description: String::new(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(horde_adapter::Question {
+                id,
+                header: text("header"),
+                question: text("question"),
+                options,
+                multi_select: question
+                    .get("multi_select")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                allows_free_text: true,
+                secret: false,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Step::AskQuestion {
+        tool_call_id,
+        tool_name,
+        questions,
+    })
 }
 
 /// The `{id, tool, input}` triple both tool-shaped steps share.
@@ -557,6 +620,31 @@ pub async fn prepare(
     })
 }
 
+/// Whether a probed harness may be registered: a refused version stops the
+/// Worker with the reason and the fix; an untested one is registered with a
+/// warning here (and journaled again on each agent's first turn).
+///
+/// # Errors
+///
+/// The refusal, naming the version, the floor, and what to do.
+pub fn admit_harness(version: &horde_adapter::VersionReport) -> Result<(), String> {
+    match version.verdict {
+        horde_adapter::SupportVerdict::Refused => Err(format!(
+            "{}; upgrade it on this machine, or start the worker without --adapter {}",
+            version.describe(),
+            version.table.provider
+        )),
+        horde_adapter::SupportVerdict::Untested => {
+            tracing::warn!(harness = version.table.provider, "{}", version.describe());
+            Ok(())
+        }
+        horde_adapter::SupportVerdict::Supported => {
+            tracing::info!(harness = version.table.provider, "{}", version.describe());
+            Ok(())
+        }
+    }
+}
+
 /// Assembles the Runtime a configuration asks for.
 ///
 /// Async for one reason: the codex adapter probes its binary's version before
@@ -583,33 +671,7 @@ async fn build_runtime(
         .with_agent_endpoints(channel, name);
 
     for adapter in &config.adapters {
-        runtime = match adapter {
-            AdapterChoice::Fake => {
-                let mut fake = FakeAdapter::new(configured_script(config)?);
-                if let Some(recipe) = configured_fake_login(config) {
-                    fake = fake.with_login_recipe(recipe);
-                }
-                runtime.with_adapter(Arc::new(fake))
-            }
-            AdapterChoice::Claude => runtime.with_adapter(Arc::new(crate::ClaudeAdapter::new(
-                harness_profile(config, "claude", &journal),
-            ))),
-            AdapterChoice::Codex => {
-                // Belt and braces on the transcript-23 hazard: the flag was
-                // validated at parse, and the value is re-validated here so a
-                // config constructed programmatically gets the same gate. The
-                // codec pins the wire value regardless.
-                horde_adapter_codex::approvals_reviewer_from_config(
-                    config.codex_approvals_reviewer.as_deref(),
-                )?;
-                // Probed, not assumed: the exec-gating capability claim is
-                // version-gated (ADR-0005, 2026-08-19 amendment).
-                let adapter = codex_adapter(config, &journal)
-                    .probe_exec_interception()
-                    .await;
-                runtime.with_adapter(Arc::new(adapter))
-            }
-        };
+        runtime = runtime.with_adapter(adapter_for(*adapter, config, &journal).await?);
     }
 
     if let Some(root) = &config.workspace_root {
@@ -625,6 +687,53 @@ async fn build_runtime(
         runtime = runtime.with_relay(relay_location(relay, identity, &config.identity_dir()));
     }
     Ok(runtime)
+}
+
+/// The adapter one `--adapter` choice runs. Claude and codex are probed for
+/// their versions first, and a refused version stops the Worker here (W12c).
+async fn adapter_for(
+    choice: AdapterChoice,
+    config: &WorkerConfig,
+    journal: &Journal,
+) -> Result<Arc<dyn horde_adapter::Adapter>, String> {
+    Ok(match choice {
+        AdapterChoice::Fake => {
+            let mut fake = FakeAdapter::new(configured_script(config)?);
+            if let Some(recipe) = configured_fake_login(config) {
+                fake = fake.with_login_recipe(recipe);
+            }
+            Arc::new(fake)
+        }
+        AdapterChoice::Claude => {
+            // Probed, not assumed: the version picks the permission route
+            // (stdio from 2.1.323) and a refused version stops the Worker
+            // here, loudly, rather than failing every spawn (W12c).
+            let adapter = claude_adapter(config, journal).probe_version().await;
+            admit_harness(&adapter.version)?;
+            Arc::new(adapter)
+        }
+        AdapterChoice::Codex => {
+            // Belt and braces on the transcript-23 hazard: the flag was
+            // validated at parse, and the value is re-validated here so a
+            // config constructed programmatically gets the same gate. The
+            // codec pins the wire value regardless.
+            horde_adapter_codex::approvals_reviewer_from_config(
+                config.codex_approvals_reviewer.as_deref(),
+            )?;
+            // Probed, not assumed: the per-kind gating claims are
+            // version-gated (ADR-0005, 2026-08-19 and 2026-11-13
+            // amendments), and a refused version stops the Worker here.
+            let adapter = codex_adapter(config, journal).probe_version().await;
+            admit_harness(&adapter.version)?;
+            Arc::new(adapter)
+        }
+    })
+}
+
+/// The claude adapter a configuration asks for, before its version probe:
+/// launched under the Worker's own claude profile.
+fn claude_adapter(config: &WorkerConfig, journal: &Journal) -> crate::ClaudeAdapter {
+    crate::ClaudeAdapter::new(harness_profile(config, "claude", journal))
 }
 
 /// Where this Worker's git reaches the Relay. An `https://` Relay is the
@@ -1392,28 +1501,6 @@ mod tests {
         ));
     }
 
-    /// The codex adapter runs under the Worker's own codex profile and the
-    /// configured sandbox tiers, not the adapter's defaults.
-    #[test]
-    fn the_codex_adapter_takes_the_configured_sandbox_and_its_own_profile() {
-        let state = tempfile::tempdir().expect("a temp dir");
-        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
-        config.sandbox = horde_adapter_codex::SandboxPolicy::default()
-            .with_mode("careful", horde_adapter_codex::SandboxTier::ReadOnly);
-        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
-        let adapter = super::codex_adapter(&config, &journal);
-        assert_eq!(adapter.sandbox_policy, config.sandbox);
-        assert_ne!(
-            adapter.sandbox_policy,
-            horde_adapter_codex::SandboxPolicy::default()
-        );
-        assert_eq!(
-            adapter.profile.root(),
-            crate::harness::HarnessProfile::in_state_dir(state.path(), "codex").root()
-        );
-        assert!(adapter.profile.root().ends_with("codex"));
-    }
-
     /// The ignored-ambient-token line is owed only for an ambient token
     /// over an existing identity — not for an explicit one, not for no
     /// token, not before anything is enrolled.
@@ -1562,6 +1649,138 @@ mod tests {
             panic!("the step must be the permission ask");
         };
         assert!(input.is_object(), "the default input is an empty object");
+    }
+
+    /// A scripted question parses into the fake's question step, every
+    /// question needing an id and the step needing at least one.
+    #[test]
+    fn a_scripted_question_parses_and_its_ids_are_required() {
+        let script = fake_script(
+            r#"[{"steps": [{"ask_question": {"id": "q-1", "tool": "AskUserQuestion",
+                "questions": [{"id": "colour", "header": "C", "question": "Which?",
+                               "options": ["Red", "Blue"], "multi_select": true}]}}]}]"#,
+        )
+        .expect("a valid question");
+        let horde_adapter_fake::Step::AskQuestion {
+            tool_call_id,
+            tool_name,
+            questions,
+        } = &script.turns[0].steps[0]
+        else {
+            panic!("the step must be the question");
+        };
+        assert_eq!(
+            (tool_call_id.as_str(), tool_name.as_str()),
+            ("q-1", "AskUserQuestion")
+        );
+        let [question] = questions.as_slice() else {
+            panic!("one question, got {questions:?}");
+        };
+        assert_eq!(question.id, "colour");
+        assert_eq!(question.header, "C");
+        assert_eq!(question.question, "Which?");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Red", "Blue"]
+        );
+        assert!(question.multi_select && question.allows_free_text);
+        assert!(!question.secret, "a scripted question is never secret");
+
+        let plain = fake_script(
+            r#"[{"steps": [{"ask_question": {"id": "q-2", "tool": "T",
+                "questions": [{"id": "size", "question": "How big?"}]}}]}]"#,
+        )
+        .expect("a valid question");
+        let horde_adapter_fake::Step::AskQuestion { questions, .. } = &plain.turns[0].steps[0]
+        else {
+            panic!("the step must be the question");
+        };
+        assert!(!questions[0].multi_select, "unsaid is single-choice");
+
+        for (json, needle) in [
+            (
+                r#"[{"steps": [{"ask_question": {"id": "q", "tool": "T", "questions": [{"question": "?"}]}}]}]"#,
+                "non-empty id",
+            ),
+            (
+                r#"[{"steps": [{"ask_question": {"id": "q", "tool": "T", "questions": []}}]}]"#,
+                "non-empty questions",
+            ),
+            (
+                r#"[{"steps": [{"ask_question": {"tool": "T"}}]}]"#,
+                "ask_question needs a non-empty id",
+            ),
+        ] {
+            let refused = fake_script(json).expect_err("must refuse");
+            assert!(refused.contains(needle), "{json}: {refused}");
+        }
+    }
+
+    /// Each adapter runs under the Worker's own profile for its provider,
+    /// and codex under the configured sandbox tiers.
+    #[test]
+    fn each_adapter_takes_its_own_profile_and_codex_the_configured_sandbox() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
+        config.sandbox = horde_adapter_codex::SandboxPolicy::default()
+            .with_mode("careful", horde_adapter_codex::SandboxTier::ReadOnly);
+        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
+        let codex = super::codex_adapter(&config, &journal);
+        assert_eq!(codex.sandbox_policy, config.sandbox);
+        assert_ne!(
+            codex.sandbox_policy,
+            horde_adapter_codex::SandboxPolicy::default(),
+            "the configured tiers, not the adapter's defaults"
+        );
+        assert_eq!(
+            codex.profile.root(),
+            crate::harness::HarnessProfile::in_state_dir(state.path(), "codex").root()
+        );
+        assert!(codex.profile.root().ends_with("codex"));
+        let claude = super::claude_adapter(&config, &journal);
+        assert_eq!(
+            claude.profile.root(),
+            crate::harness::HarnessProfile::in_state_dir(state.path(), "claude").root()
+        );
+    }
+
+    /// The fake adapter carries the configured login recipe.
+    #[tokio::test]
+    async fn the_fake_adapter_carries_the_configured_login() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
+        config.fake_login = Some(std::path::PathBuf::from("/bin/fake-login"));
+        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
+        let fake = super::adapter_for(super::AdapterChoice::Fake, &config, &journal)
+            .await
+            .expect("the fake needs no probe");
+        assert_eq!(
+            fake.login_recipe().map(|recipe| recipe.program),
+            Some("/bin/fake-login".to_owned())
+        );
+    }
+
+    /// A refused harness stops the worker with the version, the floor and
+    /// the fix; untested and supported ones are admitted.
+    #[test]
+    fn only_a_refused_harness_is_turned_away() {
+        let codex = horde_adapter_codex::SUPPORT;
+        let refused = super::admit_harness(&codex.classify("codex-cli 0.145.0"))
+            .expect_err("below the floor");
+        assert!(refused.contains("codex 0.145.0 is refused"), "{refused}");
+        assert!(refused.contains("--adapter codex"), "{refused}");
+        assert_eq!(
+            super::admit_harness(&codex.classify("codex-cli 0.167.0")),
+            Ok(())
+        );
+        assert_eq!(
+            super::admit_harness(&codex.classify("codex-cli 9.0.0")),
+            Ok(())
+        );
     }
 
     #[test]

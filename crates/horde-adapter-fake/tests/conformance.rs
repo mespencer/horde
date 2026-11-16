@@ -506,3 +506,88 @@ async fn a_horde_verb_is_reported_as_a_tool_call_without_an_approval_round_trip(
         "a Horde verb needs no approval and must not register as a denial"
     );
 }
+
+/// A scripted question blocks until answered; its answers are rendered as
+/// the tool's result, while answers to a plain permission ask fail the tool
+/// (W12c).
+#[tokio::test]
+async fn a_scripted_question_takes_answers_and_a_plain_ask_refuses_them() {
+    async fn answered(step: Step, decision: PermissionDecision) -> Vec<AgentEvent> {
+        let adapter = FakeAdapter::new(Script::of(vec![
+            ScriptedTurn::saying("done").with_step(step),
+        ]));
+        let mut session = adapter.spawn(&AgentSpec::default()).await.expect("spawn");
+        session.send(TurnInput::queued("go")).await.expect("sends");
+        let mut events = Vec::new();
+        loop {
+            match session.next_event().await {
+                Ok(Some(AgentEvent::PermissionRequested { request, .. })) => {
+                    session
+                        .answer_permission(&request.tool_call_id, decision.clone())
+                        .await
+                        .expect("answers");
+                }
+                Ok(Some(AgentEvent::TurnEnded(_))) | Ok(None) => break,
+                Ok(Some(event)) => events.push(event),
+                Err(error) => panic!("the turn failed: {error}"),
+            }
+        }
+        events
+    }
+    let answers = horde_adapter::Answers::from([(
+        "colour".to_owned(),
+        vec!["Red".to_owned(), "Blue".to_owned()],
+    )]);
+    let question = Step::AskQuestion {
+        tool_call_id: "q-1".to_owned(),
+        tool_name: "AskUserQuestion".to_owned(),
+        questions: vec![horde_adapter::Question {
+            id: "colour".to_owned(),
+            ..horde_adapter::Question::default()
+        }],
+    };
+    let events = answered(question, PermissionDecision::answer(answers.clone())).await;
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::Output { text, .. } if text == "answered colour=Red|Blue")));
+    let two = Step::AskQuestion {
+        tool_call_id: "q-2".to_owned(),
+        tool_name: "AskUserQuestion".to_owned(),
+        questions: ["colour", "size"]
+            .map(|id| horde_adapter::Question {
+                id: id.to_owned(),
+                ..horde_adapter::Question::default()
+            })
+            .to_vec(),
+    };
+    let both = horde_adapter::Answers::from([
+        ("colour".to_owned(), vec!["Red".to_owned()]),
+        ("size".to_owned(), vec!["L".to_owned()]),
+    ]);
+    let events = answered(two, PermissionDecision::answer(both)).await;
+    assert!(
+        events.iter().any(|event| matches!(event,
+            AgentEvent::Output { text, .. } if text == "answered colour=Red, size=L")),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCompleted {
+            is_error: false,
+            ..
+        }
+    )));
+
+    let plain = Step::AskPermission {
+        tool_call_id: "c-1".to_owned(),
+        tool_name: "Write".to_owned(),
+        input: json!({}),
+    };
+    let events = answered(plain, PermissionDecision::answer(answers)).await;
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::Output { text, .. } if text == "answers apply only to questions")));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCompleted { is_error: true, .. }))
+    );
+}

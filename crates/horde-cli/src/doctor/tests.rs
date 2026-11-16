@@ -80,7 +80,14 @@ fn harness_binaries_are_looked_for_on_the_given_path() {
     std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).expect("chmods");
     let path = std::env::join_paths([bin.path()]).expect("a path");
 
-    let checks = harness_checks(&[], Some(&path));
+    let found_at = harness_checks(&[], Some(&path));
+    assert_eq!(
+        found_at[0].1,
+        Some(("claude".to_owned(), claude.clone())),
+        "where a harness was found travels on, for its version check"
+    );
+    assert_eq!(found_at[1].1, None);
+    let checks: Vec<Check> = found_at.into_iter().map(|(check, _)| check).collect();
     assert_eq!(checks.len(), 2);
     let found = verdict_named(&checks, "harness claude");
     assert_eq!(found.verdict, Verdict::Ok);
@@ -116,7 +123,48 @@ fn harness_binaries_are_looked_for_on_the_given_path() {
 
     let named = harness_checks(&["fake-harness".to_owned()], None);
     assert_eq!(named.len(), 1);
-    assert_eq!(named[0].verdict, Verdict::Warn, "no PATH finds nothing");
+    assert_eq!(named[0].0.verdict, Verdict::Warn, "no PATH finds nothing");
+}
+
+/// Each harness's version is classified against its adapter's measured
+/// range: supported is ok, untested warns, refused fails, and a harness no
+/// adapter knows is reported without a verdict.
+#[test]
+fn harness_versions_are_classified_against_each_adapters_range() {
+    use super::harness_version_check;
+
+    let claude = harness_version_check("claude", Ok("2.1.323 (Claude Code)\n".to_owned()));
+    assert_eq!(claude.verdict, Verdict::Ok);
+    assert_eq!(claude.name, "harness claude version");
+    assert!(claude.detail.contains("2.1.323 is supported"), "{claude:?}");
+
+    let newer = harness_version_check("codex", Ok("codex-cli 0.170.0".to_owned()));
+    assert_eq!(newer.verdict, Verdict::Warn);
+    assert!(newer.detail.contains("untested"), "{newer:?}");
+    assert!(
+        newer
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("first turn"))
+    );
+
+    let old = harness_version_check("codex", Ok("codex-cli 0.145.0".to_owned()));
+    assert_eq!(old.verdict, Verdict::Fail);
+    assert!(old.detail.contains("below 0.147.0"), "{old:?}");
+    assert!(
+        old.fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("upgrade"))
+    );
+
+    let silent = harness_version_check("claude", Err("could not run: denied".to_owned()));
+    assert_eq!(silent.verdict, Verdict::Warn);
+    assert!(silent.detail.contains("could not run"), "{silent:?}");
+
+    let other = harness_version_check("fake-harness", Ok(" 9.9 \n".to_owned()));
+    assert_eq!((other.verdict, other.detail.as_str()), (Verdict::Ok, "9.9"));
+    let other = harness_version_check("fake-harness", Err("hung".to_owned()));
+    assert_eq!(other.detail, "unknown (hung)");
 }
 
 /// An owner-only dir passes; a group-readable one warns with the chmod; an
@@ -218,6 +266,27 @@ fn the_report_renders_and_fails_only_on_failures() {
     let json: serde_json::Value =
         serde_json::from_str(&render(&checks, Format::Json)).expect("json");
     assert_eq!(json["healthy"], true);
+}
+
+/// A harness found on the path has its version checked too, by running it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_found_harness_has_its_version_checked() {
+    let dir = tempfile::tempdir().expect("a dir");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    let claude = bin.join("claude");
+    std::fs::write(&claude, "#!/bin/sh\necho '2.1.323 (Claude Code)'\n").expect("writes");
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmods");
+    let mut inputs = inputs(&dir.path().join("id"), None);
+    inputs.path = Some(std::env::join_paths([&bin]).expect("a path"));
+    let checks = report(&inputs).await;
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "harness claude version"),
+        "{checks:?}"
+    );
 }
 
 fn inputs(identity: &std::path::Path, endpoint: Option<String>) -> Inputs {
@@ -419,7 +488,10 @@ fn windows_harnesses_are_exes_on_the_given_path() {
     std::fs::write(bin.path().join("codex.cmd"), "@echo off\r\n").expect("writes");
     let path = std::env::join_paths([bin.path()]).expect("a path");
 
-    let checks = harness_checks(&[], Some(&path));
+    let checks: Vec<Check> = harness_checks(&[], Some(&path))
+        .into_iter()
+        .map(|(check, _)| check)
+        .collect();
     let found = verdict_named(&checks, "harness claude");
     assert_eq!(found.verdict, Verdict::Ok);
     assert_eq!(found.detail, claude.display().to_string());

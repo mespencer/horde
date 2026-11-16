@@ -516,6 +516,10 @@ fn decided_event(
                 reason,
                 remember_for_session: false,
                 updated_input,
+                // No layer the chain runs can answer a question; questions
+                // escalate (`chain::evaluate`), so a chain decision never
+                // carries answers.
+                answers: std::collections::HashMap::new(),
             }),
         })),
     }
@@ -608,6 +612,7 @@ mod tests {
                 fields: [("file_path".to_owned(), file_path)].into(),
             }),
             rendered: format!("{tool} {path}"),
+            questions: Vec::new(),
         }
     }
 
@@ -1577,6 +1582,7 @@ mod tests {
             tool_name: "expose".to_owned(),
             input: None,
             rendered: format!("{} {}", spec.name, spec.worker_port),
+            questions: Vec::new(),
         };
         let mut event = requested(agent, request_id, Some(call));
         if let Some(Kind::PermissionRequested(raised)) = event.kind.as_mut()

@@ -17,5 +17,10 @@ thiserror = { workspace = true }
 # Worker, captured by whatever starts the harness inside it.
 tokio = { workspace = true, features = ["rt"] }
 
+[features]
+# One bounded `--version` run, shared by the Worker and `horde doctor` so the
+# two cannot classify a binary differently.
+probe = ["tokio/process", "tokio/time"]
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time"] }

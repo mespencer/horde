@@ -129,6 +129,10 @@ impl ThreadConfig {
                     // anything that does arrive is declined by the session.
                     "rules": true,
                     "sandbox_approval": true,
+                    // Routes sandbox-widening requests to Horde instead of
+                    // codex's default refusal (W12c, transcript 39). Inert
+                    // until codex offers the agent `request_permissions`.
+                    "request_permissions": true,
                 }
             },
             "approvalsReviewer": APPROVALS_REVIEWER,
@@ -288,6 +292,60 @@ pub fn encode_decision_decline(id: u64) -> String {
     encode_exec_approval_response(id, &ExecDecision::Decline)
 }
 
+/// The reply to a sandbox-widening request: the profile granted, for the
+/// turn or the session (transcript 39 — granting exactly the requested
+/// `{"network":{"enabled":true}}` let the curl that followed run).
+///
+/// A refusal is an empty grant: the schema requires `permissions`, and an
+/// empty profile widens nothing.
+#[must_use]
+pub fn encode_permissions_response(id: u64, granted: &Value, for_session: bool) -> String {
+    let scope = if for_session { "session" } else { "turn" };
+    json!({ "jsonrpc": "2.0", "id": id, "result": { "permissions": granted, "scope": scope } })
+        .to_string()
+}
+
+/// The reply to `item/tool/requestUserInput`: each question id to the
+/// chosen labels (or free text), the shape transcript 38 recorded codex
+/// reading back. An empty map answers nothing — the encoding of a refusal,
+/// since the schema has no decline.
+#[must_use]
+pub fn encode_user_input_response(id: u64, answers: &horde_adapter::Answers) -> String {
+    let answers: serde_json::Map<String, Value> = answers
+        .iter()
+        .map(|(question, chosen)| (question.clone(), json!({ "answers": chosen })))
+        .collect();
+    json!({ "jsonrpc": "2.0", "id": id, "result": { "answers": answers } }).to_string()
+}
+
+/// The reply that withdraws an outstanding request without a chain verdict
+/// — the interrupt path — in that request's own vocabulary, with the
+/// encoding's name for the journal.
+///
+/// Every kind gets an answer: an unanswered request parks the thread even
+/// as the turn dies (the transcript-19 hang).
+#[must_use]
+pub fn encode_withdrawal(withdrawn: &crate::turn::ResolvedApproval) -> (String, &'static str) {
+    use crate::turn::ApprovalKind;
+
+    let id = withdrawn.rpc_id;
+    match &withdrawn.kind {
+        ApprovalKind::ExecCommand { .. } | ApprovalKind::FileChange => (
+            encode_exec_approval_response(id, &ExecDecision::Cancel),
+            ExecDecision::Cancel.wire_name(),
+        ),
+        ApprovalKind::McpElicitation => (encode_elicitation_response(id, false), "decline"),
+        ApprovalKind::Permissions { .. } => (
+            encode_permissions_response(id, &json!({}), false),
+            "empty grant",
+        ),
+        ApprovalKind::UserInput => (
+            encode_user_input_response(id, &horde_adapter::Answers::new()),
+            "no answers",
+        ),
+    }
+}
+
 /// A JSON-RPC error reply for a server request this codec cannot answer.
 ///
 /// Sent rather than left silent, because an unanswered request can park the
@@ -343,6 +401,88 @@ pub fn encode_interrupt(id: u64, thread_id: &str) -> String {
 
 fn request(id: u64, method: &str, params: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+}
+
+#[cfg(test)]
+mod w12c_tests {
+    use serde_json::{Value, json};
+
+    use crate::turn::{ApprovalKind, ResolvedApproval};
+
+    fn parsed(line: &str) -> Value {
+        serde_json::from_str(line).expect("we produced this")
+    }
+
+    /// Transcript 39's accepted reply, and the empty-grant refusal.
+    #[test]
+    fn a_permissions_reply_grants_a_profile_for_its_scope() {
+        let granted = json!({"network": {"enabled": true}, "fileSystem": null});
+        assert_eq!(
+            parsed(&super::encode_permissions_response(0, &granted, false)),
+            json!({"jsonrpc": "2.0", "id": 0,
+                   "result": {"permissions": granted, "scope": "turn"}})
+        );
+        assert_eq!(
+            parsed(&super::encode_permissions_response(3, &json!({}), true))["result"],
+            json!({"permissions": {}, "scope": "session"})
+        );
+    }
+
+    /// Transcript 38's reply shape.
+    #[test]
+    fn a_user_input_reply_files_each_answer_under_its_question_id() {
+        let answers = horde_adapter::Answers::from([
+            ("colour".to_owned(), vec!["Red".to_owned()]),
+            ("sizes".to_owned(), vec!["S".to_owned(), "M".to_owned()]),
+        ]);
+        assert_eq!(
+            parsed(&super::encode_user_input_response(0, &answers)),
+            json!({"jsonrpc": "2.0", "id": 0, "result": {"answers": {
+                "colour": {"answers": ["Red"]},
+                "sizes": {"answers": ["S", "M"]}
+            }}})
+        );
+    }
+
+    /// Every kind has a withdrawal, in its own vocabulary.
+    #[test]
+    fn every_kind_withdraws_in_its_own_vocabulary() {
+        let withdraw = |kind| {
+            let (line, name) = super::encode_withdrawal(&ResolvedApproval { rpc_id: 9, kind });
+            (parsed(&line), name)
+        };
+        let (exec, name) = withdraw(ApprovalKind::ExecCommand {
+            proposed_amendment: None,
+        });
+        assert_eq!(
+            (exec["result"]["decision"].clone(), name),
+            (json!("cancel"), "cancel")
+        );
+        let (file, name) = withdraw(ApprovalKind::FileChange);
+        assert_eq!(
+            (file["result"]["decision"].clone(), name),
+            (json!("cancel"), "cancel")
+        );
+        let (mcp, name) = withdraw(ApprovalKind::McpElicitation);
+        assert_eq!(
+            (mcp["result"]["action"].clone(), name),
+            (json!("decline"), "decline")
+        );
+        let (perms, name) = withdraw(ApprovalKind::Permissions {
+            requested: json!({"network": {"enabled": true}}),
+        });
+        assert_eq!(
+            (perms["result"].clone(), name),
+            (json!({"permissions": {}, "scope": "turn"}), "empty grant"),
+            "a withdrawal grants nothing, whatever was asked"
+        );
+        let (input, name) = withdraw(ApprovalKind::UserInput);
+        assert_eq!(
+            (input["result"].clone(), name),
+            (json!({"answers": {}}), "no answers")
+        );
+        assert_eq!(input["id"], 9);
+    }
 }
 
 #[cfg(test)]

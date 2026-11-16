@@ -372,6 +372,7 @@ mod tests {
                         tool_name: tool.to_owned(),
                         input: Some(Default::default()),
                         rendered: String::new(),
+                        questions: Vec::new(),
                     }),
                     ..Default::default()
                 }),

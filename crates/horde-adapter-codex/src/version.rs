@@ -1,63 +1,67 @@
-//! Whether the launched codex routes exec approvals — the version gate on
-//! [`Capability::PreAuthorizeExecCommands`].
+//! Which codex releases this adapter drives, and which per-kind claims each
+//! one earns.
 //!
-//! Measured, not assumed (re-probe transcripts 20–33): under the granular
-//! approval policy this adapter always sends, `item/commandExecution/
-//! requestApproval` reaches the client at codex-cli **0.147.0** (transcript
-//! 33) and **0.148.0** (transcript 25), while **0.145.0** routed nothing in
-//! six configurations (ADR-0005) and the 0.147 `on-request` control shows the
-//! boundary is real per policy (transcript 32). The claim therefore holds from
-//! 0.147 up, and only after the running binary has actually said so — an
-//! unprobed or unparseable version fails closed to the sandbox-only claim,
-//! because advertising interception a CLI will never perform leaves the chain
-//! silently doing nothing.
+//! Measured, not assumed:
 //!
-//! [`Capability::PreAuthorizeExecCommands`]: horde_adapter::Capability::PreAuthorizeExecCommands
+//! * **Exec approvals** — under the granular approval policy this adapter
+//!   always sends, `item/commandExecution/requestApproval` reaches the client
+//!   at codex-cli **0.147.0** (transcript 33), **0.148.0** (25) and
+//!   **0.167.0** (34–35, 40), while **0.145.0** routed nothing in six
+//!   configurations (ADR-0005) and 0.147 `on-request` parks (32).
+//! * **File-change approvals** — park forever at 0.148 (28, 31); route at
+//!   **0.167.0** and are honoured both ways (36–37, W12c).
+//!
+//! [`SUPPORT`] therefore refuses anything below 0.147 — without exec routing
+//! the chain cannot gate the agent's shell at all, and the protocol shapes
+//! below it were never recorded against the granular policy — and calls
+//! 0.147.0–0.167.0 supported. Each claim holds only once the running binary
+//! has said its version: unreadable output earns nothing.
+
+use horde_adapter::{HarnessVersion, SupportTable, VersionReport};
+
+/// codex's measured range.
+pub const SUPPORT: SupportTable = SupportTable {
+    provider: crate::PROVIDER,
+    floor: FIRST_EXEC_ROUTING,
+    tested_from: FIRST_EXEC_ROUTING,
+    tested_through: HarnessVersion::new(0, 167, 0),
+    floor_reason: "exec approvals route to the client from 0.147 (transcripts 25/33); below \
+                   it the chain cannot gate the agent's shell",
+};
 
 /// The first release whose granular policy routes exec approvals.
-const FIRST_ROUTING_VERSION: (u64, u64, u64) = (0, 147, 0);
+pub const FIRST_EXEC_ROUTING: HarnessVersion = HarnessVersion::new(0, 147, 0);
+
+/// The first release measured routing file-change approvals (transcripts
+/// 36–37). Somewhere between 0.148 (parks) and here it changed; the gate sits
+/// at the first measured version, not a guessed earlier one.
+pub const FIRST_FILE_CHANGE_ROUTING: HarnessVersion = HarnessVersion::new(0, 167, 0);
 
 /// Whether `--version` output names a codex that routes exec approvals.
-///
-/// Accepts the CLI's own format (`codex-cli 0.148.0`) by scanning for the
-/// first dotted version anywhere in the output, so a future banner line does
-/// not break the probe. No version found is `false` — fail closed.
+/// No version found is `false` — fail closed.
 #[must_use]
 pub fn routes_exec_approvals(version_output: &str) -> bool {
-    parse_first_version(version_output).is_some_and(|version| version >= FIRST_ROUTING_VERSION)
+    SUPPORT
+        .classify(version_output)
+        .at_least(FIRST_EXEC_ROUTING)
 }
 
-/// The first `major.minor.patch` (patch optional) in `text`, as numbers.
-fn parse_first_version(text: &str) -> Option<(u64, u64, u64)> {
-    text.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
-        .find_map(parse_version_token)
-}
-
-/// One token as a dotted version, or `None`.
-fn parse_version_token(token: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = token.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    // Patch is optional ("0.147"), and trailing junk ("0.147.0-rc1") is not a
-    // version this probe trusts: an unreadable component fails the token, and
-    // the scan moves on.
-    let patch = match parts.next() {
-        None => 0,
-        Some(part) => part.parse().ok()?,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
+/// Whether a probed binary routes file-change approvals.
+#[must_use]
+pub fn routes_file_change_approvals(report: &VersionReport) -> bool {
+    report.at_least(FIRST_FILE_CHANGE_ROUTING)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_first_version, routes_exec_approvals};
+    use horde_adapter::SupportVerdict;
+
+    use super::{SUPPORT, routes_exec_approvals, routes_file_change_approvals};
 
     /// The measured boundary, both sides of it, in the CLI's own format.
     #[test]
-    fn the_measured_versions_land_on_the_right_sides_of_the_gate() {
+    fn the_measured_versions_land_on_the_right_sides_of_the_exec_gate() {
+        assert!(routes_exec_approvals("codex-cli 0.167.0"), "transcript 34");
         assert!(routes_exec_approvals("codex-cli 0.148.0"), "transcript 25");
         assert!(routes_exec_approvals("codex-cli 0.147.0"), "transcript 33");
         assert!(
@@ -69,12 +73,7 @@ mod tests {
             routes_exec_approvals("codex-cli 1.0.0"),
             "later majors keep it"
         );
-    }
-
-    /// Fail closed: silence, prose, and unreadable versions all claim nothing.
-    #[test]
-    fn unparseable_output_never_claims_interception() {
-        for output in ["", "command not found", "codex-cli", "v.next", "0.x.1"] {
+        for output in ["", "command not found", "codex-cli", "v.next"] {
             assert!(
                 !routes_exec_approvals(output),
                 "{output:?} must fail closed"
@@ -82,33 +81,31 @@ mod tests {
         }
     }
 
-    /// The scanner's own corners: the version may sit anywhere in the output,
-    /// a two-part version reads as patch zero, and suffixed tokens are not
-    /// trusted as versions.
     #[test]
-    fn the_first_dotted_version_is_found_wherever_it_sits() {
-        assert_eq!(
-            parse_first_version("codex-cli 0.148.0 (homebrew)"),
-            Some((0, 148, 0))
+    fn file_changes_route_only_from_the_first_measured_version() {
+        assert!(routes_file_change_approvals(
+            &SUPPORT.classify("codex-cli 0.167.0")
+        ));
+        assert!(routes_file_change_approvals(
+            &SUPPORT.classify("codex-cli 0.170.2")
+        ));
+        assert!(
+            !routes_file_change_approvals(&SUPPORT.classify("codex-cli 0.166.9")),
+            "unmeasured below 0.167; 0.148 parks (transcripts 28/31)"
         );
-        assert_eq!(parse_first_version("0.147"), Some((0, 147, 0)));
-        assert_eq!(
-            parse_first_version("codex 0.147.0-rc1 0.146.0"),
-            Some((0, 146, 0)),
-            "a suffixed token is skipped, not misread"
-        );
-        assert_eq!(parse_first_version("1.2.3.4"), None, "too many parts");
+        assert!(!routes_file_change_approvals(
+            &SUPPORT.classify("codex-cli")
+        ));
     }
 
-    /// Each split delimiter must work alone: a version wrapped in parens with
-    /// no adjoining whitespace is still found. This is the corner that
-    /// separates `||` from `&&` in the tokenizer — a character is a delimiter
-    /// if it is *any* of them, never all of them at once.
     #[test]
-    fn a_parenthesized_version_is_still_found() {
-        assert_eq!(parse_first_version("codex(0.147.0)"), Some((0, 147, 0)));
-        assert_eq!(parse_first_version("(0.148.0"), Some((0, 148, 0)));
-        assert_eq!(parse_first_version("0.149.0)"), Some((0, 149, 0)));
-        assert!(routes_exec_approvals("codex(0.147.0)"));
+    fn the_support_table_matches_the_recordings() {
+        let verdict = |output: &str| SUPPORT.classify(output).verdict;
+        assert_eq!(verdict("codex-cli 0.146.0"), SupportVerdict::Refused);
+        assert_eq!(verdict("codex-cli 0.147.0"), SupportVerdict::Supported);
+        assert_eq!(verdict("codex-cli 0.167.0"), SupportVerdict::Supported);
+        assert_eq!(verdict("codex-cli 0.168.0"), SupportVerdict::Untested);
+        assert_eq!(verdict("codex-cli ?"), SupportVerdict::Untested);
+        assert_eq!(SUPPORT.provider, "codex");
     }
 }

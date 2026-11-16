@@ -8,9 +8,9 @@ to test against one without a provider login. The design rationale is
 
 | Crate | What it is |
 |---|---|
-| `horde-adapter` | The `Adapter`/`AgentSession` trait pair and the domain vocabulary every provider is normalized into. No I/O, no provider knowledge. |
-| `horde-adapter-claude` | Claude Code's `stream-json` protocol as a pure codec: wire types, turn assembly, usage normalization, and the `--permission-prompt-tool` payloads. |
-| `horde-adapter-codex` | Codex's `app-server` JSON-RPC protocol as a pure codec: wire types, turn assembly, usage idempotence, the MCP-elicitation permission seam, and the sandbox-tier policy. |
+| `horde-adapter` | The `Adapter`/`AgentSession` trait pair and the domain vocabulary every provider is normalized into — including the version support tables (`version`) every adapter classifies its binary against. No I/O, no provider knowledge. |
+| `horde-adapter-claude` | Claude Code's `stream-json` protocol as a pure codec: wire types, turn assembly, usage normalization, the permission prompts on both routes (`can_use_tool` control requests on stdout, and the MCP approve tool), and the measured version range. |
+| `horde-adapter-codex` | Codex's `app-server` JSON-RPC protocol as a pure codec: wire types, turn assembly, usage idempotence, every server request Horde adjudicates (MCP elicitations, exec, file-change and permissions approvals, questions), the sandbox-tier policy, the measured version range, and the declared protocol surface the drift check reads. |
 | `horde-adapter-fake` | A scripted harness — a real alternate backend, not a mock — for orchestration tests. |
 | `horde-testkit` | Golden-transcript loading and the shared conformance suite. |
 
@@ -49,14 +49,14 @@ on someone else's phone.
 Providers differ in ways that change what Horde may safely do with them, so
 capability flags are values, not doc comments.
 
-The load-bearing pair is `PreAuthorizeToolCalls` and its scoped sibling
-`PreAuthorizeMcpToolCalls`: whether Horde sees a proposed tool call **before**
-it runs, and for which kinds. Claude Code has the broad claim (spike W1c).
-Codex has the scoped one — since the ADR-0005 amendment (measured again for
-W5b, transcripts 17–18), every **MCP** tool call is routed through a
-client-facing elicitation before a byte reaches the MCP server, while
-**shell/exec** remains adjudicated internally against the sandbox tier: the
-two routing feature flags are still off at 0.147.0.
+The load-bearing claims are `PreAuthorizeToolCalls` and its scoped siblings
+`PreAuthorizeMcpToolCalls`, `PreAuthorizeExecCommands` and
+`PreAuthorizeFileChanges`: whether Horde sees a proposed tool call **before**
+it runs, and for which kinds. Claude Code has the broad claim (spike W1c,
+re-measured on the stdio route at 2.1.323). Codex holds the scoped ones, each
+from the first version it was measured on: MCP calls on every supported
+version (transcripts 17–18), exec from 0.147 (25/33), file changes from 0.167
+(36–37). The worker probes the binary's version before claiming any of them.
 
 Ask `Capabilities::permission_enforcement_for(kind)` rather than reading flags
 yourself; the kind-blind `permission_enforcement()` answers with the **floor**
@@ -71,6 +71,29 @@ for high-trust exec:
 
 `SteerAtTurnBoundary` is separate from `InterruptibleTurn` because both harnesses
 split them (Codex has `turn/steer` alongside `turn/interrupt`).
+
+## Harness versions
+
+Every claim above is a measurement against particular CLI versions, so each
+adapter states its measurements as a `SupportTable` and the Worker classifies
+the launched binary (`--version`, bounded) before an agent runs on it:
+
+| Provider | Refused | Supported (recorded) | Untested |
+|---|---|---|---|
+| claude | below 2.1.226 | 2.1.226 – 2.1.323 | newer, or an unreadable banner |
+| codex | below 0.147.0 | 0.147.0 – 0.167.0 | newer, or an unreadable banner |
+
+*Refused* stops the Worker at startup with the version, the floor and the
+fix, and a spawn refuses with `AdapterError::RefusedVersion` (a refusal, not
+a process death). *Untested* runs, with a `harness version warning` journaled
+on each agent's first turn — where its failures would land — and Claude's own
+`system/init` reports `claude_code_version` per turn as a second opinion.
+`horde doctor` prints the same verdict for every local harness, and the
+Worker advertises the probed version in `HarnessCapability.version`.
+
+The version also picks behavior: Claude prompts ride stdio from 2.1.323 (the
+MCP tool route below it, where only that was measured), and codex's exec and
+file-change claims arrive at 0.147 and 0.167 respectively.
 
 ## Spawn is not side-effect-free
 
@@ -136,14 +159,61 @@ a flag — and not merely gate it. An adapter whose harness cannot do that must
 report `Capability::RewritesToolInput` as unsupported and reject such a decision,
 so a narrowing that failed to apply can never look like one that took effect.
 
-For Claude the prompts arrive on the **MCP endpoint, not on stdout**, so a live
-session merges two inbound channels. Both stdio and HTTP MCP servers work, and
-the harness will wait — a 180-second stall was answered with no timeout, which is
-what makes the human-approval layer viable.
+For Claude the prompts arrive **on stdout** (W12c): `--permission-prompt-tool
+stdio` makes the harness write a `control_request` with subtype
+`can_use_tool` — tool name, input, `tool_use_id`, its own permission
+suggestions — and wait for a `control_response` on stdin carrying
+`{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`.
+It is the exchange the Agent SDK's `canUseTool` callback rides, so a live
+session has one inbound channel again. Re-measured at 2.1.323 (transcripts
+`12a`–`13`): allow, deny (the message is what the agent reads), a narrowing
+`updatedInput` (the harness wrote the narrowed content), a 90-second stall
+answered with no timeout, and a session-scoped `updatedPermissions` grant the
+harness honoured. Horde deliberately **never sends `updatedPermissions`**:
+the chain remembers the exact call, while Claude's grants are tool- or
+mode-wide (its own suggestion for a Write is `setMode acceptEdits`), so
+mirroring one would let calls the chain never saw run unasked. Every control
+request is answered — a subtype Horde does not handle gets an error, a prompt
+outside any turn a denial — and an interrupt denies any prompt still parked
+before it interrupts. The W1c route — `--permission-prompt-tool
+mcp__horde__approve`, prompts as MCP tool calls on the agent's endpoint — is
+kept as the fallback for binaries older than 2.1.323, where only it was
+measured; it still works at 2.1.323 (transcript `17`). Either way the worker
+passes `--settings` with empty allow/deny lists and `--permission-mode
+manual`, because ambient allowlists decide a call before the prompt tool ever
+sees it (ADR-0003, ADR-0010).
 
-For Codex the prompts arrive **on stdout**, as `mcpServer/elicitation/request`
-server requests, and only for MCP tool calls. Three measured facts shape the
-adapter (transcripts 17–19):
+### Questions
+
+Some prompts are questions rather than permissions: Claude's
+`AskUserQuestion` and codex's `item/tool/requestUserInput`. They ride the
+same path — a `ProposedToolCall` with `questions` (id, header, question,
+options, multi-select, free text allowed, secret) — and only a human settles
+them: the chain escalates a question past every allow layer and the judge
+(authored deny still applies), and the answer comes back as
+`PermissionDecision::Answer` (`PermissionDecision.answers` on the wire). The
+Server resolves loosely typed answers — a question's id or its 1-based
+position, an option's label or its number — into canonical ones before
+journaling, refuses an allow without answers on a question and answers on
+anything else, and never remembers an answer. Clients answer with `horde
+answer <request> 1=2` (or `horde approve --answer`); the TUI inbox answers a
+single-question request with the number keys. Claude keys its answers by the
+question text and reads one string per question (several choices joined with
+`", "`); codex keys them by question id with a list per question.
+
+For Codex the prompts arrive **on stdout** as server requests. At 0.167 five
+methods become permission events (W12c, transcripts 34–41): MCP elicitations
+(below), exec approvals (`exec`, ADR-0005's 2026-08-19 amendment), file-change
+approvals (`apply_patch`, the patch joined from the started `fileChange`
+item's `changes`, answered in the exec `decision` vocabulary), sandbox-widening
+requests (`request_permissions`, granted exactly what was asked — for the
+session when the decision remembers — or an empty profile on refusal), and
+questions (`request_user_input`, see above). The last two only reach a client
+when codex offers the agent those tools (`request_permissions_tool`,
+`default_mode_request_user_input`, both off by default at 0.167). A
+`serverRequest/resolved` notification for a request Horde still holds means
+codex settled it itself, and the session drops it. Three measured facts shape
+the MCP elicitation path (transcripts 17–19):
 
 - The reply's field is `action` (`accept`/`decline`) — an MCP elicitation
   result, not the `decision` shape codex's exec approvals use. There is
@@ -161,8 +231,10 @@ adapter (transcripts 17–19):
   request must be answered, so the live session refuses anything it cannot
   adjudicate (deny-by-default) rather than leaving it pending.
 
-For exec, Codex's enforcement is the **sandbox tier chosen at spawn**. The
-worker derives it from the agent's permission-mode name through a configured
+Beneath the chain, Codex's floor is the **sandbox tier chosen at spawn**: a
+call the tier permits runs without a request at all, and only escalations
+past it are asked about. The worker derives the tier from the agent's
+permission-mode name through a configured
 `SandboxPolicy` — unknown and absent modes fail closed to `read-only`,
 `danger-full-access` is unrepresentable — and journals the choice and its
 reason on the agent's first turn as a `HarnessDiagnostic` chunk.
@@ -211,8 +283,11 @@ a real harness forces), and its permission steps genuinely block the turn.
 ## Golden transcripts
 
 `docs/spikes/transcripts/` holds real recorded `claude` sessions from spike
-W1c; `docs/spikes/codex-app-server/transcripts/` holds the `codex app-server`
-sessions from spike W2c plus the W5b elicitation captures (17–19).
+W1c (2.1.226) and the W12c re-probe (2.1.323, `12a`–`17`: the stdio route,
+`AskUserQuestion`, and the baselines re-recorded);
+`docs/spikes/codex-app-server/transcripts/` holds the `codex app-server`
+sessions from spike W2c, the W5b elicitation captures (17–19), the exec
+re-probe (20–33), and the W12c captures at 0.167 (34–41).
 `ReplaySession` drives each codec from them, so everything above the transport
 runs exactly as it would live — the production adapters swap the line source
 for a child process's stdout and keep the rest. Replay is **lazy** and stalls
@@ -226,25 +301,42 @@ in `horde-adapter-codex/tests/conformance.rs`.
 
 Recordings can only prove the codec matched the CLI on the day they were taken.
 The `live_smoke` tests drive the **real** binaries and are `#[ignore]`d, so
-they never run in a normal suite:
+they never run in a normal suite. One command runs them all against the
+installed harnesses:
 
 ```sh
-cargo test -p horde-adapter-claude --test live_smoke -- --ignored --nocapture
-cargo test -p horde-adapter-codex  --test live_smoke -- --ignored --nocapture
-cargo test -p horde-worker         --test live_smoke -- --ignored --nocapture
+scripts/live-smoke.sh            # or: scripts/live-smoke.sh claude|codex
 ```
 
-Run them when bumping a supported CLI version. If one fails, capture a fresh
-transcript rather than loosening the parser to accept both shapes.
+It runs the codec-level smokes under the operator's own login (for claude:
+a turn, a narrowed stdio prompt, an `AskUserQuestion` round trip, the version
+verdict), the codex drift check, and — when `HORDE_LIVE_HARNESS_ROOT` names a
+signed-in Worker-owned profile — the Worker-level smokes through the
+production adapters. Run it when bumping a supported CLI version. If one
+fails, capture a fresh transcript rather than loosening the parser to accept
+both shapes.
+
+**Codex drift.** `horde-adapter-codex::surface::SURFACE` declares every
+method and field path the codec reads or sends; `schema/surface.json` is that
+surface resolved against `codex app-server generate-json-schema` at the last
+measured version (types and enum values per path). The offline test checks
+the snapshot covers the declaration exactly with nothing `MISSING`; the live
+test regenerates it from the installed codex and prints every path whose type
+or vocabulary moved. `HORDE_UPDATE_CODEX_SURFACE=1` rewrites the snapshot once
+the diff is reviewed.
 
 ## Revival identity
 
 A session id alone cannot revive an agent. Sessions live *inside* the account
 directory — `CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex (which
-holds credentials *and* the rollout files threads persist in) — so
-`RevivalIdentity` pairs the id with the directory it was recorded under, and
-`is_resumable_under` refuses a mismatch instead of surfacing an authentication
-error that looks like an outage. Journal both halves together.
+holds credentials *and* the rollout files threads persist in) — so the
+revival identity is the pair (session id, account binding). The Worker
+journals both: the session id when the harness names it, and the account
+inside the spawn command it keeps whole. Revival rebuilds the spec from that
+spawn command, so the account directory is re-derived under the same state
+directory the journal lives in — resumed under the directory it was recorded
+under by construction. (The `RevivalIdentity::is_resumable_under` guard that
+would have compared the two was never called and was deleted in W12c.)
 
 Codex adds one revival trap the codec absorbs: `thread/resume` replays the
 prior turn's `thread/tokenUsage/updated` before the new turn's, so usage is
@@ -296,15 +388,20 @@ Claude session reports EOF as the death it always is — reaping the child for
 its exit status and keeping stderr — because the Worker never closes a live
 agent's stdin.
 
-## Not here yet
+## Known gaps
 
-The MCP endpoint that carries Claude's permission prompts is still to be
-wired into the spawn (`permission_prompt_tool` is a constructor seam). When it
-is, the Claude adapter already passes `--settings` with empty allow/deny lists
-and `--permission-mode manual` alongside it, because ambient settings
-allowlists decide a call before the permission tool ever sees it (ADR-0003,
-re-verified 2026-08-11). The Codex adapter needs no such merge: its permission
-requests arrive on stdout as elicitations.
+- The Worker-level Claude live smoke needs a signed-in Worker-owned profile
+  (`HORDE_LIVE_HARNESS_ROOT`); the codec-level smokes run under the
+  operator's login without one.
+- Codex's `request_permissions` and `request_user_input` tools are off by
+  default at 0.167, so those requests are handled when codex sends them but
+  Horde does not turn the feature flags on.
+- A codex question refused by the chain is answered with empty answers (the
+  schema has no decline); how codex presents that to the model was not
+  probed.
+- The TUI answers only single-question requests with the number keys; a
+  request asking several questions points at `horde answer` (the W12f TUI
+  rebuild owns the full flow).
 
 The AmendActiveTurn question that was left to the Codex productionization is
 now answered inside the adapter rather than the pump: a `LiveCodexSession`

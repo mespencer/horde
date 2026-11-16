@@ -141,6 +141,7 @@ mod tests {
             tool_name: tool.to_owned(),
             input: Some(input),
             rendered: String::new(),
+            questions: Vec::new(),
         }
     }
 
@@ -287,6 +288,7 @@ mod tests {
             tool_name: "horde/wait_for_agent".to_owned(),
             input: None,
             rendered: String::new(),
+            questions: Vec::new(),
         };
         assert!(!own_orchestrator_verb(&no_input, "root", &state));
     }

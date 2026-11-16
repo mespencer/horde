@@ -2334,6 +2334,7 @@ mod tests {
                     tool_name: "linear__create".to_owned(),
                     input: None,
                     rendered: String::new(),
+                    questions: Vec::new(),
                 }),
                 tree_path: Vec::new(),
                 permission_mode: String::new(),

@@ -44,12 +44,12 @@ def send(msg):
     p.stdin.write(json.dumps(msg) + "\n")
     p.stdin.flush()
 
-long_prompt = ("Count from 1 to 300. Print each number on its own line, "
+long_prompt = os.environ.get("INTERRUPT_PROMPT", "Count from 1 to 300. Print each number on its own line, "
                "with the word 'tick' after it. Do not stop early.")
 send({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": long_prompt}]}})
 
 first_assistant.wait(timeout=120)
-time.sleep(2.0)  # let some output accumulate
+time.sleep(float(os.environ.get("INTERRUPT_DELAY", "2.0")))  # let some output accumulate
 print(f"[probe] first assistant seen; firing interrupt via {mode}", file=sys.stderr)
 
 if mode == "control":
