@@ -109,6 +109,9 @@ fn binary_headers_name_their_platform() {
         }))
     );
     assert_eq!(binary_kind(&macho(0x0000_0007)), None);
+    // Every byte of the cputype counts, the middle two as much as the ends.
+    assert_eq!(binary_kind(&macho(0x0100_0107)), None);
+    assert_eq!(binary_kind(&macho(0x0101_0007)), None);
     assert_eq!(
         binary_kind(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2]),
         Some(BinaryKind::UniversalDarwin)
@@ -158,6 +161,8 @@ fn targets_are_ssh_destinations_never_options() {
     for bad in [
         "-oProxyCommand=sh",
         "me@-oProxyCommand=x",
+        "me@-box",
+        "-me@box",
         "",
         "me@",
         "me box",

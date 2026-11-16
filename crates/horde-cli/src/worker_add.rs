@@ -121,6 +121,14 @@ pub struct Checked {
     pub wait_secs: u64,
 }
 
+impl Checked {
+    /// How long the run waits for the started worker to register.
+    #[must_use]
+    pub fn registration_limit(&self) -> Duration {
+        Duration::from_secs(self.wait_secs)
+    }
+}
+
 fn refusal(message: impl Into<String>) -> ClientError {
     ClientError::WorkerAdd(message.into())
 }
@@ -213,23 +221,29 @@ impl Source {
 
     /// The build to run first, if any.
     #[must_use]
-    pub fn build(&self, platform: Platform) -> Option<Invocation> {
+    pub fn build(&self, platform: Platform) -> Option<Step> {
         match self {
             Self::Dir(_) => None,
-            Self::Build { .. } => Some(Invocation {
-                program: "cargo".to_owned(),
-                args: [
-                    "build",
-                    "--release",
-                    "-p",
-                    "horde-worker",
-                    "--bin",
-                    "horde-worker",
-                    "--target",
-                    platform.triple(),
-                ]
-                .map(str::to_owned)
-                .to_vec(),
+            Self::Build { .. } => Some(Step {
+                name: "build",
+                invocation: Invocation {
+                    program: "cargo".to_owned(),
+                    args: [
+                        "build",
+                        "--release",
+                        "-p",
+                        "horde-worker",
+                        "--bin",
+                        "horde-worker",
+                        "--target",
+                        platform.triple(),
+                    ]
+                    .map(str::to_owned)
+                    .to_vec(),
+                },
+                script: None,
+                stdin: None,
+                limit: BUILD_CEILING,
             }),
         }
     }
@@ -394,7 +408,7 @@ pub fn render_plan(
         Format::Json => json!({
             "dry_run": true,
             "assumed_platform": context.platform.to_string(),
-            "build": build.as_ref().map(|b| b.args.iter().fold(vec![b.program.clone()], |mut all, a| { all.push(a.clone()); all })),
+            "build": build.as_ref().map(|b| b.invocation.args.iter().fold(vec![b.invocation.program.clone()], |mut all, a| { all.push(a.clone()); all })),
             "steps": steps.iter().map(|step| json!({
                 "step": step.name,
                 "argv": std::iter::once(&step.invocation.program).chain(&step.invocation.args).collect::<Vec<_>>(),
@@ -479,8 +493,8 @@ pub async fn execute(
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A write the remote end refused shows up as the command's own
         // failure below, with its stderr; nothing to add here.
+        // The pipe closes as this block ends, which is the command's EOF.
         let _ = pipe.write_all(text.as_bytes()).await;
-        drop(pipe);
     }
     let output = tokio::time::timeout(limit, child.wait_with_output())
         .await
@@ -562,6 +576,21 @@ pub fn harness_warnings(adapters: &[String], harnesses: &[plan::Harness]) -> Vec
                 name = harness.name
             )
         })
+        .collect()
+}
+
+/// Every warning the run learns once the worker has started: requested
+/// adapters with no harness on the remote PATH, and a machine that does not
+/// linger.
+#[must_use]
+pub fn after_start_warnings(
+    checked: &Checked,
+    started: &plan::Started,
+    harnesses: &[plan::Harness],
+) -> Vec<String> {
+    harness_warnings(&checked.adapters, harnesses)
+        .into_iter()
+        .chain(linger_warning(started, &checked.remote.target))
         .collect()
 }
 
@@ -728,7 +757,22 @@ pub async fn mint(
     let minted = client
         .mint_enrollment_code(horde_proto::v1::Role::Worker, &checked.name, ttl_minutes)
         .await?;
-    let token = crate::cli::token_from_mint(endpoint, &minted)
+    dialable_token(endpoint, &minted, checked, warnings)
+}
+
+/// The join token a mint answer makes, judged for whether `checked`'s
+/// remote can dial it; see [`mint`].
+///
+/// # Errors
+///
+/// An answer naming no enrollment listener, or a token no machine can dial.
+pub fn dialable_token(
+    endpoint: &str,
+    minted: &horde_proto::v1::MintEnrollmentCodeResponse,
+    checked: &Checked,
+    warnings: &mut Vec<String>,
+) -> Result<horde_identity::JoinToken, ClientError> {
+    let token = crate::cli::token_from_mint(endpoint, minted)
         .ok_or_else(|| refusal("the server's mint answer named no enrollment listener"))?;
     match token.scope() {
         horde_identity::HostScope::Unspecified => Err(refusal(format!(
@@ -791,13 +835,7 @@ pub async fn run(
     let checked = checked(args)?;
     let source = Source::of(args, exe_dir(), cargo_target_dir())?;
     progress(format, &format!("probing {}", checked.remote.target));
-    let probed = execute(
-        "probe",
-        &probe_step(&checked).invocation,
-        None,
-        STEP_CEILING,
-    )
-    .await?;
+    let probed = run_planned(&probe_step(&checked)).await?;
     let probe = plan::parse_probe(&probed).map_err(refusal)?;
     let context = context_of(&checked.remote.target, &probe)?;
     let binary = local_binary(&source, &checked, &context, format).await?;
@@ -807,15 +845,9 @@ pub async fn run(
     let token = mint(client, &checked, endpoint, args.ttl_minutes, &mut warnings).await?;
     let started = start(&steps, &token, format).await?;
     progress(format, &format!("waiting for {} to register", checked.name));
-    await_registration(
-        client,
-        &checked.name,
-        Duration::from_secs(checked.wait_secs),
-    )
-    .await?;
-    let harnesses = plan::parse_harnesses(&run_step(&steps, "harnesses", None).await?);
-    warnings.extend(harness_warnings(&checked.adapters, &harnesses));
-    warnings.extend(linger_warning(&started, &checked.remote.target));
+    await_registration(client, &checked.name, checked.registration_limit()).await?;
+    let harnesses = plan::parse_harnesses(&run_step(&steps, "harnesses").await?);
+    warnings.extend(after_start_warnings(&checked, &started, &harnesses));
     let mode = start_mode(&checked, &context);
     let added = Added {
         name: checked.name.clone(),
@@ -850,7 +882,7 @@ async fn local_binary(
 ) -> Result<PathBuf, ClientError> {
     if let Some(build) = source.build(context.platform) {
         progress(format, &format!("building: {}", build.display()));
-        execute("build", &build, None, BUILD_CEILING).await?;
+        run_planned(&build).await?;
     }
     let binary = source.binary(context.platform);
     check_binary(
@@ -862,13 +894,27 @@ async fn local_binary(
     Ok(binary)
 }
 
-/// Runs the named step from `steps`.
-async fn run_step(steps: &[Step], name: &str, stdin: Option<&str>) -> Result<String, ClientError> {
-    let step = steps
+/// The named step from `steps`.
+fn planned<'a>(steps: &'a [Step], name: &str) -> Result<&'a Step, ClientError> {
+    steps
         .iter()
         .find(|step| step.name == name)
-        .ok_or_else(|| refusal(format!("no {name} step was planned")))?;
-    execute(name, &step.invocation, stdin, step.limit).await
+        .ok_or_else(|| refusal(format!("no {name} step was planned")))
+}
+
+/// Runs one step that reads nothing: its stdin is `/dev/null`, so a
+/// command that reads it ends at once rather than waiting on a pipe.
+///
+/// # Errors
+///
+/// As [`execute`].
+pub async fn run_planned(step: &Step) -> Result<String, ClientError> {
+    execute(step.name, &step.invocation, None, step.limit).await
+}
+
+/// Runs the named step from `steps`.
+async fn run_step(steps: &[Step], name: &str) -> Result<String, ClientError> {
+    run_planned(planned(steps, name)?).await
 }
 
 /// Prepare, copy, install: the binary's `--version` line on success.
@@ -877,28 +923,32 @@ async fn install(steps: &[Step], checked: &Checked, format: Format) -> Result<St
         format,
         &format!("installing into {}", checked.dir.scp_path()),
     );
-    run_step(steps, "prepare", None).await?;
-    run_step(steps, "copy", None).await?;
-    let version = run_step(steps, "install", None).await?;
+    run_step(steps, "prepare").await?;
+    run_step(steps, "copy").await?;
+    let version = run_step(steps, "install").await?;
     Ok(version.lines().next().unwrap_or_default().trim().to_owned())
 }
 
 /// The start step, with the token on stdin; refuses when the join was not
 /// redeemed, carrying the worker log's tail.
-async fn start(
+///
+/// # Errors
+///
+/// No start step planned, or the join not redeemed.
+pub async fn start(
     steps: &[Step],
     token: &horde_identity::JoinToken,
     format: Format,
 ) -> Result<plan::Started, ClientError> {
     progress(format, "starting the worker");
+    let step = planned(steps, "start")?;
     let stdin = format!("{token}\n");
-    let output = match run_step(steps, "start", Some(&stdin)).await {
-        Ok(output) => output,
-        Err(ClientError::WorkerAdd(message)) => {
-            return Err(refusal(join_failure(&message)));
-        }
-        Err(other) => return Err(other),
-    };
+    let output = execute(step.name, &step.invocation, Some(&stdin), step.limit)
+        .await
+        .map_err(|error| match error {
+            ClientError::WorkerAdd(message) => refusal(join_failure(&message)),
+            other => other,
+        })?;
     let started = plan::parse_started(&output);
     if started.joined {
         Ok(started)

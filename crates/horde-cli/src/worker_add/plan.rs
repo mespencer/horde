@@ -229,10 +229,14 @@ fn macho_kind(header: &[u8]) -> Option<BinaryKind> {
 /// `-` — ssh would read that as an option (`-oProxyCommand=…`).
 #[must_use]
 pub fn is_valid_target(target: &str) -> bool {
-    let (user, host) = target.rsplit_once('@').unwrap_or(("", target));
-    let user_ok = user
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    let (user_ok, host) = match target.rsplit_once('@') {
+        Some((user, host)) => (
+            user.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+            host,
+        ),
+        None => (true, target),
+    };
     let host_ok = !host.is_empty()
         && host
             .bytes()

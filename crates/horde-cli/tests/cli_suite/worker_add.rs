@@ -277,6 +277,83 @@ async fn a_worker_that_cannot_join_is_refused_with_its_log() -> Setup<()> {
     Ok(())
 }
 
+/// A terminal run narrates every step on stderr — the local build included,
+/// under `--build-locally` — and its report names a requested adapter whose
+/// harness the remote PATH lacks. The build is a `cargo` stand-in that puts
+/// the real worker binary where the release build would.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_run_narrates_the_build_and_warns_of_a_missing_harness() -> Setup<()> {
+    let operator = operator().await?;
+    let remote = Remote::new()?;
+    std::fs::remove_file(remote.root.path().join("path/claude"))?;
+    let worker =
+        horde_server_testkit::process::product_binary("horde-worker", "horde-worker").await?;
+    let tools = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    executable(
+        &tools.path().join("cargo"),
+        &format!(
+            "#!/bin/sh
+             while [ \"$1\" != --target ]; do shift; done
+             mkdir -p \"$CARGO_TARGET_DIR/$2/release\"
+             exec cp '{}' \"$CARGO_TARGET_DIR/$2/release/horde-worker\"
+",
+            worker.display()
+        ),
+    )?;
+    let path = format!(
+        "{}:{}",
+        tools.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args(["--endpoint", &operator.harness.main_endpoint()])
+        .args(["--identity", &operator.identity.path().to_string_lossy()])
+        .args(["worker", "add", "box-told", "me@remote", "--build-locally"])
+        .args(["--ssh", &remote.program("ssh")])
+        .args(["--scp", &remote.program("scp")])
+        .args([
+            "--adapter",
+            "fake",
+            "--adapter",
+            "claude",
+            "--timeout-secs",
+            "20",
+        ])
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", target.path())
+        .output();
+    let output = within("horde worker add", output).await??;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stderr}\n{stdout}");
+    let narrated: Vec<&str> = stderr.lines().collect();
+    assert_eq!(narrated.len(), 5, "{stderr}");
+    assert_eq!(narrated[0], "probing me@remote");
+    assert!(
+        narrated[1].starts_with("building: cargo build --release -p horde-worker"),
+        "{stderr}"
+    );
+    assert_eq!(
+        narrated[2..],
+        [
+            "installing into .horde/bin",
+            "starting the worker",
+            "waiting for box-told to register"
+        ],
+        "{stderr}"
+    );
+    assert!(
+        stdout.starts_with("added worker=box-told target=me@remote"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("warning: --adapter claude, but no claude is on the remote PATH"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
 /// The registration wait gives up with a refusal, not a hang, and a name
 /// on the roster is the only thing that satisfies it.
 #[tokio::test(flavor = "multi_thread")]
@@ -354,5 +431,16 @@ async fn a_dry_run_prints_the_plan_and_touches_nothing() -> Setup<()> {
         "{plan}"
     );
     assert_eq!(plan["build"][0], "cargo");
+
+    // Without a probe the remote home and PATH are placeholders, and a
+    // service unit shows both.
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args(["--json", "worker", "add", "box", "me@remote", "--dry-run"])
+        .arg("--service")
+        .output()
+        .await?;
+    let plan = String::from_utf8(output.stdout)?;
+    assert!(plan.contains("<remote-home>/.horde/bin"), "{plan}");
+    assert!(plan.contains("<remote-PATH>"), "{plan}");
     Ok(())
 }

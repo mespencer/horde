@@ -351,3 +351,93 @@ async fn execute_refuses_a_program_that_does_not_exist() {
         .expect_err("a missing program is refused");
     assert!(error.to_string().contains("could not run /nonexistent/ssh"));
 }
+
+/// A step that reads nothing gets `/dev/null`, not a pipe it would have to
+/// wait on: ssh, for one, forwards whatever its stdin holds.
+#[tokio::test]
+async fn a_planned_step_reads_nothing() -> Outcome {
+    let step = horde_cli::worker_add::Step {
+        name: "probe",
+        invocation: Invocation {
+            program: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "if [ -p /dev/stdin ]; then echo pipe; else echo none; fi".to_owned(),
+            ],
+        },
+        script: None,
+        stdin: None,
+        limit: Duration::from_secs(10),
+    };
+    assert_eq!(horde_cli::worker_add::run_planned(&step).await?, "none\n");
+    Ok(())
+}
+
+/// A command that outlives its limit is killed, not left running behind
+/// the refusal.
+#[tokio::test]
+async fn a_command_past_its_limit_is_killed() -> Outcome {
+    let dir = tempfile::tempdir()?;
+    let pid_file = dir.path().join("pid");
+    let hanging = Invocation {
+        program: "sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+        ],
+    };
+    let error = horde_cli::worker_add::execute("start", &hanging, None, Duration::from_millis(500))
+        .await
+        .expect_err("a hang is refused");
+    assert!(error.to_string().contains("start: no answer within 500ms"));
+    let pid = std::fs::read_to_string(&pid_file)?.trim().to_owned();
+    let stat = Path::new("/proc").join(&pid).join("stat");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Gone, or a zombie waiting to be reaped: either way, no longer running.
+    while std::fs::read_to_string(&stat).is_ok_and(|text| {
+        !text
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+    }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} still runs after its step was refused"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// A start step that succeeds without reporting a join is a refusal, with
+/// what it said; a successful one hands back what the start reported.
+#[tokio::test]
+async fn a_start_that_never_reports_its_join_is_refused() -> Outcome {
+    let code = format!("ab.{}", "0".repeat(64));
+    let token = horde_identity::JoinToken::new(
+        "horde.lan:7778",
+        horde_identity::JoinCode::parse(&code).ok_or("a well-formed code")?,
+    );
+    let step = |script: &str| horde_cli::worker_add::Step {
+        name: "start",
+        invocation: Invocation {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), script.to_owned()],
+        },
+        script: None,
+        stdin: Some("join token"),
+        limit: Duration::from_secs(10),
+    };
+    let quiet = [step("cat >/dev/null; echo pid 7")];
+    let refused = horde_cli::worker_add::start(&quiet, &token, horde_cli::render::Format::Json)
+        .await
+        .expect_err("no join reported");
+    assert_eq!(
+        refused.to_string(),
+        "worker add: the worker did not join: pid 7"
+    );
+    let joined = [step("read token; echo pid 9; echo joined")];
+    let started =
+        horde_cli::worker_add::start(&joined, &token, horde_cli::render::Format::Json).await?;
+    assert_eq!((started.pid, started.joined), (Some(9), true));
+    Ok(())
+}

@@ -172,7 +172,77 @@ fn the_binary_comes_from_the_flag_the_exe_dir_or_a_build() -> Outcome {
             target_dir: PathBuf::from("/t")
         }
     );
-    assert!(Source::of(&parsed(&["g", "h"])?, None, None).is_err());
+    let refused = Source::of(&parsed(&["g", "h"])?, None, None)
+        .expect_err("no flag and no exe dir names no binary");
+    assert_eq!(
+        message(&refused),
+        "worker add: cannot tell where this horde runs from; pass --binary-dir"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_local_build_is_its_own_step_with_the_long_ceiling() -> Outcome {
+    let built = Source::of(&parsed(&["g", "h", "--build-locally"])?, None, None)?;
+    let build = built.build(LINUX_X86).ok_or("a build")?;
+    assert_eq!(build.name, "build");
+    assert_eq!(build.limit, BUILD_CEILING);
+    assert!(
+        build.limit > STEP_CEILING,
+        "a release build outlasts a remote step"
+    );
+    assert_eq!((build.script, build.stdin), (None, None));
+    Ok(())
+}
+
+#[test]
+fn the_registration_wait_is_the_timeout_flag() -> Outcome {
+    let checked = checked(&parsed(&["g", "h", "--timeout-secs", "20"])?)?;
+    assert_eq!(checked.registration_limit(), Duration::from_secs(20));
+    Ok(())
+}
+
+#[test]
+fn a_started_worker_earns_harness_and_linger_warnings_together() -> Outcome {
+    let checked = checked(&parsed(&["g", "me@box", "--adapter", "codex"])?)?;
+    let harnesses = [plan::Harness {
+        name: "codex".to_owned(),
+        path: None,
+        version: None,
+    }];
+    let lingering = plan::Started {
+        linger: Some(false),
+        ..plan::Started::default()
+    };
+    let warnings = after_start_warnings(&checked, &lingering, &harnesses);
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("--adapter codex, but no codex"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[1].contains("loginctl enable-linger` on me@box"),
+        "{warnings:?}"
+    );
+    assert!(after_start_warnings(&checked, &plan::Started::default(), &[]).is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_mint_answer_naming_no_listener_is_refused() -> Outcome {
+    let checked = checked(&parsed(&["g", "me@box"])?)?;
+    let answer = horde_proto::v1::MintEnrollmentCodeResponse {
+        enrollment_port: 0,
+        ..horde_proto::v1::MintEnrollmentCodeResponse::default()
+    };
+    let mut warnings = Vec::new();
+    let refused = dialable_token("https://horde.lan:7777", &answer, &checked, &mut warnings)
+        .expect_err("no port, no token");
+    assert_eq!(
+        message(&refused),
+        "worker add: the server's mint answer named no enrollment listener"
+    );
+    assert!(warnings.is_empty());
     Ok(())
 }
 
