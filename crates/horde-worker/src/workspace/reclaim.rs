@@ -273,7 +273,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => status.ok(),
         Err(_) => {
-            terminate(leader, &mut child).await;
+            terminate(&mut child).await;
             for reader in readers.into_iter().flatten() {
                 reader.abort();
             }
@@ -327,19 +327,18 @@ async fn drain(
     tail_text(tail)
 }
 
-/// SIGTERM to the group, a grace for the leader, then SIGKILL to whatever
-/// of the group is left — a member that ignores SIGTERM does not outlive
-/// its leader — then the reap. On Windows the job is terminated at once: a
-/// console-less command has no SIGTERM.
-async fn terminate(leader: Option<u32>, tree: &mut ProcessTree) {
-    if leader.is_some() {
-        #[cfg(unix)]
-        {
-            tree.signal(Stop::Terminate);
-            let _ = tokio::time::timeout(KILL_GRACE, tree.wait()).await;
-        }
-        tree.signal(Stop::Kill);
+/// SIGTERM to the group, a grace for the leader, then SIGKILL to the group
+/// whatever the leader did — a member that ignores SIGTERM outlives a
+/// leader that honours it, and still holds the group id — then the reap.
+/// On Windows the job is terminated at once: a console-less command has no
+/// SIGTERM.
+async fn terminate(tree: &mut ProcessTree) {
+    #[cfg(unix)]
+    {
+        tree.signal(Stop::Terminate);
+        let _ = tokio::time::timeout(KILL_GRACE, tree.wait()).await;
     }
+    tree.signal(Stop::Kill);
     let _ = tree.kill_root().await;
 }
 
@@ -1070,7 +1069,8 @@ mod tests {
         );
     }
 
-    /// A group member that ignores SIGTERM does not outlive its leader.
+    /// A group member that ignores SIGTERM does not outlive its leader, and
+    /// a leader that honours SIGTERM at once ends the command promptly.
     #[tokio::test]
     async fn a_member_ignoring_sigterm_is_killed_with_its_group() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1079,7 +1079,13 @@ mod tests {
             "sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 600' & wait",
             marker.display()
         );
+        let started = std::time::Instant::now();
         timed_out_sh(dir.path(), script).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the leader was asked first, not left to the grace: {:?}",
+            started.elapsed()
+        );
         let pid = written_pid_soon(&marker).await;
         let gone = gone_soon(pid).await;
         kill_now(pid);

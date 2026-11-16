@@ -58,11 +58,18 @@ impl FsStats for StatvfsStats {
         {
             let stats = nix::sys::statvfs::statvfs(path).ok()?;
             let fragment = u64::from(stats.fragment_size());
-            let free = u64::from(stats.blocks_available()).saturating_mul(fragment);
-            let total = u64::from(stats.blocks()).saturating_mul(fragment);
-            Some((free, total))
+            Some((
+                blocks_to_bytes(u64::from(stats.blocks_available()), fragment),
+                blocks_to_bytes(u64::from(stats.blocks()), fragment),
+            ))
         }
     }
+}
+
+/// `blocks` of `fragment` bytes each, saturating rather than wrapping.
+#[cfg_attr(windows, allow(dead_code))]
+fn blocks_to_bytes(blocks: u64, fragment: u64) -> u64 {
+    blocks.saturating_mul(fragment)
 }
 
 /// What a spawn asks of its checkout.

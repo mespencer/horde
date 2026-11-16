@@ -471,6 +471,7 @@ pub fn forwarded_hangups() -> std::io::Result<tokio::sync::mpsc::Receiver<()>> {
     #[cfg(unix)]
     {
         let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        // #[gamma::skip(literal.int_increment, reason = "the capacity only bounds how many hang-ups wait unread; the forwarder awaits room on every send, so each hang-up is delivered, in order, at capacity 1 or 2 alike")]
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             while signal.recv().await.is_some() {
@@ -1865,11 +1866,15 @@ mod tests {
             .await
             .expect("the server starts");
         // Raised, not sent: `send_hangup` refuses its own process by design.
-        nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).expect("a hang-up to ourselves");
-        tokio::time::timeout(std::time::Duration::from_secs(10), hangups.recv())
-            .await
-            .expect("the hang-up arrives within the ceiling")
-            .expect("the channel is open");
+        // Every hang-up is forwarded, not only the first: each is a re-mint.
+        for _ in 0..2 {
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP)
+                .expect("a hang-up to ourselves");
+            tokio::time::timeout(std::time::Duration::from_secs(10), hangups.recv())
+                .await
+                .expect("the hang-up arrives within the ceiling")
+                .expect("the channel is open");
+        }
 
         let refused = super::serve_with_hangups(&config)
             .await

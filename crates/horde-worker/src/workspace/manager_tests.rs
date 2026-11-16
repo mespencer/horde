@@ -81,6 +81,13 @@ impl FsStats for FixedStats {
 }
 
 #[test]
+fn blocks_count_as_their_fragment_size_and_saturate() {
+    assert_eq!(super::blocks_to_bytes(3, 4096), 12_288);
+    assert_eq!(super::blocks_to_bytes(0, 4096), 0);
+    assert_eq!(super::blocks_to_bytes(u64::MAX, 2), u64::MAX);
+}
+
+#[test]
 fn statvfs_reports_the_real_filesystem() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (free, total) = StatvfsStats

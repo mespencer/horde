@@ -162,13 +162,10 @@ impl HarnessProfile {
     pub fn secret_file(&self, prefix: &str, contents: &[u8]) -> Result<SecretFile, String> {
         let run = self.root.join(RUN_DIR);
         owner_only_dir(&run)?;
+        // tempfile creates its files 0600 on Unix: owner-only from the first
+        // byte, with no window for a chmod to close.
         let mut builder = tempfile::Builder::new();
         builder.prefix(prefix).suffix(".json");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(std::fs::Permissions::from_mode(0o600));
-        }
         let mut file = builder.tempfile_in(&run).map_err(|error| {
             format!(
                 "could not create a secret file in {}: {error}",
@@ -412,6 +409,22 @@ mod tests {
             "{\"token\":\"t\"}"
         );
         assert!(path.starts_with(scratch.path().join("run")));
+        let name = path
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with("mcp-") && name.ends_with(".json"),
+            "{name}"
+        );
+
+        // Directories the profile had to create on the way are owner-only
+        // too, not only the run directory itself.
+        let deep = HarnessProfile::new(scratch.path().join("made/on/the-way"));
+        let _deep_secret = deep.secret_file("x-", b"x").expect("written");
+        #[cfg(unix)]
+        assert_eq!(mode(&scratch.path().join("made")), 0o700);
 
         let clone = secret.clone();
         drop(secret);

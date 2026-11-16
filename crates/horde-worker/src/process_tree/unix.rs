@@ -15,10 +15,16 @@ pub(crate) fn signal_spawned_group(leader: u32, signal: Signal) -> bool {
     let Some(pgid) = group_pid(leader) else {
         return false;
     };
-    if pgid == nix::unistd::getpgrp() || pgid == nix::unistd::getpid() {
+    if is_own(pgid, nix::unistd::getpgrp(), nix::unistd::getpid()) {
         return false;
     }
     killpg(pgid, signal).is_ok()
+}
+
+/// Whether `pgid` names the caller's own group, or a group the caller
+/// itself would lead.
+fn is_own(pgid: Pid, own_group: Pid, own_pid: Pid) -> bool {
+    pgid == own_group || pgid == own_pid
 }
 
 /// A pid as nix wants it, refusing the ids that would broadcast: 0 is the
@@ -40,6 +46,21 @@ mod tests {
         assert_eq!(group_pid(1), None);
         assert_eq!(group_pid(u32::MAX), None, "out of pid_t range");
         assert_eq!(group_pid(4242).map(nix::unistd::Pid::as_raw), Some(4242));
+        assert_eq!(
+            group_pid(2).map(nix::unistd::Pid::as_raw),
+            Some(2),
+            "2 is the first id that is only ever one process"
+        );
+    }
+
+    /// Either of the caller's own ids is its own, whether or not it leads
+    /// its group.
+    #[test]
+    fn the_callers_group_and_pid_are_each_its_own() {
+        let pid = nix::unistd::Pid::from_raw;
+        assert!(super::is_own(pid(10), pid(10), pid(20)));
+        assert!(super::is_own(pid(20), pid(10), pid(20)));
+        assert!(!super::is_own(pid(30), pid(10), pid(20)));
     }
 
     /// The Worker's own group and pid are never a spawned tree's group:

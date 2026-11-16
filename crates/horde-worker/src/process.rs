@@ -251,9 +251,14 @@ impl SupervisedHarness {
         let pgid = child.group();
 
         let pipes = child.take_pipes();
-        let stdin = pipes.stdin.ok_or(SupervisorError::MissingPipe("stdin"))?;
-        let stdout = pipes.stdout.ok_or(SupervisorError::MissingPipe("stdout"))?;
-        let stderr_pipe = pipes.stderr.ok_or(SupervisorError::MissingPipe("stderr"))?;
+        // All three were piped above, so none can be missing: the refusal is
+        // for a broken invariant, not a case a harness can bring about.
+        let (Some(stdin), Some(stdout), Some(stderr_pipe)) =
+            (pipes.stdin, pipes.stdout, pipes.stderr)
+        else {
+            // #[gamma::skip(literal, reason = "unreachable: the command pipes stdin, stdout and stderr just above, so the spawned root always exposes all three and this word is never shown")]
+            return Err(SupervisorError::MissingPipe("stdio"));
+        };
 
         let stderr: StderrTail = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
         let sink = Arc::clone(&stderr);
@@ -354,7 +359,8 @@ impl SupervisedHarness {
             // Already reaped, so already swept: nothing of ours is left.
             return Ok(());
         }
-        self.signal_group(Stop::Kill);
+        // The root first; reaping it sweeps the rest of the group, whose
+        // members still hold the id (`after_reap`).
         self.child.kill_root().await?;
         self.after_reap().await;
         Ok(())

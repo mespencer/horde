@@ -437,8 +437,11 @@ fn disk_check(dir: &Path) -> Check {
             .arg("-Pk")
             .arg(dir)
             .output();
+        // A df that complains has not measured: GNU df still prints the
+        // rows it could read beside an error, so its exit status decides.
         let available = output
             .ok()
+            .filter(|out| out.status.success())
             .and_then(|out| available_kib(&String::from_utf8_lossy(&out.stdout)));
         disk_verdict(&label, available)
     }

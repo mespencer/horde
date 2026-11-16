@@ -98,6 +98,22 @@ fn harness_binaries_are_looked_for_on_the_given_path() {
             .is_some_and(|fix| fix.contains("--adapter"))
     );
 
+    // Any execute bit makes a harness — the owner's or another user's —
+    // and a write bit alone does not.
+    for (mode, found) in [(0o100, true), (0o001, true), (0o646, false)] {
+        let dir = tempfile::tempdir().expect("a dir");
+        let candidate = dir.path().join("h");
+        std::fs::write(&candidate, "#!/bin/sh\n").expect("writes");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(mode))
+            .expect("chmods");
+        let path = std::env::join_paths([dir.path()]).expect("a path");
+        assert_eq!(
+            super::on_path("h", Some(&path)).is_some(),
+            found,
+            "mode {mode:o}"
+        );
+    }
+
     let named = harness_checks(&["fake-harness".to_owned()], None);
     assert_eq!(named.len(), 1);
     assert_eq!(named[0].verdict, Verdict::Warn, "no PATH finds nothing");
@@ -129,6 +145,16 @@ fn state_dirs_are_checked_for_permissions_and_disk() {
     assert_eq!(
         checks[0].fix.as_deref(),
         Some(format!("chmod 700 {}", open.display()).as_str())
+    );
+
+    // Search permission for others is still a look inside.
+    let searchable = root.path().join("searchable");
+    std::fs::create_dir(&searchable).expect("mkdir");
+    std::fs::set_permissions(&searchable, std::fs::Permissions::from_mode(0o701)).expect("chmods");
+    let checks = state_dir_checks(&searchable);
+    assert_eq!(
+        (checks[0].verdict, checks[0].detail.as_str()),
+        (Verdict::Warn, "mode 701 lets other users look inside")
     );
 
     let absent = state_dir_checks(&root.path().join("absent"));

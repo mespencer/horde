@@ -187,9 +187,29 @@ mod unix_tests {
         let mut tree = ProcessTree::spawn(command).expect("sleep spawns");
         let pid = tree.id().expect("a live root");
         let shown = format!("{tree:?}");
-        assert!(shown.starts_with("ProcessTree"), "{shown}");
-        assert!(shown.contains(&pid.to_string()), "{shown}");
+        assert_eq!(shown, format!("ProcessTree {{ id: Some({pid}), .. }}"));
         tree.kill_root().await.expect("kills");
+    }
+
+    /// A tree dropped without a stop still loses its root.
+    #[tokio::test]
+    async fn dropping_the_tree_kills_its_root() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("600");
+        let tree = ProcessTree::spawn(command).expect("sleep spawns");
+        let pid = tree.id().expect("a live root");
+        drop(tree);
+        let stat = format!("/proc/{pid}/stat");
+        for _ in 0..100 {
+            // Gone, or a zombie awaiting the runtime's reap.
+            let running = std::fs::read_to_string(&stat)
+                .is_ok_and(|text| text.split_whitespace().nth(2) != Some("Z"));
+            if !running {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the root {pid} outlived its dropped tree");
     }
 }
 

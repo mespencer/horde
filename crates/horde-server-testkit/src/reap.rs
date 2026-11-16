@@ -197,9 +197,11 @@ pub fn target_root(test_executable: &Path) -> Option<PathBuf> {
     root.parent().map(Path::to_path_buf)
 }
 
+/// Set once this test process has swept.
+static SWEPT: OnceLock<()> = OnceLock::new();
+
 /// Sweeps this target directory's orphaned products, once per test process.
 pub fn reap_orphans_once() {
-    static SWEPT: OnceLock<()> = OnceLock::new();
     SWEPT.get_or_init(|| {
         if let Some(root) = std::env::current_exe()
             .ok()
@@ -209,6 +211,12 @@ pub fn reap_orphans_once() {
             reap_orphans(&root, PRODUCTS);
         }
     });
+}
+
+/// Whether this test process has swept its orphans yet.
+#[must_use]
+pub fn swept() -> bool {
+    SWEPT.get().is_some()
 }
 
 #[cfg(test)]
