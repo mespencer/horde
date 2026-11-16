@@ -202,8 +202,7 @@ where
 
         follow.reopen_if_asked(&mut app);
     }
-    // Dropping the follow stops its pump.
-    drop(follow);
+    // Leaving drops the follow, which stops its pump.
 
     Ok((terminal, app))
 }
@@ -356,6 +355,7 @@ async fn execute_refresh(
             refresh_sessions(client, app).await?;
             return Ok(None);
         }
+        // #[gamma::skip(option.none_to_some, reason = "the server reads an empty session id as no filter, so the mutant lists every session's forwards exactly as `None` does")]
         Directive::RefreshForwards => Update::Forwards(client.list_forwards(None).await?),
         Directive::RefreshWorkers => Update::Workers(client.list_workers().await?),
         Directive::RefreshWorkspaces => Update::Workspaces(workspaces(client).await?),
@@ -485,10 +485,9 @@ async fn usage(
 /// The server's newest log records as `horde logs server` prints them —
 /// as many as it shows by default, redacted by the server — newest first.
 async fn server_logs(client: &mut Client) -> Result<Vec<String>, ClientError> {
-    let args = crate::logs::LogsArgs {
-        n: horde_observe::reader::DEFAULT_TAIL,
-        ..crate::logs::LogsArgs::default()
-    };
+    // A tail of zero asks for the reader's default, the 200 records
+    // `horde logs` shows.
+    let args = crate::logs::LogsArgs::default();
     let mut printed = Vec::new();
     crate::logs::run_remote(
         client,
@@ -910,6 +909,14 @@ mod tests {
                 agent_id: root.clone(),
                 text: "four".to_owned(),
             },
+            Directive::SendNow {
+                agent_id: root.clone(),
+                text: "five".to_owned(),
+            },
+            Directive::SendNow {
+                agent_id: root.clone(),
+                text: "six".to_owned(),
+            },
             Directive::Archive {
                 session_id: session_id.clone(),
             },
@@ -919,7 +926,15 @@ mod tests {
                 .expect("the server takes it");
         }
         let log = logged(&mut client, &session_id).await;
-        for text in ["one", "two", "three", "four", "archived from the TUI"] {
+        for text in [
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "archived from the TUI",
+        ] {
             assert!(
                 log.iter().any(|kind| kind.contains(&format!("\"{text}\""))),
                 "{text} is on the log: {log:#?}"
