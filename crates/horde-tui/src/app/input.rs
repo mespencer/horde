@@ -63,13 +63,25 @@ impl App {
             Intent::ToggleDetails => self.details = !self.details,
             Intent::ScrollUp => self.scroll = (self.scroll + PAGE).min(self.scroll_ceiling()),
             Intent::ScrollDown => self.scroll = self.scroll.saturating_sub(PAGE),
-            Intent::ScrollEnd => self.scroll = 0,
+            Intent::ScrollEnd => self.scroll_to_end(),
             Intent::Interrupt => return self.interrupt(),
             Intent::Escape => return self.escape(),
             Intent::Prompt(key) => return self.prompt_key(key),
             other => return self.act_compose_or_list(other),
         }
         Vec::new()
+    }
+
+    /// Back to the newest rows.
+    fn scroll_to_end(&mut self) {
+        // #[gamma::skip(assign_value.default, reason = "`usize::default()` is `0`, the value assigned")]
+        self.scroll = 0;
+    }
+
+    /// Closes the command menu's highlight back onto its first row.
+    fn reset_menu(&mut self) {
+        // #[gamma::skip(assign_value.default, reason = "`usize::default()` is `0`, the value assigned")]
+        self.menu = 0;
     }
 
     fn act_compose_or_list(&mut self, intent: Intent) -> Vec<Directive> {
@@ -118,6 +130,7 @@ impl App {
             self.previous = self.screen;
         }
         self.screen = screen;
+        // #[gamma::skip(assign_value.default, reason = "`bool::default()` is `false`, the value assigned")]
         self.inbox_card = false;
         self.entering(screen)
     }
@@ -152,6 +165,7 @@ impl App {
         match self.screen {
             Screen::Session => self.session_escape(),
             Screen::Inbox if self.inbox_card => {
+                // #[gamma::skip(assign_value.default, reason = "`bool::default()` is `false`, the value assigned")]
                 self.inbox_card = false;
                 Vec::new()
             }
@@ -205,14 +219,14 @@ impl App {
         if let Some(command) = completions.get(self.menu.min(completions.len().saturating_sub(1))) {
             let space = if command.args.is_empty() { "" } else { " " };
             self.compose.set_text(&format!("/{}{space}", command.name));
-            self.menu = 0;
+            self.reset_menu();
             return;
         }
-        if self.prompt_focused() {
-            self.compose_focus_for = self.front_prompt().map(|front| front.request_id);
-        } else {
-            self.compose_focus_for = None;
-        }
+        // Focus flips: off a focused prompt onto the compose box, and back.
+        self.compose_focus_for = self
+            .front_prompt()
+            .filter(|_| self.prompt_focused())
+            .map(|front| front.request_id);
     }
 
     fn edit(&mut self, edit: Edit) {
@@ -237,7 +251,7 @@ impl App {
             Edit::DeleteWord => self.compose.delete_word(),
             Edit::DeleteToLineStart => self.compose.delete_to_line_start(),
         }
-        self.menu = 0;
+        self.reset_menu();
     }
 
     /// `?` on an empty compose box opens help, the way Claude Code's does;
@@ -247,7 +261,7 @@ impl App {
             return self.goto(Screen::Help);
         }
         self.compose.insert_char(c);
-        self.menu = 0;
+        self.reset_menu();
         Vec::new()
     }
 
@@ -276,7 +290,7 @@ impl App {
             self.report_error("the session has no root agent to send to yet");
             return Vec::new();
         };
-        self.scroll = 0;
+        self.scroll_to_end();
         vec![directive(agent_id, self.compose.take())]
     }
 
@@ -291,13 +305,13 @@ impl App {
                 // A partly typed command that needs an argument completes
                 // and waits for it rather than refusing.
                 self.compose.set_text(&format!("/{} ", command.name));
-                self.menu = 0;
+                self.reset_menu();
                 return Vec::new();
             }
             Some(command) => format!("/{}", command.name),
             None => text.to_owned(),
         };
-        self.menu = 0;
+        self.reset_menu();
         match slash::parse(&line) {
             Ok(command) => {
                 self.compose.take();
@@ -432,7 +446,8 @@ impl App {
             Screen::Overview => self.tree_rows().len(),
             Screen::Inbox => self.inbox_entries().len(),
             Screen::Forwards => self.forwards.len(),
-            Screen::Workspaces => self.workspaces.as_ref().map_or(0, Vec::len),
+            Screen::Workspaces => self.workspaces.iter().flatten().count(),
+            // #[gamma::skip(literal.int_increment, reason = "`step` clamps to `len - 1` saturating, so a length of 0 or 1 both keep the selection at 0; the other screens have nothing to select")]
             _ => 0,
         }
     }
@@ -509,7 +524,9 @@ impl App {
     fn decide(&mut self, request: &PendingPermission, decision: Decision) -> Vec<Directive> {
         let request_id = request.request_id.clone();
         self.submitted.insert(request_id.clone());
+        // #[gamma::skip(assign_value.default, reason = "`Option::default()` is `None`, the value assigned")]
         self.cursor = None;
+        // #[gamma::skip(assign_value.default, reason = "`bool::default()` is `false`, the value assigned")]
         self.inbox_card = false;
         vec![match decision {
             Decision::Allow { remember } => Directive::Approve {

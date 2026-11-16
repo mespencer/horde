@@ -246,7 +246,11 @@ impl App {
             menu: 0,
             details: false,
             scroll: 0,
-            viewport: (80, 24),
+            viewport: (
+                80,
+                // #[gamma::skip(literal.int_increment, reason = "the height is read only halved, by the scroll ceiling, and 24 and 25 halve alike")]
+                24,
+            ),
             selected: BTreeMap::new(),
             forwards: Vec::new(),
             workers: Vec::new(),
@@ -269,6 +273,7 @@ impl App {
     pub fn attached(session_id: impl Into<String>, agent_id: Option<String>) -> Self {
         let session_id = session_id.into();
         let mut app = Self::overview();
+        // #[gamma::skip(assign_value.default, reason = "`bool::default()` is `false`, the value assigned")]
         app.replay_all = false;
         app.sessions
             .insert(session_id.clone(), SessionState::new(session_id.clone()));
@@ -280,7 +285,6 @@ impl App {
         app.attachment = Some(attachment.clone());
         app.launched_scope = Some(attachment);
         app.screen = Screen::Session;
-        app.previous = Screen::Session;
         app
     }
 
@@ -448,15 +452,12 @@ impl App {
     /// already been folded — a reopened stream never re-delivers history.
     #[must_use]
     pub fn replay_cursors(&self) -> Vec<(String, u64)> {
-        self.replayed
-            .iter()
-            .map(|session_id| {
-                let folded = self
-                    .sessions
-                    .get(session_id)
-                    .map_or(0, |session| session.stream_head);
-                (session_id.clone(), folded + 1)
-            })
+        // Every replayed session is a known one: it is marked replayed only
+        // as it is listed, created or attached.
+        self.sessions
+            .values()
+            .filter(|session| self.replayed.contains(&session.session_id))
+            .map(|session| (session.session_id.clone(), session.stream_head + 1))
             .collect()
     }
 
@@ -735,9 +736,10 @@ impl App {
             agent_id,
         });
         self.screen = Screen::Session;
-        self.previous = Screen::Session;
         self.scroll = 0;
+        // #[gamma::skip(assign_value.default, reason = "`Option::default()` is `None`, the value assigned")]
         self.cursor = None;
+        // #[gamma::skip(assign_value.default, reason = "`Option::default()` is `None`, the value assigned")]
         self.compose_focus_for = None;
     }
 
@@ -776,11 +778,9 @@ fn push_subtree(rows: &mut Vec<TreeRow>, session: &SessionState, agent_id: &str,
         agent_id: agent_id.to_owned(),
         depth,
     });
-    // Counted ceiling, as in `in_subtree`: a malformed parent chain could
-    // cycle, and no real tree is deeper than it has agents.
-    if depth >= session.agents.len() {
-        return;
-    }
+    // No ceiling is needed: the walk starts at a parentless agent and moves
+    // to children, and an agent on a parent cycle is nobody's descendant
+    // from there (each agent has one parent, which the cycle holds).
     let children = session
         .agents
         .iter()

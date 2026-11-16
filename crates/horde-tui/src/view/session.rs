@@ -166,11 +166,13 @@ fn cursor_position(app: &App, area: Rect) -> Position {
         .map(|line| line.chars().count() / width + 1)
         .sum();
     let visual_row = (above + col / width).min(COMPOSE_MAX_ROWS - 1);
+    // #[gamma::skip(literal.int_increment, reason = "`col % width` is below `width`, which came from a u16, so the conversion cannot fail and its fallback is never read")]
+    let column = u16::try_from(col % width).unwrap_or(0);
+    // #[gamma::skip(literal.int_increment, reason = "`visual_row` is at most `COMPOSE_MAX_ROWS - 1`, so the conversion cannot fail and its fallback is never read")]
+    let line = u16::try_from(visual_row).unwrap_or(0);
     Position {
-        // #[gamma::skip(literal.int_increment, reason = "`col % width` is below `width`, which came from a u16, so the conversion cannot fail and its fallback is never read")]
-        x: area.x + 3 + u16::try_from(col % width).unwrap_or(0),
-        // #[gamma::skip(literal.int_increment, reason = "`visual_row` is at most `COMPOSE_MAX_ROWS - 1`, so the conversion cannot fail and its fallback is never read")]
-        y: area.y + 1 + u16::try_from(visual_row).unwrap_or(0),
+        x: area.x + 3 + column,
+        y: area.y + 1 + line,
     }
 }
 

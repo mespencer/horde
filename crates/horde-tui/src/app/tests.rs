@@ -443,9 +443,9 @@ fn attach_by_name_finds_agents_then_sessions_and_refuses_ambiguity() {
 
     app.run(Slash::Attach(Some("docs-work".to_owned())));
     assert_eq!(
-        app.attachment().map(|a| a.session_id.as_str()),
-        Some("s2-abc"),
-        "a slug names a session"
+        attached_to(&app),
+        Some(("s2-abc", None)),
+        "a slug names a session, attached at its root"
     );
     assert!(
         app.take_resubscribe(),
@@ -1225,4 +1225,239 @@ fn the_workspaces_list_moves_its_selection() {
     assert_eq!(app.selected(Screen::Workspaces), 1);
     press(&mut app, KeyCode::Down);
     assert_eq!(app.selected(Screen::Workspaces), 1, "clamped to the last");
+}
+
+// -- Menus, focus and attachment, pinned at their edges -----------------------
+
+/// Presses down `times` times.
+fn downs(app: &mut App, times: usize) {
+    for _ in 0..times {
+        press(app, KeyCode::Down);
+    }
+}
+
+/// A highlight pushed past the menu's end stays on its last row, for tab
+/// and for enter alike; either leaves the highlight back at the top.
+#[test]
+fn a_highlight_past_the_menu_end_acts_on_the_last_command() {
+    let mut app = attached();
+    chars(&mut app, "/a");
+    downs(&mut app, 5);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.input(), "/archive ", "/a: attach, agents, archive");
+    assert_eq!(app.menu(), 0);
+
+    app.on_input(&ctrl('u'));
+    chars(&mut app, "/no");
+    downs(&mut app, 5);
+    assert!(press(&mut app, KeyCode::Enter).is_empty());
+    assert_eq!(app.input(), "/note ", "/no: now, note");
+    assert_eq!(app.menu(), 0);
+}
+
+/// Running a highlighted command, editing the text and typing all put the
+/// highlight back on the first row.
+#[test]
+fn running_editing_or_typing_resets_the_highlight() {
+    let mut app = attached();
+    chars(&mut app, "/a");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen(), Screen::Overview, "/agents ran");
+    assert_eq!(app.menu(), 0);
+
+    let mut app = attached();
+    chars(&mut app, "/a");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.menu(), 0, "an edit");
+
+    let mut app = attached();
+    chars(&mut app, "/");
+    press(&mut app, KeyCode::Down);
+    chars(&mut app, "a");
+    assert_eq!(app.menu(), 0, "a typed character");
+}
+
+/// A fresh app's highlight is on the first row: pasted text runs the
+/// first completion.
+#[test]
+fn a_fresh_menu_highlights_its_first_row() {
+    let mut app = attached();
+    app.on_input(&TermEvent::Paste("/n".to_owned()));
+    assert_eq!(
+        press(&mut app, KeyCode::Enter),
+        vec![Directive::NewSession { title: None }],
+        "/n: new, now, note"
+    );
+    assert!(!App::overview().inbox_card(), "and no inbox card is open");
+}
+
+/// Going to the screen already shown keeps where Esc goes back to, and
+/// closes an open inbox card.
+#[test]
+fn going_to_the_current_screen_keeps_the_way_back() {
+    use crate::keys::Intent;
+    let mut app = attached();
+    app.act(Intent::Goto(Screen::Overview));
+    app.act(Intent::Goto(Screen::Inbox));
+    app.act(Intent::Goto(Screen::Inbox));
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen(), Screen::Overview);
+
+    let mut app = two_sessions();
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.inbox_card());
+    app.act(Intent::Goto(Screen::Inbox));
+    assert!(!app.inbox_card());
+}
+
+/// A message with nobody to send it to is refused in words.
+#[test]
+fn a_note_with_no_root_is_refused_in_the_status_line() {
+    let mut app = App::attached("s9", None);
+    assert!(
+        app.run(crate::slash::Slash::Note("fyi".to_owned()))
+            .is_empty()
+    );
+    assert_eq!(app.status(), "the session has no root agent to send to yet");
+}
+
+/// Sending returns the transcript to its newest rows.
+#[test]
+fn sending_scrolls_back_to_the_end() {
+    let mut app = attached();
+    for sequence in 3..40 {
+        event(
+            &mut app,
+            "s1",
+            sequence,
+            "root-1",
+            chunk(AgentOutputChannel::Assistant, &format!("t{sequence}"), "x"),
+        );
+    }
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.scroll(), 10);
+    chars(&mut app, "go");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.scroll(), 0);
+}
+
+/// Before any resize the scroll ceiling is judged at 80 columns: one reply
+/// that fills 78 cells and one a cell wider, which wraps.
+#[test]
+fn the_first_scroll_ceiling_is_judged_at_eighty_columns() {
+    let mut app = attached();
+    let mut texts = vec!["x".repeat(78), "y".repeat(79)];
+    texts.extend((0..30).map(|_| "z".to_owned()));
+    for (offset, text) in texts.iter().enumerate() {
+        let sequence = 3 + offset as u64;
+        event(
+            &mut app,
+            "s1",
+            sequence,
+            "root-1",
+            chunk(AgentOutputChannel::Assistant, &format!("t{sequence}"), text),
+        );
+    }
+    for _ in 0..10 {
+        press(&mut app, KeyCode::PageUp);
+    }
+    assert_eq!(
+        app.scroll(),
+        33 + 1 + 32 - 12,
+        "33 blocks, one wrapped, 32 gaps, less half of 24 rows"
+    );
+}
+
+/// The inbox answers its last entry when the list shrinks under the
+/// selection.
+#[test]
+fn a_shrunken_inbox_answers_its_last_entry() {
+    let mut app = two_sessions();
+    event(&mut app, "s1", 2, "root-1", requested("req-0", "ls"));
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Down);
+    event(
+        &mut app,
+        "s2",
+        3,
+        "root-2",
+        decided("req-1", PermissionOutcome::Allow, ""),
+    );
+    assert_eq!(chars(&mut app, "y"), approve("req-0", false));
+}
+
+/// Attaching starts the card afresh: focus back on it, its cursor dropped.
+#[test]
+fn attaching_gives_the_card_back_its_focus_and_a_fresh_cursor() {
+    use crate::slash::Slash;
+    let mut app = attached();
+    event(&mut app, "s1", 3, "root-1", requested("req-1", "rm x"));
+    press(&mut app, KeyCode::Down);
+    assert!(app.cursor().is_some());
+    press(&mut app, KeyCode::Tab);
+    assert!(!app.prompt_focused());
+    app.run(Slash::Attach(Some("ci-fix".to_owned())));
+    assert!(app.prompt_focused());
+    assert_eq!(app.cursor(), None);
+    assert!(
+        !app.take_resubscribe(),
+        "an already replayed session needs no new stream"
+    );
+}
+
+/// A request that arrived without an id still takes focus, on a fresh
+/// attachment and after attaching from the tree.
+#[test]
+fn a_request_without_an_id_still_takes_focus() {
+    let idless = || {
+        let mut request = requested("x", "rm x");
+        if let Kind::PermissionRequested(requested) = &mut request
+            && let Some(inner) = requested.request.as_mut()
+        {
+            inner.request_id = None;
+        }
+        request
+    };
+    let mut app = attached();
+    event(&mut app, "s1", 3, "root-1", idless());
+    assert!(app.prompt_focused());
+
+    let mut app = App::overview();
+    app.apply(Update::SessionCreated {
+        session_id: "s9".to_owned(),
+    });
+    event(&mut app, "s9", 1, "root-9", spawned(None, &["new"]));
+    event(&mut app, "s9", 2, "root-9", idless());
+    assert!(app.prompt_focused());
+}
+
+/// A created session is known and attached at its root.
+#[test]
+fn a_created_session_is_known_and_attached_at_its_root() {
+    let mut app = App::overview();
+    app.apply(Update::SessionCreated {
+        session_id: "s9".to_owned(),
+    });
+    assert!(app.session("s9").is_some());
+    assert_eq!(attached_to(&app), Some(("s9", None)));
+    assert_eq!(app.replay_cursors(), vec![("s9".to_owned(), 1)]);
+}
+
+/// A list shrinking by one under its last row selects the new last row.
+#[test]
+fn a_list_shrinking_by_one_selects_its_new_last_row() {
+    let mut app = App::overview();
+    let forwards = |count: usize| {
+        (0..count)
+            .map(|_| horde_proto::v1::ForwardStatus::default())
+            .collect::<Vec<_>>()
+    };
+    app.apply(Update::Forwards(forwards(3)));
+    press(&mut app, KeyCode::Char('f'));
+    downs(&mut app, 2);
+    app.apply(Update::Forwards(forwards(2)));
+    assert_eq!(app.selected(Screen::Forwards), 1);
 }

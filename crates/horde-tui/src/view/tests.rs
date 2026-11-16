@@ -1384,3 +1384,30 @@ fn a_checkout_is_marked_only_when_dirty() {
         "        messy          01234567  dirty  /w/messy"
     );
 }
+
+/// At 60 columns an inbox row has 38 cells for its summary: one that fills
+/// them shows whole, one a cell longer is clipped.
+#[test]
+fn an_inbox_summary_clips_at_the_row_width() {
+    let mut app = App::overview();
+    app.apply(Update::Sessions(vec![summary("s1", "ci-fix", "root-1")]));
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![
+            spawned(None, &["ci-fix"]),
+            requested("req-1", &"a".repeat(21)),
+            requested("req-2", &"b".repeat(22)),
+        ],
+    );
+    press(&mut app, KeyCode::Char('i'));
+    let screen = rows_at(&app, 60, 12);
+    assert_eq!(
+        screen[2..4],
+        [
+            format!("❯ ci-fix             reviewer wants `{}`", "a".repeat(21)),
+            format!("  ci-fix             reviewer wants `{}…", "b".repeat(21)),
+        ]
+    );
+}
