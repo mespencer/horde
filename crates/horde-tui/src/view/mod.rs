@@ -7,7 +7,7 @@
 //! layout and every word.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -30,18 +30,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
 
 /// The frame every non-session screen shares: tabs, body, hints, status.
 fn render_list_screen(app: &App, frame: &mut Frame<'_>, screen: Screen) {
-    let areas = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-    frame.render_widget(Paragraph::new(tabs(app, screen)), areas[0]);
-    let (body, hints) = match screen {
-        Screen::Overview => lists::overview(app, areas[2]),
-        Screen::Inbox => lists::inbox(app, areas[2]),
+    let (above, body, below) = split(frame.area(), &[1, 1], &[1, 1]);
+    frame.render_widget(Paragraph::new(tabs(app, screen)), above[0]);
+    // Every row is the frame's full width; only the heights differ.
+    let width = frame.area().width;
+    let (lines, hints) = match screen {
+        Screen::Overview => lists::overview(app, width),
+        Screen::Inbox => lists::inbox(app, width),
         Screen::Forwards => lists::forwards(app),
         Screen::Workspaces => panels::workspaces(app),
         Screen::Usage => panels::usage(app),
@@ -49,11 +44,39 @@ fn render_list_screen(app: &App, frame: &mut Frame<'_>, screen: Screen) {
         _ => panels::help(),
     };
     frame.render_widget(
-        Paragraph::new(scrolled(body, app.selected(screen), areas[2])),
-        areas[2],
+        Paragraph::new(scrolled(lines, app.selected(screen), body)),
+        body,
     );
-    frame.render_widget(Paragraph::new(hint_line(app, hints)), areas[3]);
-    frame.render_widget(Paragraph::new(status_line(app)), areas[4]);
+    frame.render_widget(Paragraph::new(hint_line(app, hints)), below[0]);
+    frame.render_widget(Paragraph::new(status_line(app)), below[1]);
+}
+
+/// A screen's rows: fixed parts above and below one body that takes what
+/// they leave. A frame too short for every fixed part gives them their rows
+/// from the bottom up (the status line first), then from the top down, and
+/// the body whatever remains, possibly nothing. Computed here rather than by
+/// ratatui's solver, which settles conflicting lengths differently from one
+/// run to the next.
+fn split(area: Rect, above: &[u16], below: &[u16]) -> (Vec<Rect>, Rect, Vec<Rect>) {
+    let mut left = area.height;
+    let mut granted = |want: u16| {
+        let got = want.min(left);
+        left -= got;
+        got
+    };
+    let mut below_heights: Vec<u16> = below.iter().rev().map(|&want| granted(want)).collect();
+    below_heights.reverse();
+    let above_heights: Vec<u16> = above.iter().map(|&want| granted(want)).collect();
+    let mut y = area.y;
+    let mut next = |height: u16| {
+        let rect = Rect { y, height, ..area };
+        y += height;
+        rect
+    };
+    let above = above_heights.into_iter().map(&mut next).collect();
+    let body = next(left);
+    let below = below_heights.into_iter().map(&mut next).collect();
+    (above, body, below)
 }
 
 /// Keeps the selected row on screen: the body scrolls once the selection

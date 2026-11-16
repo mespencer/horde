@@ -1,6 +1,5 @@
 //! The list screens: the session/agent tree, the inbox, the forward panel.
 
-use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use super::{card, marker};
@@ -12,7 +11,7 @@ use crate::wrap::{clip, fit};
 
 /// The tree: every session, its agents nested by spawn ancestry, each with
 /// its state (`LOST` included), worker and what waits on it.
-pub(super) fn overview(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static str) {
+pub(super) fn overview(app: &App, width: u16) -> (Vec<Line<'static>>, &'static str) {
     let rows = app.tree_rows();
     let hints = "enter attach · n new session · x archive · r refresh · esc back · q quit";
     if rows.is_empty() {
@@ -24,30 +23,29 @@ pub(super) fn overview(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static s
             hints,
         );
     }
-    let width = usize::from(area.width);
+    let width = usize::from(width);
     let selected = app.selected(Screen::Overview);
+    // Every row comes from a listed session, so none is dropped here.
     let lines = rows
         .iter()
         .enumerate()
-        .map(|(index, row)| tree_line(app, row, index == selected, width))
+        .filter_map(|(index, row)| tree_line(app, row, index == selected, width))
         .collect();
     (lines, hints)
 }
 
-fn tree_line(app: &App, row: &TreeRow, selected: bool, width: usize) -> Line<'static> {
+fn tree_line(app: &App, row: &TreeRow, selected: bool, width: usize) -> Option<Line<'static>> {
     match row {
-        TreeRow::Session { session_id } => app.session(session_id).map_or_else(
-            || Line::raw(""),
-            |session| session_line(app, session, selected),
-        ),
+        TreeRow::Session { session_id } => app
+            .session(session_id)
+            .map(|session| session_line(app, session, selected)),
         TreeRow::Agent {
             session_id,
             agent_id,
             depth,
-        } => app.session(session_id).map_or_else(
-            || Line::raw(""),
-            |session| agent_line(app, session, agent_id, *depth, selected, width),
-        ),
+        } => app
+            .session(session_id)
+            .map(|session| agent_line(app, session, agent_id, *depth, selected, width)),
     }
 }
 
@@ -137,7 +135,7 @@ fn agent_line(
 }
 
 /// The inbox: every prompt waiting anywhere, and the selected one's card.
-pub(super) fn inbox(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static str) {
+pub(super) fn inbox(app: &App, width: u16) -> (Vec<Line<'static>>, &'static str) {
     let entries = app.inbox_entries();
     if entries.is_empty() {
         return (
@@ -146,7 +144,7 @@ pub(super) fn inbox(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static str)
         );
     }
     let selected = app.selected(Screen::Inbox).min(entries.len() - 1);
-    let width = usize::from(area.width);
+    let columns = usize::from(width);
     let mut lines: Vec<Line<'static>> = entries
         .iter()
         .enumerate()
@@ -157,7 +155,7 @@ pub(super) fn inbox(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static str)
                 Span::raw(" "),
                 Span::raw(clip(
                     &prompt_summary(&entry.permission),
-                    width.saturating_sub(22),
+                    columns.saturating_sub(22),
                 )),
             ])
         })
@@ -170,7 +168,7 @@ pub(super) fn inbox(app: &App, area: Rect) -> (Vec<Line<'static>>, &'static str)
         &entry.permission,
         &cursor,
         app.inbox_card(),
-        area.width,
+        width,
     ));
     let hints = if app.inbox_card() {
         "answer in the card · esc back to the list"

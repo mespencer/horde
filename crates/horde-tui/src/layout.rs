@@ -177,12 +177,9 @@ fn notice_lines(rows: &mut Vec<Line<'static>>, tone: Tone, text: &str, width: us
         Tone::Warn => ("⚠ ", theme::warn()),
         Tone::Error => ("✗ ", theme::error()),
     };
-    let style = if tone == Tone::Info {
-        theme::dim()
-    } else {
-        marker.1
-    };
-    marked(rows, marker, text, style, width);
+    // The text wears its marker's colour: dim for information, the tone's
+    // colour for a warning or an error.
+    marked(rows, marker, text, marker.1, width);
 }
 
 /// A paragraph behind a two-cell marker, continuation rows indented to match.
@@ -453,6 +450,202 @@ mod tests {
             text_of(&transcript, false, 10),
             vec!["● one two", "  three", "  four"]
         );
+    }
+
+    fn x(count: usize) -> String {
+        "x".repeat(count)
+    }
+
+    fn tool(name: &str, input: &str, result: Option<&str>) -> Block {
+        Block::Tool {
+            turn: "t".to_owned(),
+            name: name.to_owned(),
+            input: input.to_owned(),
+            result: result.map(str::to_owned),
+        }
+    }
+
+    fn prompt(summary: usize) -> Block {
+        Block::Prompt {
+            request_id: "r".to_owned(),
+            summary: x(summary),
+            settled: None,
+        }
+    }
+
+    fn reported(summary: usize) -> Block {
+        Block::Reported {
+            status: "success",
+            summary: x(summary),
+        }
+    }
+
+    /// At 20 columns a marked paragraph has 18 cells and an indented one 16.
+    /// Each block's text is one cell too long, so it breaks exactly one cell
+    /// from the edge: a row a cell narrower or wider would cut it elsewhere.
+    #[test]
+    fn every_block_breaks_exactly_at_the_edge_of_its_width() {
+        let wide = x(19);
+        let cases: Vec<(Block, bool, Vec<String>)> = vec![
+            (
+                Block::Message {
+                    from: Speaker::Human,
+                    text: wide.clone(),
+                    note: false,
+                },
+                false,
+                vec![format!("› {}", x(18)), "  x".to_owned()],
+            ),
+            (
+                Block::Assistant {
+                    turn: "t".to_owned(),
+                    text: wide.clone(),
+                },
+                false,
+                vec![format!("● {}", x(18)), "  x".to_owned()],
+            ),
+            (
+                Block::Thinking {
+                    turn: "t".to_owned(),
+                    text: wide.clone(),
+                },
+                true,
+                vec![format!("✻ {}", x(18)), "  x".to_owned()],
+            ),
+            // Words move whole, so a prompt and a result take two texts:
+            // one that exactly fills the row, one a cell too long for it.
+            (prompt(7), false, vec![format!("◆ needs you: {}", x(7))]),
+            (
+                prompt(8),
+                false,
+                vec!["◆ needs you:".to_owned(), format!("  {}", x(8))],
+            ),
+            (
+                Block::Child { text: wide.clone() },
+                false,
+                vec![format!("↳ {}", x(18)), "  x".to_owned()],
+            ),
+            (
+                reported(2),
+                false,
+                vec![format!("◼ result success: {}", x(2))],
+            ),
+            (
+                reported(3),
+                false,
+                vec!["◼ result success:".to_owned(), format!("  {}", x(3))],
+            ),
+            (
+                Block::Notice {
+                    tone: Tone::Warn,
+                    text: wide.clone(),
+                },
+                false,
+                vec![format!("⚠ {}", x(18)), "  x".to_owned()],
+            ),
+            (
+                tool(&x(17), "", Some(&x(17))),
+                false,
+                vec![
+                    format!("● {}(", x(17)),
+                    "  )".to_owned(),
+                    format!("  ⎿ {}", x(16)),
+                    "    x".to_owned(),
+                ],
+            ),
+            (
+                tool("T", &x(17), Some("ok")),
+                true,
+                vec![
+                    format!("● T({}", x(16)),
+                    "  x)".to_owned(),
+                    format!("    {}", x(16)),
+                    "    x".to_owned(),
+                    "  ⎿ ok".to_owned(),
+                ],
+            ),
+        ];
+        for (block, details, expected) in cases {
+            let label = format!("{block:?}");
+            assert_eq!(text_of(&of(vec![block]), details, 20), expected, "{label}");
+        }
+    }
+
+    /// Eleven columns leave seven cells under a tool call, one short of
+    /// `running…`, which therefore breaks before its ellipsis.
+    #[test]
+    fn a_running_call_breaks_at_its_indented_width() {
+        assert_eq!(
+            text_of(&of(vec![tool("T", "", None)]), false, 11),
+            vec!["● T()", "    running", "    …"]
+        );
+    }
+
+    /// Below eight columns the transcript lays out as if eight wide: six
+    /// cells behind the marker.
+    #[test]
+    fn a_tiny_terminal_lays_out_at_eight_columns() {
+        let transcript = of(vec![Block::Assistant {
+            turn: "t".to_owned(),
+            text: x(7),
+        }]);
+        for width in [0, 3, 8] {
+            assert_eq!(
+                text_of(&transcript, false, width),
+                vec![format!("● {}", x(6)), "  x".to_owned()],
+                "at {width} columns"
+            );
+        }
+    }
+
+    /// A result's trailing blank lines are dropped, and a single hidden
+    /// line is still counted.
+    #[test]
+    fn a_result_drops_trailing_blanks_and_counts_one_hidden_line() {
+        assert_eq!(
+            text_of(&of(vec![tool("", "", Some("ok\n\n\n"))]), false, 40),
+            vec!["  ⎿ ok"]
+        );
+        assert_eq!(
+            text_of(&of(vec![tool("", "", Some("a\nb\nc\nd"))]), false, 40),
+            vec![
+                "  ⎿ a",
+                "    b",
+                "    c",
+                "    … +1 lines (ctrl-o to expand)"
+            ]
+        );
+    }
+
+    /// A call still running wears a yellow bullet; one with its result, green.
+    #[test]
+    fn a_call_is_yellow_while_running_and_green_when_done() {
+        let bullet = |result: Option<&str>| {
+            transcript_lines(&of(vec![tool("Read", "", result)]), false, 40)[0].spans[0].style
+        };
+        assert_eq!(bullet(None), crate::theme::warn());
+        assert_eq!(bullet(Some("ok")), crate::theme::ok());
+    }
+
+    /// A notice's text wears its marker's colour.
+    #[test]
+    fn a_notice_is_coloured_by_its_tone() {
+        for (tone, style) in [
+            (Tone::Info, crate::theme::dim()),
+            (Tone::Warn, crate::theme::warn()),
+            (Tone::Error, crate::theme::error()),
+        ] {
+            let lines = transcript_lines(
+                &of(vec![Block::Notice {
+                    tone,
+                    text: "n".to_owned(),
+                }]),
+                false,
+                40,
+            );
+            let styles: Vec<_> = lines[0].spans.iter().map(|span| span.style).collect();
+            assert_eq!(styles, vec![style, style], "{tone:?}");
+        }
     }
 
     #[test]

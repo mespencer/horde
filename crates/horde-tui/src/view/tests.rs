@@ -932,3 +932,455 @@ fn the_tree_marks_the_attached_session() {
     assert_eq!(marked.len(), 1, "one session is attached: {screen}");
     assert!(marked[0].contains("docs"), "and it is docs: {screen}");
 }
+
+/// The front prompt's card as text, at `width` columns.
+fn card_at(app: &App, focused: bool, width: u16) -> Vec<String> {
+    let Some(request) = app.front_prompt() else {
+        return Vec::new();
+    };
+    super::card::lines(app, &request, &app.cursor_for(&request), focused, width)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+        .collect()
+}
+
+fn rows(texts: &[&str]) -> Vec<String> {
+    texts.iter().map(|text| (*text).to_owned()).collect()
+}
+
+/// At 30 columns a card's text has 26 cells: the command 24 behind its
+/// indent, the title 25 before its gap. Each text here is one cell too long
+/// for its place, so it breaks or clips exactly there; and a permission's
+/// long choice is clipped instead of breaking the border.
+#[test]
+fn a_permission_card_breaks_and_clips_at_its_inner_width() {
+    let mut app = attached_conversation();
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![requested("req-w", &"r".repeat(25))],
+    );
+    assert_eq!(
+        card_at(&app, true, 30),
+        rows(&[
+            "╭─ Permission · ci-fix > re… ╮",
+            "│ The agent wants to run:    │",
+            "│   rrrrrrrrrrrrrrrrrrrrrrrr │",
+            "│   r                        │",
+            "│ mode manual                │",
+            "│ ❯ 1. Yes                   │",
+            "│   2. Yes, and don't ask a… │",
+            "│   3. No                    │",
+            "╰─ ↑↓ enter · y yes · n no … ╯",
+        ])
+    );
+}
+
+/// The question's twin: the question breaks at 26 cells, an option's label
+/// clips at 20 (room for a checkbox), the free-text row at 24.
+#[test]
+fn a_question_card_breaks_and_clips_at_its_inner_width() {
+    let mut app = attached_conversation();
+    let mut request = asked("q-w", &[(&"q".repeat(26), &[&"a".repeat(18), "b"])]);
+    if let Some(question) = first_question(&mut request) {
+        question.allows_free_text = true;
+    }
+    fold(&mut app, "s1", "root-1", vec![request]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    typed(&mut app, &"t".repeat(18));
+    assert_eq!(
+        card_at(&app, true, 30),
+        rows(&[
+            "╭─ Question 1/1 · root-1 ────╮",
+            "│ qqqqqqqqqqqqqqqqqqqqqqqqqq │",
+            "│ ?                          │",
+            "│   1. aaaaaaaaaaaaaaaa…     │",
+            "│   2. b                     │",
+            "│ ❯ Other: tttttttttttttttt… │",
+            "╰─ ↑↓ enter · space toggle … ╯",
+        ])
+    );
+}
+
+/// Below twelve columns a card keeps eight cells of text, as at twelve.
+#[test]
+fn a_tiny_terminal_keeps_eight_cells_of_card() {
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![requested("req-1", "rm x")]);
+    let at_twelve = card_at(&app, true, 12);
+    assert_eq!(at_twelve[0], "╭─ Permis… ╮");
+    for width in [0, 4, 11] {
+        assert_eq!(card_at(&app, true, width), at_twelve, "at {width} columns");
+    }
+}
+
+/// A focused card's border is magenta; one that stepped aside is dim. The
+/// highlighted choice is cyan, the rest plain.
+#[test]
+fn a_card_colours_its_border_by_focus_and_its_highlighted_choice() {
+    use crate::theme;
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![requested("req-1", "rm x")]);
+    let Some(request) = app.front_prompt() else {
+        panic!("the request is waiting");
+    };
+    let cursor = app.cursor_for(&request);
+    let styles = |focused: bool| {
+        super::card::lines(&app, &request, &cursor, focused, 40)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.style).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let focused = styles(true);
+    assert_eq!(focused[0][0], theme::needs_you());
+    assert_eq!(styles(false)[0][0], theme::dim());
+    // Rows 4 and 5 are the first two choices: border, marker, label.
+    assert_eq!(focused[4][2], theme::selected(), "the highlighted choice");
+    assert_eq!(focused[5][2], theme::PLAIN, "the next choice");
+}
+
+/// The screen's rows at `width`×`height`, trailing blanks trimmed.
+fn rows_at(app: &App, width: u16, height: u16) -> Vec<String> {
+    let terminal = terminal_at(app, width, height);
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The compose box breaks its text at its inner width (76 cells at 80
+/// columns, two of them the gutter's); continuation rows and later lines
+/// sit behind a blank gutter.
+#[test]
+fn the_compose_box_breaks_at_its_inner_width() {
+    let mut app = attached_conversation();
+    typed(&mut app, &"x".repeat(77));
+    alt_enter(&mut app);
+    typed(&mut app, "y");
+    let screen = rows_at(&app, 80, 24);
+    let boxed = |text: &str| format!("│{text:<78}│");
+    assert_eq!(
+        screen[17..22],
+        [
+            format!("╭{}╮", "─".repeat(78)),
+            boxed(&format!("› {}", "x".repeat(76))),
+            boxed("  x"),
+            boxed("  y"),
+            format!("╰{}╯", "─".repeat(78)),
+        ],
+        "{screen:#?}"
+    );
+}
+
+/// On a five-column terminal the box has one cell of text per row.
+#[test]
+fn a_tiny_compose_box_holds_one_character_a_row() {
+    let mut app = attached_conversation();
+    typed(&mut app, "abc");
+    let screen = rows_at(&app, 5, 12);
+    assert_eq!(screen[5..10], ["╭───╮", "│› a│", "│  b│", "│  c│", "╰───╯"]);
+    assert_eq!(
+        cursor_at(&app, 4, 12),
+        (3, 9),
+        "with no room for text, the cursor steps down a row a character"
+    );
+}
+
+/// A transcript row breaks exactly at the terminal's width.
+#[test]
+fn the_transcript_breaks_at_the_terminal_width() {
+    let mut app = attached_conversation();
+    fold(
+        &mut app,
+        "s1",
+        "root-1",
+        vec![chunk(AgentOutputChannel::Assistant, "t9", &"z".repeat(79))],
+    );
+    let screen = rows_at(&app, 80, 24);
+    assert_eq!(
+        screen[16..18],
+        [format!("● {}", "z".repeat(78)), "  z".to_owned()]
+    );
+}
+
+/// A short terminal gives the bottom rows first: six rows hold the status,
+/// the hint, the three-row compose box and one row of transcript; three
+/// hold the status, the hint and the compose box's top border.
+#[test]
+fn a_short_terminal_keeps_the_bottom_rows_first() {
+    let app = attached_conversation();
+    assert_eq!(
+        rows_at(&app, 30, 6),
+        [
+            "↳ spawned reviewer",
+            "╭────────────────────────────╮",
+            "│› message the agent, or / fo│",
+            "╰────────────────────────────╯",
+            " enter send · alt-enter newlin",
+            " ci-fix · ci-fix · claude · op",
+        ]
+    );
+    assert_eq!(
+        rows_at(&app, 30, 3),
+        [
+            "╭────────────────────────────╮",
+            " enter send · alt-enter newlin",
+            " ci-fix · ci-fix · claude · op",
+        ]
+    );
+}
+
+/// Rows are granted bottom-up, then top-down, the body taking the rest,
+/// each part placed under the one before it.
+#[test]
+fn split_grants_the_fixed_rows_and_the_body_the_rest() {
+    use ratatui::layout::Rect;
+    let rect = |y, height| Rect::new(2, y, 10, height);
+    let at = |height| super::split(rect(3, height), &[1, 2], &[2, 1]);
+    assert_eq!(
+        at(10),
+        (
+            vec![rect(3, 1), rect(4, 2)],
+            rect(6, 4),
+            vec![rect(10, 2), rect(12, 1)]
+        )
+    );
+    assert_eq!(
+        at(5),
+        (
+            vec![rect(3, 1), rect(4, 1)],
+            rect(5, 0),
+            vec![rect(5, 2), rect(7, 1)]
+        )
+    );
+    assert_eq!(
+        at(2),
+        (
+            vec![rect(3, 0), rect(3, 0)],
+            rect(3, 0),
+            vec![rect(3, 1), rect(4, 1)]
+        )
+    );
+}
+
+/// With the card focused the compose box is dim and the terminal cursor is
+/// left where it was, outside the box.
+#[test]
+fn a_focused_card_dims_the_compose_box_and_takes_the_cursor_out() {
+    use ratatui::style::Color;
+    let mut app = attached_conversation();
+    fold(&mut app, "s1", "root-1", vec![requested("req-1", "rm x")]);
+    let mut terminal = terminal_at(&app, 80, 24);
+    // The compose box is the last box on the screen, under the card.
+    let corner = |terminal: &Terminal<TestBackend>| {
+        let buffer = terminal.backend().buffer();
+        (0..24)
+            .rev()
+            .map(|y| &buffer[(0, y)])
+            .find(|cell| cell.symbol() == "╭")
+            .map(|cell| cell.fg)
+    };
+    assert_eq!(corner(&terminal), Some(Color::DarkGray));
+    let position = terminal
+        .get_cursor_position()
+        .expect("a TestBackend always reports its cursor");
+    assert_eq!((position.x, position.y), (0, 0), "never moved");
+    press(&mut app, KeyCode::Tab);
+    terminal = terminal_at(&app, 80, 24);
+    assert_eq!(
+        corner(&terminal),
+        Some(Color::Reset),
+        "focused again: plain"
+    );
+}
+
+/// An agent with nothing in its transcript yet invites the first message.
+#[test]
+fn an_agent_with_nothing_said_invites_a_message() {
+    let mut app = App::attached("s1", Some("kid".to_owned()));
+    conversation(&mut app);
+    let screen = rows_at(&app, 80, 24);
+    assert!(
+        screen.contains(&" nothing said yet — type a message below".to_owned()),
+        "{screen:#?}"
+    );
+}
+
+/// The command menu shows eight commands at most, and a highlight moved
+/// past its end stays on its last row.
+#[test]
+fn the_command_menu_shows_eight_and_clamps_its_highlight() {
+    let mut app = attached_conversation();
+    typed(&mut app, "/");
+    assert!(crate::slash::completions("/").len() > 8);
+    let menu = |app: &App| {
+        rows_at(app, 80, 40)
+            .into_iter()
+            .filter(|row| row.starts_with("  /"))
+            .count()
+    };
+    assert_eq!(menu(&app), 8);
+
+    let mut app = attached_conversation();
+    typed(&mut app, "/a");
+    let shown = crate::slash::completions("/a").len();
+    for _ in 0..shown + 2 {
+        press(&mut app, KeyCode::Down);
+    }
+    let styled = styled_at(&app, 80, 24);
+    let highlighted: Vec<&str> = styled
+        .lines()
+        .filter(|row| row.contains("‹Cyan+b›  /"))
+        .collect();
+    assert_eq!(highlighted.len(), 1, "{styled}");
+    let last = crate::slash::completions("/a")[shown - 1].name;
+    assert!(highlighted[0].contains(&format!("/{last}")), "{styled}");
+}
+
+fn cursor_at(app: &App, width: u16, height: u16) -> (u16, u16) {
+    let mut terminal = terminal_at(app, width, height);
+    let position = terminal
+        .get_cursor_position()
+        .expect("a TestBackend always reports its cursor");
+    (position.x, position.y)
+}
+
+/// A list screen on five rows keeps one row of its body; on four, only
+/// its frame.
+#[test]
+fn a_short_list_screen_keeps_its_frame_first() {
+    let tabs = " horde  1:session  2:agents  3:inbox 1  4:workspaces  5:usage";
+    let hint = " enter attach · n new session · x archive · r refresh · esc ba";
+    let status = " not attached · ● live";
+    assert_eq!(
+        rows_at(&tree(), 62, 5),
+        [tabs, "", "❯ ci-fix  s1  active  1 waiting", hint, status]
+    );
+    assert_eq!(rows_at(&tree(), 62, 4), [tabs, "", hint, status]);
+}
+
+/// The list scrolls once the selection passes the body's second-to-last
+/// row, keeping it in view; and names take a third of the width, so at 62
+/// columns a name column is 20 cells.
+#[test]
+fn a_list_scrolls_to_keep_its_selection_in_view() {
+    let mut app = tree();
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(
+        rows_at(&app, 62, 8)[2..6],
+        [
+            "      reviewer         unspecified      gpu-box          1 wai",
+            "  docs  s2  active",
+            "❯   docs               LOST             worker-9",
+            "",
+        ]
+    );
+}
+
+/// The inbox list, card closed, hints at answering from the list.
+#[test]
+fn the_inbox_list_hints_at_answering_from_the_row() {
+    let mut app = tree();
+    press(&mut app, KeyCode::Char('i'));
+    let screen = rows_at(&app, 80, 24);
+    assert_eq!(
+        screen[22],
+        " y allow · n deny · 1-9 answer · enter open · g go to agent · esc back"
+    );
+}
+
+/// A stream that ended without a reason says only that it ended.
+#[test]
+fn a_stream_ended_without_a_reason_says_so() {
+    let mut app = attached_conversation();
+    app.apply(Update::StreamEnded {
+        reason: String::new(),
+    });
+    let screen = rows_at(&app, 80, 24);
+    assert!(
+        screen[23].ends_with(" · ⚠ stream ended"),
+        "{:?}",
+        screen[23]
+    );
+}
+
+/// An account the provider says is exhausted is marked so; one with no
+/// window statement shows its counts alone. An aggregate with no agent
+/// reads as a dash.
+#[test]
+fn usage_marks_an_exhausted_account_and_a_keyless_row() {
+    let mut app = App::overview();
+    let account = |name: &str, exhausted: bool| horde_proto::v1::AccountHeadroom {
+        provider: "claude".to_owned(),
+        account: name.to_owned(),
+        remaining_fraction: exhausted.then_some(0.0),
+        exhausted,
+        ..horde_proto::v1::AccountHeadroom::default()
+    };
+    app.apply(Update::Usage(UsageReport {
+        scope: "every session".to_owned(),
+        by_agent: vec![UsageAggregate::default()],
+        accounts: vec![account("spent", true), account("fresh", false)],
+        ..UsageReport::default()
+    }));
+    press(&mut app, KeyCode::Char('u'));
+    let screen = rows_at(&app, 120, 24);
+    let counts = "in         0  out         0  cache         0";
+    assert_eq!(
+        screen[5],
+        format!("   —                            {counts}")
+    );
+    assert_eq!(
+        screen[11],
+        format!("   claude/spent                 {counts}  0% left  EXHAUSTED")
+    );
+    assert_eq!(
+        screen[12],
+        format!("   claude/fresh                 {counts}")
+    );
+}
+
+/// A clean checkout carries no mark; a dirty one says so.
+#[test]
+fn a_checkout_is_marked_only_when_dirty() {
+    let mut app = App::overview();
+    let checkout = |name: &str, dirty: bool| RepoInstanceReport {
+        repo_name: name.to_owned(),
+        path: format!("/w/{name}"),
+        head_commit_sha: "0123456789".to_owned(),
+        dirty,
+    };
+    app.apply(Update::Workspaces(vec![WorkspaceEntry {
+        definition: WorkspaceDefinition {
+            name: "w".to_owned(),
+            ..WorkspaceDefinition::default()
+        },
+        instances: vec![WorkspaceInstanceReport {
+            state: WorkspaceInstanceState::Ready as i32,
+            repos: vec![checkout("clean", false), checkout("messy", true)],
+            ..WorkspaceInstanceReport::default()
+        }],
+    }]));
+    press(&mut app, KeyCode::Char('w'));
+    let screen = rows_at(&app, 80, 24);
+    assert_eq!(screen[4], "        clean          01234567  /w/clean");
+    assert_eq!(
+        screen[5],
+        "        messy          01234567  dirty  /w/messy"
+    );
+}

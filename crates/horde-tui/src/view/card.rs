@@ -95,7 +95,7 @@ fn permission_body(
     for (index, choice) in PERMISSION_CHOICES.iter().enumerate() {
         body.push(choice_line(
             index == cursor.row(),
-            &format!("{}. {choice}", index + 1),
+            &clip(&format!("{}. {choice}", index + 1), inner.saturating_sub(2)),
             None,
         ));
     }

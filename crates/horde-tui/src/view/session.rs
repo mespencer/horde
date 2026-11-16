@@ -3,11 +3,11 @@
 //! and the hint and status lines.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
-use super::{card, hint_line, status_line};
+use super::{card, hint_line, split, status_line};
 use crate::app::App;
 use crate::slash;
 use crate::theme;
@@ -31,35 +31,36 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     let compose_rows = compose_rows(app, width.saturating_sub(4));
     let working = app.agent_working() && card.is_none();
 
-    let areas = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(u16::from(working)),
-        Constraint::Length(height(card.as_ref().map_or(0, Vec::len))),
-        Constraint::Length(height(compose_rows.len() + 2)),
-        Constraint::Length(height(menu.len())),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let (_, body, areas) = split(
+        area,
+        &[],
+        &[
+            u16::from(working),
+            height(card.as_ref().map_or(0, Vec::len)),
+            height(compose_rows.len() + 2),
+            height(menu.len()),
+            1,
+            1,
+        ],
+    );
 
-    frame.render_widget(Paragraph::new(transcript(app, areas[0])), areas[0]);
-    if working {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("✻ ", theme::warn()),
-                Span::styled("Working… ", theme::warn()),
-                Span::styled("(esc to interrupt)", theme::dim()),
-            ])),
-            areas[1],
-        );
-    }
+    frame.render_widget(Paragraph::new(transcript(app, body)), body);
+    // The spinner's row has no height unless the agent is working.
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("✻ ", theme::warn()),
+            Span::styled("Working… ", theme::warn()),
+            Span::styled("(esc to interrupt)", theme::dim()),
+        ])),
+        areas[0],
+    );
     if let Some(card) = card {
-        frame.render_widget(Paragraph::new(card), areas[2]);
+        frame.render_widget(Paragraph::new(card), areas[1]);
     }
-    render_compose(app, frame, areas[3], &compose_rows);
-    frame.render_widget(Paragraph::new(menu), areas[4]);
-    frame.render_widget(Paragraph::new(hint_line(app, hints(app))), areas[5]);
-    frame.render_widget(Paragraph::new(status_line(app)), areas[6]);
+    render_compose(app, frame, areas[2], &compose_rows);
+    frame.render_widget(Paragraph::new(menu), areas[3]);
+    frame.render_widget(Paragraph::new(hint_line(app, hints(app))), areas[4]);
+    frame.render_widget(Paragraph::new(status_line(app)), areas[5]);
 }
 
 fn height(rows: usize) -> u16 {
@@ -166,7 +167,9 @@ fn cursor_position(app: &App, area: Rect) -> Position {
         .sum();
     let visual_row = (above + col / width).min(COMPOSE_MAX_ROWS - 1);
     Position {
+        // #[gamma::skip(literal.int_increment, reason = "`col % width` is below `width`, which came from a u16, so the conversion cannot fail and its fallback is never read")]
         x: area.x + 3 + u16::try_from(col % width).unwrap_or(0),
+        // #[gamma::skip(literal.int_increment, reason = "`visual_row` is at most `COMPOSE_MAX_ROWS - 1`, so the conversion cannot fail and its fallback is never read")]
         y: area.y + 1 + u16::try_from(visual_row).unwrap_or(0),
     }
 }
@@ -205,5 +208,18 @@ fn hints(app: &App) -> &'static str {
         "enter queue · ctrl-s send now · esc interrupt · ctrl-t agents · ? help"
     } else {
         "enter send · alt-enter newline · / commands · ctrl-t agents · ? help"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::height;
+
+    /// More rows than a terminal has saturate rather than wrap.
+    #[test]
+    fn a_height_past_the_largest_terminal_saturates() {
+        assert_eq!(height(7), 7);
+        assert_eq!(height(usize::from(u16::MAX)), u16::MAX);
+        assert_eq!(height(usize::from(u16::MAX) + 1), u16::MAX);
     }
 }
