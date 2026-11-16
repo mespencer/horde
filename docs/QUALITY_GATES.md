@@ -542,7 +542,8 @@ narrowed run that touched horde-worker failed its baseline on
 found beside the test binary") while the full sweep, which builds everything, passed. So a
 run that selects packages also passes `--test-package` for each of them and for the owner
 of every binary their suites spawn (`SPAWNED_BINARIES`, which a test holds to every
-cross-package `product_binary` call in the tree). Naming a test package replaces gamma's
+cross-package `product_binary` call in the tree), followed through each owner's own suite
+in turn, since an owner that judges needs its own spawns built too. Naming a test package replaces gamma's
 own-package default, so the selected packages are named too; a mutant may then be killed
 by another selected package's suite that reaches it, which only makes the oracle
 stricter.

@@ -510,28 +510,40 @@ pub fn selection(packages: &[String]) -> Vec<String> {
 }
 
 /// A run's package selection: [`selection`], and when that names packages,
-/// the packages whose tests judge the mutants.
-///
-/// Those are the selected packages themselves — gamma's own default, which
-/// naming any test package replaces — and the owners of every binary their
-/// suites spawn ([`SPAWNED_BINARIES`]), so that gamma builds those binaries.
+/// the packages whose tests judge the mutants ([`judges`]).
 pub fn run_selection(packages: &[String]) -> Vec<String> {
     let mut args = selection(packages);
-    let judges: BTreeSet<&str> = packages
-        .iter()
-        .map(String::as_str)
-        .chain(
-            SPAWNED_BINARIES
-                .iter()
-                .filter(|(spawner, ..)| packages.iter().any(|package| package == spawner))
-                .map(|(_, owner, _)| *owner),
-        )
-        .collect();
-    for judge in judges {
+    for judge in judges(packages, SPAWNED_BINARIES) {
         args.push("--test-package".to_owned());
         args.push(judge.to_owned());
     }
     args
+}
+
+/// The packages whose tests judge a run over `packages`, given which
+/// packages' suites spawn which others' binaries (`spawned`).
+///
+/// The selected packages themselves — gamma's own default, which naming any
+/// test package replaces — and the owner of every binary a judge's suite
+/// spawns, so that gamma builds it. That owner judges too, so its own suite's
+/// spawns are followed in turn: horde-cli's suite runs horde-worker, whose
+/// suite reaches the stub MCP server. Each round adds every owner the judges
+/// so far spawn, and no chain is longer than the table, so the table's length
+/// in rounds reaches the whole closure.
+pub fn judges<'a>(
+    packages: &'a [String],
+    spawned: &[(&'a str, &'a str, &str)],
+) -> BTreeSet<&'a str> {
+    let mut judges: BTreeSet<&str> = packages.iter().map(String::as_str).collect();
+    for _ in spawned {
+        let owners: Vec<&str> = spawned
+            .iter()
+            .filter(|(spawner, ..)| judges.contains(spawner))
+            .map(|(_, owner, _)| *owner)
+            .collect();
+        judges.extend(owners);
+    }
+    judges
 }
 
 /// The arguments a listing and a run share, so a listing describes exactly

@@ -499,6 +499,27 @@ fn a_narrowed_run_is_judged_by_its_packages_and_the_owners_of_what_they_spawn() 
     );
 }
 
+#[test]
+fn a_judge_s_own_spawns_are_followed_to_the_end_of_the_chain() {
+    let chain = [
+        ("c", "d", "c's suite runs d"),
+        ("b", "c", "b's suite runs c"),
+        ("a", "b", "a's suite runs b"),
+        ("x", "y", "nothing selected spawns x"),
+    ];
+    let selected = ["a".to_owned()];
+    assert_eq!(
+        judges(&selected, &chain).into_iter().collect::<Vec<_>>(),
+        vec!["a", "b", "c", "d"]
+    );
+    assert_eq!(
+        judges(&["x".to_owned(), "q".to_owned()], &chain)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["q", "x", "y"]
+    );
+}
+
 /// Every `.rs` file under `dir`.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
