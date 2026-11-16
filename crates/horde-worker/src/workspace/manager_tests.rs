@@ -453,6 +453,7 @@ async fn the_shared_policy_is_the_instance_itself() {
             ..PreparedRepo::default()
         }]
     );
+    assert_eq!(prepared.overlay, None, "the shared policy has no overlay");
 
     let lazy = CheckoutRequest {
         mode: CheckoutMode::Lazy,
@@ -478,4 +479,498 @@ async fn the_shared_policy_is_the_instance_itself() {
             .to_string();
         assert!(error.contains("shared policy"), "{error}");
     }
+}
+
+/// The bytes `statvfs` reports agree with `df`'s: the filesystem's size
+/// exactly, and its free space to within half a block per free block —
+/// tight enough that miscounting the block size by one is caught, loose
+/// enough for other writers between the two readings.
+#[test]
+fn statvfs_agrees_with_df() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (free, total) = StatvfsStats.stats(dir.path()).expect("a real filesystem");
+    let output = std::process::Command::new("df")
+        .args(["-B1", "--output=size,avail"])
+        .arg(dir.path())
+        .output()
+        .expect("df runs");
+    assert!(output.status.success(), "df failed");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let numbers: Vec<u64> = text
+        .lines()
+        .nth(1)
+        .expect("df's row")
+        .split_whitespace()
+        .map(|field| field.parse().expect("a byte count"))
+        .collect();
+    let (size, avail) = (numbers[0], numbers[1]);
+    assert_eq!(total, size, "the filesystem's size");
+    let tolerance = avail / 8192;
+    assert!(
+        free.abs_diff(avail) <= tolerance,
+        "free {free} vs df {avail}"
+    );
+}
+
+/// Collects the progress a materialization reports, as `(step, completed,
+/// total)`.
+async fn progress_of(
+    manager: &WorkspaceManager,
+    definition: &WorkspaceDefinition,
+) -> (
+    horde_proto::v1::WorkspaceInstanceReport,
+    Vec<(String, u32, u32)>,
+) {
+    let mut steps = Vec::new();
+    let report = manager
+        .materialize_with(definition, &mut |progress| {
+            steps.push((
+                progress.step,
+                progress.completed_repos,
+                progress.total_repos,
+            ));
+        })
+        .await;
+    (report, steps)
+}
+
+/// A repo directory with no `.git` in it is cloned into, not fetched in;
+/// once cloned it is fetched. Each repo and the unmanaged paths are one
+/// step each, counted.
+#[tokio::test]
+async fn materialization_clones_then_fetches_and_counts_its_steps() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let mut definition = definition("ws-1", dir.path(), &["atlas", "beta"]);
+    definition.unmanaged_paths = vec!["data".to_owned()];
+    std::fs::create_dir_all(dir.path().join("ws/ws-1/atlas")).expect("an empty repo directory");
+    let (first, steps) = progress_of(&manager, &definition).await;
+    assert_eq!(first.detail, "");
+    assert_eq!(
+        first.state,
+        i32::from(horde_proto::v1::WorkspaceInstanceState::Ready)
+    );
+    assert_eq!(
+        steps,
+        vec![
+            ("cloning atlas".to_owned(), 0, 2),
+            ("cloning beta".to_owned(), 1, 2),
+            ("creating unmanaged paths".to_owned(), 2, 2),
+        ]
+    );
+    let (_, again) = progress_of(&manager, &definition).await;
+    assert_eq!(again[0], ("fetching atlas".to_owned(), 0, 2));
+    assert_eq!(again[1], ("fetching beta".to_owned(), 1, 2));
+}
+
+/// A repo with no default branch named is cloned at origin's HEAD.
+#[tokio::test]
+async fn a_repo_with_no_default_branch_clones_origins_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let mut definition = definition("ws-1", dir.path(), &["atlas"]);
+    definition.repos[0].default_branch = String::new();
+    let report = manager.materialize(&definition).await;
+    assert_eq!(report.detail, "");
+    let origin_head = head(Path::new(&definition.repos[0].remote_url));
+    assert_eq!(report.repos[0].head_commit_sha, origin_head);
+}
+
+/// A Definition id that is not a directory name materializes nothing.
+#[tokio::test]
+async fn an_unsafe_definition_id_materializes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let mut definition = definition("ws-1", dir.path(), &["atlas"]);
+    definition.workspace_definition_id =
+        Some(horde_proto::v1::WorkspaceDefinitionId::new("../escape"));
+    let report = manager.materialize(&definition).await;
+    assert_eq!(
+        report.state,
+        i32::from(horde_proto::v1::WorkspaceInstanceState::Degraded)
+    );
+    assert_eq!(
+        report.detail,
+        "definition id \"../escape\" is not a directory name"
+    );
+    assert!(!dir.path().join("escape").exists());
+    assert!(!dir.path().join("ws").exists());
+}
+
+/// An Instance root that cannot be created, or a state file that cannot
+/// be written, degrades the report and says which.
+#[tokio::test]
+async fn what_cannot_be_written_degrades_the_instance() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("ws"), "a file where the root goes").expect("a file");
+    let definition = definition("ws-1", dir.path(), &["atlas"]);
+    let blocked = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let report = blocked.materialize(&definition).await;
+    assert_eq!(
+        report.state,
+        i32::from(horde_proto::v1::WorkspaceInstanceState::Degraded)
+    );
+    assert!(
+        report.detail.starts_with("could not create "),
+        "{}",
+        report.detail
+    );
+
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws2"));
+    std::fs::create_dir_all(dir.path().join("ws2/ws-1").join(super::STATE_FILE))
+        .expect("a directory where the state file goes");
+    let report = manager.materialize(&definition).await;
+    assert_eq!(
+        report.state,
+        i32::from(horde_proto::v1::WorkspaceInstanceState::Degraded)
+    );
+    assert!(
+        report
+            .detail
+            .starts_with("could not write the instance state file: "),
+        "{}",
+        report.detail
+    );
+}
+
+/// Unmanaged paths that would leave the Instance are each refused and
+/// named, the rest are still created, and only the contained ones are
+/// sized.
+#[tokio::test]
+async fn escaping_unmanaged_paths_are_refused_one_by_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let mut definition = definition("ws-1", dir.path(), &["atlas"]);
+    definition.unmanaged_paths = vec![
+        "../escape".to_owned(),
+        "data".to_owned(),
+        "../other".to_owned(),
+        "more".to_owned(),
+    ];
+    let report = manager.materialize(&definition).await;
+    assert_eq!(
+        report.detail,
+        "unmanaged path \"../escape\" is not a relative path inside the instance; \
+         unmanaged path \"../other\" is not a relative path inside the instance"
+    );
+    let ws = dir.path().join("ws");
+    assert!(ws.join("ws-1/data").is_dir() && ws.join("ws-1/more").is_dir());
+    assert!(!ws.join("escape").exists() && !ws.join("other").exists());
+
+    std::fs::create_dir_all(ws.join("escape")).expect("data outside");
+    std::fs::write(ws.join("escape/outside.bin"), [0_u8; 100]).expect("outside");
+    std::fs::write(ws.join("ws-1/data/inside.bin"), [0_u8; 64]).expect("inside");
+    let reports = manager.warm_instances().await;
+    assert_eq!(reports[0].unmanaged_bytes, 64);
+}
+
+/// An unmanaged path that cannot be created is named with the reason.
+#[tokio::test]
+async fn an_unmanaged_path_that_cannot_be_created_is_named() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let mut definition = definition("ws-1", dir.path(), &["atlas"]);
+    manager.materialize(&definition).await;
+    std::fs::write(dir.path().join("ws/ws-1/blocked"), "a file").expect("a file in the way");
+    definition.unmanaged_paths = vec!["blocked/x".to_owned()];
+    let report = manager.materialize(&definition).await;
+    assert!(
+        report
+            .detail
+            .starts_with("could not create unmanaged path blocked/x: "),
+        "{}",
+        report.detail
+    );
+}
+
+/// An Instance repo whose directory lost its `.git` is reported missing,
+/// not probed with git.
+#[tokio::test]
+async fn an_instance_repo_without_git_is_missing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas"]).await;
+    let repo = dir.path().join("ws/ws-1/atlas");
+    std::fs::remove_dir_all(&repo).expect("removed");
+    std::fs::create_dir_all(&repo).expect("an empty directory");
+    let reports = manager.warm_instances().await;
+    assert_eq!(reports[0].detail, "repo atlas is missing from disk");
+}
+
+/// The warm report of an unarchived checkout no live agent claims: an
+/// orphan, named, with its activity, its size, and when it was sized.
+#[tokio::test]
+async fn a_warm_report_describes_each_checkout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas"]).await;
+    manager
+        .checkout_agent(&request("agent-1"), &NoSource)
+        .await
+        .expect("checked out");
+    let record = ledger::read(&manager.agents_dir("ws-1"), "agent-1")
+        .await
+        .expect("the ledger");
+    let reports = manager.warm_instances().await;
+    let report = &reports[0];
+    assert!(report.instance_bytes > 0, "the Instance is sized");
+    let sized_at = report.sized_at.expect("sized now");
+    assert!(sized_at.seconds > 1_700_000_000, "{sized_at:?}");
+    let checkout = &report.checkouts[0];
+    assert_eq!(
+        checkout.agent_id,
+        Some(horde_proto::v1::AgentId::new("agent-1"))
+    );
+    assert_eq!(
+        checkout.state,
+        i32::from(horde_proto::v1::CheckoutState::Orphan)
+    );
+    assert_eq!(
+        checkout.last_active_at,
+        Some(super::timestamp(record.last_active_at_ms))
+    );
+}
+
+/// Records come back in agent order, ledgered and synthesized alike.
+#[tokio::test]
+async fn records_are_in_agent_order_whatever_their_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas"]).await;
+    let agents_dir = manager.agents_dir("ws-1");
+    ledger::write(&agents_dir, &crashed_record("agent-z"))
+        .await
+        .expect("a ledgered record");
+    std::fs::create_dir_all(agents_dir.join("agent-a")).expect("an unledgered directory");
+    let agents: Vec<String> = manager
+        .records("ws-1")
+        .await
+        .into_iter()
+        .map(|record| record.agent_id)
+        .collect();
+    assert_eq!(agents, ["agent-a", "agent-z"]);
+}
+
+/// A synthesized record takes its activity from the directory's
+/// modification time, and is zero when there is no directory to ask.
+#[test]
+fn a_synthesized_record_dates_from_its_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_root = dir.path().join("agent-1");
+    std::fs::create_dir_all(&agent_root).expect("the agent root");
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_234_567_890);
+    std::fs::File::open(&agent_root)
+        .expect("the directory opens")
+        .set_modified(at)
+        .expect("its mtime is set");
+    let definition = WorkspaceDefinition::default();
+    let record = super::synthesized_record(&agent_root, "agent-1", &definition);
+    assert_eq!(record.created_at_ms, 1_234_567_890);
+    assert_eq!(record.last_active_at_ms, 1_234_567_890);
+    let absent = super::synthesized_record(&dir.path().join("gone"), "gone", &definition);
+    assert_eq!(absent.created_at_ms, 0);
+    assert_eq!(absent.last_active_at_ms, 0);
+}
+
+/// A repo whose layout escapes the Instance is never read as part of a
+/// synthesized checkout, nor as making it a fresh clone.
+#[test]
+fn a_synthesized_record_skips_repos_that_cannot_be_laid_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_root = dir.path().join("agent-1");
+    std::fs::create_dir_all(&agent_root).expect("the agent root");
+    let definition = WorkspaceDefinition {
+        repos: vec![WorkspaceRepo {
+            name: "bad".to_owned(),
+            layout_path: "../bad".to_owned(),
+            ..WorkspaceRepo::default()
+        }],
+        ..WorkspaceDefinition::default()
+    };
+    let record = super::synthesized_record(&agent_root, "agent-1", &definition);
+    assert_eq!(record.repos, Vec::<LedgerRepo>::new());
+    assert_eq!(record.policy, ledger::WORKTREE);
+}
+
+/// Adding a repo is activity: it refreshes the checkout's last activity
+/// and undoes an earlier soft reclaim.
+#[tokio::test]
+async fn adding_a_repo_is_activity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas", "beta"]).await;
+    let mut lazy = request("agent-1");
+    lazy.checkout_repos = vec!["atlas".to_owned()];
+    manager
+        .checkout_agent(&lazy, &NoSource)
+        .await
+        .expect("the lazy checkout");
+    let agents_dir = manager.agents_dir("ws-1");
+    let mut record = ledger::read(&agents_dir, "agent-1")
+        .await
+        .expect("the ledger");
+    record.last_active_at_ms = 1;
+    record.soft_reclaimed_at_ms = Some(5);
+    ledger::write(&agents_dir, &record).await.expect("aged");
+    manager
+        .add_repo(
+            "ws-1",
+            "agent-1",
+            "beta",
+            None,
+            FetchPolicy::default(),
+            &NoSource,
+        )
+        .await
+        .expect("beta is added");
+    let after = ledger::read(&agents_dir, "agent-1")
+        .await
+        .expect("the ledger");
+    assert!(after.last_active_at_ms > 1_700_000_000_000, "{after:?}");
+    assert_eq!(after.soft_reclaimed_at_ms, None);
+}
+
+/// A directory the ledger does not know, holding files but no `.git`, is
+/// neither adopted nor cleared: the checkout fails and the files stay.
+#[tokio::test]
+async fn an_unknown_directory_without_git_is_left_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas"]).await;
+    let destination = manager.agents_dir("ws-1").join("agent-1/atlas");
+    std::fs::create_dir_all(&destination).expect("a directory");
+    std::fs::write(destination.join("notes.txt"), "someone's").expect("a file");
+    let failed = manager.checkout_agent(&request("agent-1"), &NoSource).await;
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(
+        std::fs::read_to_string(destination.join("notes.txt")).expect("still there"),
+        "someone's"
+    );
+}
+
+/// A crashed repo, redone, leaves one ledger entry: done, branch created.
+#[tokio::test]
+async fn a_redone_repo_leaves_one_ledger_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, agents_dir) = crashed(dir.path()).await;
+    let prepared = manager
+        .checkout_agent(&request("agent-1"), &NoSource)
+        .await
+        .expect("composed");
+    assert_eq!(
+        prepared.prepared.mode,
+        i32::from(CheckoutMode::All),
+        "an ALL checkout says so"
+    );
+    assert_eq!(prepared.overlay, None);
+    let record = ledger::read(&agents_dir, "agent-1")
+        .await
+        .expect("the ledger");
+    assert_eq!(
+        record.repos,
+        vec![LedgerRepo {
+            name: "atlas".to_owned(),
+            base_commit_sha: prepared.prepared.repos[0].base_commit_sha.clone(),
+            resolution: "fresh".to_owned(),
+            created_branch: true,
+            ..LedgerRepo::default()
+        }]
+    );
+}
+
+/// A checkout that fails after the ledger marked its repo pending leaves
+/// it pending, with no branch claimed as created.
+#[tokio::test]
+async fn a_failed_placement_stays_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas"]).await;
+    let instance_repo = dir.path().join("ws/ws-1/atlas");
+    let holder = dir.path().join("elsewhere");
+    run_git(
+        &instance_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "horde/agent-1",
+            &holder.display().to_string(),
+        ],
+    );
+    let error = manager
+        .checkout_agent(&request("agent-1"), &NoSource)
+        .await
+        .expect_err("the branch is held elsewhere")
+        .to_string();
+    assert!(error.contains("checked out by"), "{error}");
+    let record = ledger::read(&manager.agents_dir("ws-1"), "agent-1")
+        .await
+        .expect("the ledger");
+    assert_eq!(record.repos.len(), 1);
+    assert!(record.repos[0].pending, "{record:?}");
+    assert!(!record.repos[0].created_branch, "{record:?}");
+}
+
+/// A branch already in the Instance, behind its base and held nowhere, is
+/// adopted: the ledger says the branch was not created.
+#[tokio::test]
+async fn an_adopted_branch_is_not_created() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, _) = materialized(dir.path(), &["atlas"]).await;
+    let instance_repo = dir.path().join("ws/ws-1/atlas");
+    run_git(&instance_repo, &["branch", "horde/agent-1"]);
+    manager
+        .checkout_agent(&request("agent-1"), &NoSource)
+        .await
+        .expect("adopted");
+    let record = ledger::read(&manager.agents_dir("ws-1"), "agent-1")
+        .await
+        .expect("the ledger");
+    assert!(!record.repos[0].created_branch, "{record:?}");
+    assert!(!record.repos[0].pending, "{record:?}");
+}
+
+/// A fresh clone starts on its own new branch at a base only the Instance's
+/// remote-tracking refs hold, which the clone fetches first.
+#[tokio::test]
+async fn a_fresh_clone_fetches_a_base_its_clone_lacks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (manager, definition) = materialized(dir.path(), &["atlas"]).await;
+    let origin = PathBuf::from(&definition.repos[0].remote_url);
+    std::fs::write(origin.join("NEW.md"), "new").expect("a change");
+    run_git(&origin, &["add", "."]);
+    run_git(&origin, &["commit", "-qm", "new"]);
+    let latest = head(&origin);
+    let fresh = CheckoutRequest {
+        policy: CheckoutPolicy::FreshClone,
+        ..request("agent-1")
+    };
+    let prepared = manager
+        .checkout_agent(&fresh, &NoSource)
+        .await
+        .expect("cloned");
+    assert_eq!(prepared.prepared.repos[0].base_commit_sha, latest);
+    assert_eq!(head(&prepared.root.join("atlas")), latest);
+    let record = ledger::read(&manager.agents_dir("ws-1"), "agent-1")
+        .await
+        .expect("the ledger");
+    assert!(record.repos[0].created_branch, "{record:?}");
+}
+
+/// Unmanaged paths are linked into a checkout once; a recomposition
+/// leaves the links it finds and restores any that went missing.
+#[tokio::test]
+async fn unmanaged_links_are_kept_and_restored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("w-7", dir.path().join("ws"));
+    let mut definition = definition("ws-1", dir.path(), &["atlas"]);
+    definition.unmanaged_paths = vec!["a".to_owned(), "b".to_owned()];
+    assert_eq!(manager.materialize(&definition).await.detail, "");
+    let first = manager
+        .checkout_agent(&request("agent-1"), &NoSource)
+        .await
+        .expect("composed");
+    let (a, b) = (first.root.join("a"), first.root.join("b"));
+    assert!(a.is_symlink() && b.is_symlink());
+    std::fs::remove_file(&b).expect("one link lost");
+    manager
+        .checkout_agent(&request("agent-1"), &NoSource)
+        .await
+        .expect("recomposed over the existing link");
+    assert!(a.is_symlink() && b.is_symlink(), "both linked again");
 }

@@ -186,6 +186,117 @@ mod tests {
         assert!(answer.is_err(), "{answer:?}");
     }
 
+    /// The environment git runs under, as `run` sets it: an alias that
+    /// prints it.
+    async fn environment_of(run: GitRun) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_with(
+            dir.path(),
+            &["-c", "alias.environment=!env", "environment"],
+            run,
+        )
+        .await
+        .expect("the alias runs")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// A remote invocation can never stop to ask for a credential; a local
+    /// one runs in the caller's environment untouched.
+    #[tokio::test]
+    async fn only_a_remote_run_refuses_to_prompt() {
+        let remote = environment_of(GitRun::remote(Duration::from_secs(30))).await;
+        assert!(
+            remote.iter().any(|line| line == "GIT_TERMINAL_PROMPT=0"),
+            "{remote:?}"
+        );
+        assert!(
+            remote.iter().any(|line| line == "GIT_ASKPASS="),
+            "{remote:?}"
+        );
+        let local = environment_of(GitRun::LOCAL).await;
+        assert!(
+            !local
+                .iter()
+                .any(|line| line == "GIT_TERMINAL_PROMPT=0" || line == "GIT_ASKPASS="),
+            "{local:?}"
+        );
+    }
+
+    /// Whether the process `pid` is still running: gone, or a zombie
+    /// awaiting its reaper, is not.
+    fn running(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        })
+    }
+
+    /// Dropping `invocation` before it finishes kills the git it started:
+    /// the alias records git's pid (its shell's parent) and then outlives
+    /// the drop.
+    async fn git_dies_with_its_future<F>(dir: &Path, invocation: impl FnOnce(String) -> F)
+    where
+        F: std::future::Future,
+    {
+        let pid_file = dir.join("git.pid");
+        let alias = format!(
+            "alias.linger=!echo $PPID > {}; sleep 20",
+            pid_file.display()
+        );
+        let pid = {
+            let invocation = invocation(alias);
+            tokio::pin!(invocation);
+            let mut pid = None;
+            let mut finished = false;
+            for _ in 0..500 {
+                tokio::select! {
+                    _ = &mut invocation => {
+                        finished = true;
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(20)) => {
+                        pid = std::fs::read_to_string(&pid_file)
+                            .ok()
+                            .filter(|pid| pid.ends_with('\n'));
+                        if pid.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(!finished, "the invocation finished before it was dropped");
+            pid.expect("the alias recorded git's pid").trim().to_owned()
+            // The invocation is dropped here, git still running under it.
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(&pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!running(&pid), "git {pid} outlived its dropped future");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_run_kills_its_git() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        git_dies_with_its_future(dir.path(), |alias| async move {
+            git(&cwd, &["-c", &alias, "linger"]).await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_dropped_check_kills_its_git() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        git_dies_with_its_future(dir.path(), |alias| async move {
+            git_check(&cwd, &["-c", &alias, "linger"]).await
+        })
+        .await;
+    }
+
     /// A remote that accepts the connection and never answers: the ceiling
     /// fires, and it reads as a failure naming itself, never as success with
     /// empty output.

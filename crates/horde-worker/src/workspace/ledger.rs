@@ -164,8 +164,14 @@ pub(crate) async fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), St
 /// Milliseconds since the Unix epoch, now.
 #[must_use]
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    unix_ms(std::time::SystemTime::now())
+}
+
+/// Milliseconds since the Unix epoch at `at`: zero for an instant before
+/// the epoch, and the largest count for one past what an `i64` holds.
+#[must_use]
+pub fn unix_ms(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
@@ -257,5 +263,65 @@ mod tests {
     #[test]
     fn now_is_after_the_epoch() {
         assert!(now_ms() > 1_700_000_000_000);
+    }
+
+    /// An instant is counted to the millisecond; one before the epoch is
+    /// zero, and one past an `i64` of milliseconds is the largest count.
+    #[test]
+    fn an_instant_is_its_milliseconds_since_the_epoch() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            unix_ms(UNIX_EPOCH + Duration::from_millis(1_234_567)),
+            1_234_567
+        );
+        assert_eq!(unix_ms(UNIX_EPOCH), 0);
+        let before = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(5))
+            .expect("this platform reaches before the epoch");
+        assert_eq!(unix_ms(before), 0);
+        let far = UNIX_EPOCH
+            .checked_add(Duration::from_secs(1 << 62))
+            .expect("this platform reaches 2^62 seconds");
+        assert_eq!(unix_ms(far), i64::MAX);
+    }
+
+    /// `now_ms` reads the clock: it lands between two readings taken
+    /// around it, which (often within one millisecond) pins it exactly.
+    #[test]
+    fn now_is_the_clock_to_the_millisecond() {
+        for _ in 0..200 {
+            let before = unix_ms(std::time::SystemTime::now());
+            let now = now_ms();
+            let after = unix_ms(std::time::SystemTime::now());
+            assert!(
+                before <= now && now <= after,
+                "{before} <= {now} <= {after}"
+            );
+        }
+    }
+
+    /// Removing a record under a hostile id removes nothing and is not an
+    /// error: there is no such record.
+    #[tokio::test]
+    async fn removing_a_hostile_id_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), &record("agent-a"))
+            .await
+            .expect("written");
+        assert_eq!(remove(dir.path(), "../agent-a").await, Ok(()));
+        assert_eq!(list(dir.path()).await.len(), 1);
+    }
+
+    /// A record with several repos knows each of them.
+    #[test]
+    fn every_repo_of_a_record_is_known() {
+        let mut record = record("agent-a");
+        record.repos.push(LedgerRepo {
+            name: "proto".to_owned(),
+            ..LedgerRepo::default()
+        });
+        assert!(record.has_repo("atlas"));
+        assert!(record.has_repo("proto"));
+        assert!(!record.has_repo("ghost"));
     }
 }

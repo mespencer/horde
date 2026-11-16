@@ -111,11 +111,6 @@ pub struct FetchThrottle {
 }
 
 impl FetchThrottle {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// How many fetches this throttle has run.
     #[must_use]
     pub fn fetches_run(&self) -> u64 {
@@ -320,12 +315,11 @@ async fn resolve_requested(
 /// commit: `rev-parse main` would find the Instance's own `main`, frozen at
 /// its clone point, ahead of `origin/main`.
 async fn lookup(instance_repo: &Path, reference: &str) -> Option<String> {
-    let mut candidates = Vec::with_capacity(3);
-    if is_abbreviated_sha(reference) {
-        candidates.push(reference.to_owned());
-    }
-    candidates.push(format!("refs/remotes/origin/{reference}"));
-    candidates.push(format!("refs/tags/{reference}"));
+    let commit = is_abbreviated_sha(reference).then(|| reference.to_owned());
+    let candidates = commit.into_iter().chain([
+        format!("refs/remotes/origin/{reference}"),
+        format!("refs/tags/{reference}"),
+    ]);
     for candidate in candidates {
         if let Some(sha) = commit_of(instance_repo, &candidate).await {
             return Some(sha);
@@ -384,18 +378,15 @@ pub(crate) async fn plan_branch(
 async fn worktree_holding(instance_repo: &Path, reference: &str) -> Result<Option<String>, String> {
     let listing = git(instance_repo, &["worktree", "list", "--porcelain"]).await?;
     for block in listing.split("\n\n") {
-        let mut path = None;
-        let mut holds = false;
-        for line in block.lines() {
-            if let Some(found) = line.strip_prefix("worktree ") {
-                path = Some(found.to_owned());
-            }
-            if line.strip_prefix("branch ") == Some(reference) {
-                holds = true;
-            }
-        }
+        let holds = block
+            .lines()
+            .any(|line| line.strip_prefix("branch ") == Some(reference));
         if holds {
-            return Ok(Some(holder_name(path.as_deref().unwrap_or_default())));
+            let path = block
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+                .unwrap_or_default();
+            return Ok(Some(holder_name(path)));
         }
     }
     Ok(None)
@@ -492,14 +483,286 @@ mod tests {
     #[tokio::test]
     async fn a_fetch_inside_the_throttle_is_reused_and_not_counted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let throttle = FetchThrottle::new();
+        let throttle = FetchThrottle::default();
         assert_eq!(throttle.fetches_run(), 0);
         let policy = FetchPolicy::default();
         let first = throttle.fetch(dir.path(), policy).await;
         let second = throttle.fetch(dir.path(), policy).await;
         assert_eq!(throttle.fetches_run(), 1);
         assert!(first.error.is_some(), "not a repository");
+        assert_eq!(first.last_success_ms, None, "a failed fetch is no success");
         assert_eq!(first, second, "the outcome is reused");
+    }
+
+    /// A successful fetch is stamped; a failed one after it keeps the
+    /// earlier stamp rather than claiming a new success.
+    #[tokio::test]
+    async fn only_a_successful_fetch_is_stamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, _) = origin_and_instance(dir.path());
+        let throttle = FetchThrottle::default();
+        let policy = FetchPolicy {
+            throttle: Duration::ZERO,
+            timeout: Duration::from_secs(30),
+        };
+        let fetched = throttle.fetch(&instance, policy).await;
+        assert_eq!(fetched.error, None);
+        let stamped = fetched.last_success_ms.expect("a success is stamped");
+        std::fs::rename(&origin, dir.path().join("gone")).expect("origin moved away");
+        let failed = throttle.fetch(&instance, policy).await;
+        assert!(failed.error.is_some(), "origin is gone");
+        assert_eq!(failed.last_success_ms, Some(stamped));
+    }
+
+    /// With no tracking ref for the default branch, the checkout starts at
+    /// the Instance's own HEAD and says so — and says why the fetch failed
+    /// when it did.
+    #[tokio::test]
+    async fn no_tracking_ref_starts_from_the_instance_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, seed) = origin_and_instance(dir.path());
+        let untracked = repo("nosuch");
+        let resolve = || async {
+            prepare_base(
+                &instance,
+                &untracked,
+                None,
+                "horde/agent-1",
+                &FetchThrottle::default(),
+                FetchPolicy::default(),
+                &NoSource,
+            )
+            .await
+        };
+        let resolved = resolve().await.expect("the default base never errors");
+        assert_eq!(resolved.resolution, BaseResolution::InstanceHead);
+        assert_eq!(resolved.sha, seed);
+        assert_eq!(
+            resolved.stale_reason,
+            "no refs/remotes/origin/nosuch; starting from the instance HEAD"
+        );
+        std::fs::rename(&origin, dir.path().join("gone")).expect("origin moved away");
+        let offline = resolve().await.expect("the default base never errors");
+        assert_eq!(offline.sha, seed);
+        assert!(
+            offline.stale_reason.starts_with(
+                "no refs/remotes/origin/nosuch; starting from the instance HEAD (fetch failed: "
+            ),
+            "{}",
+            offline.stale_reason
+        );
+    }
+
+    /// A full SHA the Instance already holds is used as it is, without a
+    /// fetch, under the source that named it.
+    #[tokio::test]
+    async fn a_present_full_sha_is_used_without_fetching() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, instance, seed) = origin_and_instance(dir.path());
+        for (source, resolution) in [
+            (RepoBaseSource::Parent, BaseResolution::Parent),
+            (RepoBaseSource::Requested, BaseResolution::Requested),
+        ] {
+            let throttle = FetchThrottle::default();
+            let resolved = prepare_base(
+                &instance,
+                &repo("main"),
+                Some(&requested(&seed, source)),
+                "horde/agent-1",
+                &throttle,
+                FetchPolicy::default(),
+                &NoSource,
+            )
+            .await
+            .expect("present");
+            assert_eq!(
+                resolved,
+                ResolvedBase {
+                    sha: seed.clone(),
+                    resolution,
+                    requested_ref: seed.clone(),
+                    fetched_at_ms: None,
+                    stale_reason: String::new(),
+                }
+            );
+            assert_eq!(throttle.fetches_run(), 0, "nothing was fetched");
+        }
+    }
+
+    /// Resolves `reference` as a requested base of `atlas` in `instance`.
+    async fn resolve_named(
+        instance: &Path,
+        reference: &str,
+        throttle: &FetchThrottle,
+    ) -> Result<ResolvedBase, String> {
+        prepare_base(
+            instance,
+            &repo("main"),
+            Some(&requested(reference, RepoBaseSource::Requested)),
+            "horde/agent-1",
+            throttle,
+            FetchPolicy::default(),
+            &NoSource,
+        )
+        .await
+    }
+
+    /// A ref origin has that is neither a branch nor a tag is reached by
+    /// the one targeted fetch, and stamped as fetched just now.
+    #[tokio::test]
+    async fn a_ref_only_a_targeted_fetch_reaches_is_stamped_now() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, _) = origin_and_instance(dir.path());
+        let custom = commit(&origin, "custom");
+        run_git(&origin, &["update-ref", "refs/custom/x", &custom]);
+        run_git(&origin, &["reset", "-q", "--hard", "HEAD~1"]);
+        let before = now_ms();
+        let resolved = resolve_named(&instance, "refs/custom/x", &FetchThrottle::default())
+            .await
+            .expect("the targeted fetch finds it");
+        assert_eq!(resolved.sha, custom);
+        assert_eq!(resolved.resolution, BaseResolution::Requested);
+        let fetched_at = resolved.fetched_at_ms.expect("fetched just now");
+        assert!(fetched_at >= before, "{fetched_at} >= {before}");
+    }
+
+    /// A named branch is origin's, never the Instance's own local branch of
+    /// that name, which is frozen at the clone point.
+    #[tokio::test]
+    async fn a_named_branch_is_origins_not_the_instances() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, seed) = origin_and_instance(dir.path());
+        let latest = commit(&origin, "latest");
+        let resolved = resolve_named(&instance, "main", &FetchThrottle::default())
+            .await
+            .expect("origin/main");
+        assert_eq!(resolved.sha, latest);
+        assert_ne!(resolved.sha, seed);
+    }
+
+    /// An origin branch already fetched resolves from the tracking ref,
+    /// even once origin has deleted it and no fetch could find it again.
+    #[tokio::test]
+    async fn a_fetched_origin_branch_resolves_from_its_tracking_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, _) = origin_and_instance(dir.path());
+        run_git(&origin, &["checkout", "-q", "-b", "feature"]);
+        let feature = commit(&origin, "feature");
+        run_git(&origin, &["checkout", "-q", "main"]);
+        let throttle = FetchThrottle::default();
+        assert_eq!(
+            throttle
+                .fetch(&instance, FetchPolicy::default())
+                .await
+                .error,
+            None
+        );
+        run_git(&origin, &["branch", "-q", "-D", "feature"]);
+        let resolved = resolve_named(&instance, "feature", &throttle)
+            .await
+            .expect("the tracking ref still names it");
+        assert_eq!(resolved.sha, feature);
+    }
+
+    /// A tag the Instance holds resolves, even one origin no longer has.
+    #[tokio::test]
+    async fn a_tag_the_instance_holds_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, instance, seed) = origin_and_instance(dir.path());
+        commit(&instance, "local");
+        run_git(&instance, &["tag", "v1", &seed]);
+        let resolved = resolve_named(&instance, "v1", &FetchThrottle::default())
+            .await
+            .expect("the tag");
+        assert_eq!(resolved.sha, seed);
+    }
+
+    /// A source that fetches every branch of another repository into the
+    /// Instance: where a parent's commit can come from.
+    struct Sibling(PathBuf);
+
+    #[async_trait]
+    impl CommitSource for Sibling {
+        async fn obtain_into(&self, instance_repo: &Path, _: &str, _: &str) -> Result<(), String> {
+            git(
+                instance_repo,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    &self.0.display().to_string(),
+                    "+refs/heads/*:refs/sibling/*",
+                ],
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    /// A parent's commit neither the Instance nor origin has is obtained
+    /// through the commit source, and resolves to that commit.
+    #[tokio::test]
+    async fn a_parents_commit_is_obtained_through_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (origin, instance, _) = origin_and_instance(dir.path());
+        let sibling = dir.path().join("sibling");
+        run_git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                "--",
+                &origin.display().to_string(),
+                &sibling.display().to_string(),
+            ],
+        );
+        let parents = commit(&sibling, "parents");
+        let resolved = prepare_base(
+            &instance,
+            &repo("main"),
+            Some(&requested(&parents, RepoBaseSource::Parent)),
+            "horde/agent-1",
+            &FetchThrottle::default(),
+            FetchPolicy::default(),
+            &Sibling(sibling),
+        )
+        .await
+        .expect("the source supplies it");
+        assert_eq!(resolved.sha, parents);
+        assert_eq!(resolved.resolution, BaseResolution::Parent);
+        assert!(resolved.fetched_at_ms.is_some(), "origin was fetched");
+    }
+
+    /// Each worktree's own block names its holder: the Instance's checkout
+    /// of `main` is not the agent's, though the agent's is listed after it.
+    #[tokio::test]
+    async fn each_held_branch_names_its_own_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, instance, seed) = origin_and_instance(dir.path());
+        let agent = dir.path().join("ws/.horde-agents/agent-9/atlas");
+        run_git(
+            &instance,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-branch",
+                &agent.display().to_string(),
+                &seed,
+            ],
+        );
+        let main = plan_branch(&instance, "main", &seed)
+            .await
+            .expect_err("main is checked out");
+        assert!(
+            main.contains("checked out by a worktree Horde did not create"),
+            "{main}"
+        );
+        let agents = plan_branch(&instance, "agent-branch", &seed)
+            .await
+            .expect_err("the agent holds it");
+        assert!(agents.contains("checked out by agent agent-9"), "{agents}");
     }
 
     /// The window is half-open: a zero throttle never reuses an attempt,
@@ -507,7 +770,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_zero_throttle_fetches_again_at_the_same_instant() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let throttle = FetchThrottle::new();
+        let throttle = FetchThrottle::default();
         let policy = FetchPolicy {
             throttle: Duration::ZERO,
             timeout: Duration::from_secs(30),
@@ -529,7 +792,7 @@ mod tests {
             &repo(""),
             None,
             "horde/agent-1",
-            &FetchThrottle::new(),
+            &FetchThrottle::default(),
             FetchPolicy::default(),
             &NoSource,
         )
@@ -545,7 +808,7 @@ mod tests {
     async fn an_empty_or_option_shaped_base_is_refused_up_front() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (_, instance, _) = origin_and_instance(dir.path());
-        let throttle = FetchThrottle::new();
+        let throttle = FetchThrottle::default();
         for reference in ["", "--upload-pack=touch /tmp/x"] {
             let error = prepare_base(
                 &instance,
@@ -582,7 +845,7 @@ mod tests {
                     &repo("main"),
                     Some(&requested(&missing, source)),
                     "horde/agent-1",
-                    &FetchThrottle::new(),
+                    &FetchThrottle::default(),
                     FetchPolicy::default(),
                     &NoSource,
                 )

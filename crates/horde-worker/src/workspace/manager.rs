@@ -112,7 +112,7 @@ impl WorkspaceManager {
         Self {
             worker_id: worker_id.into(),
             root: root.into(),
-            throttle: Arc::new(FetchThrottle::new()),
+            throttle: Arc::new(FetchThrottle::default()),
             fs_stats: Arc::new(StatvfsStats),
         }
     }
@@ -146,15 +146,9 @@ impl WorkspaceManager {
     /// `(free, total)` bytes of the filesystem holding the workspace root.
     #[must_use]
     pub fn filesystem(&self) -> Option<(u64, u64)> {
-        let probe = if self.root.exists() {
-            self.root.clone()
-        } else {
-            self.root
-                .ancestors()
-                .find(|ancestor| ancestor.exists())
-                .map(Path::to_path_buf)?
-        };
-        self.fs_stats.stats(&probe)
+        // The root is its own first ancestor.
+        let probe = self.root.ancestors().find(|ancestor| ancestor.exists())?;
+        self.fs_stats.stats(probe)
     }
 
     /// One Instance's root directory.
@@ -211,8 +205,9 @@ impl WorkspaceManager {
             );
         }
 
+        // #[gamma::skip(expr.decrement, reason = "a Definition holding u32::MAX repos cannot be built in memory, so the saturating fallback is unreachable")]
         let total = u32::try_from(definition.repos.len()).unwrap_or(u32::MAX);
-        for (index, repo) in definition.repos.iter().enumerate() {
+        for (index, repo) in (0_u32..).zip(&definition.repos) {
             let verb = if instance_root.join(&repo.name).join(".git").exists() {
                 "fetching"
             } else {
@@ -220,7 +215,7 @@ impl WorkspaceManager {
             };
             progress(MaterializationProgress {
                 step: format!("{verb} {}", repo.name),
-                completed_repos: u32::try_from(index).unwrap_or(u32::MAX),
+                completed_repos: index,
                 total_repos: total,
                 detail: String::new(),
             });
@@ -873,15 +868,16 @@ async fn place_repo(
     destination: &Path,
     resolved: &ResolvedBase,
 ) -> Result<(), WorkerError> {
-    record.repos.retain(|r| r.name != repo.name);
-    record.repos.push(LedgerRepo {
+    let pending = LedgerRepo {
         name: repo.name.clone(),
         base_commit_sha: resolved.sha.clone(),
         resolution: resolution_name(resolved.resolution).to_owned(),
         requested_ref: resolved.requested_ref.clone(),
         created_branch: false,
         pending: true,
-    });
+    };
+    record.repos.retain(|r| r.name != repo.name);
+    record.repos.push(pending.clone());
     super::ledger::write(agents_dir, record)
         .await
         .map_err(WorkerError::Workspace)?;
@@ -892,8 +888,11 @@ async fn place_repo(
         worktree_repo(instance_repo, destination, &record.branch, &resolved.sha).await?
     };
     if let Some(entry) = record.repos.iter_mut().find(|r| r.name == repo.name) {
-        entry.pending = false;
-        entry.created_branch = created_branch;
+        *entry = LedgerRepo {
+            created_branch,
+            pending: false,
+            ..pending
+        };
     }
     super::ledger::write(agents_dir, record)
         .await
@@ -928,10 +927,7 @@ fn synthesized_record(
     });
     let modified = std::fs::metadata(agent_root)
         .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
+        .map_or(0, super::ledger::unix_ms);
     LedgerRecord {
         agent_id: agent_id.to_owned(),
         policy: if fresh_clone {
@@ -1185,6 +1181,7 @@ async fn materialize_repo(
             arguments.push("--branch".to_owned());
             arguments.push(repo.default_branch.clone());
         }
+        // #[gamma::skip(stmt.delete_call, reason = "defence in depth: an option-shaped remote_url is refused above and the destination is an absolute path, so no positional after the separator can start with '-'")]
         arguments.push("--".to_owned());
         arguments.push(repo.remote_url.clone());
         arguments.push(path_str(&destination));
@@ -1322,6 +1319,7 @@ async fn clone_repo(
     )
     .await
     .map_err(WorkerError::Workspace)?;
+    // #[gamma::skip(cond.always_true, reason = "the clone holds only commits reachable from the Instance's refs, and the Instance serves any reachable commit, so fetching a base already present is a no-op; the guard only saves the round trip")]
     if commit_of(destination, base).await.is_none() {
         git(destination, &["fetch", "--no-tags", "origin", base])
             .await

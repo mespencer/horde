@@ -79,7 +79,9 @@ pub(crate) async fn required_state(
 pub fn timestamp(unix_ms: i64) -> horde_proto::prost_types::Timestamp {
     horde_proto::prost_types::Timestamp {
         seconds: unix_ms.div_euclid(1000),
-        nanos: i32::try_from(unix_ms.rem_euclid(1000) * 1_000_000).unwrap_or(0),
+        // `rem_euclid(1000)` is in 0..1000, so the nanoseconds are under
+        // 10^9 and the cast is exact.
+        nanos: (unix_ms.rem_euclid(1000) * 1_000_000) as i32,
     }
 }
 

@@ -153,7 +153,8 @@ pub fn duration_of(duration: WireDuration) -> Option<Duration> {
 pub fn wire_duration(duration: Duration) -> WireDuration {
     WireDuration {
         seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-        nanos: i32::try_from(duration.subsec_nanos()).unwrap_or(0),
+        // Under 10^9 by `subsec_nanos`'s contract, so the cast is exact.
+        nanos: duration.subsec_nanos() as i32,
     }
 }
 
@@ -263,5 +264,14 @@ mod tests {
         );
         let back = duration_of(wire_duration(Duration::from_millis(1_500)));
         assert_eq!(back, Some(Duration::from_millis(1_500)));
+    }
+
+    /// A duration longer than the wire's seconds can hold saturates there
+    /// rather than wrapping or zeroing.
+    #[test]
+    fn a_duration_past_the_wire_saturates() {
+        let wire = wire_duration(Duration::MAX);
+        assert_eq!(wire.seconds, i64::MAX);
+        assert_eq!(wire.nanos, 999_999_999);
     }
 }
