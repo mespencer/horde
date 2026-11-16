@@ -87,6 +87,44 @@ fn blocks_count_as_their_fragment_size_and_saturate() {
     assert_eq!(super::blocks_to_bytes(u64::MAX, 2), u64::MAX);
 }
 
+/// The bytes `StatvfsStats` reports are `df`'s, to the byte: the size
+/// exactly, and the free space at some reading of a few — other writers move
+/// it between the two measurements, a miscount never agrees.
+#[cfg(target_os = "linux")]
+#[test]
+fn statvfs_bytes_are_dfs_to_the_byte() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut last = None;
+    for _ in 0..20 {
+        let ours = StatvfsStats
+            .stats(dir.path())
+            .expect("a real filesystem answers");
+        let output = std::process::Command::new("df")
+            .args(["-P", "-B1"])
+            .arg(dir.path())
+            .output()
+            .expect("df runs");
+        assert!(output.status.success(), "df failed");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let row: Vec<u64> = text
+            .lines()
+            .nth(1)
+            .expect("df's row")
+            .split_whitespace()
+            .skip(1)
+            .take(3)
+            .map(|field| field.parse().expect("a byte count"))
+            .collect();
+        let theirs = (row[2], row[0]);
+        if ours == theirs {
+            return;
+        }
+        last = Some((ours, theirs));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("statvfs never agreed with df (free, total): {last:?}");
+}
+
 #[test]
 fn statvfs_reports_the_real_filesystem() {
     let dir = tempfile::tempdir().expect("tempdir");

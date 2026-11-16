@@ -269,7 +269,6 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
         pipes.stdout.map(|out| collect(out, Arc::clone(&tail))),
         pipes.stderr.map(|err| collect(err, Arc::clone(&tail))),
     ];
-    let leader = child.id();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => status.ok(),
         Err(_) => {
@@ -285,7 +284,7 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
             };
         }
     };
-    let output_tail = drain(readers, leader, &mut child, &tail).await;
+    let output_tail = drain(readers, &mut child, &tail).await;
     let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
     let succeeded = status.is_some_and(|status| status.success());
     Ran {
@@ -305,7 +304,6 @@ pub async fn execute(argv: &[String], cwd: &Path, timeout: Duration) -> Ran {
 /// command left behind, so its group is killed and the readers dropped.
 async fn drain(
     readers: [Option<tokio::task::JoinHandle<()>>; 2],
-    leader: Option<u32>,
     tree: &mut ProcessTree,
     tail: &Arc<Mutex<Vec<u8>>>,
 ) -> String {
@@ -317,9 +315,7 @@ async fn drain(
     })
     .await;
     if drained.is_err() {
-        if leader.is_some() {
-            tree.signal(Stop::Kill);
-        }
+        tree.signal(Stop::Kill);
         for reader in &readers {
             reader.abort();
         }
