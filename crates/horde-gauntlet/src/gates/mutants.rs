@@ -418,7 +418,10 @@ fn measure_scope(
             scope.label()
         )));
     }
-    let packages = if ctx.packages.is_empty() && scope.diff().is_some() {
+    // A diff names few packages; building only those is the point of scoping
+    // by it. Every listed mutant is in a selected package, so this narrows a
+    // `-p` selection too, to the named packages the diff touches.
+    let packages = if scope.diff().is_some() {
         audit::packages_of(&listed)
     } else {
         ctx.packages.clone()

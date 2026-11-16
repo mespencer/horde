@@ -226,11 +226,76 @@ fn a_clean_full_sweep_passes_and_records_head_as_the_last_green_one() {
         "cargo gamma list --color never --progress never --workspace --json --no-config"
     );
     assert!(
-        !run.mutation_command().contains("--in-diff"),
-        "{:?}",
+        !run.mutation_command().contains("--in-diff")
+            && run.mutation_command().contains(" --workspace "),
+        "the whole tree is measured as the workspace: {:?}",
         run.lines
     );
     assert_eq!(run.lines[6], "git status --porcelain --untracked-files=no");
+    assert_eq!(
+        std::fs::read_to_string(artifact_dir(&run.ctx).join("missed.txt")).expect("written"),
+        "",
+        "nothing missed is an empty file, not a blank line"
+    );
+}
+
+#[test]
+fn a_sweep_whose_tree_state_cannot_be_read_is_reported_but_not_recorded() {
+    let run = full_run(
+        &report(&["Killed"]),
+        vec![failed(128, "fatal: not a git repository")],
+    );
+    assert_eq!(run.outcome.label(), "pass");
+    assert!(
+        run.outcome.detail().ends_with(
+            "not recorded as the last green full sweep: `git status` failed: fatal: not a git \
+             repository"
+        ),
+        "{}",
+        run.outcome.detail()
+    );
+    assert_eq!(last_full_sweep(&run.ctx), None);
+}
+
+#[test]
+fn a_sweep_whose_head_cannot_be_named_is_reported_but_not_recorded() {
+    for head in [failed(128, "fatal: bad revision"), ok("\n")] {
+        let run = full_run(&report(&["Killed"]), vec![ok(""), head]);
+        assert_eq!(run.outcome.label(), "pass");
+        assert!(
+            run.outcome.detail().ends_with(
+                "not recorded as the last green full sweep: `git rev-parse HEAD` named no commit"
+            ),
+            "{}",
+            run.outcome.detail()
+        );
+        assert_eq!(last_full_sweep(&run.ctx), None);
+    }
+}
+
+#[test]
+fn artifacts_that_cannot_be_cleared_stop_the_run_before_gamma_starts() {
+    let script = whole_tree_script();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ctx = ctx_at(dir.path()).measuring_everything(true);
+    std::fs::create_dir_all(&ctx.log_dir).expect("log dir");
+    std::fs::write(artifact_dir(&ctx), "a file where the directory goes").expect("blocker");
+    let runner = ScriptedRunner::new(script);
+    let GateOutcome::Error { reason } = measure(&ctx, &runner, &settings()) else {
+        panic!("a stale artifact directory that cannot be cleared is a broken instrument");
+    };
+    assert!(
+        reason.starts_with(&format!("could not clear {}", artifact_dir(&ctx).display())),
+        "{reason}"
+    );
+    assert!(
+        !runner
+            .command_lines()
+            .iter()
+            .any(|line| line.contains("cargo gamma run")),
+        "{:?}",
+        runner.command_lines()
+    );
 }
 
 #[test]
@@ -265,6 +330,10 @@ fn a_full_sweep_with_survivors_fails_lists_them_and_records_nothing() {
     let missed =
         std::fs::read_to_string(artifact_dir(&run.ctx).join("missed.txt")).expect("written");
     assert_eq!(missed.lines().count(), 3, "{missed}");
+    assert!(
+        missed.ends_with('\n') && !missed.ends_with("\n\n"),
+        "one line per finding, each ended: {missed:?}"
+    );
     assert!(
         missed.contains("pipeline.rs:179:47: literal.str_to_empty"),
         "{missed}"
@@ -715,6 +784,10 @@ fn a_workspace_listing_naming_the_reaper_stops_everything() {
         panic!("a mutant of the reaper must never run");
     };
     assert!(reason.starts_with("REFUSING TO MUTATE"), "{reason}");
+    assert!(
+        reason.contains("the workspace listing contains"),
+        "{reason}"
+    );
     assert_eq!(
         run.lines.len(),
         3,
@@ -806,7 +879,43 @@ fn a_report_left_by_an_earlier_run_is_never_read_as_this_one() {
     let GateOutcome::Error { reason } = outcome else {
         panic!("a run that wrote no report did not measure");
     };
-    assert!(reason.contains("gamma-report.json"), "{reason}");
+    assert!(
+        reason.starts_with("`cargo gamma run` did not leave a readable ")
+            && reason.contains("gamma-report.json"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_report_naming_no_mutant_is_skipped_as_such() {
+    let outcome = outcome_of(&Scope::FullTree, &Tally::default());
+    assert_eq!(outcome.label(), "skipped");
+    assert_eq!(
+        outcome.detail(),
+        "gamma reported no mutant in the whole tree"
+    );
+}
+
+#[test]
+fn a_branch_diff_that_fails_is_an_instrument_error() {
+    let workspace = listing(&[(PRODUCT, "a")]);
+    let mut script = preflight();
+    script.extend(audit(&workspace));
+    script.extend([
+        ok("branchpoint\n"),
+        ok("tip\n"),
+        failed(128, "fatal: bad object branchpoint"),
+    ]);
+    let run = measure_with(|ctx| ctx, script, None);
+    assert_eq!(run.outcome.label(), "error", "{:?}", run.outcome);
+    assert!(
+        run.outcome
+            .detail()
+            .contains("fatal: bad object branchpoint"),
+        "{}",
+        run.outcome.detail()
+    );
+    assert!(!run.ran(), "{:?}", run.lines);
 }
 
 #[test]
@@ -940,6 +1049,7 @@ fn settings_are_read_from_the_environment() {
         JOBS_ENV => Some("3".to_owned()),
         MEMORY_ENV => Some("off".to_owned()),
         CACHE_ENV => Some("/fast/cache".to_owned()),
+        "CARGO_ENCODED_RUSTFLAGS" => Some("-Cdebuginfo=0".to_owned()),
         _ => None,
     };
     assert_eq!(
@@ -948,8 +1058,17 @@ fn settings_are_read_from_the_environment() {
             jobs: 3,
             memory: MemoryCap::Disabled,
             cache_dir: Some(PathBuf::from("/fast/cache")),
-            rustflags: "--cap-lints=allow".to_owned(),
+            rustflags: "-Cdebuginfo=0\u{1f}--cap-lints=allow".to_owned(),
         })
+    );
+    let plain = Settings::from_env(
+        |key| (key == "RUSTFLAGS").then(|| "-Cdebuginfo=0 -Dwarnings".to_owned()),
+        Some(32),
+    )
+    .expect("readable");
+    assert_eq!(
+        plain.rustflags,
+        "-Cdebuginfo=0\u{1f}-Dwarnings\u{1f}--cap-lints=allow"
     );
     assert!(Settings::from_env(|key| (key == JOBS_ENV).then(|| "x".to_owned()), None).is_err());
 }

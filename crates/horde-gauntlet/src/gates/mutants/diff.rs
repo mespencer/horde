@@ -36,13 +36,13 @@ pub fn mutable_sections(diff: &str, mutable: &BTreeSet<String>) -> String {
 
 /// The path a `diff --git` header says the file is changed to.
 ///
-/// The header is `a/<old> b/<new>`. Paths with spaces are quoted by git, and
-/// no workspace source file has one, so a quoted header is simply not matched
-/// — which drops it, the safe direction for a path gamma could not resolve.
+/// The header is `a/<old> b/<new>`. Git quotes a path with unusual
+/// characters, `"b/<new>"`, and no workspace source file has one: a quoted
+/// new path has no ` b/` before it, and any ` b/` inside it leaves a fragment
+/// ending in a quote, which names no file gamma lists. Either way the section
+/// is dropped — the safe direction for a path gamma could not resolve.
 fn changed_path(header: &str) -> Option<&str> {
-    let header = header.trim_end();
-    let (_, new) = header.rsplit_once(" b/")?;
-    (!new.starts_with('"')).then_some(new)
+    header.trim_end().rsplit_once(" b/").map(|(_, new)| new)
 }
 
 #[cfg(test)]
@@ -119,5 +119,16 @@ mod tests {
     fn a_quoted_path_is_not_matched() {
         let quoted = "diff --git \"a/x y.rs\" \"b/x y.rs\"\n+z\n";
         assert_eq!(mutable_sections(quoted, &mutable(&["x y.rs"])), "");
+        let split = "diff --git \"a/x b/y.rs\" \"b/x b/y.rs\"\n+z\n";
+        assert_eq!(mutable_sections(split, &mutable(&["y.rs", "x b/y.rs"])), "");
+    }
+
+    #[test]
+    fn anything_before_the_first_section_is_dropped() {
+        let diff = format!("warning: CRLF will be replaced by LF\n{SOURCE}");
+        assert_eq!(
+            mutable_sections(&diff, &mutable(&["crates/a/src/lib.rs"])),
+            SOURCE
+        );
     }
 }

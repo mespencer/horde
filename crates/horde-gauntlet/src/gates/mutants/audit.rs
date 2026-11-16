@@ -14,7 +14,7 @@
 //! * and one removal that is not a choice but a hazard: a file whose mutants
 //!   must never run at all (`refuse_dangerous`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -157,10 +157,7 @@ pub struct Exclusion {
 /// this gate cannot read is an instrument it cannot vouch for, so it refuses
 /// rather than assuming there are no exclusions.
 pub fn configured_exclusions(config: &str) -> Result<Vec<Exclusion>, String> {
-    let Some(body) = exclusion_body(config)? else {
-        return Ok(Vec::new());
-    };
-    Ok(entries(&body))
+    exclusion_body(config).map(|body| entries(&body))
 }
 
 /// The body of the `exclude-files` array, comments and all.
@@ -168,15 +165,20 @@ pub fn configured_exclusions(config: &str) -> Result<Vec<Exclusion>, String> {
 /// Comments are kept because an exclusion is worth no more than the reason
 /// written beside it. That means the closing `]` has to be found the way TOML
 /// finds it — in code, not inside a comment that happens to mention one.
-fn exclusion_body(config: &str) -> Result<Option<String>, String> {
-    let Some(start) = config
+///
+/// Without the key there is no body, and so no entry.
+fn exclusion_body(config: &str) -> Result<String, String> {
+    let tail: String = config
         .lines()
-        .position(|line| is_exclusion_key(line.trim()))
-    else {
-        return Ok(None);
+        .skip_while(|line| !is_exclusion_key(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tail.is_empty() {
+        return Ok(tail);
+    }
+    let Some((_, opened)) = tail.split_once('[') else {
+        return Err(format!("{CONFIG}: `exclude-files` is not an array"));
     };
-    let tail: String = config.lines().skip(start).collect::<Vec<_>>().join("\n");
-    let opened = tail.split_once('[').map_or("", |(_, rest)| rest);
     let mut body = String::new();
     for line in opened.lines() {
         let (code, comment) = split_comment(line);
@@ -192,7 +194,7 @@ fn exclusion_body(config: &str) -> Result<Option<String>, String> {
             body.push_str(" #");
             body.push_str(comment);
         }
-        return Ok(Some(body));
+        return Ok(body);
     }
     Err(format!(
         "{CONFIG}: `exclude-files` is missing its closing `]`"
@@ -206,13 +208,16 @@ fn exclusion_body(config: &str) -> Result<Option<String>, String> {
 fn split_comment(line: &str) -> (&str, Option<&str>) {
     let mut quote: Option<char> = None;
     for (at, character) in line.char_indices() {
-        match (quote, character) {
-            (Some(open), _) if open == character => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(character),
-            (None, '#') => return (&line[..at], Some(line[at + 1..].trim())),
-            (None, _) => {}
-        }
+        quote = match quote {
+            Some(open) if open == character => None,
+            Some(open) => Some(open),
+            None if character == '#' => {
+                let (code, comment) = line.split_at(at);
+                return (code, comment.strip_prefix('#').map(str::trim));
+            }
+            None if matches!(character, '"' | '\'') => Some(character),
+            None => None,
+        };
     }
     (line, None)
 }
@@ -267,24 +272,25 @@ fn is_exclusion_key(line: &str) -> bool {
 }
 
 /// The TOML strings in an array body, in either quoting style.
+///
+/// One pass over the characters: a quote opens a string, the same quote closes
+/// it, and a string never closed is not an entry.
 fn toml_strings(text: &str) -> Vec<String> {
     let mut found = Vec::new();
-    let mut rest = text;
-    // `find` over a character set already means "whichever quote comes first".
-    while let Some(open) = rest.find(['"', '\'']) {
-        let Some(quote) = rest.get(open..).and_then(|tail| tail.chars().next()) else {
-            break;
+    let mut open: Option<(char, String)> = None;
+    for character in text.chars() {
+        open = match open {
+            Some((quote, value)) if quote == character => {
+                found.push(value);
+                None
+            }
+            Some((quote, mut value)) => {
+                value.push(character);
+                Some((quote, value))
+            }
+            None if matches!(character, '"' | '\'') => Some((character, String::new())),
+            None => None,
         };
-        let Some(after) = rest.get(open + 1..) else {
-            break;
-        };
-        let Some(close) = after.find(quote) else {
-            break;
-        };
-        if let Some(value) = after.get(..close) {
-            found.push(value.to_owned());
-        }
-        rest = after.get(close + 1..).unwrap_or("");
     }
     found
 }
@@ -468,13 +474,12 @@ fn is_directive(line: &str) -> bool {
     if line.trim_start().starts_with(DIRECTIVE) {
         return true;
     }
-    let Some(at) = line.find(&format!("// {DIRECTIVE}")) else {
+    let Some((before, _)) = line.split_once(&format!("// {DIRECTIVE}")) else {
         return false;
     };
     // Code before the comment, not a comment already (a doc comment that
     // mentions a directive) and not an open string literal (a test that
     // quotes one).
-    let before = &line[..at];
     !before.contains("//") && before.matches('"').count().is_multiple_of(2)
 }
 
@@ -546,7 +551,7 @@ pub fn verify_suppressions(
     configured: &[Listed],
     directives: &[Directive],
 ) -> Result<usize, String> {
-    let mut used: BTreeMap<(&str, usize), usize> = BTreeMap::new();
+    let mut used: BTreeSet<(&str, usize)> = BTreeSet::new();
     let mut suppressed = 0;
     for mutant in configured {
         let Some(suppression) = &mutant.suppression else {
@@ -574,12 +579,12 @@ pub fn verify_suppressions(
             ));
         }
         if let Some(line) = suppression.line {
-            *used.entry((mutant.file.as_str(), line)).or_default() += 1;
+            used.insert((mutant.file.as_str(), line));
         }
     }
     if let Some(stale) = directives
         .iter()
-        .find(|directive| !used.contains_key(&(directive.file.as_str(), directive.line)))
+        .find(|directive| !used.contains(&(directive.file.as_str(), directive.line)))
     {
         return Err(format!(
             "{}:{}: this gamma::skip directive suppresses no mutant. The expression it argued \
@@ -676,7 +681,12 @@ mod tests {
         .expect_err("a mutant of the reaper must never run");
         assert!(message.starts_with("REFUSING TO MUTATE"), "{message}");
         assert!(message.contains("the run's listing"), "{message}");
-        assert!(message.contains(REAP), "{message}");
+        assert!(
+            message.contains(&format!(
+                "contains `{REAP}:3:5: fn_value.default in Thing::make -> ()`"
+            )),
+            "{message}"
+        );
     }
 
     #[test]
@@ -723,6 +733,49 @@ mod tests {
                     why: "also spawned".to_owned()
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn a_reason_over_several_lines_is_read_whole_and_a_trailing_one_after_the_bracket_too() {
+        let config = "exclude-files = [\n    # the suite spawns it\n    #rather than tests it\n    \
+                      'a.rs',\n    'b.rs', 'c.rs'] #spawned too\nprofile = \"mutants\"\n";
+        assert_eq!(
+            configured_exclusions(config),
+            Ok(vec![
+                Exclusion {
+                    pattern: "a.rs".to_owned(),
+                    why: "the suite spawns it rather than tests it".to_owned()
+                },
+                Exclusion {
+                    pattern: "b.rs".to_owned(),
+                    why: "spawned too".to_owned()
+                },
+                Exclusion {
+                    pattern: "c.rs".to_owned(),
+                    why: "spawned too".to_owned()
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn adjacent_strings_on_one_line_are_each_an_entry() {
+        let config = "exclude-files = [\"a.rs\"'b.rs',\"c.rs\"] # all three\n";
+        let found: Vec<String> = configured_exclusions(config)
+            .expect("readable")
+            .into_iter()
+            .map(|entry| entry.pattern)
+            .collect();
+        assert_eq!(found, vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn an_exclusion_key_that_is_not_an_array_is_refused() {
+        let message = configured_exclusions("exclude-files = 'a.rs'\n").expect_err("not a list");
+        assert!(
+            message.contains("`exclude-files` is not an array"),
+            "{message}"
         );
     }
 
@@ -839,6 +892,24 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_after_an_inferred_one_is_still_refused() {
+        let other = "crates/b/src/lib.rs";
+        let unconfigured = [
+            mutant(FIXTURE, "()"),
+            mutant(PRODUCT, "Ok(Default::default())"),
+            mutant(other, "0"),
+        ];
+        let message = verify_exclusions(&[justified(FIXTURE)], &[], &unconfigured, not_the_reaper)
+            .expect_err("an inferred removal accounts for itself, not for the next one");
+        assert!(
+            message.contains(&format!(
+                "`{other}:3:5: fn_value.default in Thing::make -> 0` was excluded"
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn a_removal_no_entry_names_is_refused() {
         let unconfigured = [mutant(FIXTURE, "()"), mutant(PRODUCT, "0")];
         let message = verify_exclusions(&[justified(FIXTURE)], &[], &unconfigured, not_the_reaper)
@@ -904,9 +975,11 @@ mod tests {
             format!("let s = \"// {DIRECTIVE}arith)]\";"),
             format!("/// doc mentioning // {DIRECTIVE}arith)]"),
             format!("//! crate doc mentioning `// {DIRECTIVE}arith)]`"),
+            format!("    {DIRECTIVE}arith)]"),
+            format!("let s = \"closed\"; // {DIRECTIVE}arith)]"),
         ]
         .join("\n");
-        assert_eq!(directive_lines(&text), vec![2, 3, 4]);
+        assert_eq!(directive_lines(&text), vec![2, 3, 4, 8, 9]);
     }
 
     #[test]
@@ -943,7 +1016,35 @@ mod tests {
     #[test]
     fn a_workspace_with_no_crates_directory_has_no_directives() {
         let dir = tempfile::tempdir().expect("temp dir");
+        // Rust outside `crates/` is not the workspace's sources.
+        std::fs::write(
+            dir.path().join("spike.rs"),
+            format!("// {DIRECTIVE}arith, reason = \"r\")]\n"),
+        )
+        .expect("write");
         assert_eq!(scan_directives(dir.path()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn directives_are_listed_in_path_order_whatever_order_the_tree_is_read_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("crates").join("a").join("src");
+        std::fs::create_dir_all(&src).expect("dirs");
+        let directive = format!("// {DIRECTIVE}arith, reason = \"r\")]\n");
+        // Created out of order: a directory reads back in creation order on
+        // some filesystems and newest-first on others, and neither is sorted.
+        for name in ["c.rs", "a.rs", "d.rs", "b.rs"] {
+            std::fs::write(src.join(name), &directive).expect("write");
+        }
+        let files: Vec<String> = scan_directives(dir.path())
+            .expect("readable")
+            .into_iter()
+            .map(|found| found.file)
+            .collect();
+        assert_eq!(
+            files,
+            ["a.rs", "b.rs", "c.rs", "d.rs"].map(|name| format!("crates/a/src/{name}"))
+        );
     }
 
     fn directive(file: &str, line: usize) -> Directive {

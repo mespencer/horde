@@ -245,12 +245,13 @@ mod tests {
             mutant("CompileError", "the mutant does not compile"),
             mutant("Ignored", "flaky: failed again without the mutant"),
             mutant("Ignored", "suppressed"),
+            mutant("Ignored", "suppressed"),
         ]
         .join(",");
         let tally = parse(&report(&mutants)).expect("valid");
         assert_eq!(tally.scored(), 0);
-        assert_eq!((tally.unviable, tally.excluded, tally.flaky), (1, 2, 1));
-        assert_eq!(tally.total, 3);
+        assert_eq!((tally.unviable, tally.excluded, tally.flaky), (1, 3, 1));
+        assert_eq!(tally.total, 4);
     }
 
     #[test]
@@ -266,6 +267,23 @@ mod tests {
         assert_eq!(
             tally.findings,
             vec!["crates/a/src/lib.rs:3:7: relational.gt_to_ge -> >= [Survived]".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_replacement_spanning_lines_is_one_line_in_the_finding() {
+        let text = report(
+            r#"{"status":"Survived","mutatorName":"fn_value.default","replacement":"Ok(\n        Default::default())",
+                "location":{"start":{"line":3,"column":7}},"statusReason":"timed out: after 60s"}"#,
+        );
+        let tally = parse(&text).expect("valid");
+        assert_eq!(
+            tally.findings,
+            vec![
+                "crates/a/src/lib.rs:3:7: fn_value.default -> Ok( Default::default()) [Survived] \
+                 timed out: after 60s"
+                    .to_owned()
+            ]
         );
     }
 

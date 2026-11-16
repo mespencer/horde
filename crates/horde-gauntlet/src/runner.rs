@@ -255,6 +255,17 @@ mod tests {
             without(&gates, selected, &["coverage".to_owned()]).expect_err("crap reads it");
         assert!(message.contains("`crap` reads its output"), "{message}");
         let selected = resolve(&gates, &[]).expect("everything");
+        let message = without(
+            &gates,
+            selected,
+            &["mutants".to_owned(), "coverage".to_owned()],
+        )
+        .expect_err("crap still reads coverage, whatever else is skipped beside it");
+        assert!(
+            message.contains("cannot skip `coverage`: `crap` reads its output"),
+            "{message}"
+        );
+        let selected = resolve(&gates, &[]).expect("everything");
         let both = without(
             &gates,
             selected,
