@@ -140,6 +140,7 @@ impl FakeAdapter {
             misbehaviour: self.script.misbehaviour,
             stall: None,
             stall_deadline: None,
+            stderr: horde_adapter::stderr::current(),
         }
     }
 }
@@ -290,6 +291,9 @@ pub struct FakeSession {
     /// When the standing stall ends, fixed by the first wait on it, so a
     /// dropped `next_event` neither loses nor restarts it.
     stall_deadline: Option<tokio::time::Instant>,
+    /// Where [`Step::Stderr`] lines go: the sink the spawn was scoped with,
+    /// exactly as a real harness's supervisor captures it.
+    stderr: Option<std::sync::Arc<dyn horde_adapter::stderr::StderrSink>>,
 }
 
 impl FakeSession {
@@ -329,6 +333,11 @@ impl FakeSession {
                 Step::Think(text) => self.emit_output(OutputChannel::Reasoning, text),
                 Step::Stall(duration) => self.stall = Some(duration),
                 Step::Exit => self.finished = true,
+                Step::Stderr(line) => {
+                    if let Some(sink) = &self.stderr {
+                        sink.line(&line);
+                    }
+                }
                 Step::UseHordeTool {
                     tool_call_id,
                     tool_name,
@@ -1924,5 +1933,49 @@ mod endpoint_call_tests {
             vec![false],
             "a served call completes without error"
         );
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use std::sync::Arc;
+    use std::sync::mpsc::{Sender, channel};
+    use std::time::Duration;
+
+    use horde_adapter::stderr::{StderrSink, scoped};
+
+    use crate::{Script, ScriptedTurn, Step};
+
+    /// Hands every line it is given to the test, in order.
+    struct Forward(Sender<String>);
+
+    impl StderrSink for Forward {
+        fn line(&self, text: &str) {
+            let _ = self.0.send(text.to_owned());
+        }
+    }
+
+    /// A scripted stderr line reaches the sink the spawn was scoped with, as
+    /// a real harness's stderr does.
+    #[tokio::test]
+    async fn a_scripted_stderr_line_reaches_the_spawns_sink() {
+        let (sender, received) = channel();
+        let sink: Arc<dyn StderrSink> = Arc::new(Forward(sender));
+        let script = Script::of(vec![
+            ScriptedTurn::saying("done").with_step(Step::Stderr("warned".to_owned())),
+        ]);
+        let mut session = scoped(Some(sink), super::harness::started(script)).await;
+        let mut lines: Vec<String> = Vec::new();
+        for _ in 0..20 {
+            let next = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+                .await
+                .expect("an event comes");
+            lines.extend(received.try_iter());
+            if !lines.is_empty() || !matches!(next, Ok(Some(_))) {
+                break;
+            }
+        }
+        lines.extend(received.try_iter());
+        assert_eq!(lines, ["warned"]);
     }
 }

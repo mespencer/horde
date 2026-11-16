@@ -1009,12 +1009,18 @@ impl Lane {
     ) {
         let (control, control_receiver) = mpsc::channel(CONTROL_CAPACITY);
         let session_id = context.session_id.clone();
-        let task = tokio::spawn(pump(
-            session,
-            self.shared.journal.clone(),
-            context,
-            control_receiver,
-            std::sync::Arc::clone(&self.shared.activity),
+        // The span the log reader keys on (ADR-0015): every record the pump
+        // and its adapter emit carries the agent and its session.
+        let span = tracing::info_span!("agent", session = %session_id, agent = %agent_id);
+        let task = tokio::spawn(tracing::Instrument::instrument(
+            pump(
+                session,
+                self.shared.journal.clone(),
+                context,
+                control_receiver,
+                std::sync::Arc::clone(&self.shared.activity),
+            ),
+            span,
         ));
         for (input, command_id) in inputs {
             let _ = control

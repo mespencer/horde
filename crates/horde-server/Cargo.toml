@@ -27,6 +27,9 @@ horde-relay = { workspace = true }
 # export pipeline both live there, where they are testable.
 horde-observe = { workspace = true }
 horde-proto = { workspace = true }
+# The diagnostic-log serving loop and wire translations it shares with the
+# worker (ADR-0015).
+horde-wire = { workspace = true }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
@@ -60,6 +63,9 @@ proptest = "1.9.0"
 # The trust suite calls every guarded method by path with an empty body,
 # which needs a codec over `()` rather than a generated client per method.
 tonic-prost = "0.14.6"
+# Paused time: a dispatched read's ten-second tunnel deadline passes in no
+# time at all.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "horde-server"

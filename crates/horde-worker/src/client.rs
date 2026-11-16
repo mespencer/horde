@@ -261,7 +261,32 @@ impl Connection {
         target: &mut dyn ApplyCommand,
         logins: std::sync::Arc<crate::login::LoginPlane>,
     ) -> Result<(), WorkerError> {
+        self.run_with_logs(journal, target, logins, None).await
+    }
+
+    /// [`Self::run`], also serving log reads from `logs` (ADR-0015) when
+    /// this Worker keeps them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    pub async fn run_with_logs(
+        &mut self,
+        journal: &Journal,
+        target: &mut dyn ApplyCommand,
+        logins: std::sync::Arc<crate::login::LoginPlane>,
+        logs: Option<std::sync::Arc<crate::logs::LogServing>>,
+    ) -> Result<(), WorkerError> {
         let mut push_side = self.clone();
+        let logs_client = self.service_client();
+        let logs_worker = self.worker_id.clone();
+        // A Worker that keeps no logs serves no reads; the arm waits forever.
+        let log_plane = async move {
+            match logs {
+                Some(logs) => crate::logs::serve(logs_client, &logs_worker, logs).await,
+                None => std::future::pending().await,
+            }
+        };
         let forward_client = self.service_client();
         let forward_worker = self.worker_id.clone();
         let login_client = self.service_client();
@@ -282,6 +307,9 @@ impl Connection {
             // It also re-advertises after a login exits cleanly, so the
             // accounts it signed in are placeable on this connection.
             outcome = crate::login::serve(login_client, &login_worker, &registered, logins) => outcome,
+            // The log plane (ADR-0015) rides the same lifecycle: its dispatch
+            // stream dies here, and each read ends with its own tunnel.
+            outcome = log_plane => outcome,
         }
     }
 

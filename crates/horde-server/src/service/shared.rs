@@ -83,6 +83,10 @@ pub struct ServerCore {
     /// The server's effective configuration with origins, for
     /// `GetEffectiveConfig`. Empty for a core built without settings.
     pub config: Arc<horde_config::Provenance>,
+    /// Diagnostic logs (ADR-0015): the server's own files, the workers' log
+    /// lanes, and the agent read limits. Ephemeral like `logins`; nothing
+    /// in it is ever journaled.
+    pub logs: crate::diagnostics::LogPlane,
 }
 
 impl ServerCore {
@@ -108,6 +112,7 @@ impl ServerCore {
             tiers: Arc::new(crate::tiers::TierCatalog::shipped_defaults()),
             permission_modes: Arc::new(crate::permission::PermissionModes::shipped()),
             config: Arc::new(horde_config::Provenance::default()),
+            logs: crate::diagnostics::LogPlane::default(),
         }
     }
 
@@ -140,6 +145,15 @@ impl ServerCore {
         policy: crate::workspace_policy::WorkspacePolicyConfig,
     ) -> Self {
         self.workspace_policy = Arc::new(policy);
+        self
+    }
+
+    /// Serves the server's own log files (ADR-0015) from `logs` — the
+    /// serving path points it at `<state>/logs`, followable through the
+    /// binary's tap.
+    #[must_use]
+    pub fn with_local_logs(mut self, logs: horde_observe::reader::LocalLogs) -> Self {
+        self.logs.local = Some(logs);
         self
     }
 

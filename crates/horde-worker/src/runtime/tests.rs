@@ -3137,3 +3137,29 @@ async fn a_revived_workspace_agent_is_registered_with_its_checkout() {
         .expect("the revived agent's checkout is live");
     second.shutdown().await;
 }
+
+/// The agents' `logs` verb serves this Worker's files whichever the Runtime
+/// was handed first, its logs or its endpoints.
+#[tokio::test]
+async fn the_logs_verb_is_served_whichever_comes_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let logs = || Arc::new(crate::logs::LogServing::new(dir.path(), "boot", None));
+    let channel = || tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let logs_first = runtime_with(Script::echoing())
+        .with_logs(logs())
+        .with_agent_endpoints(channel(), "w-test");
+    let endpoints_first = runtime_with(Script::echoing())
+        .with_agent_endpoints(channel(), "w-test")
+        .with_logs(logs());
+    let bare = runtime_with(Script::echoing()).with_agent_endpoints(channel(), "w-test");
+    let serves = |runtime: &Runtime| {
+        runtime
+            .shared
+            .endpoints
+            .as_ref()
+            .is_some_and(|endpoints| endpoints.serves_logs())
+    };
+    assert!(serves(&logs_first));
+    assert!(serves(&endpoints_first));
+    assert!(!serves(&bare));
+}

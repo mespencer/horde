@@ -51,9 +51,14 @@ fn run() -> Result<ExitCode, String> {
     // and a log line interleaved into it breaks the scripts that read it.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,horde_server=debug"));
+    // A serving server also keeps bounded JSON-lines logs under its state
+    // directory (ADR-0015); `HORDE_LOG` filters them, and a typo there is a
+    // refusal like any other.
+    let file = horde_server::startup::file_logging_for(&parsed, |name| std::env::var(name).ok())?;
     tracing::dispatcher::set_global_default(horde_observe::stderr_subscriber(
         filter,
         telemetry.as_ref(),
+        file.as_ref(),
     ))
     .map_err(|error| format!("could not install the subscriber: {error}"))?;
 
@@ -64,13 +69,10 @@ fn run() -> Result<ExitCode, String> {
         Invocation::Print(_) => ExitCode::SUCCESS,
     };
 
-    if let Some(telemetry) = telemetry {
-        // From main's own thread, with the runtime still alive for the flush
-        // to travel its channel. The verdict is discarded deliberately: a
-        // collector that is down must not change an exit code.
-        let _ = telemetry.shutdown();
-    }
-    Ok(code)
+    // What is still queued reaches the file, and export is flushed, before
+    // the process exits — from main's own thread, with the runtime still
+    // alive for the export flush to travel its channel.
+    Ok(horde_observe::conclude(code, file.as_ref(), telemetry))
 }
 
 /// The health-check invocation: open the log, report by exit code.

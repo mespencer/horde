@@ -625,10 +625,56 @@ pub async fn otlp_scrubbed_run(
 ) -> Setup<std::process::Output> {
     let mut command = tokio::process::Command::new(program);
     command.args(arguments);
+    // A caller that bounds the run and gives up must not leave the child.
+    command.kill_on_drop(true);
     command.env_remove(horde_observe::ENDPOINT_VAR);
     command.env_remove(horde_observe::SAMPLE_VAR);
     for (name, value) in environment {
         command.env(name, value);
     }
     Ok(command.output().await?)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod run_tests {
+    use std::time::Duration;
+
+    /// Whether `pid` is gone or only a zombie waiting to be reaped.
+    fn dead(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z'))
+        })
+    }
+
+    /// A run its caller gives up on takes its child with it.
+    #[tokio::test]
+    async fn a_run_given_up_on_takes_its_child_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let arguments = ["-c", script.as_str()];
+        let mut run = Box::pin(super::otlp_scrubbed_run("sh", &arguments, &[]));
+        let mut pid = String::new();
+        for _ in 0..500 {
+            tokio::select! {
+                ended = &mut run => panic!("the child outlived nothing: {ended:?}"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            if pid.ends_with('\n') {
+                break;
+            }
+        }
+        let pid = pid.trim().to_owned();
+        assert!(!pid.is_empty(), "the child said who it is");
+        drop(run);
+        for _ in 0..500 {
+            if dead(&pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the child {pid} outlived the run that was given up on");
+    }
 }

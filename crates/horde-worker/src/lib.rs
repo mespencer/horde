@@ -37,6 +37,7 @@ pub mod hub;
 mod inbox;
 pub mod journal;
 pub mod login;
+pub mod logs;
 pub mod process;
 pub mod process_tree;
 pub mod runtime;
