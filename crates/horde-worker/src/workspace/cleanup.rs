@@ -298,6 +298,7 @@ async fn remove_checkout(
                 ..RepoAction::default()
             },
             Err(error) => {
+                // #[gamma::skip(assign_value.default, reason = "`bool::default()` is `false`, the value assigned, so the mutant is the same expression")]
                 all_removed = false;
                 RepoAction {
                     repo_name: repo.name.clone(),
@@ -379,6 +380,7 @@ pub async fn note_activity(
         && at_ms > record.last_active_at_ms
     {
         record.last_active_at_ms = at_ms;
+        // #[gamma::skip(assign_value.default, reason = "`Option::default()` is `None`, the value assigned, so the mutant is the same expression")]
         record.soft_reclaimed_at_ms = None;
         let _ = ledger::write(&agents_dir, &record).await;
     }

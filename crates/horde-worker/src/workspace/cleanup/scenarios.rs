@@ -16,8 +16,10 @@ use super::{
     AgentId, CleanupTier, CleanupTrigger, LedgerRecord, Outcome, Pass, RepoAction, RetainedFile,
     WorkerId, WorkspaceCleanup, WorkspaceDefinition, WorkspaceDefinitionId,
     WorkspaceInstanceReport, WorkspaceInstanceState, WorkspaceManager, WorkspacePolicy,
-    commit_older_than, hard_remove, ledger, note_activity, removal, remove_instance, unpin,
+    commit_older_than, hard_remove, ledger, mark_archived, note_activity, removal, remove_instance,
+    soft_reclaim, unpin,
 };
+use crate::workspace::policy::{AutoRule, CommandSpec};
 
 const WS: &str = "ws-1";
 
@@ -201,6 +203,11 @@ async fn a_refused_checkout_names_each_repo_and_why() {
 
     let (event, removed) = rig.hard("agent-1", false, false).await;
     assert!(!removed);
+    assert_eq!(event.worker_id, Some(WorkerId::new("worker-1")));
+    assert_eq!(
+        event.workspace_definition_id,
+        Some(WorkspaceDefinitionId::new(WS))
+    );
     let atlas = event
         .repos
         .iter()
@@ -669,4 +676,335 @@ async fn a_lossless_checkout_goes_with_its_instance() {
     assert_eq!(events.len(), 2);
     assert_eq!(outcome(&events[0].repos[0]), Outcome::Done);
     assert!(!rig.instance().exists());
+}
+
+// ---- soft reclaim and the ledger ----------------------------------------------
+
+/// A rule that runs `argv` in any repo holding `marker`.
+fn rule(marker: &str, argv: &[&str]) -> AutoRule {
+    AutoRule {
+        marker_file: marker.to_owned(),
+        command: CommandSpec {
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+            timeout: None,
+            output_paths: Vec::new(),
+        },
+    }
+}
+
+impl Rig {
+    fn pass_as(&self, trigger: CleanupTrigger, dry_run: bool) -> Pass<'_> {
+        Pass {
+            trigger,
+            gc_request_id: "",
+            dry_run,
+            policy: &self.policy,
+        }
+    }
+
+    async fn soft(&self, agent: &str, trigger: CleanupTrigger, dry_run: bool) -> WorkspaceCleanup {
+        let record = self.record(agent).await.expect("a ledgered checkout");
+        soft_reclaim(&self.manager, WS, &record, self.pass_as(trigger, dry_run)).await
+    }
+}
+
+/// Without the Instance's state file, both operations still name the
+/// agent, and nothing is removed.
+#[tokio::test]
+async fn without_a_state_file_the_events_still_name_the_agent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new("worker-1", temp.path());
+    let policy = WorkspacePolicy::default();
+    let record = LedgerRecord {
+        agent_id: "agent-1".to_owned(),
+        ..LedgerRecord::default()
+    };
+    let pass = Pass {
+        trigger: CleanupTrigger::Explicit,
+        gc_request_id: "",
+        dry_run: false,
+        policy: &policy,
+    };
+    let soft = soft_reclaim(&manager, WS, &record, pass).await;
+    assert_eq!(soft.agent_id, Some(AgentId::new("agent-1")));
+    assert!(soft.repos.is_empty());
+    let (hard, removed) = hard_remove(&manager, WS, &record, pass, true).await;
+    assert!(!removed, "nothing to remove is not a removal");
+    assert_eq!(hard.agent_id, Some(AgentId::new("agent-1")));
+    assert!(hard.repos.is_empty());
+    let (events, report) = remove_instance(&manager, WS, &[], &no_relay, pass, true).await;
+    assert!(events.is_empty());
+    assert_eq!(report, None);
+}
+
+/// A dry-run soft reclaim says what it would run and runs nothing, and
+/// writes nothing to the ledger.
+#[tokio::test]
+async fn a_dry_run_soft_reclaim_runs_and_records_nothing() {
+    let mut rig = Rig::new(&["atlas"], &[]).await;
+    rig.policy.auto_rules = vec![rule("BUILD", &["rm", "-rf", "build"])];
+    let root = rig.spawn("agent-1").await;
+    std::fs::write(root.join("atlas/BUILD"), "").expect("marker");
+    std::fs::create_dir(root.join("atlas/build")).expect("build dir");
+    let before = rig.record("agent-1").await;
+
+    let event = rig.soft("agent-1", CleanupTrigger::Scan, true).await;
+    assert_eq!(outcome(&event.repos[0]), Outcome::WouldDo);
+    assert_eq!(event.repos[0].argv, vec!["rm", "-rf", "build"]);
+    assert!(root.join("atlas/build").exists(), "nothing ran");
+    assert_eq!(
+        rig.record("agent-1").await,
+        before,
+        "the ledger is untouched"
+    );
+}
+
+/// A dry run whose every repo would be skipped still writes nothing.
+#[tokio::test]
+async fn a_dry_run_that_would_skip_everything_records_nothing() {
+    let rig = Rig::new(&["atlas"], &[]).await;
+    rig.spawn("agent-1").await;
+    let before = rig.record("agent-1").await;
+    let event = rig.soft("agent-1", CleanupTrigger::Scan, true).await;
+    assert_eq!(outcome(&event.repos[0]), Outcome::Skipped);
+    assert_eq!(rig.record("agent-1").await, before);
+}
+
+/// The reclaim is settled only when every repo was done or skipped: one
+/// failure leaves it unsettled.
+#[tokio::test]
+async fn one_failed_repo_leaves_the_reclaim_unsettled() {
+    let mut rig = Rig::new(&["atlas", "beta"], &[]).await;
+    rig.policy.auto_rules = vec![rule("FAIL", &["false"])];
+    let root = rig.spawn("agent-1").await;
+    std::fs::write(root.join("beta/FAIL"), "").expect("marker");
+
+    let event = rig.soft("agent-1", CleanupTrigger::Explicit, false).await;
+    let outcomes: Vec<Outcome> = event.repos.iter().map(outcome).collect();
+    assert_eq!(outcomes, vec![Outcome::Skipped, Outcome::Failed]);
+    let record = rig.record("agent-1").await.expect("the record");
+    assert_eq!(record.soft_reclaimed_at_ms, None);
+
+    std::fs::remove_file(root.join("beta/FAIL")).expect("marker gone");
+    rig.soft("agent-1", CleanupTrigger::Explicit, false).await;
+    let record = rig.record("agent-1").await.expect("the record");
+    assert!(record.soft_reclaimed_at_ms.is_some(), "all skipped settles");
+    assert!(!record.orphan_reported, "only a scan reports an orphan");
+
+    rig.soft("agent-1", CleanupTrigger::Scan, false).await;
+    let record = rig.record("agent-1").await.expect("the record");
+    assert!(record.orphan_reported, "a scan's reclaim reports it");
+}
+
+/// A reclaim that changes nothing in its record does not write it back:
+/// what was written since the caller read it stays.
+#[tokio::test]
+async fn an_unchanged_record_is_not_written_back() {
+    let mut rig = Rig::new(&["atlas"], &[]).await;
+    rig.policy.auto_rules = vec![rule("FAIL", &["false"])];
+    let root = rig.spawn("agent-1").await;
+    std::fs::write(root.join("atlas/FAIL"), "").expect("marker");
+    let read = rig.record("agent-1").await.expect("the record");
+    let later = read.last_active_at_ms + 60_000;
+    note_activity(&rig.manager, WS, "agent-1", later).await;
+
+    let event = soft_reclaim(
+        &rig.manager,
+        WS,
+        &read,
+        rig.pass_as(CleanupTrigger::Explicit, false),
+    )
+    .await;
+    assert_eq!(outcome(&event.repos[0]), Outcome::Failed);
+    let record = rig.record("agent-1").await.expect("the record");
+    assert_eq!(record.last_active_at_ms, later);
+}
+
+/// A dry-run refusal leaves the retained reason alone; a real one records
+/// every repo's reason.
+#[tokio::test]
+async fn only_a_real_refusal_records_why_the_checkout_stays() {
+    let rig = Rig::new(&["atlas", "beta"], &[]).await;
+    let root = rig.spawn("agent-1").await;
+    std::fs::write(root.join("atlas/a.txt"), "a").expect("untracked");
+    std::fs::write(root.join("beta/b.txt"), "b").expect("untracked");
+
+    rig.hard("agent-1", true, false).await;
+    let record = rig.record("agent-1").await.expect("the record");
+    assert_eq!(record.retained_reason, "");
+
+    rig.hard("agent-1", false, false).await;
+    let record = rig.record("agent-1").await.expect("the record");
+    assert_eq!(
+        record.retained_reason,
+        "untracked files: 1; untracked files: 1"
+    );
+}
+
+/// Archiving twice keeps the first archive time.
+#[tokio::test]
+async fn an_archive_time_is_set_once() {
+    let rig = Rig::new(&["atlas"], &[]).await;
+    rig.spawn("agent-1").await;
+    let first = mark_archived(&rig.manager, WS, "agent-1")
+        .await
+        .expect("archived")
+        .archived_at_ms;
+    assert!(first.is_some());
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let second = mark_archived(&rig.manager, WS, "agent-1")
+        .await
+        .expect("archived")
+        .archived_at_ms;
+    assert_eq!(second, first);
+    assert_eq!(
+        rig.record("agent-1")
+            .await
+            .and_then(|record| record.archived_at_ms),
+        first
+    );
+}
+
+// ---- archive pins, across repos and agents -------------------------------------
+
+/// A repo with no pins is not fetched: an unpin pass has nothing to prove
+/// there.
+#[tokio::test]
+async fn a_repo_without_pins_is_not_fetched() {
+    let rig = Rig::new(&["atlas"], &[]).await;
+    let repo = rig.instance_repo("atlas");
+    let tracked = git(&repo, &["rev-parse", "refs/remotes/origin/main"]);
+    let origin = rig._temp.path().join("atlas-origin");
+    std::fs::write(origin.join("new.txt"), "new").expect("file");
+    git(&origin, &["add", "."]);
+    git(&origin, &["commit", "-qm", "new"]);
+
+    assert!(rig.unpin(false, false).await.is_empty());
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tracked
+    );
+}
+
+/// A repo without pins does not end the pass: the next repo's pins go.
+#[tokio::test]
+async fn a_repo_without_pins_does_not_end_the_pass() {
+    let rig = Rig::new(&["atlas", "beta"], &[]).await;
+    rig.spawn("agent-1").await;
+    let (_, removed) = rig.hard("agent-1", false, false).await;
+    assert!(removed);
+    git(
+        &rig.instance_repo("atlas"),
+        &["update-ref", "-d", &removal::pin_ref("agent-1")],
+    );
+
+    let events = rig.unpin(false, false).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].repos[0].repo_name, "beta");
+    assert_eq!(outcome(&events[0].repos[0]), Outcome::Done);
+    assert!(!has_ref(
+        &rig.instance_repo("beta"),
+        &removal::pin_ref("agent-1")
+    ));
+}
+
+/// A ledgered agent's pin stays, and does not end the pass.
+#[tokio::test]
+async fn a_ledgered_agents_pin_stays() {
+    let rig = Rig::new(&["atlas"], &[]).await;
+    rig.spawn("agent-a").await;
+    rig.spawn("agent-b").await;
+    let (_, removed) = rig.hard("agent-b", false, false).await;
+    assert!(removed);
+    let repo = rig.instance_repo("atlas");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    git(
+        &repo,
+        &["update-ref", &removal::pin_ref("agent-a"), head.trim()],
+    );
+
+    let events = rig.unpin(false, false).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].agent_id, Some(AgentId::new("agent-b")));
+    assert!(has_ref(&repo, &removal::pin_ref("agent-a")));
+    assert!(!has_ref(&repo, &removal::pin_ref("agent-b")));
+}
+
+// ---- Instance removal, refusals ----------------------------------------------------
+
+/// Live agents refuse the removal outright, by name, with no report.
+#[tokio::test]
+async fn live_agents_refuse_the_instance_by_name() {
+    let rig = Rig::new(&["atlas"], &[]).await;
+    let live = vec!["agent-1".to_owned(), "agent-2".to_owned()];
+    let (events, report) =
+        remove_instance(&rig.manager, WS, &live, &no_relay, rig.pass(false), true).await;
+    assert_eq!(report, None);
+    assert_eq!(
+        refusal_reason(&events),
+        "agents still live in this instance: agent-1, agent-2"
+    );
+    assert!(rig.instance().exists());
+}
+
+/// Every blocker is named, in order.
+#[tokio::test]
+async fn every_blocker_is_named() {
+    let rig = Rig::new(&["atlas"], &["data"]).await;
+    std::fs::write(rig.instance_repo("atlas").join("stray.txt"), "x").expect("dirty");
+    std::fs::write(rig.instance().join("data/kept"), "x").expect("data");
+    let (events, _) = rig.remove(false, false).await;
+    assert_eq!(
+        refusal_reason(&events),
+        "repo atlas: untracked files: 1; non-empty unmanaged data cannot be proven recoverable"
+    );
+}
+
+/// A ledgered checkout with no repos blocks nothing in a dry run.
+#[tokio::test]
+async fn an_empty_checkout_does_not_block_a_dry_run() {
+    let rig = Rig::new(&["atlas"], &[]).await;
+    ledger::write(
+        &rig.manager.agents_dir(WS),
+        &LedgerRecord {
+            agent_id: "agent-x".to_owned(),
+            ..LedgerRecord::default()
+        },
+    )
+    .await
+    .expect("written");
+    let (events, _) = rig.remove(true, false).await;
+    let actions = instance_actions(&events);
+    assert_eq!(actions.len(), 1, "{events:?}");
+    assert_eq!(outcome(&actions[0]), Outcome::WouldDo, "{actions:?}");
+}
+
+/// One byte standing in an unmanaged path's place is data.
+#[tokio::test]
+async fn a_one_byte_unmanaged_file_is_data() {
+    let rig = Rig::new(&["atlas"], &["data"]).await;
+    let data = rig.instance().join("data");
+    std::fs::remove_dir_all(&data).expect("dir gone");
+    std::fs::write(&data, "x").expect("one byte");
+    let (events, report) = rig.remove(false, false).await;
+    assert_eq!(report, None);
+    assert_eq!(
+        instance_actions(&events)[0].unrecoverable_files,
+        vec![RetainedFile {
+            path: "data".to_owned(),
+            bytes: 1
+        }]
+    );
+}
+
+/// A repo git cannot even run in has no provable age.
+#[test]
+fn a_commit_in_no_repo_is_never_old() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let hour = std::time::Duration::from_secs(3600);
+    assert!(!commit_older_than(
+        &temp.path().join("absent"),
+        "HEAD",
+        hour
+    ));
 }

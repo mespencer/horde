@@ -111,14 +111,15 @@ async fn history_refusal(target: Target<'_>) -> Result<Option<String>, String> {
     let head = commit_of(target.checkout, "HEAD")
         .await
         .ok_or_else(|| "HEAD names no commit".to_owned())?;
-    let branch_holder = if target.fresh_clone {
-        target.checkout
-    } else {
-        target.instance_repo
-    };
-    if let Some(tip) = commit_of(branch_holder, &format!("refs/heads/{}", target.branch)).await
+    // The branch is read where the checkout reads it: a clone's own, or —
+    // a worktree sharing its Instance's refs — the Instance's.
+    if let Some(tip) = commit_of(target.checkout, &format!("refs/heads/{}", target.branch)).await
         && tip != head
-        && !git_check(branch_holder, &["merge-base", "--is-ancestor", &tip, &head]).await?
+        && !git_check(
+            target.checkout,
+            &["merge-base", "--is-ancestor", &tip, &head],
+        )
+        .await?
     {
         return Ok(Some(format!(
             "branch {} holds commits HEAD does not",
@@ -774,6 +775,271 @@ mod tests {
         assert_eq!(
             instance_tree_clean(&fixture.instance).await,
             Ok(Some("uncommitted changes: 1".to_owned()))
+        );
+    }
+    /// The refusal counts every ignored path outside the outputs and names
+    /// the first: one under an output path is passed over, not the end.
+    #[tokio::test]
+    async fn ignored_loss_is_counted_whole_and_named_by_its_first_path() {
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.instance.join(".git/info/exclude"),
+            "*.log\nbuild/\n",
+        )
+        .expect("excludes");
+        std::fs::write(fixture.worktree.join("a.log"), "a").expect("a.log");
+        std::fs::create_dir(fixture.worktree.join("build")).expect("build");
+        std::fs::write(fixture.worktree.join("build/out"), "o").expect("output");
+        std::fs::write(fixture.worktree.join("z.log"), "z").expect("z.log");
+        let outputs = vec!["build".to_owned()];
+        let target = Target {
+            output_paths: &outputs,
+            ..fixture.target()
+        };
+        assert_eq!(
+            removable(target).await.reason(),
+            "2 ignored path(s) outside the reclaim command's outputs, e.g. a.log"
+        );
+    }
+
+    /// A checkout whose HEAD names no commit has nothing to prove from.
+    #[tokio::test]
+    async fn a_head_naming_no_commit_is_not_provable() {
+        let temp = tempfile::tempdir().expect("a tempdir");
+        run_git(temp.path(), &["init", "-q", "-b", "main"]);
+        let target = Target {
+            instance_repo: temp.path(),
+            checkout: temp.path(),
+            branch: "agent/b",
+            fresh_clone: true,
+            output_paths: &[],
+        };
+        assert_eq!(
+            removable(target).await.reason(),
+            "not provable: HEAD names no commit"
+        );
+    }
+
+    /// Rule 4 on a fresh clone reads the clone's own branch.
+    #[tokio::test]
+    async fn a_clones_own_branch_ahead_of_head_refuses() {
+        let fixture = Fixture::new();
+        let clone = fixture.instance.parent().expect("a parent").join("clone");
+        run_git(
+            fixture.instance.parent().expect("a parent"),
+            &[
+                "clone",
+                "-q",
+                &path_str(&fixture.instance),
+                &path_str(&clone),
+            ],
+        );
+        run_git(&clone, &["checkout", "-q", "-b", "agent/b"]);
+        commit(&clone, "ahead");
+        run_git(&clone, &["checkout", "-q", "--detach", "HEAD~1"]);
+        let target = Target {
+            checkout: &clone,
+            fresh_clone: true,
+            ..fixture.target()
+        };
+        assert_eq!(
+            removable(target).await.reason(),
+            "branch agent/b holds commits HEAD does not"
+        );
+    }
+
+    /// Rule 5 is a clone's alone: a worktree's Instance may hold other
+    /// branches with commits outside HEAD's history.
+    #[tokio::test]
+    async fn other_instance_branches_do_not_refuse_a_worktree() {
+        let fixture = Fixture::new();
+        run_git(&fixture.instance, &["checkout", "-q", "-b", "side"]);
+        commit(&fixture.instance, "side");
+        run_git(&fixture.instance, &["checkout", "-q", "main"]);
+        assert_eq!(removable(fixture.target()).await, Proof::Lossless);
+    }
+
+    /// Each operation git can leave in progress refuses, by name.
+    #[tokio::test]
+    async fn every_operation_in_progress_refuses_by_name() {
+        let fixture = Fixture::new();
+        let git_dir = run_git(&fixture.worktree, &["rev-parse", "--absolute-git-dir"]);
+        for (marker, operation, dir) in [
+            ("CHERRY_PICK_HEAD", "cherry-pick", false),
+            ("REVERT_HEAD", "revert", false),
+            ("BISECT_LOG", "bisect", false),
+            ("rebase-merge", "rebase", true),
+            ("rebase-apply", "rebase", true),
+        ] {
+            let path = Path::new(&git_dir).join(marker);
+            if dir {
+                std::fs::create_dir(&path).expect("a marker dir");
+            } else {
+                std::fs::write(&path, "x").expect("a marker");
+            }
+            assert_eq!(
+                removable(fixture.target()).await.reason(),
+                format!("a {operation} is in progress"),
+                "{marker}"
+            );
+            if dir {
+                std::fs::remove_dir(&path).expect("marker removed");
+            } else {
+                std::fs::remove_file(&path).expect("marker removed");
+            }
+        }
+    }
+
+    /// The unforced removal re-checks after pinning: a tree that changed
+    /// since the check is not removed.
+    #[tokio::test]
+    async fn an_unforced_removal_rechecks_the_tree() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.worktree.join("late.txt"), "late").expect("a late file");
+        assert_eq!(
+            remove_repo(fixture.target(), "agent-1", true, false).await,
+            Err("changed after the check: untracked files: 1".to_owned())
+        );
+        assert!(fixture.worktree.join("late.txt").exists());
+    }
+
+    /// An unforced removal does not force git: git's own refusal (here, a
+    /// worktree holding a submodule) stands. Forced, it goes.
+    #[tokio::test]
+    async fn only_a_forced_removal_forces_git() {
+        let fixture = Fixture::new();
+        let module = fixture.instance.parent().expect("a parent").join("module");
+        std::fs::create_dir(&module).expect("module dir");
+        run_git(&module, &["init", "-q", "-b", "main"]);
+        commit(&module, "m");
+        run_git(
+            &fixture.worktree,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &path_str(&module),
+                "sub",
+            ],
+        );
+        run_git(&fixture.worktree, &["commit", "-qm", "sub"]);
+        let refused = remove_repo(fixture.target(), "agent-1", true, false).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("submodules")),
+            "{refused:?}"
+        );
+        assert!(fixture.worktree.exists());
+        remove_repo(fixture.target(), "agent-1", true, true)
+            .await
+            .expect("forced, it goes");
+        assert!(!fixture.worktree.exists());
+    }
+
+    /// A removal repeated after it completed succeeds again: the created
+    /// branch is already gone, and the pin is reported.
+    #[tokio::test]
+    async fn a_repeated_removal_is_idempotent() {
+        let fixture = Fixture::new();
+        let first = remove_repo(fixture.target(), "agent-1", true, false)
+            .await
+            .expect("removed");
+        assert_eq!(
+            remove_repo(fixture.target(), "agent-1", true, false).await,
+            Ok(first)
+        );
+    }
+
+    /// The keepers: whether origin fetched, and the commits the Relay's
+    /// share refs name.
+    #[tokio::test]
+    async fn keepers_list_the_relays_share_commits() {
+        let fixture = Fixture::new();
+        let relay = fixture.instance.parent().expect("a parent").join("relay");
+        std::fs::create_dir(&relay).expect("relay dir");
+        run_git(&relay, &["init", "-q", "--bare"]);
+        let head = run_git(&fixture.instance, &["rev-parse", "HEAD"]);
+        run_git(
+            &fixture.instance,
+            &["push", "-q", &path_str(&relay), "HEAD:refs/horde/share/a1"],
+        );
+        let timeout = std::time::Duration::from_secs(30);
+        let keepers = keepers(&fixture.instance, Some(&path_str(&relay)), timeout).await;
+        assert!(!keepers.origin_fetched, "there is no origin");
+        assert_eq!(keepers.relay_shares, vec![head]);
+
+        run_git(
+            &fixture.instance,
+            &["remote", "add", "origin", &path_str(&relay)],
+        );
+        let keepers = keepers_of(&fixture.instance, timeout).await;
+        assert!(keepers.origin_fetched);
+        assert!(keepers.relay_shares.is_empty(), "no Relay was named");
+    }
+
+    async fn keepers_of(instance: &Path, timeout: std::time::Duration) -> Keepers {
+        keepers(instance, None, timeout).await
+    }
+
+    /// Without this pass's fetch, a stale origin ref proves nothing.
+    #[tokio::test]
+    async fn a_stale_origin_ref_proves_nothing_without_the_fetch() {
+        let fixture = Fixture::new();
+        let head = run_git(&fixture.instance, &["rev-parse", "HEAD"]);
+        run_git(
+            &fixture.instance,
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        run_git(
+            &fixture.instance,
+            &["update-ref", "refs/horde/archived/a", &head],
+        );
+        let unfetched = Keepers::default();
+        assert_eq!(
+            reachable(&fixture.instance, "refs/horde/archived/a", &unfetched)
+                .await
+                .reason(),
+            "not provable: the fetch from origin failed in this pass"
+        );
+        let fetched = Keepers {
+            origin_fetched: true,
+            relay_shares: Vec::new(),
+        };
+        assert_eq!(
+            reachable(&fixture.instance, "refs/horde/archived/a", &fetched).await,
+            Proof::Lossless
+        );
+    }
+
+    /// A share whose history git cannot read keeps nothing: an error in
+    /// the ancestry check is not a yes.
+    #[tokio::test]
+    async fn an_unreadable_share_history_keeps_nothing() {
+        let fixture = Fixture::new();
+        let instance = &fixture.instance;
+        let seed = run_git(instance, &["rev-parse", "HEAD"]);
+        run_git(instance, &["checkout", "-q", "-b", "feature"]);
+        let middle = commit(instance, "middle");
+        let share = commit(instance, "share");
+        let object = instance
+            .join(".git/objects")
+            .join(&middle[..2])
+            .join(&middle[2..]);
+        std::fs::remove_file(&object).expect("the loose object");
+        std::fs::write(&object, "garbage").expect("a corrupt object");
+        run_git(instance, &["update-ref", "refs/horde/archived/a", &seed]);
+        let keepers = Keepers {
+            origin_fetched: false,
+            relay_shares: vec![share],
+        };
+        assert_eq!(
+            reachable(instance, "refs/horde/archived/a", &keepers)
+                .await
+                .reason(),
+            "not provable: the fetch from origin failed in this pass"
         );
     }
 }
