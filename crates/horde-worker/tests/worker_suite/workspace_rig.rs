@@ -157,10 +157,12 @@ pub(crate) async fn three_repo_rig(temp: &Path) -> Rig {
 }
 
 /// Waits for workspace work — clones, fetches, worktree adds, reclaim
-/// commands — under a ceiling sized for real git under a parallel suite's
-/// load, while still turning a hang into a failure rather than a stuck run.
+/// commands — under a ceiling with room for real git under a parallel
+/// suite's load (the slowest whole test here takes a few seconds), that
+/// still ends well inside a mutation run's per-mutant timeout: work that
+/// never settles fails its test instead of stalling the run.
 pub(crate) async fn settled_within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-    match tokio::time::timeout(Duration::from_secs(120), future).await {
+    match tokio::time::timeout(Duration::from_secs(30), future).await {
         Ok(value) => value,
         Err(_) => panic!("{what} must finish rather than hang"),
     }
