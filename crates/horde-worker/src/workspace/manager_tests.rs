@@ -483,33 +483,37 @@ async fn the_shared_policy_is_the_instance_itself() {
 
 /// The bytes `statvfs` reports agree with `df`'s: the filesystem's size
 /// exactly, and its free space to within half a block per free block —
-/// tight enough that miscounting the block size by one is caught, loose
-/// enough for other writers between the two readings.
+/// tight enough that miscounting the block size by one is caught. Other
+/// writers can move free space between the two readings, so a reading is
+/// retried a few times; a miscount is off by the same amount every time.
 #[test]
 fn statvfs_agrees_with_df() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (free, total) = StatvfsStats.stats(dir.path()).expect("a real filesystem");
-    let output = std::process::Command::new("df")
-        .args(["-B1", "--output=size,avail"])
-        .arg(dir.path())
-        .output()
-        .expect("df runs");
-    assert!(output.status.success(), "df failed");
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let numbers: Vec<u64> = text
-        .lines()
-        .nth(1)
-        .expect("df's row")
-        .split_whitespace()
-        .map(|field| field.parse().expect("a byte count"))
-        .collect();
-    let (size, avail) = (numbers[0], numbers[1]);
-    assert_eq!(total, size, "the filesystem's size");
-    let tolerance = avail / 8192;
-    assert!(
-        free.abs_diff(avail) <= tolerance,
-        "free {free} vs df {avail}"
-    );
+    let mut last = None;
+    for _ in 0..10 {
+        let (free, total) = StatvfsStats.stats(dir.path()).expect("a real filesystem");
+        let output = std::process::Command::new("df")
+            .args(["-B1", "--output=size,avail"])
+            .arg(dir.path())
+            .output()
+            .expect("df runs");
+        assert!(output.status.success(), "df failed");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let numbers: Vec<u64> = text
+            .lines()
+            .nth(1)
+            .expect("df's row")
+            .split_whitespace()
+            .map(|field| field.parse().expect("a byte count"))
+            .collect();
+        let (size, avail) = (numbers[0], numbers[1]);
+        assert_eq!(total, size, "the filesystem's size");
+        if free.abs_diff(avail) <= avail / 8192 {
+            return;
+        }
+        last = Some((free, avail));
+    }
+    panic!("statvfs's free space never agreed with df's: {last:?}");
 }
 
 /// Collects the progress a materialization reports, as `(step, completed,
