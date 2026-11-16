@@ -70,9 +70,13 @@ pub struct ServeConfig {
     /// ([`crate::blob::DEFAULT_MAX_BLOB_BYTES`]). This is DESIGN §8's
     /// "server-configurable size cap".
     pub blob_max_bytes: Option<u64>,
-    /// Serve the git Relay here (DESIGN §8, fix a10). `None` serves no
-    /// relay; loopback only — see [`crate::relay::mount`].
+    /// Serve the git Relay's plaintext door here (DESIGN §8, fix a10).
+    /// `None` serves no such door; loopback only — see
+    /// [`crate::relay::mount`].
     pub relay_bind: Option<SocketAddr>,
+    /// Serve the git Relay's mTLS door here: the one workers on other
+    /// machines dial, presenting their enrolled identity. Any address.
+    pub relay_mtls_bind: Option<SocketAddr>,
     /// The worker-lost lease (ADR-0011); `None` takes
     /// [`crate::liveness::DEFAULT_WORKER_LEASE`].
     pub worker_lease: Option<std::time::Duration>,
@@ -139,9 +143,15 @@ struct ServerArgs {
     #[arg(long, requires = "serve", default_value = "127.0.0.1:7778")]
     enrollment_bind: SocketAddr,
 
-    /// Serve the git Relay here (loopback only).
+    /// Serve the git Relay's plaintext door here (loopback only).
     #[arg(long, requires = "serve")]
     relay_bind: Option<SocketAddr>,
+
+    /// Serve the git Relay's mTLS door here — the address workers on other
+    /// machines reach it at (`horde-worker --relay https://<san>:<port>`).
+    /// Every git dial presents an enrolled certificate.
+    #[arg(long, requires = "serve")]
+    relay_mtls_bind: Option<SocketAddr>,
 
     /// An extra name the listener certificate answers to — the host other
     /// machines dial. Repeatable. Join tokens name the first one when the
@@ -225,6 +235,7 @@ pub fn invocation_in(
         subject_names: args.subject_names,
         blob_max_bytes: args.blob_max_bytes,
         relay_bind: args.relay_bind,
+        relay_mtls_bind: args.relay_mtls_bind,
         worker_lease: args.worker_lease.map(std::time::Duration::from_secs),
     })))
 }
@@ -264,7 +275,8 @@ pub struct RunningServer {
     /// This server's hold on its state directory: a second server on the
     /// same state refuses while this lives.
     pub state_lock: horde_identity::StateLock,
-    /// The mounted git Relay, when `--relay-bind` asked for one.
+    /// The mounted git Relay, when `--relay-bind` or `--relay-mtls-bind`
+    /// asked for one.
     pub relay: Option<crate::relay::MountedRelay>,
     /// One line per hub-placed MCP server the startup warm-up touched
     /// (ADR-0004): connected with its tool count, or unavailable with the
@@ -453,7 +465,7 @@ pub async fn serve(config: &ServeConfig) -> Result<RunningServer, ServerError> {
         ),
     };
 
-    let relay = mounted_relay(config, &core).await?;
+    let relay = mounted_relay(config, &core, &authority).await?;
     let hub_lines = warm_hub(&core).await?;
 
     let main = crate::transport::serve_main(main_listener, core, Arc::clone(&authority)).await?;
@@ -591,23 +603,32 @@ fn blob_store(config: &ServeConfig) -> Result<crate::blob::BlobStore, ServerErro
     })
 }
 
-/// The Relay, when `--relay-bind` asked for one (DESIGN §8, fix a10) —
-/// mounted before the gRPC listeners so a bad relay bind fails startup whole
-/// rather than leaving a half-up server.
+/// The Relay, when `--relay-bind` or `--relay-mtls-bind` asked for one
+/// (DESIGN §8, fix a10) — mounted before the gRPC listeners so a bad relay
+/// bind fails startup whole rather than leaving a half-up server. The mTLS
+/// door authenticates with the main listener's credential, CA and live
+/// revocation list: the same trust, so a revoked worker loses the Relay at
+/// its next handshake.
 ///
 /// # Errors
 ///
-/// The mount failing: the bind, or the relay's own state directory.
+/// The mount failing: a bind, the TLS material, or the relay's own state
+/// directory.
 async fn mounted_relay(
     config: &ServeConfig,
     core: &ServerCore,
+    authority: &EnrollmentAuthority,
 ) -> Result<Option<crate::relay::MountedRelay>, ServerError> {
-    match config.relay_bind {
-        Some(bind) => Ok(Some(
-            crate::relay::mount(bind, &config.state_dir, &core.log).await?,
-        )),
-        None => Ok(None),
-    }
+    let doors = crate::relay::RelayDoors {
+        loopback: config.relay_bind,
+        mtls: config.relay_mtls_bind.map(|bind| crate::relay::MtlsDoor {
+            bind,
+            credential: authority.credential(),
+            ca_pem: authority.ca_pem(),
+            deny: authority.deny_list(),
+        }),
+    };
+    crate::relay::mount(doors, &config.state_dir, &core.log).await
 }
 
 /// Warms the MCP Hub's upstreams (ADR-0004, 2026-08-19 amendment) from the
@@ -714,7 +735,12 @@ pub fn operator_lines(running: &RunningServer) -> Vec<String> {
         format!("server-fingerprint {}", running.server_fingerprint),
     ];
     if let Some(relay) = &running.relay {
-        lines.push(format!("listening relay={}", relay.server.addr()));
+        if let Some(door) = &relay.loopback {
+            lines.push(format!("listening relay={}", door.addr()));
+        }
+        if let Some(door) = &relay.mtls {
+            lines.push(format!("listening relay-mtls={}", door.addr()));
+        }
     }
     lines.extend(running.hub_lines.iter().cloned());
     // The same token the state dir's bootstrap-token file carries: the
@@ -848,6 +874,8 @@ mod tests {
             "1048576",
             "--relay-bind",
             "127.0.0.1:7420",
+            "--relay-mtls-bind",
+            "0.0.0.0:7779",
             "--worker-lease",
             "45",
         ]) else {
@@ -860,6 +888,11 @@ mod tests {
         assert_eq!(
             config.relay_bind.map(|addr| addr.to_string()),
             Some("127.0.0.1:7420".to_owned())
+        );
+        assert_eq!(
+            config.relay_mtls_bind.map(|addr| addr.to_string()),
+            Some("0.0.0.0:7779".to_owned()),
+            "the mTLS door may bind wide: it authenticates every dial"
         );
         assert_eq!(config.database, "/tmp/x.db");
         assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
@@ -888,6 +921,7 @@ mod tests {
             "unset lets the store keep its documented default"
         );
         assert_eq!(defaulted.worker_lease, None);
+        assert_eq!(defaulted.relay_mtls_bind, None);
     }
 
     /// A mistyped flag silently falling back to a default would serve on the
@@ -913,6 +947,7 @@ mod tests {
             (&["--state-dir", "/tmp/x"][..], "--serve"),
             (&["--blob-max-bytes", "1"][..], "--serve"),
             (&["--relay-bind", "127.0.0.1:1"][..], "--serve"),
+            (&["--relay-mtls-bind", "127.0.0.1:1"][..], "--serve"),
             (
                 &["--serve", "--relay-bind", "not-an-address"][..],
                 "not-an-address",
@@ -1002,8 +1037,138 @@ mod tests {
             subject_names: Vec::new(),
             blob_max_bytes: None,
             relay_bind,
+            relay_mtls_bind: None,
             worker_lease: None,
         }
+    }
+
+    /// Runs real git, bounded, answering whether it succeeded and what it
+    /// said on stderr.
+    async fn git_ok(args: &[&str]) -> (bool, String) {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::process::Command::new("git").args(args).output(),
+        )
+        .await
+        .expect("git must finish rather than hang")
+        .expect("git runs");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// `--relay-mtls-bind` serves the Relay to other machines: the door
+    /// answers a real `git ls-remote` presenting a worker identity issued by
+    /// the server's own persisted CA, and refuses the same dial with no
+    /// certificate — the wiring uses the listener's trust, not new trust.
+    #[tokio::test]
+    async fn the_relay_mtls_door_serves_enrolled_git_and_refuses_bare_dials() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let origin = directory.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        let origin_path = origin.display().to_string();
+        for args in [
+            &["init", "-q", "-b", "main", &origin_path][..],
+            &[
+                "-C",
+                &origin_path,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "seed",
+                "--allow-empty",
+            ][..],
+        ] {
+            let (ok, stderr) = git_ok(args).await;
+            assert!(ok, "git {args:?}: {stderr}");
+        }
+
+        let mut config = config_in(&directory, None);
+        config.relay_mtls_bind = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        let log = super::open_log(&config.database).expect("the log opens");
+        crate::service::shared::append_server_event(
+            &log,
+            crate::workspace::CATALOG_STREAM,
+            "ws-1:1",
+            horde_proto::v1::Event {
+                agent_id: None,
+                occurred_at: None,
+                idempotency_key: "ws-1:1".to_owned(),
+                kind: Some(horde_proto::v1::event::Kind::WorkspaceDefinitionChanged(
+                    horde_proto::v1::WorkspaceDefinitionChanged {
+                        definition: Some(horde_proto::v1::WorkspaceDefinition {
+                            workspace_definition_id: Some(
+                                horde_proto::v1::WorkspaceDefinitionId::new("ws-1"),
+                            ),
+                            name: "globes".to_owned(),
+                            etag: "1".to_owned(),
+                            repos: vec![horde_proto::v1::WorkspaceRepo {
+                                name: "globe".to_owned(),
+                                remote_url: origin_path.clone(),
+                                default_branch: "main".to_owned(),
+                                layout_path: String::new(),
+                            }],
+                            ..horde_proto::v1::WorkspaceDefinition::default()
+                        }),
+                        deleted: false,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("the definition journals");
+        drop(log);
+
+        let running = super::serve(&config).await.expect("the server comes up");
+        let relay = running
+            .relay
+            .as_ref()
+            .expect("the mTLS door mounts a relay");
+        assert!(
+            relay.loopback.is_none(),
+            "no --relay-bind, no loopback door"
+        );
+        let door = relay.mtls.as_ref().expect("the mTLS door").addr();
+        assert!(
+            super::operator_lines(&running).contains(&format!("listening relay-mtls={door}")),
+            "the operator learns where the mTLS door listens: {:?}",
+            super::operator_lines(&running)
+        );
+
+        // A worker identity from the server's own CA, saved the way a join
+        // saves it.
+        let ca = horde_identity::CertificateAuthority::load(&config.state_dir.join("ca"))
+            .expect("the CA persisted");
+        let (key_pem, csr_pem) = horde_identity::enroll::generate_csr().expect("a CSR");
+        let worker = horde_identity::Principal::new(horde_identity::PrincipalRole::Worker, "w-1")
+            .expect("a valid name");
+        let issued = ca
+            .sign_join(&csr_pem, &worker, super::wall_clock_ms())
+            .expect("signs");
+        let ids = directory.path().join("identity");
+        horde_identity::StoredIdentity {
+            certificate_pem: issued.certificate_pem,
+            key_pem,
+            ca_pem: ca.certificate_pem().to_owned(),
+        }
+        .save(&ids)
+        .expect("the identity saves");
+
+        let url = format!("https://localhost:{}/globe", door.port());
+        let ca_file = format!("http.sslCAInfo={}", ids.join("ca.pem").display());
+        let (bare_ok, _) = git_ok(&["-c", &ca_file, "ls-remote", &url]).await;
+        assert!(!bare_ok, "a dial with no certificate must be refused");
+
+        let identity = horde_relay::RelayIdentity::in_dir(&ids);
+        let cert = format!("http.sslCert={}", identity.certificate.display());
+        let key = format!("http.sslKey={}", identity.key.display());
+        let (ok, stderr) =
+            git_ok(&["-c", &ca_file, "-c", &cert, "-c", &key, "ls-remote", &url]).await;
+        assert!(ok, "an enrolled worker's git must be served: {stderr}");
     }
 
     /// The hub warm-up's effect is on the operator interface: a server
@@ -1070,7 +1235,17 @@ mod tests {
             .relay
             .as_ref()
             .expect("--relay-bind mounts the relay");
-        assert_ne!(relay.server.addr().port(), 0, "the relay bound a real port");
+        assert_ne!(
+            relay
+                .loopback
+                .as_ref()
+                .expect("the loopback door")
+                .addr()
+                .port(),
+            0,
+            "the relay bound a real port"
+        );
+        assert!(relay.mtls.is_none(), "no --relay-mtls-bind, no mTLS door");
         assert!(
             super::operator_lines(&running)
                 .iter()
@@ -1123,7 +1298,12 @@ mod tests {
             lines[3],
             format!(
                 "listening relay={}",
-                running.relay.as_ref().expect("mounted").server.addr()
+                running
+                    .relay
+                    .as_ref()
+                    .and_then(|relay| relay.loopback.as_ref())
+                    .expect("mounted")
+                    .addr()
             )
         );
         assert_eq!(lines[4], format!("bootstrap-client-token {token}"));

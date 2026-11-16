@@ -604,6 +604,30 @@ async fn the_run_loop_redials_dial_failures_until_shutdown() {
     );
 }
 
+/// `--relay` reaches the runtime: payload shares go through the named Relay,
+/// and without the flag there is none. An insecure Worker has no identity to
+/// present, so even an `https://` Relay is dialled bare.
+#[tokio::test]
+async fn prepare_points_payload_shares_at_the_configured_relay() {
+    for relay in [
+        None,
+        Some("http://127.0.0.1:7420"),
+        Some("https://horde.lan:7779"),
+    ] {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut config = harness::insecure_config("http://127.0.0.1:1", "w-relay", state.path());
+        config.relay = relay.map(ToOwned::to_owned);
+        let prepared = horde_worker::startup::prepare(&config, &mut |_| {})
+            .await
+            .expect("an insecure daemon prepares without a server");
+        assert_eq!(
+            prepared.runtime.relay(),
+            relay.map(horde_relay::RelayLocation::new).as_ref(),
+            "{relay:?}"
+        );
+    }
+}
+
 /// Startup sweeps the harness groups a crashed previous run left in the
 /// journal (ADR-0010), before anything spawns, and says how many.
 #[tokio::test]

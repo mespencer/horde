@@ -80,6 +80,12 @@ impl ShareBroker {
         }
     }
 
+    /// The Relay cross-Worker shares go through, if one was configured.
+    #[must_use]
+    pub fn relay(&self) -> Option<&RelayLocation> {
+        self.relay.as_ref()
+    }
+
     /// Records where a spawned Agent's repos live.
     pub fn register(&self, agent_id: &str, checkout: AgentCheckout) {
         self.lock().insert(agent_id.to_owned(), checkout);
