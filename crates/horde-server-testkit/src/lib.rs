@@ -29,10 +29,14 @@
 //! server — a session fetched back, an event replayed — rather than trusting a
 //! returned value.
 
+pub mod port;
 pub mod process;
 pub mod ps;
 pub mod pty;
 pub mod reap;
+// Stand-in scripts go into place through `install`: Unix-only.
+#[cfg(unix)]
+pub mod script;
 pub mod secure;
 
 use horde_cli::Client;

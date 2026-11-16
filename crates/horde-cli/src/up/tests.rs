@@ -363,7 +363,6 @@ fn fake_daemon(
     lines: &[String],
     epilogue: Option<&str>,
 ) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("the bin dir");
     let mark = bin.join(format!("{name}.stopped"));
@@ -377,8 +376,10 @@ fn fake_daemon(
         mark.display(),
         epilogue.unwrap_or("while true; do sleep 1; done")
     );
-    std::fs::write(&path, script).expect("the script writes");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmods");
+    // Installed, never written through a descriptor of this process: a
+    // test running beside this one could fork while it was open, and
+    // exec'ing the script would then fail with ETXTBSY.
+    horde_server_testkit::script::install(&path, &script).expect("the script installs");
     path
 }
 
@@ -766,21 +767,22 @@ async fn a_stale_bootstrap_token_is_refused() {
     assert!(refusal.contains("earlier run"), "{refusal}");
 }
 
+/// The refusal of a bring-up whose scripted server prints `line`, then
+/// runs `death`.
+async fn refusal_of_a_dying_server(line: &str, death: &str) -> String {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let mut environment = idle_rig(root.path(), "127.0.0.1:1");
+    environment.server_binary =
+        fake_daemon(root.path(), "server", "", &[line.to_owned()], Some(death));
+    refusal_of(&environment).await
+}
+
 /// A daemon that dies before its line is reported at once, with what it
 /// said — not after the startup ceiling.
 #[tokio::test]
 async fn a_daemon_dying_during_bring_up_fails_with_its_output() {
-    let root = tempfile::tempdir().expect("a temp dir");
-    let mut environment = idle_rig(root.path(), "127.0.0.1:1");
-    environment.server_binary = fake_daemon(
-        root.path(),
-        "server",
-        "",
-        &["boom: address in use".to_owned()],
-        Some("exit 3"),
-    );
     let started = std::time::Instant::now();
-    let refusal = refusal_of(&environment).await;
+    let refusal = refusal_of_a_dying_server("boom: address in use", "exit 3").await;
     assert!(
         refusal.contains("exited") && refusal.contains("boom: address in use"),
         "{refusal}"
@@ -788,6 +790,25 @@ async fn a_daemon_dying_during_bring_up_fails_with_its_output() {
     assert!(
         started.elapsed() < TEST_TIMINGS.startup,
         "reported on the exit, not the ceiling"
+    );
+}
+
+/// A dying daemon's report waits for its output to be read to the end:
+/// words still on their way down the pipe when the exit is seen are in it.
+/// Here they come from a process the daemon left behind, a second after
+/// the exit — long past the first poll that sees it.
+#[tokio::test]
+async fn a_dying_daemons_report_carries_the_words_still_in_its_pipe() {
+    let refusal = refusal_of_a_dying_server(
+        "boom: first words",
+        "(sleep 1; echo 'boom: last words') & exit 3",
+    )
+    .await;
+    assert!(
+        refusal.contains("exited")
+            && refusal.contains("boom: first words")
+            && refusal.contains("boom: last words"),
+        "{refusal}"
     );
 }
 
