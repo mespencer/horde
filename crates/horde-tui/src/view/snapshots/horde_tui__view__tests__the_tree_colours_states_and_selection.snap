@@ -1,0 +1,20 @@
+---
+source: crates/horde-tui/src/view/tests.rs
+expression: "styled_at(&app, 80, 16)"
+---
+‹Reset+b› horde ‹DarkGray› 1:session ‹Cyan+b› 2:agents ‹DarkGray› 3:inbox 1  4:workspaces  5:usage  6:logs  7:forward
+‹Reset›
+‹Cyan+b›❯ ci-fix‹DarkGray›  s1  active‹Magenta+b›  1 waiting‹Reset›
+‹Reset›    ci-fix                ‹DarkGray› unspecified      gpu-box        opus‹Reset›
+‹Reset›      reviewer            ‹DarkGray› unspecified      gpu-box        ‹Magenta+b›  1 waiting‹Reset›
+‹Reset›  ‹Reset+b›docs‹DarkGray›  s2  active‹Reset›
+‹Reset›    docs                  ‹Red› LOST            ‹DarkGray› worker-9       ‹Reset›
+‹Reset›  ‹Reset+b›states‹DarkGray›  s3  active‹Reset›
+‹Reset›    a-run                 ‹Green› running         ‹DarkGray› —              ‹Reset›
+‹Reset›      a-busy              ‹Yellow› working         ‹DarkGray› —              ‹Reset›
+‹Reset›      a-dead              ‹Red› failed          ‹DarkGray› —              ‹Reset›
+‹Reset›      a-idle              ‹Green› idle            ‹DarkGray› —              ‹Reset›
+‹Reset›      a-wait              ‹Yellow› queued          ‹DarkGray› —              ‹Reset›
+‹Reset›
+‹DarkGray› enter attach · n new session · x archive · r refresh · esc back · q quit‹Reset›
+‹DarkGray› not attached · ‹Green›● live‹Reset›

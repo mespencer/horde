@@ -28,7 +28,7 @@ citations are for `9218ac2`.
 | §8 Git backbone, relay, blob store | CONFORMS (as built) | Relay mounted by `--relay-bind` (loopback) and `--relay-mtls-bind` (other machines; the worker's git presents its identity, W12b — proven across containers by `crates/horde-multinode`); dirty trees refused on the stamp path (`horde-worker/src/share.rs:139-144`); blob GC absent by design. |
 | §9 MCP hub (ADR-0004) | CONFORMS | Hub warmed at serve; canonical `horde/<tool>` names. MCP-spawned children carry their parent's agent type, so allowlists resolve for them (`horde-server/src/lineage.rs:28`; `hub.rs:152,194`) — checked at `9218ac2`. |
 | §10 Permissions | CONFORMS (as amended by ADR-0016) | Chain driver runs in `serve()` over the configured registry (`horde-server/src/startup.rs`, `core.permission_modes`); the default mode is `bypass`, the rule chain is the built-in `ask` mode or any authored one, and questions (`AskUserQuestion`) always escalate (`permission/chain.rs` `is_question`). No judge, by decision: no key can author judge instructions. See "§10 and §13 at W12e" below. |
-| §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. Archive and workspace/MCP edits stay unattributed. |
+| §11 Clients | CONFORMS (largely) | Front door, `doctor`, `agent status`, stale-stream badge, subtree attach, actor attribution on every event that carries an `Actor`. The TUI was rebuilt in W12f (see "§11 TUI after W12f" below). Archive and workspace/MCP edits stay unattributed. |
 | §12 Usage and observability | PARTIAL | Usage folds conform. Diagnostic logs are built (ADR-0015, W12h; see the surfaces table). Threshold alerts are absent, OTLP is plaintext only (removal is deferred until the operator signs off), and hard budgets are shape-only. |
 | §13 Configuration layering | PARTIAL (W12e, ADR-0016) | One strict TOML file per role under `~/.horde`, layered defaults → file → workspace → session → flags with provenance (`horde config show --origin`, `--show-config`); tiers, modes, ADR-0014's and ADR-0015's keys are configuration. The repo `.horde/` layer and prompt overlays are not built. See "§10 and §13 at W12e" below. |
 | §14–§15 | CONFORMS | Unchanged. |
@@ -99,6 +99,25 @@ only with W12c; until then the adapter answers it with an error.
 | Diagnostic logs (ADR-0015, W12h): daemons keep rotating JSON-lines files under `<state>/logs` (16 MiB × 8, 14 days); a worker keeps per-agent harness stderr (4 MiB × 2, 256 MiB budget); `ControlPlane/ReadLogs` and the `StreamLogRequests`/`WorkerLogTunnel` pair serve them; records are redacted at egress; a worker caller is scoped to its agent's session and limited to 16/64 KiB per call, 6 calls a minute (burst 3); `horde logs` and the `horde/logs` MCP verb; `JoinToken`/`JoinCode` no longer print their secret in Debug | `crates/horde-observe/src/{layer,files,agents,reader,redact,limits}.rs`; `crates/horde-wire/src/logs.rs`; `crates/horde-server/src/diagnostics/mod.rs`, `service/diagnostics.rs`, `trust.rs` (rows `ReadLogs`, `StreamLogRequests`, `WorkerLogTunnel`); `crates/horde-worker/src/logs.rs`, `process.rs` (stderr drain); `crates/horde-mcp/src/logs.rs`; `crates/horde-cli/src/logs.rs` | `horde-observe` units (rotation, pruning, permissions, truncation, drop counter, redactor table); `horde-server/src/diagnostics/tests.rs`; `login/relay.rs` and `forward/relay.rs` (bytes never logged); `worker_suite/logs.rs`; `cli_suite/logs.rs`; `horde-mcp/src/logs.rs`; `horde-e2e/tests/e2e_suite/logs.rs` |
 | Wire limits — 16 MiB messages and 1 MiB push batches on the worker spine; 64 KiB output chunks | `crates/horde-proto/src/limits.rs:14,19`; `horde-server/src/transport.rs:133`; `horde-worker/src/client.rs:54`; `runtime/shape.rs:25` | `limits.rs:26`; `shape.rs:319` |
 
+### §11 TUI after W12f
+
+The TUI is a pure state machine in `horde-tui`: server updates and keys go in, directives come out (`crates/horde-tui/src/app.rs`). Keys become intents through lookup tables (`keys.rs:88-215`), events fold into per-agent transcripts (`transcript.rs:196`), and rendering is a function of the state (`view/mod.rs:24`). The runtime in `horde-cli` maps each directive to one client verb (`crates/horde-cli/src/tui.rs:334,349,371,398`), so CLI parity holds by construction.
+
+| §11 claim | Verdict | Implementation | Proving test |
+|---|---|---|---|
+| Two zoom levels; detach to the overview and back without restarting | CONFORMS | ctrl-t, alt-1…7 and `/agents` switch views (`keys.rs:88`); the tree attaches any session or agent (`app.rs:593`). Opening the tree or inbox after an attach widens the replay, and the runtime reopens its one stream with cursors just past what it has folded (`app.rs:467,762`; `tui.rs:230`) | `cli_suite/tui_pty.rs:322`; `cli_suite/tui_drive.rs:510` |
+| Attached to a session: the top-level agent, prompts from the whole tree, stamped with the tree path | CONFORMS | The view shows the steer target's transcript (`app.rs:489`); the front prompt is the oldest in scope, as an inline card (`app.rs:567`) | `view/tests.rs:146,179`; `cli_suite/tui_pty.rs:502` |
+| Attached to a subagent: that subtree's prompts plus a passive badge | CONFORMS | `app.rs:544,561`; the stream is scoped server-side (`tui.rs:306`) | `view/tests.rs:249` |
+| Global inbox, answerable in place | CONFORMS | `app.rs:515`; y, n and digits answer the selected entry, enter opens its card (`keys.rs:154`) | `view/tests.rs:344`; `cli_suite/tui_drive.rs:173` |
+| Steering vs interrupt: two verbs | CONFORMS | enter queues for the turn boundary, ctrl-s and `/now` send with interrupt delivery, esc on a working agent and ctrl-x interrupt (`keys.rs:105-134`; `tui.rs:398`) | `cli_suite/tui_pty.rs:420,449`; `cli_suite/tui_drive.rs:258` |
+| Questions answerable from the TUI (W12c) | CONFORMS | One card steps through several questions; multi-select toggles, free text is typed, secrets are masked (`prompt.rs:94`) | `view/tests.rs:192,580,593`; `cli_suite/tui_pty.rs:535` |
+| Stale-stream announcement | CONFORMS | 45 s of silence, heartbeats included, reads `stale` in the status line (`app.rs:89,706`) | `view/tests.rs:283` |
+| Status line: session, agent, worker, model, harness, connection | CONFORMS | `view/mod.rs:141` | `view/tests.rs:146` |
+| Workspaces view, tolerant of missing data | CONFORMS | Definitions with whatever instances the server reports; a definition whose instances cannot be fetched still shows (`tui.rs:442`) | `view/tests.rs:366,415`; `cli_suite/tui_drive.rs:532` |
+| Usage view (§12 reporting), display only | CONFORMS | Per agent and per tree path, scoped to the attached session, with account headroom (`tui.rs:465`) | `view/tests.rs:424,468`; `cli_suite/tui_drive.rs:532` |
+| Logs view | CONFORMS | The server's diagnostic log (ADR-0015), newest first, read through `ReadLogs` as `horde logs server` reads it and redacted at egress; entering the view or `r` reads it again (`tui.rs:487`; `view/panels.rs:215`) | `view/tests.rs:485`; `app/tests.rs:1465`; `tui.rs:933` |
+| Slash commands | CONFORMS | One table drives the parser, the completion menu and `/help` (`slash.rs:53`) | `view/tests.rs:224,508`; `cli_suite/tui_drive.rs:470` |
+
 ### Status of the W7d fix list (Part 2, (a))
 
 | # | Status | Evidence at `22f2599` |
@@ -152,7 +171,7 @@ only with W12c; until then the adapter answers it with an error.
 | 0011 delivery and liveness | CONFORMS | Lease, boot reconcile, reset, position resume. |
 | 0012 worker inbox | CONFORMS | Inbox, lanes, replay. |
 | 0013 read path and ingest | CONFORMS | Projection, read pool, batch ingest, name filter. |
-| 0015 logs and diagnostics | CONFORMS (as resolved) | Built per its 2026-11-13 resolutions (W12h). OTLP removal is deferred until the operator signs off, and the TUI pane belongs to W12f. |
+| 0015 logs and diagnostics | CONFORMS (as resolved) | Built per its 2026-11-13 resolutions (W12h). OTLP removal is deferred until the operator signs off. The TUI's logs view reads the server's log (W12f). |
 | 0016 configuration and permission defaults | CONFORMS (W12e) | See "§10 and §13 at W12e". |
 
 ### Deferred by design (supersedes Part 2 (c))

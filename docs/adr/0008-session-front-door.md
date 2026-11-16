@@ -114,3 +114,28 @@ and an all-digit last label refused naming the flaw) — resolution is still
 the dial-time certificate check's job. Placement refuses a worker that does
 not advertise the requested harness as installed, so a spawn queues with
 "lacks harness `x`" instead of failing on the worker.
+
+## Amendment (2026-11-13): the TUI revamp (W12f)
+
+The "future design" this ADR deferred has landed. Attaching through the front
+door now opens a conversation view in the manner of Claude Code: the attached
+agent's transcript (messages, streamed replies, tool calls collapsed to a few
+lines with their results, errors), a multi-line compose box, prompt cards
+answered in place, including several questions in one request, slash
+commands, and one status line (session, agent, harness, model, worker, state,
+connection with the stale badge). The overview is now one view among
+several: the session/agent tree, inbox, workspaces, usage, logs and forwards,
+reached by ctrl-t, alt-1…7 or a slash command.
+
+Nothing in the front door's contract moved: bare `horde`, `horde new`,
+`horde attach [--agent]`, the picker and its shared row format, name
+resolution and the refusals are as above, and each TUI action is still a
+`horde <verb>`. Two behaviours a user of the old screens would notice: Esc no
+longer detaches (it interrupts a working agent, as in Claude Code; ctrl-t
+opens the tree), and `q` types a letter in the compose box (ctrl-c on an
+empty box, ctrl-d or `/quit` quit).
+
+The tree and the inbox look across sessions, so opening either after an
+attach widens the stream's replay to every listed session; the client
+reopens its one stream with per-session cursors just past what it has
+folded, so nothing is replayed twice.

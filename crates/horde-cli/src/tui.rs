@@ -18,14 +18,15 @@
 //! [`Client`] verb that also exists as `horde <verb>` (DESIGN.md §11: CLI
 //! parity is a hard rule; the TUI is optional).
 
-use horde_proto::v1::DeliveryMode;
+use horde_proto::v1::{DeliveryMode, UsageGroupBy};
+use horde_tui::app::{UsageReport, WorkspaceEntry};
 use horde_tui::{App, Directive, Update};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event as TermEvent;
 use tokio::sync::mpsc;
 
-use crate::client::{PermissionAnswer, StreamUpdate};
+use crate::client::{PermissionAnswer, StreamUpdate, UsageOptions};
 use crate::{Client, ClientError};
 
 /// What the user asked to open.
@@ -156,21 +157,22 @@ where
     let (updates, mut inbox) = mpsc::channel::<Update>(256);
 
     let sessions = refresh_sessions(&mut client, &mut app).await?;
+    // Worker names are cosmetic: a refusal leaves ids on screen, not an error.
+    perform(vec![Directive::RefreshWorkers], &mut client, &mut app).await;
 
     // One stream serves the whole TUI. An attach scoped to an agent's
     // subtree scopes it server-side (`subtree_root`, fix a14) — the server
     // has honored the field all along; the TUI simply never sent it. An
     // unscoped launch keeps the merged all-sessions stream.
-    let subscription = subscription_for(app.attachment(), &sessions);
-    tokio::spawn(pump(client.clone(), subscription, updates));
+    let follower = client.clone();
+    let mut follow = Follow::start(&mut app, &sessions, |subscription| {
+        Stream::open(&follower, subscription, &updates)
+    });
 
     // The staleness clock (fix a9): a dead stream produces no updates, so
     // only a tick can notice its silence — and redraw the badge in.
     let mut ticker = tokio::time::interval(TICK_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Once the pump hangs up the channel answers `None` instantly, forever;
-    // polling it then would spin the loop redrawing at full speed.
-    let mut stream_open = true;
 
     while !app.should_quit() {
         terminal
@@ -187,19 +189,70 @@ where
                 // The terminal went away under us; there is no one left to draw for.
                 None => app.request_quit(),
             },
-            update = inbox.recv(), if stream_open => match update {
+            update = inbox.recv() => match update {
                 Some(update) => drain_into(&mut app, update, &mut inbox),
-                // The pump already said why in its `StreamEnded`; the
-                // channel closing is only its sender going away.
-                None => stream_open = false,
+                // Unreachable while `updates` lives here, but an arm that
+                // spun on `None` would be worse than one that quits.
+                None => app.request_quit(),
             },
             _ = ticker.tick() => {
                 app.apply(Update::Tick { now: std::time::Instant::now() });
             }
         }
+
+        follow.reopen_if_asked(&mut app);
     }
+    // Leaving drops the follow, which stops its pump.
 
     Ok((terminal, app))
+}
+
+/// The TUI's one follow stream, and how to open another.
+struct Follow<O: FnMut(Subscription) -> Stream> {
+    stream: Stream,
+    open: O,
+}
+
+impl<O: FnMut(Subscription) -> Stream> Follow<O> {
+    /// Opens the launch's stream, which already covers whatever the first
+    /// refresh added to the replay set.
+    fn start(app: &mut App, sessions: &[horde_proto::v1::SessionSummary], mut open: O) -> Self {
+        let stream = open(subscription_for(app.attachment(), sessions));
+        app.take_resubscribe();
+        Self { stream, open }
+    }
+
+    /// A screen that looks across sessions, or an attach to one the stream
+    /// does not replay, widens the replay set: the one stream is reopened
+    /// with every session's cursor just past what is folded, and the old
+    /// one stops.
+    fn reopen_if_asked(&mut self, app: &mut App) {
+        if app.take_resubscribe() {
+            self.stream = (self.open)(Subscription::Everything(app.replay_cursors()));
+        }
+    }
+}
+
+/// The running follow stream: a pump task forwarding onto the loop's
+/// channel, stopped when dropped. Whatever it already queued is still
+/// folded; the state's sequence dedup absorbs the overlap with the next
+/// stream.
+struct Stream(tokio::task::JoinHandle<()>);
+
+impl Stream {
+    fn open(client: &Client, subscription: Subscription, updates: &mpsc::Sender<Update>) -> Self {
+        Self(tokio::spawn(pump(
+            client.clone(),
+            subscription,
+            updates.clone(),
+        )))
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Folds `first` and then everything already queued behind it before the
@@ -275,21 +328,80 @@ async fn perform(directives: Vec<Directive>, client: &mut Client, app: &mut App)
     }
 }
 
-/// One directive, one client verb — the same verbs the CLI exposes.
+/// One directive, one client verb — the same verbs the CLI exposes. Each
+/// family's executor hands back what it does not handle.
 async fn execute(
     directive: Directive,
     client: &mut Client,
     app: &mut App,
 ) -> Result<(), ClientError> {
-    match directive {
-        Directive::RefreshSessions => refresh_sessions(client, app).await.map(drop),
-        Directive::RefreshForwards => {
-            let forwards = client.list_forwards(None).await?;
-            app.apply(Update::Forwards(forwards));
-            Ok(())
+    let Some(directive) = execute_refresh(directive, client, app).await? else {
+        return Ok(());
+    };
+    let Some(directive) = execute_session(directive, client, app).await? else {
+        return Ok(());
+    };
+    execute_steer(directive, client).await
+}
+
+/// The directives that ask the server what a view shows.
+async fn execute_refresh(
+    directive: Directive,
+    client: &mut Client,
+    app: &mut App,
+) -> Result<Option<Directive>, ClientError> {
+    let update = match directive {
+        Directive::RefreshSessions => {
+            refresh_sessions(client, app).await?;
+            return Ok(None);
         }
-        Directive::Approve { request_id } => client
-            .answer_permission(PermissionAnswer::allow(&request_id))
+        // #[gamma::skip(option.none_to_some, reason = "the server reads an empty session id as no filter, so the mutant lists every session's forwards exactly as `None` does")]
+        Directive::RefreshForwards => Update::Forwards(client.list_forwards(None).await?),
+        Directive::RefreshWorkers => Update::Workers(client.list_workers().await?),
+        Directive::RefreshWorkspaces => Update::Workspaces(workspaces(client).await?),
+        Directive::RefreshUsage { session_id } => Update::Usage(usage(client, session_id).await?),
+        Directive::RefreshLogs => Update::Logs(server_logs(client).await?),
+        other => return Ok(Some(other)),
+    };
+    app.apply(update);
+    Ok(None)
+}
+
+/// The directives that create or archive a session.
+async fn execute_session(
+    directive: Directive,
+    client: &mut Client,
+    app: &mut App,
+) -> Result<Option<Directive>, ClientError> {
+    match directive {
+        Directive::NewSession { title } => {
+            let (summary, _root) = client
+                .create_session(title.as_deref().unwrap_or_default(), "")
+                .await?;
+            if let Some(session_id) = summary.session_id.as_ref().map(ToString::to_string) {
+                app.apply(Update::SessionCreated { session_id });
+            }
+        }
+        Directive::Archive { session_id } => {
+            client
+                .archive_session(&session_id, "archived from the TUI")
+                .await?;
+            refresh_sessions(client, app).await?;
+        }
+        other => return Ok(Some(other)),
+    }
+    Ok(None)
+}
+
+/// The directives that answer or steer an agent: nothing comes back for
+/// the App but what the stream will carry.
+async fn execute_steer(directive: Directive, client: &mut Client) -> Result<(), ClientError> {
+    match directive {
+        Directive::Approve {
+            request_id,
+            remember,
+        } => client
+            .answer_permission(PermissionAnswer::allow(&request_id).remembering(remember))
             .await
             .map(drop),
         Directive::Answer {
@@ -307,11 +419,89 @@ async fn execute(
             .send_assignment(&agent_id, &text, DeliveryMode::TurnBoundary, "")
             .await
             .map(drop),
+        Directive::SendNow { agent_id, text } => client
+            .send_assignment(&agent_id, &text, DeliveryMode::Interrupt, "")
+            .await
+            .map(drop),
+        Directive::SendNote { agent_id, text } => client
+            .send_note(&agent_id, &text, DeliveryMode::TurnBoundary, "")
+            .await
+            .map(drop),
         Directive::Interrupt { agent_id } => client
             .interrupt(&agent_id, "interrupted from the TUI")
             .await
             .map(drop),
+        // `execute` hands every other family to its own executor first.
+        _ => Ok(()),
     }
+}
+
+/// Every workspace definition with its known instances. A definition whose
+/// instances cannot be fetched still shows, with none listed: the view is
+/// tolerant of missing data rather than blank because of one refusal.
+async fn workspaces(client: &mut Client) -> Result<Vec<WorkspaceEntry>, ClientError> {
+    let definitions = client.list_workspace_definitions().await?;
+    let mut entries = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let id = definition
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let instances = match client.get_workspace_definition(&id).await {
+            Ok(response) => response.instances,
+            Err(_) => Vec::new(),
+        };
+        entries.push(WorkspaceEntry {
+            definition,
+            instances,
+        });
+    }
+    Ok(entries)
+}
+
+/// Usage per agent and per tree path, scoped to one session when given, and
+/// the accounts' headroom beside them.
+async fn usage(
+    client: &mut Client,
+    session_id: Option<String>,
+) -> Result<UsageReport, ClientError> {
+    let scoped = |group_by| {
+        UsageOptions::grouped_by(group_by).sessions(session_id.iter().cloned().collect())
+    };
+    let by_agent = client.query_usage(&scoped(UsageGroupBy::Agent)).await?;
+    let by_tree = client.query_usage(&scoped(UsageGroupBy::TreePath)).await?;
+    Ok(UsageReport {
+        scope: session_id.map_or_else(
+            || "every session".to_owned(),
+            |id| format!("session {}", horde_tui::state::short_id(&id)),
+        ),
+        by_agent: by_agent.aggregates,
+        by_tree: by_tree.aggregates,
+        accounts: by_agent.accounts,
+    })
+}
+
+/// The server's newest log records as `horde logs server` prints them —
+/// as many as it shows by default, redacted by the server — newest first.
+async fn server_logs(client: &mut Client) -> Result<Vec<String>, ClientError> {
+    // A tail of zero asks for the reader's default, the 200 records
+    // `horde logs` shows.
+    let args = crate::logs::LogsArgs::default();
+    let mut printed = Vec::new();
+    crate::logs::run_remote(
+        client,
+        &crate::logs::RemoteTarget::Server,
+        &args,
+        crate::Format::Human,
+        &mut printed,
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&printed)
+        .lines()
+        .rev()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Lists sessions and folds the answer in, returning the summaries so the
@@ -413,7 +603,8 @@ mod tests {
     use horde_tui::{App, Update};
 
     use super::{
-        DRAIN_CEILING, FollowEnd, Subscription, drain_into, ended_update, subscription_for,
+        DRAIN_CEILING, Follow, FollowEnd, Stream, Subscription, drain_into, ended_update,
+        subscription_for,
     };
     use crate::ClientError;
 
@@ -526,5 +717,271 @@ mod tests {
             ended_update(Err(refusal)),
             Some(Update::StreamEnded { reason: words })
         );
+    }
+
+    /// A stream whose pump never ends on its own, and the handle that tells
+    /// whether it was stopped.
+    fn parked() -> (Stream, tokio::task::AbortHandle) {
+        let pump = tokio::spawn(std::future::pending::<()>());
+        let handle = pump.abort_handle();
+        (Stream(pump), handle)
+    }
+
+    /// Waits, bounded, for an aborted pump to finish.
+    async fn stopped(handle: &tokio::task::AbortHandle) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Dropping a stream stops its pump: a replaced subscription must not
+    /// keep reading from the server behind the new one.
+    #[tokio::test]
+    async fn dropping_a_stream_cancels_its_pump() {
+        let (stream, handle) = parked();
+        drop(stream);
+        assert!(stopped(&handle).await, "the pump must have been cancelled");
+    }
+
+    /// The launch opens one stream, which covers what the first refresh
+    /// asked for; a later ask reopens it from every folded cursor and
+    /// stops the one it replaces; with no ask nothing is reopened.
+    #[tokio::test]
+    async fn the_follow_reopens_only_when_asked_and_stops_what_it_replaces() {
+        let opened = std::cell::RefCell::new(Vec::new());
+        let handles = std::cell::RefCell::new(Vec::new());
+        let open = |subscription: Subscription| {
+            opened.borrow_mut().push(subscription);
+            let (stream, handle) = parked();
+            handles.borrow_mut().push(handle);
+            stream
+        };
+        let mut app = App::overview();
+        app.apply(Update::Sessions(vec![listed("s1")]));
+        let mut follow = Follow::start(&mut app, &[listed("s1")], open);
+        follow.reopen_if_asked(&mut app);
+        assert_eq!(
+            *opened.borrow(),
+            [Subscription::Everything(vec![("s1".to_owned(), 0)])],
+            "the first refresh's ask is already covered"
+        );
+
+        app.apply(Update::Sessions(vec![listed("s2")]));
+        follow.reopen_if_asked(&mut app);
+        assert_eq!(
+            opened.borrow().get(1),
+            Some(&Subscription::Everything(vec![
+                ("s1".to_owned(), 1),
+                ("s2".to_owned(), 1)
+            ]))
+        );
+        let first = handles.borrow()[0].clone();
+        assert!(stopped(&first).await, "the replaced stream stops");
+        drop(follow);
+        let second = handles.borrow()[1].clone();
+        assert!(stopped(&second).await, "and the last one with the loop");
+    }
+
+    /// The kinds of `session_id`'s log, each as its debug text.
+    async fn logged(client: &mut crate::Client, session_id: &str) -> Vec<String> {
+        let mut seen = Vec::new();
+        client
+            .sync(
+                &crate::client::SyncOptions::new(session_id),
+                |envelope| {
+                    if let Some(kind) = envelope.event.as_ref().and_then(|e| e.kind.as_ref()) {
+                        seen.push(format!("{kind:?}"));
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect("the log reads back");
+        seen
+    }
+
+    /// Each refresh directive asks the server and lands its answer where
+    /// the views read it: the sessions it lists, the workers registered,
+    /// the forwards open in every session.
+    #[tokio::test]
+    async fn refreshes_land_what_the_server_lists() {
+        use horde_tui::Directive;
+        let (_core, mut client, endpoint) = crate::forward::testing::served_with_endpoint().await;
+        let (summary, root) = client
+            .create_session("refreshed", "k-1")
+            .await
+            .expect("a session");
+        let session_id = summary
+            .session_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        horde_server_testkit::register_worker_with(
+            &endpoint,
+            "w-tui",
+            horde_proto::v1::WorkerCapabilities::default(),
+        )
+        .await
+        .expect("a registered worker");
+        let docs = horde_proto::v1::ForwardSpec {
+            name: "docs".to_owned(),
+            worker_port: 3000,
+            direction: horde_proto::v1::ForwardDirection::Expose.into(),
+            ..horde_proto::v1::ForwardSpec::default()
+        };
+        client
+            .open_forward(&session_id, &root.to_string(), docs, "fwd-docs")
+            .await
+            .expect("a forward");
+
+        let mut app = App::overview();
+        for directive in [
+            Directive::RefreshSessions,
+            Directive::RefreshWorkers,
+            Directive::RefreshForwards,
+        ] {
+            super::execute(directive, &mut client, &mut app)
+                .await
+                .expect("the server answers");
+        }
+        assert_eq!(
+            app.session(&session_id)
+                .map(|session| session.title.as_str()),
+            Some("refreshed")
+        );
+        assert_eq!(app.worker_name("w-tui"), "w-tui");
+        assert_eq!(app.workers().len(), 1);
+        assert_eq!(app.forwards().len(), 1, "every session's forwards");
+    }
+
+    /// Sessions, assignments and notes are sent with no idempotency key, so
+    /// two of each are two; an archive gives the TUI's reason.
+    #[tokio::test]
+    async fn repeated_directives_are_distinct_and_an_archive_says_why() {
+        use horde_tui::Directive;
+        let (_core, mut client) = crate::forward::testing::served().await;
+        let mut app = App::overview();
+        for title in ["first", "second"] {
+            super::execute(
+                Directive::NewSession {
+                    title: Some(title.to_owned()),
+                },
+                &mut client,
+                &mut app,
+            )
+            .await
+            .expect("created");
+        }
+        let listed = client.list_sessions(false).await.expect("the list");
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let session_id = app
+            .attachment()
+            .map(|attachment| attachment.session_id.clone())
+            .unwrap_or_default();
+        let root = listed
+            .iter()
+            .find(|summary| summary.title == "second")
+            .and_then(|summary| summary.root_agent_id.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+
+        for directive in [
+            Directive::SendAssignment {
+                agent_id: root.clone(),
+                text: "one".to_owned(),
+            },
+            Directive::SendAssignment {
+                agent_id: root.clone(),
+                text: "two".to_owned(),
+            },
+            Directive::SendNote {
+                agent_id: root.clone(),
+                text: "three".to_owned(),
+            },
+            Directive::SendNote {
+                agent_id: root.clone(),
+                text: "four".to_owned(),
+            },
+            Directive::SendNow {
+                agent_id: root.clone(),
+                text: "five".to_owned(),
+            },
+            Directive::SendNow {
+                agent_id: root.clone(),
+                text: "six".to_owned(),
+            },
+            Directive::Archive {
+                session_id: session_id.clone(),
+            },
+        ] {
+            super::execute(directive, &mut client, &mut app)
+                .await
+                .expect("the server takes it");
+        }
+        let log = logged(&mut client, &session_id).await;
+        for text in [
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "archived from the TUI",
+        ] {
+            assert!(
+                log.iter().any(|kind| kind.contains(&format!("\"{text}\""))),
+                "{text} is on the log: {log:#?}"
+            );
+        }
+    }
+
+    /// The logs directive reads the server's own log the way `horde logs
+    /// server` does, redacted, and hands it to the App newest first.
+    #[tokio::test]
+    async fn the_logs_directive_reads_the_server_log_newest_first() {
+        use horde_observe::reader::LocalLogs;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let logging = horde_observe::FileLogging::start(
+            dir.path(),
+            horde_server::diagnostics::BINARY,
+            &horde_observe::settings::LogSettings::daemon(),
+            &horde_observe::ServiceIdentity::new("horde-server"),
+        )
+        .expect("the file layer starts");
+        logging.with_default(|| {
+            tracing::info!(target: "horde_server", "placed agent first");
+            tracing::warn!(target: "horde_server", "minted horde://join/h:7/s3cr3t.fp");
+        });
+        assert!(logging.flush(std::time::Duration::from_secs(5)));
+        let core = horde_server::service::ServerCore::new(
+            horde_server::EventLog::in_memory().expect("an in-memory log"),
+        )
+        .with_local_logs(LocalLogs::new(
+            dir.path(),
+            horde_server::diagnostics::BINARY,
+            None,
+        ));
+        let endpoint = horde_server_testkit::serve_core(core)
+            .await
+            .expect("the server binds");
+        let mut client = crate::Client::connect(&endpoint)
+            .await
+            .expect("the client dials");
+
+        let mut app = App::overview();
+        super::execute(horde_tui::Directive::RefreshLogs, &mut client, &mut app)
+            .await
+            .expect("the server reads its log");
+        let lines = app.logs().unwrap_or_default();
+        let at = |needle: &str| lines.iter().position(|line| line.contains(needle));
+        let (Some(minted), Some(placed)) = (at("minted"), at("placed agent first")) else {
+            panic!("both records are read: {lines:#?}");
+        };
+        assert!(minted < placed, "newest first: {lines:#?}");
+        assert!(lines[minted].contains("WARN"), "{lines:#?}");
+        assert_eq!(at("s3cr3t"), None, "redacted at egress: {lines:#?}");
     }
 }
