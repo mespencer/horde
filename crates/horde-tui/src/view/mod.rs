@@ -40,7 +40,7 @@ fn render_list_screen(app: &App, frame: &mut Frame<'_>, screen: Screen) {
         Screen::Forwards => lists::forwards(app),
         Screen::Workspaces => panels::workspaces(app),
         Screen::Usage => panels::usage(app),
-        Screen::Logs => panels::logs(),
+        Screen::Logs => panels::logs(app),
         _ => panels::help(),
     };
     frame.render_widget(

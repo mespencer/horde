@@ -101,22 +101,22 @@ only with W12c; until then the adapter answers it with an error.
 
 ### §11 TUI after W12f
 
-The TUI is a pure state machine in `horde-tui`: server updates and keys go in, directives come out (`crates/horde-tui/src/app.rs`). Keys become intents through lookup tables (`keys.rs:88-215`), events fold into per-agent transcripts (`transcript.rs:196`), and rendering is a function of the state (`view/mod.rs:24`). The runtime in `horde-cli` maps each directive to one client verb (`crates/horde-cli/src/tui.rs:314,329,350,377`), so CLI parity holds by construction.
+The TUI is a pure state machine in `horde-tui`: server updates and keys go in, directives come out (`crates/horde-tui/src/app.rs`). Keys become intents through lookup tables (`keys.rs:88-215`), events fold into per-agent transcripts (`transcript.rs:196`), and rendering is a function of the state (`view/mod.rs:24`). The runtime in `horde-cli` maps each directive to one client verb (`crates/horde-cli/src/tui.rs:334,349,371,398`), so CLI parity holds by construction.
 
 | §11 claim | Verdict | Implementation | Proving test |
 |---|---|---|---|
-| Two zoom levels; detach to the overview and back without restarting | CONFORMS | ctrl-t, alt-1…7 and `/agents` switch views (`keys.rs:88`); the tree attaches any session or agent (`app.rs:579`). Opening the tree or inbox after an attach widens the replay, and the runtime reopens its one stream with cursors just past what it has folded (`app.rs:450,746`; `tui.rs:206`) | `cli_suite/tui_pty.rs:322`; `cli_suite/tui_drive.rs:510` |
-| Attached to a session: the top-level agent, prompts from the whole tree, stamped with the tree path | CONFORMS | The view shows the steer target's transcript (`app.rs:475`); the front prompt is the oldest in scope, as an inline card (`app.rs:553`) | `view/tests.rs:146,179`; `cli_suite/tui_pty.rs:502` |
-| Attached to a subagent: that subtree's prompts plus a passive badge | CONFORMS | `app.rs:530,547`; the stream is scoped server-side (`tui.rs:286`) | `view/tests.rs:249` |
-| Global inbox, answerable in place | CONFORMS | `app.rs:501`; y, n and digits answer the selected entry, enter opens its card (`keys.rs:154`) | `view/tests.rs:344`; `cli_suite/tui_drive.rs:173` |
-| Steering vs interrupt: two verbs | CONFORMS | enter queues for the turn boundary, ctrl-s and `/now` send with interrupt delivery, esc on a working agent and ctrl-x interrupt (`keys.rs:105-134`; `tui.rs:377`) | `cli_suite/tui_pty.rs:420,449`; `cli_suite/tui_drive.rs:258` |
-| Questions answerable from the TUI (W12c) | CONFORMS | One card steps through several questions; multi-select toggles, free text is typed, secrets are masked (`prompt.rs:92`) | `view/tests.rs:192,559,572`; `cli_suite/tui_pty.rs:535` |
-| Stale-stream announcement | CONFORMS | 45 s of silence, heartbeats included, reads `stale` in the status line (`app.rs:87,691`) | `view/tests.rs:283` |
-| Status line: session, agent, worker, model, harness, connection | CONFORMS | `view/mod.rs:118` | `view/tests.rs:146` |
-| Workspaces view, tolerant of missing data | CONFORMS | Definitions with whatever instances the server reports; a definition whose instances cannot be fetched still shows (`tui.rs:421`) | `view/tests.rs:366,415`; `cli_suite/tui_drive.rs:532` |
-| Usage view (§12 reporting), display only | CONFORMS | Per agent and per tree path, scoped to the attached session, with account headroom (`tui.rs:444`) | `view/tests.rs:424,468`; `cli_suite/tui_drive.rs:532` |
-| Logs view | PLACEHOLDER | A labelled pane with no RPC behind it: `horde logs` lands with W12h (ADR-0015) | `view/tests.rs:480` |
-| Slash commands | CONFORMS | One table drives the parser, the completion menu and `/help` (`slash.rs:53`) | `view/tests.rs:224,487`; `cli_suite/tui_drive.rs:470` |
+| Two zoom levels; detach to the overview and back without restarting | CONFORMS | ctrl-t, alt-1…7 and `/agents` switch views (`keys.rs:88`); the tree attaches any session or agent (`app.rs:593`). Opening the tree or inbox after an attach widens the replay, and the runtime reopens its one stream with cursors just past what it has folded (`app.rs:467,762`; `tui.rs:230`) | `cli_suite/tui_pty.rs:322`; `cli_suite/tui_drive.rs:510` |
+| Attached to a session: the top-level agent, prompts from the whole tree, stamped with the tree path | CONFORMS | The view shows the steer target's transcript (`app.rs:489`); the front prompt is the oldest in scope, as an inline card (`app.rs:567`) | `view/tests.rs:146,179`; `cli_suite/tui_pty.rs:502` |
+| Attached to a subagent: that subtree's prompts plus a passive badge | CONFORMS | `app.rs:544,561`; the stream is scoped server-side (`tui.rs:306`) | `view/tests.rs:249` |
+| Global inbox, answerable in place | CONFORMS | `app.rs:515`; y, n and digits answer the selected entry, enter opens its card (`keys.rs:154`) | `view/tests.rs:344`; `cli_suite/tui_drive.rs:173` |
+| Steering vs interrupt: two verbs | CONFORMS | enter queues for the turn boundary, ctrl-s and `/now` send with interrupt delivery, esc on a working agent and ctrl-x interrupt (`keys.rs:105-134`; `tui.rs:398`) | `cli_suite/tui_pty.rs:420,449`; `cli_suite/tui_drive.rs:258` |
+| Questions answerable from the TUI (W12c) | CONFORMS | One card steps through several questions; multi-select toggles, free text is typed, secrets are masked (`prompt.rs:94`) | `view/tests.rs:192,580,593`; `cli_suite/tui_pty.rs:535` |
+| Stale-stream announcement | CONFORMS | 45 s of silence, heartbeats included, reads `stale` in the status line (`app.rs:89,706`) | `view/tests.rs:283` |
+| Status line: session, agent, worker, model, harness, connection | CONFORMS | `view/mod.rs:141` | `view/tests.rs:146` |
+| Workspaces view, tolerant of missing data | CONFORMS | Definitions with whatever instances the server reports; a definition whose instances cannot be fetched still shows (`tui.rs:442`) | `view/tests.rs:366,415`; `cli_suite/tui_drive.rs:532` |
+| Usage view (§12 reporting), display only | CONFORMS | Per agent and per tree path, scoped to the attached session, with account headroom (`tui.rs:465`) | `view/tests.rs:424,468`; `cli_suite/tui_drive.rs:532` |
+| Logs view | CONFORMS | The server's diagnostic log (ADR-0015), newest first, read through `ReadLogs` as `horde logs server` reads it and redacted at egress; entering the view or `r` reads it again (`tui.rs:487`; `view/panels.rs:215`) | `view/tests.rs:485`; `app/tests.rs:1465`; `tui.rs:933` |
+| Slash commands | CONFORMS | One table drives the parser, the completion menu and `/help` (`slash.rs:53`) | `view/tests.rs:224,508`; `cli_suite/tui_drive.rs:470` |
 
 ### Status of the W7d fix list (Part 2, (a))
 
@@ -171,7 +171,7 @@ The TUI is a pure state machine in `horde-tui`: server updates and keys go in, d
 | 0011 delivery and liveness | CONFORMS | Lease, boot reconcile, reset, position resume. |
 | 0012 worker inbox | CONFORMS | Inbox, lanes, replay. |
 | 0013 read path and ingest | CONFORMS | Projection, read pool, batch ingest, name filter. |
-| 0015 logs and diagnostics | CONFORMS (as resolved) | Built per its 2026-11-13 resolutions (W12h). OTLP removal is deferred until the operator signs off, and the TUI pane belongs to W12f. |
+| 0015 logs and diagnostics | CONFORMS (as resolved) | Built per its 2026-11-13 resolutions (W12h). OTLP removal is deferred until the operator signs off. The TUI's logs view reads the server's log (W12f). |
 | 0016 configuration and permission defaults | CONFORMS (W12e) | See "§10 and §13 at W12e". |
 
 ### Deferred by design (supersedes Part 2 (c))

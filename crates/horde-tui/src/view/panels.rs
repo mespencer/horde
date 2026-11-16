@@ -209,24 +209,25 @@ fn window(account: &horde_proto::v1::AccountHeadroom) -> String {
     format!("{remaining}{exhausted}")
 }
 
-/// The logs pane: `horde logs` (W12h) is not on this server's surface yet,
-/// so the pane says so rather than inventing an RPC.
-pub(super) fn logs() -> (Vec<Line<'static>>, &'static str) {
-    (
-        vec![
-            Line::styled(" Logs are not available from this build.", theme::bold()),
-            Line::raw(""),
-            Line::styled(
-                "  Worker and server logs arrive with `horde logs` (wave 12, W12h); this",
-                theme::dim(),
-            ),
-            Line::styled(
-                "  pane will follow them once the server offers the RPC.",
-                theme::dim(),
-            ),
-        ],
-        "esc back · q quit",
-    )
+/// The logs pane: the server's own diagnostic log (ADR-0015), its newest
+/// records first, as `horde logs server` prints them. Redacted by the
+/// server before they leave it; `r` asks again.
+pub(super) fn logs(app: &App) -> (Vec<Line<'static>>, &'static str) {
+    let hints = "r refresh · esc back · q quit";
+    let lines = match app.logs() {
+        None => vec![Line::styled(
+            "  asking the server for its log…",
+            theme::dim(),
+        )],
+        Some([]) => vec![Line::styled(
+            "  the server has written no log records",
+            theme::dim(),
+        )],
+        Some(records) => std::iter::once(Line::styled(" server log, newest first", theme::bold()))
+            .chain(records.iter().map(|record| Line::raw(format!(" {record}"))))
+            .collect(),
+    };
+    (lines, hints)
 }
 
 /// Keys and commands, printed from the same tables the dispatcher uses.

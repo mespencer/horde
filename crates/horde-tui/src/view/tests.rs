@@ -479,11 +479,32 @@ fn usage_loading_and_empty_say_which() {
     insta::assert_snapshot!(format!("{loading}\n{}", drawn(&app)));
 }
 
+/// The logs pane says it is asking, then shows the server's lines newest
+/// first under a heading, or says the server has written none.
 #[test]
-fn the_logs_pane_is_a_labelled_placeholder() {
+fn the_logs_pane_shows_the_server_log_newest_first() {
     let mut app = App::overview();
     press(&mut app, KeyCode::Char('l'));
-    insta::assert_snapshot!(drawn(&app));
+    let body = |app: &App| rows_at(app, 80, 24)[2..5].to_vec();
+    assert_eq!(body(&app), ["  asking the server for its log…", "", ""]);
+    app.apply(Update::Logs(Vec::new()));
+    assert_eq!(
+        body(&app),
+        ["  the server has written no log records", "", ""]
+    );
+    app.apply(Update::Logs(vec![
+        "t2 WARN  horde_server minted [redacted]".to_owned(),
+        "t1 INFO  horde_server placed agent".to_owned(),
+    ]));
+    assert_eq!(
+        body(&app),
+        [
+            " server log, newest first",
+            " t2 WARN  horde_server minted [redacted]",
+            " t1 INFO  horde_server placed agent",
+        ]
+    );
+    assert_eq!(rows_at(&app, 80, 24)[22], " r refresh · esc back · q quit");
 }
 
 #[test]

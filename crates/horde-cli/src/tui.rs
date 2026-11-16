@@ -360,6 +360,7 @@ async fn execute_refresh(
         Directive::RefreshWorkers => Update::Workers(client.list_workers().await?),
         Directive::RefreshWorkspaces => Update::Workspaces(workspaces(client).await?),
         Directive::RefreshUsage { session_id } => Update::Usage(usage(client, session_id).await?),
+        Directive::RefreshLogs => Update::Logs(server_logs(client).await?),
         other => return Ok(Some(other)),
     };
     app.apply(update);
@@ -479,6 +480,29 @@ async fn usage(
         by_tree: by_tree.aggregates,
         accounts: by_agent.accounts,
     })
+}
+
+/// The server's newest log records as `horde logs server` prints them —
+/// as many as it shows by default, redacted by the server — newest first.
+async fn server_logs(client: &mut Client) -> Result<Vec<String>, ClientError> {
+    let args = crate::logs::LogsArgs {
+        n: horde_observe::reader::DEFAULT_TAIL,
+        ..crate::logs::LogsArgs::default()
+    };
+    let mut printed = Vec::new();
+    crate::logs::run_remote(
+        client,
+        &crate::logs::RemoteTarget::Server,
+        &args,
+        crate::Format::Human,
+        &mut printed,
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&printed)
+        .lines()
+        .rev()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Lists sessions and folds the answer in, returning the summaries so the
@@ -901,5 +925,52 @@ mod tests {
                 "{text} is on the log: {log:#?}"
             );
         }
+    }
+
+    /// The logs directive reads the server's own log the way `horde logs
+    /// server` does, redacted, and hands it to the App newest first.
+    #[tokio::test]
+    async fn the_logs_directive_reads_the_server_log_newest_first() {
+        use horde_observe::reader::LocalLogs;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let logging = horde_observe::FileLogging::start(
+            dir.path(),
+            horde_server::diagnostics::BINARY,
+            &horde_observe::settings::LogSettings::daemon(),
+            &horde_observe::ServiceIdentity::new("horde-server"),
+        )
+        .expect("the file layer starts");
+        logging.with_default(|| {
+            tracing::info!(target: "horde_server", "placed agent first");
+            tracing::warn!(target: "horde_server", "minted horde://join/h:7/s3cr3t.fp");
+        });
+        assert!(logging.flush(std::time::Duration::from_secs(5)));
+        let core = horde_server::service::ServerCore::new(
+            horde_server::EventLog::in_memory().expect("an in-memory log"),
+        )
+        .with_local_logs(LocalLogs::new(
+            dir.path(),
+            horde_server::diagnostics::BINARY,
+            None,
+        ));
+        let endpoint = horde_server_testkit::serve_core(core)
+            .await
+            .expect("the server binds");
+        let mut client = crate::Client::connect(&endpoint)
+            .await
+            .expect("the client dials");
+
+        let mut app = App::overview();
+        super::execute(horde_tui::Directive::RefreshLogs, &mut client, &mut app)
+            .await
+            .expect("the server reads its log");
+        let lines = app.logs().unwrap_or_default();
+        let at = |needle: &str| lines.iter().position(|line| line.contains(needle));
+        let (Some(minted), Some(placed)) = (at("minted"), at("placed agent first")) else {
+            panic!("both records are read: {lines:#?}");
+        };
+        assert!(minted < placed, "newest first: {lines:#?}");
+        assert!(lines[minted].contains("WARN"), "{lines:#?}");
+        assert_eq!(at("s3cr3t"), None, "redacted at egress: {lines:#?}");
     }
 }

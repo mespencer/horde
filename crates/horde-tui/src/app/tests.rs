@@ -898,10 +898,7 @@ fn entering_a_screen_asks_for_its_data() {
         vec![Directive::RefreshForwards],
         "r re-asks"
     );
-    assert!(
-        asks(&mut app, Screen::Logs).is_empty(),
-        "logs have no RPC to ask"
-    );
+    assert_eq!(asks(&mut app, Screen::Logs), vec![Directive::RefreshLogs]);
     assert!(asks(&mut app, Screen::Help).is_empty());
     assert_eq!(
         App::overview().act(crate::keys::Intent::Goto(Screen::Usage)),
@@ -1460,4 +1457,25 @@ fn a_list_shrinking_by_one_selects_its_new_last_row() {
     downs(&mut app, 2);
     app.apply(Update::Forwards(forwards(2)));
     assert_eq!(app.selected(Screen::Forwards), 1);
+}
+
+/// The logs screen asks for the server's log on the way in and on `r`, and
+/// the answer lands where the pane reads it.
+#[test]
+fn the_logs_screen_asks_for_the_server_log() {
+    let mut app = App::overview();
+    assert_eq!(
+        press(&mut app, KeyCode::Char('l')),
+        vec![Directive::RefreshLogs]
+    );
+    assert_eq!(app.logs(), None, "asked, not yet answered");
+    assert_eq!(
+        press(&mut app, KeyCode::Char('r')),
+        vec![Directive::RefreshLogs]
+    );
+    app.apply(Update::Logs(vec!["newest".to_owned(), "older".to_owned()]));
+    assert_eq!(
+        app.logs(),
+        Some(&["newest".to_owned(), "older".to_owned()][..])
+    );
 }

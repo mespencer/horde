@@ -238,14 +238,14 @@ pub fn render(record: &Record, format: Format) -> String {
 /// Prints records, marking a restart when the writing process's boot
 /// changes between two of them.
 struct Printer<'a> {
-    out: &'a mut dyn Write,
+    out: &'a mut (dyn Write + Send),
     format: Format,
     boot: Option<String>,
 }
 
 impl<'a> Printer<'a> {
     /// A printer that has seen no boot yet.
-    fn new(out: &'a mut dyn Write, format: Format) -> Self {
+    fn new(out: &'a mut (dyn Write + Send), format: Format) -> Self {
         Self {
             out,
             format,
@@ -323,7 +323,7 @@ pub async fn run_dir(
     dir: &Path,
     args: &LogsArgs,
     format: Format,
-    out: &mut dyn Write,
+    out: &mut (dyn Write + Send),
 ) -> Result<(), ClientError> {
     let filter = local_filter(args, SystemTime::now()).map_err(ClientError::Logs)?;
     let mut printer = Printer::new(out, format);
@@ -454,7 +454,7 @@ pub async fn run_remote(
     target: &RemoteTarget,
     args: &LogsArgs,
     format: Format,
-    out: &mut dyn Write,
+    out: &mut (dyn Write + Send),
 ) -> Result<(), ClientError> {
     let mut printer = Printer::new(out, format);
     let mut last: Option<Cursor> = None;

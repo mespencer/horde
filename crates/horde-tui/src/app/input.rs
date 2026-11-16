@@ -144,6 +144,7 @@ impl App {
             }
             Screen::Workspaces => vec![Directive::RefreshWorkspaces, Directive::RefreshWorkers],
             Screen::Usage => vec![self.usage_directive()],
+            Screen::Logs => vec![Directive::RefreshLogs],
             Screen::Forwards => vec![Directive::RefreshForwards],
             _ => Vec::new(),
         }

@@ -116,7 +116,7 @@ A workspace (`horde workspace create|update --permission-mode`), a session (`hor
 
 On a prompt card, ↑↓ and enter choose, y allows a permission, n denies a permission or declines a question, a digit picks an option, space toggles a multi-select option, and ←→ move between questions. Alt-1 to alt-7 switch views anywhere: session, agents, inbox, workspaces, usage, logs and forwards. On a list view, j and k (or ↑↓) move, enter attaches to the selected session or agent (or opens the inbox card), r refreshes, n creates a session, x archives the selected session after a y, esc goes back and q quits. The inbox answers the selected prompt with y, n or a digit, and g goes to the agent that asked.
 
-Type `/` in the compose box for commands: `/attach [session|agent]`, `/new [title]`, `/agents`, `/inbox`, `/workspaces`, `/usage`, `/logs`, `/forwards`, `/interrupt`, `/now <message>`, `/note <message>`, `/details`, `/archive [session]`, `/help` and `/quit`. The agent tree marks LOST agents, the usage view only displays usage, and the logs view is a placeholder until `horde logs` lands.
+Type `/` in the compose box for commands: `/attach [session|agent]`, `/new [title]`, `/agents`, `/inbox`, `/workspaces`, `/usage`, `/logs`, `/forwards`, `/interrupt`, `/now <message>`, `/note <message>`, `/details`, `/archive [session]`, `/help` and `/quit`. The agent tree marks LOST agents, the usage view only displays usage, and the logs view shows the server's own log, newest first, as `horde logs server` reads it.
 
 ## Diagnosing a setup
 

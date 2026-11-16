@@ -575,7 +575,7 @@ async fn the_workspaces_and_usage_views_fill_from_the_server() {
 
     harness.press(KeyCode::Char('l')).await.expect("logs");
     harness
-        .state("the logs placeholder", |app| app.screen() == Screen::Logs)
+        .state("the logs view", |app| app.screen() == Screen::Logs)
         .await
         .expect("the logs view opens");
     harness.quit_from_list_screen().await.expect("q exits");

@@ -54,6 +54,8 @@ pub enum Update {
     Workspaces(Vec<WorkspaceEntry>),
     /// A usage query's answer.
     Usage(UsageReport),
+    /// The server's newest log records as terminal lines, newest first.
+    Logs(Vec<String>),
     /// A session this client just created; the App attaches to it.
     SessionCreated { session_id: String },
     /// The terminal's size, so scrolling can clamp to what fits.
@@ -104,6 +106,8 @@ pub enum Directive {
     RefreshUsage {
         session_id: Option<String>,
     },
+    /// The server's newest diagnostic log records (`horde logs server`).
+    RefreshLogs,
     Approve {
         request_id: String,
         /// Widen the allow rules for the rest of the session.
@@ -212,6 +216,7 @@ pub struct App {
     workers: Vec<WorkerSummary>,
     workspaces: Option<Vec<WorkspaceEntry>>,
     usage: Option<UsageReport>,
+    logs: Option<Vec<String>>,
     confirm: Option<Confirm>,
     /// The last refusal or notice, shown until the next one replaces it.
     status: String,
@@ -256,6 +261,7 @@ impl App {
             workers: Vec::new(),
             workspaces: None,
             usage: None,
+            logs: None,
             confirm: None,
             status: String::new(),
             replayed: BTreeSet::new(),
@@ -407,6 +413,13 @@ impl App {
     #[must_use]
     pub fn usage(&self) -> Option<&UsageReport> {
         self.usage.as_ref()
+    }
+
+    /// The server's log lines, newest first; `None` until the server has
+    /// answered.
+    #[must_use]
+    pub fn logs(&self) -> Option<&[String]> {
+        self.logs.as_deref()
     }
 
     /// A worker's name, or a short id when the worker list does not know it.
@@ -632,6 +645,7 @@ impl App {
             Update::Workers(workers) => self.workers = workers,
             Update::Workspaces(entries) => self.workspaces = Some(entries),
             Update::Usage(report) => self.usage = Some(report),
+            Update::Logs(lines) => self.logs = Some(lines),
             Update::SessionCreated { session_id } => {
                 self.session_entry(session_id.clone());
                 self.attach_to(session_id, None);
