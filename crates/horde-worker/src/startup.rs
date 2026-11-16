@@ -1501,28 +1501,6 @@ mod tests {
         ));
     }
 
-    /// The codex adapter runs under the Worker's own codex profile and the
-    /// configured sandbox tiers, not the adapter's defaults.
-    #[test]
-    fn the_codex_adapter_takes_the_configured_sandbox_and_its_own_profile() {
-        let state = tempfile::tempdir().expect("a temp dir");
-        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
-        config.sandbox = horde_adapter_codex::SandboxPolicy::default()
-            .with_mode("careful", horde_adapter_codex::SandboxTier::ReadOnly);
-        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
-        let adapter = super::codex_adapter(&config, &journal);
-        assert_eq!(adapter.sandbox_policy, config.sandbox);
-        assert_ne!(
-            adapter.sandbox_policy,
-            horde_adapter_codex::SandboxPolicy::default()
-        );
-        assert_eq!(
-            adapter.profile.root(),
-            crate::harness::HarnessProfile::in_state_dir(state.path(), "codex").root()
-        );
-        assert!(adapter.profile.root().ends_with("codex"));
-    }
-
     /// The ignored-ambient-token line is owed only for an ambient token
     /// over an existing identity — not for an explicit one, not for no
     /// token, not before anything is enrolled.
@@ -1753,10 +1731,16 @@ mod tests {
         let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
         let codex = super::codex_adapter(&config, &journal);
         assert_eq!(codex.sandbox_policy, config.sandbox);
+        assert_ne!(
+            codex.sandbox_policy,
+            horde_adapter_codex::SandboxPolicy::default(),
+            "the configured tiers, not the adapter's defaults"
+        );
         assert_eq!(
             codex.profile.root(),
             crate::harness::HarnessProfile::in_state_dir(state.path(), "codex").root()
         );
+        assert!(codex.profile.root().ends_with("codex"));
         let claude = super::claude_adapter(&config, &journal);
         assert_eq!(
             claude.profile.root(),

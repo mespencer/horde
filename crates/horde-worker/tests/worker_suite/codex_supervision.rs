@@ -152,6 +152,23 @@ mod harness {
         .await
     }
 
+    /// Runs the turn to its end, asserting the journal named the chain's
+    /// `verdict` (`deny`, `answer`, ...), and answers the turn's outcome.
+    pub(crate) async fn turn_naming_the_chain(
+        session: &mut Box<dyn AgentSession>,
+        verdict: &str,
+    ) -> Option<TurnOutcome> {
+        let (events, outcome) = events_through_turn_end(session).await;
+        let said = format!(": chain {verdict} → ");
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AgentEvent::Output { text, .. } if text.contains(&said))
+            ),
+            "the journal names what the chain said: {events:?}"
+        );
+        outcome
+    }
+
     /// Drains events until assistant output arrives — the proof the turn is
     /// genuinely open on the session's side, since output can only follow the
     /// `turn/started` frame. A mid-turn send before this point would honestly
@@ -310,7 +327,7 @@ mod harness {
 
 use harness::{
     adapter_for, basic_turn, control_log_shows, events_through_turn_end, exec_approval_params,
-    exec_approval_script, mid_turn, session_on, surfaced_request, within,
+    exec_approval_script, mid_turn, session_on, surfaced_request, turn_naming_the_chain, within,
 };
 use horde_adapter::{
     Adapter, AdapterError, AgentEvent, AgentSpec, OutputChannel, PermissionDecision,
@@ -579,12 +596,7 @@ async fn a_denied_exec_approval_declines_on_the_wire_and_records_the_denial() {
         control_log_shows(&log_path, |log| log.contains("\"decision\":\"decline\"")).await;
     assert!(recorded.contains("\"decision\":\"decline\""), "{recorded}");
 
-    let (events, outcome) = events_through_turn_end(&mut session).await;
-    assert!(
-        events.iter().any(|event| matches!(event,
-            AgentEvent::Output { text, .. } if text.contains(": chain deny → "))),
-        "the journal names what the chain said: {events:?}"
-    );
+    let outcome = turn_naming_the_chain(&mut session, "deny").await;
     let outcome = outcome.expect("the turn finishes after the decline");
     assert_eq!(outcome.denials.len(), 1, "the refusal is the audit record");
     assert_eq!(outcome.denials[0].tool_name, "exec");
@@ -1543,7 +1555,9 @@ mod codex_0167_requests {
     use serde_json::json;
 
     use super::harness;
-    use super::{control_log_shows, events_through_turn_end, surfaced_request};
+    use super::{
+        control_log_shows, events_through_turn_end, surfaced_request, turn_naming_the_chain,
+    };
 
     fn script_with(request: &str) -> String {
         [
@@ -1630,12 +1644,7 @@ mod codex_0167_requests {
             recorded.contains(r#""answers":{"colour":{"answers":["Red"]}}"#),
             "{recorded}"
         );
-        let (events, outcome) = events_through_turn_end(&mut session).await;
-        assert!(
-            events.iter().any(|event| matches!(event,
-                AgentEvent::Output { text, .. } if text.contains(": chain answer → "))),
-            "the journal names what the chain said: {events:?}"
-        );
+        let outcome = turn_naming_the_chain(&mut session, "answer").await;
         assert!(outcome.is_some());
         session.shutdown().await.expect("shuts down");
     }
