@@ -255,7 +255,11 @@ mod scripted_worker {
             follow,
             ..horde_cli::logs::LogsArgs::default()
         };
-        let mut out = Vec::new();
+        // A fixed buffer: a follow that kept printing without reading
+        // anything new runs out of room and fails, rather than filling
+        // memory.
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut out = std::io::Cursor::new(&mut buffer[..]);
         let target = horde_cli::logs::RemoteTarget::Worker("scripted".to_owned());
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -269,7 +273,11 @@ mod scripted_worker {
         )
         .await
         .expect("the read finishes");
-        (result, String::from_utf8_lossy(&out).into_owned())
+        let written = usize::try_from(out.position()).unwrap_or(buffer.len());
+        (
+            result,
+            String::from_utf8_lossy(&buffer[..written]).into_owned(),
+        )
     }
 }
 
@@ -288,4 +296,31 @@ async fn a_follow_that_loses_its_worker_says_so_and_redials() {
     assert!(result.is_ok(), "{result:?}");
     assert!(out.contains("--- lost the stream ("), "{out}");
     assert!(out.contains("after the redial"), "{out}");
+}
+
+/// An agent named by its session's name resolves to that session's root agent
+/// before the read is asked for: the refusal names the agent, not the
+/// session.
+#[tokio::test]
+async fn an_agent_read_names_the_resolved_agent() {
+    let endpoint = horde_server_testkit::serve().await.expect("served");
+    let (mut client, _session_id, root) = horde_server_testkit::seeded(&endpoint, "logs-agent")
+        .await
+        .expect("seeded");
+    let args = horde_cli::logs::LogsArgs {
+        target: Some("agent".to_owned()),
+        name: Some("logs-agent".to_owned()),
+        ..horde_cli::logs::LogsArgs::default()
+    };
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        horde_cli::logs::run(&mut client, &args, horde_cli::Format::Json),
+    )
+    .await
+    .expect("the read returns");
+    let Err(horde_cli::ClientError::Rpc(status)) = refused else {
+        panic!("an unplaced agent is refused: {refused:?}");
+    };
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(status.message().contains(&root), "{}", status.message());
 }

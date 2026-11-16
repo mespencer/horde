@@ -58,6 +58,9 @@ pub struct LogsArgs {
     pub source: Option<String>,
 }
 
+/// The name the CLI's own log files and spans go under.
+pub const BINARY: &str = "horde";
+
 /// Where this machine's CLI writes its own opt-in log: `~/.horde/client/logs`.
 #[must_use]
 pub fn client_log_dir(home: Option<PathBuf>) -> PathBuf {
@@ -91,9 +94,9 @@ pub fn client_file_logging(
     let settings = horde_observe::settings::LogSettings::client().with_env(lookup)?;
     horde_observe::FileLogging::start(
         &client_log_dir(home),
-        "horde",
+        BINARY,
         &settings,
-        &horde_observe::ServiceIdentity::new("horde").with_principal(principal),
+        &horde_observe::ServiceIdentity::new(BINARY).with_principal(principal),
     )
     .map(Some)
 }
@@ -117,7 +120,7 @@ pub fn observability(
     ),
     String,
 > {
-    let identity = horde_observe::ServiceIdentity::new("horde").with_principal(principal.clone());
+    let identity = horde_observe::ServiceIdentity::new(BINARY).with_principal(principal.clone());
     let telemetry = horde_observe::init_from_env(identity, &lookup).map_err(|e| e.to_string())?;
     let wanted = wants_log_file(
         log_file,
@@ -165,9 +168,9 @@ pub fn wire_filter(args: &LogsArgs) -> LogFilter {
         since: args.since.clone().unwrap_or_default(),
         level: args.level.clone().unwrap_or_default(),
         grep: args.grep.clone().unwrap_or_default(),
-        agent: None,
         source: args.source.clone().unwrap_or_default(),
         tail_records: u32::try_from(args.n).unwrap_or(u32::MAX),
+        ..LogFilter::default()
     }
 }
 
@@ -240,7 +243,16 @@ struct Printer<'a> {
     boot: Option<String>,
 }
 
-impl Printer<'_> {
+impl<'a> Printer<'a> {
+    /// A printer that has seen no boot yet.
+    fn new(out: &'a mut dyn Write, format: Format) -> Self {
+        Self {
+            out,
+            format,
+            boot: None,
+        }
+    }
+
     fn record(&mut self, record: &Record) -> Result<(), ClientError> {
         let restarted = record.key.source == horde_observe::record::Source::Horde
             && !record.key.boot.is_empty()
@@ -294,9 +306,8 @@ pub fn local_filter(args: &LogsArgs, now: SystemTime) -> Result<Filter, String> 
             .map(horde_observe::reader::Level::parse)
             .transpose()?,
         grep: args.grep.as_deref().map(compile_grep).transpose()?,
-        agent: None,
-        session_scope: None,
         sources: Sources::parse(args.source.as_deref().unwrap_or_default())?,
+        ..Filter::default()
     })
 }
 
@@ -315,11 +326,7 @@ pub async fn run_dir(
     out: &mut dyn Write,
 ) -> Result<(), ClientError> {
     let filter = local_filter(args, SystemTime::now()).map_err(ClientError::Logs)?;
-    let mut printer = Printer {
-        out,
-        format,
-        boot: None,
-    };
+    let mut printer = Printer::new(out, format);
     let mut window = Window {
         after: None,
         tail: Some(args.n),
@@ -333,18 +340,18 @@ pub async fn run_dir(
         if !args.follow {
             return Ok(());
         }
-        if let Some(last) = selection.last() {
-            window.after = Some(last.clone());
-        } else if window.after.is_none() {
-            // Nothing matched yet: follow from now on, not from the start.
-            window.after = Some(Cursor {
-                ts: horde_observe::record::format_ts(SystemTime::now()),
-                source: horde_observe::record::Source::Horde,
-                boot: String::new(),
-                seq: 0,
-            });
-        }
-        window.tail = None;
+        // Forward from the last record shown; with nothing shown yet, from
+        // now on rather than from the start. A forward read ignores the
+        // tail.
+        window.after = Some(
+            selection
+                .last()
+                .cloned()
+                .or(window.after.take())
+                .unwrap_or_else(|| {
+                    Cursor::start_of(horde_observe::record::format_ts(SystemTime::now()))
+                }),
+        );
         tokio::time::sleep(DIR_POLL).await;
     }
 }
@@ -360,16 +367,21 @@ enum Ended {
 
 /// Reads one stream to its end, printing as it goes; returns how it ended
 /// and the last cursor seen.
-async fn pump(
-    stream: &mut tonic::Streaming<horde_proto::v1::ReadLogsResponse>,
+async fn pump<S>(
+    stream: &mut S,
     printer: &mut Printer<'_>,
     last: &mut Option<Cursor>,
-) -> Result<Ended, ClientError> {
+) -> Result<Ended, ClientError>
+where
+    S: tokio_stream::Stream<Item = Result<horde_proto::v1::ReadLogsResponse, tonic::Status>>
+        + Unpin,
+{
+    use tokio_stream::StreamExt as _;
     loop {
-        let message = match stream.message().await {
-            Ok(Some(message)) => message,
-            Ok(None) => return Ok(Ended::Lost("the stream closed".to_owned())),
-            Err(status) => return Ok(Ended::Lost(status.message().to_owned())),
+        let message = match stream.next().await {
+            Some(Ok(message)) => message,
+            None => return Ok(Ended::Lost("the stream closed".to_owned())),
+            Some(Err(status)) => return Ok(Ended::Lost(status.message().to_owned())),
         };
         if let Some(ended) = show(message.body, printer, last)? {
             return Ok(ended);
@@ -415,6 +427,22 @@ pub fn redial_delay(attempt: u32) -> Duration {
     Duration::from_secs(u64::from(attempt.min(5)) * 2).max(Duration::from_millis(500))
 }
 
+/// A lost follow's redial schedule: [`redial_delay`] of each attempt in
+/// turn, from the first.
+#[derive(Debug, Default)]
+struct Backoff {
+    attempt: u32,
+}
+
+impl Backoff {
+    /// The wait before the next attempt.
+    fn next_delay(&mut self) -> Duration {
+        let delay = redial_delay(self.attempt);
+        self.attempt = self.attempt.saturating_add(1);
+        delay
+    }
+}
+
 /// A remote read; with `--follow`, redials on loss from the last cursor.
 ///
 /// # Errors
@@ -428,11 +456,7 @@ pub async fn run_remote(
     format: Format,
     out: &mut dyn Write,
 ) -> Result<(), ClientError> {
-    let mut printer = Printer {
-        out,
-        format,
-        boot: None,
-    };
+    let mut printer = Printer::new(out, format);
     let mut last: Option<Cursor> = None;
     let mut stream = client.read_logs(request(target, args, None)).await?;
     loop {
@@ -456,10 +480,9 @@ async fn redial(
     args: &LogsArgs,
     last: Option<&Cursor>,
 ) -> tonic::Streaming<horde_proto::v1::ReadLogsResponse> {
-    let mut attempt = 0;
+    let mut backoff = Backoff::default();
     loop {
-        tokio::time::sleep(redial_delay(attempt)).await;
-        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(backoff.next_delay()).await;
         if let Ok(next) = client.read_logs(request(target, args, last)).await {
             return next;
         }
@@ -526,6 +549,11 @@ mod tests {
         assert_eq!(on.dir(), home.path().join(".horde/client/logs"));
         assert_eq!(on.binary(), "horde");
         assert!(client_file_logging(true, None, None, |_| Some("=[".to_owned())).is_err());
+        assert_eq!(
+            client_log_dir(None),
+            std::path::PathBuf::from(".horde-client-logs"),
+            "with no home, beside the working directory"
+        );
     }
 
     #[test]
@@ -799,6 +827,143 @@ mod tests {
         assert_eq!(out.text().matches("first").count(), 1, "nothing twice");
     }
 
+    /// A writer that refuses every byte, as a closed stdout does.
+    struct Refusing;
+
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Stdout going away ends a read, naming stdout.
+    #[test]
+    fn a_closed_stdout_is_named_in_the_refusal() {
+        let mut out = Refusing;
+        let mut printer = Printer::new(&mut out, Format::Json);
+        let refused = printer.record(&record(r#"{"ts":"t1","msg":"a"}"#));
+        assert!(
+            matches!(&refused, Err(crate::ClientError::File { path, .. })
+                if path == std::path::Path::new("<stdout>")),
+            "{refused:?}"
+        );
+    }
+
+    /// A new printer has seen no boot: the first record is never a restart.
+    #[test]
+    fn a_new_printer_marks_no_restart_on_its_first_record() {
+        let mut out = Vec::new();
+        Printer::new(&mut out, Format::Human)
+            .record(&record(r#"{"ts":"t1","msg":"a","boot":"b1","seq":1}"#))
+            .expect("print");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("restarted"), "{text}");
+    }
+
+    /// A count too large for the wire asks for everything the wire can.
+    #[test]
+    fn an_enormous_tail_is_the_wires_largest() {
+        let filter = super::wire_filter(&LogsArgs {
+            n: usize::MAX,
+            ..LogsArgs::default()
+        });
+        assert_eq!(filter.tail_records, u32::MAX);
+        assert_eq!(
+            filter.agent, None,
+            "the target names the agent, never the filter"
+        );
+    }
+
+    /// A stream that closes, or fails, without an end frame is lost; each
+    /// record shown moves the cursor a redial resumes from.
+    #[tokio::test]
+    async fn a_stream_without_an_end_is_lost_and_records_move_the_cursor() {
+        use horde_proto::v1::{LogRecords, ReadLogsResponse, read_logs_response::Body};
+        let mut out = Vec::new();
+        let mut printer = Printer::new(&mut out, Format::Json);
+        let mut last = None;
+        let batch = ReadLogsResponse {
+            body: Some(Body::Records(LogRecords {
+                lines: vec![
+                    r#"{"ts":"t1","msg":"a","boot":"b","seq":1}"#.to_owned(),
+                    r#"{"ts":"t2","msg":"b","boot":"b","seq":2}"#.to_owned(),
+                ],
+                ..LogRecords::default()
+            })),
+        };
+        let mut closed = tokio_stream::iter(vec![Ok(batch)]);
+        assert_eq!(
+            super::pump(&mut closed, &mut printer, &mut last)
+                .await
+                .expect("pumped"),
+            Ended::Lost("the stream closed".to_owned())
+        );
+        assert_eq!(last.as_ref().map(|key| key.seq), Some(2));
+        let mut failed = tokio_stream::iter(vec![Err(tonic::Status::unavailable("gone"))]);
+        assert_eq!(
+            super::pump(&mut failed, &mut printer, &mut last)
+                .await
+                .expect("pumped"),
+            Ended::Lost("gone".to_owned())
+        );
+    }
+
+    /// A lost follow redials after half a second, then backs off by two
+    /// seconds an attempt, to ten.
+    #[test]
+    fn redials_back_off_from_half_a_second_to_ten() {
+        let mut backoff = super::Backoff::default();
+        let delays: Vec<Duration> = (0..7).map(|_| backoff.next_delay()).collect();
+        assert_eq!(
+            delays,
+            [500, 2_000, 4_000, 6_000, 8_000, 10_000, 10_000].map(Duration::from_millis)
+        );
+    }
+
+    /// Following a directory where nothing matched yet starts from now: a
+    /// record stamped earlier that turns up later is not shown, one stamped
+    /// later is.
+    #[tokio::test]
+    async fn a_dir_follow_with_nothing_yet_starts_from_now() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = Shared::default();
+        let mut writer = out.clone();
+        let args = LogsArgs {
+            follow: true,
+            ..LogsArgs::default()
+        };
+        let driver = async {
+            // Past the first look, which found nothing.
+            tokio::time::sleep(super::DIR_POLL / 2).await;
+            std::fs::write(
+                dir.path().join("horde.b.1.jsonl"),
+                [
+                    r#"{"ts":"2020-01-01T00:00:00.000000Z","level":"INFO","msg":"stale"}"#,
+                    r#"{"ts":"2999-01-01T00:00:00.000000Z","level":"INFO","msg":"fresh"}"#,
+                ]
+                .join("\n"),
+            )
+            .expect("write");
+            let mut polls = 0;
+            while !out.text().contains("fresh") {
+                polls += 1;
+                assert!(polls < 100, "the later record is followed: {}", out.text());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::select! {
+            ended = run_dir(dir.path(), &args, Format::Json, &mut writer) => {
+                panic!("a follow keeps reading, but it ended: {ended:?}");
+            }
+            () = driver => {}
+        }
+        assert!(!out.text().contains("stale"), "{}", out.text());
+    }
+
     #[test]
     fn a_notice_prints_in_human_output() {
         let mut human = Vec::new();
@@ -929,6 +1094,7 @@ mod tests {
         .await
         .expect("read");
         assert!(tail.contains("last"));
+        assert_eq!(tail.lines().count(), 1, "the newest one only: {tail}");
         let bad = bounded_dir(
             dir.path(),
             &LogsArgs {

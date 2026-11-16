@@ -75,6 +75,18 @@ impl Cursor {
         )
     }
 
+    /// The first position at `ts`: every record stamped `ts` or later sorts
+    /// after it, every earlier one before it.
+    #[must_use]
+    pub fn start_of(ts: String) -> Self {
+        Self {
+            ts,
+            source: Source::Horde,
+            boot: String::new(),
+            seq: 0,
+        }
+    }
+
     /// Reads [`Self::encode`] back; `None` for anything else.
     #[must_use]
     pub fn decode(text: &str) -> Option<Self> {
@@ -285,6 +297,27 @@ mod tests {
         };
         assert_eq!(horde.encode(), "2026-01-01T00:00:00.000000Z~horde~b~7");
         assert_eq!(Cursor::decode(&horde.encode()), Some(horde));
+    }
+
+    /// Nothing at a timestamp sorts before its start, and nothing earlier
+    /// sorts after it.
+    #[test]
+    fn the_start_of_a_timestamp_precedes_everything_stamped_with_it() {
+        let start = Cursor::start_of("2026-01-01T00:00:01.000000Z".to_owned());
+        let at = |ts: &str, source, boot: &str, seq| Cursor {
+            ts: ts.to_owned(),
+            source,
+            boot: boot.to_owned(),
+            seq,
+        };
+        assert!(start < at("2026-01-01T00:00:01.000000Z", Source::Horde, "", 1));
+        assert!(start < at("2026-01-01T00:00:01.000000Z", Source::Horde, "a", 0));
+        assert!(start < at("2026-01-01T00:00:01.000000Z", Source::Stderr, "", 0));
+        assert!(start > at("2026-01-01T00:00:00.999999Z", Source::Stderr, "z", 9));
+        assert_eq!(
+            start,
+            at("2026-01-01T00:00:01.000000Z", Source::Horde, "", 0)
+        );
     }
 
     fn cursor_at(ts: &str) -> Cursor {

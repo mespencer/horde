@@ -871,8 +871,8 @@ pub fn spec_from(args: &SpecArgs) -> Result<horde_proto::v1::AgentSpec, ClientEr
 /// alone already carries one branch per verb, and anything else in the same
 /// function walks the whole thing back over the complexity ceiling.
 pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
-    if run_unconnected(cli, format).await? {
-        return Ok(());
+    if let Some(verb) = unconnected(cli)? {
+        return run_unconnected(cli, verb, format).await;
     }
     let settings = crate::config::ClientSettings::load(
         cli.config.as_deref(),
@@ -900,67 +900,87 @@ pub async fn run(cli: &Cli, format: Format) -> Result<(), ClientError> {
     dispatch(&mut client, cli, &resolved, format).await
 }
 
-/// The verbs that run before, or instead of, a connection to the server:
-/// `enroll join`, `up`, a dry-run `worker add`, `logs --dir` (and a remote
-/// `logs` target's local validation), and `doctor`. `true` means the verb
-/// ran here and nothing should connect.
-async fn run_unconnected(cli: &Cli, format: Format) -> Result<bool, ClientError> {
-    // The one verb that must work *before* any identity exists: joining is
-    // how this machine gets one, so it dials the enrollment listener rather
-    // than the control plane.
-    if let Some(Command::Enroll(EnrollCommand::Join {
-        token,
-        token_file,
-        force,
-    })) = &cli.command
-    {
-        let text = join_token_text(
-            token.as_deref(),
-            token_file.as_deref(),
-            std::env::var(JOIN_TOKEN_VAR).ok(),
-        )?;
-        return run_join(cli, &text, *force, format).await.map(|()| true);
-    }
-    // `up` orchestrates its own enrollments and connections, starting from
-    // a machine that may hold nothing yet.
-    if let Some(Command::Up(args)) = &cli.command {
-        return crate::up::run(args, cli.identity.as_deref())
-            .await
-            .map(|()| true);
-    }
-    // A dry run of `worker add` prints its plan and connects to nothing —
-    // not even the server it would mint through.
-    if let Some(Command::Worker(WorkerCommand::Add(args))) = &cli.command
-        && args.dry_run
-    {
-        return crate::worker_add::dry_run(args, format).map(|()| true);
-    }
-    // `logs --dir` reads local files, for exactly the machine that cannot
-    // reach a server.
-    if let Some(Command::Logs(args)) = &cli.command {
-        if let Some(dir) = &args.dir {
-            return crate::logs::run_dir(dir, args, format, &mut std::io::stdout())
-                .await
-                .map(|()| true);
+/// A verb that runs before, or instead of, a connection to the server.
+#[derive(Debug)]
+enum Unconnected<'a> {
+    /// The one verb that must work *before* any identity exists: joining is
+    /// how this machine gets one, so it dials the enrollment listener rather
+    /// than the control plane.
+    Join { token: String, force: bool },
+    /// `up` orchestrates its own enrollments and connections, starting from
+    /// a machine that may hold nothing yet.
+    Up(&'a crate::up::UpArgs),
+    /// A dry run of `worker add` prints its plan and connects to nothing —
+    /// not even the server it would mint through.
+    PlanWorkerAdd(&'a crate::worker_add::AddArgs),
+    /// `logs --dir` reads local files, for exactly the machine that cannot
+    /// reach a server.
+    LogsDir(&'a std::path::Path, &'a crate::logs::LogsArgs),
+    /// `doctor` diagnoses the very connection the other verbs need, so it
+    /// must run whether or not one can be made.
+    Doctor(&'a crate::doctor::DoctorArgs),
+}
+
+/// The verb this invocation runs without a connection, if it is one.
+///
+/// # Errors
+///
+/// A join with no token, or a remote `logs` target mistaken: the user's to
+/// fix whether or not a server is up, so refused before any dial.
+fn unconnected(cli: &Cli) -> Result<Option<Unconnected<'_>>, ClientError> {
+    Ok(match &cli.command {
+        Some(Command::Enroll(EnrollCommand::Join {
+            token,
+            token_file,
+            force,
+        })) => Some(Unconnected::Join {
+            token: join_token_text(
+                token.as_deref(),
+                token_file.as_deref(),
+                std::env::var(JOIN_TOKEN_VAR).ok(),
+            )?,
+            force: *force,
+        }),
+        Some(Command::Up(args)) => Some(Unconnected::Up(args)),
+        Some(Command::Worker(WorkerCommand::Add(args))) if args.dry_run => {
+            Some(Unconnected::PlanWorkerAdd(args))
         }
-        // A target mistake is refused before any dial: it is the user's to
-        // fix whether or not a server is up.
-        crate::logs::remote_target(args.target.as_deref(), args.name.as_deref())
-            .map_err(ClientError::Logs)?;
+        Some(Command::Logs(args)) => match &args.dir {
+            Some(dir) => Some(Unconnected::LogsDir(dir, args)),
+            None => {
+                crate::logs::remote_target(args.target.as_deref(), args.name.as_deref())
+                    .map_err(ClientError::Logs)?;
+                None
+            }
+        },
+        Some(Command::Doctor(args)) => Some(Unconnected::Doctor(args)),
+        _ => None,
+    })
+}
+
+/// Runs a verb that needs no connection.
+async fn run_unconnected(
+    cli: &Cli,
+    verb: Unconnected<'_>,
+    format: Format,
+) -> Result<(), ClientError> {
+    match verb {
+        Unconnected::Join { token, force } => run_join(cli, &token, force, format).await,
+        Unconnected::Up(args) => crate::up::run(args, cli.identity.as_deref()).await,
+        Unconnected::PlanWorkerAdd(args) => crate::worker_add::dry_run(args, format),
+        Unconnected::LogsDir(dir, args) => {
+            crate::logs::run_dir(dir, args, format, &mut std::io::stdout()).await
+        }
+        Unconnected::Doctor(args) => {
+            crate::doctor::run(
+                cli.endpoint.as_deref(),
+                cli.identity.as_deref(),
+                args,
+                format,
+            )
+            .await
+        }
     }
-    // `doctor` diagnoses the very connection the other verbs need, so it
-    // must run whether or not one can be made.
-    if let Some(Command::Doctor(args)) = &cli.command {
-        return crate::doctor::run(
-            cli.endpoint.as_deref(),
-            cli.identity.as_deref(),
-            args,
-            format,
-        )
-        .await
-        .map(|()| true);
-    }
-    Ok(false)
 }
 
 /// Dispatches to one handler per verb.
@@ -3134,6 +3154,65 @@ mod enrollment_tests {
         assert_eq!(args.bind, "127.0.0.1:7777", "the day-one default port");
         assert_eq!(args.enrollment_bind, "127.0.0.1:7778");
         assert!(args.adapters.is_empty() && args.state_dir.is_none());
+    }
+
+    /// Exactly these verbs run without a connection: a join, `up`, a dry
+    /// run of `worker add`, `logs --dir` and `doctor`. A remote `logs`
+    /// target's mistake is refused before any dial; every other verb
+    /// connects.
+    #[test]
+    fn the_unconnected_verbs_are_known_before_any_dial() {
+        use super::{Unconnected, unconnected};
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("valid arguments");
+
+        let join = parsed(&[
+            "horde",
+            "enroll",
+            "join",
+            "horde://join/h:1/s.fp",
+            "--force",
+        ]);
+        assert!(matches!(
+            unconnected(&join),
+            Ok(Some(Unconnected::Join { token, force: true })) if token == "horde://join/h:1/s.fp"
+        ));
+        assert!(matches!(
+            unconnected(&parsed(&["horde", "up"])),
+            Ok(Some(Unconnected::Up(_)))
+        ));
+        assert!(matches!(
+            unconnected(&parsed(&[
+                "horde",
+                "worker",
+                "add",
+                "box",
+                "me@remote",
+                "--dry-run"
+            ])),
+            Ok(Some(Unconnected::PlanWorkerAdd(_)))
+        ));
+        assert!(matches!(
+            unconnected(&parsed(&["horde", "logs", "--dir", "/tmp/logs"])),
+            Ok(Some(Unconnected::LogsDir(dir, _))) if dir == std::path::Path::new("/tmp/logs")
+        ));
+        assert!(matches!(
+            unconnected(&parsed(&["horde", "doctor"])),
+            Ok(Some(Unconnected::Doctor(_)))
+        ));
+        for connected in [
+            &["horde", "worker", "add", "box", "me@remote"][..],
+            &["horde", "logs", "server"][..],
+            &["horde", "hello"][..],
+        ] {
+            assert!(
+                matches!(unconnected(&parsed(connected)), Ok(None)),
+                "{connected:?}"
+            );
+        }
+        assert!(matches!(
+            unconnected(&parsed(&["horde", "logs", "nowhere"])),
+            Err(crate::ClientError::Logs(_))
+        ));
     }
 
     /// ADR-0007's endpoint precedence, whole: explicit beats stored, the
