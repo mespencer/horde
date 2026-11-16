@@ -205,8 +205,7 @@ impl WorkspaceManager {
             );
         }
 
-        // #[gamma::skip(expr.decrement, reason = "a Definition holding u32::MAX repos cannot be built in memory, so the saturating fallback is unreachable")]
-        let total = u32::try_from(definition.repos.len()).unwrap_or(u32::MAX);
+        let total = saturating_u32(definition.repos.len());
         for (index, repo) in (0_u32..).zip(&definition.repos) {
             let verb = if instance_root.join(&repo.name).join(".git").exists() {
                 "fetching"
@@ -437,6 +436,7 @@ impl WorkspaceManager {
                 )
                 .await?;
             record.last_active_at_ms = now_ms();
+            // #[gamma::skip(assign_value.default, reason = "`Default::default()` for an `Option<i64>` is `None`: the mutant is the same expression")]
             record.soft_reclaimed_at_ms = None;
             super::ledger::write(&agents_dir, &record)
                 .await
@@ -1332,6 +1332,11 @@ async fn clone_repo(
 }
 
 // The checkout composition suite: real repos, real git, one manager.
+/// `count` as a `u32`, saturating: a progress total, never wrapped.
+fn saturating_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod composition_tests;

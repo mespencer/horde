@@ -2484,6 +2484,258 @@ async fn an_abandoned_spawn_is_removed_at_once_whatever_the_grace() {
         !workspaces_root.join("ws-1/.horde-agents/agent-1").exists(),
         "nothing ran there, so the grace does not apply"
     );
+    let tiers: Vec<i32> = housekeeping_cleanups(&runtime)
+        .await
+        .into_iter()
+        .filter(|cleanup| {
+            cleanup
+                .agent_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                == Some("agent-1")
+        })
+        .map(|cleanup| cleanup.tier)
+        .collect();
+    assert_eq!(
+        tiers,
+        vec![i32::from(horde_proto::v1::CleanupTier::Hard)],
+        "nothing ran there to reclaim either: the removal is the only cleanup"
+    );
+    runtime.shutdown().await;
+}
+
+/// Every workspace cleanup the Runtime journaled, in order.
+async fn housekeeping_cleanups(runtime: &Runtime) -> Vec<horde_proto::v1::WorkspaceCleanup> {
+    runtime
+        .shared
+        .journal
+        .read_from(1, 100_000)
+        .await
+        .expect("a readable journal")
+        .into_iter()
+        .filter_map(
+            |journaled| match journaled.event.and_then(|event| event.kind) {
+                Some(Kind::WorkspaceCleanup(cleanup)) => Some(cleanup),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// `agent`'s ledger record in `ws-1`, as it stands.
+async fn record_of(runtime: &Runtime, agent: &str) -> crate::workspace::ledger::LedgerRecord {
+    runtime
+        .shared
+        .workspaces
+        .as_ref()
+        .expect("workspaces")
+        .records("ws-1")
+        .await
+        .into_iter()
+        .find(|record| record.agent_id == agent)
+        .expect("the agent's record")
+}
+
+/// A scan removes an archived checkout the very millisecond its grace is
+/// over, and not one before.
+#[tokio::test]
+async fn an_archived_checkout_goes_the_millisecond_its_grace_is_over() {
+    let (_temp, workspaces_root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    let spec = horde_proto::v1::AgentSpec {
+        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
+        ..first_turn("hello")
+    };
+    runtime
+        .apply(spawn_of(2, "agent-1", spec, Some(graceful_policy())))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    runtime
+        .apply(archive_command(3, "s1:3", "agent-1"))
+        .await
+        .expect("the archive applies");
+    settle(&runtime).await;
+    // The archive's release runs after the command, under the checkout
+    // lock: once it is reclaimed and the lock is free, it is done.
+    tokio::time::timeout(core::time::Duration::from_secs(15), async {
+        while record_of(&runtime, "agent-1")
+            .await
+            .soft_reclaimed_at_ms
+            .is_none()
+        {
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the archive's release reclaims the checkout");
+    drop(runtime.shared.checkout_locks.of("agent-1").lock().await);
+    let record = record_of(&runtime, "agent-1").await;
+    let archived_at = record.archived_at_ms.expect("archived");
+    let grace_over = archived_at + 86_400_000;
+    let housekeeper = super::housekeeping::of(&runtime.shared).expect("a housekeeper");
+    let checkout = workspaces_root.join("ws-1/.horde-agents/agent-1");
+    assert!(
+        !housekeeper
+            .scan_checkout("ws-1", &record, grace_over - 1)
+            .await,
+        "a millisecond short of the grace changes nothing"
+    );
+    assert!(checkout.exists(), "still within its grace");
+    assert!(
+        housekeeper.scan_checkout("ws-1", &record, grace_over).await,
+        "the grace is over"
+    );
+    assert!(!checkout.exists(), "removed the moment the grace ended");
+    runtime.shutdown().await;
+}
+
+/// A scan reclaims a live agent's checkout the very millisecond it has
+/// been idle for the policy's time, and not one before.
+#[tokio::test]
+async fn a_live_checkout_is_reclaimed_the_millisecond_it_turns_idle() {
+    let (_temp, _root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    let spec = horde_proto::v1::AgentSpec {
+        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
+        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
+        ..first_turn("hello")
+    };
+    let policy = horde_proto::v1::ResolvedWorkspacePolicy {
+        idle_reclaim_after: Some(horde_proto::prost_types::Duration {
+            seconds: 3_600,
+            nanos: 0,
+        }),
+        ..graceful_policy()
+    };
+    runtime
+        .apply(spawn_of(2, "agent-1", spec, Some(policy)))
+        .await
+        .expect("the spawn applies");
+    settle(&runtime).await;
+    // Once its turn is over nothing touches the agent's activity again;
+    // forgotten, the ledger's last activity is its whole history.
+    tokio::time::timeout(core::time::Duration::from_secs(15), async {
+        while !runtime
+            .shared
+            .activity
+            .snapshot("agent-1")
+            .is_some_and(|seen| !seen.busy)
+        {
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first turn ends");
+    runtime.shared.activity.forget("agent-1");
+    let record = record_of(&runtime, "agent-1").await;
+    let idle_from = record.last_active_at_ms + 3_600_000;
+    let housekeeper = super::housekeeping::of(&runtime.shared).expect("a housekeeper");
+    assert!(
+        !housekeeper
+            .scan_checkout("ws-1", &record, idle_from - 1)
+            .await,
+        "a millisecond short of idle changes nothing"
+    );
+    assert!(
+        housekeeper.scan_checkout("ws-1", &record, idle_from).await,
+        "idle for exactly the policy's time"
+    );
+    let idle: Vec<_> = housekeeping_cleanups(&runtime)
+        .await
+        .into_iter()
+        .filter(|cleanup| cleanup.trigger == i32::from(horde_proto::v1::CleanupTrigger::Idle))
+        .collect();
+    assert_eq!(idle.len(), 1, "one idle reclaim: {idle:?}");
+    runtime.shutdown().await;
+}
+
+/// Disk pressure's candidates: archived checkouts by archive time, then
+/// orphans, then live agents, each group oldest first.
+#[tokio::test]
+async fn pressure_candidates_go_archived_then_orphans_then_live() {
+    let (_temp, _root, runtime) = spawned_in_workspace().await;
+    let manager = runtime.shared.workspaces.clone().expect("workspaces");
+    let agents_dir = manager.agents_dir("ws-1");
+    // Named so that agent order is not the expected order.
+    for (agent, archived_at_ms, last_active_at_ms) in [
+        ("agent-z", Some(20), 1),
+        ("agent-y", Some(10), 2),
+        ("agent-x", None, 30),
+        ("agent-w", None, 20),
+    ] {
+        crate::workspace::ledger::write(
+            &agents_dir,
+            &crate::workspace::ledger::LedgerRecord {
+                agent_id: agent.to_owned(),
+                archived_at_ms,
+                last_active_at_ms,
+                ..crate::workspace::ledger::LedgerRecord::default()
+            },
+        )
+        .await
+        .expect("the record is written");
+    }
+    let housekeeper = super::housekeeping::of(&runtime.shared).expect("a housekeeper");
+    let order: Vec<String> = housekeeper
+        .pressure_candidates()
+        .await
+        .into_iter()
+        .map(|(_, record)| record.agent_id)
+        .collect();
+    assert_eq!(
+        order,
+        ["agent-y", "agent-z", "agent-w", "agent-x", "agent-1"],
+        "archived by archive time, orphans, then the live agent"
+    );
+    runtime.shutdown().await;
+}
+
+/// Counts the reports it is handed.
+#[derive(Default)]
+struct CountingReporter(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl super::InstanceReporter for CountingReporter {
+    async fn report(&self, _reports: Vec<horde_proto::v1::WorkspaceInstanceReport>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A scan loop held up for many intervals does not catch up on the ticks
+/// it missed: one scan follows, then the interval again — not a burst.
+#[tokio::test]
+async fn a_held_up_scan_loop_does_not_burst() {
+    let temp = tempfile::tempdir().expect("a tempdir");
+    let reporter = Arc::new(CountingReporter::default());
+    let interval = core::time::Duration::from_millis(250);
+    let mut runtime = runtime_with(Script::echoing())
+        .with_workspaces(crate::workspace::WorkspaceManager::new(
+            "worker-a",
+            temp.path().join("workspaces"),
+        ))
+        .with_instance_reporter(reporter.clone())
+        .with_housekeeping(super::HousekeepingConfig {
+            scan_interval: interval,
+            // Every scan reports, so the reports count the scans.
+            report_interval: core::time::Duration::ZERO,
+            ..super::HousekeepingConfig::default()
+        });
+    let episode = Arc::clone(&runtime.episode);
+    let held = episode.lock().await;
+    runtime.replay_inbox().await.expect("the replay runs");
+    // The first scan waits on the episode for ten intervals.
+    tokio::time::sleep(interval * 10).await;
+    assert_eq!(reporter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(held);
+    tokio::time::sleep(interval / 5).await;
+    let scans = reporter.0.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&scans),
+        "the held-up scan, and no burst of missed ones: {scans}"
+    );
     runtime.shutdown().await;
 }
 

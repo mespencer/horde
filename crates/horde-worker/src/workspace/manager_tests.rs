@@ -9,7 +9,7 @@ use super::super::ledger;
 use super::{
     Arc, BaseResolution, CheckoutMode, CheckoutPolicy, CheckoutRequest, FsStats, LedgerRecord,
     LedgerRepo, Path, PathBuf, PreparedRepo, RepoBase, RepoBaseSource, StatvfsStats,
-    WorkspaceDefinition, WorkspaceManager, WorkspaceRepo,
+    WorkspaceDefinition, WorkspaceManager, WorkspaceRepo, saturating_u32,
 };
 use crate::workspace::test_git::git as run_git;
 
@@ -977,4 +977,10 @@ async fn unmanaged_links_are_kept_and_restored() {
         .await
         .expect("recomposed over the existing link");
     assert!(a.is_symlink() && b.is_symlink(), "both linked again");
+}
+
+#[test]
+fn a_count_past_u32_saturates() {
+    assert_eq!(saturating_u32(7), 7);
+    assert_eq!(saturating_u32(usize::MAX), u32::MAX);
 }

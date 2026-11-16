@@ -541,8 +541,8 @@ validates it (below). The Worker also runs `git check-ref-format --branch
   branch is created with `worktree add -b`, and the ledger records
   `created_branch = true`.
 - **A local branch exists and is checked out in another worktree.** The
-  spawn fails, naming the holder agent from the ledgers or "a worktree Horde
-  did not create". The usual case is an archived agent's retained checkout,
+  spawn fails, naming the holder agent from the ledgers, or the path of a
+  worktree Horde did not create. The usual case is an archived agent's retained checkout,
   and the error says so: `horde workspace gc --hard --agent <id> [--force]`.
 - **A local branch exists and is not checked out anywhere.** If its tip is
   an ancestor of, or equal to, the resolved base, the Worker moves it to the

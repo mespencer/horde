@@ -421,21 +421,26 @@ impl Housekeeper {
         .await
     }
 
-    /// One scan pass: idle and orphan reclaim, grace expiry, then disk
-    /// pressure. Returns whether anything changed.
+    /// One scan pass, now: idle and orphan reclaim, grace expiry, then
+    /// disk pressure. Returns whether anything changed.
     pub(super) async fn scan(&self, config: &HousekeepingConfig, episode: &mut Episode) -> bool {
         let mut changed = false;
         for (definition_id, _) in self.workspaces.instances().await {
             for record in self.workspaces.records(&definition_id).await {
-                changed |= self.scan_checkout(&definition_id, &record).await;
+                changed |= self.scan_checkout(&definition_id, &record, now_ms()).await;
             }
         }
         changed |= self.relieve_pressure(config, episode).await;
         changed
     }
 
-    /// The scan's rules for one checkout.
-    async fn scan_checkout(&self, definition_id: &str, record: &LedgerRecord) -> bool {
+    /// The scan's rules for one checkout, at `now` (ms since the epoch).
+    pub(super) async fn scan_checkout(
+        &self,
+        definition_id: &str,
+        record: &LedgerRecord,
+        now: i64,
+    ) -> bool {
         let lock = self.shared.checkout_locks.of(&record.agent_id);
         // A checkout someone is working on is skipped this pass, not waited
         // for: the scan has every other checkout to get through.
@@ -444,9 +449,9 @@ impl Housekeeper {
         };
         let policy = self.policy(definition_id);
         match self.standing(record).await {
-            Standing::Live => self.scan_live(definition_id, record, &policy).await,
+            Standing::Live => self.scan_live(definition_id, record, &policy, now).await,
             Standing::Archived(archived_at) => {
-                self.scan_archived(definition_id, record, archived_at, &policy)
+                self.scan_archived(definition_id, record, archived_at, &policy, now)
                     .await
             }
             Standing::Orphan if !record.orphan_reported => {
@@ -464,6 +469,7 @@ impl Housekeeper {
         definition_id: &str,
         record: &LedgerRecord,
         policy: &WorkspacePolicy,
+        now: i64,
     ) -> bool {
         let activity = &self.shared.activity;
         if let Some(at) = activity.due_for_write(&record.agent_id, now_ms()) {
@@ -486,7 +492,7 @@ impl Housekeeper {
             .map(|seen| seen.last_active_ms)
             .unwrap_or(record.last_active_at_ms)
             .max(record.last_active_at_ms);
-        if !idle_reached(last_active, now_ms(), after) {
+        if !idle_reached(last_active, now, after) {
             return false;
         }
         // Seen for the first time already idle (a revival's checkout, a
@@ -514,8 +520,9 @@ impl Housekeeper {
         record: &LedgerRecord,
         archived_at: i64,
         policy: &WorkspacePolicy,
+        now: i64,
     ) -> bool {
-        if !grace_over(archived_at, now_ms(), policy.archived_grace) {
+        if !grace_over(archived_at, now, policy.archived_grace) {
             return false;
         }
         let pass = Pass {
@@ -634,7 +641,7 @@ impl Housekeeper {
     /// Checkouts already reclaimed since their last activity are not
     /// candidates; a busy agent is skipped when its turn comes, under its
     /// lock.
-    async fn pressure_candidates(&self) -> Vec<(String, LedgerRecord)> {
+    pub(super) async fn pressure_candidates(&self) -> Vec<(String, LedgerRecord)> {
         let mut archived = Vec::new();
         let mut orphans = Vec::new();
         let mut live = Vec::new();
@@ -830,8 +837,8 @@ pub(super) struct Episode {
 
 impl Episode {
     fn end(&mut self) {
-        self.active = false;
-        self.reported = false;
+        // #[gamma::skip(assign_value.default, reason = "`Self::default()` and `Default::default()` name the same derived `Episode::default`")]
+        *self = Self::default();
     }
 }
 

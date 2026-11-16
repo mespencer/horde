@@ -962,11 +962,10 @@ pub fn human_bytes(bytes: u64) -> String {
     let [mut name, larger @ ..] = UNITS;
     let mut value = bytes;
     for unit in larger {
-        if value < 1024 {
-            break;
+        if value >= 1024 {
+            value /= 1024;
+            name = unit;
         }
-        value /= 1024;
-        name = unit;
     }
     format!("{value} {name}")
 }

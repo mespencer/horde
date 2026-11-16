@@ -374,7 +374,7 @@ pub(crate) async fn plan_branch(
 }
 
 /// Who holds `reference` checked out, if anyone: the agent whose checkout
-/// path names it, or "a worktree Horde did not create".
+/// path names it, or the path of a worktree Horde did not create.
 async fn worktree_holding(instance_repo: &Path, reference: &str) -> Result<Option<String>, String> {
     let listing = git(instance_repo, &["worktree", "list", "--porcelain"]).await?;
     for block in listing.split("\n\n") {
@@ -403,7 +403,7 @@ pub(crate) fn holder_name(path: &str) -> String {
             return format!("agent {agent}");
         }
     }
-    "a worktree Horde did not create".to_owned()
+    format!("the worktree at {path}, which Horde did not create")
 }
 
 #[cfg(test)]
@@ -419,9 +419,12 @@ mod tests {
         );
         assert_eq!(
             holder_name("/elsewhere/atlas"),
-            "a worktree Horde did not create"
+            "the worktree at /elsewhere/atlas, which Horde did not create"
         );
-        assert_eq!(holder_name(""), "a worktree Horde did not create");
+        assert_eq!(
+            holder_name(""),
+            "the worktree at , which Horde did not create"
+        );
     }
 
     #[test]
@@ -756,7 +759,10 @@ mod tests {
             .await
             .expect_err("main is checked out");
         assert!(
-            main.contains("checked out by a worktree Horde did not create"),
+            main.contains(&format!(
+                "checked out by the worktree at {}, which Horde did not create",
+                instance.display()
+            )),
             "{main}"
         );
         let agents = plan_branch(&instance, "agent-branch", &seed)

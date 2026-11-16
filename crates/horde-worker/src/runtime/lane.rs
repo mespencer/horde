@@ -556,10 +556,11 @@ impl Lane {
         // Registered only once the harness actually started: a checkout with
         // no agent behind it must not become a peer-fetch source or a
         // stamping target.
+        // The checkout lock goes with this function's return, in this same
+        // poll: nothing below awaits.
         if let Some(checkout) = checkout {
             self.shared.broker.register(&agent_id, checkout);
         }
-        drop(held);
 
         let inputs = spawn
             .spec
