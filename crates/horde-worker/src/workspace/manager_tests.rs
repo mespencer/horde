@@ -87,9 +87,10 @@ fn blocks_count_as_their_fragment_size_and_saturate() {
     assert_eq!(super::blocks_to_bytes(u64::MAX, 2), u64::MAX);
 }
 
-/// The bytes `StatvfsStats` reports are `df`'s, to the byte: the size
-/// exactly, and the free space at some reading of a few — other writers move
-/// it between the two measurements, a miscount never agrees.
+/// The bytes `StatvfsStats` reports are `df`'s, to the byte, at a reading
+/// where nothing moved: ours before and after `df` agree with each other
+/// and with it. Other writers move free space between measurements, so a
+/// few readings are taken; a miscount never agrees in a still moment.
 #[cfg(target_os = "linux")]
 #[test]
 fn statvfs_bytes_are_dfs_to_the_byte() {
@@ -116,7 +117,10 @@ fn statvfs_bytes_are_dfs_to_the_byte() {
             .map(|field| field.parse().expect("a byte count"))
             .collect();
         let theirs = (row[2], row[0]);
-        if ours == theirs {
+        let after = StatvfsStats
+            .stats(dir.path())
+            .expect("a real filesystem answers");
+        if ours == theirs && after == theirs {
             return;
         }
         last = Some((ours, theirs));
@@ -534,41 +538,6 @@ async fn the_shared_policy_is_the_instance_itself() {
             .to_string();
         assert!(error.contains("shared policy"), "{error}");
     }
-}
-
-/// The bytes `statvfs` reports agree with `df`'s: the filesystem's size
-/// exactly, and its free space to within half a block per free block —
-/// tight enough that miscounting the block size by one is caught. Other
-/// writers can move free space between the two readings, so a reading is
-/// retried a few times; a miscount is off by the same amount every time.
-#[test]
-fn statvfs_agrees_with_df() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut last = None;
-    for _ in 0..10 {
-        let (free, total) = StatvfsStats.stats(dir.path()).expect("a real filesystem");
-        let output = std::process::Command::new("df")
-            .args(["-B1", "--output=size,avail"])
-            .arg(dir.path())
-            .output()
-            .expect("df runs");
-        assert!(output.status.success(), "df failed");
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let numbers: Vec<u64> = text
-            .lines()
-            .nth(1)
-            .expect("df's row")
-            .split_whitespace()
-            .map(|field| field.parse().expect("a byte count"))
-            .collect();
-        let (size, avail) = (numbers[0], numbers[1]);
-        assert_eq!(total, size, "the filesystem's size");
-        if free.abs_diff(avail) <= avail / 8192 {
-            return;
-        }
-        last = Some((free, avail));
-    }
-    panic!("statvfs's free space never agreed with df's: {last:?}");
 }
 
 /// Collects the progress a materialization reports, as `(step, completed,
