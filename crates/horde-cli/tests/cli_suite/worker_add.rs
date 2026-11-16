@@ -19,10 +19,11 @@ mod scripts;
 
 type Setup<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// A stand-in program: installed, never written through a descriptor of
+/// this process, which a test running beside it could fork while open —
+/// exec'ing the stand-in would then fail with ETXTBSY.
 fn executable(path: &Path, content: &str) -> Setup<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, content)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    horde_server_testkit::script::install(path, content)?;
     Ok(())
 }
 

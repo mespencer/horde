@@ -37,11 +37,9 @@ fn run_sh(script: &str, home: &Path, path: Option<&str>, stdin: &str) -> std::pr
     child.wait_with_output().expect("sh finishes")
 }
 
+/// Installed rather than written here: see `super::executable`.
 fn write_executable(path: &Path, content: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, content).expect("the script writes");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("the script is executable");
+    horde_server_testkit::script::install(path, content).expect("the script installs");
 }
 
 #[test]
@@ -101,8 +99,8 @@ fn prepare_and_finalize_install_an_owner_only_binary_that_runs() -> Outcome {
     let bin = home.path().join(".horde/bin");
     assert_eq!(std::fs::metadata(&bin)?.permissions().mode() & 0o777, 0o700);
 
-    std::fs::write(
-        bin.join(staged_name()),
+    horde_server_testkit::script::install(
+        &bin.join(staged_name()),
         "#!/bin/sh\necho 'horde-worker 9.9'\n",
     )?;
     let finalized = run_sh(&finalize_script(&dir), home.path(), None, "");
@@ -119,7 +117,7 @@ fn prepare_and_finalize_install_an_owner_only_binary_that_runs() -> Outcome {
     assert!(!bin.join(staged_name()).exists(), "the staged copy moved");
 
     // A binary that cannot run fails the install step.
-    std::fs::write(bin.join(staged_name()), "#!/bin/sh\nexit 1\n")?;
+    horde_server_testkit::script::install(&bin.join(staged_name()), "#!/bin/sh\nexit 1\n")?;
     let refused = run_sh(&finalize_script(&dir), home.path(), None, "");
     assert!(!refused.status.success());
     Ok(())
