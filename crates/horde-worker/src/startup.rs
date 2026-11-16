@@ -864,7 +864,7 @@ pub fn with_observability(
     // What is still queued reaches the file, and export is flushed, before
     // the process exits — with the runtime still alive for the export flush
     // to travel its channel.
-    Ok(horde_observe::conclude(code, Some(&file), telemetry))
+    Ok(file.conclude(code, telemetry))
 }
 
 /// The daemon's file logging under `<state>/logs`, stamped with the

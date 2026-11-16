@@ -74,8 +74,8 @@ pub enum LogsTarget<'a> {
     Remote(read_logs_request::Target),
 }
 
-/// Parses a `target` for an agent on `own_worker`; `local` is the worker's
-/// files, when this endpoint has them to read.
+/// Parses a `target` for `agent`; `local` is its worker's files and name,
+/// when this endpoint has them to read.
 ///
 /// # Errors
 ///
@@ -83,13 +83,12 @@ pub enum LogsTarget<'a> {
 pub fn parse_target<'a>(
     target: Option<&str>,
     agent: &str,
-    own_worker: &str,
-    local: Option<&'a LocalLogs>,
+    local: Option<(&'a LocalLogs, &str)>,
 ) -> Result<LogsTarget<'a>, String> {
     let target = target.unwrap_or_default().trim();
     if target.is_empty() || target == "self" {
         return Ok(match local {
-            Some(local) => LogsTarget::Local(local, Target::Agent(agent.to_owned())),
+            Some((local, _)) => LogsTarget::Local(local, Target::Agent(agent.to_owned())),
             None => LogsTarget::Remote(read_logs_request::Target::Agent(AgentId::new(agent))),
         });
     }
@@ -99,14 +98,16 @@ pub fn parse_target<'a>(
         )));
     }
     if let Some(worker) = target.strip_prefix("worker:").filter(|w| !w.is_empty()) {
-        return Ok(match local.filter(|_| worker == own_worker) {
-            Some(local) => LogsTarget::Local(local, Target::Process),
-            None => LogsTarget::Remote(read_logs_request::Target::Worker(worker.to_owned())),
-        });
+        return Ok(
+            match local.filter(|(_, own_worker)| worker == *own_worker) {
+                Some((local, _)) => LogsTarget::Local(local, Target::Process),
+                None => LogsTarget::Remote(read_logs_request::Target::Worker(worker.to_owned())),
+            },
+        );
     }
     if let Some(other) = target.strip_prefix("agent:").filter(|a| !a.is_empty()) {
         return Ok(match local.filter(|_| other == agent) {
-            Some(local) => LogsTarget::Local(local, Target::Agent(agent.to_owned())),
+            Some((local, _)) => LogsTarget::Local(local, Target::Agent(agent.to_owned())),
             None => LogsTarget::Remote(read_logs_request::Target::Agent(AgentId::new(other))),
         });
     }
@@ -202,11 +203,11 @@ impl LogAccess {
         params: &LogsParams,
     ) -> Result<LogsView, String> {
         let _slot = self.admit(agent, Instant::now())?;
-        let (local, own_worker) = match &self.local {
-            Some((local, worker_id)) => (Some(local), worker_id.as_str()),
-            None => (None, ""),
-        };
-        let target = parse_target(params.target.as_deref(), agent, own_worker, local)?;
+        let local = self
+            .local
+            .as_ref()
+            .map(|(local, worker_id)| (local, worker_id.as_str()));
+        let target = parse_target(params.target.as_deref(), agent, local)?;
         let max_bytes = self
             .buckets
             .limits()
@@ -353,7 +354,7 @@ mod tests {
     #[test]
     fn targets_parse_to_local_or_remote() {
         let files = LocalLogs::new("/nowhere", "horde-worker", None);
-        let local = |target: Option<&str>| parse_target(target, "a1", "w1", Some(&files));
+        let local = |target: Option<&str>| parse_target(target, "a1", Some((&files, "w1")));
         let reads_here = |parsed: Result<LogsTarget<'_>, String>, expected: &Target| {
             matches!(parsed, Ok(LogsTarget::Local(logs, target))
                 if std::ptr::eq(logs, &files) && &target == expected)
@@ -378,15 +379,15 @@ mod tests {
             Ok(LogsTarget::Remote(read_logs_request::Target::Agent(id))) if id.value == "a2"
         ));
         assert!(matches!(
-            parse_target(None, "a1", "w1", None),
+            parse_target(None, "a1", None),
             Ok(LogsTarget::Remote(read_logs_request::Target::Agent(id))) if id.value == "a1"
         ));
         assert!(matches!(
-            parse_target(Some("worker:w1"), "a1", "w1", None),
+            parse_target(Some("worker:w1"), "a1", None),
             Ok(LogsTarget::Remote(_))
         ));
         assert!(matches!(
-            parse_target(Some("agent:a1"), "a1", "w1", None),
+            parse_target(Some("agent:a1"), "a1", None),
             Ok(LogsTarget::Remote(read_logs_request::Target::Agent(id))) if id.value == "a1"
         ));
         for bad in ["worker:", "agent:", "disk", "worker"] {

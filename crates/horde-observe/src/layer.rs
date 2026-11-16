@@ -324,6 +324,12 @@ impl FileLogging {
         result
     }
 
+    /// [`conclude`] for a binary that always keeps a file.
+    pub fn conclude<T>(&self, outcome: T, telemetry: Option<Telemetry>) -> T {
+        self.flush(EXIT_FLUSH);
+        finish_export(outcome, telemetry)
+    }
+
     /// Records this as the running process's file logging — the binaries
     /// do, once, when they install it — so the process's own serving paths
     /// can follow its tap. A second registration is ignored.
@@ -348,9 +354,14 @@ pub const EXIT_FLUSH: Duration = Duration::from_secs(2);
 /// verdict is discarded on purpose — a dead collector must not change an
 /// exit code.
 pub fn conclude<T>(outcome: T, file: Option<&FileLogging>, telemetry: Option<Telemetry>) -> T {
-    if let Some(file) = file {
-        file.flush(EXIT_FLUSH);
+    match file {
+        Some(file) => file.conclude(outcome, telemetry),
+        None => finish_export(outcome, telemetry),
     }
+}
+
+/// Flushes export, discarding the verdict, and hands `outcome` back.
+fn finish_export<T>(outcome: T, telemetry: Option<Telemetry>) -> T {
     if let Some(telemetry) = telemetry {
         let _ = telemetry.shutdown();
     }
@@ -732,6 +743,61 @@ mod tests {
             .count();
         assert_eq!(written, queued);
         assert_eq!(super::conclude("no file", None, None), "no file");
+    }
+
+    /// File logging whose first file is a FIFO nobody reads, so the writer
+    /// blocks opening it with a record in hand; and the reader that will
+    /// release it.
+    #[cfg(unix)]
+    fn stalled(dir: &std::path::Path) -> (FileLogging, std::path::PathBuf) {
+        let logging = logging(dir, "info");
+        let fifo = dir.join(crate::files::file_name(
+            "horde-test",
+            Some(logging.boot()),
+            1,
+        ));
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "the FIFO is made");
+        tracing::dispatcher::with_default(&logging.dispatch(), || tracing::info!("held"));
+        (logging, fifo)
+    }
+
+    /// Opens the FIFO for reading on a thread of its own, so the stalled
+    /// writer can finish.
+    #[cfg(unix)]
+    fn release(fifo: std::path::PathBuf) {
+        std::thread::spawn(move || {
+            if let Ok(mut reader) = std::fs::File::open(fifo) {
+                let _ = std::io::Read::read_to_end(&mut reader, &mut Vec::new());
+            }
+        });
+    }
+
+    /// A binary's last act waits for its file, as long as the exit flush
+    /// allows, whether it always keeps one or only may.
+    #[cfg(unix)]
+    #[test]
+    fn concluding_waits_for_a_stalled_file_up_to_the_deadline() {
+        for always in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (logging, fifo) = stalled(dir.path());
+            let started = std::time::Instant::now();
+            let outcome = if always {
+                logging.conclude(7, None)
+            } else {
+                super::conclude(7, Some(&logging), None)
+            };
+            let waited = started.elapsed();
+            release(fifo);
+            assert_eq!(outcome, 7);
+            assert!(
+                waited >= super::EXIT_FLUSH,
+                "waited {waited:?} (always keeps a file: {always})"
+            );
+        }
     }
 
     #[test]

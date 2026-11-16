@@ -971,6 +971,11 @@ mod tests {
         assert_eq!(file.dir(), super::log_dir(state.path()));
         assert_eq!(file.dir(), state.path().join("logs"));
         assert_eq!(file.binary(), "horde-server");
+        assert_eq!(
+            horde_observe::layer::process_logging().map(horde_observe::FileLogging::boot),
+            Some(file.boot()),
+            "registered as the process's file logging, for ReadLogs to follow"
+        );
         tracing::dispatcher::with_default(&file.dispatch(), || {
             for n in 0..4000 {
                 tracing::info!(padding = %"p".repeat(512), "served {n}");
