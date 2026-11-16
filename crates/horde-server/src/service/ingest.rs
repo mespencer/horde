@@ -86,6 +86,9 @@ pub struct OriginView {
     /// `(stream, worker)` pairs a prewarm named: the only way a worker's
     /// agent-less instance change has a reason to exist.
     prewarmed: BTreeSet<(String, String)>,
+    /// `(request id, worker)` pairs a gc request targeted: the only answers
+    /// a worker's `WorkspaceGcCompleted` may give (ADR-0014).
+    gc_requests: BTreeSet<(String, String)>,
     cursor: u64,
     /// A plaintext channel's journal: no certificate names its worker, so
     /// there is no origin to judge against (see [`Self::ambient`]).
@@ -179,6 +182,17 @@ impl OriginView {
                         .insert((global.event.session_id.clone(), worker_id.to_string()));
                 }
             }
+            // A gc request names its workers: each may answer it, and a
+            // worker removing an Instance reports it MISSING into the
+            // stream the request rode.
+            (Some(Kind::WorkspaceGcRequested(requested)), _) => {
+                for worker in &requested.worker_ids {
+                    self.gc_requests
+                        .insert((requested.request_id.clone(), worker.to_string()));
+                    self.prewarmed
+                        .insert((global.event.session_id.clone(), worker.to_string()));
+                }
+            }
             _ => {}
         }
     }
@@ -224,8 +238,29 @@ impl OriginView {
                 | Kind::AgentLifecycleChanged(_)
                 | Kind::ResultReported(_)
                 | Kind::TurnInterrupted(_)
-                | Kind::UsageRecorded(_),
+                | Kind::UsageRecorded(_)
+                | Kind::CheckoutPrepared(_),
             ) => self.judge_agent(worker_id, session_id, agent_id.as_deref()),
+            Some(Kind::WorkspaceCleanup(cleanup)) => {
+                judge_housekeeping(worker_id, session_id, cleanup.worker_id.as_ref())
+            }
+            Some(Kind::WorkspaceDiskPressure(pressure)) => {
+                judge_housekeeping(worker_id, session_id, pressure.worker_id.as_ref())
+            }
+            Some(Kind::WorkspaceGcCompleted(completed)) => {
+                judge_housekeeping(worker_id, session_id, completed.worker_id.as_ref())?;
+                if self
+                    .gc_requests
+                    .contains(&(completed.request_id.clone(), worker_id.to_owned()))
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no gc request {} asked worker {worker_id} to clean up",
+                        completed.request_id
+                    ))
+                }
+            }
             Some(kind) => Err(format!(
                 "{} is written only by the server",
                 horde_proto::kind_field_name(kind).unwrap_or("this kind")
@@ -318,6 +353,29 @@ impl OriginView {
     }
 }
 
+/// A housekeeping event (ADR-0014): only into the housekeeping stream, and
+/// only about the journaling worker itself.
+fn judge_housekeeping(
+    worker_id: &str,
+    session_id: &str,
+    named: Option<&horde_proto::v1::WorkerId>,
+) -> Result<(), String> {
+    if !crate::workspace::is_housekeeping_stream(session_id) {
+        return Err(format!(
+            "workspace housekeeping belongs in {}, not {session_id:?}",
+            horde_proto::WORKSPACE_HOUSEKEEPING_STREAM
+        ));
+    }
+    let named = named.map(ToString::to_string).unwrap_or_default();
+    if named == worker_id {
+        Ok(())
+    } else {
+        Err(format!(
+            "worker {worker_id} may not journal housekeeping for worker {named:?}"
+        ))
+    }
+}
+
 /// What a late journal entry from a former placement becomes (ADR-0011).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Late {
@@ -335,7 +393,9 @@ pub enum Late {
 /// not late, they are refused, so they answer `None` and fall to the judge.
 fn late_handling(kind: &Kind, current_worker_id: Option<String>) -> Option<Late> {
     match kind {
-        Kind::AgentOutputChunk(_) | Kind::UsageRecorded(_) => Some(Late::Land),
+        Kind::AgentOutputChunk(_) | Kind::UsageRecorded(_) | Kind::CheckoutPrepared(_) => {
+            Some(Late::Land)
+        }
         Kind::AgentLifecycleChanged(_)
         | Kind::PermissionRequested(_)
         | Kind::ResultReported(_)
@@ -1129,6 +1189,117 @@ mod tests {
     /// An instance change answers a prewarm naming this worker in this
     /// stream — the catalog stream included — or a placed agent; its report
     /// may not name another worker.
+    /// ADR-0014's kinds: a checkout's provenance is an agent event; cleanup
+    /// and disk pressure land only in the housekeeping stream and only about
+    /// the journaling worker; a gc answer must answer a request that named
+    /// that worker; and the request itself is the server's to write.
+    #[tokio::test]
+    async fn workspace_housekeeping_is_admitted_only_from_its_own_worker() {
+        let core = core();
+        placed_for_test(&core, "s1", "agent-1", "worker-a").await;
+        let housekeeping = horde_proto::WORKSPACE_HOUSEKEEPING_STREAM;
+        crate::service::shared::append_server_event(
+            &core.log,
+            housekeeping,
+            "",
+            event(
+                None,
+                Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested {
+                    request_id: "gc-1".to_owned(),
+                    worker_ids: vec![WorkerId::new("worker-a")],
+                    ..horde_proto::v1::WorkspaceGcRequested::default()
+                }),
+            ),
+        )
+        .await
+        .expect("the request appends");
+        let view = view_of(&core).await;
+
+        let prepared = event(
+            Some("agent-1"),
+            Kind::CheckoutPrepared(horde_proto::v1::CheckoutPrepared::default()),
+        );
+        assert!(view.judge("worker-a", "s1", &prepared).is_ok());
+        assert!(
+            view.judge("worker-b", "s1", &prepared).is_err(),
+            "not its agent"
+        );
+
+        let cleanup = |worker: &str| {
+            event(
+                None,
+                Kind::WorkspaceCleanup(horde_proto::v1::WorkspaceCleanup {
+                    worker_id: Some(WorkerId::new(worker)),
+                    ..horde_proto::v1::WorkspaceCleanup::default()
+                }),
+            )
+        };
+        assert!(
+            view.judge("worker-a", housekeeping, &cleanup("worker-a"))
+                .is_ok()
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &cleanup("worker-b"))
+                .is_err(),
+            "another worker's"
+        );
+        assert!(
+            view.judge("worker-a", "s1", &cleanup("worker-a")).is_err(),
+            "not into a session"
+        );
+        let pressure = event(
+            None,
+            Kind::WorkspaceDiskPressure(horde_proto::v1::WorkspaceDiskPressure {
+                worker_id: Some(WorkerId::new("worker-a")),
+                ..horde_proto::v1::WorkspaceDiskPressure::default()
+            }),
+        );
+        assert!(view.judge("worker-a", housekeeping, &pressure).is_ok());
+        assert!(view.judge("worker-b", housekeeping, &pressure).is_err());
+
+        let completed = |request: &str| {
+            event(
+                None,
+                Kind::WorkspaceGcCompleted(horde_proto::v1::WorkspaceGcCompleted {
+                    request_id: request.to_owned(),
+                    worker_id: Some(WorkerId::new("worker-a")),
+                    ..horde_proto::v1::WorkspaceGcCompleted::default()
+                }),
+            )
+        };
+        assert!(
+            view.judge("worker-a", housekeeping, &completed("gc-1"))
+                .is_ok()
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &completed("gc-ghost"))
+                .is_err(),
+            "no request asked"
+        );
+        let missing = event(
+            None,
+            Kind::WorkspaceInstanceChanged(WorkspaceInstanceChanged {
+                report: Some(WorkspaceInstanceReport {
+                    worker_id: Some(WorkerId::new("worker-a")),
+                    ..WorkspaceInstanceReport::default()
+                }),
+                progress: None,
+            }),
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &missing).is_ok(),
+            "a removal's MISSING report answers the request that targeted it"
+        );
+        let forged = event(
+            None,
+            Kind::WorkspaceGcRequested(horde_proto::v1::WorkspaceGcRequested::default()),
+        );
+        assert!(
+            view.judge("worker-a", housekeeping, &forged).is_err(),
+            "server-written only"
+        );
+    }
+
     #[tokio::test]
     async fn an_instance_change_must_answer_a_prewarm_or_a_placed_agent() {
         let core = core();

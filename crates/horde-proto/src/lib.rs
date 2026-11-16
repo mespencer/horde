@@ -29,8 +29,16 @@ mod ids;
 pub mod limits;
 pub mod login;
 mod names;
+pub mod units;
 
 pub use names::kind_field_name;
+
+/// The reserved log stream workspace housekeeping lives in (ADR-0014): every
+/// `WorkspaceCleanup`, gc request and answer, and disk-pressure episode. Named
+/// here because three binaries meet at it — the Server appends gc requests
+/// there, Workers journal their cleanup there, and `horde workspace gc` reads
+/// it — and one spelling cannot drift.
+pub const WORKSPACE_HOUSEKEEPING_STREAM: &str = "horde-workspace-housekeeping";
 
 /// Compiled `FileDescriptorSet` for every file in `horde.v1`.
 ///

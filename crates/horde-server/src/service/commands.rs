@@ -104,6 +104,13 @@ struct Buffered {
     delivery: i32,
 }
 
+/// One Definition as the fold last saw it.
+#[derive(Debug)]
+struct Catalogued {
+    definition: WorkspaceDefinition,
+    deleted: bool,
+}
+
 /// The fold state: everything needed to turn the next log row into commands.
 ///
 /// Deliberately free of any I/O, so the interesting logic is a pure function of
@@ -128,7 +135,14 @@ pub struct CommandProjection {
     /// worker must be able to materialize without a round trip — and the only
     /// place a fold can get one is the `WorkspaceDefinitionChanged` events
     /// that precede every prewarm request in append order.
-    definitions: BTreeMap<String, WorkspaceDefinition>,
+    ///
+    /// A deleted Definition stays, marked deleted: a purge's gc commands
+    /// still carry its last cleanup policy for the Instances it removes,
+    /// but nothing materializes it again (ADR-0014).
+    definitions: BTreeMap<String, Catalogued>,
+    /// The Server's workspace defaults, resolved with each Definition into
+    /// the policy every spawn, materialize and gc command carries.
+    workspace_policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
     /// The MCP Hub catalog as this fold has seen it, for the same reason:
     /// a `SpawnAgentCommand` carries the agent's `local` server configs and
     /// its visible hub server names in full, and the only place a fold can
@@ -153,6 +167,24 @@ impl CommandProjection {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Resolves command policies against these Server defaults.
+    #[must_use]
+    pub fn with_workspace_policy(
+        mut self,
+        policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
+    ) -> Self {
+        self.workspace_policy = policy;
+        self
+    }
+
+    /// The policy one Definition's commands carry.
+    fn policy_for(&self, definition_id: Option<&str>) -> horde_proto::v1::ResolvedWorkspacePolicy {
+        let definition = definition_id
+            .and_then(|id| self.definitions.get(id))
+            .map(|known| &known.definition);
+        crate::workspace_policy::resolve(&self.workspace_policy, definition)
     }
 
     /// How many commands this worker has been issued so far.
@@ -197,6 +229,9 @@ impl CommandProjection {
             }
             (Some(Kind::WorkspacePrewarmRequested(prewarm)), _) => {
                 self.materialize_command(global, &prewarm)
+            }
+            (Some(Kind::WorkspaceGcRequested(requested)), _) => {
+                self.gc_commands(global, &requested)
             }
             (Some(Kind::AgentSpawned(spawned)), Some(agent_id)) => {
                 self.spawned.insert(
@@ -333,11 +368,48 @@ impl CommandProjection {
         else {
             return;
         };
-        if changed.deleted {
-            self.definitions.remove(&id);
-        } else {
-            self.definitions.insert(id, definition);
+        self.definitions.insert(
+            id,
+            Catalogued {
+                definition,
+                deleted: changed.deleted,
+            },
+        );
+    }
+
+    /// A gc request is one `WorkspaceGcCommand` per Worker it names, each
+    /// carrying the resolved policy; its id is the request's position
+    /// suffixed with the Worker, so a refold issues the same ids (ADR-0014).
+    fn gc_commands(
+        &mut self,
+        global: &GlobalEvent,
+        requested: &horde_proto::v1::WorkspaceGcRequested,
+    ) -> Vec<(String, StreamCommandsResponse)> {
+        let definition_id = requested
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let policy = self.policy_for(definition_id.as_deref());
+        let mut commands = Vec::new();
+        for worker in &requested.worker_ids {
+            let worker_id = worker.to_string();
+            let command = Command::WorkspaceGc(horde_proto::v1::WorkspaceGcCommand {
+                request_id: requested.request_id.clone(),
+                workspace_definition_id: requested.workspace_definition_id.clone(),
+                agent_ids: requested.agent_ids.clone(),
+                level: requested.level,
+                force: requested.force,
+                dry_run: requested.dry_run,
+                remove_instance: requested.remove_instance,
+                include_pins: requested.include_pins,
+                policy: Some(policy.clone()),
+                carrying_stream: Some(SessionId::new(global.event.session_id.clone())),
+            });
+            let issued = self.issue(&worker_id, global, command, &format!(":gc:{worker_id}"));
+            commands.push((worker_id, issued));
         }
+        commands
     }
 
     /// A prewarm request for a known definition is a materialize command.
@@ -357,14 +429,18 @@ impl CommandProjection {
         let Some(definition) = prewarm
             .workspace_definition_id
             .as_ref()
-            .and_then(|id| self.definitions.get(&id.to_string()).cloned())
+            .and_then(|id| self.definitions.get(&id.to_string()))
+            .filter(|known| !known.deleted)
+            .map(|known| known.definition.clone())
         else {
             return Vec::new();
         };
 
+        let policy = crate::workspace_policy::resolve(&self.workspace_policy, Some(&definition));
         let command = Command::MaterializeWorkspace(MaterializeWorkspaceCommand {
             definition: Some(definition),
             session_id: Some(SessionId::new(global.event.session_id.clone())),
+            policy: Some(policy),
         });
         let issued = self.issue(&worker_id, global, command, MAIN);
         vec![(worker_id, issued)]
@@ -480,6 +556,11 @@ impl CommandProjection {
                         visible_hub_mcp_servers: self
                             .mcp_servers
                             .visible_hub_servers_for(agent_type),
+                        workspace_policy: details
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.workspace_definition_id.as_ref())
+                            .map(|id| self.policy_for(Some(&id.to_string()))),
                     });
                     let issued = self.issue(&worker_id, global, spawn, MAIN);
                     commands.push((worker_id.clone(), issued));
@@ -772,6 +853,16 @@ impl CommandStream {
     #[must_use]
     pub fn open(log: &EventLog, worker_id: &str, resume_from: u64) -> Self {
         Self::resuming(log, worker_id, Resume::from_sequence(resume_from))
+    }
+
+    /// Stamps commands with policies resolved against these defaults.
+    #[must_use]
+    pub fn with_workspace_policy(
+        mut self,
+        policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
+    ) -> Self {
+        self.projection = std::mem::take(&mut self.projection).with_workspace_policy(policy);
+        self
     }
 
     /// [`Self::open`], resuming wherever the worker said — by position when
@@ -1556,6 +1647,171 @@ mod tests {
         }
     }
 
+    /// The Server's configured defaults, not the built-in ones, ride a
+    /// command from a projection given them.
+    #[test]
+    fn a_configured_workspace_policy_rides_the_commands_it_resolves() {
+        let config = crate::workspace_policy::WorkspacePolicyConfig {
+            fetch_throttle: std::time::Duration::from_secs(7),
+            ..crate::workspace_policy::WorkspacePolicyConfig::default()
+        };
+        let mut projection = CommandProjection::new().with_workspace_policy(Arc::new(config));
+        let rows = [
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(2, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued: Vec<_> = rows
+            .iter()
+            .flat_map(|global| projection.advance(global))
+            .collect();
+        assert_eq!(issued.len(), 1);
+        match issued[0].1.command.as_ref().expect("a command") {
+            Command::MaterializeWorkspace(materialize) => assert_eq!(
+                materialize
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.fetch_throttle)
+                    .map(|d| d.seconds),
+                Some(7)
+            ),
+            other => panic!("expected a materialize command, got {other:?}"),
+        }
+    }
+
+    fn gc_event(request: &str, workers: &[&str], definition: Option<&str>) -> Event {
+        Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::WorkspaceGcRequested(
+                horde_proto::v1::WorkspaceGcRequested {
+                    request_id: request.to_owned(),
+                    worker_ids: workers.iter().map(|w| WorkerId::new(*w)).collect(),
+                    workspace_definition_id: definition
+                        .map(horde_proto::v1::WorkspaceDefinitionId::new),
+                    level: horde_proto::v1::GcLevel::Hard.into(),
+                    force: true,
+                    dry_run: true,
+                    remove_instance: true,
+                    include_pins: true,
+                    ..horde_proto::v1::WorkspaceGcRequested::default()
+                },
+            )),
+        }
+    }
+
+    /// A gc request commands exactly the workers it names — one command
+    /// each, every field carried over, the policy resolved — under ids a
+    /// refold reproduces (ADR-0014).
+    #[test]
+    fn a_gc_request_commands_exactly_its_workers_with_stable_ids() {
+        let rows = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(
+                2,
+                "horde-workspace-housekeeping",
+                1,
+                gc_event("gc-1", &["worker-a", "worker-b"], Some("ws-1")),
+            ),
+        ];
+        let commands = fold(&rows);
+        let workers: Vec<&str> = commands.iter().map(|(worker, _)| worker.as_str()).collect();
+        assert_eq!(workers, vec!["worker-a", "worker-b"]);
+        let ids: Vec<String> = commands.iter().map(|(_, c)| c.command_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "horde-workspace-housekeeping:1:gc:worker-a",
+                "horde-workspace-housekeeping:1:gc:worker-b"
+            ]
+        );
+        let Some(Command::WorkspaceGc(gc)) = commands[0].1.command.clone() else {
+            panic!("a gc command");
+        };
+        assert_eq!(gc.request_id, "gc-1");
+        assert_eq!(gc.level, i32::from(horde_proto::v1::GcLevel::Hard));
+        assert!(gc.force && gc.dry_run && gc.remove_instance && gc.include_pins);
+        assert_eq!(
+            gc.workspace_definition_id
+                .map(|id| id.to_string())
+                .as_deref(),
+            Some("ws-1")
+        );
+        assert_eq!(
+            gc.carrying_stream.map(|id| id.to_string()).as_deref(),
+            Some("horde-workspace-housekeeping")
+        );
+        assert_eq!(
+            gc.policy.and_then(|p| p.archived_grace).map(|d| d.seconds),
+            Some(86_400),
+            "the resolved policy rides the command"
+        );
+        let refolded: Vec<String> = fold(&rows).into_iter().map(|(_, c)| c.command_id).collect();
+        assert_eq!(refolded, ids, "a refold issues the same ids");
+        assert!(
+            fold(&[row(
+                1,
+                "horde-workspace-housekeeping",
+                1,
+                gc_event("gc-2", &[], None)
+            )])
+            .is_empty()
+        );
+    }
+
+    /// A purge's commands still carry the deleted Definition's policy: the
+    /// fold keeps the last Definition of a deleted id.
+    #[test]
+    fn a_purge_after_deletion_still_resolves_the_definitions_policy() {
+        let mut overriding = definition("ws-1");
+        overriding.cleanup = Some(horde_proto::v1::WorkspaceCleanupPolicy {
+            idle_reclaim_after: None,
+            archived_grace: Some(horde_proto::prost_types::Duration {
+                seconds: 7,
+                nanos: 0,
+            }),
+        });
+        let changed = |deleted| Event {
+            agent_id: None,
+            occurred_at: None,
+            idempotency_key: String::new(),
+            kind: Some(Kind::WorkspaceDefinitionChanged(
+                horde_proto::v1::WorkspaceDefinitionChanged {
+                    definition: Some(overriding.clone()),
+                    deleted,
+                },
+            )),
+        };
+        let rows = vec![
+            row(1, "horde-workspace-catalog", 1, changed(false)),
+            row(2, "horde-workspace-catalog", 2, changed(true)),
+            row(
+                3,
+                "horde-workspace-housekeeping",
+                1,
+                gc_event("gc-1", &["worker-a"], Some("ws-1")),
+            ),
+        ];
+        let commands = fold(&rows);
+        let Some(Command::WorkspaceGc(gc)) = commands[0].1.command.clone() else {
+            panic!("a gc command");
+        };
+        assert_eq!(
+            gc.policy.and_then(|p| p.archived_grace).map(|d| d.seconds),
+            Some(7)
+        );
+    }
+
     /// A prewarm naming a definition the fold has not seen — or one that was
     /// deleted — yields nothing: a worker told to materialize an empty
     /// definition would create an instance of nothing.
@@ -1583,6 +1839,78 @@ mod tests {
             fold(&deleted).is_empty(),
             "a deleted definition is not materializable"
         );
+    }
+
+    /// A Definition deleted and created again is materializable again.
+    #[test]
+    fn a_recreated_definition_is_materializable_again() {
+        let rows = vec![
+            row(
+                1,
+                "horde-workspace-catalog",
+                1,
+                definition_event("ws-1", false),
+            ),
+            row(
+                2,
+                "horde-workspace-catalog",
+                2,
+                definition_event("ws-1", true),
+            ),
+            row(
+                3,
+                "horde-workspace-catalog",
+                3,
+                definition_event("ws-1", false),
+            ),
+            row(4, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued = fold(&rows);
+        assert_eq!(issued.len(), 1);
+        assert!(matches!(
+            issued[0].1.command,
+            Some(Command::MaterializeWorkspace(_))
+        ));
+    }
+
+    /// A materialization carries the Definition's own cleanup overrides,
+    /// layered over the Server's defaults.
+    #[test]
+    fn a_materialization_carries_its_definitions_cleanup_policy() {
+        let changed = Event {
+            kind: Some(Kind::WorkspaceDefinitionChanged(
+                horde_proto::v1::WorkspaceDefinitionChanged {
+                    definition: Some(horde_proto::v1::WorkspaceDefinition {
+                        cleanup: Some(horde_proto::v1::WorkspaceCleanupPolicy {
+                            idle_reclaim_after: None,
+                            archived_grace: Some(horde_proto::prost_types::Duration {
+                                seconds: 42,
+                                nanos: 0,
+                            }),
+                        }),
+                        ..definition("ws-1")
+                    }),
+                    deleted: false,
+                },
+            )),
+            ..definition_event("ws-1", false)
+        };
+        let rows = vec![
+            row(1, "horde-workspace-catalog", 1, changed),
+            row(2, "s1", 1, prewarm_event("ws-1", "worker-a")),
+        ];
+        let issued = fold(&rows);
+        match issued[0].1.command.as_ref().expect("a command") {
+            Command::MaterializeWorkspace(materialize) => assert_eq!(
+                materialize
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.archived_grace)
+                    .map(|d| d.seconds),
+                Some(42)
+            ),
+            other => panic!("expected a materialize command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1920,6 +2248,44 @@ mod tests {
             1,
             "registration answers the restarted count"
         );
+    }
+
+    /// A stream given the Server's workspace defaults stamps its commands
+    /// with them, not the built-in ones.
+    #[tokio::test]
+    async fn a_stream_stamps_commands_with_its_configured_policy() {
+        let log = EventLog::in_memory().expect("in-memory log");
+        for (session, event) in [
+            ("horde-workspace-catalog", definition_event("ws-1", false)),
+            ("s1", prewarm_event("ws-1", "worker-a")),
+        ] {
+            log.append(PendingEvent {
+                session_id: session.to_owned(),
+                payload: event.encode_to_vec(),
+                ..PendingEvent::default()
+            })
+            .await
+            .expect("append");
+        }
+        let config = crate::workspace_policy::WorkspacePolicyConfig {
+            fetch_throttle: std::time::Duration::from_secs(7),
+            ..crate::workspace_policy::WorkspacePolicyConfig::default()
+        };
+        let mut stream =
+            CommandStream::open(&log, "worker-a", 1).with_workspace_policy(Arc::new(config));
+        let batch = next_within(&mut stream).await;
+        let throttles: Vec<_> = batch
+            .iter()
+            .filter_map(|response| match &response.command {
+                Some(Command::MaterializeWorkspace(materialize)) => materialize
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.fetch_throttle)
+                    .map(|d| d.seconds),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(throttles, vec![7]);
     }
 
     /// A stream resumed by position delivers what was caused at or after it,

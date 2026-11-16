@@ -69,6 +69,19 @@ service ControlPlaneService {
   // Progress streams as Session events, not in this response.
   rpc PrewarmWorkspace(PrewarmWorkspaceRequest) returns (PrewarmWorkspaceResponse);
 
+  // Reclaim disk on the Workers holding Instances (ADR-0014). Appends one
+  // WorkspaceGcRequested to the workspace-housekeeping stream and returns;
+  // the Workers' WorkspaceCleanup and WorkspaceGcCompleted answers follow
+  // in that stream.
+  rpc CollectWorkspaceGarbage(CollectWorkspaceGarbageRequest) returns (CollectWorkspaceGarbageResponse);
+
+  // Remove one Instance from one Worker: a WorkspaceGcRequested with
+  // remove_instance. Refused by the Worker while any agent lives there.
+  rpc RemoveWorkspaceInstance(RemoveWorkspaceInstanceRequest) returns (RemoveWorkspaceInstanceResponse);
+
+  // The cached Instance reports, with their checkouts and disk facts.
+  rpc ListWorkspaceInstances(ListWorkspaceInstancesRequest) returns (ListWorkspaceInstancesResponse);
+
   // -- MCP Hub ---------------------------------------------------------------
 
   // Create or update one MCP server in the Hub catalog (ADR-0004). Journaled
@@ -156,8 +169,8 @@ message CreateSessionRequest {
   string title = 1;
 
   // The Workspace the Session's root Agent runs in; clients set it
-  // explicitly. DESIGN §7's cwd auto-registration (`horde new`) is not
-  // yet built.
+  // explicitly. A Definition is always deliberate: nothing registers one
+  // from cwd (ADR-0014).
   WorkspaceDefinitionId workspace_definition_id = 2;
 
   // The top-level Agent. Its initial_assignment is the first prompt.
@@ -370,6 +383,10 @@ message CreateWorkspaceDefinitionRequest {
   repeated WorkspaceRepo repos = 2;
 
   repeated string unmanaged_paths = 3;
+
+  CheckoutMode checkout_mode = 4;
+
+  WorkspaceCleanupPolicy cleanup = 5;
 }
 
 message CreateWorkspaceDefinitionResponse {
@@ -412,8 +429,15 @@ message UpdateWorkspaceDefinitionRequest {
 
   repeated string unmanaged_paths = 4;
 
-  // Layout changes only; `repos` here may not add or remove repos.
+  // Layout and reclaim changes only; `repos` here may not add or remove
+  // repos.
   repeated WorkspaceRepo repos = 5;
+
+  // Unspecified: unchanged.
+  CheckoutMode checkout_mode = 6;
+
+  // Unset: unchanged.
+  WorkspaceCleanupPolicy cleanup = 7;
 }
 
 message UpdateWorkspaceDefinitionResponse {
@@ -436,9 +460,88 @@ message DeleteWorkspaceDefinitionRequest {
   WorkspaceDefinitionId workspace_definition_id = 1;
 
   string etag = 2;
+
+  // Also remove every Instance (a WorkspaceGcRequested with remove_instance).
+  bool purge = 3;
+
+  // Only with purge: remove what cannot be proven recoverable.
+  bool force = 4;
+
+  // Only with purge: plan the purge, delete nothing, keep the Definition.
+  bool dry_run = 5;
 }
 
-message DeleteWorkspaceDefinitionResponse {}
+message DeleteWorkspaceDefinitionResponse {
+  // Set when purge asked for Instance removal.
+  string purge_request_id = 1;
+
+  // Log position of the WorkspaceGcRequested in the housekeeping stream.
+  uint64 purge_sequence = 2;
+}
+
+message CollectWorkspaceGarbageRequest {
+  // Optional: every Instance when empty.
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  // Empty: every Worker holding an Instance.
+  repeated WorkerId worker_ids = 2;
+
+  repeated AgentId agent_ids = 3;
+
+  GcLevel level = 4;
+
+  bool force = 5;
+
+  bool dry_run = 6;
+
+  bool include_pins = 7;
+}
+
+message CollectWorkspaceGarbageResponse {
+  string request_id = 1;
+
+  // Online, protocol 2 or later: answers will follow.
+  repeated WorkerId targeted = 2;
+
+  // The command waits in their stream until they reconnect.
+  repeated WorkerId offline = 3;
+
+  repeated WorkerId unsupported = 4;
+
+  // Log position of the WorkspaceGcRequested in the housekeeping stream.
+  uint64 sequence = 5;
+}
+
+message RemoveWorkspaceInstanceRequest {
+  WorkspaceDefinitionId workspace_definition_id = 1;
+
+  WorkerId worker_id = 2;
+
+  bool force = 3;
+
+  bool dry_run = 4;
+}
+
+message RemoveWorkspaceInstanceResponse {
+  string request_id = 1;
+
+  uint64 sequence = 2;
+
+  // Whether the Worker was online and supports removal; false means the
+  // command waits for it, or it cannot act on it.
+  bool targeted = 3;
+}
+
+message ListWorkspaceInstancesRequest {
+  // Optional filters.
+  WorkerId worker_id = 1;
+
+  WorkspaceDefinitionId workspace_definition_id = 2;
+}
+
+message ListWorkspaceInstancesResponse {
+  repeated WorkspaceInstanceReport instances = 1;
+}
 
 message PrewarmWorkspaceRequest {
   WorkspaceDefinitionId workspace_definition_id = 1;

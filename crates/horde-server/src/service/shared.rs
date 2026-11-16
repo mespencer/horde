@@ -72,6 +72,9 @@ pub struct ServerCore {
     /// declared lost (ADR-0011). A partition shorter than this is ridden
     /// out; one longer is treated as the worker's death.
     pub worker_lease: std::time::Duration,
+    /// The workspace defaults every command's policy is resolved against
+    /// (ADR-0014).
+    pub workspace_policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
 }
 
 impl ServerCore {
@@ -93,7 +96,19 @@ impl ServerCore {
             logins: crate::login::registry::LoginRegistry::new(),
             hub: Arc::new(crate::hub::HubUpstreams::new()),
             worker_lease: crate::liveness::DEFAULT_WORKER_LEASE,
+            workspace_policy: Arc::new(crate::workspace_policy::WorkspacePolicyConfig::default()),
         }
+    }
+
+    /// Overrides the workspace defaults (ADR-0014) — the serving path from
+    /// its `--workspace-*` flags, tests to shrink a grace or an idle time.
+    #[must_use]
+    pub fn with_workspace_policy(
+        mut self,
+        policy: crate::workspace_policy::WorkspacePolicyConfig,
+    ) -> Self {
+        self.workspace_policy = Arc::new(policy);
+        self
     }
 
     /// Overrides the worker-lost lease (ADR-0011) — the serving path from

@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{Setup, harness, identity_for, verbs_for_one_agent};
+use common::{Setup, harness, identity_for, recorded_spec, verbs_for_one_agent};
 use horde_mcp::verbs::{MessageKind, Verbs};
 use horde_proto::v1::ResultStatus;
 
@@ -260,33 +260,6 @@ async fn a_spawn_with_nowhere_to_run_comes_back_queued_rather_than_failing() -> 
     Ok(())
 }
 
-/// The spec the log recorded for `agent_id`'s spawn.
-async fn recorded_spec(
-    endpoint: &str,
-    session_id: &str,
-    agent_id: &str,
-) -> common::Setup<Option<horde_proto::v1::AgentSpec>> {
-    let mut client = horde_cli::client::Client::connect(endpoint).await?;
-    let mut recorded = None;
-    client
-        .sync(
-            &horde_cli::client::SyncOptions::new(session_id.to_owned()),
-            |envelope| {
-                let Some(event) = envelope.event.as_ref() else {
-                    return;
-                };
-                if event.agent_id.as_ref().map(ToString::to_string).as_deref() == Some(agent_id)
-                    && let Some(horde_proto::v1::event::Kind::AgentSpawned(spawned)) = &event.kind
-                {
-                    recorded.clone_from(&spawned.spec);
-                }
-            },
-            |_| {},
-        )
-        .await?;
-    Ok(recorded)
-}
-
 /// A child spawned through the verb is its parent's child, not a blank one:
 /// the Server fills its workspace, type, and model from the parent's spec as
 /// the log recorded it — so it gets a checkout of the parent's workspace and
@@ -294,20 +267,6 @@ async fn recorded_spec(
 /// names (here, a tier) stands.
 #[tokio::test]
 async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setup<()> {
-    let endpoint = horde_server_testkit::serve().await?;
-    let mut client = horde_cli::client::Client::connect(&endpoint).await?;
-    let definition = client
-        .create_workspace_definition(
-            "atlas-ws",
-            vec![horde_proto::v1::WorkspaceRepo {
-                name: "atlas".to_owned(),
-                remote_url: "https://example.invalid/atlas.git".to_owned(),
-                default_branch: "main".to_owned(),
-                layout_path: String::new(),
-            }],
-            Vec::new(),
-        )
-        .await?;
     let tier = |name: &str| {
         Some(horde_proto::v1::ModelSelection {
             selection: Some(horde_proto::v1::model_selection::Selection::Tier(
@@ -315,23 +274,18 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
             )),
         })
     };
-    let (summary, root) = client
-        .create_session_with(
-            "lineage",
-            horde_proto::v1::AgentSpec {
-                agent_type: "reviewer".to_owned(),
-                model: tier("deep"),
-                workspace_definition_id: definition.workspace_definition_id.clone(),
-                ..horde_proto::v1::AgentSpec::default()
-            },
-            "",
-        )
-        .await?;
-    let session_id = summary
-        .session_id
-        .as_ref()
-        .map(ToString::to_string)
-        .ok_or("a session id")?;
+    let common::WorkspaceSession {
+        endpoint,
+        session_id,
+        root,
+        definition,
+    } = common::workspace_session(horde_proto::v1::AgentSpec {
+        agent_type: "reviewer".to_owned(),
+        model: tier("deep"),
+        ..horde_proto::v1::AgentSpec::default()
+    })
+    .await?;
+    let client = horde_cli::client::Client::connect(&endpoint).await?;
     let journaled: std::sync::Arc<dyn horde_mcp::journal::JournalSink> =
         std::sync::Arc::new(common::ServerJournal::new(&endpoint));
     let verbs = Verbs::new(horde_mcp::context::AgentContext::new(
@@ -339,7 +293,7 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
         client,
         session_id.clone(),
     ));
-    let identity = identity_for(&root.to_string())?;
+    let identity = identity_for(&root)?;
 
     // An empty tier names none — the parent's is inherited, not refused.
     let inherited = verbs
@@ -349,6 +303,7 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
             &horde_mcp::verbs::ChildOverrides {
                 agent_type: None,
                 tier: Some(String::new()),
+                ..horde_mcp::verbs::ChildOverrides::default()
             },
             "spawn-inherit",
         )
@@ -370,6 +325,7 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
             &horde_mcp::verbs::ChildOverrides {
                 agent_type: Some("fixer".to_owned()),
                 tier: Some("fast".to_owned()),
+                ..horde_mcp::verbs::ChildOverrides::default()
             },
             "spawn-faster",
         )
@@ -383,6 +339,51 @@ async fn a_spawned_child_inherits_its_parents_workspace_type_and_model() -> Setu
         spec.workspace_definition_id, definition.workspace_definition_id,
         "and the workspace is still the parent's"
     );
+    Ok(())
+}
+
+/// The ADR-0014 overrides a spawner names — checkout mode, initial repos,
+/// bases and branch — ride the child's spec as given, so the Worker that
+/// materializes it checks out what was asked, where it was asked.
+#[tokio::test]
+async fn a_spawns_checkout_overrides_ride_the_childs_spec() -> Setup<()> {
+    let session = common::workspace_session(horde_proto::v1::AgentSpec::default()).await?;
+    let journaled: std::sync::Arc<dyn horde_mcp::journal::JournalSink> =
+        std::sync::Arc::new(common::ServerJournal::new(&session.endpoint));
+    let verbs = Verbs::new(horde_mcp::context::AgentContext::new(
+        journaled,
+        horde_cli::client::Client::connect(&session.endpoint).await?,
+        session.session_id.clone(),
+    ));
+    let base = horde_proto::v1::RepoBase {
+        repo_name: "atlas".to_owned(),
+        r#ref: "release/1.4".to_owned(),
+        source: horde_proto::v1::RepoBaseSource::Requested.into(),
+    };
+    let child = verbs
+        .spawn_agent(
+            &identity_for(&session.root)?,
+            "",
+            &horde_mcp::verbs::ChildOverrides {
+                repos: vec!["atlas".to_owned()],
+                bases: vec![base.clone()],
+                branch: Some("feat/verbs".to_owned()),
+                checkout_mode: horde_proto::v1::CheckoutMode::Lazy,
+                ..horde_mcp::verbs::ChildOverrides::default()
+            },
+            "spawn-checkout",
+        )
+        .await?;
+    let spec = recorded_spec(&session.endpoint, &session.session_id, &child.agent_id)
+        .await?
+        .ok_or("the child's spawn is recorded")?;
+    assert_eq!(
+        spec.checkout_mode,
+        i32::from(horde_proto::v1::CheckoutMode::Lazy)
+    );
+    assert_eq!(spec.checkout_repos, vec!["atlas".to_owned()]);
+    assert_eq!(spec.repo_bases, vec![base]);
+    assert_eq!(spec.branch, "feat/verbs");
     Ok(())
 }
 

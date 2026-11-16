@@ -296,6 +296,40 @@ impl ControlPlane {
         Ok(workspace)
     }
 
+    /// A spawn's ADR-0014 fields, validated against its Definition (a bare
+    /// base filled in a one-repo workspace), and its branch refused when a
+    /// live agent already holds it there. Run under the placement lock, so
+    /// two spawns cannot both claim one branch.
+    async fn validated_checkout(
+        &self,
+        spec: horde_proto::v1::AgentSpec,
+        agent_id: &str,
+    ) -> Result<horde_proto::v1::AgentSpec, Status> {
+        let definition_id = spec
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let definition = match definition_id.as_deref() {
+            Some(id) => Some(self.required_definition(id).await.map_err(Status::from)?),
+            None => None,
+        };
+        let spec = crate::workspace_policy::validated_spawn(spec, definition.as_ref(), agent_id)
+            .map_err(Status::from)?;
+        if let Some(id) = definition_id.as_deref()
+            && let Some((holder, session)) =
+                super::workspace_gc::branch_holder(&self.core, id, &spec.branch)
+                    .await
+                    .map_err(Status::from)?
+        {
+            return Err(Status::failed_precondition(format!(
+                "branch {} in this workspace is held by live agent {holder} (session {session});                  archive it first or choose another branch",
+                spec.branch
+            )));
+        }
+        Ok(spec)
+    }
+
     /// The spec a spawn runs with: what it asked for, with every unset field
     /// filled from the named parent's spec as the log recorded it — never
     /// from anything the spawner asserts (DESIGN §5). A spawn an agent made
@@ -498,6 +532,9 @@ impl ControlPlaneService for ControlPlane {
             format!("session-{}", request.idempotency_key)
         };
         let root_agent_id = format!("{session_id}-root");
+        let serialized = self.core.placement_lock.clone();
+        let held = serialized.lock().await;
+        let root_agent = self.validated_checkout(root_agent, &root_agent_id).await?;
 
         let spawned = Event {
             agent_id: Some(AgentId::new(root_agent_id.clone())),
@@ -514,6 +551,8 @@ impl ControlPlaneService for ControlPlane {
         self.append(&session_id, &request.idempotency_key, spawned)
             .await
             .map_err(Status::from)?;
+        // The claim is in the log now; the placement pass takes the lock itself.
+        drop(held);
 
         // The root agent needs a worker like any other agent; a placement
         // pass answers its spawn now (placed, or queued with the reason)
@@ -723,7 +762,14 @@ impl ControlPlaneService for ControlPlane {
         let (history, tail) = self
             .core
             .log
-            .tail_merged(&cursors, request.all_sessions, &[CATALOG_STREAM.to_owned()])
+            .tail_merged(
+                &cursors,
+                request.all_sessions,
+                &[
+                    CATALOG_STREAM.to_owned(),
+                    horde_proto::WORKSPACE_HOUSEKEEPING_STREAM.to_owned(),
+                ],
+            )
             .await
             .map_err(Status::from)?;
 
@@ -1005,6 +1051,7 @@ impl ControlPlaneService for ControlPlane {
         {
             return Ok(Response::new(response));
         }
+        let spec = self.validated_checkout(spec, &agent_id).await?;
 
         // The agent exists whether or not it is placed: spawn never blocks, and
         // an unmatched spawn comes back queued with a reason (DESIGN.md §6).
@@ -1024,6 +1071,7 @@ impl ControlPlaneService for ControlPlane {
             harness: harness.as_deref(),
             load: &load,
             now_unix_ms: placement::now_unix_ms(),
+            needs_workspace_protocol: crate::workspace_policy::needs_workspace_protocol(&spec),
         });
 
         self.append(
@@ -1081,6 +1129,10 @@ impl ControlPlaneService for ControlPlane {
         let request = request.into_inner();
         let repos = normalized_repos(request.repos);
         validate_definition(&request.name, &repos).map_err(Status::from)?;
+        let mode =
+            horde_proto::v1::CheckoutMode::try_from(request.checkout_mode).unwrap_or_default();
+        crate::workspace_policy::validate_definition_fields(&repos, &request.unmanaged_paths, mode)
+            .map_err(Status::from)?;
 
         let catalog = self.catalog().await.map_err(Status::from)?;
         if catalog.get_by_name(&request.name).is_some() {
@@ -1099,6 +1151,8 @@ impl ControlPlaneService for ControlPlane {
             unmanaged_paths: request.unmanaged_paths,
             created_at: None,
             etag: String::new(),
+            checkout_mode: request.checkout_mode,
+            cleanup: request.cleanup,
         };
         let stamped = self
             .append_definition(definition, false)
@@ -1204,6 +1258,15 @@ impl ControlPlaneService for ControlPlane {
             return Err(Status::from(ServerError::WorkspaceNameTaken { name }));
         }
 
+        let checkout_mode = if request.checkout_mode == 0 {
+            current.checkout_mode
+        } else {
+            request.checkout_mode
+        };
+        let mode = horde_proto::v1::CheckoutMode::try_from(checkout_mode).unwrap_or_default();
+        crate::workspace_policy::validate_definition_fields(&repos, &request.unmanaged_paths, mode)
+            .map_err(Status::from)?;
+        let cleanup = request.cleanup.or(current.cleanup);
         let stamped = self
             .append_definition(
                 horde_proto::v1::WorkspaceDefinition {
@@ -1211,6 +1274,8 @@ impl ControlPlaneService for ControlPlane {
                     repos,
                     unmanaged_paths: request.unmanaged_paths,
                     etag: String::new(),
+                    checkout_mode,
+                    cleanup,
                     ..current
                 },
                 false,
@@ -1250,17 +1315,170 @@ impl ControlPlaneService for ControlPlane {
         &self,
         request: Request<DeleteWorkspaceDefinitionRequest>,
     ) -> Result<Response<DeleteWorkspaceDefinitionResponse>, Status> {
+        let requested_by = principal_of(&request);
         let request = request.into_inner();
+        if (request.force || request.dry_run) && !request.purge {
+            return Err(Status::invalid_argument(
+                "--force and --dry-run apply to --purge; a plain delete removes only the definition",
+            ));
+        }
         let current = self
             .mutable_definition(request.workspace_definition_id.as_ref(), &request.etag)
             .await
             .map_err(Status::from)?;
+        let id = current
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
 
-        self.append_definition(current, true)
-            .await
-            .map_err(Status::from)?;
+        // A purge dry run plans the purge and keeps the Definition; a real
+        // purge appends the deletion first, so the purge's commands carry
+        // the last Definition the fold keeps for deleted ids (ADR-0014).
+        if !request.dry_run {
+            self.append_definition(current, true)
+                .await
+                .map_err(Status::from)?;
+        }
+        if !request.purge {
+            return Ok(Response::new(DeleteWorkspaceDefinitionResponse::default()));
+        }
+        let workers = super::workspace_gc::workers_for(&self.core, &[], Some(&id));
+        let targets = super::workspace_gc::targets(&self.core, workers);
+        let (purge_request_id, purge_sequence) = super::workspace_gc::request_gc(
+            &self.core,
+            super::workspace_gc::GcAsk::removal(id, request.force, request.dry_run, requested_by),
+            &targets,
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(DeleteWorkspaceDefinitionResponse {
+            purge_request_id,
+            purge_sequence,
+        }))
+    }
 
-        Ok(Response::new(DeleteWorkspaceDefinitionResponse {}))
+    #[instrument(skip_all)]
+    async fn collect_workspace_garbage(
+        &self,
+        request: Request<horde_proto::v1::CollectWorkspaceGarbageRequest>,
+    ) -> Result<Response<horde_proto::v1::CollectWorkspaceGarbageResponse>, Status> {
+        let requested_by = principal_of(&request);
+        let request = request.into_inner();
+        let level = horde_proto::v1::GcLevel::try_from(request.level).unwrap_or_default();
+        if request.force && level != horde_proto::v1::GcLevel::Hard {
+            return Err(Status::invalid_argument("force applies only to a hard gc"));
+        }
+        let definition_id = request
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let workers = super::workspace_gc::workers_for(
+            &self.core,
+            &request.worker_ids,
+            definition_id.as_deref(),
+        );
+        let targets = super::workspace_gc::targets(&self.core, workers);
+        let (request_id, sequence) = super::workspace_gc::request_gc(
+            &self.core,
+            super::workspace_gc::GcAsk {
+                definition_id,
+                agent_ids: request.agent_ids,
+                level,
+                force: request.force,
+                dry_run: request.dry_run,
+                remove_instance: false,
+                include_pins: request.include_pins,
+                requested_by,
+            },
+            &targets,
+        )
+        .await
+        .map_err(Status::from)?;
+        let ids = |workers: &[String]| workers.iter().map(horde_proto::v1::WorkerId::new).collect();
+        Ok(Response::new(
+            horde_proto::v1::CollectWorkspaceGarbageResponse {
+                request_id,
+                targeted: ids(&targets.targeted),
+                offline: ids(&targets.offline),
+                unsupported: ids(&targets.unsupported),
+                sequence,
+            },
+        ))
+    }
+
+    #[instrument(skip_all)]
+    async fn remove_workspace_instance(
+        &self,
+        request: Request<horde_proto::v1::RemoveWorkspaceInstanceRequest>,
+    ) -> Result<Response<horde_proto::v1::RemoveWorkspaceInstanceResponse>, Status> {
+        let requested_by = principal_of(&request);
+        let request = request.into_inner();
+        let definition_id = request
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Status::invalid_argument("an instance removal names its workspace"))?;
+        let worker_id = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Status::invalid_argument("an instance removal names its worker"))?;
+        let targets = super::workspace_gc::targets(&self.core, vec![worker_id]);
+        if !targets.unsupported.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "worker {} is too old to remove instances (workspace protocol below 2)",
+                targets.unsupported.join(", ")
+            )));
+        }
+        let (request_id, sequence) = super::workspace_gc::request_gc(
+            &self.core,
+            super::workspace_gc::GcAsk::removal(
+                definition_id,
+                request.force,
+                request.dry_run,
+                requested_by,
+            ),
+            &targets,
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(
+            horde_proto::v1::RemoveWorkspaceInstanceResponse {
+                request_id,
+                sequence,
+                targeted: !targets.targeted.is_empty(),
+            },
+        ))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_workspace_instances(
+        &self,
+        request: Request<horde_proto::v1::ListWorkspaceInstancesRequest>,
+    ) -> Result<Response<horde_proto::v1::ListWorkspaceInstancesResponse>, Status> {
+        let request = request.into_inner();
+        let worker = request
+            .worker_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        let definition = request
+            .workspace_definition_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|id| !id.is_empty());
+        Ok(Response::new(
+            horde_proto::v1::ListWorkspaceInstancesResponse {
+                instances: self
+                    .core
+                    .instances
+                    .filtered(worker.as_deref(), definition.as_deref()),
+            },
+        ))
     }
 
     #[instrument(skip_all)]

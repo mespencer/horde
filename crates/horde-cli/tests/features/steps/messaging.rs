@@ -78,12 +78,5 @@ async fn the_result_is_on_the_log(world: &mut HordeWorld, summary: String) -> St
 /// result arrived, not its summary — the TUI owns the richer view.
 #[then("the session replay shows a reported result")]
 async fn the_replay_shows_a_reported_result(world: &mut HordeWorld) -> StepResult {
-    let endpoint = world.endpoint()?.to_owned();
-    let session = world.session()?.to_owned();
-    world.run_horde(&endpoint, &["sync", &session]).await?;
-    let run = world.last_run()?;
-    if !(run.success && run.stdout.contains("result_reported")) {
-        return Err(format!("no result in the replay: {:?}", run.stdout).into());
-    }
-    Ok(())
+    crate::steps::cli::replay_shows(world, "result_reported").await
 }

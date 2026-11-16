@@ -68,6 +68,9 @@ pub struct PlacementRequest<'a> {
     /// refusing on stale registration state. Handed in rather than read, so
     /// the scheduler stays a pure decision that replays.
     pub now_unix_ms: i64,
+    /// The spawn uses ADR-0014's fields (a base, a branch, lazy mode or
+    /// initial repos): only a Worker of workspace protocol 2 can honour it.
+    pub needs_workspace_protocol: bool,
 }
 
 impl<'a> PlacementRequest<'a> {
@@ -83,6 +86,7 @@ impl<'a> PlacementRequest<'a> {
             harness: None,
             load,
             now_unix_ms: 0,
+            needs_workspace_protocol: false,
         }
     }
 
@@ -207,11 +211,52 @@ impl WorkerRegistry {
     }
 }
 
+/// How free disk shapes placement (ADR-0014 resolution 7): a Worker below
+/// the pressure threshold is deprioritized, not excluded; one below the hard
+/// floor is excluded. A Worker that reported no disk facts is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskPlacement {
+    /// Hundredths of a percent of the filesystem (1000 = 10 %).
+    pub pressure_basis_points: u64,
+    /// The pressure threshold is the larger of the share and this.
+    pub pressure_bytes: u64,
+    /// Below this many free bytes a Worker takes no workspace spawns.
+    pub floor_bytes: u64,
+}
+
+impl Default for DiskPlacement {
+    fn default() -> Self {
+        Self {
+            pressure_basis_points: 1_000,
+            pressure_bytes: 20 << 30,
+            floor_bytes: 2 << 30,
+        }
+    }
+}
+
+impl DiskPlacement {
+    /// Whether `(free, total)` is under pressure.
+    #[must_use]
+    pub fn pressured(&self, free: u64, total: u64) -> bool {
+        let share =
+            u64::try_from(u128::from(total) * u128::from(self.pressure_basis_points) / 10_000)
+                .unwrap_or(u64::MAX);
+        free < share.max(self.pressure_bytes)
+    }
+
+    /// Whether `free` is below the hard floor.
+    #[must_use]
+    pub fn below_floor(&self, free: u64) -> bool {
+        free < self.floor_bytes
+    }
+}
+
 /// The real scheduler: constraints filter, preferences order.
 #[derive(Debug, Clone)]
 pub struct CapabilityScheduler {
     registry: WorkerRegistry,
     instances: InstanceCache,
+    disk: DiskPlacement,
 }
 
 impl CapabilityScheduler {
@@ -220,7 +265,27 @@ impl CapabilityScheduler {
         Self {
             registry,
             instances,
+            disk: DiskPlacement::default(),
         }
+    }
+
+    /// Overrides how free disk shapes placement.
+    #[must_use]
+    pub fn with_disk_placement(mut self, disk: DiskPlacement) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// A Worker's freshest disk facts: its instance reports, else its
+    /// registration. `None` when neither said.
+    fn filesystem_of(&self, worker: &RegisteredWorker) -> Option<(u64, u64)> {
+        self.instances.filesystem_of(&worker.worker_id).or_else(|| {
+            let capabilities = &worker.capabilities;
+            (capabilities.workspace_total_bytes > 0).then_some((
+                capabilities.workspace_free_bytes,
+                capabilities.workspace_total_bytes,
+            ))
+        })
     }
 }
 
@@ -258,7 +323,18 @@ impl Scheduler for CapabilityScheduler {
         let mut candidates = Vec::new();
         for worker in &workers {
             let load = worker_load(request.load, &worker.worker_id);
-            let refusals = refusals(request, &worker.capabilities, load);
+            let mut refusals = refusals(request, &worker.capabilities, load);
+            let disk = request
+                .workspace_definition_id
+                .and_then(|_| self.filesystem_of(worker));
+            if let Some((free, _)) = disk
+                && self.disk.below_floor(free)
+            {
+                refusals.push(format!(
+                    "has {free} bytes free, below the {}-byte floor",
+                    self.disk.floor_bytes
+                ));
+            }
             if refusals.is_empty() {
                 candidates.push(Candidate {
                     worker_id: worker.worker_id.clone(),
@@ -269,6 +345,7 @@ impl Scheduler for CapabilityScheduler {
                     ),
                     on_parent: Some(worker.worker_id.as_str()) == request.parent_worker_id,
                     load,
+                    pressured: disk.is_some_and(|(free, total)| self.disk.pressured(free, total)),
                 });
             } else {
                 refusals_by_worker.push(format!("{} {}", worker.worker_id, refusals.join(", ")));
@@ -296,6 +373,8 @@ struct Candidate {
     /// Is the spawning parent's worker.
     on_parent: bool,
     load: u64,
+    /// Below the disk-pressure threshold: placed elsewhere when it can be.
+    pressured: bool,
 }
 
 /// The preference order among eligible workers: warmth, then the parent's
@@ -307,6 +386,7 @@ fn preferred(candidates: Vec<Candidate>) -> Option<String> {
         .into_iter()
         .min_by_key(|candidate| {
             (
+                candidate.pressured,
                 !candidate.warm,
                 !candidate.on_parent,
                 candidate.load,
@@ -441,6 +521,11 @@ fn workspace_refusal(
     let supports = capabilities.supports_workspaces;
     if needs && !supports {
         Some("does not support workspaces".to_owned())
+    } else if request.needs_workspace_protocol && capabilities.workspace_protocol < 2 {
+        Some(format!(
+            "speaks workspace protocol {}, and a base, branch, lazy mode or repo list needs 2",
+            capabilities.workspace_protocol
+        ))
     } else {
         None
     }
@@ -541,6 +626,16 @@ mod tests {
     /// The unconstrained request, for struct-update spreads in these tests.
     fn request_defaults() -> PlacementRequest<'static> {
         PlacementRequest::new(&NO_CONSTRAINTS, &NO_LOAD)
+    }
+
+    /// The defaults, for a spawn into `ws-1`, needing workspace protocol 2
+    /// or not.
+    fn ws_1_request(needs_workspace_protocol: bool) -> PlacementRequest<'static> {
+        PlacementRequest {
+            workspace_definition_id: Some("ws-1"),
+            needs_workspace_protocol,
+            ..request_defaults()
+        }
     }
 
     struct Harness {
@@ -996,7 +1091,161 @@ mod tests {
             warm,
             on_parent,
             load,
+            pressured: false,
         }
+    }
+
+    /// Disk pressure outranks every other preference — a warm worker on a
+    /// filling disk loses to a cold one with room — but only deprioritizes:
+    /// a pressured worker is still chosen when it is the only one.
+    #[test]
+    fn a_pressured_worker_is_chosen_last_not_never() {
+        let pressured = Candidate {
+            pressured: true,
+            ..candidate("warm-but-full", true, true, 0)
+        };
+        assert_eq!(
+            preferred(vec![pressured.clone(), candidate("cold", false, false, 9)]),
+            Some("cold".to_owned())
+        );
+        assert_eq!(preferred(vec![pressured]), Some("warm-but-full".to_owned()));
+    }
+
+    #[test]
+    fn disk_pressure_is_the_larger_threshold_and_the_floor_excludes() {
+        let disk = DiskPlacement {
+            pressure_basis_points: 1_000,
+            pressure_bytes: 100,
+            floor_bytes: 10,
+        };
+        assert!(disk.pressured(99, 500), "under the 100-byte threshold");
+        assert!(!disk.pressured(100, 500));
+        assert!(disk.pressured(150, 2_000), "under 10% of 2000");
+        assert!(!disk.pressured(200, 2_000));
+        assert!(disk.below_floor(9));
+        assert!(!disk.below_floor(10));
+        let defaults = DiskPlacement::default();
+        assert_eq!(defaults.pressure_basis_points, 1_000);
+        assert_eq!(defaults.pressure_bytes, 20 << 30);
+        assert_eq!(defaults.floor_bytes, 2 << 30);
+    }
+
+    /// The share is exact at its boundaries: `free` equal to the share is
+    /// not pressured, one byte under is, and a share past `u64` saturates.
+    #[test]
+    fn the_pressure_share_is_exact_at_its_boundaries() {
+        let share = |basis_points| DiskPlacement {
+            pressure_basis_points: basis_points,
+            pressure_bytes: 0,
+            floor_bytes: 0,
+        };
+        assert!(share(1_000).pressured(0, 10), "10% of 10 is 1");
+        assert!(!share(10_000).pressured(9, 9), "all of 9 is 9");
+        assert!(!share(1_000).pressured(1_000, 10_000));
+        assert!(!share(1_000).pressured(999, 9_999), "10% of 9999 is 999");
+        assert!(share(10_000).pressured(9_999, 10_000));
+        assert!(
+            share(20_000).pressured(u64::MAX - 1, u64::MAX),
+            "twice the disk saturates to u64::MAX"
+        );
+    }
+
+    /// A Worker that registered any disk at all is held to the floor by its
+    /// registration until it reports; a whole protocol below 2 is refused,
+    /// 1 included.
+    #[test]
+    fn a_one_byte_disk_counts_and_protocol_one_is_too_old() {
+        let floor = harness();
+        let scheduler = floor.scheduler.clone().with_disk_placement(DiskPlacement {
+            pressure_basis_points: 0,
+            pressure_bytes: 0,
+            floor_bytes: 100,
+        });
+        let mut tiny = capabilities(&[]);
+        tiny.workspace_free_bytes = 0;
+        tiny.workspace_total_bytes = 1;
+        floor.registry.register("tiny", tiny);
+        let request = ws_1_request(false);
+        let reason = queued_reason(scheduler.place(&request));
+        assert!(reason.contains("below the 100-byte floor"), "{reason}");
+
+        let harness = harness();
+        let mut one = capabilities(&[]);
+        one.workspace_protocol = 1;
+        harness.registry.register("one", one);
+        let request = ws_1_request(true);
+        let reason = queued_reason(harness.scheduler.place(&request));
+        assert!(reason.contains("workspace protocol 1"), "{reason}");
+    }
+
+    /// A spawn naming a base, branch, lazy mode or repos is placed only on a
+    /// worker that speaks workspace protocol 2; the refusal says why.
+    #[test]
+    fn a_new_checkout_field_needs_a_protocol_two_worker() {
+        let harness = harness();
+        let mut old = capabilities(&[]);
+        old.workspace_protocol = 0;
+        harness.registry.register("old", old);
+        let request = ws_1_request(true);
+        let reason = queued_reason(harness.scheduler.place(&request));
+        assert!(reason.contains("workspace protocol 0"), "{reason}");
+        let mut new = capabilities(&[]);
+        new.workspace_protocol = 2;
+        harness.registry.register("new", new);
+        assert_eq!(placed_on(harness.scheduler.place(&request)), "new");
+        let plain = PlacementRequest {
+            needs_workspace_protocol: false,
+            ..request
+        };
+        assert_eq!(placed_on(harness.scheduler.place(&plain)), "new");
+    }
+
+    /// Below the floor a worker is excluded from workspace spawns, by its
+    /// reported disk facts; between the floor and the pressure threshold it
+    /// is merely placed last.
+    #[test]
+    fn the_disk_floor_excludes_and_pressure_reorders() {
+        let harness = harness();
+        let scheduler = harness
+            .scheduler
+            .clone()
+            .with_disk_placement(DiskPlacement {
+                pressure_basis_points: 0,
+                pressure_bytes: 1_000,
+                floor_bytes: 100,
+            });
+        let mut full = capabilities(&[]);
+        full.workspace_free_bytes = 50;
+        full.workspace_total_bytes = 10_000;
+        harness.registry.register("full", full);
+        let request = ws_1_request(false);
+        let reason = queued_reason(scheduler.place(&request));
+        assert!(reason.contains("below the 100-byte floor"), "{reason}");
+        let no_workspace = PlacementRequest {
+            workspace_definition_id: None,
+            ..request
+        };
+        assert_eq!(
+            placed_on(scheduler.place(&no_workspace)),
+            "full",
+            "only workspace spawns need disk"
+        );
+
+        let mut tight = capabilities(&[]);
+        tight.workspace_free_bytes = 500;
+        tight.workspace_total_bytes = 10_000;
+        harness.registry.register("a-tight", tight);
+        let mut roomy = capabilities(&[]);
+        roomy.workspace_free_bytes = 5_000;
+        roomy.workspace_total_bytes = 10_000;
+        harness.registry.register("b-roomy", roomy);
+        assert_eq!(placed_on(scheduler.place(&request)), "b-roomy");
+        harness.registry.deregister("b-roomy");
+        assert_eq!(
+            placed_on(scheduler.place(&request)),
+            "a-tight",
+            "pressure deprioritizes, never excludes"
+        );
     }
 
     /// The whole preference order in one table: warmth beats the parent's

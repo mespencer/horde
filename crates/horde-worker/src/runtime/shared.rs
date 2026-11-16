@@ -5,7 +5,7 @@
 //! uses neither, so no module cycle runs through the runtime.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use horde_adapter::{Adapter, AgentSession, Capability, ProviderAccount, TurnInput};
 use horde_proto::v1::{
@@ -13,10 +13,12 @@ use horde_proto::v1::{
     DeliverMessageCommand, DeliveryMode, SpawnAgentCommand, deliver_message_command, event::Kind,
 };
 
+use super::activity::{Activity, CheckoutLocks, InstanceReporter};
 use crate::error::WorkerError;
 use crate::journal::{Journal, JournalEntry, RevivableAgent};
 use crate::share::{AgentCheckout, ShareBroker, StampingSink};
 use crate::translate::AgentContext;
+use crate::workspace::policy::WorkspacePolicy;
 
 /// Everything a lane needs that is not its own agent. Cheap to clone: every
 /// field is a handle.
@@ -39,6 +41,16 @@ pub(super) struct Shared {
     /// Serves each Session's MCP endpoint and mints per-agent tokens. `None`
     /// means spawned agents get no endpoint — the in-process test shape.
     pub(super) endpoints: Option<Arc<crate::endpoint::EndpointManager>>,
+    /// Which agents have a turn in flight, and since when they are idle.
+    pub(super) activity: Arc<Activity>,
+    /// One lock per agent checkout: spawn, `workspace_checkout`, archive and
+    /// every cleanup take it (ADR-0014).
+    pub(super) checkout_locks: Arc<CheckoutLocks>,
+    /// Where the Instance set is reported after changes.
+    pub(super) reporter: Option<Arc<dyn InstanceReporter>>,
+    /// The last workspace policy each Instance's commands carried — what
+    /// the scan, which no command carries, cleans up by.
+    pub(super) policies: Arc<Mutex<BTreeMap<String, WorkspacePolicy>>>,
 }
 
 impl Shared {
@@ -51,6 +63,10 @@ impl Shared {
             broker: Arc::new(ShareBroker::new(None)),
             attachments: Arc::new(crate::blob::AttachmentBroker::new(None)),
             endpoints: None,
+            activity: Arc::new(Activity::default()),
+            checkout_locks: Arc::new(CheckoutLocks::default()),
+            reporter: None,
+            policies: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -60,32 +76,42 @@ impl Shared {
         StampingSink::new(self.journal.sink(), Arc::clone(&self.broker))
     }
 
+    /// Remembers the policy a command carried for an Instance.
+    pub(super) fn remember_policy(
+        &self,
+        definition_id: &str,
+        wire: Option<&horde_proto::v1::ResolvedWorkspacePolicy>,
+    ) {
+        if wire.is_none() {
+            return;
+        }
+        self.policies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(definition_id.to_owned(), WorkspacePolicy::from_wire(wire));
+    }
+
+    /// The last policy seen for an Instance, or the defaults.
+    pub(super) fn policy_for(&self, definition_id: &str) -> WorkspacePolicy {
+        self.policies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(definition_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The Relay URL of one repo, when a Relay is configured.
+    pub(super) fn relay_repo_url(&self) -> impl Fn(&str) -> Option<String> + Sync + use<> {
+        let relay = self.broker.relay().cloned();
+        move |repo_name: &str| relay.as_ref().map(|relay| relay.repo_url(repo_name))
+    }
+
     /// Revokes an agent's endpoint identity and drops its MCP surface (and
     /// its Session's endpoint, when it was the last agent there).
     pub(super) async fn forget_endpoint(&self, agent_id: &str) {
         if let Some(endpoints) = &self.endpoints {
             endpoints.forget_agent(agent_id).await;
-        }
-    }
-
-    /// Gives back what a spawn minted for an agent whose harness never
-    /// started: the endpoint token (a credential nobody holds must not stay
-    /// valid), its `local` MCP children, and the checkout — the agent is not
-    /// remembered, so nothing would ever reuse or release it.
-    pub(super) async fn abandon_spawn(&self, agent_id: &str, checkout: Option<&AgentCheckout>) {
-        self.forget_endpoint(agent_id).await;
-        if let Some(checkout) = checkout {
-            self.release_checkout(agent_id, &checkout.root).await;
-        }
-    }
-
-    /// Gives one agent's checkout back (ADR-0010), logging rather than
-    /// failing: a checkout that will not release is disk, not correctness.
-    pub(super) async fn release_checkout(&self, agent_id: &str, root: &std::path::Path) {
-        if let Some(workspaces) = &self.workspaces
-            && let Err(error) = workspaces.release_checkout(root).await
-        {
-            tracing::warn!(agent_id, %error, "could not release an agent's checkout");
         }
     }
 
@@ -160,10 +186,13 @@ impl Shared {
             .ok_or(WorkerError::UnknownProvider(provider))
     }
 
-    /// The checkout a spawn's workspace and Checkout Policy call for — its
-    /// root is the agent's working directory, its repos the payload seam's
-    /// map — or `None` when the spawn names no workspace and the agent runs
-    /// where the Worker runs.
+    /// The checkout a spawn's workspace, Checkout Policy, mode, bases and
+    /// branch call for — its root is the agent's working directory, its
+    /// repos the payload seam's map — or `None` when the spawn names no
+    /// workspace and the agent runs where the Worker runs.
+    ///
+    /// A checkout with a ledger record is recomposed from it, so a revival
+    /// reuses the same repos, branch and bases (`REUSED`).
     ///
     /// # Errors
     ///
@@ -173,7 +202,7 @@ impl Shared {
     pub(super) async fn agent_checkout(
         &self,
         spawn: &SpawnAgentCommand,
-    ) -> Result<Option<AgentCheckout>, WorkerError> {
+    ) -> Result<Option<SpawnCheckout>, WorkerError> {
         let Some(definition_id) = workspace_of(spawn) else {
             return Ok(None);
         };
@@ -182,64 +211,41 @@ impl Shared {
                 "the spawn names workspace {definition_id}, but this worker has no workspace root"
             ))
         })?;
-
-        let agent_id = spawn
-            .agent_id
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let policy = spawn
-            .spec
-            .as_ref()
-            .and_then(|spec| horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy).ok())
-            .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified);
-        let start_points = self.parent_start_points(&spawn.parent_agent_id).await;
-        let root = workspaces
-            .checkout(&definition_id, &agent_id, policy, &start_points)
+        self.remember_policy(&definition_id, spawn.workspace_policy.as_ref());
+        let policy = self.policy_for(&definition_id);
+        let spec = spawn.spec.clone().unwrap_or_default();
+        let request = crate::workspace::CheckoutRequest {
+            definition_id: definition_id.clone(),
+            agent_id: spawn
+                .agent_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            session_id: spawn
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            policy: horde_proto::v1::CheckoutPolicy::try_from(spec.checkout_policy)
+                .unwrap_or(horde_proto::v1::CheckoutPolicy::Unspecified),
+            mode: horde_proto::v1::CheckoutMode::try_from(spec.checkout_mode)
+                .unwrap_or(horde_proto::v1::CheckoutMode::Unspecified),
+            checkout_repos: spec.checkout_repos,
+            bases: spec.repo_bases,
+            branch: spec.branch,
+            fetch: policy.fetch,
+        };
+        let prepared = workspaces
+            .checkout_agent(&request, self.broker.as_ref())
             .await?;
-        let repos = workspaces.instance_repos(&definition_id).await?;
-        Ok(Some(AgentCheckout { root, repos }))
-    }
-
-    /// The parent's committed HEAD per repo — what a child's checkout starts
-    /// from (DESIGN §5, fix a8). Empty when the spawn has no parent, or the
-    /// parent's checkout is not on this Worker (a cross-worker parent's
-    /// commits travel as payloads, not as checkout ancestry): those children
-    /// honestly start from the instance's HEAD.
-    async fn parent_start_points(
-        &self,
-        parent_agent_id: &Option<horde_proto::v1::AgentId>,
-    ) -> BTreeMap<String, String> {
-        let mut start_points = BTreeMap::new();
-        let Some(parent) = parent_agent_id
-            .as_ref()
-            .map(ToString::to_string)
-            .filter(|id| !id.is_empty())
-        else {
-            return start_points;
-        };
-        let Some(checkout) = self.broker.checkout_of(&parent) else {
-            return start_points;
-        };
-        for (repo_name, relative) in &checkout.repos {
-            match horde_relay::observe_head(&checkout.root.join(relative)).await {
-                Ok(observed) => {
-                    start_points.insert(repo_name.clone(), observed.commit_sha);
-                }
-                // A parent repo whose HEAD cannot be observed contributes no
-                // start point rather than failing the child's spawn: the
-                // instance HEAD is a working default, a dead spawn is not.
-                Err(error) => {
-                    tracing::warn!(
-                        parent,
-                        repo = %repo_name,
-                        %error,
-                        "could not observe the parent's HEAD; the child starts at the instance's"
-                    );
-                }
-            }
-        }
-        start_points
+        Ok(Some(SpawnCheckout {
+            checkout: AgentCheckout {
+                root: prepared.root,
+                repos: prepared.repos,
+            },
+            prepared: prepared.prepared,
+            overlay: prepared.overlay,
+        }))
     }
 
     /// Resumes the provider conversation a remembered agent names.
@@ -249,11 +255,14 @@ impl Shared {
     pub(super) async fn resume_session(
         &self,
         record: &RevivableAgent,
-    ) -> Result<(Box<dyn AgentSession>, bool, Option<AgentCheckout>), WorkerError> {
+    ) -> Result<(Box<dyn AgentSession>, bool, Option<SpawnCheckout>), WorkerError> {
         let provider_session_id = record.provider_session_id.as_deref().unwrap_or_default();
         let adapter = self.adapter_for(&record.spawn)?;
         let checkout = self.agent_checkout(&record.spawn).await?;
-        let cwd = checkout.as_ref().map(|checkout| checkout.root.clone());
+        let cwd = checkout
+            .as_ref()
+            .map(|checkout| checkout.checkout.root.clone());
+        let spawn = with_overlay(&record.spawn, checkout.as_ref());
         // A fresh endpoint identity per incarnation, and a re-assembled MCP
         // surface: the token the previous process held is replaced, never
         // reused, and its `local` children are new.
@@ -264,8 +273,7 @@ impl Shared {
         // already spent its ordinal, and reusing it would hand the revived
         // turn journal keys the Server has partially seen. Turn ids need
         // uniqueness, not density, so the skip is free.
-        let spec =
-            domain_spec(&record.spawn, cwd, endpoint).with_turns_taken(record.turns_taken + 1);
+        let spec = domain_spec(&spawn, cwd, endpoint).with_turns_taken(record.turns_taken + 1);
         let session = adapter
             .resume(
                 &spec,
@@ -289,6 +297,8 @@ impl Shared {
         agent_id: &str,
         payload: &horde_proto::v1::Payload,
     ) -> Result<(), WorkerError> {
+        let payload = self.obtain_pending(agent_id, payload).await?;
+        let payload = &payload;
         self.broker.obtain(agent_id, payload).await?;
         if payload.attachments.is_empty() {
             return Ok(());
@@ -307,6 +317,98 @@ impl Shared {
             .materialize(&payload.attachments, &root)
             .await?;
         Ok(())
+    }
+}
+
+/// A spawn's composed checkout: the broker's view, what each repo started
+/// from, and the lazy prompt paragraph.
+pub(super) struct SpawnCheckout {
+    pub(super) checkout: AgentCheckout,
+    pub(super) prepared: horde_proto::v1::CheckoutPrepared,
+    pub(super) overlay: Option<String>,
+}
+
+impl Shared {
+    /// Handles the commits of a payload naming repos the receiver has not
+    /// checked out (a lazy agent): each is made present in the Instance repo
+    /// and listed as pending in the manifest — no worktree, since the agent
+    /// did not ask for one (ADR-0014). Returns the rest of the payload, for
+    /// the broker's ordinary delivery into checked-out repos.
+    async fn obtain_pending(
+        &self,
+        agent_id: &str,
+        payload: &horde_proto::v1::Payload,
+    ) -> Result<horde_proto::v1::Payload, WorkerError> {
+        let Some(checkout) = self.broker.checkout_of(agent_id) else {
+            return Ok(payload.clone());
+        };
+        let (Some(workspaces), Some((definition_id, _))) = (
+            self.workspaces.as_ref(),
+            self.workspaces
+                .as_ref()
+                .and_then(|workspaces| workspaces.agent_private(&checkout.root)),
+        ) else {
+            return Ok(payload.clone());
+        };
+        let known: Vec<String> = workspaces
+            .instance_repos(&definition_id)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let mut rest = payload.clone();
+        rest.git_refs.clear();
+        for git_ref in &payload.git_refs {
+            let checked_out = checkout
+                .repos
+                .iter()
+                .any(|(name, _)| *name == git_ref.repo_name);
+            if checked_out || !known.contains(&git_ref.repo_name) {
+                rest.git_refs.push(git_ref.clone());
+                continue;
+            }
+            let instance_repo = workspaces
+                .instance_repo_path(&definition_id, &git_ref.repo_name)
+                .await?;
+            self.broker
+                .obtain_into(&instance_repo, &git_ref.repo_name, &git_ref.commit_sha)
+                .await?;
+            workspaces
+                .note_pending(&checkout.root, &git_ref.repo_name, &git_ref.commit_sha)
+                .await?;
+        }
+        Ok(rest)
+    }
+}
+
+/// A spawn with the lazy checkout's paragraph appended to its overlay.
+pub(super) fn with_overlay(
+    spawn: &SpawnAgentCommand,
+    checkout: Option<&SpawnCheckout>,
+) -> SpawnAgentCommand {
+    let mut spawn = spawn.clone();
+    if let Some(overlay) = checkout.and_then(|checkout| checkout.overlay.as_ref()) {
+        if !spawn.prompt_overlay.is_empty() {
+            spawn.prompt_overlay.push_str("\n\n");
+        }
+        spawn.prompt_overlay.push_str(overlay);
+    }
+    spawn
+}
+
+/// The `CheckoutPrepared` event a spawn or revival journals in the agent's
+/// Session.
+pub(super) fn checkout_prepared_entry(
+    session_id: &str,
+    agent_id: &str,
+    idempotency_key: String,
+    prepared: horde_proto::v1::CheckoutPrepared,
+) -> JournalEntry {
+    JournalEntry {
+        session_id: session_id.to_owned(),
+        agent_id: Some(agent_id.to_owned()),
+        idempotency_key,
+        kind: Kind::CheckoutPrepared(prepared),
     }
 }
 
@@ -453,5 +555,43 @@ pub(super) fn domain_spec(
             .map(|spec| spec.permission_mode.clone())
             .filter(|mode| !mode.is_empty()),
         provider_options: BTreeMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SpawnCheckout, with_overlay};
+    use crate::share::AgentCheckout;
+    use horde_proto::v1::SpawnAgentCommand;
+
+    fn lazy_checkout(overlay: &str) -> SpawnCheckout {
+        SpawnCheckout {
+            checkout: AgentCheckout {
+                root: "/w/agent-1".into(),
+                repos: Vec::new(),
+            },
+            prepared: horde_proto::v1::CheckoutPrepared::default(),
+            overlay: Some(overlay.to_owned()),
+        }
+    }
+
+    /// The lazy paragraph stands alone on a spawn with no overlay of its
+    /// own, and follows an existing one after a blank line.
+    #[test]
+    fn the_lazy_paragraph_joins_the_overlay_with_one_blank_line() {
+        let bare = SpawnAgentCommand::default();
+        assert_eq!(
+            with_overlay(&bare, Some(&lazy_checkout("check out lazily"))).prompt_overlay,
+            "check out lazily"
+        );
+        let own = SpawnAgentCommand {
+            prompt_overlay: "be brief".to_owned(),
+            ..SpawnAgentCommand::default()
+        };
+        assert_eq!(
+            with_overlay(&own, Some(&lazy_checkout("check out lazily"))).prompt_overlay,
+            "be brief\n\ncheck out lazily"
+        );
+        assert_eq!(with_overlay(&own, None).prompt_overlay, "be brief");
     }
 }

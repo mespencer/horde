@@ -6,6 +6,7 @@ package horde.v1;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "horde/v1/id.proto";
+import "horde/v1/workspace.proto";
 import "horde/v1/payload.proto";
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,39 @@ message AgentSpec {
 
   // The implicit first Assignment carried by the spawn.
   Assignment initial_assignment = 8;
+
+  // Unset: the Workspace Definition's (ADR-0014).
+  CheckoutMode checkout_mode = 9;
+
+  // The repos checked out at start under LAZY. Non-empty implies LAZY.
+  repeated string checkout_repos = 10;
+
+  // Where each named repo's checkout starts, overriding the fresh default.
+  repeated RepoBase repo_bases = 11;
+
+  // The branch created in every checked-out repo. Unset: horde/<agent-id>.
+  string branch = 12;
+}
+
+enum RepoBaseSource {
+  REPO_BASE_SOURCE_UNSPECIFIED = 0;
+
+  // A human or agent named it.
+  REPO_BASE_SOURCE_REQUESTED = 1;
+
+  // The spawning parent's committed HEAD.
+  REPO_BASE_SOURCE_PARENT = 2;
+}
+
+// One repo's start point for a new checkout.
+message RepoBase {
+  string repo_name = 1;
+
+  // A commit SHA, a branch on origin, or a tag.
+  string ref = 2;
+
+  // Provenance, not authority.
+  RepoBaseSource source = 3;
 }
 
 // ---------------------------------------------------------------------------

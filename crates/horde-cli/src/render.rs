@@ -270,6 +270,11 @@ fn detail(kind: Option<&Kind>) -> Value {
                 .unwrap_or_default(),
         ),
         Some(Kind::TurnInterrupted(interrupted)) => Value::String(interrupted.reason.clone()),
+        Some(Kind::CheckoutPrepared(prepared)) => crate::workspace_gc::prepared_detail(prepared),
+        Some(Kind::WorkspaceCleanup(cleanup)) => {
+            serde_json::from_str(&crate::workspace_gc::cleanup_rows(cleanup, Format::Json))
+                .unwrap_or_default()
+        }
         other => structured_detail(other),
     }
 }
@@ -280,6 +285,10 @@ fn detail(kind: Option<&Kind>) -> Value {
 fn human_detail(kind: Option<&Kind>, detail: &Value) -> String {
     match kind {
         Some(Kind::AgentLifecycleChanged(changed)) => lifecycle_line(changed),
+        Some(Kind::CheckoutPrepared(prepared)) => crate::workspace_gc::prepared_line(prepared),
+        Some(Kind::WorkspaceCleanup(cleanup)) => {
+            crate::workspace_gc::cleanup_rows(cleanup, Format::Human)
+        }
         _ => detail.as_str().unwrap_or_default().to_owned(),
     }
 }
@@ -784,31 +793,27 @@ pub fn workspaces(definitions: &[horde_proto::v1::WorkspaceDefinition], format: 
     }
 }
 
-/// Renders one definition and its known instances — what `get` answers with.
+/// Renders one definition and its known instances — what `get` answers with:
+/// each instance with its checkouts (state, branch, size, retained reason)
+/// and its disk (ADR-0014).
 #[must_use]
 pub fn workspace_with_instances(
     response: &horde_proto::v1::GetWorkspaceDefinitionResponse,
     format: Format,
 ) -> String {
-    let instances: Vec<serde_json::Value> = response
-        .instances
-        .iter()
-        .map(|report| {
-            json!({
-                "worker_id": id(report.worker_id.as_ref().map(ToString::to_string)),
-                "state": instance_state(report.state),
-                "root_path": report.root_path,
-                "detail": report.detail,
-            })
-        })
-        .collect();
     match format {
         Format::Json => {
             let mut rendered = response
                 .definition
                 .as_ref()
                 .map_or_else(|| json!({}), workspace_json);
-            rendered["instances"] = serde_json::Value::Array(instances);
+            rendered["instances"] = serde_json::Value::Array(
+                response
+                    .instances
+                    .iter()
+                    .map(crate::workspace_gc::instance_json)
+                    .collect(),
+            );
             rendered.to_string()
         }
         Format::Human => {
@@ -820,12 +825,8 @@ pub fn workspace_with_instances(
             ];
             for report in &response.instances {
                 lines.push(format!(
-                    "  instance on {}: {}",
-                    report
-                        .worker_id
-                        .as_ref()
-                        .map_or_else(|| "-".to_owned(), ToString::to_string),
-                    instance_state(report.state)
+                    "  instance {}",
+                    crate::workspace_gc::instance_lines(report)
                 ));
             }
             lines.join("\n")
@@ -926,7 +927,7 @@ fn harnesses_of(worker: &horde_proto::v1::WorkerSummary) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn instance_state(state: i32) -> &'static str {
+pub(crate) fn instance_state(state: i32) -> &'static str {
     match horde_proto::v1::WorkspaceInstanceState::try_from(state) {
         Ok(horde_proto::v1::WorkspaceInstanceState::Materializing) => "materializing",
         Ok(horde_proto::v1::WorkspaceInstanceState::Ready) => "ready",
@@ -1386,6 +1387,38 @@ mod tests {
         workspace_with_instances, workspaces,
     };
 
+    /// A cleanup event in the human log reads as its rows — who, which
+    /// repo, the tier and outcome, what it freed — not as an empty detail.
+    #[test]
+    fn a_cleanup_event_renders_as_its_rows() {
+        use horde_proto::v1::workspace_cleanup::{RepoAction, repo_action::Outcome};
+        let cleanup = horde_proto::v1::WorkspaceCleanup {
+            worker_id: Some(horde_proto::v1::WorkerId::new("w-1")),
+            tier: horde_proto::v1::CleanupTier::Hard.into(),
+            repos: vec![RepoAction {
+                repo_name: "atlas".to_owned(),
+                outcome: Outcome::Done.into(),
+                bytes_freed: 2048,
+                ..RepoAction::default()
+            }],
+            ..horde_proto::v1::WorkspaceCleanup::default()
+        };
+        let envelope = EventEnvelope {
+            sequence: 7,
+            event: Some(Event {
+                kind: Some(Kind::WorkspaceCleanup(cleanup)),
+                ..Event::default()
+            }),
+            ..EventEnvelope::default()
+        };
+        let line = event(&envelope, Format::Human);
+        assert!(line.contains("workspace_cleanup"), "{line}");
+        assert!(
+            line.ends_with("  w-1  -  atlas  hard done  2 KiB"),
+            "{line}"
+        );
+    }
+
     /// The `mcp` renders: the empty catalog says so in words (a script or a
     /// human reading nothing cannot tell it from a swallowed error), a
     /// populated one carries the fields a follow-up command needs, and a
@@ -1700,6 +1733,7 @@ mod tests {
                 remote_url: "https://git.example/atlas.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: "src".to_owned(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }],
             ..horde_proto::v1::WorkspaceDefinition::default()
         }
@@ -1766,7 +1800,7 @@ mod tests {
 
         let human = workspace_with_instances(&response, Format::Human);
         assert!(
-            human.contains("instance on w-1: ready"),
+            human.contains("  instance - on w-1: ready"),
             "the instances render under the definition: {human}"
         );
     }

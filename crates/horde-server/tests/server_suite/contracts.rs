@@ -268,6 +268,7 @@ fn atlas_repo() -> horde_proto::v1::WorkspaceRepo {
         remote_url: "https://example.com/atlas.git".to_owned(),
         default_branch: "main".to_owned(),
         layout_path: String::new(),
+        ..horde_proto::v1::WorkspaceRepo::default()
     }
 }
 
@@ -293,6 +294,7 @@ async fn create_named(h: &mut Harness, name: &str) -> Setup<horde_proto::v1::Wor
             name: name.to_owned(),
             repos: vec![atlas_repo()],
             unmanaged_paths: vec!["datasets".to_owned()],
+            ..horde_proto::v1::CreateWorkspaceDefinitionRequest::default()
         })
         .await?
         .into_inner()
@@ -387,6 +389,7 @@ async fn a_rename_may_keep_its_own_name_but_not_take_a_neighbours() {
             name: name.to_owned(),
             unmanaged_paths: vec!["datasets".to_owned()],
             repos: vec![],
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         }
     };
 
@@ -425,6 +428,7 @@ async fn an_update_lands_its_layout_and_the_log_carries_no_stale_etag() {
             name: String::new(),
             unmanaged_paths: vec!["weights".to_owned()],
             repos: vec![relaid],
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect("the layout update");
@@ -513,6 +517,7 @@ async fn workspace_mutations_enforce_the_etag() {
             name: String::new(),
             unmanaged_paths: vec![],
             repos: vec![],
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect_err("a stale etag is refused");
@@ -531,6 +536,7 @@ async fn workspace_mutations_enforce_the_etag() {
             name: "atlas-v2".to_owned(),
             unmanaged_paths: vec!["datasets".to_owned()],
             repos: vec![],
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect("a fresh etag updates")
@@ -559,8 +565,10 @@ async fn workspace_mutations_enforce_the_etag() {
                     remote_url: "https://example.com/extra.git".to_owned(),
                     default_branch: String::new(),
                     layout_path: String::new(),
+                    ..horde_proto::v1::WorkspaceRepo::default()
                 },
             ],
+            ..horde_proto::v1::UpdateWorkspaceDefinitionRequest::default()
         })
         .await
         .expect_err("update may not widen the repo set");
@@ -575,6 +583,7 @@ async fn workspace_mutations_enforce_the_etag() {
                 remote_url: "https://example.com/docs.git".to_owned(),
                 default_branch: "main".to_owned(),
                 layout_path: String::new(),
+                ..horde_proto::v1::WorkspaceRepo::default()
             }),
             etag: renamed.etag.clone(),
         })
@@ -589,6 +598,7 @@ async fn workspace_mutations_enforce_the_etag() {
         .delete_workspace_definition(DeleteWorkspaceDefinitionRequest {
             workspace_definition_id: created.workspace_definition_id.clone(),
             etag: added.etag.clone(),
+            ..horde_proto::v1::DeleteWorkspaceDefinitionRequest::default()
         })
         .await
         .expect("delete with the fresh etag");
@@ -614,6 +624,7 @@ async fn reported_instances_appear_on_the_definition_they_materialize() {
         repos: vec![],
         detail: String::new(),
         observed_at: None,
+        ..horde_proto::v1::WorkspaceInstanceReport::default()
     };
     h.worker
         .report_workspace_instances(ReportWorkspaceInstancesRequest {
