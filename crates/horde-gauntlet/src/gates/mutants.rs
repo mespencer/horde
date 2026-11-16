@@ -131,6 +131,11 @@ pub const SKIPPED_TESTS: &[(&str, &str)] = &[(
 /// test holds this list to every cross-package `product_binary` call in the tree.
 pub const SPAWNED_BINARIES: &[(&str, &str, &str)] = &[
     (
+        "horde-cli",
+        "horde-worker",
+        "the worker add suite installs and starts the real horde-worker",
+    ),
+    (
         "horde-e2e",
         "horde-cli",
         "the end-to-end suite drives the real `horde` CLI",

@@ -60,7 +60,9 @@ The server is remote-code-execution-as-a-service by design; the trust boundary i
 - **Rotation:** lifetimes are CA 20y, listener 2y, principal 1y. No renewal RPC and no expiry warning yet; rotation is manual re-enrollment under the same name, which the roster supports by keeping every serial a name has held.
 - No non-localhost binding before auth exists — auth ships with the first networked build, not as a follow-up.
 
-### Worker bootstrap over ssh (sequenced later)
+### Worker bootstrap over ssh
+
+As built (wave 12, ADR-0007 2026-11-13 amendment): `horde worker add <name> <user@host> [--adapter …] [--service] [--dry-run]` does steps 1–3 below. It probes `uname -sm`, copies a matching `horde-worker` into `~/.horde/bin`, hands the minted token over ssh stdin to a umask-077 file, starts the worker detached or as a systemd/launchd user service, waits for it to register, and reports the remote harnesses. Harness installation is still sequenced later.
 
 `horde worker up --ssh myles@host` composes existing primitives — it is client-side orchestration, not new protocol:
 
@@ -240,7 +242,7 @@ Ordering of activation, not scope. Everything in this document is end state; thi
 7. Enrollment/mTLS, remote workers, scheduler with capabilities
 8. MCP hub; blob store; usage reporting; OTLP
 
-Sequenced later (still end state): raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobile clients, multi-user server, credential-less workers (relay-only git), ssh worker bootstrap + harness install recipes.
+Sequenced later (still end state): raw-model harness, hard budgets, orchestrator-level sandbox, GUI/mobile clients, multi-user server, credential-less workers (relay-only git), harness install recipes (ssh worker bootstrap is built: `horde worker add`).
 
 ## 15. Open questions
 
