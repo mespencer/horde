@@ -156,28 +156,36 @@ fn record_frames(records: &[Record], truncated: bool) -> Vec<LogRecords> {
             ..LogRecords::default()
         }];
     }
-    let mut frames = Vec::new();
-    let mut start = 0;
-    while start < records.len() {
-        let mut bytes = 0;
-        let mut end = start;
-        while end < records.len()
-            && (end == start || bytes + records[end].line.len() <= FRAME_BYTES)
-        {
-            bytes += records[end].line.len();
-            end += 1;
+    // A frame closes before the record that would carry it past the bound;
+    // a frame's first record always fits, however large. One pass over the
+    // records, so no window can stall.
+    let mut chunks: Vec<&[Record]> = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (index, record) in records.iter().enumerate() {
+        let len = record.line.len();
+        if index > start && bytes + len > FRAME_BYTES {
+            chunks.push(&records[start..index]);
+            (start, bytes) = (index, 0);
         }
-        let chunk = &records[start..end];
-        let out = egress(chunk);
-        frames.push(LogRecords {
-            lines: out.lines,
-            cursor: chunk.last().map(|record| cursor_to_wire(&record.key)),
-            redacted: out.redacted,
-            truncated: truncated && end == records.len(),
-        });
-        start = end;
+        bytes += len;
     }
-    frames
+    if start < records.len() {
+        chunks.push(&records[start..]);
+    }
+    let count = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let out = egress(chunk);
+            LogRecords {
+                lines: out.lines,
+                cursor: chunk.last().map(|record| cursor_to_wire(&record.key)),
+                redacted: out.redacted,
+                truncated: truncated && index + 1 == count,
+            }
+        })
+        .collect()
 }
 
 /// Serves one read into `out` until it is done, the byte cap is reached, or
@@ -298,8 +306,14 @@ mod tests {
 
     use horde_observe::record::Record;
 
+    use std::sync::Arc;
+
+    use horde_observe::reader::{DEFAULT_TAIL, Filter};
+    use horde_observe::tap::LogTap;
+    use horde_proto::v1::LogGap;
+
     use super::{
-        FRAME_BYTES, Frame, LocalRead, cursor_from_wire, cursor_to_wire, filter_from_wire,
+        FRAME_BYTES, Frame, LocalRead, cursor_from_wire, cursor_to_wire, filter_from_wire, follow,
         followed_frame, record_frames, serve_local,
     };
 
@@ -349,6 +363,38 @@ mod tests {
         );
     }
 
+    /// The bound is inclusive: records filling a frame exactly share it,
+    /// and the next frame packs from zero again.
+    #[test]
+    fn records_filling_a_frame_exactly_share_it() {
+        let overhead = sized(0, 0).line.len();
+        let half = FRAME_BYTES / 2 - overhead;
+        let records: Vec<Record> = (0..4).map(|n| sized(n, half)).collect();
+        assert_eq!(records[0].line.len() * 2, FRAME_BYTES);
+        let frames = framed(records, false);
+        assert_eq!(
+            frames.iter().map(|f| f.lines.len()).collect::<Vec<_>>(),
+            [2, 2]
+        );
+    }
+
+    /// An oversized first record opens the first frame; no empty frame
+    /// goes ahead of it.
+    #[test]
+    fn an_oversized_first_record_opens_the_first_frame() {
+        let frames = framed(vec![sized(0, FRAME_BYTES + 10), sized(1, 10)], false);
+        assert_eq!(
+            frames.iter().map(|f| f.lines.len()).collect::<Vec<_>>(),
+            [1, 1]
+        );
+    }
+
+    /// Nothing matched and nothing left out is no frame at all.
+    #[test]
+    fn no_records_are_no_frames() {
+        assert!(framed(Vec::new(), false).is_empty());
+    }
+
     /// A record bigger than a frame still travels, alone.
     #[test]
     fn an_oversized_record_gets_a_frame_of_its_own() {
@@ -369,11 +415,14 @@ mod tests {
         let record = sized(0, 10);
         assert!(matches!(
             followed_frame(&record, 100, Some(100)),
-            Frame::Records(batch) if batch.lines.len() == 1 && batch.cursor.is_some()
+            Frame::Records(batch)
+                if batch.lines.len() == 1 && batch.cursor.is_some() && !batch.truncated
         ));
         assert!(matches!(
             followed_frame(&record, 101, Some(100)),
-            Frame::End(end) if end.reason == LogEndReason::ByteCap as i32
+            Frame::End(end)
+                if end.reason == LogEndReason::ByteCap as i32
+                    && end.detail == "the byte cap was reached"
         ));
         assert!(matches!(
             followed_frame(&record, usize::MAX, None),
@@ -431,6 +480,13 @@ mod tests {
         };
         assert_eq!(cursor_from_wire(&cursor_to_wire(&cursor)), Ok(cursor));
         assert!(cursor_from_wire(&LogCursor::default()).is_err());
+        assert_eq!(
+            cursor_from_wire(&LogCursor {
+                source: "horde".to_owned(),
+                ..LogCursor::default()
+            }),
+            Err("a log cursor needs its timestamp".to_owned())
+        );
         assert!(
             cursor_from_wire(&LogCursor {
                 ts: "t".to_owned(),
@@ -562,6 +618,135 @@ mod tests {
             assert!(records.lines[1].contains("[REDACTED:join-token]"));
             assert!(records.cursor.is_some());
             assert_eq!(end.reason, LogEndReason::Done as i32);
+            assert_eq!(end.detail, "", "a finished read needs no explanation");
+        });
+    }
+
+    /// Without a tail, a read shows the newest 200 records.
+    #[test]
+    fn a_read_without_a_tail_shows_the_default_tail() {
+        bounded(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let lines: Vec<String> = (0..=DEFAULT_TAIL)
+                .map(|n| {
+                    format!(r#"{{"ts":"2026-01-01T00:00:00.000000Z","msg":"m{n}","boot":"b","seq":{n}}}"#)
+                })
+                .collect();
+            std::fs::write(dir.path().join("horde-worker.b.1.jsonl"), lines.join("\n"))
+                .expect("write");
+            let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+            let frames = served(&logs, read(None, 0, false)).await;
+            let [Frame::Records(records), Frame::End(_)] = frames.as_slice() else {
+                panic!("records then end: {frames:?}");
+            };
+            assert_eq!(DEFAULT_TAIL, 200);
+            assert_eq!(records.lines.len(), DEFAULT_TAIL);
+        });
+    }
+
+    /// A process read with nothing but the given filter, cap and follow.
+    fn plain(max_bytes: Option<usize>) -> LocalRead {
+        LocalRead {
+            target: Target::Process,
+            filter: Filter::default(),
+            after: None,
+            tail: None,
+            follow: true,
+            max_bytes,
+        }
+    }
+
+    /// Runs the follow over a tap with `records` already published, and
+    /// returns its frames once it ends or has sent `want`.
+    async fn followed(
+        tap: &LogTap,
+        records: &[Record],
+        used: usize,
+        max_bytes: Option<usize>,
+        want: usize,
+    ) -> Vec<Frame> {
+        let receiver = tap.subscribe();
+        for record in records {
+            tap.publish(Arc::from(record.line.as_str()));
+        }
+        let (sender, mut out) = mpsc::channel(8);
+        let read = plain(max_bytes);
+        let serving =
+            tokio::spawn(async move { follow(receiver, &read, used, None, &sender).await });
+        let mut frames = Vec::new();
+        while frames.len() < want {
+            match next_frame(&mut out).await {
+                Some(frame) => frames.push(frame),
+                None => break,
+            }
+        }
+        drop(out);
+        serving.abort();
+        frames
+    }
+
+    /// A follow whose tap closes ends, saying so.
+    #[test]
+    fn a_follow_ends_when_its_tap_closes() {
+        bounded(|| async {
+            let tap = LogTap::new(4);
+            let receiver = tap.subscribe();
+            drop(tap);
+            let (sender, mut out) = mpsc::channel(8);
+            let read = plain(None);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                follow(receiver, &read, 0, None, &sender),
+            )
+            .await
+            .expect("a closed tap ends the follow");
+            assert!(matches!(
+                out.try_recv(),
+                Ok(Frame::End(end))
+                    if end.reason == LogEndReason::Done as i32 && end.detail == "the log closed"
+            ),);
+        });
+    }
+
+    /// A follow that fell behind the tap reports how far, and that nothing
+    /// was dropped on this side.
+    #[test]
+    fn a_lagging_follow_reports_the_gap() {
+        bounded(|| async {
+            let tap = LogTap::new(1);
+            let records: Vec<Record> = (1..=3).map(|n| sized(n, 1)).collect();
+            let frames = followed(&tap, &records, 0, None, 2).await;
+            assert_eq!(
+                frames.first(),
+                Some(&Frame::Gap(LogGap {
+                    lagged: 2,
+                    dropped: 0
+                })),
+                "{frames:?}"
+            );
+            assert!(
+                matches!(frames.get(1), Some(Frame::Records(_))),
+                "{frames:?}"
+            );
+        });
+    }
+
+    /// The follow counts each record's bytes on top of what the initial
+    /// read used: a record that lands exactly on the cap is sent, one byte
+    /// more ends the read.
+    #[test]
+    fn a_follow_counts_its_bytes_against_the_cap() {
+        bounded(|| async {
+            let record = sized(1, 10);
+            let len = record.line.len();
+            let tap = LogTap::new(4);
+            let exact = followed(&tap, std::slice::from_ref(&record), 5, Some(len + 5), 1).await;
+            assert!(matches!(exact.as_slice(), [Frame::Records(_)]), "{exact:?}");
+            let over = followed(&tap, std::slice::from_ref(&record), 6, Some(len + 5), 1).await;
+            assert!(
+                matches!(over.as_slice(), [Frame::End(end)] if end.reason == LogEndReason::ByteCap as i32),
+                "{over:?}"
+            );
         });
     }
 
