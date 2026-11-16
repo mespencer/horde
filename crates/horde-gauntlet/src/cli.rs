@@ -10,7 +10,7 @@ use crate::command::{CommandRunner, ProcessRunner};
 use crate::gate::GateContext;
 use crate::registry::{registry, render_list};
 use crate::report::{render_markdown, render_table};
-use crate::runner::{load_results, resolve, run};
+use crate::runner::{load_results, resolve, run, without};
 
 /// Horde's quality gates: one binary, the same on a laptop and in CI.
 #[derive(Debug, Parser)]
@@ -38,6 +38,15 @@ pub enum Command {
         /// no recent diff has touched.
         #[arg(long)]
         full: bool,
+        /// Measure what changed since the last green full sweep, rather than
+        /// since the branch point. Only `mutants` reads it; with no green full
+        /// sweep recorded, it measures the whole tree.
+        #[arg(long, conflicts_with = "full")]
+        incremental: bool,
+        /// Leave these gates out of the run (repeatable), e.g. `--skip mutants`
+        /// for a day-to-day handoff.
+        #[arg(long = "skip")]
+        skip: Vec<String>,
     },
     /// List the registered gates and their enforcement levels.
     List,
@@ -82,9 +91,15 @@ pub fn dispatch(
             gates: names,
             packages,
             full,
+            incremental,
+            skip,
         } => {
-            let selected = resolve(&gates, names).map_err(io::Error::other)?;
-            let ctx = GateContext::new(root, packages.clone()).measuring_everything(*full);
+            let selected = resolve(&gates, names)
+                .and_then(|selected| without(&gates, selected, skip))
+                .map_err(io::Error::other)?;
+            let ctx = GateContext::new(root, packages.clone())
+                .measuring_everything(*full)
+                .since_last_full_sweep(*incremental);
             let results = run(&selected, &ctx, runner)?;
             write!(out, "{}", render_table(&results))?;
             Ok(results.iter().all(|result| !result.reds_run()))
@@ -195,6 +210,8 @@ mod tests {
             gates: vec!["nope".to_owned()],
             packages: Vec::new(),
             full: false,
+            incremental: false,
+            skip: Vec::new(),
         };
         let error = dispatch(&command, Path::new("/repo"), &runner, &mut out)
             .expect_err("the gate does not exist");
@@ -208,6 +225,8 @@ mod tests {
             gates: vec!["fmt".to_owned()],
             packages: Vec::new(),
             full: false,
+            incremental: false,
+            skip: Vec::new(),
         };
         let (green, table) = render(&command, dir.path());
         assert!(!green, "{table}");
@@ -312,6 +331,8 @@ mod tests {
             gates: vec!["fmt".to_owned()],
             packages: Vec::new(),
             full: false,
+            incremental: false,
+            skip: Vec::new(),
         };
         assert_eq!(exit_code(&command, true).0, ExitCode::FAILURE);
     }
@@ -339,6 +360,8 @@ mod tests {
             gates,
             packages,
             full,
+            incremental,
+            skip,
         } = cli.command
         else {
             panic!("expected a run");
@@ -346,6 +369,50 @@ mod tests {
         assert_eq!(gates, vec!["crap".to_owned()]);
         assert_eq!(packages, vec!["horde-gauntlet".to_owned()]);
         assert!(!full, "the change under test is the default scope");
+        assert!(!incremental, "the branch point is the default baseline");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn the_cli_parses_skips_and_an_incremental_run() {
+        let cli = Cli::try_parse_from([
+            "gauntlet",
+            "run",
+            "--incremental",
+            "--skip",
+            "mutants",
+            "--skip",
+            "crap",
+        ])
+        .expect("valid arguments");
+        let Command::Run {
+            incremental, skip, ..
+        } = cli.command
+        else {
+            panic!("expected a run");
+        };
+        assert!(incremental);
+        assert_eq!(skip, vec!["mutants".to_owned(), "crap".to_owned()]);
+    }
+
+    #[test]
+    fn the_cli_refuses_full_and_incremental_together() {
+        assert!(Cli::try_parse_from(["gauntlet", "run", "--full", "--incremental"]).is_err());
+    }
+
+    #[test]
+    fn a_skipped_gate_does_not_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let command = Command::Run {
+            gates: vec!["fmt".to_owned(), "machete".to_owned()],
+            packages: Vec::new(),
+            full: false,
+            incremental: false,
+            skip: vec!["machete".to_owned()],
+        };
+        let (_, table) = render(&command, dir.path());
+        assert!(table.contains("fmt"), "{table}");
+        assert!(!table.contains("machete"), "{table}");
     }
 
     #[test]

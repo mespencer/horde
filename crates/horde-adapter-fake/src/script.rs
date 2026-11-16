@@ -179,6 +179,7 @@ impl Script {
     /// A script that echoes every message. The default agent for tests that do
     /// not care what the agent says.
     #[must_use]
+    // #[gamma::skip(fn_value.default, reason = "the body is `Self::default()` over a `Script` that derives `Default`, so the mutant `Default::default()` is the same expression")]
     pub fn echoing() -> Self {
         Self::default()
     }
