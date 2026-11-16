@@ -75,6 +75,12 @@ pub struct Sources {
     pub stderr: bool,
 }
 
+impl Default for Sources {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 impl Sources {
     /// Both families.
     pub const ALL: Self = Self {
@@ -112,8 +118,8 @@ impl Sources {
     }
 }
 
-/// What a read keeps.
-#[derive(Debug, Clone)]
+/// What a read keeps; the default keeps everything.
+#[derive(Debug, Clone, Default)]
 pub struct Filter {
     /// Records at or after this `ts` (fixed-width spelling).
     pub since: Option<String>,
@@ -127,25 +133,13 @@ pub struct Filter {
     pub sources: Sources,
 }
 
-impl Default for Filter {
-    fn default() -> Self {
-        Self {
-            since: None,
-            min_level: None,
-            grep: None,
-            agent: None,
-            session_scope: None,
-            sources: Sources::ALL,
-        }
-    }
-}
-
 /// Compiles a `--grep` pattern under the size limit.
 ///
 /// # Errors
 ///
 /// A pattern that does not compile, or compiles too large.
 pub fn compile_grep(pattern: &str) -> Result<Regex, String> {
+    // #[gamma::skip(expr.decrement, expr.increment, reason = "a mebibyte give or take a byte: no pattern's compiled size can be steered to land between the two")]
     regex::RegexBuilder::new(pattern)
         .size_limit(GREP_SIZE_LIMIT)
         .build()
@@ -163,8 +157,8 @@ pub fn resolve_since(text: &str, now: SystemTime) -> Result<String, String> {
         // Nothing was logged before the epoch; a longer look-back is all of it.
         let at = now
             .checked_sub(duration)
-            .filter(|at| *at >= SystemTime::UNIX_EPOCH)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .max(SystemTime::UNIX_EPOCH);
         return Ok(format_ts(at));
     }
     crate::record::parse_ts(text)
@@ -700,6 +694,108 @@ mod tests {
         );
     }
 
+    /// The default filter keeps everything: any session, any agent, any
+    /// time, either source.
+    #[test]
+    fn the_default_filter_keeps_everything() {
+        let filter = Filter::default();
+        for record in [
+            rec(1, "TRACE", "plain", ""),
+            rec(2, "INFO", "scoped", r#","session":"s1","agent":"a1""#),
+            rec(3, "INFO", "stderr", r#","stream":"stderr""#),
+        ] {
+            assert!(filter.admits(&record), "{}", record.line);
+        }
+    }
+
+    /// A forward read with no cap returns everything past the cursor, and
+    /// says nothing was left out.
+    #[test]
+    fn an_uncapped_forward_read_is_not_truncated() {
+        let records: Vec<Record> = (1..=3)
+            .map(|n| rec(n, "INFO", &format!("m{n}"), ""))
+            .collect();
+        let forward = Window {
+            after: Some(records[0].key.clone()),
+            ..Window::default()
+        };
+        let page = select(records, &Filter::default(), &forward);
+        assert_eq!(msgs(&page), ["m2", "m3"]);
+        assert!(!page.truncated);
+    }
+
+    /// A tail read's cap is inclusive: records filling it exactly all stay.
+    #[test]
+    fn a_tail_cap_filled_exactly_keeps_every_record() {
+        let records: Vec<Record> = (1..=3)
+            .map(|n| rec(n, "INFO", &format!("m{n}"), ""))
+            .collect();
+        let exact = Window {
+            max_bytes: Some(records.iter().map(|record| record.line.len()).sum()),
+            ..Window::default()
+        };
+        let selection = select(records, &Filter::default(), &exact);
+        assert_eq!(msgs(&selection), ["m1", "m2", "m3"]);
+        assert!(!selection.truncated);
+    }
+
+    /// A process read covers its own binary's files only, and an agent read
+    /// only that agent's stderr.
+    #[test]
+    fn a_read_covers_only_its_own_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("horde-worker.b.1.jsonl"),
+            rec(1, "INFO", "mine", "").line,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("horde-server.b.1.jsonl"),
+            rec(2, "INFO", "the server's", "").line,
+        )
+        .expect("write");
+        std::fs::create_dir(dir.path().join("agents")).expect("mkdir");
+        for agent in ["a1", "a2"] {
+            std::fs::write(
+                dir.path().join(format!("agents/{agent}.1.jsonl")),
+                format!(
+                    r#"{{"ts":"2026-01-01T00:00:03.000000Z","stream":"stderr","line":"{agent} warned","boot":"b","seq":1}}"#
+                ),
+            )
+            .expect("write");
+        }
+        let logs = LocalLogs::new(dir.path(), "horde-worker", None);
+        let process = logs.read(&Target::Process, &Filter::default(), &Window::default());
+        assert_eq!(msgs(&process), ["mine"]);
+        let agent = logs.read(
+            &Target::Agent("a1".to_owned()),
+            &Filter::default(),
+            &Window::default(),
+        );
+        assert_eq!(msgs(&agent), ["a1 warned"]);
+    }
+
+    /// A followed record at the cursor itself was already served.
+    #[tokio::test]
+    async fn a_follow_skips_the_record_at_the_cursor() {
+        let tap = LogTap::new(8);
+        let mut receiver = tap.subscribe();
+        let seen = rec(1, "INFO", "seen", "");
+        let fresh = rec(2, "INFO", "fresh", "");
+        tap.publish(Arc::from(seen.line.as_str()));
+        tap.publish(Arc::from(fresh.line.as_str()));
+        let mut last = Some(seen.key.clone());
+        let followed = bounded(next_followed(
+            &mut receiver,
+            &Target::Process,
+            &Filter::default(),
+            &mut last,
+        ))
+        .await
+        .expect("a record arrives");
+        assert_eq!(followed, Some(Followed::Record(fresh)));
+    }
+
     #[test]
     fn records_are_merged_by_key_and_duplicates_collapse() {
         let a = rec(2, "INFO", "later", "");
@@ -734,6 +830,15 @@ mod tests {
         assert_eq!(
             resolve_since("2026-01-01T01:00:00+01:00", now).as_deref(),
             Ok("2026-01-01T00:00:00.000000Z")
+        );
+        let day = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86_400);
+        assert_eq!(
+            resolve_since("2h", day).as_deref(),
+            Ok("1970-01-03T22:00:00.000000Z")
+        );
+        assert_eq!(
+            resolve_since("1d", day).as_deref(),
+            Ok("1970-01-03T00:00:00.000000Z")
         );
         for bad in ["", "m", "10x", "tomorrow", "-5m"] {
             assert!(resolve_since(bad, now).is_err(), "{bad:?}");

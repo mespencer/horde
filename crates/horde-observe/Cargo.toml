@@ -2,7 +2,7 @@
 name = "horde-observe"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version.workspace = true
 publish = false
 description = "Local diagnostic logs (bounded rotating JSON lines, harness stderr, egress redaction) and opt-in OTLP export for the tracing the binaries already emit."
 
@@ -19,7 +19,6 @@ opentelemetry = { version = "=0.32.0", default-features = false, features = ["tr
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "trace"] }
 opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace"] }
 getrandom = { workspace = true }
-hex = { workspace = true }
 # `--grep` and the redactor's shapes: linear-time matching with a bound on
 # the compiled size, so a reader's pattern cannot stall a daemon.
 regex = "1.13.1"

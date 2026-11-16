@@ -105,11 +105,6 @@ pub struct SecretRegistry {
 }
 
 impl SecretRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn locked(&self) -> std::sync::MutexGuard<'_, Vec<(String, Option<SystemTime>)>> {
         match self.entries.lock() {
             Ok(guard) => guard,
@@ -146,7 +141,7 @@ impl SecretRegistry {
 }
 
 /// The process's registry, which [`redact_line`] consults.
-static REGISTRY: LazyLock<SecretRegistry> = LazyLock::new(SecretRegistry::new);
+static REGISTRY: LazyLock<SecretRegistry> = LazyLock::new(SecretRegistry::default);
 
 /// Registers a secret this process holds with the process registry.
 pub fn register_secret(value: &str, expires: Option<SystemTime>) {
@@ -228,12 +223,10 @@ fn walk(value: &mut Value, registered: &[String], touched: &mut bool) {
 pub fn redact_text(text: &str, registered: &[String]) -> String {
     let mut out = text.to_owned();
     for shape in SHAPES.iter() {
-        if shape.pattern.is_match(&out) {
-            out = shape
-                .pattern
-                .replace_all(&out, shape.replacement)
-                .into_owned();
-        }
+        out = shape
+            .pattern
+            .replace_all(&out, shape.replacement)
+            .into_owned();
     }
     for value in registered {
         if value.len() >= MIN_REGISTERED_LEN && out.contains(value.as_str()) {
@@ -346,7 +339,7 @@ mod tests {
 
     #[test]
     fn registered_values_are_scrubbed_until_forgotten_or_expired() {
-        let registry = SecretRegistry::new();
+        let registry = SecretRegistry::default();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         registry.register("short", None);
         registry.register("held-forever-1", None);
@@ -369,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_value_exactly_the_minimum_length_is_held() {
-        let registry = SecretRegistry::new();
+        let registry = SecretRegistry::default();
         registry.register("12345678", None);
         registry.register("1234567", None);
         assert_eq!(registry.live(SystemTime::now()), ["12345678"]);
@@ -382,6 +375,11 @@ mod tests {
         assert_eq!(
             redact_text("abc and abcdefgh", &["abc".to_owned()]),
             "abc and abcdefgh"
+        );
+        // Exactly the minimum is long enough.
+        assert_eq!(
+            redact_text("key abcdefgh", &["abcdefgh".to_owned()]),
+            "key [REDACTED:secret]"
         );
     }
 
@@ -402,7 +400,7 @@ mod tests {
 
     #[test]
     fn the_registry_is_bounded_and_re_registering_does_not_duplicate() {
-        let registry = SecretRegistry::new();
+        let registry = SecretRegistry::default();
         for n in 0..MAX_REGISTERED + 5 {
             registry.register(&format!("secret-value-{n}"), None);
         }

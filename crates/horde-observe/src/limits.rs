@@ -174,5 +174,10 @@ mod tests {
         assert_eq!(retry_after_secs(Duration::from_secs(10)), 10);
         assert_eq!(retry_after_secs(Duration::from_millis(10_001)), 11);
         assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(
+            retry_after_secs(Duration::new(1, 1)),
+            2,
+            "a single nanosecond over is another second"
+        );
     }
 }

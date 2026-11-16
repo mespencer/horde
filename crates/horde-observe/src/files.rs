@@ -259,7 +259,7 @@ impl RotatingFiles {
 
     /// Forgets the open file, so the next write opens a new one.
     pub fn discard(&mut self) {
-        self.current = None;
+        self.current.take();
     }
 
     fn open_next(&mut self, now: SystemTime) -> std::io::Result<Vec<PathBuf>> {
@@ -271,7 +271,7 @@ impl RotatingFiles {
             self.n,
         ));
         let mut file = open_owner_only(&path)?;
-        let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut size = file.metadata()?.len();
         if let Some(header) = &self.header {
             let line = header(now);
             file.write_all(line.as_bytes())?;
@@ -402,6 +402,47 @@ mod tests {
         let debug = format!("{files:?}");
         assert!(debug.starts_with("RotatingFiles"), "{debug}");
         assert!(debug.contains("horde-worker.b.1.jsonl"), "{debug}");
+        assert!(debug.contains("{ set: FileSet {"), "{debug}");
+        assert!(debug.contains(", n: 1, current: Some("), "{debug}");
+    }
+
+    /// The header's newline counts once: a header and two lines that fill
+    /// the file exactly share it.
+    #[test]
+    fn a_header_and_lines_that_fill_the_file_exactly_share_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = FileSet {
+            max_file_bytes: 12,
+            ..set(dir.path(), Some("b"))
+        };
+        let mut files = RotatingFiles::new(small).with_header(|_| "HHHH".to_owned());
+        files.write("abc", SystemTime::now()).expect("write");
+        files.write("ab", SystemTime::now()).expect("write");
+        assert_eq!(list(dir.path(), None).len(), 1, "5 + 4 + 3 bytes fill 12");
+    }
+
+    /// Only regular files are log files, whatever their names.
+    #[test]
+    fn a_directory_named_like_a_log_file_is_not_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(file_name("horde-worker", Some("b"), 1)))
+            .expect("mkdir");
+        assert!(list(dir.path(), None).is_empty());
+    }
+
+    /// Another family's files do not move this family's numbering.
+    #[test]
+    fn numbering_ignores_other_families() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file_name("horde-server", None, 5)), "").expect("write");
+        let mut files = RotatingFiles::new(set(dir.path(), None));
+        files.write("a", SystemTime::now()).expect("write");
+        assert!(
+            files
+                .current_path()
+                .is_some_and(|path| path.ends_with(file_name("horde-worker", None, 1))),
+            "{files:?}"
+        );
     }
 
     #[test]
@@ -491,12 +532,14 @@ mod tests {
     fn directories_and_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
-        let logs = dir.path().join("logs");
+        let state = dir.path().join("state");
+        let logs = state.join("logs");
         let mut files = RotatingFiles::new(set(&logs, Some("b")));
         files.write("x", SystemTime::now()).expect("write");
         let mode =
             |path: &Path| std::fs::metadata(path).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&state), 0o700, "a parent it had to create, too");
         let path = files.current_path().expect("open").to_path_buf();
         assert_eq!(mode(&path), 0o600);
     }

@@ -175,14 +175,7 @@ pub fn serialize_bounded(mut record: Map<String, Value>) -> String {
 
 /// Shortens `text` to at most `keep` bytes, backing off to a char boundary.
 fn cut_on_char_boundary(text: &mut String, keep: usize) {
-    if text.len() <= keep {
-        return;
-    }
-    let mut end = keep;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
+    text.truncate(text.floor_char_boundary(keep));
 }
 
 /// One parsed record, with its raw line kept for egress.
@@ -285,6 +278,143 @@ mod tests {
         }
         assert_eq!(Source::parse("horde"), Some(Source::Horde));
         assert!(Source::Horde < Source::Stderr);
+
+        let horde = Cursor {
+            source: Source::Horde,
+            ..cursor_at("2026-01-01T00:00:00.000000Z")
+        };
+        assert_eq!(horde.encode(), "2026-01-01T00:00:00.000000Z~horde~b~7");
+        assert_eq!(Cursor::decode(&horde.encode()), Some(horde));
+    }
+
+    fn cursor_at(ts: &str) -> Cursor {
+        Cursor {
+            ts: ts.to_owned(),
+            source: Source::Stderr,
+            boot: "b".to_owned(),
+            seq: 7,
+        }
+    }
+
+    /// `msg` padded so the record serializes to exactly `len` bytes.
+    fn record_of_len(mut map: Map<String, Value>, len: usize) -> Map<String, Value> {
+        map.insert("msg".to_owned(), json!(""));
+        let base = Value::Object(map.clone()).to_string().len();
+        map.insert("msg".to_owned(), json!("m".repeat(len - base)));
+        map
+    }
+
+    /// The bound is inclusive: a record of exactly 16 KiB is kept whole.
+    #[test]
+    fn a_record_of_exactly_sixteen_kib_is_kept_whole() {
+        let exact = record_of_len(record(""), MAX_RECORD_BYTES);
+        let whole = Value::Object(exact.clone()).to_string();
+        assert_eq!(whole.len(), MAX_RECORD_BYTES);
+        assert_eq!(serialize_bounded(exact), whole);
+    }
+
+    /// An oversized message is cut to leave 64 bytes of headroom under the
+    /// bound, and the marker is added after it.
+    #[test]
+    fn an_oversized_message_is_cut_to_the_headroom() {
+        let over = record_of_len(record(""), MAX_RECORD_BYTES + 100);
+        let line = serialize_bounded(over);
+        assert_eq!(
+            line.len(),
+            MAX_RECORD_BYTES - 64 + r#","truncated":true"#.len(),
+            "{line}"
+        );
+    }
+
+    /// Harness stderr carries its text as `line`, which is cut the same way.
+    #[test]
+    fn an_oversized_stderr_line_is_cut_not_dropped() {
+        let map = json!({"ts": "t", "stream": "stderr", "line": "l".repeat(MAX_RECORD_BYTES)})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let line = serialize_bounded(map);
+        let parsed = Record::parse(&line).expect("json");
+        assert!(parsed.message().len() > MAX_RECORD_BYTES / 2, "{line}");
+        assert!(parsed.message().chars().all(|c| c == 'l'));
+        assert_eq!(parsed.value.get("truncated"), Some(&Value::Bool(true)));
+    }
+
+    /// A message exactly as long as the excess is the oversized part: it is
+    /// cut to nothing and everything else is kept.
+    #[test]
+    fn a_message_exactly_as_long_as_the_excess_is_the_one_cut() {
+        // The rest of the record leaves exactly 64 bytes under the bound, so
+        // the excess equals the message's length.
+        let mut map = record("");
+        map.insert("fields".to_owned(), json!({"blob": ""}));
+        let empty = Value::Object(map.clone()).to_string().len();
+        map.insert(
+            "fields".to_owned(),
+            json!({"blob": "b".repeat(MAX_RECORD_BYTES - 64 - empty)}),
+        );
+        map.insert("msg".to_owned(), json!("m".repeat(100)));
+        let line = serialize_bounded(map);
+        let parsed = Record::parse(&line).expect("json");
+        assert_eq!(parsed.message(), "");
+        assert_ne!(parsed.value.get("fields"), Some(&json!({})), "fields kept");
+    }
+
+    /// When the message is not the problem, `fields` and `spans` are both
+    /// emptied, and a result of exactly 16 KiB stands.
+    #[test]
+    fn emptied_structure_that_lands_exactly_on_the_bound_stands() {
+        let mut map = record("short");
+        map.insert("other".to_owned(), json!(""));
+        let mut probe = map.clone();
+        probe.insert("truncated".to_owned(), Value::Bool(true));
+        let base = Value::Object(probe).to_string().len();
+        map.insert(
+            "other".to_owned(),
+            json!("o".repeat(MAX_RECORD_BYTES - base)),
+        );
+        map.insert(
+            "fields".to_owned(),
+            json!({"blob": "f".repeat(MAX_RECORD_BYTES)}),
+        );
+        map.insert(
+            "spans".to_owned(),
+            json!([{"blob": "s".repeat(MAX_RECORD_BYTES)}]),
+        );
+        let line = serialize_bounded(map);
+        assert_eq!(line.len(), MAX_RECORD_BYTES, "{line}");
+        let parsed = Record::parse(&line).expect("json");
+        assert_eq!(parsed.value.get("fields"), Some(&json!({})));
+        assert_eq!(parsed.value.get("spans"), Some(&json!([])));
+        assert!(parsed.value.contains_key("other"), "not cut to the minimum");
+    }
+
+    /// The last resort keeps the identifying keys and an empty message.
+    #[test]
+    fn the_minimal_record_keeps_every_identifying_key() {
+        let mut map = json!({
+            "ts": "t", "level": "WARN", "target": "horde_worker", "boot": "b1", "seq": 9,
+            "agent": "a1", "session": "s1", "msg": "short", "other": "y".repeat(MAX_RECORD_BYTES * 2)
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        map.insert("fields".to_owned(), json!({}));
+        let line = serialize_bounded(map);
+        let parsed = Record::parse(&line).expect("json");
+        assert_eq!(
+            Value::Object(parsed.value),
+            json!({
+                "ts": "t", "level": "WARN", "target": "horde_worker", "boot": "b1", "seq": 9,
+                "agent": "a1", "session": "s1", "msg": "", "truncated": true
+            })
+        );
+    }
+
+    #[test]
+    fn a_record_without_text_has_an_empty_message() {
+        let bare = Record::parse(r#"{"ts":"t"}"#).expect("record");
+        assert_eq!(bare.message(), "");
     }
 
     fn record(msg: &str) -> Map<String, Value> {

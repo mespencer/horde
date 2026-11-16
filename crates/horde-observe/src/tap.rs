@@ -23,6 +23,7 @@ pub struct LogTap {
 
 impl Default for LogTap {
     fn default() -> Self {
+        // #[gamma::skip(expr.decrement, reason = "the broadcast channel rounds its capacity up to a power of two, so 4095 holds 4096 like 4096 does")]
         Self::new(TAP_CAPACITY)
     }
 }
@@ -67,6 +68,36 @@ mod tests {
         assert_eq!(receiver.try_recv().as_deref(), Ok("r3"));
         assert_eq!(receiver.try_recv().as_deref(), Ok("r4"));
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// The default tap holds 4096 records for a slow receiver, and no more.
+    #[test]
+    fn the_default_tap_holds_four_thousand_ninety_six() {
+        let tap = LogTap::default();
+        let mut receiver = tap.subscribe();
+        for n in 0..=super::TAP_CAPACITY {
+            tap.publish(Arc::from(format!("r{n}")));
+        }
+        assert_eq!(super::TAP_CAPACITY, 4096);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Lagged(1)));
+    }
+
+    /// A tap asked for no room still holds one record; one asked for one
+    /// holds exactly one.
+    #[test]
+    fn a_tap_holds_at_least_one_record() {
+        for capacity in [0, 1] {
+            let tap = LogTap::new(capacity);
+            let mut receiver = tap.subscribe();
+            tap.publish(Arc::from("first"));
+            tap.publish(Arc::from("second"));
+            assert_eq!(
+                receiver.try_recv(),
+                Err(TryRecvError::Lagged(1)),
+                "{capacity}"
+            );
+            assert_eq!(receiver.try_recv().as_deref(), Ok("second"));
+        }
     }
 
     #[test]

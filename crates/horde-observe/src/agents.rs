@@ -115,6 +115,11 @@ impl AgentLogs {
     }
 
     /// The agents with a live writer, and each one's current file.
+    ///
+    /// Each writer's lock is waited for, not tried: a writer busy with a line
+    /// still has a current file, and skipping it would offer that file to
+    /// the budget. No writer holds its own lock while enforcing the budget,
+    /// so the wait is always short.
     fn live_files(&self) -> (BTreeSet<String>, BTreeSet<PathBuf>) {
         let mut live = lock(&self.live);
         live.agents.retain(|_, files| files.strong_count() > 0);
@@ -123,8 +128,7 @@ impl AgentLogs {
         for (agent, files) in &live.agents {
             agents.insert(agent.clone());
             if let Some(files) = files.upgrade()
-                && let Ok(guard) = files.try_lock()
-                && let Some(path) = guard.files.current_path()
+                && let Some(path) = lock(&files).files.current_path()
             {
                 current.insert(path.to_path_buf());
             }
@@ -132,12 +136,9 @@ impl AgentLogs {
         (agents, current)
     }
 
-    /// Enforces the directory budget; returns what it deleted. `opened` is
-    /// the file just opened, which is current even while its writer holds
-    /// the lock that hides it from [`Self::live_files`].
-    fn enforce_budget(&self, opened: &Path) -> Vec<PathBuf> {
-        let (live, mut current) = self.live_files();
-        current.insert(opened.to_path_buf());
+    /// Enforces the directory budget; returns what it deleted.
+    fn enforce_budget(&self) -> Vec<PathBuf> {
+        let (live, current) = self.live_files();
         let files = list(&self.dir, None);
         budget_choice(&files, self.settings.budget_bytes, &live, &current)
             .into_iter()
@@ -161,18 +162,15 @@ pub fn budget_choice(
     let older_live = files
         .iter()
         .filter(|file| live.contains(&file.prefix) && !current.contains(&file.path));
-    let mut doomed = Vec::new();
-    for file in archived.chain(older_live) {
-        if total <= budget {
-            break;
-        }
-        if current.contains(&file.path) {
-            continue;
-        }
-        total = total.saturating_sub(file.len);
-        doomed.push(file.path.clone());
-    }
-    doomed
+    archived
+        .chain(older_live)
+        .take_while(|file| {
+            let over = total > budget;
+            total = total.saturating_sub(file.len);
+            over
+        })
+        .map(|file| file.path.clone())
+        .collect()
 }
 
 impl AgentStderr {
@@ -205,18 +203,17 @@ impl AgentStderr {
         if let Some(tap) = &self.logs.tap {
             tap.publish(Arc::from(line.as_str()));
         }
-        let (rotated, opened) = {
+        let rotated = {
             let mut files = lock(&self.files);
             let before = files.files.current_path().map(Path::to_path_buf);
             if files.files.write(&line, now).is_err() {
                 files.files.discard();
                 return;
             }
-            let after = files.files.current_path().map(Path::to_path_buf);
-            (before != after, after)
+            before.as_deref() != files.files.current_path()
         };
-        if rotated && let Some(opened) = opened {
-            self.logs.enforce_budget(&opened);
+        if rotated {
+            self.logs.enforce_budget();
         }
     }
 }
@@ -258,6 +255,7 @@ mod tests {
         assert_eq!(record.text("agent"), Some("agent-1"));
         assert_eq!(record.text("session"), Some("session-1"));
         assert_eq!(record.key.boot, "boot1");
+        assert_eq!(record.value["seq"], 1);
         assert!(
             receiver
                 .try_recv()
@@ -350,6 +348,67 @@ mod tests {
             "the archived agent's file went: {left:?}"
         );
         assert_eq!(left.len(), 4, "{left:?}");
+    }
+
+    /// However tight the budget, every live agent's current file stays —
+    /// the writer's own, and another's it did not rotate.
+    #[test]
+    fn a_tight_budget_never_takes_a_live_agents_current_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = AgentLogs::new(dir.path(), settings(1), "b", None);
+        let quiet = logs.writer("quiet", "s1");
+        quiet.line("one line");
+        let busy = logs.writer("busy", "s1");
+        for _ in 0..3 {
+            busy.line(&"b".repeat(300));
+        }
+        let left: Vec<String> = list(dir.path(), None)
+            .iter()
+            .map(|file| format!("{}.{}", file.prefix, file.n))
+            .collect();
+        assert_eq!(left, ["quiet.1", "busy.3"], "only current files remain");
+    }
+
+    /// The budget is enforced when a file rotates, not on every line: a
+    /// line that grows the current file leaves the directory alone.
+    #[test]
+    fn the_budget_is_enforced_at_rotation_only() {
+        let probe = tempfile::tempdir().expect("tempdir");
+        let measure = AgentLogs::new(probe.path(), settings(1 << 20), "b", None);
+        measure.writer("live", "s").line("short");
+        let short = list(probe.path(), None)[0].len;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = AgentLogs::new(dir.path(), settings(1 << 20), "b", None);
+        old.writer("old", "s").line(&"o".repeat(200));
+        let archived = list(dir.path(), None)[0].len;
+
+        let logs = AgentLogs::new(dir.path(), settings(archived + short), "b", None);
+        let live = logs.writer("live", "s");
+        live.line("short");
+        live.line("short");
+        assert!(
+            list(dir.path(), Some("old")).len() == 1,
+            "over budget, but nothing rotated: {:?}",
+            list(dir.path(), None)
+        );
+    }
+
+    /// A file that refuses a line is let go: the next line opens a fresh one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_that_fails_is_let_go_for_a_fresh_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("/dev/full", dir.path().join("a.1.jsonl")).expect("link");
+        let logs = AgentLogs::new(dir.path(), settings(1 << 20), "b", None);
+        let writer = logs.writer("a", "s");
+        writer.line("lost");
+        writer.line("kept");
+        let kept: Vec<String> = read_dir(dir.path(), Some("a"))
+            .iter()
+            .map(|record| record.message().to_owned())
+            .collect();
+        assert_eq!(kept, ["kept"]);
     }
 
     fn file(prefix: &str, n: u64, len: u64) -> LogFile {

@@ -67,17 +67,19 @@ impl Stamp {
 /// A fresh random boot id: 16 hex digits.
 #[must_use]
 pub fn new_boot() -> String {
-    let mut bytes = [0_u8; 8];
-    if getrandom::fill(&mut bytes).is_err() {
-        // No randomness is no reason to stop logging: the clock is unique
-        // enough to tell two boots of one process apart.
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        return format!("{:016x}", nanos as u64);
-    }
-    hex::encode(bytes)
+    boot_from(getrandom::u64(), SystemTime::now())
+}
+
+/// The boot id for `random`, or for `now` when there was no randomness: no
+/// randomness is no reason to stop logging, and the clock is unique enough
+/// to tell two boots of one process apart.
+fn boot_from<E>(random: Result<u64, E>, now: SystemTime) -> String {
+    let value = random.unwrap_or_else(|_| {
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or_default()
+    });
+    format!("{value:016x}")
 }
 
 /// A record the logging machinery writes about itself.
@@ -163,9 +165,8 @@ impl WriterState {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if self.disabled_until.take().is_some() {
-            self.files.discard();
-        }
+        // A failure already discarded the file it failed on, so the first
+        // write after the pause opens a fresh one.
         let lost = self.dropped.swap(0, Ordering::Relaxed);
         let mut result = self.files.write(line, now).map(|_| ());
         if result.is_ok() && lost > 0 {
@@ -183,6 +184,18 @@ impl WriterState {
             ));
         }
     }
+}
+
+/// The bounded hand-off from the layer to the writer thread.
+fn channel() -> (SyncSender<Message>, Receiver<Message>) {
+    std::sync::mpsc::sync_channel(CHANNEL_CAPACITY)
+}
+
+/// Hands the writer a flush marker and waits (up to `timeout`) for it to come
+/// back: `false` when the writer is gone or too slow.
+fn flush_through(sender: &SyncSender<Message>, timeout: Duration) -> bool {
+    let (done, wait) = std::sync::mpsc::channel();
+    sender.send(Message::Flush(done)).is_ok() && wait.recv_timeout(timeout).is_ok()
 }
 
 /// A process's file logging: the writer thread, the tap, and what the layer
@@ -235,7 +248,7 @@ impl FileLogging {
             }
             system_record(&header_stamp, now, "log.opened", fields)
         });
-        let (sender, receiver) = std::sync::mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (sender, receiver) = channel();
         let state = WriterState::new(files, Arc::clone(&stamp), tap.clone(), Arc::clone(&dropped));
         std::thread::Builder::new()
             .name("horde-log-writer".to_owned())
@@ -258,10 +271,8 @@ impl FileLogging {
     where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
-        // Validated in `start`; an invalid filter cannot reach here, and
-        // the empty fallback would admit nothing rather than everything.
-        let filter = tracing_subscriber::EnvFilter::try_new(&self.level)
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
+        // Validated in `start`, so the lossy parse loses nothing.
+        let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(&self.level);
         JsonLayer {
             stamp: Arc::clone(&self.stamp),
             tap: self.tap.clone(),
@@ -308,6 +319,7 @@ impl FileLogging {
     /// real records without claiming the process's global subscriber.
     pub fn with_default<R>(&self, f: impl FnOnce() -> R) -> R {
         let result = tracing::dispatcher::with_default(&self.dispatch(), f);
+        // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_one, reason = "a deadline for a writer that answers in milliseconds: no test can tell one, four, five or six seconds apart")]
         self.flush(Duration::from_secs(5));
         result
     }
@@ -323,11 +335,7 @@ impl FileLogging {
     /// written. Binaries call it on the way out; tests call it before
     /// reading the files back.
     pub fn flush(&self, timeout: Duration) -> bool {
-        let (done, wait) = std::sync::mpsc::channel();
-        if self.sender.send(Message::Flush(done)).is_err() {
-            return false;
-        }
-        wait.recv_timeout(timeout).is_ok()
+        flush_through(&self.sender, timeout)
     }
 }
 
@@ -501,7 +509,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime};
 
-    use super::{FileLogging, RETRY_AFTER, Stamp, WriterState, new_boot};
+    use serde_json::Value;
+
+    use super::{
+        CHANNEL_CAPACITY, FileLogging, JsonLayer, Message, RETRY_AFTER, Stamp, WriterState,
+        boot_from, channel, flush_through, new_boot,
+    };
     use crate::files::{FileSet, RotatingFiles, list};
     use crate::pipeline::ServiceIdentity;
     use crate::record::Record;
@@ -540,7 +553,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let logging = logging(dir.path(), "info");
         logging.with_default(|| {
-            let span = tracing::info_span!("pump", session = "s1", agent = "a1");
+            let span = tracing::info_span!("pump", session = "s1", agent = "a1", pump = 7_u64);
             let _entered = span.enter();
             tracing::info!(target: "horde_worker", turns = 3_u64, "turn ended");
             tracing::debug!("below the filter");
@@ -557,6 +570,14 @@ mod tests {
         assert_eq!(header.message(), "log.opened");
         assert_eq!(header.value["fields"]["service"], "horde-test");
         assert_eq!(header.value["fields"]["principal"], "worker:w1");
+        // The header is a whole record of its own, under this crate's target.
+        assert_eq!(header.value["level"], "INFO");
+        assert_eq!(header.value["target"], "horde_observe");
+        assert_eq!(header.value["spans"], serde_json::json!([]));
+        assert_eq!(header.value["boot"], logging.boot());
+        // The header is stamped when the first record opens the file, so it
+        // follows that record in the count.
+        assert_eq!(header.value["seq"], 2);
 
         let turn = &records[1];
         assert_eq!(turn.message(), "turn ended");
@@ -565,9 +586,25 @@ mod tests {
         assert_eq!(turn.value["fields"]["turns"], 3);
         assert_eq!(turn.text("agent"), Some("a1"));
         assert_eq!(turn.text("session"), Some("s1"));
+        assert_eq!(turn.value["level"], "INFO");
         assert_eq!(turn.value["spans"][0]["name"], "pump");
+        assert_eq!(turn.value["spans"][0]["session"], "s1");
+        assert_eq!(turn.value["spans"][0]["pump"], 7);
+        assert!(
+            turn.value.get("pump").is_none(),
+            "only the conventions are hoisted: {:?}",
+            turn.value
+        );
         assert_eq!(turn.key.boot, logging.boot());
-        assert_ne!(turn.key.seq, header.key.seq, "one counter numbers both");
+        assert_eq!(turn.value["seq"], 1, "one counter numbers both");
+
+        let files = list(dir.path(), None);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(
+            files[0].boot.as_deref(),
+            Some(logging.boot()),
+            "the file is named for its boot"
+        );
     }
 
     #[test]
@@ -678,6 +715,107 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// The random value names the boot; without one, the clock does.
+    #[test]
+    fn a_boot_is_the_random_value_or_else_the_clock() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_nanos(0x1234_5678);
+        assert_eq!(boot_from::<()>(Ok(0xabc), at), "0000000000000abc");
+        assert_eq!(boot_from(Err(()), at), "0000000012345678");
+        assert_eq!(
+            boot_from(Err(()), SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
+            "0000000000000000"
+        );
+    }
+
+    /// The writer thread carries its name, for an operator reading `top`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_writer_thread_is_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _logging = logging(dir.path(), "info");
+        let names = || -> Vec<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("tasks")
+                .filter_map(Result::ok)
+                .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+                .collect()
+        };
+        // The thread names itself once it runs; the kernel keeps fifteen
+        // bytes of the name.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !names()
+            .iter()
+            .any(|name| name.trim_end() == "horde-log-write")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no thread is named for the writer: {:?}",
+                names()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The hand-off holds exactly its capacity; the next record is refused,
+    /// not queued.
+    #[test]
+    fn the_hand_off_holds_its_capacity_and_no_more() {
+        let (sender, _receiver) = channel();
+        for n in 0..CHANNEL_CAPACITY {
+            assert!(
+                sender.try_send(Message::Line(String::new())).is_ok(),
+                "record {n} fits"
+            );
+        }
+        assert!(matches!(
+            sender.try_send(Message::Line(String::new())),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    /// A flush is answered by the writer: a gone writer is `false` at
+    /// once, a silent one `false` at the deadline, an answering one `true`.
+    #[test]
+    fn a_flush_needs_the_writer_to_answer() {
+        let (gone, receiver) = channel();
+        drop(receiver);
+        assert!(!flush_through(&gone, Duration::from_secs(5)));
+
+        let (silent, held) = channel();
+        assert!(!flush_through(&silent, Duration::from_millis(20)));
+        drop(held);
+
+        let (answering, receiver) = channel();
+        let writer = std::thread::spawn(move || {
+            if let Ok(Message::Flush(done)) = receiver.recv() {
+                let _ = done.send(());
+            }
+        });
+        assert!(flush_through(&answering, Duration::from_secs(5)));
+        writer.join().expect("the writer answered");
+    }
+
+    /// A record the writer cannot take is counted, not lost silently.
+    #[test]
+    fn a_record_the_writer_cannot_take_is_counted() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (sender, receiver) = channel();
+        drop(receiver);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let layer = JsonLayer {
+            stamp: Arc::new(Stamp::new("b".to_owned())),
+            tap: LogTap::default(),
+            sender,
+            dropped: Arc::clone(&dropped),
+        };
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("one");
+            tracing::info!("two");
+        });
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
     fn state(dir: &std::path::Path) -> (WriterState, Arc<AtomicU64>) {
         let dropped = Arc::new(AtomicU64::new(0));
         let files = RotatingFiles::new(FileSet {
@@ -701,9 +839,21 @@ mod tests {
     #[test]
     fn dropped_records_are_counted_and_announced_once_the_writer_catches_up() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut state, dropped) = state(dir.path());
+        let (state, dropped) = state(dir.path());
+        let tap = LogTap::default();
+        let mut announced = tap.subscribe();
+        let mut state = WriterState {
+            tap: tap.clone(),
+            ..state
+        };
         dropped.store(5, Ordering::Relaxed);
         state.accept(r#"{"ts":"t","msg":"next"}"#, SystemTime::now());
+        assert!(
+            announced
+                .try_recv()
+                .is_ok_and(|line| line.contains("log.dropped")),
+            "the notice is followable too"
+        );
         let records = records_in(dir.path());
         let notice = records
             .iter()
@@ -720,6 +870,44 @@ mod tests {
             1,
             "announced once"
         );
+
+        // A single lost record is announced too.
+        dropped.store(1, Ordering::Relaxed);
+        state.accept(r#"{"ts":"t","msg":"third"}"#, SystemTime::now());
+        let counts: Vec<Value> = records_in(dir.path())
+            .iter()
+            .filter(|r| r.message() == "log.dropped")
+            .map(|r| r.value["fields"]["count"].clone())
+            .collect();
+        assert_eq!(counts, [Value::from(5), Value::from(1)]);
+    }
+
+    /// The warnings [`WriterState::with_warn`] routed here, from every test.
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn remember_warning(text: &str) {
+        if let Ok(mut warned) = WARNED.lock() {
+            warned.push(text.to_owned());
+        }
+    }
+
+    /// A file whose writes fail is let go: after the pause, the next
+    /// record opens a fresh file instead of failing on the same one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_that_fails_is_let_go_for_a_fresh_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The first file the family opens is a device that refuses writes.
+        std::os::unix::fs::symlink("/dev/full", dir.path().join("w.b.1.jsonl")).expect("link");
+        let (mut state, _dropped) = state(dir.path());
+        let now = SystemTime::now();
+        state.accept(r#"{"ts":"t","msg":"lost"}"#, now);
+        assert!(state.is_disabled(now));
+        state.accept(r#"{"ts":"t","msg":"back"}"#, now + RETRY_AFTER);
+        assert!(
+            records_in(dir.path()).iter().any(|r| r.message() == "back"),
+            "the retry wrote to a fresh file"
+        );
     }
 
     #[test]
@@ -727,10 +915,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let blocker = dir.path().join("logs");
         std::fs::write(&blocker, "a file where the directory should be").expect("write");
-        let (mut state, dropped) = state(&blocker);
+        let (state, dropped) = state(&blocker);
+        let mut state = state.with_warn(remember_warning);
         let now = SystemTime::now();
         state.accept(r#"{"ts":"t","msg":"lost"}"#, now);
         assert!(state.is_disabled(now));
+        let warned = WARNED.lock().map(|w| w.clone()).unwrap_or_default();
+        let expected = format!(
+            "horde: the log file in {} is disabled for a minute: ",
+            blocker.display()
+        );
+        assert!(
+            warned.iter().any(|w| w.starts_with(&expected)),
+            "{warned:?}"
+        );
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         state.accept(
             r#"{"ts":"t","msg":"also lost"}"#,
