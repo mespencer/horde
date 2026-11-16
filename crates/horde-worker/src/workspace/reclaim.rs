@@ -494,6 +494,18 @@ mod tests {
         assert_eq!(empty.exit_code, -1, "a refusal has no exit status");
     }
 
+    /// `sh -c script` in `dir` under a one-second timeout, which it outlives.
+    async fn timed_out_sh(dir: &Path, script: String) -> Ran {
+        let ran = execute(
+            &["sh".to_owned(), "-c".to_owned(), script],
+            dir,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(ran.reason.contains("timed out"), "{ran:?}");
+        ran
+    }
+
     /// A command past its timeout is killed with its whole group: a child it
     /// forked into the background dies too.
     #[tokio::test]
@@ -501,15 +513,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("child.pid");
         let script = format!("sleep 600 & echo $! > {}; wait", marker.display());
-        let ran = execute(
-            &["sh".to_owned(), "-c".to_owned(), script],
-            dir.path(),
-            Duration::from_secs(1),
-        )
-        .await;
+        let ran = timed_out_sh(dir.path(), script).await;
         assert!(!ran.succeeded);
         assert_eq!(ran.exit_code, -1, "a killed command has no exit status");
-        assert!(ran.reason.contains("timed out"), "{ran:?}");
         // The background sleep was in the group: it is gone (or a zombie
         // already reparented and reaped).
         let pid = written_pid(&marker);
@@ -947,13 +953,7 @@ mod tests {
             "trap 'echo termed > {}; exit 0' TERM; sleep 600 & wait",
             marker.display()
         );
-        let ran = execute(
-            &["sh".to_owned(), "-c".to_owned(), script],
-            dir.path(),
-            Duration::from_secs(1),
-        )
-        .await;
-        assert!(ran.reason.contains("timed out"), "{ran:?}");
+        timed_out_sh(dir.path(), script).await;
         assert_eq!(
             std::fs::read_to_string(&marker)
                 .map(|text| text.trim().to_owned())
@@ -971,13 +971,7 @@ mod tests {
             "sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 600' & wait",
             marker.display()
         );
-        let ran = execute(
-            &["sh".to_owned(), "-c".to_owned(), script],
-            dir.path(),
-            Duration::from_secs(1),
-        )
-        .await;
-        assert!(ran.reason.contains("timed out"), "{ran:?}");
+        timed_out_sh(dir.path(), script).await;
         let pid = written_pid_soon(&marker).await;
         let gone = gone_soon(pid).await;
         kill_now(pid);

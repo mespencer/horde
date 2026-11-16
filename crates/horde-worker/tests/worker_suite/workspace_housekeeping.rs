@@ -7,52 +7,24 @@
 //! Every assertion reads what production wrote — git refs, files, journaled
 //! events, the reports a recording reporter (or the Server) received.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::stream_commands_response::Command;
 use horde_proto::v1::{
-    CheckoutMode, CheckoutState, CleanupTier, CleanupTrigger, GcLevel, ResolvedWorkspacePolicy,
-    WorkspaceCleanup, WorkspaceDefinition, WorkspaceInstanceReport,
+    CheckoutState, CleanupTier, CleanupTrigger, GcLevel, ResolvedWorkspacePolicy, WorkspaceCleanup,
+    WorkspaceInstanceReport,
 };
 use horde_worker::workspace::WorkspaceManager;
 use horde_worker::{ApplyCommand as _, Journal};
 
 use crate::workspace_rig::{
-    Rig, TOTAL, archive, cleanups, command, events, fresh_rig, kinds, materialize, observed_within,
-    policy, rig_with, settled_within, spawn_in, spawn_with, three_repo_rig, wire, worktree_in,
+    Rig, TOTAL, agent_root, archive, archived_pins, atlas_rig, cleanups, command, daemon_config,
+    daemon_while, definition_named, dirty_atlas, events, eventually, fresh_rig, kinds, materialize,
+    observed_within, pinned_instance_repo, policy, rig_with, settled_within, spawn_in,
+    three_repo_rig, wire,
 };
-use crate::workspaces::harness;
-
-/// Polls `holds` every 20 ms for up to `limit`, answering whether it held.
-async fn eventually<F, Fut>(limit: Duration, mut holds: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + limit;
-    while tokio::time::Instant::now() < deadline {
-        if holds().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    holds().await
-}
-
-fn definition_named(temp: &Path, id: &str, repo: &str) -> WorkspaceDefinition {
-    let origin = harness::origin(temp, repo);
-    harness::definition(id, vec![harness::repo(repo, &origin)])
-}
-
-/// A fresh rig with the one-repo `ws-1` (`atlas`) materialized under
-/// `policy`.
-async fn atlas_rig(temp: &Path, policy: ResolvedWorkspacePolicy) -> Rig {
-    let mut rig = fresh_rig(temp);
-    materialize(&mut rig, &definition_named(temp, "ws-1", "atlas"), policy).await;
-    rig
-}
 
 /// [`atlas_rig`] under a day's grace and no idle reclaim, with `agent`
 /// spawned in it.
@@ -137,13 +109,6 @@ async fn archived_and_released(rig: &mut Rig, agent: &str, count: usize) {
         }
     })
     .await;
-}
-
-fn agent_root(rig: &Rig, definition_id: &str, agent: &str) -> PathBuf {
-    rig.root
-        .join(definition_id)
-        .join(".horde-agents")
-        .join(agent)
 }
 
 fn manager(rig: &Rig) -> &WorkspaceManager {
@@ -443,11 +408,7 @@ async fn a_retained_checkout_is_not_rejournaled_for_the_same_reason() {
     let temp = tempfile::tempdir().expect("a tempdir");
     let mut rig = atlas_rig(temp.path(), policy(0, 0)).await;
     spawn_in(&mut rig, "ws-1", "agent-1").await;
-    std::fs::write(
-        agent_root(&rig, "ws-1", "agent-1").join("atlas/wip.txt"),
-        "wip",
-    )
-    .expect("dirty");
+    dirty_atlas(&rig, "agent-1");
     archived_and_released(&mut rig, "agent-1", 2).await;
     let records = manager(&rig).records("ws-1").await;
     assert!(
@@ -512,14 +473,8 @@ async fn the_scan_loop_drops_safe_pins_and_reports_the_change() {
     let mut rig = atlas_rig(temp.path(), policy(0, 0)).await;
     spawn_in(&mut rig, "ws-1", "agent-1").await;
     archived_and_released(&mut rig, "agent-1", 2).await;
-    let instance_repo = rig.root.join("ws-1/atlas");
-    let pins = || {
-        harness::git(
-            &instance_repo,
-            &["for-each-ref", "--format=%(refname)", "refs/horde/archived"],
-        )
-    };
-    assert!(pins().contains("agent-1"), "the removal pinned HEAD");
+    let instance_repo = pinned_instance_repo(&rig, "agent-1");
+    let pins = || archived_pins(&instance_repo);
     let journal = rig.journal.clone();
     rig.runtime.shutdown().await;
     // Nothing has run the pin pass, and the hand-driven loop never would.
@@ -618,79 +573,6 @@ async fn materialization_progress_names_its_instance_under_distinct_keys() {
     rig.runtime.shutdown().await;
 }
 
-fn head(repo: &Path) -> String {
-    harness::git(repo, &["rev-parse", "HEAD"]).trim().to_owned()
-}
-
-/// A lazy receiver's payload: the commit for a repo it has checked out
-/// goes to its checkout as usual, while one for a repo it has not is made
-/// present in the Instance and listed as pending — for that repo only.
-#[tokio::test]
-async fn a_lazy_receiver_holds_commits_for_unchecked_repos_as_pending() {
-    let temp = tempfile::tempdir().expect("a tempdir");
-    let (mut definition, _atlas, _docs) = harness::two_repo_definition(temp.path());
-    definition.checkout_mode = CheckoutMode::Lazy.into();
-    let mut rig = fresh_rig(temp.path());
-    materialize(&mut rig, &definition, policy(86_400, 0)).await;
-    spawn_with(
-        &mut rig,
-        "agent-1",
-        horde_proto::v1::AgentSpec {
-            checkout_repos: vec!["atlas".to_owned()],
-            ..worktree_in("ws-1")
-        },
-    )
-    .await;
-    let atlas_head = head(&rig.root.join("ws-1/atlas"));
-    let docs_head = head(&rig.root.join("ws-1/docs"));
-    let git_ref = |repo: &str, sha: &str| horde_proto::v1::GitRef {
-        repo_name: repo.to_owned(),
-        commit_sha: sha.to_owned(),
-        branch: String::new(),
-    };
-    rig.runtime
-        .apply(command(
-            "deliver-1",
-            Command::DeliverMessage(horde_proto::v1::DeliverMessageCommand {
-                agent_id: Some(horde_proto::v1::AgentId::new("agent-1")),
-                body: Some(horde_proto::v1::deliver_message_command::Body::Assignment(
-                    horde_proto::v1::Assignment {
-                        assignment_id: None,
-                        text: "look at these".to_owned(),
-                        payload: Some(horde_proto::v1::Payload {
-                            git_refs: vec![
-                                git_ref("atlas", &atlas_head),
-                                git_ref("docs", &docs_head),
-                            ],
-                            attachments: Vec::new(),
-                        }),
-                    },
-                )),
-                delivery: horde_proto::v1::DeliveryMode::TurnBoundary.into(),
-            }),
-        ))
-        .await
-        .expect("the delivery applies");
-    settled_within("the delivery", rig.runtime.settled()).await;
-
-    let manifest = horde_worker::workspace::manifest::read(&agent_root(&rig, "ws-1", "agent-1"))
-        .await
-        .expect("a manifest");
-    let pending: Vec<(String, Vec<String>)> = manifest
-        .repos
-        .iter()
-        .map(|repo| (repo.name.clone(), repo.pending_commits.clone()))
-        .collect();
-    assert_eq!(
-        pending,
-        vec![
-            ("atlas".to_owned(), Vec::new()),
-            ("docs".to_owned(), vec![docs_head])
-        ]
-    );
-    rig.runtime.shutdown().await;
-}
-
 /// The daemon reports its Instances to the Server it dials, on its report
 /// interval and without any command: an Instance that appears on disk
 /// after registration (which advertised only the first) reaches the
@@ -715,36 +597,9 @@ async fn the_daemon_reports_its_instances_to_the_server() {
 
     let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
     let server = crate::support::serve(core.clone()).await;
-    let state = temp.path().join("state");
-    let config = horde_worker::startup::invocation(
-        [
-            "--insecure",
-            "--server",
-            &server,
-            "--name",
-            "w-reports",
-            "--adapter",
-            "fake",
-            "--state-dir",
-            &state.to_string_lossy(),
-            "--workspace-root",
-            &root.to_string_lossy(),
-            "--workspace-scan-interval",
-            "1s",
-            "--workspace-report-interval",
-            "1s",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned),
-    )
-    .expect("the shape parses");
-    let mut sink = |_: String| {};
-    let prepared = horde_worker::startup::prepare(&config, &mut sink)
-        .await
-        .expect("an insecure daemon prepares");
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let config = daemon_config(&server, "w-reports", &temp.path().join("state"), &root);
     let later = definition_named(temp.path(), "ws-2", "docs");
-    let watcher = async {
+    let reached = daemon_while(&config, async {
         let registered = eventually(Duration::from_secs(20), || async {
             !core.instances.for_definition("ws-1").is_empty()
         })
@@ -757,21 +612,9 @@ async fn the_daemon_reports_its_instances_to_the_server() {
             !core.instances.for_definition("ws-2").is_empty()
         })
         .await;
-        let _ = stop.send(());
         registered && reported
-    };
-    let mut announce = |_: String| {};
-    let (outcome, reached) = tokio::join!(
-        horde_worker::startup::run(
-            prepared,
-            async move {
-                let _ = stopped.await;
-            },
-            &mut announce,
-        ),
-        watcher
-    );
-    assert!(outcome.is_ok(), "{outcome:?}");
+    })
+    .await;
     assert!(reached, "the Server holds both of the Worker's Instances");
     let held = core.instances.for_definition("ws-2");
     assert_eq!(

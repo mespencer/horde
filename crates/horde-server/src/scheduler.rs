@@ -628,6 +628,16 @@ mod tests {
         PlacementRequest::new(&NO_CONSTRAINTS, &NO_LOAD)
     }
 
+    /// The defaults, for a spawn into `ws-1`, needing workspace protocol 2
+    /// or not.
+    fn ws_1_request(needs_workspace_protocol: bool) -> PlacementRequest<'static> {
+        PlacementRequest {
+            workspace_definition_id: Some("ws-1"),
+            needs_workspace_protocol,
+            ..request_defaults()
+        }
+    }
+
     struct Harness {
         registry: WorkerRegistry,
         instances: InstanceCache,
@@ -1155,12 +1165,7 @@ mod tests {
         tiny.workspace_free_bytes = 0;
         tiny.workspace_total_bytes = 1;
         floor.registry.register("tiny", tiny);
-        let constraints = PlacementConstraints::default();
-        let request = PlacementRequest {
-            constraints: &constraints,
-            workspace_definition_id: Some("ws-1"),
-            ..request_defaults()
-        };
+        let request = ws_1_request(false);
         let reason = queued_reason(scheduler.place(&request));
         assert!(reason.contains("below the 100-byte floor"), "{reason}");
 
@@ -1168,12 +1173,7 @@ mod tests {
         let mut one = capabilities(&[]);
         one.workspace_protocol = 1;
         harness.registry.register("one", one);
-        let request = PlacementRequest {
-            constraints: &constraints,
-            workspace_definition_id: Some("ws-1"),
-            needs_workspace_protocol: true,
-            ..request_defaults()
-        };
+        let request = ws_1_request(true);
         let reason = queued_reason(harness.scheduler.place(&request));
         assert!(reason.contains("workspace protocol 1"), "{reason}");
     }
@@ -1186,13 +1186,7 @@ mod tests {
         let mut old = capabilities(&[]);
         old.workspace_protocol = 0;
         harness.registry.register("old", old);
-        let constraints = PlacementConstraints::default();
-        let request = PlacementRequest {
-            constraints: &constraints,
-            workspace_definition_id: Some("ws-1"),
-            needs_workspace_protocol: true,
-            ..request_defaults()
-        };
+        let request = ws_1_request(true);
         let reason = queued_reason(harness.scheduler.place(&request));
         assert!(reason.contains("workspace protocol 0"), "{reason}");
         let mut new = capabilities(&[]);
@@ -1224,12 +1218,7 @@ mod tests {
         full.workspace_free_bytes = 50;
         full.workspace_total_bytes = 10_000;
         harness.registry.register("full", full);
-        let constraints = PlacementConstraints::default();
-        let request = PlacementRequest {
-            constraints: &constraints,
-            workspace_definition_id: Some("ws-1"),
-            ..request_defaults()
-        };
+        let request = ws_1_request(false);
         let reason = queued_reason(scheduler.place(&request));
         assert!(reason.contains("below the 100-byte floor"), "{reason}");
         let no_workspace = PlacementRequest {

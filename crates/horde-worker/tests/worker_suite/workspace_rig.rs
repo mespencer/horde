@@ -295,3 +295,167 @@ pub(crate) async fn cleanups(journal: &Journal) -> Vec<WorkspaceCleanup> {
         })
         .collect()
 }
+
+/// Polls `holds` every 20 ms for up to `limit`, answering whether it held.
+pub(crate) async fn eventually<F, Fut>(limit: Duration, mut holds: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if holds().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    holds().await
+}
+
+/// A Definition `id` holding the one repo `repo`, its origin under `temp`.
+pub(crate) fn definition_named(temp: &Path, id: &str, repo: &str) -> WorkspaceDefinition {
+    let origin = harness::origin(temp, repo);
+    harness::definition(id, vec![harness::repo(repo, &origin)])
+}
+
+/// A fresh rig with the one-repo `ws-1` (`atlas`) materialized under
+/// `policy`.
+pub(crate) async fn atlas_rig(temp: &Path, policy: ResolvedWorkspacePolicy) -> Rig {
+    let mut rig = fresh_rig(temp);
+    materialize(&mut rig, &definition_named(temp, "ws-1", "atlas"), policy).await;
+    rig
+}
+
+/// Where `agent`'s checkout of `definition_id` lives.
+pub(crate) fn agent_root(rig: &Rig, definition_id: &str, agent: &str) -> PathBuf {
+    rig.root
+        .join(definition_id)
+        .join(".horde-agents")
+        .join(agent)
+}
+
+/// Leaves uncommitted work in `agent`'s `ws-1` atlas checkout.
+pub(crate) fn dirty_atlas(rig: &Rig, agent: &str) {
+    std::fs::write(agent_root(rig, "ws-1", agent).join("atlas/wip.txt"), "wip").expect("dirty");
+}
+
+/// The archive pins `repo` holds, one ref per line.
+pub(crate) fn archived_pins(repo: &Path) -> String {
+    harness::git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/horde/archived"],
+    )
+}
+
+/// `ws-1`'s atlas Instance repo, after asserting that `agent`'s removal
+/// pinned its HEAD there.
+pub(crate) fn pinned_instance_repo(rig: &Rig, agent: &str) -> PathBuf {
+    let repo = rig.root.join("ws-1/atlas");
+    assert!(
+        archived_pins(&repo).contains(agent),
+        "the removal pinned HEAD"
+    );
+    repo
+}
+
+/// `repo`'s HEAD commit.
+pub(crate) fn head(repo: &Path) -> String {
+    harness::git(repo, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+/// Delivers an assignment carrying `refs` to `agent-1`.
+pub(crate) async fn deliver_refs(rig: &mut Rig, refs: &[(&str, String)]) {
+    let git_refs = refs
+        .iter()
+        .map(|(repo, sha)| horde_proto::v1::GitRef {
+            repo_name: (*repo).to_owned(),
+            commit_sha: sha.clone(),
+            branch: String::new(),
+        })
+        .collect();
+    let assignment = horde_proto::v1::Assignment {
+        assignment_id: None,
+        text: "look at these".to_owned(),
+        payload: Some(horde_proto::v1::Payload {
+            git_refs,
+            attachments: Vec::new(),
+        }),
+    };
+    rig.runtime
+        .apply(command(
+            "deliver-1",
+            Command::DeliverMessage(horde_proto::v1::DeliverMessageCommand {
+                agent_id: Some(horde_proto::v1::AgentId::new("agent-1")),
+                body: Some(horde_proto::v1::deliver_message_command::Body::Assignment(
+                    assignment,
+                )),
+                delivery: horde_proto::v1::DeliveryMode::TurnBoundary.into(),
+            }),
+        ))
+        .await
+        .expect("the delivery applies");
+    settled_within("the delivery", rig.runtime.settled()).await;
+}
+
+/// An insecure daemon named `name` dialing `server`, its state in `state`
+/// and its workspaces under `root`, scanning and reporting every second.
+pub(crate) fn daemon_config(
+    server: &str,
+    name: &str,
+    state: &Path,
+    root: &Path,
+) -> horde_worker::startup::WorkerConfig {
+    horde_worker::startup::invocation(
+        [
+            "--insecure",
+            "--server",
+            server,
+            "--name",
+            name,
+            "--adapter",
+            "fake",
+            "--state-dir",
+            &state.to_string_lossy(),
+            "--workspace-root",
+            &root.to_string_lossy(),
+            "--workspace-scan-interval",
+            "1s",
+            "--workspace-report-interval",
+            "1s",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned),
+    )
+    .expect("the shape parses")
+}
+
+/// Runs the daemon `config` describes until `watcher` is done, and answers
+/// what the watcher saw; the daemon must end cleanly.
+pub(crate) async fn daemon_while<W: std::future::Future>(
+    config: &horde_worker::startup::WorkerConfig,
+    watcher: W,
+) -> W::Output {
+    let mut sink = |_: String| {};
+    let prepared = horde_worker::startup::prepare(config, &mut sink)
+        .await
+        .expect("an insecure daemon prepares");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let watched = async {
+        let seen = watcher.await;
+        let _ = stop.send(());
+        seen
+    };
+    let mut announce = |_: String| {};
+    let (outcome, seen) = tokio::join!(
+        horde_worker::startup::run(
+            prepared,
+            async move {
+                let _ = stopped.await;
+            },
+            &mut announce,
+        ),
+        watched
+    );
+    assert!(outcome.is_ok(), "{outcome:?}");
+    seen
+}

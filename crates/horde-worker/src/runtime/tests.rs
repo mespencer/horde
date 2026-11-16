@@ -2002,15 +2002,7 @@ async fn a_spawn_that_cannot_start_releases_what_it_minted() {
 /// removed. A shutdown alone keeps the checkout, for the revival.
 #[tokio::test]
 async fn archiving_an_agent_with_no_pump_still_gives_its_checkout_back() {
-    let (_temp, workspaces_root, mut first) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    first
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
-    settle(&first).await;
-    let journal = first.shared.journal.clone();
-    first.shutdown().await;
+    let (_temp, workspaces_root, journal) = stopped_after_a_spawn().await;
     let checkout = workspaces_root
         .join("ws-1")
         .join(".horde-agents")
@@ -2352,9 +2344,7 @@ async fn the_workspace_verbs_answer_from_the_live_checkout() {
     use horde_mcp::workspace::WorkspaceAccess as _;
 
     let (_temp, workspaces_root, runtime) = spawned_in_workspace().await;
-    let access = super::access::WorkerWorkspaceAccess {
-        shared: runtime.shared.clone(),
-    };
+    let access = access_of(&runtime);
 
     let answer = access
         .checkout("agent-1", "atlas", None)
@@ -2440,6 +2430,70 @@ fn worktree_spec(workspace: &str) -> horde_proto::v1::AgentSpec {
         checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
         ..first_turn("hello")
     }
+}
+
+/// The Runtime's own workspace access, as an agent's endpoint holds it.
+fn access_of(runtime: &Runtime) -> super::access::WorkerWorkspaceAccess {
+    super::access::WorkerWorkspaceAccess {
+        shared: runtime.shared.clone(),
+    }
+}
+
+/// Spawns `agent-1` with `spec` and lets the spawn settle.
+async fn spawned_agent_1(runtime: &mut Runtime, spec: horde_proto::v1::AgentSpec) {
+    runtime
+        .apply(spawn_of(2, "agent-1", spec, None))
+        .await
+        .expect("the spawn applies");
+    settle(runtime).await;
+}
+
+/// A materialized Runtime that spawned `agent-1` into `ws-1` and then shut
+/// down: its temp dir, workspace root and journal, for a restart.
+async fn stopped_after_a_spawn() -> (tempfile::TempDir, std::path::PathBuf, Journal) {
+    let (temp, workspaces_root, mut first) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    first
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+    settle(&first).await;
+    let journal = first.shared.journal.clone();
+    first.shutdown().await;
+    (temp, workspaces_root, journal)
+}
+
+/// Materializes `ws-1` from `origin`, then spawns `agent-1` into it.
+async fn materialized_then_spawned(runtime: &mut Runtime, origin: &std::path::Path) {
+    runtime
+        .apply(materialize_command(1, origin))
+        .await
+        .expect("the materialize applies");
+    settle(runtime).await;
+    runtime
+        .apply(workspace_spawn(2, "agent-1", "ws-1"))
+        .await
+        .expect("the spawn applies");
+}
+
+/// A materialized Runtime with `agent-1` spawned as `spec`.
+async fn agent_1_spawned_as(spec: horde_proto::v1::AgentSpec) -> (tempfile::TempDir, Runtime) {
+    let (temp, _root, mut runtime) =
+        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
+    spawned_agent_1(&mut runtime, spec).await;
+    (temp, runtime)
+}
+
+/// The repos of `agent-1`'s parent bases, in order.
+async fn base_names(access: &super::access::WorkerWorkspaceAccess) -> Vec<String> {
+    use horde_mcp::workspace::WorkspaceAccess as _;
+    access
+        .parent_bases("agent-1")
+        .await
+        .expect("bases")
+        .into_iter()
+        .map(|base| base.repo_name)
+        .collect()
 }
 
 /// A materialize of `ws-1` cloning each `(name, origin)`.
@@ -2543,11 +2597,7 @@ async fn record_of(runtime: &Runtime, agent: &str) -> crate::workspace::ledger::
 async fn an_archived_checkout_goes_the_millisecond_its_grace_is_over() {
     let (_temp, workspaces_root, mut runtime) =
         materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    let spec = horde_proto::v1::AgentSpec {
-        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
-        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
-        ..first_turn("hello")
-    };
+    let spec = worktree_spec("ws-1");
     runtime
         .apply(spawn_of(2, "agent-1", spec, Some(graceful_policy())))
         .await
@@ -2598,11 +2648,7 @@ async fn an_archived_checkout_goes_the_millisecond_its_grace_is_over() {
 async fn a_live_checkout_is_reclaimed_the_millisecond_it_turns_idle() {
     let (_temp, _root, mut runtime) =
         materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    let spec = horde_proto::v1::AgentSpec {
-        workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new("ws-1")),
-        checkout_policy: horde_proto::v1::CheckoutPolicy::Worktree as i32,
-        ..first_turn("hello")
-    };
+    let spec = worktree_spec("ws-1");
     let policy = horde_proto::v1::ResolvedWorkspacePolicy {
         idle_reclaim_after: Some(horde_proto::prost_types::Duration {
             seconds: 3_600,
@@ -2743,15 +2789,7 @@ async fn a_held_up_scan_loop_does_not_burst() {
 /// keep a later scan or gc away from its checkout.
 #[tokio::test]
 async fn archiving_forgets_the_agents_activity() {
-    let (_temp, workspaces_root, mut first) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    first
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
-    settle(&first).await;
-    let journal = first.shared.journal.clone();
-    first.shutdown().await;
+    let (_temp, workspaces_root, journal) = stopped_after_a_spawn().await;
 
     // A restarted Worker: no pump will ever touch this agent's activity.
     let mut second = Runtime::new(journal)
@@ -2914,15 +2952,7 @@ async fn the_agents_endpoint_checks_out_through_the_runtimes_workspaces() {
         temp.path().join("workspaces"),
     ))
     .with_agent_endpoints(channel, "w-test");
-    runtime
-        .apply(materialize_command(1, &origin))
-        .await
-        .expect("the materialize applies");
-    settle(&runtime).await;
-    runtime
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
+    materialized_then_spawned(&mut runtime, &origin).await;
     journal_satisfying(&runtime, "the checkout's answer", |events| {
         any_kind(
             events,
@@ -2939,20 +2969,12 @@ async fn the_agents_endpoint_checks_out_through_the_runtimes_workspaces() {
 async fn a_shared_policy_agent_is_told_it_cannot_check_out() {
     use horde_mcp::workspace::WorkspaceAccess as _;
 
-    let (_temp, _root, mut runtime) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    let spec = horde_proto::v1::AgentSpec {
+    let (_temp, runtime) = agent_1_spawned_as(horde_proto::v1::AgentSpec {
         checkout_policy: horde_proto::v1::CheckoutPolicy::Shared as i32,
         ..worktree_spec("ws-1")
-    };
-    runtime
-        .apply(spawn_of(2, "agent-1", spec, None))
-        .await
-        .expect("the spawn applies");
-    settle(&runtime).await;
-    let access = super::access::WorkerWorkspaceAccess {
-        shared: runtime.shared.clone(),
-    };
+    })
+    .await;
+    let access = access_of(&runtime);
     let refused = access
         .checkout("agent-1", "atlas", None)
         .await
@@ -2970,20 +2992,12 @@ async fn a_shared_policy_agent_is_told_it_cannot_check_out() {
 async fn a_lazy_checkout_joins_the_agents_bases() {
     use horde_mcp::workspace::WorkspaceAccess as _;
 
-    let (_temp, _root, mut runtime) =
-        materialized_runtime(Script::of(vec![ScriptedTurn::saying("hi")])).await;
-    let spec = horde_proto::v1::AgentSpec {
+    let (_temp, runtime) = agent_1_spawned_as(horde_proto::v1::AgentSpec {
         checkout_mode: horde_proto::v1::CheckoutMode::Lazy as i32,
         ..worktree_spec("ws-1")
-    };
-    runtime
-        .apply(spawn_of(2, "agent-1", spec, None))
-        .await
-        .expect("the spawn applies");
-    settle(&runtime).await;
-    let access = super::access::WorkerWorkspaceAccess {
-        shared: runtime.shared.clone(),
-    };
+    })
+    .await;
+    let access = access_of(&runtime);
     assert!(
         access
             .parent_bases("agent-1")
@@ -2996,14 +3010,7 @@ async fn a_lazy_checkout_joins_the_agents_bases() {
         .checkout("agent-1", "atlas", None)
         .await
         .expect("the lazy checkout");
-    let bases = access.parent_bases("agent-1").await.expect("bases");
-    assert_eq!(
-        bases
-            .iter()
-            .map(|base| base.repo_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["atlas"]
-    );
+    assert_eq!(base_names(&access).await, vec!["atlas"]);
     runtime.shutdown().await;
 }
 
@@ -3011,8 +3018,6 @@ async fn a_lazy_checkout_joins_the_agents_bases() {
 /// after it still do.
 #[tokio::test]
 async fn an_unobservable_repo_does_not_cost_the_others_their_bases() {
-    use horde_mcp::workspace::WorkspaceAccess as _;
-
     let temp = tempfile::tempdir().expect("a tempdir");
     let first = tiny_origin(&temp.path().join("a"));
     let second = tiny_origin(&temp.path().join("b"));
@@ -3031,17 +3036,8 @@ async fn an_unobservable_repo_does_not_cost_the_others_their_bases() {
         .expect("the spawn applies");
     settle(&runtime).await;
     std::fs::remove_dir_all(root.join("ws-1/.horde-agents/agent-1/a")).expect("breaks a");
-    let access = super::access::WorkerWorkspaceAccess {
-        shared: runtime.shared.clone(),
-    };
-    let bases = access.parent_bases("agent-1").await.expect("bases");
-    assert_eq!(
-        bases
-            .iter()
-            .map(|base| base.repo_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["b"]
-    );
+    let access = access_of(&runtime);
+    assert_eq!(base_names(&access).await, vec!["b"]);
     runtime.shutdown().await;
 }
 
@@ -3069,19 +3065,9 @@ async fn a_parent_base_is_staged_on_the_relay() {
         .with_relay(horde_relay::RelayLocation::new(
             &relay.display().to_string(),
         ));
-    runtime
-        .apply(materialize_command(1, &origin))
-        .await
-        .expect("the materialize applies");
+    materialized_then_spawned(&mut runtime, &origin).await;
     settle(&runtime).await;
-    runtime
-        .apply(workspace_spawn(2, "agent-1", "ws-1"))
-        .await
-        .expect("the spawn applies");
-    settle(&runtime).await;
-    let access = super::access::WorkerWorkspaceAccess {
-        shared: runtime.shared.clone(),
-    };
+    let access = access_of(&runtime);
     let bases = access.parent_bases("agent-1").await.expect("staged");
     let shared = std::process::Command::new("git")
         .args(["for-each-ref", "--format=%(refname)", "refs/horde/share"])

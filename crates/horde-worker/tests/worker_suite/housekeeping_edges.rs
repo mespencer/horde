@@ -13,40 +13,83 @@ use std::time::Duration;
 use horde_proto::v1::event::Kind;
 use horde_proto::v1::{
     CleanupTier, CleanupTrigger, GcLevel, ResolvedWorkspacePolicy, WorkspaceCleanup,
-    WorkspaceDefinition, WorkspaceGcCommand,
+    WorkspaceGcCommand,
 };
 use horde_worker::workspace::{FsStats, WorkspaceManager};
 use horde_worker::{ApplyCommand as _, Journal};
 
-use crate::workspace_rig::{
-    Rig, TOTAL, archive, cleanups, command, events, fresh_rig, kinds, materialize, observed_within,
-    policy, rig_with, settled_within, spawn_in, wire,
-};
+use crate::workspace_rig::{Rig, TOTAL, agent_root, archive, archived_pins, atlas_rig};
+use crate::workspace_rig::{cleanups, command, daemon_config, daemon_while, definition_named};
+use crate::workspace_rig::{deliver_refs, dirty_atlas, events, eventually, fresh_rig, head};
+use crate::workspace_rig::{kinds, materialize, observed_within, pinned_instance_repo, policy};
+use crate::workspace_rig::{rig_with, settled_within, spawn_in, wire};
 use crate::workspaces::harness;
-
-fn definition_named(temp: &Path, id: &str, repo: &str) -> WorkspaceDefinition {
-    let origin = harness::origin(temp, repo);
-    harness::definition(id, vec![harness::repo(repo, &origin)])
-}
-
-/// A fresh rig with the one-repo `ws-1` (`atlas`) materialized under
-/// `policy`.
-async fn atlas_rig(temp: &Path, policy: ResolvedWorkspacePolicy) -> Rig {
-    let mut rig = fresh_rig(temp);
-    materialize(&mut rig, &definition_named(temp, "ws-1", "atlas"), policy).await;
-    rig
-}
 
 /// A day's grace, no idle reclaim.
 fn graceful() -> ResolvedWorkspacePolicy {
     policy(86_400, 0)
 }
 
-fn agent_root(rig: &Rig, definition_id: &str, agent: &str) -> std::path::PathBuf {
-    rig.root
-        .join(definition_id)
-        .join(".horde-agents")
-        .join(agent)
+/// [`atlas_rig`] under [`graceful`], with `agents` spawned in it.
+async fn graceful_rig(temp: &Path, agents: &[&str]) -> Rig {
+    let mut rig = atlas_rig(temp, graceful()).await;
+    for agent in agents {
+        spawn_in(&mut rig, "ws-1", agent).await;
+    }
+    rig
+}
+
+/// [`atlas_rig`] with no grace, `agent-1` spawned and archived.
+async fn archived_atlas_rig(temp: &Path) -> Rig {
+    let mut rig = atlas_rig(temp, policy(0, 0)).await;
+    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    archived(&mut rig, "agent-1", 2).await;
+    rig
+}
+
+/// Makes `agent-a`'s activity a minute newer than any other's.
+async fn agent_a_was_active_last(rig: &Rig) {
+    let manager = rig.runtime.workspaces().expect("workspaces");
+    horde_worker::workspace::cleanup::note_activity(
+        manager,
+        "ws-1",
+        "agent-a",
+        horde_worker::workspace::ledger::now_ms() + 60_000,
+    )
+    .await;
+}
+
+/// `agent`'s checkout survived, and pressure removed nothing; then the
+/// Runtime stops.
+async fn assert_spared_by_pressure(rig: Rig, agent: &str) {
+    assert!(agent_root(&rig, "ws-1", agent).exists());
+    assert!(
+        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Hard)
+            .await
+            .is_empty()
+    );
+    rig.runtime.shutdown().await;
+}
+
+/// Scans, and answers which agents disk pressure touched at `tier`.
+async fn pressure_touches(rig: &Rig, tier: CleanupTier) -> Vec<String> {
+    rig.runtime.scan_workspaces().await;
+    touched(rig, CleanupTrigger::DiskPressure, tier).await
+}
+
+/// A rig under `temp` whose housekeeping loop runs on these intervals.
+fn looping_rig(temp: &Path, scan: Duration, pins: Duration, reports: Duration) -> Rig {
+    let config = horde_worker::runtime::HousekeepingConfig {
+        scan_interval: scan,
+        pin_scan_interval: pins,
+        report_interval: reports,
+        ..horde_worker::runtime::HousekeepingConfig::default()
+    };
+    rig_with(
+        &temp.join("workspaces"),
+        Journal::in_memory().expect("journal"),
+        config,
+    )
 }
 
 fn agent_of(cleanup: &WorkspaceCleanup) -> String {
@@ -137,9 +180,7 @@ async fn gc(rig: &mut Rig, gc: WorkspaceGcCommand) {
 #[tokio::test]
 async fn an_archive_journals_trigger_events_on_the_housekeeping_stream() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), policy(0, 0)).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
-    archived(&mut rig, "agent-1", 2).await;
+    let mut rig = archived_atlas_rig(temp.path()).await;
     assert_triggered(&rig, CleanupTrigger::Archive).await;
 
     spawn_in(&mut rig, "ws-1", "agent-2").await;
@@ -191,8 +232,7 @@ async fn an_idle_reclaim_is_a_real_trigger_event() {
 #[tokio::test]
 async fn a_live_agent_with_no_idle_reclaim_changes_nothing() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    let rig = graceful_rig(temp.path(), &["agent-1"]).await;
     assert!(!rig.runtime.scan_workspaces().await);
     rig.runtime.shutdown().await;
 }
@@ -228,8 +268,7 @@ async fn a_scan_past_the_grace_removes_as_a_trigger() {
 #[tokio::test]
 async fn free_space_exactly_at_the_low_watermark_starts_no_episode() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    let rig = graceful_rig(temp.path(), &["agent-1"]).await;
     let (low, _) = watermarks();
     rig.disk.set_free(low);
     assert!(!rig.runtime.scan_workspaces().await);
@@ -257,13 +296,7 @@ async fn an_episode_ends_at_exactly_the_high_watermark() {
     archived(&mut rig, "agent-1", 1).await;
     rig.disk.set_free(low + (high - low) / 2);
     assert!(!rig.runtime.scan_workspaces().await);
-    assert!(agent_root(&rig, "ws-1", "agent-1").exists());
-    assert!(
-        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Hard)
-            .await
-            .is_empty()
-    );
-    rig.runtime.shutdown().await;
+    assert_spared_by_pressure(rig, "agent-1").await;
 }
 
 /// Exhaustion is a change worth reporting; an episode that then has
@@ -291,8 +324,7 @@ async fn exhaustion_changes_the_scan_and_an_idle_episode_does_not() {
 #[tokio::test]
 async fn a_byte_short_of_the_high_watermark_still_reclaims() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    let rig = graceful_rig(temp.path(), &["agent-1"]).await;
     let (low, high) = watermarks();
     rig.disk.queue(&[low - 1, high - 1]);
     assert!(rig.runtime.scan_workspaces().await);
@@ -309,8 +341,7 @@ async fn a_byte_short_of_the_high_watermark_still_reclaims() {
 #[tokio::test]
 async fn exactly_the_high_watermark_reclaims_nothing() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    let rig = graceful_rig(temp.path(), &["agent-1"]).await;
     let (low, high) = watermarks();
     rig.disk.queue(&[low - 1, high]);
     rig.runtime.scan_workspaces().await;
@@ -355,23 +386,12 @@ async fn archived_removals_stop_at_exactly_the_high_watermark() {
 #[tokio::test]
 async fn pressure_keeps_an_archived_checkout_with_uncommitted_work() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
-    std::fs::write(
-        agent_root(&rig, "ws-1", "agent-1").join("atlas/wip.txt"),
-        "wip",
-    )
-    .expect("dirty");
+    let mut rig = graceful_rig(temp.path(), &["agent-1"]).await;
+    dirty_atlas(&rig, "agent-1");
     archived(&mut rig, "agent-1", 1).await;
     rig.disk.set_free(1);
     rig.runtime.scan_workspaces().await;
-    assert!(agent_root(&rig, "ws-1", "agent-1").exists());
-    assert!(
-        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Hard)
-            .await
-            .is_empty()
-    );
-    rig.runtime.shutdown().await;
+    assert_spared_by_pressure(rig, "agent-1").await;
 }
 
 /// A busy agent is passed over, and the episode goes on to the next
@@ -379,23 +399,13 @@ async fn pressure_keeps_an_archived_checkout_with_uncommitted_work() {
 #[tokio::test]
 async fn pressure_passes_over_a_busy_agent_to_the_next() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-a").await;
-    spawn_in(&mut rig, "ws-1", "agent-b").await;
+    let rig = graceful_rig(temp.path(), &["agent-a", "agent-b"]).await;
     // agent-b's activity is the older, so it comes first; it is busy.
-    let manager = rig.runtime.workspaces().expect("workspaces");
-    horde_worker::workspace::cleanup::note_activity(
-        manager,
-        "ws-1",
-        "agent-a",
-        horde_worker::workspace::ledger::now_ms() + 60_000,
-    )
-    .await;
+    agent_a_was_active_last(&rig).await;
     rig.runtime.activity().set_busy("agent-b", true);
     rig.disk.set_free(1);
-    rig.runtime.scan_workspaces().await;
     assert_eq!(
-        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Soft).await,
+        pressure_touches(&rig, CleanupTier::Soft).await,
         vec!["agent-a"]
     );
     rig.runtime.shutdown().await;
@@ -406,22 +416,12 @@ async fn pressure_passes_over_a_busy_agent_to_the_next() {
 #[tokio::test]
 async fn pressure_reclaims_the_longest_idle_agent_first() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-a").await;
-    spawn_in(&mut rig, "ws-1", "agent-b").await;
-    let manager = rig.runtime.workspaces().expect("workspaces");
-    horde_worker::workspace::cleanup::note_activity(
-        manager,
-        "ws-1",
-        "agent-a",
-        horde_worker::workspace::ledger::now_ms() + 60_000,
-    )
-    .await;
+    let rig = graceful_rig(temp.path(), &["agent-a", "agent-b"]).await;
+    agent_a_was_active_last(&rig).await;
     let (low, _) = watermarks();
     rig.disk.queue(&[low - 1, low - 1]);
-    rig.runtime.scan_workspaces().await;
     assert_eq!(
-        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Soft).await,
+        pressure_touches(&rig, CleanupTier::Soft).await,
         vec!["agent-b"]
     );
     rig.runtime.shutdown().await;
@@ -432,16 +432,13 @@ async fn pressure_reclaims_the_longest_idle_agent_first() {
 #[tokio::test]
 async fn a_reclaimed_checkout_does_not_end_the_candidate_list() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-a").await;
-    spawn_in(&mut rig, "ws-1", "agent-b").await;
+    let mut rig = graceful_rig(temp.path(), &["agent-a", "agent-b"]).await;
     archived(&mut rig, "agent-a", 1).await;
     // agent-a was soft-reclaimed by its archive, so only agent-b, listed
     // after it, is a soft candidate.
     rig.disk.set_free(1);
-    rig.runtime.scan_workspaces().await;
     assert_eq!(
-        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Soft).await,
+        pressure_touches(&rig, CleanupTier::Soft).await,
         vec!["agent-b"]
     );
     rig.runtime.shutdown().await;
@@ -452,17 +449,14 @@ async fn a_reclaimed_checkout_does_not_end_the_candidate_list() {
 #[tokio::test]
 async fn pressure_removes_the_oldest_archive_first() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-a").await;
-    spawn_in(&mut rig, "ws-1", "agent-b").await;
+    let mut rig = graceful_rig(temp.path(), &["agent-a", "agent-b"]).await;
     archived(&mut rig, "agent-b", 1).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     archived(&mut rig, "agent-a", 1).await;
     let (low, _) = watermarks();
     rig.disk.queue(&[low - 1, low - 1]);
-    rig.runtime.scan_workspaces().await;
     assert_eq!(
-        touched(&rig, CleanupTrigger::DiskPressure, CleanupTier::Hard).await,
+        pressure_touches(&rig, CleanupTier::Hard).await,
         vec!["agent-b"]
     );
     assert!(agent_root(&rig, "ws-1", "agent-a").exists());
@@ -570,8 +564,7 @@ async fn a_purge_removes_every_instance_as_a_purge() {
 #[tokio::test]
 async fn a_refused_purge_reclaims_nothing() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    let mut rig = graceful_rig(temp.path(), &["agent-1"]).await;
     gc(
         &mut rig,
         WorkspaceGcCommand {
@@ -627,8 +620,7 @@ async fn a_gc_naming_the_later_instance_reaches_it() {
 #[tokio::test]
 async fn a_gc_naming_an_agent_touches_only_its_checkout() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), graceful()).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
+    let mut rig = graceful_rig(temp.path(), &["agent-1"]).await;
     spawn_in(&mut rig, "ws-1", "agent-2").await;
     gc(
         &mut rig,
@@ -668,16 +660,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
 #[tokio::test]
 async fn the_scan_loop_never_forces_a_pin_past_its_ttl() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let config = horde_worker::runtime::HousekeepingConfig {
-        scan_interval: Duration::from_millis(20),
-        pin_scan_interval: Duration::ZERO,
-        report_interval: Duration::from_secs(3600),
-        ..horde_worker::runtime::HousekeepingConfig::default()
-    };
-    let mut rig = rig_with(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-        config,
+    let mut rig = looping_rig(
+        temp.path(),
+        Duration::from_millis(20),
+        Duration::ZERO,
+        Duration::from_secs(3600),
     );
     let ttl = ResolvedWorkspacePolicy {
         archived_grace: Some(wire(0, 0)),
@@ -721,12 +708,7 @@ async fn the_scan_loop_never_forces_a_pin_past_its_ttl() {
     )
     .await;
     let instance_repo = rig.root.join("ws-1/atlas");
-    let pins = || {
-        git(
-            &instance_repo,
-            &["for-each-ref", "--format=%(refname)", "refs/horde/archived"],
-        )
-    };
+    let pins = || archived_pins(&instance_repo);
     assert!(
         pins().contains("agent-1"),
         "the forced removal pinned the commit"
@@ -750,16 +732,11 @@ async fn the_scan_loop_never_forces_a_pin_past_its_ttl() {
 #[tokio::test]
 async fn a_shutdown_stops_the_scan_loop() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let config = horde_worker::runtime::HousekeepingConfig {
-        scan_interval: Duration::from_millis(10),
-        pin_scan_interval: Duration::from_secs(3600),
-        report_interval: Duration::ZERO,
-        ..horde_worker::runtime::HousekeepingConfig::default()
-    };
-    let mut rig = rig_with(
-        &temp.path().join("workspaces"),
-        Journal::in_memory().expect("journal"),
-        config,
+    let mut rig = looping_rig(
+        temp.path(),
+        Duration::from_millis(10),
+        Duration::from_secs(3600),
+        Duration::ZERO,
     );
     materialize(
         &mut rig,
@@ -778,44 +755,6 @@ async fn a_shutdown_stops_the_scan_loop() {
     let after = reporter.count();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(reporter.count(), after, "the loop ended with the Runtime");
-}
-
-fn head(repo: &Path) -> String {
-    git(repo, &["rev-parse", "HEAD"]).trim().to_owned()
-}
-
-/// Delivers an assignment carrying `refs` to `agent-1`.
-async fn deliver_refs(rig: &mut Rig, refs: &[(&str, String)]) {
-    rig.runtime
-        .apply(command(
-            "deliver-1",
-            horde_proto::v1::stream_commands_response::Command::DeliverMessage(
-                horde_proto::v1::DeliverMessageCommand {
-                    agent_id: Some(horde_proto::v1::AgentId::new("agent-1")),
-                    body: Some(horde_proto::v1::deliver_message_command::Body::Assignment(
-                        horde_proto::v1::Assignment {
-                            assignment_id: None,
-                            text: "look at these".to_owned(),
-                            payload: Some(horde_proto::v1::Payload {
-                                git_refs: refs
-                                    .iter()
-                                    .map(|(repo, sha)| horde_proto::v1::GitRef {
-                                        repo_name: (*repo).to_owned(),
-                                        commit_sha: sha.clone(),
-                                        branch: String::new(),
-                                    })
-                                    .collect(),
-                                attachments: Vec::new(),
-                            }),
-                        },
-                    )),
-                    delivery: horde_proto::v1::DeliveryMode::TurnBoundary.into(),
-                },
-            ),
-        ))
-        .await
-        .expect("the delivery applies");
-    settled_within("the delivery", rig.runtime.settled()).await;
 }
 
 async fn pending_of(rig: &Rig) -> Vec<(String, Vec<String>)> {
@@ -897,22 +836,6 @@ async fn a_lazy_receivers_message_arrives_with_the_unchecked_ref_held_back() {
     rig.runtime.shutdown().await;
 }
 
-/// Polls `holds` every 20 ms for up to `limit`.
-async fn eventually<F, Fut>(limit: Duration, mut holds: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + limit;
-    while tokio::time::Instant::now() < deadline {
-        if holds().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    holds().await
-}
-
 /// A daemon holding no Instance yet still advertises its disk, and its
 /// reports are its whole set: an Instance gone from disk is gone from the
 /// Server too.
@@ -926,36 +849,9 @@ async fn the_daemon_advertises_its_disk_and_reports_its_whole_set() {
     std::fs::create_dir_all(&root).expect("the root");
     let core = ServerCore::new(EventLog::in_memory().expect("an in-memory log"));
     let server = crate::support::serve(core.clone()).await;
-    let state = temp.path().join("state");
-    let config = horde_worker::startup::invocation(
-        [
-            "--insecure",
-            "--server",
-            &server,
-            "--name",
-            "w-disk",
-            "--adapter",
-            "fake",
-            "--state-dir",
-            &state.to_string_lossy(),
-            "--workspace-root",
-            &root.to_string_lossy(),
-            "--workspace-scan-interval",
-            "1s",
-            "--workspace-report-interval",
-            "1s",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned),
-    )
-    .expect("the shape parses");
-    let mut sink = |_: String| {};
-    let prepared = horde_worker::startup::prepare(&config, &mut sink)
-        .await
-        .expect("an insecure daemon prepares");
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let config = daemon_config(&server, "w-disk", &temp.path().join("state"), &root);
     let definition = definition_named(temp.path(), "ws-1", "atlas");
-    let watcher = async {
+    let (advertised, disk, reported, dropped) = daemon_while(&config, async {
         let advertised = eventually(Duration::from_secs(20), || async {
             core.workers.capabilities_of("w-disk").is_some()
         })
@@ -976,21 +872,9 @@ async fn the_daemon_advertises_its_disk_and_reports_its_whole_set() {
             core.instances.for_definition("ws-1").is_empty()
         })
         .await;
-        let _ = stop.send(());
         (advertised, disk, reported, dropped)
-    };
-    let mut announce = |_: String| {};
-    let (outcome, (advertised, disk, reported, dropped)) = tokio::join!(
-        horde_worker::startup::run(
-            prepared,
-            async move {
-                let _ = stopped.await;
-            },
-            &mut announce,
-        ),
-        watcher
-    );
-    assert!(outcome.is_ok(), "{outcome:?}");
+    })
+    .await;
     assert!(advertised, "registered");
     let (free, total) = disk.expect("capabilities");
     assert!(free > 0 && total >= free, "free {free} of {total}");
@@ -1003,17 +887,9 @@ async fn the_daemon_advertises_its_disk_and_reports_its_whole_set() {
 #[tokio::test]
 async fn the_pin_pass_keeps_its_own_interval() {
     let temp = tempfile::tempdir().expect("a tempdir");
-    let mut rig = atlas_rig(temp.path(), policy(0, 0)).await;
-    spawn_in(&mut rig, "ws-1", "agent-1").await;
-    archived(&mut rig, "agent-1", 2).await;
-    let instance_repo = rig.root.join("ws-1/atlas");
-    let pins = || {
-        git(
-            &instance_repo,
-            &["for-each-ref", "--format=%(refname)", "refs/horde/archived"],
-        )
-    };
-    assert!(pins().contains("agent-1"), "the removal pinned HEAD");
+    let rig = archived_atlas_rig(temp.path()).await;
+    let instance_repo = pinned_instance_repo(&rig, "agent-1");
+    let pins = || archived_pins(&instance_repo);
     let journal = rig.journal.clone();
     rig.runtime.shutdown().await;
 

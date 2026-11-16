@@ -260,6 +260,24 @@ impl horde_mcp::workspace::WorkspaceAccess for FixedCheckout {
     }
 }
 
+/// An endpoint serving `context` to `agent` alone, and a client initialized
+/// against it as that agent; the endpoint lives as long as its handle.
+async fn connected(
+    agent: &str,
+    context: horde_mcp::context::AgentContext,
+) -> Setup<(McpClient, horde_mcp::server::ServingEndpoint)> {
+    let registry = AgentRegistry::new();
+    registry.insert(agent, TOKEN);
+    let (address, serving) = serve(
+        &EndpointConfig::loopback(0),
+        std::sync::Arc::new(registry),
+        HordeEndpoint::new(context),
+    )
+    .await?;
+    let mcp = McpClient::connect(address, agent, TOKEN).await?;
+    Ok((mcp, serving))
+}
+
 /// With the Worker's workspaces behind it, `workspace_checkout` answers
 /// with the checkout the Worker made, and `spawn_agent` hands the child the
 /// caller's committed HEAD as its base and the branch the caller named.
@@ -268,8 +286,6 @@ async fn the_workspace_verbs_reach_the_workers_checkout() {
     let session = common::workspace_session(horde_proto::v1::AgentSpec::default())
         .await
         .expect("a session in a workspace");
-    let registry = AgentRegistry::new();
-    registry.insert(&session.root, TOKEN);
     let context = horde_mcp::context::AgentContext::new(
         std::sync::Arc::new(common::ServerJournal::new(&session.endpoint)),
         horde_cli::client::Client::connect(&session.endpoint)
@@ -278,16 +294,9 @@ async fn the_workspace_verbs_reach_the_workers_checkout() {
         session.session_id.clone(),
     )
     .with_workspace(std::sync::Arc::new(FixedCheckout));
-    let (address, _serving) = serve(
-        &EndpointConfig::loopback(0),
-        std::sync::Arc::new(registry),
-        HordeEndpoint::new(context),
-    )
-    .await
-    .expect("the endpoint serves");
-    let mcp = McpClient::connect(address, &session.root, TOKEN)
+    let (mcp, _serving) = connected(&session.root, context)
         .await
-        .expect("the legacy flow must initialize");
+        .expect("the endpoint serves an initialized client");
 
     let answer = mcp
         .call_tool("workspace_checkout", serde_json::json!({ "repo": "atlas" }))
@@ -396,23 +405,14 @@ impl horde_mcp::workspace::WorkspaceAccess for RefusingCheckout {
 #[tokio::test]
 async fn a_workers_workspace_refusal_reaches_the_caller() {
     let horde = harness().await.expect("a harness");
-    let registry = AgentRegistry::new();
-    registry.insert(&horde.agent_id, TOKEN);
     let context = horde
         .context()
         .await
         .expect("a context")
         .with_workspace(std::sync::Arc::new(RefusingCheckout));
-    let (address, _serving) = serve(
-        &EndpointConfig::loopback(0),
-        std::sync::Arc::new(registry),
-        HordeEndpoint::new(context),
-    )
-    .await
-    .expect("the endpoint serves");
-    let mcp = McpClient::connect(address, &horde.agent_id, TOKEN)
+    let (mcp, _serving) = connected(&horde.agent_id, context)
         .await
-        .expect("the legacy flow must initialize");
+        .expect("the endpoint serves an initialized client");
     let rpc = mcp
         .call_tool_raw("workspace_checkout", serde_json::json!({ "repo": "ghost" }))
         .await

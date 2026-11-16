@@ -639,11 +639,8 @@ mod tests {
         assert_eq!(removable(fixture.target()).await, Proof::Lossless);
     }
 
-    /// Rule 5: a fresh clone holding a branch outside HEAD's history
-    /// refuses.
-    #[tokio::test]
-    async fn a_clone_with_another_branch_refuses() {
-        let fixture = Fixture::new();
+    /// A fresh clone of the fixture's Instance repo, beside it.
+    fn fresh_clone(fixture: &Fixture) -> std::path::PathBuf {
         let clone = fixture.instance.parent().expect("a parent").join("clone");
         run_git(
             fixture.instance.parent().expect("a parent"),
@@ -654,6 +651,15 @@ mod tests {
                 &path_str(&clone),
             ],
         );
+        clone
+    }
+
+    /// Rule 5: a fresh clone holding a branch outside HEAD's history
+    /// refuses.
+    #[tokio::test]
+    async fn a_clone_with_another_branch_refuses() {
+        let fixture = Fixture::new();
+        let clone = fresh_clone(&fixture);
         let target = Target {
             checkout: &clone,
             fresh_clone: true,
@@ -824,16 +830,7 @@ mod tests {
     #[tokio::test]
     async fn a_clones_own_branch_ahead_of_head_refuses() {
         let fixture = Fixture::new();
-        let clone = fixture.instance.parent().expect("a parent").join("clone");
-        run_git(
-            fixture.instance.parent().expect("a parent"),
-            &[
-                "clone",
-                "-q",
-                &path_str(&fixture.instance),
-                &path_str(&clone),
-            ],
-        );
+        let clone = fresh_clone(&fixture);
         run_git(&clone, &["checkout", "-q", "-b", "agent/b"]);
         commit(&clone, "ahead");
         run_git(&clone, &["checkout", "-q", "--detach", "HEAD~1"]);
