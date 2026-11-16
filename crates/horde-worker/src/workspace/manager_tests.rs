@@ -87,46 +87,66 @@ fn blocks_count_as_their_fragment_size_and_saturate() {
     assert_eq!(super::blocks_to_bytes(u64::MAX, 2), u64::MAX);
 }
 
-/// The bytes `StatvfsStats` reports are `df`'s, to the byte, at a reading
-/// where nothing moved: ours before and after `df` agree with each other
-/// and with it. Other writers move free space between measurements, so a
-/// few readings are taken; a miscount never agrees in a still moment.
+/// `df`'s (available, size) for the filesystem holding `path`, in bytes.
+#[cfg(target_os = "linux")]
+fn df_bytes(path: &Path) -> (u64, u64) {
+    let output = std::process::Command::new("df")
+        .args(["-P", "-B1"])
+        .arg(path)
+        .output()
+        .expect("df runs");
+    assert!(output.status.success(), "df failed");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let row: Vec<u64> = text
+        .lines()
+        .nth(1)
+        .expect("df's row")
+        .split_whitespace()
+        .skip(1)
+        .take(3)
+        .map(|field| field.parse().expect("a byte count"))
+        .collect();
+    (row[2], row[0])
+}
+
+/// On a filesystem whose figures cannot move, `StatvfsStats` and `df`
+/// agree to the byte, free space included: Linux's `/proc` holds no blocks
+/// at all, so not one block is miscounted in either direction.
 #[cfg(target_os = "linux")]
 #[test]
-fn statvfs_bytes_are_dfs_to_the_byte() {
+fn statvfs_agrees_with_df_exactly_where_nothing_moves() {
+    let proc = Path::new("/proc");
+    let ours = StatvfsStats.stats(proc).expect("/proc answers");
+    assert_eq!(ours, df_bytes(proc), "(free, total), to the byte");
+}
+
+/// The bytes `StatvfsStats` reports are `df`'s: the filesystem's size to
+/// the byte, and its free space between our readings just before and just
+/// after `df`'s. Other writers move free space all the while (a loaded
+/// machine never holds it still), so `df` is sandwiched rather than matched
+/// at an instant; a miscount — a wrong field, a wrong unit, the halves
+/// swapped — lands outside every sandwich.
+#[cfg(target_os = "linux")]
+#[test]
+fn statvfs_reads_what_df_reads() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut last = None;
     for _ in 0..20 {
-        let ours = StatvfsStats
+        let before = StatvfsStats
             .stats(dir.path())
             .expect("a real filesystem answers");
-        let output = std::process::Command::new("df")
-            .args(["-P", "-B1"])
-            .arg(dir.path())
-            .output()
-            .expect("df runs");
-        assert!(output.status.success(), "df failed");
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let row: Vec<u64> = text
-            .lines()
-            .nth(1)
-            .expect("df's row")
-            .split_whitespace()
-            .skip(1)
-            .take(3)
-            .map(|field| field.parse().expect("a byte count"))
-            .collect();
-        let theirs = (row[2], row[0]);
+        let (free, total) = df_bytes(dir.path());
         let after = StatvfsStats
             .stats(dir.path())
             .expect("a real filesystem answers");
-        if ours == theirs && after == theirs {
+        assert_eq!((before.1, after.1), (total, total), "the size, to the byte");
+        let (low, high) = (before.0.min(after.0), before.0.max(after.0));
+        if (low..=high).contains(&free) {
             return;
         }
-        last = Some((ours, theirs));
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        last = Some((before.0, free, after.0));
     }
-    panic!("statvfs never agreed with df (free, total): {last:?}");
+    panic!("df's free space never fell between ours (before, df, after): {last:?}");
 }
 
 #[test]

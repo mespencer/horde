@@ -940,6 +940,47 @@ mod tests {
         );
     }
 
+    /// A guard past its timeout kills the `cargo` it started rather than
+    /// leaving it running. The checkout's toolchain file points the rustup
+    /// proxy at a stand-in `cargo` that records its pid and never answers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_cargo_guard_kills_its_cargo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        cargo_crate(
+            dir.path(),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let marker = dir.path().join("cargo.pid");
+        let toolchain = dir.path().join("toolchain");
+        std::fs::create_dir_all(toolchain.join("bin")).expect("the toolchain's bin");
+        horde_server_testkit::script::install(
+            &toolchain.join("bin/cargo"),
+            &format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 600\n",
+                marker.display()
+            ),
+        )
+        .expect("the stand-in installs");
+        std::fs::write(
+            dir.path().join("rust-toolchain.toml"),
+            format!("[toolchain]\npath = \"{}\"\n", toolchain.display()),
+        )
+        .expect("the toolchain file");
+        let policy = WorkspacePolicy {
+            reclaim_timeout: Duration::from_secs(2),
+            ..WorkspacePolicy::default()
+        };
+        assert_eq!(
+            resolve(dir.path(), None, &policy).await,
+            Resolved::Skip("could not locate target dir: cargo metadata timed out".to_owned())
+        );
+        let pid = written_pid_soon(&marker).await;
+        let gone = gone_soon(pid).await;
+        kill_now(pid);
+        assert!(gone, "the timed-out cargo {pid} outlived its guard");
+    }
+
     #[test]
     fn a_run_frees_what_it_shrank_by_or_nothing_when_unmeasured() {
         assert_eq!(freed(Some(10), Some(4)), 6);
