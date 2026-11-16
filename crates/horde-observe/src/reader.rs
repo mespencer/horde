@@ -490,6 +490,11 @@ mod tests {
         Record::parse(&line).expect("record")
     }
 
+    /// Everything `logs` holds for `target`, unfiltered.
+    fn everything_of(logs: &LocalLogs, target: &Target) -> super::Selection {
+        logs.read(target, &Filter::default(), &Window::default())
+    }
+
     fn msgs(selection: &super::Selection) -> Vec<&str> {
         selection.records.iter().map(Record::message).collect()
     }
@@ -765,13 +770,9 @@ mod tests {
             .expect("write");
         }
         let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let process = logs.read(&Target::Process, &Filter::default(), &Window::default());
+        let process = everything_of(&logs, &Target::Process);
         assert_eq!(msgs(&process), ["mine"]);
-        let agent = logs.read(
-            &Target::Agent("a1".to_owned()),
-            &Filter::default(),
-            &Window::default(),
-        );
+        let agent = everything_of(&logs, &Target::Agent("a1".to_owned()));
         assert_eq!(msgs(&agent), ["a1 warned"]);
     }
 
@@ -875,13 +876,9 @@ torn"#,
         )
         .expect("write");
         let logs = LocalLogs::new(dir.path(), "horde-worker", None);
-        let agent = logs.read(
-            &Target::Agent("a1".to_owned()),
-            &Filter::default(),
-            &Window::default(),
-        );
+        let agent = everything_of(&logs, &Target::Agent("a1".to_owned()));
         assert_eq!(msgs(&agent), ["pumped", "warned"]);
-        let process = logs.read(&Target::Process, &Filter::default(), &Window::default());
+        let process = everything_of(&logs, &Target::Process);
         assert_eq!(msgs(&process), ["pumped", "other"]);
         assert_eq!(logs.dir(), dir.path());
         assert!(logs.tap().is_none());

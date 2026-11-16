@@ -512,8 +512,14 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn a_local_read_pages_redacts_and_stays_in_its_session() {
+    /// A [`generous`] access over a fresh directory, a client, and agent
+    /// `a1`'s whole first page of session `s1` through them.
+    async fn read_generously() -> (
+        tempfile::TempDir,
+        LogAccess,
+        horde_cli::client::Client,
+        LogsView,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let access = generous(dir.path());
         let mut client = client();
@@ -521,6 +527,12 @@ mod tests {
             .call(&mut client, "a1", "s1", &LogsParams::default())
             .await
             .expect("read");
+        (dir, access, client, all)
+    }
+
+    #[tokio::test]
+    async fn a_local_read_pages_redacts_and_stays_in_its_session() {
+        let (_dir, access, mut client, all) = read_generously().await;
         assert_eq!(all.records.len(), 6, "{:?}", all.records);
         assert!(!all.records.iter().any(|r| r.contains("another session")));
         assert_eq!(all.redacted, 1);
@@ -610,13 +622,7 @@ mod tests {
     /// records, one byte less pages one.
     #[tokio::test]
     async fn a_local_page_holds_exactly_its_cap() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let access = generous(dir.path());
-        let mut client = client();
-        let all = access
-            .call(&mut client, "a1", "s1", &LogsParams::default())
-            .await
-            .expect("read");
+        let (_dir, access, mut client, all) = read_generously().await;
         let two = u32::try_from(all.records[0].len() + all.records[1].len()).expect("small");
         let page = |max_bytes| LogsParams {
             cursor: Some("1970-01-01T00:00:00.000000Z~horde~~0".to_owned()),

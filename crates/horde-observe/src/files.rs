@@ -373,15 +373,20 @@ mod tests {
         assert_eq!(list(over.path(), None).len(), 2, "51 + 51 bytes do not");
     }
 
+    /// Files of at most 12 bytes, each opening with the header `HHHH`.
+    fn twelve_bytes_with_a_header(dir: &Path) -> RotatingFiles {
+        let small = FileSet {
+            max_file_bytes: 12,
+            ..set(dir, Some("b"))
+        };
+        RotatingFiles::new(small).with_header(|_| "HHHH".to_owned())
+    }
+
     /// The header's bytes count toward the file's size.
     #[test]
     fn the_header_counts_toward_the_size() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let small = FileSet {
-            max_file_bytes: 12,
-            ..set(dir.path(), Some("b"))
-        };
-        let mut files = RotatingFiles::new(small).with_header(|_| "HHHH".to_owned());
+        let mut files = twelve_bytes_with_a_header(dir.path());
         for _ in 0..3 {
             files.write("abc", SystemTime::now()).expect("write");
         }
@@ -411,11 +416,7 @@ mod tests {
     #[test]
     fn a_header_and_lines_that_fill_the_file_exactly_share_it() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let small = FileSet {
-            max_file_bytes: 12,
-            ..set(dir.path(), Some("b"))
-        };
-        let mut files = RotatingFiles::new(small).with_header(|_| "HHHH".to_owned());
+        let mut files = twelve_bytes_with_a_header(dir.path());
         files.write("abc", SystemTime::now()).expect("write");
         files.write("ab", SystemTime::now()).expect("write");
         assert_eq!(list(dir.path(), None).len(), 1, "5 + 4 + 3 bytes fill 12");

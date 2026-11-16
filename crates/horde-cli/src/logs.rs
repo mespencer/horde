@@ -735,6 +735,23 @@ mod tests {
         assert_eq!(text.lines().count(), 2, "only records in JSON: {text}");
     }
 
+    /// A `--follow` read of `dir` beside `driver`, which must finish first:
+    /// a follow that ends on its own has stopped following.
+    async fn following(
+        dir: &std::path::Path,
+        args: &LogsArgs,
+        format: Format,
+        writer: &mut Shared,
+        driver: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::select! {
+            ended = run_dir(dir, args, format, writer) => {
+                panic!("a follow keeps reading, but it ended: {ended:?}");
+            }
+            () = driver => {}
+        }
+    }
+
     /// A buffer a spawned follow writes into while the test reads it.
     #[derive(Clone, Default)]
     struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -810,12 +827,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        tokio::select! {
-            ended = run_dir(dir.path(), &args, Format::Human, &mut writer) => {
-                panic!("a follow keeps reading, but it ended: {ended:?}");
-            }
-            () = driver => {}
-        }
+        following(dir.path(), &args, Format::Human, &mut writer, driver).await;
         assert_eq!(out.text().matches("first").count(), 1, "nothing twice");
     }
 
@@ -947,12 +959,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        tokio::select! {
-            ended = run_dir(dir.path(), &args, Format::Json, &mut writer) => {
-                panic!("a follow keeps reading, but it ended: {ended:?}");
-            }
-            () = driver => {}
-        }
+        following(dir.path(), &args, Format::Json, &mut writer, driver).await;
         assert!(!out.text().contains("stale"), "{}", out.text());
     }
 

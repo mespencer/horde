@@ -71,16 +71,18 @@ async fn served(
     Ok((mcp, serving))
 }
 
+/// A server log directory and a worker log directory, both fresh.
+fn log_dirs() -> Setup<(tempfile::TempDir, tempfile::TempDir)> {
+    Ok((tempfile::tempdir()?, tempfile::tempdir()?))
+}
+
 fn view(text: &str) -> Setup<serde_json::Value> {
     Ok(serde_json::from_str(text)?)
 }
 
 #[tokio::test]
 async fn logs_round_trips_locally_and_through_the_server_redacted() {
-    let (server_logs, worker_logs) = (
-        tempfile::tempdir().expect("dir"),
-        tempfile::tempdir().expect("dir"),
-    );
+    let (server_logs, worker_logs) = log_dirs().expect("two log dirs");
     let (mcp, _serving) = served(server_logs.path(), worker_logs.path())
         .await
         .expect("served");
@@ -178,10 +180,7 @@ async fn logs_round_trips_locally_and_through_the_server_redacted() {
 /// over it is left out.
 #[tokio::test]
 async fn a_server_read_holds_exactly_the_agents_cap() {
-    let (server_logs, worker_logs) = (
-        tempfile::tempdir().expect("dir"),
-        tempfile::tempdir().expect("dir"),
-    );
+    let (server_logs, worker_logs) = log_dirs().expect("two log dirs");
     let (mcp, _serving) = served(server_logs.path(), worker_logs.path())
         .await
         .expect("served");

@@ -1938,21 +1938,20 @@ mod endpoint_call_tests {
 
 #[cfg(test)]
 mod stderr_tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::mpsc::{Sender, channel};
     use std::time::Duration;
 
     use horde_adapter::stderr::{StderrSink, scoped};
 
     use crate::{Script, ScriptedTurn, Step};
 
-    #[derive(Default)]
-    struct Collect(Mutex<Vec<String>>);
+    /// Hands every line it is given to the test, in order.
+    struct Forward(Sender<String>);
 
-    impl StderrSink for Collect {
+    impl StderrSink for Forward {
         fn line(&self, text: &str) {
-            if let Ok(mut lines) = self.0.lock() {
-                lines.push(text.to_owned());
-            }
+            let _ = self.0.send(text.to_owned());
         }
     }
 
@@ -1960,33 +1959,23 @@ mod stderr_tests {
     /// a real harness's stderr does.
     #[tokio::test]
     async fn a_scripted_stderr_line_reaches_the_spawns_sink() {
-        let collect = Arc::new(Collect::default());
-        let sink: Arc<dyn StderrSink> = collect.clone();
+        let (sender, received) = channel();
+        let sink: Arc<dyn StderrSink> = Arc::new(Forward(sender));
         let script = Script::of(vec![
             ScriptedTurn::saying("done").with_step(Step::Stderr("warned".to_owned())),
         ]);
         let mut session = scoped(Some(sink), super::harness::started(script)).await;
+        let mut lines: Vec<String> = Vec::new();
         for _ in 0..20 {
             let next = tokio::time::timeout(Duration::from_secs(5), session.next_event())
                 .await
                 .expect("an event comes");
-            if collect
-                .0
-                .lock()
-                .map(|lines| !lines.is_empty())
-                .unwrap_or(false)
-                || !matches!(next, Ok(Some(_)))
-            {
+            lines.extend(received.try_iter());
+            if !lines.is_empty() || !matches!(next, Ok(Some(_))) {
                 break;
             }
         }
-        assert_eq!(
-            collect
-                .0
-                .lock()
-                .map(|lines| lines.clone())
-                .unwrap_or_default(),
-            ["warned"]
-        );
+        lines.extend(received.try_iter());
+        assert_eq!(lines, ["warned"]);
     }
 }
