@@ -69,6 +69,7 @@ fn output(text: &str) -> Kind {
 
 fn spawn(parent: Option<&str>, tree_path: &[&str]) -> Kind {
     Kind::AgentSpawned(AgentSpawned {
+        session: None,
         parent_agent_id: parent.map(AgentId::new),
         spawned_by: None,
         spec: None,

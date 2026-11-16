@@ -111,8 +111,16 @@ pub async fn serve_with_permissions(
     modes: horde_server::permission::PermissionModes,
     judge: Option<std::sync::Arc<dyn horde_server::permission::PolicyJudge>>,
 ) -> Setup<String> {
-    let core = ServerCore::new(EventLog::in_memory()?);
-    let _chain = horde_server::permission::spawn(&core.log, std::sync::Arc::new(modes), judge);
+    // One registry for the chain and for the spawns it stamps (ADR-0016),
+    // as the serving path has: a spawn naming no mode is stamped with this
+    // registry's default, which the chain must then recognize.
+    let core =
+        ServerCore::new(EventLog::in_memory()?).with_permission_modes(std::sync::Arc::new(modes));
+    let _chain = horde_server::permission::spawn(
+        &core.log,
+        std::sync::Arc::clone(&core.permission_modes),
+        judge,
+    );
     serve_core(core).await
 }
 
@@ -463,9 +471,9 @@ pub async fn seed_agent(
         agent_id: Some(AgentId::new(agent)),
         occurred_at: None,
         idempotency_key: format!("{agent}:spawned"),
+        // A root agent: no parent, no spawner, no session settings of its
+        // own — the session's defaults.
         kind: Some(Kind::AgentSpawned(AgentSpawned {
-            parent_agent_id: None,
-            spawned_by: None,
             spec: Some(AgentSpec {
                 initial_assignment: Some(Assignment {
                     assignment_id: None,
@@ -474,7 +482,7 @@ pub async fn seed_agent(
                 }),
                 ..AgentSpec::default()
             }),
-            tree_path: Vec::new(),
+            ..AgentSpawned::default()
         })),
     };
     let state = match worker {

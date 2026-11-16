@@ -12,6 +12,9 @@ workspace = true
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 horde-adapter = { path = "../horde-adapter" }
+# The client's config file (ADR-0016): the strict reader and provenance
+# every role shares.
+horde-config = { workspace = true }
 # Enrollment is a client verb (DESIGN §3: "horde worker enroll", and clients
 # enroll identically), and the mTLS channel config is the identity crate's.
 horde-identity = { workspace = true }

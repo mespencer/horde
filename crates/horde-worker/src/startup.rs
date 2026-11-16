@@ -590,7 +590,7 @@ async fn build_runtime(
                 )?;
                 // Probed, not assumed: the exec-gating capability claim is
                 // version-gated (ADR-0005, 2026-08-19 amendment).
-                let adapter = crate::CodexAdapter::new(harness_profile(config, "codex", &journal))
+                let adapter = codex_adapter(config, &journal)
                     .probe_exec_interception()
                     .await;
                 runtime.with_adapter(Arc::new(adapter))
@@ -652,6 +652,17 @@ impl crate::runtime::InstanceReporter for GrpcInstanceReporter {
             tracing::debug!(%error, "the instance report did not reach the server");
         }
     }
+}
+
+/// The codex adapter a configuration asks for, before its version probe:
+/// launched under the Worker's own codex profile, with the sandbox tier each
+/// permission mode gets on this machine (`codex.sandbox.*`, ADR-0016) —
+/// codex cannot be gated per call, so that is the control its agents
+/// actually run under.
+fn codex_adapter(config: &WorkerConfig, journal: &Journal) -> crate::CodexAdapter {
+    let mut adapter = crate::CodexAdapter::new(harness_profile(config, "codex", journal));
+    adapter.sandbox_policy = config.sandbox.clone();
+    adapter
 }
 
 /// The Worker-owned harness profile one provider's adapter launches under
@@ -1337,6 +1348,28 @@ mod tests {
             identity_plan(&ambient, false),
             Ok(IdentityPlan::Join { .. })
         ));
+    }
+
+    /// The codex adapter runs under the Worker's own codex profile and the
+    /// configured sandbox tiers, not the adapter's defaults.
+    #[test]
+    fn the_codex_adapter_takes_the_configured_sandbox_and_its_own_profile() {
+        let state = tempfile::tempdir().expect("a temp dir");
+        let mut config = parsed(&["--state-dir", &state.path().to_string_lossy()]).expect("parses");
+        config.sandbox = horde_adapter_codex::SandboxPolicy::default()
+            .with_mode("careful", horde_adapter_codex::SandboxTier::ReadOnly);
+        let journal = super::Journal::open(&state.path().join("journal.db")).expect("a journal");
+        let adapter = super::codex_adapter(&config, &journal);
+        assert_eq!(adapter.sandbox_policy, config.sandbox);
+        assert_ne!(
+            adapter.sandbox_policy,
+            horde_adapter_codex::SandboxPolicy::default()
+        );
+        assert_eq!(
+            adapter.profile.root(),
+            crate::harness::HarnessProfile::in_state_dir(state.path(), "codex").root()
+        );
+        assert!(adapter.profile.root().ends_with("codex"));
     }
 
     /// The ignored-ambient-token line is owed only for an ambient token

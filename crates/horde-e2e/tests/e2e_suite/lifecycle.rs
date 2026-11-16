@@ -159,7 +159,10 @@ async fn an_agent_reaches_the_orchestrator_verbs_through_its_endpoint() {
 /// client through the log, `horde approve` answers it, and the turn resumes.
 #[tokio::test]
 async fn a_permission_is_requested_and_approved_from_the_cli() {
-    let system = System::launch().await;
+    // `ask`: the rule chain that escalates what it does not allow — the
+    // shape this scenario's human approval needs (ADR-0016's default is
+    // bypass).
+    let system = System::launch_with(&["--permission-mode", "ask"]).await;
 
     // The scripted provider: one turn that asks before acting. The ids are
     // the test's to choose, which is how the approval can name the request
@@ -248,6 +251,72 @@ async fn a_permission_is_requested_and_approved_from_the_cli() {
         2,
         "the remembered layer's answer is an event of record too: {events:?}"
     );
+
+    worker.terminate().await.expect("SIGTERM sends");
+    let (status, _, _) = worker.wait().await.expect("the worker exits");
+    assert!(status.success());
+}
+
+/// The deployed default is bypass (ADR-0016): an ordinary call the harness
+/// proposes is allowed by the chain — journaled, with the reason, so every
+/// client sees it — while a question (`AskUserQuestion`) still stops for a
+/// human, who answers it from the CLI.
+#[tokio::test]
+async fn bypass_allows_calls_but_a_question_still_waits_for_a_human() {
+    let system = System::launch().await;
+    let mut worker = system
+        .spawn_scripted_worker(
+            "w-1",
+            r#"[{"steps": [
+                {"ask_permission": {"id": "call-1", "tool": "Bash",
+                                    "input": {"command": "cargo test"}}},
+                {"say": "ran without asking"},
+                {"ask_permission": {"id": "ask-1", "tool": "AskUserQuestion",
+                                    "input": {"questions": []}}},
+                {"say": "answered"}
+            ], "text": "done"}]"#,
+        )
+        .await;
+
+    let (session_id, root) = system.placed_session("e2e bypass").await;
+    system.cli_json(&["send", &root, "go"]).await;
+    let events = system
+        .sync_until(&session_id, "the question's escalation", |events| {
+            outputs(events)
+                .iter()
+                .any(|text| text == "ran without asking")
+                && events
+                    .iter()
+                    .filter(|event| event["kind"] == "permission_requested")
+                    .count()
+                    >= 3
+        })
+        .await;
+    let decisions: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "permission_decided")
+        .collect();
+    assert_eq!(decisions.len(), 1, "only the call was decided: {events:?}");
+    assert!(
+        decisions[0].to_string().contains("bypass mode"),
+        "the allow names bypass: {decisions:?}"
+    );
+    assert!(
+        !outputs(&events).iter().any(|text| text == "answered"),
+        "the question must block for a human: {events:?}"
+    );
+
+    let answered = system.cli(&["approve", "ask-1"]).await;
+    assert!(
+        answered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    system
+        .sync_until(&session_id, "the answered turn", |events| {
+            outputs(events).iter().any(|text| text == "answered")
+        })
+        .await;
 
     worker.terminate().await.expect("SIGTERM sends");
     let (status, _, _) = worker.wait().await.expect("the worker exits");

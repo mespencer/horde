@@ -173,6 +173,7 @@ async fn the_request_level_workspace_fills_in_without_overriding_the_spec() {
     let created = h
         .control
         .create_session(CreateSessionRequest {
+            settings: None,
             title: "request-level".to_owned(),
             workspace_definition_id: ws.clone(),
             root_agent: None,
@@ -212,6 +213,7 @@ async fn the_request_level_workspace_fills_in_without_overriding_the_spec() {
     // bogus id is never validated and the create succeeds.
     h.control
         .create_session(CreateSessionRequest {
+            settings: None,
             title: "spec-wins".to_owned(),
             workspace_definition_id: Some(horde_proto::v1::WorkspaceDefinitionId::new(
                 "ws-that-does-not-exist",

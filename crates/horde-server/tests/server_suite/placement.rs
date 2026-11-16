@@ -271,6 +271,7 @@ async fn a_session_rooted_in_an_unknown_workspace_is_refused() {
     let refused = harness
         .control
         .create_session(horde_proto::v1::CreateSessionRequest {
+            settings: None,
             title: "ghost".to_owned(),
             workspace_definition_id: None,
             root_agent: Some(AgentSpec {
@@ -389,6 +390,89 @@ async fn a_spawn_requiring_an_account_places_once_its_worker_advertises_it() {
             worker_id: Some("acct".to_owned()),
         }),
         "the advertised account is what placement matched: {observed:?}"
+    );
+}
+
+/// A spawn naming a provider demands that harness of its worker, on the
+/// spawn's own placement and again when the queue drains: it queues against
+/// a worker without the harness, naming it, stays queued when another
+/// worker without it arrives, and places on the one that has it installed.
+#[tokio::test]
+async fn a_spawn_naming_a_provider_waits_for_a_worker_with_its_harness() {
+    use horde_proto::v1::{
+        ConcreteModel, HarnessCapability, ModelSelection, model_selection::Selection,
+    };
+    let mut harness = connect().await.expect("a harness");
+    register(&mut harness, "plain", WorkerCapabilities::default())
+        .await
+        .expect("register without codex");
+    let (session_id, _root) = seed(&mut harness, "harnesses", "key-1")
+        .await
+        .expect("a session");
+
+    let codex = AgentSpec {
+        model: Some(ModelSelection {
+            selection: Some(Selection::Concrete(ConcreteModel {
+                provider: "codex".to_owned(),
+                model: "m".to_owned(),
+                provider_account: String::new(),
+            })),
+        }),
+        ..AgentSpec::default()
+    };
+    let (agent, placement) = spawn_under(&mut harness, &session_id, None, codex)
+        .await
+        .expect("the spawn is answered");
+    assert_eq!(placement.state, PlacementState::Queued as i32);
+    assert!(
+        placement.reason.contains("lacks harness `codex`"),
+        "{}",
+        placement.reason
+    );
+
+    // A drain the queue sees on another codex-less worker's arrival leaves
+    // the spawn where it is.
+    register(&mut harness, "other", WorkerCapabilities::default())
+        .await
+        .expect("another worker without codex");
+    register(
+        &mut harness,
+        "codexed",
+        WorkerCapabilities {
+            harnesses: vec![HarnessCapability {
+                provider: "codex".to_owned(),
+                installed: true,
+                ..HarnessCapability::default()
+            }],
+            ..WorkerCapabilities::default()
+        },
+    )
+    .await
+    .expect("a worker with codex");
+    let mut observed = Vec::new();
+    for minimum in 2..8 {
+        observed = placements_until(&mut harness, &session_id, minimum)
+            .await
+            .expect("the drain");
+        if observed
+            .iter()
+            .any(|seen| seen.agent_id == agent && seen.state == PlacementState::Placed)
+        {
+            break;
+        }
+    }
+    let placed: Vec<&Observed> = observed
+        .iter()
+        .filter(|seen| seen.agent_id == agent && seen.state == PlacementState::Placed)
+        .collect();
+    assert_eq!(
+        placed,
+        [&Observed {
+            agent_id: agent,
+            state: PlacementState::Placed,
+            worker_id: Some("codexed".to_owned()),
+        }],
+        "only the worker with the harness takes it: {observed:?}"
     );
 }
 

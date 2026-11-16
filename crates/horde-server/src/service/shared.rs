@@ -75,6 +75,14 @@ pub struct ServerCore {
     /// The workspace defaults every command's policy is resolved against
     /// (ADR-0014).
     pub workspace_policy: Arc<crate::workspace_policy::WorkspacePolicyConfig>,
+    /// The model-tier catalog spawns resolve through (DESIGN §5, ADR-0016).
+    pub tiers: Arc<crate::tiers::TierCatalog>,
+    /// The permission modes the chain evaluates and spawns are stamped from
+    /// (ADR-0016).
+    pub permission_modes: Arc<crate::permission::PermissionModes>,
+    /// The server's effective configuration with origins, for
+    /// `GetEffectiveConfig`. Empty for a core built without settings.
+    pub config: Arc<horde_config::Provenance>,
 }
 
 impl ServerCore {
@@ -97,7 +105,31 @@ impl ServerCore {
             hub: Arc::new(crate::hub::HubUpstreams::new()),
             worker_lease: crate::liveness::DEFAULT_WORKER_LEASE,
             workspace_policy: Arc::new(crate::workspace_policy::WorkspacePolicyConfig::default()),
+            tiers: Arc::new(crate::tiers::TierCatalog::shipped_defaults()),
+            permission_modes: Arc::new(crate::permission::PermissionModes::shipped()),
+            config: Arc::new(horde_config::Provenance::default()),
         }
+    }
+
+    /// Replaces the permission modes spawns are stamped from — the registry
+    /// a chain driver over this core's log must share.
+    #[must_use]
+    pub fn with_permission_modes(mut self, modes: Arc<crate::permission::PermissionModes>) -> Self {
+        self.permission_modes = modes;
+        self
+    }
+
+    /// Takes everything configuration decides from `settings` (ADR-0016):
+    /// the workspace defaults, the tier catalog, the permission modes and the
+    /// provenance `GetEffectiveConfig` reports. Placement's disk thresholds
+    /// belong to the scheduler, which the serving path builds with them.
+    #[must_use]
+    pub fn with_settings(mut self, settings: &crate::config::ServerSettings) -> Self {
+        self.workspace_policy = Arc::new(settings.workspace.clone());
+        self.tiers = Arc::new(settings.tiers.clone());
+        self.permission_modes = Arc::new(settings.modes.clone());
+        self.config = Arc::new(settings.provenance.clone());
+        self
     }
 
     /// Overrides the workspace defaults (ADR-0014) — the serving path from

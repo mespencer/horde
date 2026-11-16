@@ -109,6 +109,11 @@ pub async fn connect_with_plane(plane: ControlPlane, core: ServerCore) -> Setup<
     })
 }
 
+/// The longest any one RPC of these suites may take. A handler that never
+/// answers — a lock it forgot to release, say — fails its test here, well
+/// inside any runner's own ceiling, instead of stalling the run.
+const RPC_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Stands up one service on a duplex pair and returns a channel to it.
 ///
 /// Each client gets its own transport, which is how they behave in
@@ -121,6 +126,7 @@ async fn duplex_channel(
 
     let mut client_side = Some(client_side);
     let channel = Endpoint::try_from("http://[::]:50051")?
+        .timeout(RPC_CEILING)
         .connect_with_connector(tower::service_fn(move |_: Uri| {
             let stream = client_side.take();
             async move {
@@ -164,6 +170,7 @@ pub async fn seed(harness: &mut Harness, title: &str, key: &str) -> Setup<(Strin
     let created = harness
         .control
         .create_session(CreateSessionRequest {
+            settings: None,
             title: title.to_owned(),
             workspace_definition_id: None,
             root_agent: Some(AgentSpec::default()),
