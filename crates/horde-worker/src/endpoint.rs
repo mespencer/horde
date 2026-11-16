@@ -124,6 +124,12 @@ impl EndpointManager {
         )));
     }
 
+    /// Whether the agents' `logs` verb is served from local files.
+    #[cfg(test)]
+    pub(crate) fn serves_logs(&self) -> bool {
+        self.logs.get().is_some()
+    }
+
     #[must_use]
     pub fn new(channel: tonic::transport::Channel, worker_id: &str) -> Self {
         Self {

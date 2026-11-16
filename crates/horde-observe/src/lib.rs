@@ -65,7 +65,7 @@ mod subscriber;
 pub mod tap;
 
 pub use config::{ConfigError, ENDPOINT_VAR, OtlpConfig, SAMPLE_VAR, from_env};
-pub use layer::FileLogging;
+pub use layer::{FileLogging, conclude};
 pub use pipeline::{
     InitError, PRINCIPAL_ATTRIBUTE, PipelineError, ServiceIdentity, Telemetry, init_from_env,
     pipeline,

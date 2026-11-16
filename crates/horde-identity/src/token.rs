@@ -254,6 +254,14 @@ mod tests {
         assert!(!debug.contains("00ff"), "{debug}");
         assert!(debug.contains("host:7000"), "{debug}");
         assert!(debug.contains("[REDACTED]"), "{debug}");
+        assert_eq!(
+            debug,
+            format!(
+                "JoinToken {{ host_port: \"host:7000\", code: JoinCode {{ secret: \"[REDACTED]\", \
+                 server_fingerprint: \"{}\" }} }}",
+                "a".repeat(64)
+            )
+        );
     }
 
     #[test]

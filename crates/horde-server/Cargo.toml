@@ -63,6 +63,9 @@ proptest = "1.9.0"
 # The trust suite calls every guarded method by path with an empty body,
 # which needs a codec over `()` rather than a generated client per method.
 tonic-prost = "0.14.6"
+# Paused time: a dispatched read's ten-second tunnel deadline passes in no
+# time at all.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "horde-server"

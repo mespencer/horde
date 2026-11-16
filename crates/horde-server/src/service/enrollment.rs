@@ -207,6 +207,7 @@ impl EnrollmentAuthority {
         // redeemed or expires (ADR-0015's registered values).
         horde_observe::redact::register_secret(
             &secret,
+            // #[gamma::skip(expr.decrement, expr.increment, reason = "a millisecond either side of the code's own expiry: the scrub ends one millisecond early or late, which no wall-clock test can place")]
             u64::try_from(expires_at_unix_ms)
                 .ok()
                 .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
@@ -481,6 +482,19 @@ pub(crate) mod tests {
         ));
         assert!(touched, "{line}");
         assert!(!line.contains(&minted.secret), "{line}");
+
+        // Redeemed, it opens nothing, and is shown as written again.
+        let (_key, csr) = horde_identity::enroll::generate_csr().expect("a CSR");
+        authority
+            .redeem(&minted.secret, &csr, super::wall_clock_ms())
+            .await
+            .expect("redeems");
+        let (line, touched) = horde_observe::redact::redact_line(&format!(
+            "{{\"msg\":\"joined with {}\"}}",
+            minted.secret
+        ));
+        assert!(!touched, "{line}");
+        assert!(line.contains(&minted.secret), "{line}");
     }
 
     #[test]

@@ -1935,3 +1935,58 @@ mod endpoint_call_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stderr_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use horde_adapter::stderr::{StderrSink, scoped};
+
+    use crate::{Script, ScriptedTurn, Step};
+
+    #[derive(Default)]
+    struct Collect(Mutex<Vec<String>>);
+
+    impl StderrSink for Collect {
+        fn line(&self, text: &str) {
+            if let Ok(mut lines) = self.0.lock() {
+                lines.push(text.to_owned());
+            }
+        }
+    }
+
+    /// A scripted stderr line reaches the sink the spawn was scoped with, as
+    /// a real harness's stderr does.
+    #[tokio::test]
+    async fn a_scripted_stderr_line_reaches_the_spawns_sink() {
+        let collect = Arc::new(Collect::default());
+        let sink: Arc<dyn StderrSink> = collect.clone();
+        let script = Script::of(vec![
+            ScriptedTurn::saying("done").with_step(Step::Stderr("warned".to_owned())),
+        ]);
+        let mut session = scoped(Some(sink), super::harness::started(script)).await;
+        for _ in 0..20 {
+            let next = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+                .await
+                .expect("an event comes");
+            if collect
+                .0
+                .lock()
+                .map(|lines| !lines.is_empty())
+                .unwrap_or(false)
+                || !matches!(next, Ok(Some(_)))
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            collect
+                .0
+                .lock()
+                .map(|lines| lines.clone())
+                .unwrap_or_default(),
+            ["warned"]
+        );
+    }
+}

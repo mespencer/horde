@@ -13,7 +13,7 @@ use horde_proto::v1::{
 };
 use horde_wire::logs::{Frame, LocalRead, filter_from_wire, serve_local};
 use tokio::sync::mpsc;
-use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tokio_stream::{Stream, StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::shared::ServerCore;
@@ -62,6 +62,7 @@ pub async fn read_logs(
     let request = request.into_inner();
     let authorized = authorize(core, conduit.as_deref(), &request, Instant::now()).await?;
     let frames = open(core, authorized, &request).await?;
+    // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_one, reason = "how many responses wait for the client changes when the lift waits, never what the client receives")]
     let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(lift_until_gone(frames, sender));
     Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
@@ -101,6 +102,7 @@ pub fn stream_log_requests(
     serial: Option<String>,
 ) -> LogRequestsStream {
     let (epoch, mut lane) = core.logs.registry.register_worker(&worker_id);
+    // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_one, reason = "how many queries wait for the worker changes when the pump waits, never which queries it receives")]
     let (sender, receiver) = mpsc::channel(16);
     let registry = core.logs.registry.clone();
     tokio::spawn(async move {
@@ -137,7 +139,19 @@ pub async fn worker_log_tunnel(
 ) -> Result<Response<LogTunnelStream>, Status> {
     let caller = crate::trust::conduit_worker(&request);
     let mut inbound = request.into_inner();
-    let request_id = match inbound.message().await? {
+    let first = inbound.message().await?;
+    let frames = claim_tunnel(&core.logs.registry, first, caller.as_deref())?;
+    Ok(Response::new(pump_tunnel(inbound, frames)))
+}
+
+/// Pairs a tunnel with the read it answers: its first frame must name the
+/// request id, and the read must still be waiting for this worker.
+fn claim_tunnel(
+    registry: &LogRegistry,
+    first: Option<WorkerLogTunnelRequest>,
+    caller: Option<&str>,
+) -> Result<mpsc::Sender<Frame>, Status> {
+    let request_id = match first {
         Some(WorkerLogTunnelRequest {
             frame: Some(worker_log_tunnel_request::Frame::Open(open)),
         }) => open.request_id,
@@ -147,7 +161,7 @@ pub async fn worker_log_tunnel(
             ));
         }
     };
-    let pair = match core.logs.registry.claim(&request_id, caller.as_deref()) {
+    let pair = match registry.claim(&request_id, caller) {
         Claim::Matched(pair) => pair,
         Claim::WrongWorker => {
             return Err(Status::permission_denied(format!(
@@ -160,10 +174,21 @@ pub async fn worker_log_tunnel(
             )));
         }
     };
+    // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_one, reason = "how many frames wait between the tunnel and the relay changes when the pump waits, never what arrives")]
     let (frames, reader) = mpsc::channel(16);
-    if pair.send(reader).is_err() {
-        return Err(Status::cancelled("the reader went away"));
-    }
+    pair.send(reader)
+        .map_err(|_| Status::cancelled("the reader went away"))?;
+    Ok(frames)
+}
+
+/// Pumps a claimed tunnel's frames to its read until either side goes
+/// away. The returned stream sends nothing; its end is the worker's order
+/// to stop serving.
+fn pump_tunnel<S>(mut inbound: S, frames: mpsc::Sender<Frame>) -> LogTunnelStream
+where
+    S: Stream<Item = Result<WorkerLogTunnelRequest, Status>> + Unpin + Send + 'static,
+{
+    // #[gamma::skip(literal.int_increment, reason = "nothing is ever sent on this channel, so its capacity is never used")]
     let (keepalive, responses) = mpsc::channel::<Result<WorkerLogTunnelResponse, Status>>(1);
     tokio::spawn(async move {
         // Held for the pump's life: dropping it ends the worker's response
@@ -171,10 +196,10 @@ pub async fn worker_log_tunnel(
         let _keepalive = keepalive;
         loop {
             let message = tokio::select! {
-                message = inbound.message() => message,
+                message = inbound.next() => message,
                 () = frames.closed() => return,
             };
-            let Ok(Some(message)) = message else {
+            let Some(Ok(message)) = message else {
                 return;
             };
             if let Some(frame) = from_tunnel(message)
@@ -184,7 +209,7 @@ pub async fn worker_log_tunnel(
             }
         }
     });
-    Ok(Response::new(Box::pin(ReceiverStream::new(responses))))
+    Box::pin(ReceiverStream::new(responses))
 }
 
 /// An agent's session and the worker it is placed on.
@@ -318,6 +343,7 @@ pub async fn open(
     // Validated here, so a bad pattern is refused before any worker is asked.
     filter_from_wire(&filter, authorized.session_scope.clone(), SystemTime::now())
         .map_err(Status::invalid_argument)?;
+    // #[gamma::skip(expr.decrement, expr.increment, reason = "how many frames wait between the source and the lift changes when the source waits, never what the client receives")]
     let (sender, receiver) = mpsc::channel(FRAME_DEPTH);
     tracing::info!(
         target: horde_observe::tap::QUIET_TARGET,

@@ -667,16 +667,6 @@ pub fn file_logging_for(
     }
 }
 
-/// Writes out what is still queued for the file, waiting at most
-/// `deadline`, on the way out. Returns whether everything reached it
-/// (`true` with no file at all).
-pub fn flush_file_logging(
-    file: Option<&horde_observe::FileLogging>,
-    deadline: std::time::Duration,
-) -> bool {
-    file.is_none_or(|file| file.flush(deadline))
-}
-
 /// Where the server's log files live: `<state>/logs`, so two servers with
 /// separate state directories never share files.
 #[must_use]
@@ -970,10 +960,6 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
-        assert!(
-            super::flush_file_logging(None, std::time::Duration::ZERO),
-            "nothing to flush is flushed"
-        );
 
         let serve = parsed(&["--serve", "--state-dir", &state.path().to_string_lossy()])
             .expect("a serve invocation");
@@ -990,14 +976,14 @@ mod tests {
                 tracing::info!(padding = %"p".repeat(512), "served {n}");
             }
         });
+        // A zero deadline only sees the writer's answer if this thread is
+        // preempted between asking and looking; a hundred tries cannot all
+        // be.
         assert!(
-            !super::flush_file_logging(Some(&file), std::time::Duration::ZERO),
+            (0..100).any(|_| !file.flush(std::time::Duration::ZERO)),
             "a backlog is not written in no time"
         );
-        assert!(super::flush_file_logging(
-            Some(&file),
-            std::time::Duration::from_secs(10)
-        ));
+        assert!(file.flush(std::time::Duration::from_secs(10)));
         assert!(horde_observe::files::list(file.dir(), Some("horde-server")).len() == 1);
     }
 

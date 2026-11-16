@@ -127,6 +127,13 @@ mod tests {
             debug.contains(&"b".repeat(64)),
             "the pin is not a secret: {debug}"
         );
+        assert_eq!(
+            debug,
+            format!(
+                "JoinCode {{ secret: \"[REDACTED]\", server_fingerprint: \"{}\" }}",
+                "b".repeat(64)
+            )
+        );
     }
 
     #[test]

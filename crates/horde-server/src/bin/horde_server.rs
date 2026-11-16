@@ -69,15 +69,10 @@ fn run() -> Result<ExitCode, String> {
         Invocation::Print(_) => ExitCode::SUCCESS,
     };
 
-    // What is still queued reaches the file before the process exits.
-    horde_server::startup::flush_file_logging(file.as_ref(), std::time::Duration::from_secs(2));
-    if let Some(telemetry) = telemetry {
-        // From main's own thread, with the runtime still alive for the flush
-        // to travel its channel. The verdict is discarded deliberately: a
-        // collector that is down must not change an exit code.
-        let _ = telemetry.shutdown();
-    }
-    Ok(code)
+    // What is still queued reaches the file, and export is flushed, before
+    // the process exits — from main's own thread, with the runtime still
+    // alive for the export flush to travel its channel.
+    Ok(horde_observe::conclude(code, file.as_ref(), telemetry))
 }
 
 /// The health-check invocation: open the log, report by exit code.

@@ -68,11 +68,6 @@ pub struct LogRegistry {
 }
 
 impl LogRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn locked(&self) -> std::sync::MutexGuard<'_, Inner> {
         match self.inner.lock() {
             Ok(guard) => guard,
@@ -185,7 +180,7 @@ mod tests {
 
     #[test]
     fn a_lane_moves_through_its_states() {
-        let registry = LogRegistry::new();
+        let registry = LogRegistry::default();
         assert!(matches!(registry.lane("w1"), LaneState::Unknown));
         registry.note_registration("w1", false);
         assert!(matches!(registry.lane("w1"), LaneState::Unsupported));
@@ -198,9 +193,37 @@ mod tests {
         assert!(matches!(registry.lane("w1"), LaneState::Away(Some(seen)) if seen == now));
     }
 
+    /// Each registration is a new epoch, counted from one; each read a new
+    /// request id, counted from one.
+    #[test]
+    fn epochs_and_request_ids_count_from_one() {
+        let registry = LogRegistry::default();
+        assert_eq!(registry.register_worker("w1").0, 1);
+        assert_eq!(registry.register_worker("w2").0, 2);
+        assert_eq!(registry.begin("w1").0, "logs-1");
+        assert_eq!(registry.begin("w1").0, "logs-2");
+    }
+
+    /// A worker's lane holds sixteen queries it has not taken yet.
+    #[test]
+    fn a_lane_holds_sixteen_queries() {
+        let registry = LogRegistry::default();
+        let (_epoch, _receiver) = registry.register_worker("w1");
+        let LaneState::Connected(lane) = registry.lane("w1") else {
+            panic!("connected");
+        };
+        for n in 0..16 {
+            assert!(
+                lane.try_send(horde_proto::v1::LogQuery::default()).is_ok(),
+                "query {n}"
+            );
+        }
+        assert!(lane.try_send(horde_proto::v1::LogQuery::default()).is_err());
+    }
+
     #[test]
     fn a_stale_stream_cannot_knock_out_its_replacement() {
-        let registry = LogRegistry::new();
+        let registry = LogRegistry::default();
         let (old, _a) = registry.register_worker("w1");
         let (_new, _b) = registry.register_worker("w1");
         assert!(!registry.deregister_worker_if_current("w1", old, SystemTime::now()));
@@ -209,7 +232,7 @@ mod tests {
 
     #[test]
     fn a_pending_read_is_claimed_once_and_only_by_its_worker() {
-        let registry = LogRegistry::new();
+        let registry = LogRegistry::default();
         let (request_id, _paired) = registry.begin("w1");
         assert!(matches!(
             registry.claim(&request_id, Some("w2")),

@@ -980,13 +980,18 @@ mod tests {
 
         let core = core();
         let facing = super::WorkerFacing::new(core.clone());
-        for (worker, flag) in [
-            ("worker-old", "other.v1"),
-            ("worker-new", horde_wire::logs::LOGS_CAPABILITY),
+        for (worker, flags) in [
+            ("worker-old", &["other.v1"][..]),
+            (
+                "worker-new",
+                &["other.v1", horde_wire::logs::LOGS_CAPABILITY][..],
+            ),
         ] {
             let mut request = register_request(Some("0.1.0"), Some(worker), None);
             if let Some(hello) = request.get_mut().hello.as_mut() {
-                hello.capability_flags.push(flag.to_owned());
+                hello
+                    .capability_flags
+                    .extend(flags.iter().map(|flag| (*flag).to_owned()));
             }
             facing.register_worker(request).await.expect("registers");
         }
@@ -998,6 +1003,29 @@ mod tests {
             core.logs.registry.lane("worker-new"),
             LaneState::Away(None)
         ));
+    }
+
+    /// A log dispatch stream with no worker named is refused, naming the
+    /// stream.
+    #[tokio::test]
+    async fn a_log_stream_must_name_its_worker() {
+        use horde_proto::v1::worker_service_server::WorkerService as _;
+        let facing = super::WorkerFacing::new(core());
+        let refused = facing
+            .stream_log_requests(tonic::Request::new(
+                horde_proto::v1::StreamLogRequestsRequest { worker_id: None },
+            ))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(
+            refused
+                .message()
+                .contains("a log stream must name its worker"),
+            "{}",
+            refused.message()
+        );
     }
 
     /// A registration as a worker sends it: its hello's semver, its claimed

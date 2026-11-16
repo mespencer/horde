@@ -127,23 +127,6 @@ pub fn observability(
     Ok((telemetry, file))
 }
 
-/// The binary's last act: what the file still holds queued is written
-/// (waiting at most `deadline`), and export is flushed. Blocks; run it off
-/// the async runtime. Returns whether the file took everything; the export
-/// verdict is discarded on purpose — a dead collector must not change an
-/// exit code.
-pub fn finish_observability(
-    telemetry: Option<horde_observe::Telemetry>,
-    file: Option<&horde_observe::FileLogging>,
-    deadline: Duration,
-) -> bool {
-    let flushed = file.is_none_or(|file| file.flush(deadline));
-    if let Some(telemetry) = telemetry {
-        let _ = telemetry.shutdown();
-    }
-    flushed
-}
-
 /// What a remote read targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTarget {
@@ -547,15 +530,11 @@ mod tests {
 
     #[test]
     fn the_binarys_observability_is_assembled_from_flags_and_environment() {
-        use super::{finish_observability, observability};
+        use super::observability;
         let home = tempfile::tempdir().expect("home");
         let (telemetry, file) =
             observability(false, None, |_| None, Some(home.path().to_path_buf())).expect("off");
         assert!(telemetry.is_none() && file.is_none());
-        assert!(
-            finish_observability(None, None, Duration::ZERO),
-            "nothing to flush"
-        );
         let (_, file) = observability(
             false,
             None,
@@ -576,19 +555,15 @@ mod tests {
         // preempted between asking and looking, so one attempt can win the
         // race on a loaded machine; a hundred cannot all win it.
         assert!(
-            (0..100).any(|_| !finish_observability(None, Some(&file), Duration::ZERO)),
+            (0..100).any(|_| !file.flush(Duration::ZERO)),
             "a backlog is not written in no time"
         );
-        assert!(finish_observability(
-            None,
-            Some(&file),
-            Duration::from_secs(10)
-        ));
+        assert!(file.flush(Duration::from_secs(10)));
         let written = horde_observe::reader::read_dir(file.dir(), Some("horde"))
             .iter()
             .filter(|record| record.message().starts_with("burst "))
             .count();
-        assert_eq!(written, queued, "the last act flushed everything queued");
+        assert_eq!(written, queued, "the flush wrote everything queued");
         let refused = observability(
             true,
             None,

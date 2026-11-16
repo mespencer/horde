@@ -203,6 +203,7 @@ async fn answer(
     serving: Arc<LogServing>,
 ) {
     let _serving = serving.serving();
+    // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_one, reason = "how many frames wait for the tunnel changes when the forwarder waits, never what the server receives")]
     let (to_server, outbound) = mpsc::channel(16);
     let open = WorkerLogTunnelRequest {
         frame: Some(worker_log_tunnel_request::Frame::Open(LogTunnelOpen {
@@ -234,6 +235,7 @@ async fn answer(
             return;
         }
     };
+    // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_one, reason = "how many frames wait for the forwarder changes when the read waits, never what it forwards")]
     let (frames, mut produced) = mpsc::channel(16);
     let serve = async move {
         serve_local(serving.local(), read, &frames).await;

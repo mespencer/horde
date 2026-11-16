@@ -25,7 +25,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::files::{FileSet, RotatingFiles};
-use crate::pipeline::ServiceIdentity;
+use crate::pipeline::{ServiceIdentity, Telemetry};
 use crate::record::{format_ts, serialize_bounded};
 use crate::settings::LogSettings;
 use crate::tap::{LogTap, QUIET_TARGET};
@@ -337,6 +337,24 @@ impl FileLogging {
     pub fn flush(&self, timeout: Duration) -> bool {
         flush_through(&self.sender, timeout)
     }
+}
+
+/// How long a binary's last act waits for its file to take what is queued.
+pub const EXIT_FLUSH: Duration = Duration::from_secs(2);
+
+/// A binary's last act, handing `outcome` back: what the file still holds
+/// queued is written (waiting at most [`EXIT_FLUSH`]), then export is
+/// flushed. Blocks; run it off an async runtime's worker threads. The export
+/// verdict is discarded on purpose — a dead collector must not change an
+/// exit code.
+pub fn conclude<T>(outcome: T, file: Option<&FileLogging>, telemetry: Option<Telemetry>) -> T {
+    if let Some(file) = file {
+        file.flush(EXIT_FLUSH);
+    }
+    if let Some(telemetry) = telemetry {
+        let _ = telemetry.shutdown();
+    }
+    outcome
 }
 
 /// The running process's file logging, once its binary registered it.
@@ -693,6 +711,27 @@ mod tests {
         let registered = super::process_logging().expect("registered");
         assert_eq!(registered.boot(), first.boot());
         assert_ne!(registered.boot(), second.boot());
+    }
+
+    /// A binary's last act writes out everything still queued before it
+    /// hands the outcome back.
+    #[test]
+    fn concluding_writes_out_the_backlog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logging = logging(dir.path(), "info");
+        let queued = 4000;
+        tracing::dispatcher::with_default(&logging.dispatch(), || {
+            for n in 0..queued {
+                tracing::info!(padding = %"p".repeat(512), "burst {n}");
+            }
+        });
+        assert_eq!(super::conclude(7, Some(&logging), None), 7);
+        let written = records_in(dir.path())
+            .iter()
+            .filter(|record| record.message().starts_with("burst "))
+            .count();
+        assert_eq!(written, queued);
+        assert_eq!(super::conclude("no file", None, None), "no file");
     }
 
     #[test]

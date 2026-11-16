@@ -693,6 +693,46 @@ mod tests {
         assert_eq!(tail.back().map(String::as_str), Some("short"));
     }
 
+    /// A harness spawned inside a stderr scope hands every stderr line to
+    /// that scope's sink (the agent's file), not only to the death tail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scoped_harness_hands_its_stderr_to_the_sink() {
+        #[derive(Default)]
+        struct Collect(std::sync::Mutex<Vec<String>>);
+        impl horde_adapter::stderr::StderrSink for Collect {
+            fn line(&self, text: &str) {
+                if let Ok(mut lines) = self.0.lock() {
+                    lines.push(text.to_owned());
+                }
+            }
+        }
+        let collect = std::sync::Arc::new(Collect::default());
+        let sink: std::sync::Arc<dyn horde_adapter::stderr::StderrSink> = collect.clone();
+        let spec = super::HarnessSpec {
+            args: vec!["-c".to_owned(), "echo warned >&2".to_owned()],
+            ..super::HarnessSpec::new("sh")
+        };
+        let _harness =
+            horde_adapter::stderr::scoped(Some(sink), super::SupervisedHarness::spawn(&spec))
+                .await
+                .expect("spawns");
+        let lines = || {
+            collect
+                .0
+                .lock()
+                .map(|lines| lines.clone())
+                .unwrap_or_default()
+        };
+        for _ in 0..500 {
+            if !lines().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(lines(), ["warned"]);
+    }
+
     /// The fingerprint is `ps`'s start-time string for a live process — the
     /// shape a reboot-reused pid will not match — and empty for a pid that
     /// does not exist.

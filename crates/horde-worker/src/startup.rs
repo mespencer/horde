@@ -861,16 +861,10 @@ pub fn with_observability(
     file.register_process();
 
     let code = main_loop(&runtime);
-    // What is still queued reaches the file before the process exits.
-    file.flush(std::time::Duration::from_secs(2));
-
-    if let Some(telemetry) = telemetry {
-        // With the runtime still alive for the flush to travel its channel.
-        // The verdict is discarded deliberately: a collector that is down
-        // must not change an exit code.
-        let _ = telemetry.shutdown();
-    }
-    Ok(code)
+    // What is still queued reaches the file, and export is flushed, before
+    // the process exits — with the runtime still alive for the export flush
+    // to travel its channel.
+    Ok(horde_observe::conclude(code, Some(&file), telemetry))
 }
 
 /// The daemon's file logging under `<state>/logs`, stamped with the
@@ -1540,6 +1534,22 @@ mod tests {
         assert_eq!(input["status"], "success");
     }
 
+    /// The operator form of a harness stderr line (ADR-0015).
+    #[test]
+    fn the_script_form_parses_stderr_lines() {
+        let script =
+            fake_script(r#"[{"steps": [{"stderr": "warned"}]}]"#).expect("a stderr script parses");
+        assert!(
+            matches!(&script.turns[0].steps[0], horde_adapter_fake::Step::Stderr(line) if line == "warned"),
+            "{:?}",
+            script.turns[0].steps
+        );
+        assert_eq!(
+            fake_script(r#"[{"steps": [{"stderr": 42}]}]"#).err(),
+            Some("turn 0: stderr must be a string".to_owned())
+        );
+    }
+
     /// A defaulted `input` must still be an object: the wire converts the
     /// proposed call's arguments to a Struct, and `null` would be refused
     /// downstream with a message about neither the script nor the flag.
@@ -1732,11 +1742,27 @@ mod tests {
         let mut ran = false;
         let first = super::with_observability(state.path(), |runtime| {
             runtime.block_on(async {});
+            tracing::info!(target: "horde_worker", "inside the loop");
             ran = true;
             std::process::ExitCode::SUCCESS
         });
         assert!(ran, "the main loop must actually run");
         assert!(first.is_ok(), "{first:?}");
+        // The loop's records reached the daemon's own file, all of them by
+        // the time the wrapper returned, and the file is the process's for
+        // its serving paths to follow.
+        let log_dir = crate::logs::log_dir(state.path());
+        assert!(
+            horde_observe::reader::read_dir(&log_dir, Some(crate::logs::BINARY))
+                .iter()
+                .any(|record| record.message() == "inside the loop"),
+            "the loop's record is in the file"
+        );
+        assert_eq!(
+            horde_observe::layer::process_logging().map(horde_observe::FileLogging::dir),
+            Some(log_dir.as_path()),
+            "registered as the process's file logging"
+        );
 
         let refused = super::with_observability(state.path(), |_| {
             panic!("the loop must not run when startup refuses")

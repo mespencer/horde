@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use horde_observe::reader::LocalLogs;
 use horde_observe::settings::LogSettings;
 use horde_proto::v1::{
-    AgentId, LogEndReason, LogFilter, LogRecords, ReadLogsRequest, ServerTarget,
-    control_plane_service_server::ControlPlaneService, read_logs_request, read_logs_response,
+    AgentId, LogEndReason, LogFilter, LogQuery, LogRecords, LogTunnelOpen, ReadLogsRequest,
+    ServerTarget, WorkerLogTunnelRequest, control_plane_service_server::ControlPlaneService,
+    read_logs_request, read_logs_response, worker_log_tunnel_request,
 };
 use horde_wire::logs::Frame;
 use tokio::sync::mpsc;
@@ -15,6 +16,7 @@ use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 
 use super::authorize;
+use crate::diagnostics::registry::{LaneState, LogRegistry};
 use crate::diagnostics::{Authorized, BINARY, Resolved, relay};
 use crate::log::EventLog;
 use crate::service::control_plane::ControlPlane;
@@ -62,12 +64,19 @@ fn server_read(on_behalf_of: Option<&str>) -> ReadLogsRequest {
     }
 }
 
-/// Every response of a read, bounded: a relay that kept going past its end
-/// would never close the stream, so it fails here instead of hanging.
+/// Every response of a read, bounded in time and in count: a relay that
+/// kept going past its end would never close the stream, so it fails here
+/// instead of hanging or filling memory.
 async fn collected<S: tokio_stream::Stream + Unpin>(stream: S) -> Vec<S::Item> {
-    tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
-        .await
-        .expect("the read's stream closes once its end is sent")
+    const MOST: usize = 64;
+    let items = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.take(MOST + 1).collect::<Vec<_>>(),
+    )
+    .await
+    .expect("the read's stream closes once its end is sent");
+    assert!(items.len() <= MOST, "the read's stream never ended");
+    items
 }
 
 async fn messages(plane: &ControlPlane, request: Request<ReadLogsRequest>) -> Vec<String> {
@@ -111,7 +120,26 @@ async fn a_client_reads_everything_and_an_agent_only_its_session() {
 #[tokio::test]
 async fn a_worker_must_read_for_one_of_its_own_agents() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (plane, _core, _mine, _theirs) = core_with_logs(dir.path()).await;
+    let (plane, core, _mine, _theirs) = core_with_logs(dir.path()).await;
+    let anonymous = plane
+        .read_logs(as_worker("w1", Request::new(server_read(None))))
+        .await
+        .err()
+        .expect("refused");
+    assert_eq!(
+        anonymous.message(),
+        "a worker reads logs only on behalf of one of its agents (on_behalf_of)"
+    );
+    let own_agent = ReadLogsRequest {
+        target: Some(read_logs_request::Target::Agent(AgentId::new("agent-mine"))),
+        ..server_read(Some("agent-mine"))
+    };
+    assert!(
+        authorize(&core, Some("w1"), &own_agent, Instant::now())
+            .await
+            .is_ok(),
+        "an agent may read its own session's agents"
+    );
     for (worker, behalf, code) in [
         ("w1", None, Code::PermissionDenied),
         ("w1", Some("agent-theirs"), Code::PermissionDenied),
@@ -214,9 +242,26 @@ async fn targets_resolve_or_refuse_by_what_the_server_knows() {
         }
     );
     let untargeted = authorize(&core, None, &ReadLogsRequest::default(), Instant::now()).await;
+    let untargeted = untargeted.expect_err("no target");
+    assert_eq!(untargeted.code(), Code::InvalidArgument);
     assert_eq!(
-        untargeted.err().map(|s| s.code()),
-        Some(Code::InvalidArgument)
+        untargeted.message(),
+        "name a target: the server, a worker, or an agent"
+    );
+    let whole_worker = ReadLogsRequest {
+        target: Some(read_logs_request::Target::Worker("w1".to_owned())),
+        ..ReadLogsRequest::default()
+    };
+    assert_eq!(
+        authorize(&core, None, &whole_worker, Instant::now())
+            .await
+            .expect("a worker target")
+            .target,
+        Resolved::Worker {
+            worker_id: "w1".to_owned(),
+            agent: None
+        },
+        "a worker target reads the whole worker, no one agent"
     );
 
     let worker = |name: &str| ReadLogsRequest {
@@ -261,11 +306,9 @@ async fn targets_resolve_or_refuse_by_what_the_server_knows() {
 
     let bare = ControlPlane::new(ServerCore::new(EventLog::in_memory().expect("log")));
     let refused = bare.read_logs(Request::new(server_read(None))).await.err();
-    assert_eq!(
-        refused.map(|s| s.code()),
-        Some(Code::Unavailable),
-        "no log files"
-    );
+    let refused = refused.expect("no log files");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "this server keeps no log files to read");
     // The authorized shape is a plain value; this pins its fields' meaning.
     assert_eq!(
         Authorized {
@@ -326,6 +369,7 @@ async fn the_relay_reapplies_scope_and_redaction_and_reports_a_vanished_worker()
     assert!(batch.lines[1].contains("[REDACTED:join-token]"));
     assert_eq!(batch.redacted, 1);
     assert_eq!(end.reason, LogEndReason::WorkerDisconnected as i32);
+    assert_eq!(end.detail, "the worker disconnected mid-read");
 
     let unscoped = relayed(vec![records(&[theirs, "torn"])], None, None).await;
     assert!(matches!(&unscoped[0], Frame::Records(batch) if batch.lines.len() == 2));
@@ -337,7 +381,12 @@ async fn the_relay_reapplies_scope_and_redaction_and_reports_a_vanished_worker()
     )
     .await;
     assert!(
-        matches!(capped.as_slice(), [Frame::Records(_), Frame::End(end)] if end.reason == LogEndReason::ByteCap as i32),
+        matches!(
+            capped.as_slice(),
+            [Frame::Records(_), Frame::End(end)]
+                if end.reason == LogEndReason::ByteCap as i32
+                    && end.detail == "the byte cap was reached"
+        ),
         "{capped:?}"
     );
 
@@ -402,8 +451,9 @@ fn answering_worker(core: &ServerCore, worker_id: &'static str) {
             if pair.send(reader).is_err() {
                 continue;
             }
+            let grep = query.filter.map(|filter| filter.grep).unwrap_or_default();
             let line = format!(
-                r#"{{"ts":"t1","msg":"from {worker_id} capped at {}","boot":"b","seq":1}}"#,
+                r#"{{"ts":"t1","msg":"from {worker_id} capped at {}{grep}","boot":"b","seq":1}}"#,
                 query.max_bytes
             );
             let _ = frames.send(records(&[&line])).await;
@@ -429,6 +479,18 @@ async fn a_worker_read_is_dispatched_and_relayed_unbounded_for_a_client_capped_f
         messages(&plane, Request::new(read(None, 0))).await,
         ["from w9 capped at 0"],
         "a client's read is unbounded"
+    );
+    let grepped = ReadLogsRequest {
+        filter: Some(LogFilter {
+            grep: " with this grep".to_owned(),
+            ..LogFilter::default()
+        }),
+        ..read(None, 0)
+    };
+    assert_eq!(
+        messages(&plane, Request::new(grepped)).await,
+        ["from w9 capped at 0 with this grep"],
+        "the filter travels to the worker"
     );
     assert_eq!(
         messages(
@@ -457,4 +519,199 @@ async fn a_worker_read_is_dispatched_and_relayed_unbounded_for_a_client_capped_f
         [LogEndReason::ByteCap as i32],
         "the relay holds the cap too"
     );
+}
+
+/// The lift hands every frame to the client, the end included.
+#[tokio::test]
+async fn the_lift_hands_every_frame_to_the_client() {
+    let (source, frames) = mpsc::channel(4);
+    let (client, mut responses) = mpsc::channel(4);
+    source.send(records(&["one"])).await.expect("queued");
+    source
+        .send(horde_wire::logs::end(LogEndReason::Done, ""))
+        .await
+        .expect("queued");
+    drop(source);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        super::lift_until_gone(frames, client),
+    )
+    .await
+    .expect("the lift ends with its source");
+    let mut bodies = Vec::new();
+    while let Ok(response) = responses.try_recv() {
+        bodies.push(response.expect("ok").body);
+    }
+    assert!(
+        matches!(
+            bodies.as_slice(),
+            [
+                Some(read_logs_response::Body::Records(_)),
+                Some(read_logs_response::Body::End(_))
+            ]
+        ),
+        "{bodies:?}"
+    );
+}
+
+/// A worker's dispatch stream carries every query pushed down its lane,
+/// and the worker is away once the stream is dropped.
+#[tokio::test]
+async fn a_dispatch_stream_carries_queries_until_dropped() {
+    let core = ServerCore::new(EventLog::in_memory().expect("log"));
+    let mut stream = super::stream_log_requests(&core, "w5".to_owned(), None, None);
+    let LaneState::Connected(lane) = core.logs.registry.lane("w5") else {
+        panic!("the stream registers the worker's lane");
+    };
+    for id in ["q1", "q2"] {
+        lane.try_send(LogQuery {
+            request_id: id.to_owned(),
+            ..LogQuery::default()
+        })
+        .expect("queued");
+    }
+    for id in ["q1", "q2"] {
+        let query = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("a query arrives")
+            .expect("the stream is open")
+            .expect("ok")
+            .query
+            .expect("the query rides the response");
+        assert_eq!(query.request_id, id);
+    }
+    drop(stream);
+    // One more query wakes the pump, which finds the worker gone.
+    let _ = lane.try_send(LogQuery::default());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(core.logs.registry.lane("w5"), LaneState::Away(Some(_))) {
+        assert!(Instant::now() < deadline, "the worker never went away");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn open_frame(request_id: &str) -> WorkerLogTunnelRequest {
+    WorkerLogTunnelRequest {
+        frame: Some(worker_log_tunnel_request::Frame::Open(LogTunnelOpen {
+            request_id: request_id.to_owned(),
+        })),
+    }
+}
+
+/// A tunnel opens only with the id of a read still waiting for it.
+#[tokio::test]
+async fn a_tunnel_claims_its_waiting_read() {
+    let registry = LogRegistry::default();
+    for first in [None, Some(WorkerLogTunnelRequest { frame: None })] {
+        let refused = super::claim_tunnel(&registry, first, Some("w1")).err();
+        let refused = refused.expect("no open frame");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert_eq!(
+            refused.message(),
+            "a log tunnel opens with the request id it answers"
+        );
+    }
+
+    let (gone, paired) = registry.begin("w1");
+    drop(paired);
+    let refused = super::claim_tunnel(&registry, Some(open_frame(&gone)), Some("w1")).err();
+    let refused = refused.expect("nobody is reading");
+    assert_eq!(refused.code(), Code::Cancelled);
+    assert_eq!(refused.message(), "the reader went away");
+
+    let (waiting, paired) = registry.begin("w1");
+    let frames =
+        super::claim_tunnel(&registry, Some(open_frame(&waiting)), Some("w1")).expect("claimed");
+    let mut reader = paired.await.expect("paired with the tunnel");
+    frames.send(records(&["x"])).await.expect("sent");
+    assert!(matches!(reader.recv().await, Some(Frame::Records(_))));
+}
+
+/// The pump forwards every frame but a stray open, and its response stream
+/// ends when the tunnel ends.
+#[tokio::test]
+async fn a_tunnel_pumps_its_frames_and_ends_with_them() {
+    use horde_proto::v1::{LogEnd, LogGap};
+    let (frames, mut reader) = mpsc::channel(8);
+    let (worker, inbound) = mpsc::channel(8);
+    let mut responses =
+        super::pump_tunnel(tokio_stream::wrappers::ReceiverStream::new(inbound), frames);
+    let wrap = |frame| Ok(WorkerLogTunnelRequest { frame: Some(frame) });
+    for frame in [
+        wrap(worker_log_tunnel_request::Frame::Records(
+            LogRecords::default(),
+        )),
+        Ok(open_frame("late")),
+        wrap(worker_log_tunnel_request::Frame::Gap(LogGap::default())),
+        wrap(worker_log_tunnel_request::Frame::End(LogEnd::default())),
+    ] {
+        worker.send(frame).await.expect("sent");
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(
+            tokio::time::timeout(Duration::from_secs(10), reader.recv())
+                .await
+                .expect("a frame arrives")
+                .expect("the pump is running"),
+        );
+    }
+    assert!(
+        matches!(
+            seen.as_slice(),
+            [Frame::Records(_), Frame::Gap(_), Frame::End(_)]
+        ),
+        "{seen:?}"
+    );
+    drop(worker);
+    let ended = tokio::time::timeout(Duration::from_secs(10), responses.next())
+        .await
+        .expect("the response stream ends with the tunnel");
+    assert!(ended.is_none(), "nothing is ever sent to the worker");
+}
+
+/// A read that goes away stops the pump, and with it the worker's order to
+/// keep serving, though the worker's side is still open.
+#[tokio::test]
+async fn a_tunnel_stops_when_its_read_goes_away() {
+    let (frames, reader) = mpsc::channel(8);
+    let (_worker, inbound) = mpsc::channel::<Result<WorkerLogTunnelRequest, tonic::Status>>(8);
+    let mut responses =
+        super::pump_tunnel(tokio_stream::wrappers::ReceiverStream::new(inbound), frames);
+    drop(reader);
+    let ended = tokio::time::timeout(Duration::from_secs(10), responses.next())
+        .await
+        .expect("the pump stops once its read is gone");
+    assert!(ended.is_none());
+}
+
+/// A read the worker cannot be handed, or that its tunnel never answers,
+/// is forgotten: a tunnel arriving for it later finds nothing waiting.
+#[tokio::test(start_paused = true)]
+async fn an_undelivered_or_unanswered_read_is_forgotten() {
+    use crate::diagnostics::registry::Claim;
+    let registry = LogRegistry::default();
+    let (_epoch, lane) = registry.register_worker("w-shut");
+    drop(lane);
+    let refused = super::dispatch(&registry, "w-shut", LogQuery::default()).await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+    assert!(matches!(
+        registry.claim("logs-1", Some("w-shut")),
+        Claim::Unknown
+    ));
+
+    let (_epoch, mut lane) = registry.register_worker("w-mute");
+    let refused = super::dispatch(&registry, "w-mute", LogQuery::default()).await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+    let asked = lane.try_recv().expect("the query was delivered");
+    assert!(matches!(
+        registry.claim(&asked.request_id, Some("w-mute")),
+        Claim::Unknown
+    ));
 }

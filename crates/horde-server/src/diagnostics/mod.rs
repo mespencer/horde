@@ -62,7 +62,7 @@ impl Default for LogPlane {
     fn default() -> Self {
         Self {
             local: None,
-            registry: LogRegistry::new(),
+            registry: LogRegistry::default(),
             buckets: Arc::new(RateBuckets::new(AgentReadLimits::default())),
         }
     }

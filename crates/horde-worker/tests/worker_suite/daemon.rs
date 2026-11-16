@@ -413,6 +413,14 @@ async fn the_run_loop_survives_a_partition_and_registers_again() {
     let prepared = horde_worker::startup::prepare(&config, &mut sink)
         .await
         .expect("an insecure daemon prepares");
+    assert_eq!(
+        prepared
+            .logs
+            .as_ref()
+            .map(|logs| logs.local().dir().to_path_buf()),
+        Some(horde_worker::logs::log_dir(state.path())),
+        "a daemon serves its own log files"
+    );
 
     // The Debug view an operator's crash report will carry: the facts, and
     // never the key material.
