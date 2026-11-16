@@ -588,6 +588,7 @@ mod tests {
     }
 
     /// `sh -c script` in `dir` under a one-second timeout, which it outlives.
+    #[cfg(unix)]
     async fn timed_out_sh(dir: &Path, script: String) -> Ran {
         let ran = execute(
             &["sh".to_owned(), "-c".to_owned(), script],
@@ -949,6 +950,7 @@ mod tests {
     }
 
     /// Output past the tail's size keeps exactly its last bytes.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_output_tail_keeps_exactly_the_last_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -969,6 +971,7 @@ mod tests {
     }
 
     /// A one-byte read is output like any other, not the end of it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn output_after_a_one_byte_read_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -987,6 +990,7 @@ mod tests {
 
     /// The end of the output ends the read: a command that exits at once
     /// returns well inside the drain grace.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_end_of_the_output_ends_the_reclaim_at_once() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1005,6 +1009,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn kill_now(pid: i32) {
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -1012,6 +1017,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     async fn written_pid_soon(marker: &Path) -> i32 {
         for _ in 0..100 {
             if let Ok(text) = std::fs::read_to_string(marker)
@@ -1025,6 +1031,7 @@ mod tests {
     }
 
     /// A reclaim dropped unfinished (its task cancelled) kills its command.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dropped_reclaim_kills_its_command() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1048,6 +1055,7 @@ mod tests {
     }
 
     /// A timed-out command gets SIGTERM first: a trap on it runs.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_command_is_asked_to_stop_first() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1067,6 +1075,7 @@ mod tests {
 
     /// A group member that ignores SIGTERM does not outlive its leader, and
     /// a leader that honours SIGTERM at once ends the command promptly.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_member_ignoring_sigterm_is_killed_with_its_group() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1090,6 +1099,7 @@ mod tests {
 
     /// Whether every task this test's runtime spawned is gone within two
     /// seconds.
+    #[cfg(unix)]
     async fn no_task_left() -> bool {
         let metrics = tokio::runtime::Handle::current().metrics();
         for _ in 0..100 {
@@ -1103,6 +1113,7 @@ mod tests {
 
     /// A process outside the command's group holding its output open is
     /// let go: the readers do not linger once the command timed out.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_commands_readers_do_not_outlive_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1125,6 +1136,7 @@ mod tests {
     }
 
     /// The same past the drain grace, for a command that exited.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_exited_commands_readers_do_not_outlive_the_drain() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1148,6 +1160,7 @@ mod tests {
 
     /// A background process that let go of the output is not killed: only
     /// one still holding it past the drain grace is.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_background_process_that_released_the_output_is_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
